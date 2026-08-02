@@ -6613,6 +6613,314 @@ fn native_capture_echo_wc(pipe: &IrExpr) -> Option<Expr> {
     })
 }
 
+/// `$(echo args... | sort)` (bare sort) / `$(echo args... | uniq)` (bare
+/// uniq, all-literal args only) — the capture's pipeline is the sync echo
+/// builtin feeding a pure line-transform builtin: the value is a native
+/// expression over the echoed text (the runtime sort/uniq formulas —
+/// split on newline, drop the trailing empty, sort / adjacent-dedup,
+/// rejoin). No spawn, no async pipeline. sort lowers for ANY echo args
+/// (the split/sort/join chain is the runtime's exact algorithm); uniq
+/// needs the compile-time text (adjacent dedup has no regex-free native
+/// expression — the all-literal form computes the value at emit time).
+fn native_capture_echo_pipeline(pipe: &IrExpr) -> Option<Expr> {
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() != 2 {
+        return None;
+    }
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return None;
+    };
+    if f1 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(n1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
+        return None;
+    };
+    if n1 != "echo" || echo_args.iter().any(ir_expr_needs_runtime) {
+        return None;
+    }
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
+        return None;
+    };
+    if f2 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(n2, _), IrExpr::Array(cmd_args)] = a2.as_slice() else {
+        return None;
+    };
+    let (joined, no_newline, _) = echo_join_args(echo_args)?;
+    let text: Expr = if no_newline {
+        joined
+    } else {
+        Expr::BinaryExpression {
+            operator: "+",
+            left: Box::new(joined),
+            right: Box::new(str_lit("\n")),
+        }
+    };
+    let method = |obj: Expr, name: &str, margs: Vec<Expr>| Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(obj),
+            property: Box::new(Expr::Identifier {
+                name: name.to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: margs,
+        optional: false,
+    };
+    match (n2.as_str(), cmd_args.as_slice()) {
+        // `sort` with no args: the runtime's exact algorithm — split the
+        // text on newlines, drop the trailing empty (== slice off the
+        // final `\n`), sort, rejoin.
+        ("sort", []) => {
+            let sliced = Expr::ConditionalExpression {
+                test: Box::new(method(text.clone(), "endsWith", vec![str_lit("\n")])),
+                consequent: Box::new(method(text.clone(), "slice", vec![
+                    Expr::Literal {
+                        value: serde_json::Value::from(0),
+                        raw: None,
+                        regex: None,
+                    },
+                    Expr::Literal {
+                        value: serde_json::Value::from(-1),
+                        raw: None,
+                        regex: None,
+                    },
+                ])),
+                alternate: Box::new(text.clone()),
+            };
+            Some(method(
+                method(method(sliced, "split", vec![str_lit("\n")]), "sort", vec![]),
+                "join",
+                vec![str_lit("\n")],
+            ))
+        }
+        // `uniq` with no args: adjacent-dedup — only when the echoed text
+        // is a compile-time constant (all-literal args), computed here
+        // (the runtime's exact algorithm: split, pop the trailing empty
+        // line, collapse adjacent runs).
+        ("uniq", []) => {
+            let text = static_echo_text(echo_args)?;
+            let mut lines: Vec<&str> = text.split('\n').collect();
+            if lines.last() == Some(&"") {
+                lines.pop();
+            }
+            let mut out: Vec<&str> = Vec::new();
+            for l in lines {
+                if out.last().map_or(true, |x| *x != l) {
+                    out.push(l);
+                }
+            }
+            // the capture strips the output's final `\n`
+            Some(str_lit(&out.join("\n")))
+        }
+        _ => None,
+    }
+}
+
+/// The echo builtin's OUTPUT TEXT as a compile-time string: the args
+/// joined with single spaces (the runtime's exact `-e`/`-n` handling),
+/// plus the trailing newline unless `-n`. None when any arg is not a
+/// static string (store-var interpolations etc.).
+fn static_echo_text(echo_args: &[IrExpr]) -> Option<String> {
+    let mut esc = false;
+    let mut no_newline = false;
+    let mut flag_done = false;
+    let mut parts: Vec<String> = Vec::new();
+    for a in echo_args {
+        match a {
+            IrExpr::Str(sv, _) if !flag_done && (sv == "-e" || sv == "-n") => {
+                flag_done = true;
+                if sv == "-e" {
+                    esc = true;
+                } else {
+                    no_newline = true;
+                }
+            }
+            other => {
+                flag_done = true;
+                let s = static_str(other)?;
+                if s.contains(GLOB_MAGIC) || s.contains(PS_MAGIC) {
+                    return None;
+                }
+                parts.push(s);
+            }
+        }
+    }
+    let mut text = parts.join(" ");
+    if esc {
+        text = text.replace("\\n", "\n").replace("\\t", "\t");
+    }
+    if !no_newline {
+        text.push('\n');
+    }
+    Some(text)
+}
+
+/// `$(seq A B | head -N)` / `$(seq A B | tail -N)` — the capture's
+/// pipeline is the sync seq builtin feeding the sync head/tail builtin:
+/// the value is a slice of the numeric range (the runtime's exact
+/// formulas — seq emits `A..B` one per line, head/tail keep the first/
+/// last N lines), so the whole capture collapses to a native array
+/// slice. Only literal integer seq args with a bounded range (10k
+/// elements) and a plain `-N`/`-n N` head/tail count qualify; anything
+/// else (float steps, `-c`, filenames) keeps the runtime pipeline.
+fn native_capture_seq_slice(pipe: &IrExpr) -> Option<Expr> {
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() != 2 {
+        return None;
+    }
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return None;
+    };
+    if f1 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(n1, _), IrExpr::Array(seq_args)] = a1.as_slice() else {
+        return None;
+    };
+    if n1 != "seq" {
+        return None;
+    }
+    // literal integer args only: `seq A B` or `seq A S B`
+    let int_arg = |e: &IrExpr| -> Option<i64> {
+        let IrExpr::Str(sv, _) = e else { return None };
+        if !sv.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            return None;
+        }
+        sv.parse::<i64>().ok()
+    };
+    let nums: Vec<i64> = seq_args.iter().map(int_arg).collect::<Option<_>>()?;
+    let (first, step, last) = match nums.as_slice() {
+        [last] => (1i64, 1i64, *last),
+        [first, last] => (*first, 1i64, *last),
+        [first, step, last] => (*first, *step, *last),
+        _ => return None,
+    };
+    if step == 0 {
+        return None;
+    }
+    let mut range: Vec<Expr> = Vec::new();
+    let mut v = first;
+    while if step > 0 { v <= last } else { v >= last } {
+        if range.len() > 10000 {
+            return None; // bounded: no giant array literals
+        }
+        range.push(Expr::Literal {
+            value: serde_json::Value::from(v),
+            raw: None,
+            regex: None,
+        });
+        v += step;
+    }
+    if range.is_empty() {
+        return None; // empty range: seq emits nothing (no empty capture)
+    }
+    let arr = Expr::ArrayExpression {
+        elements: range.into_iter().map(Some).collect(),
+    };
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
+        return None;
+    };
+    if f2 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(n2, _), IrExpr::Array(ht_args)] = a2.as_slice() else {
+        return None;
+    };
+    // `head -N` / `head -n N` / `tail -N` / `tail -n N` (positive counts)
+    let count: i64 = match ht_args.as_slice() {
+        [IrExpr::Str(s, _)] if s.len() > 1 && s.starts_with('-') => {
+            s[1..].parse::<i64>().ok()?
+        }
+        [IrExpr::Str(f, _), IrExpr::Str(c, _)] if f == "-n" => c.parse::<i64>().ok()?,
+        _ => return None,
+    };
+    if count <= 0 {
+        return None;
+    }
+    // head: first N lines → `slice(0, N)`; tail: last N lines →
+    // `slice(-N)`
+    let slice_args = if n2 == "head" {
+        vec![
+            Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            },
+            Expr::Literal {
+                value: serde_json::Value::from(count),
+                raw: None,
+                regex: None,
+            },
+        ]
+    } else {
+        vec![Expr::Literal {
+            value: serde_json::Value::from(-count),
+            raw: None,
+            regex: None,
+        }]
+    };
+    let slice = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(arr),
+            property: Box::new(Expr::Identifier {
+                name: "slice".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: slice_args,
+        optional: false,
+    };
+    let join = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(slice),
+            property: Box::new(Expr::Identifier {
+                name: "join".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![str_lit("\n")],
+        optional: false,
+    };
+    // `head` appends a newline after the kept lines (the capture strips
+    // it); `tail`'s output ends with the last line + `\n` (stripped too).
+    // The captured value is exactly the kept lines joined with `\n`.
+    Some(Expr::CallExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "String".to_string(),
+        }),
+        arguments: vec![join],
+        optional: false,
+    })
+}
+
 /// Native lowering for a SIMPLE test expression whose operands are all
 /// lifted numeric variables (or integer literals): `"$count" -lt 100`
 /// becomes `count < 100` — no runtime test-string round-trip. Returns None
@@ -8205,6 +8513,38 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
                             if let Some(count) = native_capture_echo_wc(pipe) {
                                 return count;
+                            }
+                        }
+                    }
+                }
+                // `$(echo args... | sort)` / `$(echo args... | uniq)` —
+                // the sync echo builtin feeding a pure line-transform
+                // builtin: the value is a native expression over the
+                // echoed text (see `native_capture_echo_pipeline`) — no
+                // spawn, no async pipeline.
+                if !program_defines_function("echo")
+                    && !program_defines_function("sort")
+                    && !program_defines_function("uniq")
+                {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
+                            if let Some(value) = native_capture_echo_pipeline(pipe) {
+                                return value;
+                            }
+                        }
+                    }
+                }
+                // `$(seq A B | head -N)` / `$(seq A B | tail -N)` — the
+                // sync seq builtin feeding head/tail: a native slice of
+                // the numeric range (see `native_capture_seq_slice`).
+                if !program_defines_function("seq")
+                    && !program_defines_function("head")
+                    && !program_defines_function("tail")
+                {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
+                            if let Some(value) = native_capture_seq_slice(pipe) {
+                                return value;
                             }
                         }
                     }
