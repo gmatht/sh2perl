@@ -952,14 +952,22 @@ mod tests {
 
     #[test]
     fn echo_lowers_to_builtin_call() {
-        // `echo` is a runtime SYNC builtin → the async exec dispatch is
-        // skipped entirely (`sh2.builtin("echo", ...)`, no await).
+        // `echo` with literal args at the default stdout sink → a NATIVE
+        // `process.stdout.write` sequence (no dispatch at all); echo args
+        // the runtime would transform (globs, process substitutions) keep
+        // the sync builtin call (`sh2.builtin("echo", ...)`, no await).
         let json = to_json("echo hello world");
         assert!(json.contains("\"type\":\"Program\""));
-        assert!(json.contains("\"name\":\"builtin\""));
-        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(json.contains("\"name\":\"write\""));
+        assert!(json.contains("\"name\":\"process\""));
         assert!(json.contains("hello"));
+        assert!(!json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("\"name\":\"exec\""));
         assert!(!json.contains("unsupported"));
+        // a GLOB arg keeps the runtime builtin (it glob-expands)
+        let json2 = to_json("echo *.txt");
+        assert!(json2.contains("\"name\":\"builtin\""));
+        assert!(!json2.contains("\"name\":\"write\""));
     }
 
     #[test]
@@ -1311,12 +1319,13 @@ mod tests {
         // <(cmd) as an argument position: the redirect becomes a here-string
         // (captured producer stdout) and a materialized-path argument is
         // appended for the runtime to turn into a temp file. `<(echo a)`
-        // is a pure echo capture — lowered natively (trimCapture), no
-        // async capture machinery.
+        // is a pure echo capture — lowered natively (the joined literal
+        // provably cannot end with a newline, so even the trimCapture
+        // wrapper drops), no async capture machinery.
         let json = to_json("diff <(echo a) <(echo b)");
         assert!(!json.contains("\"name\":\"unsupported\""));
         assert!(!json.contains("\"value\":\"unsupported\""));
-        assert!(json.contains("\"name\":\"trimCapture\""));
+        assert!(!json.contains("\"name\":\"trimCapture\""));
         assert!(json.contains("\"name\":\"exec\""));
         // mapfile is stdin-only: no appended path argument, still no gate leak
         let json2 = to_json("mapfile -t lines < <(printf 'x\\ny\\n')");

@@ -34,6 +34,24 @@ static CASE_NOCASE: Mutex<Option<bool>> = Mutex::new(None);
 /// value-consuming positions (if/while/until conds, `!`, ternary) get the
 /// native lowering.
 static AND_OR_DEPTH: Mutex<usize> = Mutex::new(0);
+/// Native-echo emission depth: >0 while lowering inside a construct whose
+/// runtime stdout sink differs from the module's stdout — `redirect` /
+/// `pipeline` / `capture` / `captureWords` calls (the runtime swaps
+/// fdTargets) — or inside a function body (a script function may be
+/// CALLED under any sink at runtime; the emitter cannot see the call
+/// site's context). `process.stdout.write` is only byte-identical to the
+/// runtime's `emit` when fd 1 is the default stdout, so the native echo
+/// lowering (see `try_native_echo`) checks this depth before firing.
+static ECHO_SINK_DEPTH: Mutex<usize> = Mutex::new(0);
+/// Whether the program contains a PERSISTENT fd-1 redirect (a bare
+/// `exec >file` / `exec 1>&2` / `exec 1>&-` — the runtime keeps those in
+/// the fd table after the redirect call). Native top-level `echo` writes
+/// `process.stdout` directly, which is only byte-identical while fd 1 is
+/// the module's default stdout — a persistent fd-1 redirect ANYWHERE in
+/// the program (functions included; the emitter cannot see call-site
+/// contexts) disables the native echo lowering. Set per compilation by
+/// `shir_to_estree`; conservative (any doubt resolves to `true`).
+static PROGRAM_PERSIST_FD1: Mutex<Option<bool>> = Mutex::new(None);
 /// Per-function `local`-variable native lift: function name → the set of
 /// local vars whose declarations (and every later reference) lower to
 /// native `let` bindings inside the function body (see
@@ -414,6 +432,13 @@ fn exec_call_ir(
 /// single-quoted globs in exec-arg position, so tagging all Literals with
 /// glob chars matches bash for every example.
 const GLOB_MAGIC: &str = "\u{1}SH2GLOB\u{1}";
+
+/// Marker prefix the runtime recognizes on exec args carrying a process
+/// substitution (`<(...)`); the runtime materializes the suffix into a
+/// temp file path at exec time (see estree.rs transform_process_substitution
+/// — the marker is injected at the Word level, so IR literals can carry it).
+/// The native echo lowering must not print it raw.
+const PS_MAGIC: &str = "\u{1}SH2PS\u{1}";
 
 fn has_glob_chars(s: &str) -> bool {
     // Skip `${...}` regions: `[`/`*`/`?` inside an expansion (`${#x[@]}`, `${x:-*}`)
@@ -3037,12 +3062,14 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // static writes and the body emission widens the torn-read window.
     let nocase = ir_may_enable_nocasematch(prog);
     let errexit = ir_may_enable_errexit(prog);
+    let persist_fd1 = ir_has_persist_fd1(prog);
     let mut functions = HashSet::new();
     collect_program_functions(&prog.stmts, &mut functions);
     *LIFTED_NUMERIC.lock().unwrap() = Some(num);
     *LIFTED_STRING.lock().unwrap() = Some(str);
     *CASE_NOCASE.lock().unwrap() = Some(nocase);
     *MAY_ERREXIT.lock().unwrap() = Some(errexit);
+    *PROGRAM_PERSIST_FD1.lock().unwrap() = Some(persist_fd1);
     *PROGRAM_FUNCTIONS.lock().unwrap() = Some(functions);
     let mut body: Vec<Stmt> = Vec::new();
     // `let x = 0` (numeric) / `let x = ""` (string) at program top. bash
@@ -3159,6 +3186,22 @@ const ALWAYS_TRUE_BUILTINS: &[&str] = &[
 /// Does the lowered expression call an sh2.* runtime function that
 /// provably returns truthy on every path (so a guard wrapper is a no-op)?
 fn call_is_always_true(e: &Expr) -> bool {
+    // The native echo / `true` / `:` / `false` sequences (see
+    // try_native_echo and the status lowering): `(write, sh2.lastExit = N,
+    // B)` — always truthy (the echo builtin never fails with the default
+    // stdout sink; the status literals are constants). Same dead-weight
+    // rule as the ALWAYS_TRUE_BUILTINS: the guard can never fire.
+    if let Expr::SequenceExpression { expressions } = e {
+        return matches!(
+            expressions.last(),
+            Some(Expr::Literal { value, .. }) if value == &serde_json::Value::Bool(true)
+        ) && expressions.iter().any(|ex| {
+            matches!(ex, Expr::AssignmentExpression { left, .. }
+                if matches!(&**left, Expr::MemberExpression { object, property, .. }
+                    if matches!(&**object, Expr::Identifier { name } if name == "sh2")
+                        && matches!(&**property, Expr::Identifier { name } if name == "lastExit")))
+        });
+    }
     let Expr::CallExpression {
         callee, arguments, ..
     } = e
@@ -3705,6 +3748,111 @@ fn ir_may_enable_nocasematch(prog: &IrProgram) -> bool {
 /// in a shell variable name, so `$sh_case` can never collide with a lifted
 /// variable's native JS binding.
 const CASE_TMP: &str = "$sh_case";
+
+/// Whether the program contains a PERSISTENT fd-1 redirect (a bare
+/// `exec` builtin with a redirect — `exec >file`, `exec 1>&2`, `exec 1>&-`;
+/// the runtime keeps those in the fd table after the redirect call).
+/// Native top-level `echo` writes `process.stdout` directly, which is only
+/// byte-identical while fd 1 is the module's default stdout — a persistent
+/// fd-1 redirect anywhere (function bodies included) makes the runtime
+/// dispatch mandatory. Walks the whole ShIR (stmt + expression forms); the
+/// estree path only constructs the subset matched below, so `_ => false`
+/// is exact for it. Conservative direction: any doubt resolves to `true`.
+fn ir_has_persist_fd1(prog: &IrProgram) -> bool {
+    fn stmt_has(s: &IrStmt) -> bool {
+        match s {
+            // statement-form redirect: persist = inner is a bare literal
+            // `exec` with NO args (the stmt_to_estree persist rule)
+            IrStmt::Redirect { inner, redirects } => {
+                let persist = matches!(
+                    inner.as_slice(),
+                    [IrStmt::Expr(IrExpr::Call { func, args })]
+                        if func == "exec"
+                            && matches!(args.as_slice(), [IrExpr::Str(name, _), IrExpr::Array(a)]
+                                if name == "exec" && a.is_empty())
+                );
+                (persist && redirects.iter().any(|r| r.fd == Some(1)))
+                    || inner.iter().any(stmt_has)
+            }
+            IrStmt::Expr(e) => expr_has(e),
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                expr_has(cond)
+                    || then.iter().any(stmt_has)
+                    || elsifs
+                        .iter()
+                        .any(|(c, b)| expr_has(c) || b.iter().any(stmt_has))
+                    || else_.iter().any(stmt_has)
+            }
+            IrStmt::While { cond, body, .. } => {
+                expr_has(cond) || body.iter().any(stmt_has)
+            }
+            IrStmt::For { iter, body, .. } => {
+                expr_has(iter) || body.iter().any(stmt_has)
+            }
+            IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body) => body.iter().any(stmt_has),
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                expr_has(discriminant)
+                    || clauses.iter().any(|c| c.body.iter().any(stmt_has))
+            }
+            IrStmt::Assign { expr, .. } => expr_has(expr),
+            IrStmt::Return(Some(e)) => expr_has(e),
+            // Perl-only variants are never constructed by ast_to_ir (the
+            // estree path) — nothing to scan.
+            _ => false,
+        }
+    }
+    fn expr_has(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "redirect" {
+                    // expression-form redirect: [Arrow(stmts), Array(specs)]
+                    // — a spec object with fd 1 + persist true (see
+                    // redirect_spec_object_persist)
+                    if let [IrExpr::Arrow(_), IrExpr::Array(specs)] = args.as_slice() {
+                        if specs.iter().any(|s| match s {
+                            IrExpr::Object(props) => {
+                                let fd = props.iter().any(|(k, v)| {
+                                    k == "fd" && matches!(v, IrExpr::Int(1))
+                                });
+                                let persist = props.iter().any(|(k, v)| {
+                                    k == "persist" && matches!(v, IrExpr::Bool(true))
+                                });
+                                fd && persist
+                            }
+                            _ => false,
+                        }) {
+                            return true;
+                        }
+                    }
+                }
+                args.iter().any(expr_has)
+            }
+            IrExpr::Arrow(stmts) => stmts.iter().any(stmt_has),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_has(lhs) || expr_has(rhs)
+            }
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                InterpPart::Expr(inner) => expr_has(inner),
+                InterpPart::Lit(_) => false,
+            }),
+            // no statements inside any other estree-path variant
+            _ => false,
+        }
+    }
+    prog.stmts.iter().any(stmt_has)
+}
 
 fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     Some(match stmt {
@@ -4390,6 +4538,17 @@ fn echo_arg_to_estree(a: &IrExpr) -> Option<Expr> {
             })
         }
         other => {
+            // array-valued args (UNQUOTED `$(...)` / `$@` — the runtime's
+            // captureWords/listVar return arrays): keep the call bare — the
+            // builtin's arg flattener splices the elements into the arg
+            // list, and the join builder applies `.flat()` first (a
+            // String() wrap would comma-join the array).
+            if matches!(
+                other,
+                IrExpr::Call { func, .. } if func == "captureWords" || func == "listVar"
+            ) {
+                return Some(expr_to_estree(other));
+            }
             let e = expr_to_estree(other);
             match e {
                 // array-valued expression (emit-time brace expansion):
@@ -4434,45 +4593,92 @@ fn echo_arg_scalar(a: &IrExpr) -> Expr {
     }
 }
 
-fn try_native_echo_capture(e: &IrExpr) -> Option<Expr> {
-    let IrExpr::Call { func, args } = e else {
-        return None;
-    };
-    if func != "exec" {
-        return None;
-    }
-    let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args.as_slice() else {
-        return None;
-    };
-    if name != "echo" {
-        return None;
-    }
+/// Shared `echo` argument lowering: flag args at position 0 (the runtime
+/// checks exactly `args[0] === '-n'` / `'-e'` — at most ONE flag, later
+/// occurrences are ordinary args), the runtime's arg flattening (brace
+/// arrays splice their words into the join), and the `-e` global replaces
+/// (`\n` → newline, `\t` → tab — exactly the runtime's two). Returns the
+/// joined value, whether the FIRST arg was `-n` (no trailing newline for
+/// the statement form), and whether the joined value provably CANNOT end
+/// with a newline (the final arg is a literal with no trailing `\n` even
+/// after the `-e` replaces). The capture strips trailing newlines from the
+/// buffer, so a provably-newline-free join needs no trim wrapper.
+fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
     let mut arg_exprs: Vec<Expr> = Vec::new();
     let mut esc = false;
+    let mut no_newline = false;
+    let mut flat = false;
+    let mut flag_done = false;
     for a in echo_args {
         match a {
-            // flag args (only at position 0, only -e/-n)
-            IrExpr::Str(sv, _) if arg_exprs.is_empty() && (sv == "-e" || sv == "-n") => {
-                esc = sv == "-e";
-            }
-            other => match echo_arg_to_estree(other)? {
-                // array arg (brace expansion): splice its words into the
-                // join, exactly like the runtime's arg flattening
-                Expr::ArrayExpression { elements, .. } => {
-                    arg_exprs.extend(elements.into_iter().flatten());
+            // flag args: only at position 0, only the exact builtin flags
+            IrExpr::Str(sv, _) if !flag_done && (sv == "-e" || sv == "-n") => {
+                flag_done = true;
+                if sv == "-e" {
+                    esc = true;
+                } else {
+                    no_newline = true;
                 }
-                e => arg_exprs.push(e),
-            },
+            }
+            other => {
+                flag_done = true;
+                if matches!(
+                    other,
+                    IrExpr::Call { func, .. } if func == "captureWords" || func == "listVar"
+                ) {
+                    // array-valued arg — the runtime's flattener splices the
+                    // elements; mirror it with `.flat()` before the join
+                    flat = true;
+                }
+                match echo_arg_to_estree(other)? {
+                    // array arg (brace expansion): splice its words into the
+                    // join, exactly like the runtime's arg flattening
+                    Expr::ArrayExpression { elements, .. } => {
+                        arg_exprs.extend(elements.into_iter().flatten());
+                    }
+                    e => arg_exprs.push(e),
+                }
+            }
         }
     }
+    let last_clean = match arg_exprs.last() {
+        // the final join element decides the trailing byte: a literal that
+        // does not end with a newline (a real one, or a `\n` the -e
+        // replaces) keeps the join newline-free
+        Some(Expr::Literal { value, .. }) => match value {
+            serde_json::Value::String(s) => {
+                !s.ends_with('\n') && !(esc && s.ends_with("\\n"))
+            }
+            _ => true,
+        },
+        None => true,
+        Some(_) => false,
+    };
     let mut joined: Expr = if arg_exprs.is_empty() {
         str_lit("")
     } else {
+        let mut arr = Expr::ArrayExpression {
+            elements: arg_exprs.into_iter().map(Some).collect(),
+        };
+        if flat {
+            // `[a, ...captureWords-result].flat()` — the runtime's arg
+            // flattener (Array.isArray → splice) applied before the join
+            arr = Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(arr),
+                    property: Box::new(Expr::Identifier {
+                        name: "flat".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![],
+                optional: false,
+            };
+        }
         Expr::CallExpression {
             callee: Box::new(Expr::MemberExpression {
-                object: Box::new(Expr::ArrayExpression {
-                    elements: arg_exprs.into_iter().map(Some).collect(),
-                }),
+                object: Box::new(arr),
                 property: Box::new(Expr::Identifier {
                     name: "join".to_string(),
                 }),
@@ -4514,7 +4720,597 @@ fn try_native_echo_capture(e: &IrExpr) -> Option<Expr> {
             };
         }
     }
-    Some(sh2_call("trimCapture", vec![joined]))
+    Some((joined, no_newline, last_clean))
+}
+
+/// `$(echo args...)` — the capture's only statement is the sync echo
+/// builtin: the value is the joined args (with the runtime's `-e`
+/// interpretation) minus the capture's trailing-newline strips — no async
+/// capture machinery at all. The trailing-newline strip is a no-op when
+/// the final arg provably cannot end with a newline (a literal without
+/// `-e`-trailing `\n`), so the `sh2.trimCapture` wrapper drops too. Args
+/// the runtime would transform beyond joining (GLOB_MAGIC globs, PS_MAGIC
+/// process-substitution paths, raw-byte markers) keep the whole capture.
+fn try_native_echo_capture(e: &IrExpr) -> Option<Expr> {
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if func != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args.as_slice() else {
+        return None;
+    };
+    if name != "echo" {
+        return None;
+    }
+    if echo_args.iter().any(ir_expr_needs_runtime) {
+        return None;
+    }
+    let (joined, _, last_clean) = echo_join_args(echo_args)?;
+    if last_clean {
+        Some(joined)
+    } else {
+        // the captured value may end with newlines (a dynamic final arg) —
+        // keep the runtime's exact capture strips
+        Some(sh2_call("trimCapture", vec![joined]))
+    }
+}
+
+/// Args the runtime's echo would transform beyond plain string joining:
+/// GLOB_MAGIC (glob expansion), PS_MAGIC (process-substitution paths — the
+/// runtime materializes them into /dev/fd paths), and raw-byte markers
+/// (U+F800+ private-use chars the CLI maps to non-UTF-8 source bytes,
+/// which the runtime decodeRawBytes re-expands). Native echo would print
+/// the marker text literally — any of these keep the runtime dispatch.
+fn ir_expr_needs_runtime(e: &IrExpr) -> bool {
+    fn magic(s: &str) -> bool {
+        s.contains(GLOB_MAGIC)
+            || s.contains(PS_MAGIC)
+            || s.chars().any(|c| (0xF800..=0xF8FF).contains(&(c as u32)))
+    }
+    match e {
+        IrExpr::Str(s, _) => magic(s),
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            InterpPart::Lit(s) => magic(s),
+            InterpPart::Expr(inner) => ir_expr_needs_runtime(inner),
+        }),
+        IrExpr::Call { func, args } => {
+            // `${!prefix*[@]...}` — the runtime's param returns
+            // BADSUB_MAGIC for this shape, and the exec flattener SKIPS the
+            // whole command (status 1) when an arg IS the marker — native
+            // echo would print the marker text instead.
+            if func == "param" {
+                if let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args.as_slice() {
+                    if op == "slice" && name.starts_with('!') && name.contains('*') {
+                        return true;
+                    }
+                }
+            }
+            args.iter().any(ir_expr_needs_runtime)
+        }
+        IrExpr::Array(elems) => elems.iter().any(ir_expr_needs_runtime),
+        IrExpr::Object(props) => props.iter().any(|(_, v)| ir_expr_needs_runtime(v)),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            ir_expr_needs_runtime(lhs) || ir_expr_needs_runtime(rhs)
+        }
+        _ => false,
+    }
+}
+
+/// `echo args...` at the module's default stdout sink (see ECHO_SINK_DEPTH
+/// and PROGRAM_PERSIST_FD1): the whole statement is pure string work — a
+/// native `process.stdout.write`, no dispatch. The runtime builtin joins
+/// the flattened args with single spaces and appends a newline (unless
+/// the first arg is exactly `-n`); `-e` replaces `\n`/`\t`. Mirror that
+/// exactly, and record the status the builtin would (`sh2.lastExit = 0`)
+/// plus the truthiness its callers branch on (`true` — the builtin always
+/// returns true here: fd 1 is the default stdout, never closed).
+/// A compile-time-constant string: a bare literal or an interpolation of
+/// only literal parts (the emitter wraps QUOTED words as all-Lit
+/// interpolations, unquoted ones as Str).
+fn static_str(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(s) => out.push_str(s),
+                    InterpPart::Expr(_) => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Rust port of the runtime's `unescapeFormat` chain (harness/
+/// sh2-namespace.mjs): the SAME sequential global replaces in the SAME
+/// order (the `\\n`-before-`\\\\` order matters for `\\\\n`-style strings),
+/// then the octal `\\([0-7]{1,3})` replace last.
+fn printf_unescape(s: &str) -> Option<String> {
+    let mut out = s.to_string();
+    for (from, to) in [
+        ("\\n", "\n"),
+        ("\\t", "\t"),
+        ("\\r", "\r"),
+        ("\\a", "\x07"),
+        ("\\b", "\x08"),
+        ("\\f", "\x0c"),
+        ("\\v", "\x0b"),
+        ("\\\\", "\\"),
+    ] {
+        out = out.replace(from, to);
+    }
+    let chars: Vec<char> = out.chars().collect();
+    let mut res = String::with_capacity(out.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            let mut oct = String::new();
+            let mut j = i + 1;
+            while j < chars.len() && oct.len() < 3 && matches!(chars[j], '0'..='7') {
+                oct.push(chars[j]);
+                j += 1;
+            }
+            if !oct.is_empty() {
+                res.push(char::from_u32(u32::from_str_radix(&oct, 8).ok()?)?);
+                i = j;
+                continue;
+            }
+        }
+        res.push(chars[i]);
+        i += 1;
+    }
+    Some(res)
+}
+
+/// One `%` conversion spec from the runtime's format regex
+/// /%(?:[-+ 0#]*\d*(?:\.\d+)?[diouxXeEfgGcbsq%])/ — (flags, width, prec,
+/// conv, spec length in chars). None when the `%` at `pos` does not start
+/// a valid spec (it is plain text, exactly like the runtime's regex miss).
+fn printf_scan_spec(
+    chars: &[char],
+    pos: usize,
+) -> Option<(String, usize, Option<usize>, char, usize)> {
+    let mut i = pos + 1;
+    while i < chars.len() && matches!(chars[i], '-' | '+' | ' ' | '0' | '#') {
+        i += 1;
+    }
+    let flags: String = chars[pos + 1..i].iter().collect();
+    let wstart = i;
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    let width: usize = if i > wstart {
+        chars[wstart..i].iter().collect::<String>().parse().ok()?
+    } else {
+        0
+    };
+    let mut prec = None;
+    if i < chars.len() && chars[i] == '.' {
+        i += 1;
+        let pstart = i;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        // the runtime's (?:\\.\\d+)? needs at least one digit
+        if i > pstart {
+            prec = Some(chars[pstart..i].iter().collect::<String>().parse().ok()?);
+        } else {
+            return None;
+        }
+    }
+    if i >= chars.len() {
+        return None;
+    }
+    let conv = chars[i];
+    if !matches!(
+        conv,
+        'd' | 'i' | 'o' | 'u' | 'x' | 'X' | 'e' | 'E' | 'f' | 'g' | 'G' | 'c' | 'b' | 's'
+            | 'q' | '%'
+    ) {
+        return None;
+    }
+    Some((flags, width, prec, conv, i + 1 - pos))
+}
+
+/// JS `parseInt(s, 10)` for the reachable subset: leading JS whitespace
+/// (ASCII here — non-ASCII input bails), optional sign, decimal digits;
+/// no digits → NaN, which the runtime's `|| 0` turns into 0. Digit strings
+/// that overflow i64 bail (JS double formatting differs beyond that).
+fn js_parse_int(s: &str) -> Option<i64> {
+    if !s.is_ascii() {
+        return None;
+    }
+    let s = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return Some(0); // parseInt NaN || 0
+    }
+    let v: i64 = digits.parse().ok()?;
+    Some(if neg { -v } else { v })
+}
+
+/// The runtime's `pad()`: space/zero fill to `width`, `-` left-justifies,
+/// `0`-fill only without `-` and never for `%s`. JS `.length` counts UTF-16
+/// units — non-ASCII bails (char count would disagree).
+fn printf_pad(s: &str, flags: &str, width: usize, conv: char) -> Option<String> {
+    if !s.is_ascii() {
+        return None;
+    }
+    let len = s.chars().count();
+    if width <= len {
+        return Some(s.to_string());
+    }
+    let fill = if flags.contains('0') && !flags.contains('-') && conv != 's' {
+        '0'
+    } else {
+        ' '
+    };
+    let fill_s: String = std::iter::repeat(fill).take(width - len).collect();
+    Some(if flags.contains('-') {
+        format!("{s}{fill_s}")
+    } else {
+        format!("{fill_s}{s}")
+    })
+}
+
+/// One conversion, exact runtime semantics (printfOne) for the supported
+/// subset — `%s` and `%d`/`%i` (the runtime's precision is ignored for
+/// these, matching printfOne). Anything else bails to the runtime path.
+fn printf_one(
+    conv: char,
+    flags: &str,
+    width: usize,
+    _prec: Option<usize>,
+    arg: &str,
+) -> Option<String> {
+    match conv {
+        's' => printf_pad(arg, flags, width, 's'),
+        'd' | 'i' => printf_pad(&js_parse_int(arg)?.to_string(), flags, width, 'd'),
+        _ => None,
+    }
+}
+
+/// Parsed printf format: text runs and `%` specs in source order.
+struct PrintfFmt {
+    /// (text) runs; `Spec { flags, width, prec, conv }` entries
+    els: Vec<PrintfEl>,
+    /// spec count per format pass (each consumes one arg)
+    n_specs: usize,
+}
+
+enum PrintfEl {
+    Text(String),
+    Spec {
+        flags: String,
+        width: usize,
+        prec: Option<usize>,
+        conv: char,
+    },
+}
+
+/// Parse the RAW format (backslashes intact — unescaping applies to TEXT
+/// runs only, exactly like the runtime's formatOnce). Returns None for any
+/// conversion outside the supported subset (the caller keeps the runtime
+/// dispatch — never a wrong byte).
+fn printf_parse(fmt: &str) -> Option<PrintfFmt> {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut els: Vec<PrintfEl> = Vec::new();
+    let mut text = String::new();
+    let mut pos = 0usize;
+    let mut n_specs = 0usize;
+    while pos < chars.len() {
+        if chars[pos] == '%' {
+            if let Some((flags, width, prec, conv, len)) = printf_scan_spec(&chars, pos) {
+                if conv == '%' {
+                    text.push('%');
+                } else {
+                    if !matches!(conv, 's' | 'd' | 'i') {
+                        return None;
+                    }
+                    if !text.is_empty() {
+                        els.push(PrintfEl::Text(std::mem::take(&mut text)));
+                    }
+                    els.push(PrintfEl::Spec {
+                        flags,
+                        width,
+                        prec,
+                        conv,
+                    });
+                    n_specs += 1;
+                }
+                pos += len;
+                continue;
+            }
+        }
+        text.push(chars[pos]);
+        pos += 1;
+    }
+    if !text.is_empty() {
+        els.push(PrintfEl::Text(text));
+    }
+    Some(PrintfFmt { els, n_specs })
+}
+
+/// Apply the parsed format to literal args with the runtime's exact
+/// cycling: each spec consumes one arg per pass, missing args are `''`,
+/// a spec-less format runs once per arg, zero args runs once.
+fn printf_apply(pf: &PrintfFmt, args: &[String]) -> Option<String> {
+    let passes = if pf.n_specs == 0 {
+        args.len().max(1)
+    } else if args.is_empty() {
+        1
+    } else {
+        (args.len() + pf.n_specs - 1) / pf.n_specs
+    };
+    let mut out = String::new();
+    for _ in 0..passes {
+        let mut ai = 0usize;
+        for el in &pf.els {
+            match el {
+                PrintfEl::Text(t) => out.push_str(&printf_unescape(t)?),
+                PrintfEl::Spec {
+                    flags,
+                    width,
+                    prec,
+                    conv,
+                } => {
+                    let arg = args.get(ai).map(String::as_str).unwrap_or("");
+                    out.push_str(&printf_one(*conv, flags, *width, *prec, arg)?);
+                    ai += 1;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `printf FORMAT ARGS...` with a static format and the module's default
+/// stdout sink: the whole call is pure string work — a native
+/// `process.stdout.write`, no dispatch. All-literal args are fully
+/// computed at emit time (a Rust port of the runtime's printf pipeline);
+/// dynamic args compile the format into a template literal with the
+/// runtime's per-spec semantics (`%s` → the arg, `%d` → `parseInt||0`) and
+/// its format cycling (each spec consumes one arg per pass; the arg
+/// expressions are each evaluated exactly once). Anything the port cannot
+/// reproduce EXACTLY — unsupported conversions (`%x`, `%f`, `%q`, ...),
+/// flags/widths on dynamic args, array-valued args (they expand the arg
+/// count at runtime), magic args — keeps the runtime dispatch.
+fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Str(name, _), IrExpr::Array(pargs)] = args else {
+        return None; // env-carrying 3-arg form — keep the dispatch
+    };
+    if name != "printf" {
+        return None;
+    }
+    let fmt = static_str(pargs.first()?)?;
+    let pf = printf_parse(&fmt)?;
+    let rest = &pargs[1.min(pargs.len())..];
+    // all-literal args → compute the whole output at emit time (brace
+    // arrays flatten into the arg list, exactly like the runtime's
+    // builtin() flattener)
+    let mut lit_args: Vec<String> = Vec::new();
+    let mut all_lit = true;
+    for a in rest {
+        match a {
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    match static_str(el) {
+                        Some(s) => lit_args.push(s),
+                        None => {
+                            all_lit = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            other => match static_str(other) {
+                Some(s) => lit_args.push(s),
+                None => {
+                    all_lit = false;
+                    break;
+                }
+            },
+        }
+    }
+    let value: Expr = if all_lit {
+        let out = printf_apply(&pf, &lit_args)?;
+        str_lit(&out)
+    } else {
+        // dynamic args: the format must be flag/width/prec-free (the
+        // corpus needs none there) and every arg must be a SCALAR
+        // expression (arrays/captureWords/listVar expand the arg count at
+        // runtime — the compile-time cycling would mis-map)
+        if pf.els.iter().any(|el| matches!(el, PrintfEl::Spec { flags, width, .. }
+            if !flags.is_empty() || *width > 0))
+        {
+            return None;
+        }
+        if pf.els.iter().any(|el| matches!(el, PrintfEl::Spec { prec: Some(_), .. })) {
+            return None;
+        }
+        let mut arg_exprs: Vec<Expr> = Vec::new();
+        for a in rest {
+            match a {
+                IrExpr::Call { func, .. }
+                    if func == "captureWords" || func == "listVar" =>
+                {
+                    return None;
+                }
+                IrExpr::Array(_) => return None,
+                other => arg_exprs.push(expr_to_estree(other)),
+            }
+        }
+        let arg_at = |ai: usize| -> Expr {
+            match arg_exprs.get(ai) {
+                Some(e) => e.clone(),
+                None => str_lit(""),
+            }
+        };
+        let passes = if pf.n_specs == 0 {
+            arg_exprs.len().max(1)
+        } else if arg_exprs.is_empty() {
+            1
+        } else {
+            (arg_exprs.len() + pf.n_specs - 1) / pf.n_specs
+        };
+        if pf.n_specs == 0 {
+            // no specs: the format text repeats once per arg; the args
+            // must still be EVALUATED (side effects) — a leading array
+            // literal in the sequence does that, then the write
+            let text = printf_unescape(&fmt)?;
+            let mut seq_els = vec![Expr::ArrayExpression {
+                elements: arg_exprs.into_iter().map(Some).collect(),
+            }];
+            seq_els.push(printf_write_expr(str_lit(&text.repeat(passes))));
+            return Some(seq(seq_els));
+        }
+        // compile the format into a template: text runs become quasis,
+        // each spec consumes the next arg (cycling across passes — the
+        // runtime reuses the format until every arg is consumed)
+        let mut quasis: Vec<TemplateElement> = Vec::new();
+        let mut expressions: Vec<Expr> = Vec::new();
+        let mut quasi = String::new();
+        let mut ai = 0usize;
+        for _pass in 0..passes {
+            for el in &pf.els {
+                match el {
+                    PrintfEl::Text(t) => {
+                        quasi.push_str(&printf_unescape(t)?);
+                    }
+                    PrintfEl::Spec { conv, .. } => {
+                        quasis.push(TemplateElement {
+                            type_: "TemplateElement",
+                            value: TemplateElementValue {
+                                raw: quasi.clone(),
+                                cooked: Some(quasi.clone()),
+                            },
+                            tail: false,
+                        });
+                        quasi.clear();
+                        let arg = arg_at(ai);
+                        expressions.push(match conv {
+                            's' => arg,
+                            'd' | 'i' => Expr::LogicalExpression {
+                                operator: "||",
+                                left: Box::new(Expr::CallExpression {
+                                    callee: Box::new(Expr::Identifier {
+                                        name: "parseInt".to_string(),
+                                    }),
+                                    arguments: vec![arg, Expr::Literal {
+                                        value: serde_json::Value::from(10),
+                                        raw: None,
+                                    }],
+                                    optional: false,
+                                }),
+                                right: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(0),
+                                    raw: None,
+                                }),
+                            },
+                            _ => unreachable!("printf_parse gates the conversions"),
+                        });
+                        ai += 1;
+                    }
+                }
+            }
+        }
+        quasis.push(TemplateElement {
+            type_: "TemplateElement",
+            value: TemplateElementValue {
+                raw: quasi,
+                cooked: None,
+            },
+            tail: true,
+        });
+        Expr::TemplateLiteral {
+            quasis,
+            expressions,
+        }
+    };
+    // (process.stdout.write(value), sh2.lastExit = 0, true)
+    Some(seq(vec![
+        printf_write_expr(value),
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+            }),
+        },
+        bool_lit(true),
+    ]))
+}
+
+/// `process.stdout.write(value)` — shared by the native echo / printf
+/// lowerings (fd 1 is the module's default stdout there).
+fn printf_write_expr(value: Expr) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "process".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "stdout".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "write".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![value],
+        optional: false,
+    }
+}
+
+fn try_native_echo(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args else {
+        return None; // env-carrying 3-arg form — the env is command-scoped
+    };
+    if name != "echo" {
+        return None;
+    }
+    if echo_args.iter().any(ir_expr_needs_runtime) {
+        return None;
+    }
+    let (joined, no_newline, _) = echo_join_args(echo_args)?;
+    let text: Expr = if no_newline {
+        joined
+    } else {
+        Expr::BinaryExpression {
+            operator: "+",
+            left: Box::new(joined),
+            right: Box::new(str_lit("\n")),
+        }
+    };
+    let write = printf_write_expr(text);
+    // (process.stdout.write(text), sh2.lastExit = 0, true)
+    Some(seq(vec![
+        write,
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+            }),
+        },
+        bool_lit(true),
+    ]))
 }
 
 /// `$(echo X | tr SET1 SET2)` / `$(echo X | tr -d SET` — a pure string
@@ -6102,6 +6898,57 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                 }
             }
+            // `printf FORMAT ARGS...` with a static format at the module's
+            // default stdout sink: a native `process.stdout.write`, no
+            // dispatch — see `try_native_printf` (same guards as the echo
+            // lowering: sink depth, script-function shadow, persistent fd-1).
+            if func == "exec" && *ECHO_SINK_DEPTH.lock().unwrap() == 0 {
+                if !program_defines_function("printf")
+                    && !PROGRAM_PERSIST_FD1.lock().unwrap().unwrap_or(true)
+                {
+                    if let Some(native) = try_native_printf(args) {
+                        return native;
+                    }
+                }
+            }
+            // `echo args...` at the module's default stdout sink: a native
+            // `process.stdout.write` sequence, no dispatch — see
+            // `try_native_echo`. Suppressed inside redirect/pipeline/
+            // capture/function bodies (ECHO_SINK_DEPTH), when a script
+            // function shadows the builtin, or when the program installs a
+            // persistent fd-1 redirect (`exec >file` — PROGRAM_PERSIST_FD1).
+            if func == "exec" && *ECHO_SINK_DEPTH.lock().unwrap() == 0 {
+                if !program_defines_function("echo")
+                    && !PROGRAM_PERSIST_FD1.lock().unwrap().unwrap_or(true)
+                {
+                    if let Some(native) = try_native_echo(args) {
+                        return native;
+                    }
+                }
+            }
+            // `true` / `:` / `false` with no args: pure status writes — a
+            // native `(sh2.lastExit = N, B)` sequence, no dispatch. The
+            // runtime builtins set exactly these statuses and return the
+            // matching truthiness (`if true; then` / `while :; do` / `a &&
+            // true` all branch on it).
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
+                    if a.is_empty() && matches!(name.as_str(), "true" | ":" | "false") {
+                        let ok = name != "false";
+                        return seq(vec![
+                            Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(sh2_member("lastExit")),
+                                right: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(if ok { 0 } else { 1 }),
+                                    raw: None,
+                                }),
+                            },
+                            bool_lit(ok),
+                        ]);
+                    }
+                }
+            }
             let callee_name = exec_or_builtin(func, args);
             let call = sh2_call(callee_name, mapped_args);
             if is_async_call(callee_name) {
@@ -6194,6 +7041,19 @@ fn array(elements: Vec<Expr>) -> Expr {
 }
 
 fn arrow(params: Vec<Expr>, body: IrExpr) -> Expr {
+    // Every runtime-call arrow (capture/pipeline/redirect/subshell/define/
+    // and/or/while/for/background) is a context where the runtime may have
+    // swapped stdout sinks (fdTargets) or where the body may later be
+    // CALLED under any sink (function bodies). `process.stdout.write` is
+    // only byte-identical to the runtime's `emit` while fd 1 is the
+    // default stdout, so native echo lowering is suppressed inside.
+    *ECHO_SINK_DEPTH.lock().unwrap() += 1;
+    let out = arrow_body(params, body);
+    *ECHO_SINK_DEPTH.lock().unwrap() -= 1;
+    out
+}
+
+fn arrow_body(params: Vec<Expr>, body: IrExpr) -> Expr {
     match &body {
         IrExpr::Arrow(stmts) if stmts.len() == 1 && matches!(stmts[0], IrStmt::Expr(_)) => {
             let inner = match &stmts[0] {
