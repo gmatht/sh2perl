@@ -3047,6 +3047,11 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
 /// bash. Guarded are single calls (exec/test/pipeline/redirect/subshell/
 /// loops) and assignments; NOT guarded are `&&`/`||`/`!` expressions (bash
 /// exempts non-final commands in those lists from errexit).
+///
+/// A call that provably always succeeds is NOT guarded: the runtime guard
+/// only fires on a falsy value, so wrapping an always-truthy call (see
+/// [`call_is_always_true`]) would be a no-op — skipping it removes the
+/// dispatch while keeping errexit semantics byte-identical.
 fn top_stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     let s = stmt_to_estree(stmt)?;
     // No `set -e` anywhere → the runtime's errexit flag can never turn on,
@@ -3082,10 +3087,70 @@ fn top_stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         return Some(s);
     }
     match s {
-        Stmt::ExpressionStatement { expression } => Some(Stmt::ExpressionStatement {
-            expression: sh2_call("guard", vec![expression]),
-        }),
+        Stmt::ExpressionStatement { expression } => {
+            // A call that provably always returns truthy (always-true
+            // builtins, setVar/setArray/shopt/forLoopSync — every runtime
+            // path ends in a truthy return) can never make the guard fire:
+            // drop the wrapper.
+            if call_is_always_true(&expression) {
+                return Some(Stmt::ExpressionStatement { expression });
+            }
+            Some(Stmt::ExpressionStatement {
+                expression: sh2_call("guard", vec![expression]),
+            })
+        }
         other => Some(other),
+    }
+}
+
+/// Builtins whose runtime impls return truthy on EVERY path (verified
+/// against the builtins map in harness/sh2-namespace.mjs): a guard wrapper
+/// around them is dead weight — errexit can never fire on a truthy value.
+/// NOT in this set (they can return false and MUST stay guarded):
+/// cd/test/touch/read/readonly(dirname/basename/cmp/sort can fail too —
+/// only unconditional-true impls qualify). `exit` never returns (process
+/// exit), so its guard is unreachable either way.
+const ALWAYS_TRUE_BUILTINS: &[&str] = &[
+    "echo", "printf", "pwd", "export", "unset", "mapfile", "set", "declare",
+    "shift", "local", "trap", "type", "seq", "head", "tail", "wc", "uniq",
+    "comm", "true",
+];
+
+/// Does the lowered expression call an sh2.* runtime function that
+/// provably returns truthy on every path (so a guard wrapper is a no-op)?
+fn call_is_always_true(e: &Expr) -> bool {
+    let Expr::CallExpression {
+        callee, arguments, ..
+    } = e
+    else {
+        return false;
+    };
+    let Expr::MemberExpression {
+        object, property, ..
+    } = &**callee
+    else {
+        return false;
+    };
+    let Expr::Identifier { name: obj } = &**object else {
+        return false;
+    };
+    if obj != "sh2" {
+        return false;
+    }
+    let Expr::Identifier { name: prop } = &**property else {
+        return false;
+    };
+    match prop.as_str() {
+        // runtime helpers that always return truthy
+        "setVar" | "setArray" | "shopt" | "forLoopSync" | "whileLoopSync" => true,
+        "builtin" => match arguments.first() {
+            Some(Expr::Literal { value, .. }) => match value {
+                serde_json::Value::String(bn) => ALWAYS_TRUE_BUILTINS.contains(&bn.as_str()),
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -3871,12 +3936,15 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             body_stmts.extend(body.clone());
             let iter_e = expr_to_estree(iter);
             let body_e: Vec<Stmt> = body_stmts.iter().filter_map(stmt_to_estree).collect();
-            // Fast path: a provably-sync loop (neither the iterable nor the
-            // body needs `await`) lowers to the synchronous runtime loop —
-            // identical semantics (flattening, GLOB_MAGIC items, BREAK/
-            // CONTINUE/RETURN signals, capture bound) minus the per-iteration
-            // promise machinery (the whileLoopSync precedent).
-            if !expr_has_await(&iter_e) && !stmts_have_await(&body_e) {
+            // Fast path: a provably-sync loop (the BODY needs no `await`)
+            // lowers to the synchronous runtime loop — identical semantics
+            // (flattening, GLOB_MAGIC items, BREAK/CONTINUE/RETURN signals,
+            // capture bound) minus the per-iteration promise machinery (the
+            // whileLoopSync precedent). An `await` in the ITERABLE is fine:
+            // it resolves ONCE, before the loop starts (arguments evaluate
+            // before the call) — `$(...)`-produced item lists stay async,
+            // the per-item body still runs without promises.
+            if !stmts_have_await(&body_e) {
                 return Some(Stmt::ExpressionStatement {
                     expression: sh2_call(
                         "forLoopSync",
@@ -4254,6 +4322,78 @@ fn tr_decode_escapes(s: &str) -> Option<String> {
 /// trailing newline is stripped anyway). Conservative: no flags other
 /// than `-e`/`-n` at position 0, no glob-tagged args (the runtime would
 /// expand them), no env. A script-defined `echo` keeps the runtime path.
+/// `echo` arg → the ESTree expression for one printed word. Literals stay
+/// literals; array-valued args (brace expansion, which lowers to an
+/// `ArrayExpression`, or `${arr[@]}`-style word lists) splice to one word
+/// per element — the runtime's `builtin()` flattens array args
+/// (`flat.push(...a.map(String))`; a bare `String(array)` would
+/// comma-join, which bash never does for brace-expanded words); nested
+/// arrays keep the runtime's `a.map(String)` comma-join via the String()
+/// wrap; everything else is String()-coerced. Returns None if any element
+/// carries glob magic (the runtime would expand it).
+fn echo_arg_to_estree(a: &IrExpr) -> Option<Expr> {
+    match a {
+        IrExpr::Str(sv, _) if sv.starts_with(GLOB_MAGIC) => None,
+        IrExpr::Str(sv, _) => Some(str_lit(sv)),
+        IrExpr::Array(elems) => {
+            let mut out: Vec<Expr> = Vec::new();
+            for el in elems {
+                if let IrExpr::Str(sv, _) = el {
+                    if sv.starts_with(GLOB_MAGIC) {
+                        return None;
+                    }
+                }
+                out.push(echo_arg_scalar(el));
+            }
+            Some(Expr::ArrayExpression {
+                elements: out.into_iter().map(Some).collect(),
+            })
+        }
+        other => {
+            let e = expr_to_estree(other);
+            match e {
+                // array-valued expression (emit-time brace expansion):
+                // splice its words like the runtime's arg flattening
+                Expr::ArrayExpression { elements, .. } => {
+                    for el in &elements {
+                        if let Some(Expr::Literal { value, .. }) = el {
+                            if let serde_json::Value::String(sv) = value {
+                                if sv.starts_with(GLOB_MAGIC) {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                    Some(Expr::ArrayExpression { elements })
+                }
+                _ => Some(Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "String".to_string(),
+                    }),
+                    arguments: vec![e],
+                    optional: false,
+                }),
+            }
+        }
+    }
+}
+
+/// A scalar (non-array) echo arg word: literals stay literals, anything
+/// else is String()-coerced (the runtime's builtin() String()s every
+/// arg before printing).
+fn echo_arg_scalar(a: &IrExpr) -> Expr {
+    match a {
+        IrExpr::Str(sv, _) => str_lit(sv),
+        other => Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "String".to_string(),
+            }),
+            arguments: vec![expr_to_estree(other)],
+            optional: false,
+        },
+    }
+}
+
 fn try_native_echo_capture(e: &IrExpr) -> Option<Expr> {
     let IrExpr::Call { func, args } = e else {
         return None;
@@ -4267,13 +4407,6 @@ fn try_native_echo_capture(e: &IrExpr) -> Option<Expr> {
     if name != "echo" {
         return None;
     }
-    for a in echo_args {
-        if let IrExpr::Str(sv, _) = a {
-            if sv.starts_with(GLOB_MAGIC) {
-                return None;
-            }
-        }
-    }
     let mut arg_exprs: Vec<Expr> = Vec::new();
     let mut esc = false;
     for a in echo_args {
@@ -4282,15 +4415,14 @@ fn try_native_echo_capture(e: &IrExpr) -> Option<Expr> {
             IrExpr::Str(sv, _) if arg_exprs.is_empty() && (sv == "-e" || sv == "-n") => {
                 esc = sv == "-e";
             }
-            // plain literal — skip the String() wrap
-            IrExpr::Str(sv, _) => arg_exprs.push(str_lit(sv)),
-            other => arg_exprs.push(Expr::CallExpression {
-                callee: Box::new(Expr::Identifier {
-                    name: "String".to_string(),
-                }),
-                arguments: vec![expr_to_estree(other)],
-                optional: false,
-            }),
+            other => match echo_arg_to_estree(other)? {
+                // array arg (brace expansion): splice its words into the
+                // join, exactly like the runtime's arg flattening
+                Expr::ArrayExpression { elements, .. } => {
+                    arg_exprs.extend(elements.into_iter().flatten());
+                }
+                e => arg_exprs.push(e),
+            },
         }
     }
     let mut joined: Expr = if arg_exprs.is_empty() {
@@ -4406,12 +4538,30 @@ fn try_native_tr_pipeline(pipe: &IrExpr) -> Option<Expr> {
     if n2 != "tr" {
         return None;
     }
-    // base = String(arg) — echo String()-coerces its args before emitting
+    // base = the single echoed line — String(X) for scalar args, the
+    // words joined with a space for array args (brace expansion /
+    // `${arr[@]}`: echo prints one line of space-joined words, exactly
+    // the runtime's builtin() flattening)
+    let base_arg = match echo_arg_to_estree(&echo_args[0])? {
+        Expr::ArrayExpression { elements, .. } => Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::ArrayExpression { elements }),
+                property: Box::new(Expr::Identifier {
+                    name: "join".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![str_lit(" ")],
+            optional: false,
+        },
+        e => e,
+    };
     let base = Expr::CallExpression {
         callee: Box::new(Expr::Identifier {
             name: "String".to_string(),
         }),
-        arguments: vec![expr_to_estree(&echo_args[0])],
+        arguments: vec![base_arg],
         optional: false,
     };
     let method = |obj: Expr, name: &str, margs: Vec<Expr>| Expr::CallExpression {
