@@ -350,6 +350,232 @@ fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, 
     mark_lastexit_dead(&prog.stmts, &live, &mut dead);
     dead
 }
+
+/// Loops (`IrStmt::While`, pointer-keyed) whose FINAL status write is dead
+/// — no reader observes `$?` after the loop before the next write. Set per
+/// compilation by `shir_to_estree` (a sibling of the Plan 4 liveness; the
+/// same backward scan produces both). Under a possible `set -e` the map is
+/// EMPTY (nothing dead — the guard consumes the status). The native while
+/// lowering drops the per-iteration `bodyLast` tracking + trailing write
+/// for these loops (a bare native `while (cond) { body }`).
+static LOOP_STATUS_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+fn loop_status_write_dead(stmt: &IrStmt) -> bool {
+    LOOP_STATUS_DEAD
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.get(&(stmt as *const IrStmt as usize)).copied().unwrap_or(false))
+        .unwrap_or(false)
+}
+
+/// Collect the loop statements that may be CAPTURE PRODUCERS — loops
+/// (transitively) inside an async runtime region: a subshell / background /
+/// redirect body, a pipeline stage, a capture expression, an arrow argument
+/// of the async runtime helpers (exec/pipeline/capture/captureWords/
+/// subshell/background/redirect/block), or a function body (a script
+/// function may be CALLED from a producer — the emitter cannot see call
+/// sites). The runtime loops bound infinite producers via `_capExceeded`;
+/// a NATIVE loop has no such bound and would spin forever, hanging the
+/// harness — so these keep the runtime machinery. Pointer-keyed like
+/// [`LASTEXIT_DEAD`] (the IR tree is immutable during emission).
+fn compute_async_region_loops(prog: &IrProgram) -> HashSet<usize> {
+    fn stmt_walk(st: &IrStmt, in_async: bool, out: &mut HashSet<usize>) {
+        match st {
+            IrStmt::While { body, .. } | IrStmt::For { body, .. } => {
+                if in_async {
+                    out.insert(st as *const IrStmt as usize);
+                }
+                for b in body {
+                    stmt_walk(b, in_async, out);
+                }
+            }
+            // subshell/background/redirect bodies run under the runtime's
+            // fd/capture machinery (their output may be captured)
+            IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                for b in body {
+                    stmt_walk(b, true, out);
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner {
+                    stmt_walk(b, true, out);
+                }
+            }
+            // every pipeline stage is a potential producer/consumer
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        stmt_walk(b, true, out);
+                    }
+                }
+            }
+            // function bodies: the function may be called from a producer
+            IrStmt::Function { body, .. } => {
+                for b in body {
+                    stmt_walk(b, true, out);
+                }
+            }
+            IrStmt::Block(body) => {
+                for b in body {
+                    stmt_walk(b, in_async, out);
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                for b in then.iter().chain(else_) {
+                    stmt_walk(b, in_async, out);
+                }
+                for (_, b) in elsifs {
+                    for stm in b {
+                        stmt_walk(stm, in_async, out);
+                    }
+                }
+            }
+            IrStmt::Exec { args, .. } => {
+                for a in args {
+                    expr_walk(a, in_async, out);
+                }
+            }
+            IrStmt::Expr(e) => expr_walk(e, in_async, out),
+            IrStmt::Output { value, .. } => expr_walk(value, in_async, out),
+            IrStmt::Assign { expr, .. } => expr_walk(expr, in_async, out),
+            _ => {}
+        }
+    }
+    fn expr_walk(e: &IrExpr, in_async: bool, out: &mut HashSet<usize>) {
+        match e {
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    stmt_walk(st, in_async, out);
+                }
+            }
+            IrExpr::Capture { expr, .. } => expr_walk(expr, true, out),
+            IrExpr::Call { func, args } => {
+                // the async runtime helpers run their arrow args under the
+                // runtime machinery (producer/capture contexts)
+                let nested_async = in_async
+                    || matches!(
+                        func.as_str(),
+                        "exec" | "pipeline" | "capture" | "captureWords" | "subshell"
+                            | "background" | "redirect" | "block"
+                    );
+                for a in args {
+                    expr_walk(a, nested_async, out);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_walk(lhs, in_async, out);
+                expr_walk(rhs, in_async, out);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                expr_walk(obj, in_async, out);
+                for a in args {
+                    expr_walk(a, in_async, out);
+                }
+            }
+            IrExpr::Ternary { cond, then, else_, .. } => {
+                expr_walk(cond, in_async, out);
+                expr_walk(then, in_async, out);
+                expr_walk(else_, in_async, out);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                expr_walk(expr, in_async, out);
+                expr_walk(default, in_async, out);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(e) = p {
+                        expr_walk(e, in_async, out);
+                    }
+                }
+            }
+            IrExpr::Array(items) => {
+                for it in items {
+                    expr_walk(it, in_async, out);
+                }
+            }
+            IrExpr::Index { key, .. } => expr_walk(key, in_async, out),
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for st in &prog.stmts {
+        stmt_walk(st, false, &mut out);
+    }
+    out
+}
+
+static ASYNC_REGION_LOOPS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+/// Top-level lowering depth (see [`top_stmt_to_estree`]): 1 while lowering
+/// a direct child of the program body. The native while loop's errexit
+/// check mirrors the top-level `sh2.guard` wrapper, which only wraps
+/// TOP-LEVEL statements — a nested loop (inside an if/block/function) is
+/// never guard-wrapped, so its native form must not abort either.
+static TOP_LEVEL_DEPTH: Mutex<usize> = Mutex::new(0);
+fn is_top_level_stmt() -> bool {
+    *TOP_LEVEL_DEPTH.lock().unwrap() == 1
+}
+fn loop_in_async_region(stmt: &IrStmt) -> bool {
+    ASYNC_REGION_LOOPS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(&(stmt as *const IrStmt as usize)))
+        .unwrap_or(true)
+}
+
+/// Mark every `IrStmt::While` whose final status write is unread (not in
+/// the Plan 4 live set). Only WHILE loops: the runtime `forLoopSync` never
+/// writes lastExit itself (its status is the body's leftover — the native
+/// for-of preserves that exactly), and `do/while` never reaches the ESTree
+/// path (parsed as `IrStmt::While` with a negated cond).
+fn mark_loop_status_deadness(st: &IrStmt, live: &HashSet<usize>, dead: &mut HashMap<usize, bool>) {
+    match st {
+        IrStmt::While { body, .. } => {
+            if !live.contains(&(st as *const IrStmt as usize)) {
+                dead.insert(st as *const IrStmt as usize, true);
+            }
+            for b in body {
+                mark_loop_status_deadness(b, live, dead);
+            }
+        }
+        IrStmt::For { body, .. } => {
+            for b in body {
+                mark_loop_status_deadness(b, live, dead);
+            }
+        }
+        IrStmt::If { then, elsifs, else_, .. } => {
+            for b in then.iter().chain(else_) {
+                mark_loop_status_deadness(b, live, dead);
+            }
+            for (_, b) in elsifs {
+                for stm in b {
+                    mark_loop_status_deadness(stm, live, dead);
+                }
+            }
+        }
+        IrStmt::Block(body)
+        | IrStmt::Subshell(body)
+        | IrStmt::Background(body)
+        | IrStmt::Function { body, .. } => {
+            for b in body {
+                mark_loop_status_deadness(b, live, dead);
+            }
+        }
+        IrStmt::Redirect { inner, .. } => {
+            for b in inner {
+                mark_loop_status_deadness(b, live, dead);
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for stage in stages {
+                for b in stage {
+                    mark_loop_status_deadness(b, live, dead);
+                }
+            }
+        }
+        _ => {}
+    }
+}
 /// Builtins the runtime implements as SYNC functions (harness
 /// sh2-namespace.mjs `builtins.*` — every non-async entry of builtins.json
 /// plus `test`, the bash test builtin the runtime implements on top of its
@@ -4450,6 +4676,20 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // emission (the IR tree is immutable here — the *Sync loop bodies are
     // emitted from the ORIGINAL references, so the pointer keys hold).
     *LASTEXIT_DEAD.lock().unwrap() = Some(compute_lastexit_deadness(prog, errexit));
+    // Native-loop passes: (a) which loops may be capture producers (they
+    // keep the runtime loop — a native loop would lose the producer bound),
+    // (b) which loops' final status write is dead (the native while drops
+    // the status tracking for them).
+    *ASYNC_REGION_LOOPS.lock().unwrap() = Some(compute_async_region_loops(prog));
+    let mut loop_status_dead = HashMap::new();
+    if !errexit {
+        let mut live: HashSet<usize> = HashSet::new();
+        walk_lastexit_liveness(&prog.stmts, true, &mut live);
+        for st in &prog.stmts {
+            mark_loop_status_deadness(st, &live, &mut loop_status_dead);
+        }
+    }
+    *LOOP_STATUS_DEAD.lock().unwrap() = Some(loop_status_dead);
     let mut body: Vec<Stmt> = Vec::new();
     // `let x = 0` (numeric) / `let x = ""` (string) at program top. bash
     // reads an unset var as 0 in arithmetic and "" as a string.
@@ -4501,6 +4741,13 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
 /// [`call_is_always_true`]) would be a no-op — skipping it removes the
 /// dispatch while keeping errexit semantics byte-identical.
 fn top_stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
+    *TOP_LEVEL_DEPTH.lock().unwrap() += 1;
+    let out = top_stmt_to_estree_inner(stmt);
+    *TOP_LEVEL_DEPTH.lock().unwrap() -= 1;
+    out
+}
+
+fn top_stmt_to_estree_inner(stmt: &IrStmt) -> Option<Stmt> {
     let s = stmt_to_estree(stmt)?;
     // No `set -e` anywhere → the runtime's errexit flag can never turn on,
     // so `sh2.guard(v)` would be an identity call on every statement.
@@ -5319,6 +5566,180 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
     ]))
 }
 
+/// Native-loop signal scan: does a LOWERED loop body contain a control-flow
+/// signal source? The runtime loops catch BREAK/CONTINUE/RETURN signals
+/// (thrown by `sh2.break()`/`sh2.continue()`/`sh2.return()` calls — from
+/// case bodies with source `break`, nested arrows, and the fix_stmt
+/// conversions) and stop/continue/rethrow them; a NATIVE loop has no
+/// catch, so a signal would propagate past the loop and change control
+/// flow. The scan is conservative: ANY break/continue/return statement or
+/// sh2 signal call anywhere in the body subtree (nested blocks, ifs,
+/// switches, arrows — a function DEFINED in the body may throw when
+/// CALLED) keeps the runtime loop. The synthetic trailing `break` of the
+/// case-switch lowering is exempt (it terminates the switch, never a
+/// loop).
+fn lowered_stmts_have_signals(stmts: &[Stmt]) -> bool {
+    fn stmt_has_signal(s: &Stmt, in_switch_consequent: bool) -> bool {
+        match s {
+            // source break/continue inside a case body were already
+            // converted to sh2.break()/sh2.continue() CALLS by the case
+            // lowering — the only native break left in a consequent is the
+            // synthetic switch terminator (exempt)
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => !in_switch_consequent,
+            Stmt::ReturnStatement { .. } => true,
+            Stmt::ExpressionStatement { expression } => expr_has_signal(expression),
+            Stmt::BlockStatement { body } => body.iter().any(|x| stmt_has_signal(x, false)),
+            Stmt::IfStatement {
+                consequent,
+                alternate,
+                ..
+            } => {
+                stmt_has_signal(consequent, false)
+                    || alternate
+                        .as_deref()
+                        .map(|a| stmt_has_signal(a, false))
+                        .unwrap_or(false)
+            }
+            Stmt::SwitchStatement { cases, .. } => cases
+                .iter()
+                .any(|c| c.consequent.iter().any(|x| stmt_has_signal(x, true))),
+            Stmt::WhileStatement { body, .. } | Stmt::ForOfStatement { body, .. } => {
+                stmt_has_signal(body, false)
+            }
+            Stmt::VariableDeclaration { declarations, .. } => declarations
+                .iter()
+                .any(|d| d.init.as_ref().map(expr_has_signal).unwrap_or(false)),
+        }
+    }
+    fn expr_has_signal(e: &Expr) -> bool {
+        match e {
+            Expr::CallExpression {
+                callee, arguments, ..
+            } => {
+                if let Expr::MemberExpression { object, property, .. } = callee.as_ref() {
+                    if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2")
+                        && matches!(
+                            property.as_ref(),
+                            Expr::Identifier { name }
+                                if name == "break" || name == "continue" || name == "return"
+                        )
+                    {
+                        return true;
+                    }
+                }
+                // nested arrows: a function defined in the body may throw
+                // signals when CALLED from the loop
+                arguments.iter().any(expr_has_signal)
+            }
+            Expr::ArrowFunctionExpression { body, .. } => match body {
+                ArrowBody::Expr(inner) => expr_has_signal(inner),
+                ArrowBody::Block(b) => stmt_has_signal(b, false),
+            },
+            Expr::AssignmentExpression { right, .. } => expr_has_signal(right),
+            Expr::SequenceExpression { expressions } => expressions.iter().any(expr_has_signal),
+            Expr::ConditionalExpression {
+                consequent,
+                alternate,
+                ..
+            } => expr_has_signal(consequent) || expr_has_signal(alternate),
+            Expr::LogicalExpression { left, right, .. } => {
+                expr_has_signal(left) || expr_has_signal(right)
+            }
+            Expr::BinaryExpression { left, right, .. } => {
+                expr_has_signal(left) || expr_has_signal(right)
+            }
+            Expr::MemberExpression { object, .. } => expr_has_signal(object),
+            Expr::UnaryExpression { argument, .. } => expr_has_signal(argument),
+            Expr::AwaitExpression { argument } => expr_has_signal(argument),
+            Expr::TemplateLiteral { expressions, .. } => expressions.iter().any(expr_has_signal),
+            Expr::ArrayExpression { elements } => elements
+                .iter()
+                .filter_map(|e| e.as_ref())
+                .any(expr_has_signal),
+            Expr::ObjectExpression { properties } => {
+                properties.iter().any(|p| expr_has_signal(&p.value))
+            }
+            _ => false,
+        }
+    }
+    stmts.iter().any(|s| stmt_has_signal(s, false))
+}
+
+/// Is a for-loop ITERABLE safe to emit as a flat native array (matching the
+/// runtime `forLoopSync` flatten exactly)? The runtime expands GLOB_MAGIC
+/// items against the filesystem — the native form cannot — so any
+/// glob-tagged string in the iter subtree disqualifies. Everything else
+/// (scalar items appended, array items flattened one level — incl. the
+/// `brace`/`listVar`/`getVar`-array helpers) is byte-identical under
+/// `[].concat(...)`.
+fn for_iter_flattenable(iter: &IrExpr) -> bool {
+    match iter {
+        IrExpr::Str(s, _) => !s.starts_with(GLOB_MAGIC),
+        IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+            InterpPart::Lit(_) => true,
+            InterpPart::Expr(e) => for_iter_flattenable(e),
+        }),
+        IrExpr::Call { args, .. }
+        | IrExpr::Array(args)
+        | IrExpr::MethodCall { args, .. } => args.iter().all(for_iter_flattenable),
+        IrExpr::BinOp { lhs, rhs, .. } => for_iter_flattenable(lhs) && for_iter_flattenable(rhs),
+        IrExpr::Ternary {
+            cond, then, else_, ..
+        } => {
+            for_iter_flattenable(cond)
+                && for_iter_flattenable(then)
+                && for_iter_flattenable(else_)
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            for_iter_flattenable(expr) && for_iter_flattenable(default)
+        }
+        IrExpr::Index { key, .. } => for_iter_flattenable(key),
+        IrExpr::Capture { expr, .. } => for_iter_flattenable(expr),
+        IrExpr::Arrow(stmts) => stmts.iter().all(|s| match s {
+            IrStmt::Expr(e) => for_iter_flattenable(e),
+            IrStmt::Assign { expr, .. } => for_iter_flattenable(expr),
+            _ => false,
+        }),
+        _ => true,
+    }
+}
+
+/// The flat native iterable for a flattenable for-loop iter: `[].concat(
+/// item, ...)` — the runtime forLoopSync's exact flatten (scalars appended,
+/// array-valued items one-level-flattened) minus the GLOB_MAGIC expansion
+/// (excluded by [`for_iter_flattenable`]).
+fn flatten_for_iter(iter: &IrExpr) -> Expr {
+    let IrExpr::Array(items) = iter else {
+        // a bare non-array iter (e.g. a `brace`-style call): concat of the
+        // single item — the runtime wraps non-array items in a one-element
+        // list and flattens it to the item itself
+        return Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::ArrayExpression { elements: vec![] }),
+                property: Box::new(Expr::Identifier {
+                    name: "concat".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![expr_to_estree(iter)],
+            optional: false,
+        };
+    };
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::ArrayExpression { elements: vec![] }),
+            property: Box::new(Expr::Identifier {
+                name: "concat".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: items.iter().map(expr_to_estree).collect(),
+        optional: false,
+    }
+}
+
 fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     Some(match stmt {
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "break" => {
@@ -5573,6 +5994,130 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             let cond_e = expr_to_estree(cond);
             let body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
             if !expr_has_await(&cond_e) && !stmts_have_await(&body_stmts) {
+                // Native loop (the ladder's top rung): a plain JS `while`
+                // statement — no runtime call, no per-iteration closures,
+                // no try/catch. Eligibility: (1) NOT a potential capture
+                // producer (a native loop would lose the runtime
+                // `_capExceeded` bound — see compute_async_region_loops),
+                // (2) NO signal sources in the body (source break/continue
+                // lower to native statements and work in a native loop,
+                // but the runtime BREAK/CONTINUE/RETURN THROWS — case-body
+                // conversions, nested arrows, sh2.return() — must stay
+                // catchable), (3) the loop's own status write liveness
+                // decides the tracking (dead → bare loop, zero overhead).
+                if !loop_in_async_region(stmt) && !lowered_stmts_have_signals(&body_stmts) {
+                    let errexit = MAY_ERREXIT.lock().unwrap().unwrap_or(true);
+                    let dead = loop_status_write_dead(stmt) && !errexit;
+                    let mut tracked: Vec<Stmt> = Vec::new();
+                    let mut inner: Vec<Stmt> = Vec::new();
+                    if !dead {
+                        // `let __sh2_loop_ran = false, __sh2_loop_last = 0;`
+                        // — the runtime's `ran`/`bodyLastExit` locals
+                        tracked.push(Stmt::VariableDeclaration {
+                            kind: "let",
+                            declarations: vec![
+                                VariableDeclarator {
+                                    type_: "VariableDeclarator",
+                                    id: Expr::Identifier {
+                                        name: "__sh2_loop_ran".to_string(),
+                                    },
+                                    init: Some(bool_lit(false)),
+                                },
+                                VariableDeclarator {
+                                    type_: "VariableDeclarator",
+                                    id: Expr::Identifier {
+                                        name: "__sh2_loop_last".to_string(),
+                                    },
+                                    init: Some(Expr::Literal {
+                                        value: serde_json::Value::from(0),
+                                        raw: None,
+                                        regex: None,
+                                    }),
+                                },
+                            ],
+                        });
+                        inner.push(Stmt::ExpressionStatement {
+                            expression: Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(Expr::Identifier {
+                                    name: "__sh2_loop_ran".to_string(),
+                                }),
+                                right: Box::new(bool_lit(true)),
+                            },
+                        });
+                    }
+                    inner.extend(body_stmts);
+                    if !dead {
+                        // `__sh2_loop_last = sh2.lastExit;` — the runtime's
+                        // bodyLastExit read after the body fn
+                        inner.push(Stmt::ExpressionStatement {
+                            expression: Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(Expr::Identifier {
+                                    name: "__sh2_loop_last".to_string(),
+                                }),
+                                right: Box::new(sh2_member("lastExit")),
+                            },
+                        });
+                        tracked.push(Stmt::WhileStatement {
+                            test: cond_e.clone(),
+                            body: Box::new(Stmt::BlockStatement { body: inner }),
+                        });
+                        // `sh2.lastExit = __sh2_loop_ran ? __sh2_loop_last : 0;`
+                        tracked.push(Stmt::ExpressionStatement {
+                            expression: Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(sh2_member("lastExit")),
+                                right: Box::new(Expr::ConditionalExpression {
+                                    test: Box::new(Expr::Identifier {
+                                        name: "__sh2_loop_ran".to_string(),
+                                    }),
+                                    consequent: Box::new(Expr::Identifier {
+                                        name: "__sh2_loop_last".to_string(),
+                                    }),
+                                    alternate: Box::new(Expr::Literal {
+                                        value: serde_json::Value::from(0),
+                                        raw: None,
+                                        regex: None,
+                                    }),
+                                }),
+                            },
+                        });
+                        if errexit && is_top_level_stmt() {
+                            // the top-level guard's exact semantics: a
+                            // failing loop aborts the script when `set -e`
+                            // is on (`if (sh2.errexit && sh2.lastExit !== 0)
+                            // process.exit(0);`)
+                            tracked.push(Stmt::IfStatement {
+                                test: Expr::LogicalExpression {
+                                    operator: "&&",
+                                    left: Box::new(sh2_member("errexit")),
+                                    right: Box::new(Expr::BinaryExpression {
+                                        operator: "!==",
+                                        left: Box::new(sh2_member("lastExit")),
+                                        right: Box::new(Expr::Literal {
+                                            value: serde_json::Value::from(0),
+                                            raw: None,
+                                            regex: None,
+                                        }),
+                                    }),
+                                },
+                                consequent: Box::new(Stmt::BlockStatement {
+                                    body: vec![Stmt::ExpressionStatement {
+                                        expression: process_exit_zero(),
+                                    }],
+                                }),
+                                alternate: None,
+                            });
+                        }
+                        return Some(Stmt::BlockStatement { body: tracked });
+                    }
+                    // dead loop status: bare native while, zero tracking
+                    return Some(Stmt::WhileStatement {
+                        test: cond_e,
+                        body: Box::new(Stmt::BlockStatement { body: inner }),
+                    });
+                }
                 return Some(Stmt::ExpressionStatement {
                     expression: sh2_call(
                         "whileLoopSync",
@@ -5644,6 +6189,35 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // before the call) — `$(...)`-produced item lists stay async,
             // the per-item body still runs without promises.
             if !stmts_have_await(&body_e) {
+                // Native loop (the ladder's top rung): a plain JS
+                // `for (let i of [].concat(...))` — no runtime call, no
+                // per-iteration closures. Eligibility: (1) NOT a potential
+                // capture producer, (2) no signal sources in the body, (3)
+                // the ITERABLE is flattenable — `[].concat(...)` is the
+                // runtime forLoopSync's exact flatten (scalars appended,
+                // array items one-level-flattened) minus the GLOB_MAGIC
+                // expansion (any glob-tagged item keeps the runtime loop).
+                // The `let` binding shadows the module `let` exactly like
+                // the closure param, so the lifted-num coercion
+                // (`i = Number(i)`) and the store sync (`sh2.setVar`) work
+                // unchanged.
+                if !loop_in_async_region(stmt)
+                    && !lowered_stmts_have_signals(&body_e)
+                    && for_iter_flattenable(iter)
+                {
+                    return Some(Stmt::ForOfStatement {
+                        left: Box::new(Stmt::VariableDeclaration {
+                            kind: "let",
+                            declarations: vec![VariableDeclarator {
+                                type_: "VariableDeclarator",
+                                id: Expr::Identifier { name: js_var.clone() },
+                                init: None,
+                            }],
+                        }),
+                        right: flatten_for_iter(iter),
+                        body: Box::new(Stmt::BlockStatement { body: body_e }),
+                    });
+                }
                 return Some(Stmt::ExpressionStatement {
                     expression: sh2_call(
                         "forLoopSync",
