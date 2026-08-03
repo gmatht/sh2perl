@@ -97,6 +97,24 @@ fn program_defines_function(name: &str) -> bool {
         .unwrap_or(true) // unset → conservative: keep the async exec path
 }
 
+/// Names of script-defined functions whose CALLS lower to the sync
+/// `sh2.fnCall` path (see [`fn_call_sync_set`]): every definition body of
+/// the target AND the call-site args are provably await-free, and every
+/// function it calls is itself sync (call-graph fixpoint). Such functions
+/// are also emitted with NON-async define arrows, so the runtime runs them
+/// without a per-call promise (the whileLoopSync pattern — same semantics,
+/// no per-iteration promise machinery), which in turn lets loops over them
+/// lower to their *Sync twins. Set per compilation by `shir_to_estree`.
+static SYNC_FN_CALLS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+fn fn_call_is_sync(name: &str) -> bool {
+    SYNC_FN_CALLS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false) // unset → conservative: keep the async exec path
+}
+
 /// Recursive IrStmt walk collecting every `IrStmt::Function` name — a
 /// same-named script function shadows a builtin anywhere in the program
 /// (definitions inside bodies/arrows count).
@@ -166,6 +184,298 @@ fn collect_program_functions(stmts: &[IrStmt], out: &mut HashSet<String>) {
     }
     walk_stmts(stmts, out);
 }
+
+/// Every function DEFINITION body in the program (name → all definition
+/// bodies, program order). A name with ANY definition whose body is not
+/// provably sync stays on the async path (a later redefinition could
+/// replace a sync arrow with an async one).
+fn collect_fn_bodies<'a>(
+    stmts: &'a [IrStmt],
+    out: &mut HashMap<String, Vec<&'a [IrStmt]>>,
+) {
+    fn walk_stmts<'a>(stmts: &'a [IrStmt], out: &mut HashMap<String, Vec<&'a [IrStmt]>>) {
+        for st in stmts {
+            match st {
+                IrStmt::Function { name, body } => {
+                    out.entry(name.clone()).or_default().push(body);
+                    walk_stmts(body, out);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk_stmts(body, out),
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk_stmts(then, out);
+                    walk_stmts(else_, out);
+                    for (_, b) in elsifs {
+                        walk_stmts(b, out);
+                    }
+                }
+                IrStmt::For { body, .. } => walk_stmts(body, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for stage in stages {
+                        walk_stmts(stage, out);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => walk_stmts(inner, out),
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk_stmts(&c.body, out);
+                    }
+                }
+                IrStmt::Exec { args, .. } => {
+                    for a in args {
+                        walk_expr(a, out);
+                    }
+                }
+                IrStmt::Expr(e) => walk_expr(e, out),
+                _ => {}
+            }
+        }
+    }
+    fn walk_expr<'a>(e: &'a IrExpr, out: &mut HashMap<String, Vec<&'a [IrStmt]>>) {
+        match e {
+            IrExpr::Arrow(stmts) => walk_stmts(stmts, out),
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    walk_expr(el, out);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, out);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, out);
+                walk_expr(rhs, out);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, out);
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            IrExpr::Ternary { cond, then, else_, .. } => {
+                walk_expr(cond, out);
+                walk_expr(then, out);
+                walk_expr(else_, out);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, out);
+                walk_expr(default, out);
+            }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, out),
+            IrExpr::Index { key, .. } => walk_expr(key, out),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(inner) = p {
+                        walk_expr(inner, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk_stmts(stmts, out);
+}
+
+/// Defined-function names DIRECTLY called inside a body: exec calls whose
+/// command is a literal name in `functions` (statement form) plus
+/// expression-form exec calls (conditions, `&&`/`||` operands, pipeline
+/// stages, captures). `builtin` calls never dispatch functions (the
+/// emitter only lowers non-shadowed names to them); `command`/`eval`/
+/// dynamic names keep the async path regardless.
+fn collect_fn_calls(
+    stmts: &[IrStmt],
+    functions: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    fn walk_stmts(stmts: &[IrStmt], functions: &HashSet<String>, out: &mut HashSet<String>) {
+        for st in stmts {
+            match st {
+                IrStmt::Exec { cmd, args, .. } => {
+                    if let IrExpr::Str(name, _) = cmd {
+                        if functions.contains(name) {
+                            out.insert(name.clone());
+                        }
+                    }
+                    for a in args {
+                        walk_expr(a, functions, out);
+                    }
+                }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    walk_expr(cond, functions, out);
+                    walk_stmts(body, functions, out);
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    walk_expr(cond, functions, out);
+                    walk_stmts(then, functions, out);
+                    walk_stmts(else_, functions, out);
+                    for (_, b) in elsifs {
+                        walk_stmts(b, functions, out);
+                    }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    walk_expr(iter, functions, out);
+                    walk_stmts(body, functions, out);
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for stage in stages {
+                        walk_stmts(stage, functions, out);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => walk_stmts(inner, functions, out),
+                IrStmt::Case { discriminant, clauses, .. } => {
+                    walk_expr(discriminant, functions, out);
+                    for c in clauses {
+                        walk_stmts(&c.body, functions, out);
+                    }
+                }
+                IrStmt::Function { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk_stmts(body, functions, out),
+                IrStmt::Assign { expr, .. } => walk_expr(expr, functions, out),
+                IrStmt::Expr(e) => walk_expr(e, functions, out),
+                _ => {}
+            }
+        }
+    }
+    fn walk_expr(e: &IrExpr, functions: &HashSet<String>, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Arrow(stmts) => walk_stmts(stmts, functions, out),
+            IrExpr::Call { func, args } => {
+                if func == "exec" {
+                    if let [IrExpr::Str(name, _), ..] = args.as_slice() {
+                        if functions.contains(name) {
+                            out.insert(name.clone());
+                        }
+                    }
+                }
+                for a in args {
+                    walk_expr(a, functions, out);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    walk_expr(el, functions, out);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, functions, out);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, functions, out);
+                walk_expr(rhs, functions, out);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, functions, out);
+                for a in args {
+                    walk_expr(a, functions, out);
+                }
+            }
+            IrExpr::Ternary { cond, then, else_, .. } => {
+                walk_expr(cond, functions, out);
+                walk_expr(then, functions, out);
+                walk_expr(else_, functions, out);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, functions, out);
+                walk_expr(default, functions, out);
+            }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, functions, out),
+            IrExpr::Index { key, .. } => walk_expr(key, functions, out),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(inner) = p {
+                        walk_expr(inner, functions, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk_stmts(stmts, functions, out);
+}
+
+/// The sync-function fixpoint (see [`SYNC_FN_CALLS`]).
+///
+/// A function's emitted arrow may be run without `await` only when its
+/// lowered body (with every defined-function call at its sync `sh2.fnCall`
+/// path) contains no `AwaitExpression` AND every function it directly
+/// calls is itself sync — the async `sh2.exec` dispatch the sync path
+/// replaces would be the only added await, and the fixpoint removes it.
+/// Monotone (sync can only flip true→false), so it converges in at most
+/// |functions| iterations; recursion/mutual recursion stay async
+/// (conservative — a recursive call's target is in its own `calls` set).
+fn fn_call_sync_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<String> {
+    let mut bodies: HashMap<String, Vec<&[IrStmt]>> = HashMap::new();
+    collect_fn_bodies(&prog.stmts, &mut bodies);
+    if bodies.is_empty() {
+        return HashSet::new();
+    }
+    let mut calls: HashMap<String, HashSet<String>> = HashMap::new();
+    for (name, defs) in &bodies {
+        let mut set = HashSet::new();
+        for body in defs {
+            collect_fn_calls(body, functions, &mut set);
+        }
+        calls.insert(name.clone(), set);
+    }
+    // Optimistic await-free-ness: lower every definition body with ALL
+    // function calls on the sync path (the only awaits that scan can miss
+    // are those of non-sync targets, which the fixpoint removes). The
+    // emission is side-effect-free for the outer pass: the depth statics
+    // are balanced (arrow_sink/AND_OR_DEPTH), the lift statics are
+    // read-only.
+    *SYNC_FN_CALLS.lock().unwrap() = Some(functions.clone());
+    let mut opt_free: HashMap<String, bool> = HashMap::new();
+    for (name, defs) in &bodies {
+        let mut free = true;
+        for body in defs {
+            let e = arrow_sink(vec![], IrExpr::Arrow(body.to_vec()));
+            if expr_has_await(&e) {
+                free = false;
+                break;
+            }
+        }
+        opt_free.insert(name.clone(), free);
+    }
+    *SYNC_FN_CALLS.lock().unwrap() = None;
+    let mut sync: HashSet<String> = bodies.keys().cloned().collect();
+    loop {
+        let mut changed = false;
+        for f in sync.clone() {
+            if !opt_free.get(&f).copied().unwrap_or(false) {
+                sync.remove(&f);
+                changed = true;
+                continue;
+            }
+            let all_called_sync = calls
+                .get(&f)
+                .map(|cs| cs.iter().all(|g| sync.contains(g)))
+                .unwrap_or(true);
+            if !all_called_sync {
+                sync.remove(&f);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    sync
+}
+
 /// Serializes whole-program compilations: the lift/scan statics above are
 /// per-compilation state, and the determinism unit test compiles in
 /// parallel threads — without a lock, one thread's emission can read
@@ -981,7 +1291,7 @@ fn redirect_spec_object_persist(r: &Redirect, persist: bool) -> IrExpr {
 fn word_ir_quoted(w: &Word) -> IrExpr {
     match w {
         Word::CommandSubstitution(cmd, _) => match cmdsub_arith_expr(cmd) {
-            Some(t) => match parse_arith(t) {
+            Some(t) => match parse_arith_native(t) {
                 Some(a) => IrExpr::Arith(Box::new(a)),
                 None => call("arith", vec![st(t)]),
             },
@@ -1053,7 +1363,7 @@ fn word_ir(w: &Word) -> IrExpr {
         Word::Literal(s, _) => st(&shell_quote_removal(s)),
         Word::Variable(name, _, _) => call("getVar", vec![st(name)]),
         Word::CommandSubstitution(cmd, _) => match cmdsub_arith_expr(cmd) {
-            Some(t) => match parse_arith(t) {
+            Some(t) => match parse_arith_native(t) {
                 Some(a) => IrExpr::Arith(Box::new(a)),
                 None => call("arith", vec![st(t)]),
             },
@@ -1063,7 +1373,7 @@ fn word_ir(w: &Word) -> IrExpr {
             ),
         },
         Word::ParameterExpansion(pe, _) => param_ir(pe),
-        Word::Arithmetic(ae, _) => match parse_arith(&ae.expression) {
+        Word::Arithmetic(ae, _) => match parse_arith_native(&ae.expression) {
             Some(a) => IrExpr::Arith(Box::new(a)),
             None => call("arith", vec![st(&ae.expression)]),
         },
@@ -1509,7 +1819,7 @@ fn part_ir(part: &StringPart) -> IrExpr {
                 param_ir(pe)
             }
         }
-        StringPart::Arithmetic(ae) => match parse_arith(&ae.expression) {
+        StringPart::Arithmetic(ae) => match parse_arith_native(&ae.expression) {
             Some(a) => IrExpr::Arith(Box::new(a)),
             None => call("arith", vec![st(&ae.expression)]),
         },
@@ -1537,7 +1847,7 @@ fn part_ir(part: &StringPart) -> IrExpr {
             )],
         ),
         StringPart::CommandSubstitution(cmd) => match cmdsub_arith_expr(cmd) {
-            Some(t) => match parse_arith(t) {
+            Some(t) => match parse_arith_native(t) {
                 Some(a) => IrExpr::Arith(Box::new(a)),
                 None => call("arith", vec![st(t)]),
             },
@@ -1650,9 +1960,21 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                     key: Box::new(key),
                 });
             }
-            // postfix ++ / -- need setVar semantics → fall back to runtime
-            if eat2(chars, pos, "++") || eat2(chars, pos, "--") {
-                return None;
+            // postfix ++ / -- (`i++` / `j--`) — the value is the OLD
+            // value (the emitter preserves that; see arith_to_estree).
+            if eat2(chars, pos, "++") {
+                return Some(ArithAst::IncDec {
+                    var: name,
+                    delta: 1,
+                    prefix: false,
+                });
+            }
+            if eat2(chars, pos, "--") {
+                return Some(ArithAst::IncDec {
+                    var: name,
+                    delta: -1,
+                    prefix: false,
+                });
             }
             return Some(ArithAst::Var(name));
         }
@@ -1662,6 +1984,27 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
         skip(chars, pos);
         if *pos < chars.len() {
             let c = chars[*pos];
+            // prefix ++ / -- (`++i` / `--j`) — the value is the NEW value.
+            if c == '+' && *pos + 1 < chars.len() && chars[*pos + 1] == '+' {
+                *pos += 2;
+                skip(chars, pos);
+                let name = ident_name(chars, pos)?;
+                return Some(ArithAst::IncDec {
+                    var: name,
+                    delta: 1,
+                    prefix: true,
+                });
+            }
+            if c == '-' && *pos + 1 < chars.len() && chars[*pos + 1] == '-' {
+                *pos += 2;
+                skip(chars, pos);
+                let name = ident_name(chars, pos)?;
+                return Some(ArithAst::IncDec {
+                    var: name,
+                    delta: -1,
+                    prefix: true,
+                });
+            }
             if c == '-' || c == '+' || c == '!' || c == '~' {
                 *pos += 1;
                 let op = match c {
@@ -1938,7 +2281,78 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
         Some(test)
     }
 
-    let ast = ternary(&chars, &mut pos)?;
+    // `name op= rhs` — bash's lowest-precedence arith form, right-
+    // associative (`a = b = c` → a = (b = c)), rhs = a full ternary. Only
+    // plain scalar names (no `arr[i] =` targets) and the ops the native
+    // lowering implements (`=`/`+=`/`-=`/`*=`; `/=`/`%=` keep the runtime
+    // zero-divisor semantics — the parse fails → runtime evalArith).
+    fn assignment(chars: &[char], pos: &mut usize) -> Option<ArithAst> {
+        skip(chars, pos);
+        if *pos < chars.len()
+            && (chars[*pos].is_ascii_alphabetic() || chars[*pos] == '_')
+        {
+            let save = *pos;
+            let name = ident_name(chars, pos)?;
+            skip(chars, pos);
+            // `arr[i] = ...` — an array-element write; the native lowering
+            // has no array targets, so fall through to ternary (the Index
+            // read) and let the leftover `=` fail the parse → runtime.
+            if *pos < chars.len() && chars[*pos] == '[' {
+                *pos = save;
+                return ternary(chars, pos);
+            }
+            // `==` is equality, `<=`/`>=` are comparisons — never
+            // assignment. `+`/`-`/`*` qualify ONLY as the two-char op
+            // forms (`+=` etc.); a bare `+`/`-`/`*` is a binary op.
+            let op: Option<&str> = if *pos < chars.len() && chars[*pos] == '=' {
+                if chars.get(*pos + 1) == Some(&'=') {
+                    None
+                } else {
+                    *pos += 1;
+                    Some("=")
+                }
+            } else if eat2(chars, pos, "+=") {
+                Some("+=")
+            } else if eat2(chars, pos, "-=") {
+                Some("-=")
+            } else if eat2(chars, pos, "*=") {
+                Some("*=")
+            } else {
+                None
+            };
+            if let Some(op) = op {
+                skip(chars, pos);
+                if *pos >= chars.len() {
+                    return None;
+                }
+                let rhs = assignment(chars, pos)?;
+                return Some(ArithAst::Assign {
+                    var: name,
+                    op,
+                    rhs: Box::new(rhs),
+                });
+            }
+            *pos = save;
+        }
+        ternary(chars, pos)
+    }
+    fn ident_name(chars: &[char], pos: &mut usize) -> Option<String> {
+        if *pos >= chars.len()
+            || !(chars[*pos].is_ascii_alphabetic() || chars[*pos] == '_')
+        {
+            return None;
+        }
+        let mut name = String::new();
+        while *pos < chars.len()
+            && (chars[*pos].is_ascii_alphanumeric() || chars[*pos] == '_')
+        {
+            name.push(chars[*pos]);
+            *pos += 1;
+        }
+        Some(name)
+    }
+
+    let ast = assignment(&chars, &mut pos)?;
     skip(&chars, &mut pos);
     if pos != n {
         return None;
@@ -1946,7 +2360,44 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
     Some(ast)
 }
 
-/// Render the neutral arithmetic AST as native JS expressions.
+/// `Number(<read>) || 0` — the runtime's arithmetic coercion of a variable
+/// read: lifted NUMERIC vars are already JS numbers (bare identifier);
+/// everything else (lifted strings, store vars, bash specials) goes
+/// through the exact `Number(v) || 0` the runtime's evalArith applies.
+fn arith_var_read(name: &str) -> Expr {
+    if is_lifted_num(name) {
+        // already a JS number — no Number()/||0 coercion needed
+        return Expr::Identifier {
+            name: name.to_string(),
+        };
+    }
+    let read = if is_lifted_str(name) {
+        Expr::Identifier {
+            name: name.to_string(),
+        }
+    } else {
+        native_special_var(name).unwrap_or_else(|| {
+            sh2_call("getVar", vec![str_lit(name)])
+        })
+    };
+    Expr::LogicalExpression {
+        operator: "||",
+        left: Box::new(Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "Number".to_string(),
+            }),
+            arguments: vec![read],
+            optional: false,
+        }),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(0),
+            raw: None,
+        regex: None,
+        }),
+    }
+}
+
+/// Render the arithmetic AST as native JS expressions.
 fn arith_to_estree(a: &ArithAst) -> Expr {
     match a {
         ArithAst::Num(v) => Expr::Literal {
@@ -1954,51 +2405,109 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
             raw: None,
         regex: None,
         },
-        ArithAst::Var(name) => {
-            if is_lifted_num(name) {
-                // already a JS number — no Number()/||0 coercion needed
-                Expr::Identifier { name: name.clone() }
-            } else if is_lifted_str(name) {
-                // a JS string — bash coerces it in arithmetic (Number(x)||0)
-                Expr::LogicalExpression {
-                    operator: "||",
-                    left: Box::new(Expr::CallExpression {
-                        callee: Box::new(Expr::Identifier {
-                            name: "Number".to_string(),
-                        }),
-                        arguments: vec![Expr::Identifier { name: name.clone() }],
-                        optional: false,
+        ArithAst::Var(name) => arith_var_read(name),
+        // `x = v` / `x += v` — the assigned VALUE is the expression's
+        // value (bash semantics). Lifted numeric vars write the native
+        // binding directly (JS compound assignment); store vars write via
+        // setVar and read the value BACK from the store (the read after
+        // the write is order-correct even when the RHS reads the same
+        // var — `x = x + 1` — and the stored value is exactly the
+        // assigned one for plain vars). The RHS is provably write-free
+        // (see arith_lowerable).
+        ArithAst::Assign { var, op, rhs } => {
+            let rhs_e = arith_to_estree(rhs);
+            if is_lifted_num(var) {
+                return Expr::AssignmentExpression {
+                    operator: op.to_string(),
+                    left: Box::new(Expr::Identifier {
+                        name: var.clone(),
                     }),
-                    right: Box::new(Expr::Literal {
-                        value: serde_json::Value::from(0),
-                        raw: None,
-                    regex: None,
-                    }),
-                }
-            } else {
-                // non-lifted store var: `Number(getVar(x)) || 0` — except
-                // the bash special vars, which read the runtime's state
-                // fields directly (`$?` → Number(sh2.lastExit) || 0).
-                let read = native_special_var(name).unwrap_or_else(|| {
-                    sh2_call("getVar", vec![str_lit(name)])
-                });
-                Expr::LogicalExpression {
-                    operator: "||",
-                    left: Box::new(Expr::CallExpression {
-                        callee: Box::new(Expr::Identifier {
-                            name: "Number".to_string(),
-                        }),
-                        arguments: vec![read],
-                        optional: false,
-                    }),
-                    right: Box::new(Expr::Literal {
-                        value: serde_json::Value::from(0),
-                        raw: None,
-                    regex: None,
-                    }),
-                }
+                    right: Box::new(rhs_e),
+                };
             }
-        },
+            let cur = arith_var_read(var);
+            let bin = |op: &'static str, l: Expr, r: Expr| Expr::BinaryExpression {
+                operator: op,
+                left: Box::new(l),
+                right: Box::new(r),
+            };
+            let new_val = match *op {
+                "=" => rhs_e.clone(),
+                "+=" => bin("+", cur, rhs_e.clone()),
+                "-=" => bin("-", cur, rhs_e.clone()),
+                "*=" => bin("*", cur, rhs_e.clone()),
+                _ => unreachable!("parse_arith only emits = += -= *="),
+            };
+            seq(vec![
+                sh2_call(
+                    "setVar",
+                    vec![
+                        str_lit(var),
+                        Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "String".to_string(),
+                            }),
+                            arguments: vec![new_val],
+                            optional: false,
+                        },
+                    ],
+                ),
+                arith_var_read(var),
+            ])
+        }
+        // `++x` / `x++` / `--x` / `x--` — the value is the NEW value
+        // (prefix) or the OLD value (postfix). Lifted numeric vars use a
+        // native JS update expression (exact semantics); store vars write
+        // via setVar and read back: prefix = the stored (new) value,
+        // postfix = stored ∓ 1 (the delta is ±1, so the old value is
+        // exactly one step away — read after the write is order-correct).
+        ArithAst::IncDec { var, delta, prefix } => {
+            if is_lifted_num(var) {
+                return Expr::UnaryExpression {
+                    operator: if *delta > 0 { "++" } else { "--" },
+                    argument: Box::new(Expr::Identifier {
+                        name: var.clone(),
+                    }),
+                    prefix: *prefix,
+                };
+            }
+            let cur = arith_var_read(var);
+            let int1 = || Expr::Literal {
+                value: serde_json::Value::from(1),
+                raw: None,
+            regex: None,
+            };
+            let new_val = Expr::BinaryExpression {
+                operator: if *delta > 0 { "+" } else { "-" },
+                left: Box::new(cur),
+                right: Box::new(int1()),
+            };
+            let value = if *prefix {
+                arith_var_read(var)
+            } else {
+                Expr::BinaryExpression {
+                    operator: if *delta > 0 { "-" } else { "+" },
+                    left: Box::new(arith_var_read(var)),
+                    right: Box::new(int1()),
+                }
+            };
+            seq(vec![
+                sh2_call(
+                    "setVar",
+                    vec![
+                        str_lit(var),
+                        Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "String".to_string(),
+                            }),
+                            arguments: vec![new_val],
+                            optional: false,
+                        },
+                    ],
+                ),
+                value,
+            ])
+        }
         ArithAst::Index { var, key } => Expr::LogicalExpression {
             operator: "||",
             left: Box::new(Expr::CallExpression {
@@ -2629,6 +3138,169 @@ fn drop_externally_referenced_loop_vars(
 /// that silently blocked lifting. Shared by the numeric and string lift
 /// walkers (they duplicate the surrounding analysis but must agree on
 /// what a store read is).
+/// `let "a+1" "i++"` — every arg parses natively (`parse_arith_native`):
+/// the emitter lowers the whole call to native expressions (see
+/// `try_native_let`), so the runtime never evaluates the strings — their
+/// `$var` refs are NOT store reads, and their written vars are natively
+/// written. MUST match the emitter's try_native_let eligibility exactly (a
+/// mismatch either keeps vars store-bound — a lost win — or, worse, lifts
+/// vars the runtime still writes — a desync).
+fn arith_let_args_native(args: &[IrExpr]) -> bool {
+    matches!(args,
+        [IrExpr::Str(cname, _), IrExpr::Array(cargs)]
+            if cname == "let"
+                && !cargs.is_empty()
+                && cargs.iter().all(|a| {
+                    matches!(a, IrExpr::Str(sv, _) if parse_arith_native(sv).is_some())
+                }))
+}
+
+fn plain_ident(s: &str) -> bool {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+/// `typeset -i i` / `declare -i i` / `readonly -i i` — an INTEGER
+/// declaration with bare names and no `=value` args (the declare itself
+/// does not write; the `-i` attribute is a bash guarantee that every LATER
+/// assignment is coerced to an integer — the runtime's `intVars` set).
+///
+/// ASSUMPTION (SH2_ASSUME_INTDECL=0 disables; default ON): such a name is
+/// a numeric WITNESS — the lift analysis treats it as a numeric source and
+/// the walkers skip the store-write marks, because a lifted native JS
+/// number binding is exactly the integer bash would store (JS machine
+/// numbers — the same NO_OVERFLOW family the numeric lift already relies
+/// on). The corpus is the oracle: `echo $i` right after `typeset -i i`
+/// prints "" in bash vs "0" for a lifted binding — examples that observe
+/// the unset state keep the declare store-bound instead.
+fn int_declare_names(args: &[IrExpr]) -> Option<Vec<String>> {
+    if !assume_intdecl() {
+        return None;
+    }
+    let [IrExpr::Str(cname, _), IrExpr::Array(cargs)] = args else {
+        return None;
+    };
+    if !matches!(cname.as_str(), "typeset" | "declare" | "readonly") {
+        return None;
+    }
+    let mut names = Vec::new();
+    let mut saw_i = false;
+    for a in cargs {
+        let IrExpr::Str(sv, _) = a else { return None; };
+        if sv.starts_with('-') {
+            // `-i` / `-ir` / `-xi` ... — integer attribute (the runtime
+            // checks `f.includes('i')`); `-p`/`-f`/`-F` print forms read
+            // the store — disqualify.
+            if sv.contains('p') || sv.contains('f') || sv.contains('F') {
+                return None;
+            }
+            if sv.contains('i') {
+                saw_i = true;
+            }
+        } else if sv.starts_with('+') {
+            return None; // `+i` removes the attribute — a plain declare
+        } else if sv.contains('=') {
+            return None; // `typeset -i x=5` — the declare itself writes
+        } else if plain_ident(sv) {
+            names.push(sv.clone());
+        } else {
+            return None;
+        }
+    }
+    if !saw_i || names.is_empty() {
+        return None;
+    }
+    Some(names)
+}
+
+/// Add native-arithmetic assignment sources for the exec forms the walkers
+/// skip marking (see arith_let_args_native / int_declare_names): a
+/// natively-lowered `let` writes its args' targets natively (an
+/// `IrExpr::Arith` source — numeric when div/mod-free), and an `-i`
+/// declaration witnesses its names as numeric (`IrExpr::Int(0)` — the
+/// declare does not write; the witness only unlocks the lift). MUST stay
+/// in sync with the skip conditions in both walkers.
+fn collect_native_arith_sources(args: &[IrExpr], assigns: &mut HashMap<String, Vec<IrExpr>>) {
+    let [IrExpr::Str(cname, _), IrExpr::Array(cargs)] = args else {
+        return;
+    };
+    match cname.as_str() {
+        "typeset" | "declare" | "readonly" => {
+            if let Some(names) = int_declare_names(args) {
+                for n in names {
+                    assigns.entry(n).or_default().push(IrExpr::Int(0));
+                }
+            }
+        }
+        "let" => {
+            if !arith_let_args_native(args) {
+                return;
+            }
+            let mut asts: Vec<ArithAst> = Vec::new();
+            for a in cargs {
+                if let IrExpr::Str(sv, _) = a {
+                    if let Some(ast) = parse_arith_native(sv) {
+                        asts.push(ast);
+                    } else {
+                        return; // unreachable via arith_let_args_native
+                    }
+                }
+            }
+            for ast in asts {
+                for w in arith_written_vars(&ast) {
+                    assigns.entry(w).or_default().push(IrExpr::Arith(Box::new(ast.clone())));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every variable a (native-lowered) arith AST writes: assignment targets
+/// and `++`/`--` targets.
+fn arith_written_vars(a: &ArithAst) -> Vec<String> {
+    match a {
+        ArithAst::Assign { var, rhs, .. } => {
+            let mut v = vec![var.clone()];
+            v.extend(arith_written_vars(rhs));
+            v
+        }
+        ArithAst::IncDec { var, .. } => vec![var.clone()],
+        ArithAst::Bin { lhs, rhs, .. } => {
+            let mut v = arith_written_vars(lhs);
+            v.extend(arith_written_vars(rhs));
+            v
+        }
+        ArithAst::Un { arg, .. } => arith_written_vars(arg),
+        ArithAst::Cond { test, then, else_, .. } => {
+            let mut v = arith_written_vars(test);
+            v.extend(arith_written_vars(then));
+            v.extend(arith_written_vars(else_));
+            v
+        }
+        ArithAst::Index { key, .. } => arith_written_vars(key),
+        _ => Vec::new(),
+    }
+}
+
+/// SH2_ASSUME_INTDECL=0 — turn off the `typeset -i` numeric-witness lift
+/// (maximal fidelity: an integer-declared variable keeps the runtime
+/// store, so `echo $i` after `typeset -i i` prints "" exactly like bash).
+fn assume_intdecl() -> bool {
+    std::env::var("SH2_ASSUME_INTDECL").map_or(true, |v| v != "0")
+}
+
+/// SH2_ASSUME_CFOR=0 — turn off the native `for ((...))` ForStatement
+/// lowering (the runtime cstyleForSync twin stays; see try_native_cstyle_for).
+fn assume_cfor() -> bool {
+    std::env::var("SH2_ASSUME_CFOR").map_or(true, |v| v != "0")
+}
+
 fn mark_store_refs(s: &str, out: &mut HashSet<String>) {
     fn is_ident(s: &str) -> bool {
         let mut cs = s.chars();
@@ -2826,8 +3498,58 @@ fn arith_has_div_mod(a: &ArithAst) -> bool {
             arith_has_div_mod(test) || arith_has_div_mod(then) || arith_has_div_mod(else_)
         }
         ArithAst::Index { key, .. } => arith_has_div_mod(key),
+        ArithAst::Assign { rhs, .. } => arith_has_div_mod(rhs),
+        ArithAst::IncDec { .. } => false,
         _ => false,
     }
+}
+
+/// Does the AST contain ANY write (`=`/`op=` assignment, `++`/`--`)? Used
+/// by the native-lowering guards: a write's VALUE may only be re-evaluated
+/// when it is pure (see [`arith_value_pure`]).
+fn arith_has_write(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Assign { .. } | ArithAst::IncDec { .. } => true,
+        ArithAst::Bin { lhs, rhs, .. } => arith_has_write(lhs) || arith_has_write(rhs),
+        ArithAst::Un { arg, .. } => arith_has_write(arg),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => arith_has_write(test) || arith_has_write(then) || arith_has_write(else_),
+        ArithAst::Index { key, .. } => arith_has_write(key),
+        _ => false,
+    }
+}
+
+/// The store-var write lowering renders `x = v` as
+/// `(sh2.setVar("x", String(v)), v)` — the value is evaluated TWICE, so
+/// the whole AST lowers natively ONLY when every write sits at the TOP
+/// level with write-free subtrees (a single `x = <pure>` / `x++` /
+/// `++x`). Anything else (`x = i++`, `i++ + 1`, nested assignments)
+/// keeps the runtime evaluator (the corpus's `i++ + ++i` sites stay on
+/// `sh2.arith`).
+fn arith_lowerable(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Assign { rhs, .. } => !arith_has_write(rhs),
+        ArithAst::IncDec { .. } => true,
+        ArithAst::Bin { lhs, rhs, .. } => !arith_has_write(lhs) && !arith_has_write(rhs),
+        ArithAst::Un { arg, .. } => !arith_has_write(arg),
+        ArithAst::Cond { .. } | ArithAst::Index { .. } => !arith_has_write(a),
+        _ => true,
+    }
+}
+
+/// `parse_arith` + the native-lowering eligibility filter: the AST must
+/// lower without the runtime evaluator (`arith_lowerable`), and a
+/// div/mod expression containing writes stays on the runtime too (the
+/// arithEval try/catch cannot express the zero-divisor abort once a
+/// native write has already happened — `$((x = 1/0))` must abort BEFORE
+/// the write, only the runtime evaluator orders that).
+fn parse_arith_native(src: &str) -> Option<ArithAst> {
+    let a = parse_arith(src)?;
+    if !arith_lowerable(&a) || (arith_has_div_mod(&a) && arith_has_write(&a)) {
+        return None;
+    }
+    Some(a)
 }
 
 /// bash variables are strings; JS has real numbers. A variable whose every
@@ -2944,23 +3666,7 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // `test` / `setArray` / `setArrayAppend` strings are
                 // excluded: the renderer injects lifted values into them,
                 // so a lifted var may appear inside them.
-                let let_args_native = if func == "exec" {
-                    // `let "a < b" "c == d"` whose EVERY arith string
-                    // parses natively (parse_arith) lowers to a native
-                    // expression in the emitter — the runtime never sees
-                    // the strings, so their `$var` refs are NOT store
-                    // reads and must not mark the vars. Any unparseable
-                    // arg (assignments / `++` / `$` refs / `10#` bases)
-                    // keeps the whole call on the runtime → mark all.
-                    matches!(args.as_slice(), [IrExpr::Str(cname, _), IrExpr::Array(cargs)]
-                        if cname == "let"
-                            && !cargs.is_empty()
-                            && cargs.iter().all(|a| {
-                                matches!(a, IrExpr::Str(s, _) if parse_arith(s).is_some())
-                            }))
-                } else {
-                    false
-                };
+                let let_args_native = func == "exec" && arith_let_args_native(args);
                 if func != "getVar" && func != "test" && func != "setArray" && func != "setArrayAppend"
                     && !let_args_native
                 {
@@ -2991,7 +3697,26 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                                 | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source"
                                 | "."
                         ) {
+                            // A natively-lowered `let` (try_native_let — the
+                            // runtime never sees the args) and the bare
+                            // names of `typeset -i` declarations (numeric
+                            // witnesses — native number bindings) are not
+                            // store writes: skip the marks for them.
+                            let native_let = cname == "let" && let_args_native;
+                            let intdecl = if cname == "let" { Vec::new() } else {
+                                int_declare_names(args).unwrap_or_default()
+                            };
                             for a in &args[1..] {
+                                if native_let {
+                                    continue;
+                                }
+                                if !intdecl.is_empty() {
+                                    if let IrExpr::Str(sv, _) = a {
+                                        if !sv.contains('=') && intdecl.iter().any(|n| n == sv) {
+                                            continue;
+                                        }
+                                    }
+                                }
                                 mark_write_builtin_vars(a, excluded);
                                 // `let`/`(( ))`/`eval` args are EXPRESSIONS
                                 // ("i++") — mark EVERY identifier they touch
@@ -3141,8 +3866,33 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                         "read" | "declare" | "typeset" | "local" | "export" | "readonly"
                             | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source" | "."
                     ) {
+                        // natively-lowered `let` args (try_native_let) and
+                        // the bare names of `typeset -i` declarations are
+                        // not store writes — skip their marks (mirror of
+                        // the expression-position block; a natively-written
+                        // var must not stay store-bound, and a runtime-
+                        // written var must not lift).
+                        let native_let = cname == "let" && arith_let_args_native(args);
+                        let intdecl = if cname == "let" { Vec::new() } else {
+                            int_declare_names(args).unwrap_or_default()
+                        };
                         for a in args {
+                            if native_let {
+                                continue;
+                            }
+                            if !intdecl.is_empty() {
+                                if let IrExpr::Str(sv, _) = a {
+                                    if !sv.contains('=') && intdecl.iter().any(|n| n == sv) {
+                                        continue;
+                                    }
+                                }
+                            }
                             mark_write_builtin_vars(a, excluded);
+                            // `let`/`(( ))`/`eval` args are ARITHMETIC
+                            // EXPRESSIONS — mark EVERY identifier they
+                            // touch so a lifted native binding never
+                            // desyncs from a runtime store write
+                            mark_all_idents_args(a, string_ctx);
                         }
                     }
                 }
@@ -3388,7 +4138,12 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     *CASE_NOCASE.lock().unwrap() = Some(nocase);
     *MAY_ERREXIT.lock().unwrap() = Some(errexit);
     *PROGRAM_PERSIST_FD1.lock().unwrap() = Some(persist_fd1);
-    *PROGRAM_FUNCTIONS.lock().unwrap() = Some(functions);
+    *PROGRAM_FUNCTIONS.lock().unwrap() = Some(functions.clone());
+    // Sync-function fixpoint: names whose calls lower to the sync fnCall
+    // path (non-async define arrows; loops over them go *Sync). Must run
+    // after the lift/scan statics above (the optimistic body emission reads
+    // them) and before the main emission (the fn-call sites consult it).
+    *SYNC_FN_CALLS.lock().unwrap() = Some(fn_call_sync_set(prog, &functions));
     let mut body: Vec<Stmt> = Vec::new();
     // `let x = 0` (numeric) / `let x = ""` (string) at program top. bash
     // reads an unset var as 0 in arithmetic and "" as a string.
@@ -4261,7 +5016,6 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
 fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     Some(match stmt {
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "break" => {
-            eprintln!("DBG: stmt break arm\n{}", std::backtrace::Backtrace::force_capture());
             Stmt::BreakStatement { label: None }
         }
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "continue" => {
@@ -4564,20 +5318,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 });
             }
             Stmt::ExpressionStatement {
-                expression: {
-                    let a = await_call(
-                        "forLoop",
-                        vec![
-                            iter_e,
-                            arrow_with_param(js_var, IrExpr::Arrow(body_stmts)),
-                        ],
-                    );
-                    let s = serde_json::to_string(&a).unwrap();
-                    eprintln!("DBG forLoop var={} iter={} async_arrow_has_break={} arrow_break_kind={}",
-                        var, s.contains("SH2GLOB"), s.contains("\"type\":\"BreakStatement\""),
-                        if s.contains("\"type\":\"BreakStatement\"") { "BREAKSTMT" } else if s.contains("\"name\":\"break\"") { "SH2BREAK" } else { "NONE" });
-                    a
-                },
+                expression: await_call(
+                    "forLoop",
+                    vec![
+                        iter_e,
+                        arrow_with_param(js_var, IrExpr::Arrow(body_stmts)),
+                    ],
+                ),
             }
         }
         IrStmt::Function { name, body } => Stmt::ExpressionStatement {
@@ -4585,7 +5332,12 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // function map (`this.functions.set(name, fn); return true;`) —
             // a direct state write + `true`, no dispatch. The arrow arg is
             // lowered exactly as before (sink-aware: a function body may
-            // run under ANY stdout sink at runtime).
+            // run under ANY stdout sink at runtime). A PROVABLY-SYNC
+            // function (see [`fn_call_sync_set`]) gets a NON-async arrow:
+            // its body has no awaits by construction, and the sync fnCall
+            // path runs it without a per-call promise (the async exec path
+            // awaits it like any other — `await` on a non-promise is an
+            // identity).
             expression: seq(vec![
                 Expr::CallExpression {
                     callee: Box::new(Expr::MemberExpression {
@@ -4598,7 +5350,11 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }),
                     arguments: vec![
                         str_lit(name),
-                        arrow_sink(vec![], IrExpr::Arrow(body.clone())),
+                        if fn_call_is_sync(name) {
+                            arrow_sink_sync(vec![], IrExpr::Arrow(body.clone()))
+                        } else {
+                            arrow_sink(vec![], IrExpr::Arrow(body.clone()))
+                        },
                     ],
                     optional: false,
                 },
@@ -4734,6 +5490,35 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         return Some(Stmt::ExpressionStatement {
                             expression: await_expr(native),
                         });
+                    }
+                }
+            }
+            // `f args...` — a call to a PROVABLY-SYNC script-defined
+            // function (see `fn_call_sync_set`): the sync runtime twin of
+            // the exec function-dispatch path (sh2-namespace.mjs `fnCall`)
+            // — identical arg flattening / magic expansion / positional
+            // save-restore / RETURN-signal unwinding / lastExit recording,
+            // minus the per-call promise machinery (the whileLoopSync
+            // pattern). The call-site args must also be await-free (a
+            // capture arg would need an async context regardless).
+            // Env-carrying / redirect forms keep the async exec dispatch.
+            if env.is_empty() && redirects.is_empty() {
+                if let IrExpr::Str(name, _) = cmd {
+                    if let Some(call) = try_native_fn_call(name, args) {
+                        return Some(Stmt::ExpressionStatement { expression: call });
+                    }
+                }
+            }
+            // `let ARITH...` / `(( ARITH ))` at STATEMENT level: the
+            // native arithmetic-statement lowering (see try_native_let) —
+            // every arg parses natively, so the runtime dispatch + string
+            // re-parse disappear (the `((i++))` per-iteration hot path).
+            if env.is_empty() && redirects.is_empty() {
+                if let IrExpr::Str(name, _) = cmd {
+                    if name == "let" {
+                        if let Some(native) = try_native_let(args) {
+                            return Some(Stmt::ExpressionStatement { expression: native });
+                        }
                     }
                 }
             }
@@ -6148,6 +6933,117 @@ fn ir_expr_needs_runtime(e: &IrExpr) -> bool {
         }
         _ => false,
     }
+}
+
+/// `f args...` — a call to a PROVABLY-SYNC script-defined function
+/// (see [`SYNC_FN_CALLS`] / [`fn_call_sync_set`]) with await-free
+/// call-site args: the sync `sh2.fnCall` call, no await (see the
+/// stmt/expr exec arms). Anything else (async target, awaiting args,
+/// env form) returns None and keeps the async exec dispatch.
+fn try_native_fn_call(name: &str, args: &[IrExpr]) -> Option<Expr> {
+    if !fn_call_is_sync(name) {
+        return None;
+    }
+    let a = expr_to_estree(&IrExpr::Array(args.to_vec()));
+    if expr_has_await(&a) {
+        return None;
+    }
+    Some(sh2_call("fnCall", vec![str_lit(name), a]))
+}
+
+            // `let ARITH...` / `(( ARITH ))` — a statement/condition whose
+            // EVERY arith arg parses natively (`parse_arith_native`: incl.
+            // `++`/`--` and `=`/`+=`/`-=`/`*=` assignments — the
+            // `((i++))` per-iteration hot path; rejects `$` refs / `10#`
+            // bases / nested writes / `/=`/`%=`), the value is a native
+            // expression (lifted vars read bare, store vars as
+            // `Number(getVar)||0` — the runtime's exact coercion), with
+            // the runtime builtin's status recorded (`let` returns true
+            // iff the LAST evaluated value != 0 and sets lastExit to
+            // match — `(v !== 0 ? 0 : 1)`). No dispatch, no string
+            // re-parse per evaluation.
+            //
+            // Multiple args are emitted in order (bash evaluates every
+            // arg; earlier args were pure reads before assignments
+            // existed — now their writes must run). The LAST arg drives
+            // the status. A write-ful last arg is evaluated exactly ONCE
+            // (the status records it in place — the seq's final value is
+            // the lastExit assignment's 0/1, truthiness-identical to the
+            // runtime's boolean): the old two-eval tail would double an
+            // increment.
+fn try_native_let(args: &[IrExpr]) -> Option<Expr> {
+    if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args {
+        if name == "let" && !a.is_empty() {
+            let mut vals: Vec<(Expr, bool)> = Vec::new();
+            let mut parseable = true;
+            for arg in a {
+                match arg {
+                    IrExpr::Str(sv, _) => match parse_arith_native(sv) {
+                        Some(ast) => vals.push((arith_to_estree(&ast), arith_has_write(&ast))),
+                        None => {
+                            parseable = false;
+                            break;
+                        }
+                    },
+                    _ => {
+                        parseable = false;
+                        break;
+                    }
+                }
+            }
+            if parseable {
+                let (last_v, _last_writes) = vals.pop().expect("non-empty let");
+                let nonzero = |v: &Expr| Expr::BinaryExpression {
+                    operator: "!==",
+                    left: Box::new(v.clone()),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(0),
+                        raw: None,
+                    regex: None,
+                    }),
+                };
+                // `let` returns true iff the LAST evaluated value != 0 and
+                // sets lastExit to match. The conditional form evaluates
+                // the last arg exactly ONCE (a write-ful `((i++))` must
+                // not double-increment) and yields a real boolean: the
+                // status is recorded in each branch, the value is the
+                // comparison. Earlier args are emitted in order (bash
+                // evaluates every arg — a write in an earlier arg runs).
+                let last_ok = nonzero(&last_v);
+                let cond = Expr::ConditionalExpression {
+                    test: Box::new(last_ok.clone()),
+                    consequent: Box::new(seq(vec![
+                        Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(sh2_member("lastExit")),
+                            right: Box::new(Expr::Literal {
+                                value: serde_json::Value::from(0),
+                                raw: None,
+                            regex: None,
+                            }),
+                        },
+                        bool_lit(true),
+                    ])),
+                    alternate: Box::new(seq(vec![
+                        Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(sh2_member("lastExit")),
+                            right: Box::new(Expr::Literal {
+                                value: serde_json::Value::from(1),
+                                raw: None,
+                            regex: None,
+                            }),
+                        },
+                        bool_lit(false),
+                    ])),
+                };
+                let mut parts: Vec<Expr> = vals.into_iter().map(|(v, _)| v).collect();
+                parts.push(cond);
+                return Some(seq(parts));
+            }
+        }
+    }
+    None
 }
 
 /// `rm` / `mkdir` with only the simple flags and plain path args: a native
@@ -9154,19 +10050,7 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                 // `test` / `setArray` / `setArrayAppend` strings are
                 // excluded: the renderer injects lifted values into them,
                 // so a lifted var may appear inside them.
-                let let_args_native = if func == "exec" {
-                    // Parseable `let` args lower natively (see the
-                    // numeric-lift twin of this walker) — their `$var`
-                    // refs are never store reads.
-                    matches!(args.as_slice(), [IrExpr::Str(cname, _), IrExpr::Array(cargs)]
-                        if cname == "let"
-                            && !cargs.is_empty()
-                            && cargs.iter().all(|a| {
-                                matches!(a, IrExpr::Str(s, _) if parse_arith(s).is_some())
-                            }))
-                } else {
-                    false
-                };
+                let let_args_native = func == "exec" && arith_let_args_native(args);
                 if func != "getVar" && func != "test" && func != "setArray" && func != "setArrayAppend"
                     && !let_args_native
                 {
@@ -9227,7 +10111,26 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                                 | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source"
                                 | "."
                         ) {
+                            // A natively-lowered `let` (try_native_let — the
+                            // runtime never sees the args) and the bare
+                            // names of `typeset -i` declarations (numeric
+                            // witnesses — native number bindings) are not
+                            // store writes: skip the marks for them.
+                            let native_let = cname == "let" && let_args_native;
+                            let intdecl = if cname == "let" { Vec::new() } else {
+                                int_declare_names(args).unwrap_or_default()
+                            };
                             for a in &args[1..] {
+                                if native_let {
+                                    continue;
+                                }
+                                if !intdecl.is_empty() {
+                                    if let IrExpr::Str(sv, _) = a {
+                                        if !sv.contains('=') && intdecl.iter().any(|n| n == sv) {
+                                            continue;
+                                        }
+                                    }
+                                }
                                 mark_write_builtin_vars(a, excluded);
                                 // `let`/`(( ))`/`eval` args are EXPRESSIONS
                                 // ("i++") — mark EVERY identifier they touch
@@ -9364,8 +10267,33 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                         "read" | "declare" | "typeset" | "local" | "export" | "readonly"
                             | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source" | "."
                     ) {
+                        // natively-lowered `let` args (try_native_let) and
+                        // the bare names of `typeset -i` declarations are
+                        // not store writes — skip their marks (mirror of
+                        // the expression-position block; a natively-written
+                        // var must not stay store-bound, and a runtime-
+                        // written var must not lift).
+                        let native_let = cname == "let" && arith_let_args_native(args);
+                        let intdecl = if cname == "let" { Vec::new() } else {
+                            int_declare_names(args).unwrap_or_default()
+                        };
                         for a in args {
+                            if native_let {
+                                continue;
+                            }
+                            if !intdecl.is_empty() {
+                                if let IrExpr::Str(sv, _) = a {
+                                    if !sv.contains('=') && intdecl.iter().any(|n| n == sv) {
+                                        continue;
+                                    }
+                                }
+                            }
                             mark_write_builtin_vars(a, excluded);
+                            // `let`/`(( ))`/`eval` args are ARITHMETIC
+                            // EXPRESSIONS — mark EVERY identifier they
+                            // touch so a lifted native binding never
+                            // desyncs from a runtime store write
+                            mark_all_idents_args(a, string_ctx);
                         }
                     }
                 }
@@ -9640,6 +10568,23 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         },
         IrExpr::Interpolate(parts) => interpolate_to_estree(parts),
         IrExpr::Call { func, args } => {
+            // `f args...` — a call to a PROVABLY-SYNC script-defined
+            // function with await-free call-site args (see
+            // [`SYNC_FN_CALLS`] / `try_native_fn_call`): the sync
+            // `sh2.fnCall` call, no await — which keeps `&&`/`||`/`!`
+            // chains and enclosing loops on their native / *Sync paths.
+            // Placed BEFORE the echo/printf/let/cd special cases: a
+            // script-defined `echo`/`printf`/`let`/`cd` function shadows
+            // the builtin, and the sync call is the function dispatch.
+            // Env-carrying (3-arg) calls and dynamic names keep the async
+            // exec dispatch.
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
+                    if let Some(call) = try_native_fn_call(name, a) {
+                        return call;
+                    }
+                }
+            }
             // `sh2.brace(prefix, groups, middles, suffix)` — the args are
             // ALWAYS literal (brace_ir emits Str/Json), the expansion is
             // pure string work, and the runtime never glob-marks the
@@ -10220,68 +11165,11 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                 }
             }
-            // `let ARITH...` / `(( ARITH ))` — a statement/condition whose
-            // EVERY arith arg parses natively (parse_arith rejects
-            // assignments / `++` / `--` / `$` refs / `10#` bases): the
-            // value is a native expression (lifted vars read bare,
-            // store vars as `Number(getVar)||0` — the runtime's exact
-            // coercion), with the runtime builtin's status recorded
-            // (`let` returns true iff the LAST evaluated value != 0 and
-            // sets lastExit to match — `(v !== 0 ? 0 : 1)`). No dispatch,
-            // no string re-parse per evaluation.
+            // `let ARITH...` / `(( ARITH ))` — see try_native_let (the
+            // statement/condition whose EVERY arith arg parses natively).
             if func == "exec" {
-                if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
-                    if name == "let" && !a.is_empty() {
-                        let mut vals: Vec<Expr> = Vec::new();
-                        let mut parseable = true;
-                        for arg in a {
-                            match arg {
-                                IrExpr::Str(sv, _) => match parse_arith(sv) {
-                                    Some(ast) => vals.push(arith_to_estree(&ast)),
-                                    None => {
-                                        parseable = false;
-                                        break;
-                                    }
-                                },
-                                _ => {
-                                    parseable = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if parseable {
-                            let v = vals.pop().expect("non-empty let");
-                            let nonzero = Expr::BinaryExpression {
-                                operator: "!==",
-                                left: Box::new(v),
-                                right: Box::new(Expr::Literal {
-                                    value: serde_json::Value::from(0),
-                                    raw: None,
-                                regex: None,
-                                }),
-                            };
-                            return seq(vec![
-                                Expr::AssignmentExpression {
-                                    operator: "=".to_string(),
-                                    left: Box::new(sh2_member("lastExit")),
-                                    right: Box::new(Expr::ConditionalExpression {
-                                        test: Box::new(nonzero.clone()),
-                                        consequent: Box::new(Expr::Literal {
-                                            value: serde_json::Value::from(0),
-                                            raw: None,
-                                        regex: None,
-                                        }),
-                                        alternate: Box::new(Expr::Literal {
-                                            value: serde_json::Value::from(1),
-                                            raw: None,
-                                        regex: None,
-                                        }),
-                                    }),
-                                },
-                                nonzero,
-                            ]);
-                        }
-                    }
+                if let Some(native) = try_native_let(args) {
+                    return native;
                 }
             }
             // `grep -q PAT FILE` — a pure substring test over a file's
@@ -10441,9 +11329,6 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 }
             }
             let callee_name = exec_or_builtin(func, args);
-            if func == "break" {
-                eprintln!("DBG: expr break arm\n{}", std::backtrace::Backtrace::force_capture());
-            }
             let call = sh2_call(callee_name, mapped_args);
             if is_async_call(callee_name) {
                 await_expr(call)
@@ -10577,7 +11462,24 @@ fn arrow_sink(params: Vec<Expr>, body: IrExpr) -> Expr {
     out
 }
 
+/// `arrow_sink` twin for PROVABLY-SYNC function bodies (see
+/// [`SYNC_FN_CALLS`]): the emitted define arrow is NON-async so the sync
+/// `sh2.fnCall` path can run it without a per-call promise (the async
+/// exec path `await`s it like any other arrow — `await` on a non-promise
+/// is an identity). Same ECHO_SINK_DEPTH discipline: a function body may
+/// be called under ANY stdout sink at runtime.
+fn arrow_sink_sync(params: Vec<Expr>, body: IrExpr) -> Expr {
+    *ECHO_SINK_DEPTH.lock().unwrap() += 1;
+    let out = arrow_body_async(params, body, false);
+    *ECHO_SINK_DEPTH.lock().unwrap() -= 1;
+    out
+}
+
 fn arrow_body(params: Vec<Expr>, body: IrExpr) -> Expr {
+    arrow_body_async(params, body, true)
+}
+
+fn arrow_body_async(params: Vec<Expr>, body: IrExpr, r#async: bool) -> Expr {
     match &body {
         IrExpr::Arrow(stmts) if stmts.len() == 1 && matches!(stmts[0], IrStmt::Expr(_)) => {
             let inner = match &stmts[0] {
@@ -10588,7 +11490,7 @@ fn arrow_body(params: Vec<Expr>, body: IrExpr) -> Expr {
                 params,
                 body: ArrowBody::Expr(Box::new(inner)),
                 expression: true,
-                r#async: true,
+                r#async,
             }
         }
         IrExpr::Arrow(stmts) => Expr::ArrowFunctionExpression {
@@ -10597,13 +11499,13 @@ fn arrow_body(params: Vec<Expr>, body: IrExpr) -> Expr {
                 body: stmts.iter().filter_map(stmt_to_estree).collect(),
             })),
             expression: false,
-            r#async: true,
+            r#async,
         },
         other => Expr::ArrowFunctionExpression {
             params,
             body: ArrowBody::Expr(Box::new(expr_to_estree(other))),
             expression: true,
-            r#async: true,
+            r#async,
         },
     }
 }
