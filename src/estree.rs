@@ -516,6 +516,18 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
                 .map(|e| fix_expr(e, in_arrow, in_func))
                 .collect(),
         },
+        // the errexit-guard wrapper (`sh2._g = await sh2.forLoop(...)`)
+        // puts loop calls inside an assignment — traverse it so loop-body
+        // break/continue/return still get rewritten to sh2.* signals.
+        Expr::AssignmentExpression {
+            operator,
+            left,
+            right,
+        } => Expr::AssignmentExpression {
+            operator,
+            left: Box::new(fix_expr(*left, in_arrow, in_func)),
+            right: Box::new(fix_expr(*right, in_arrow, in_func)),
+        },
         other => other,
     }
 }
