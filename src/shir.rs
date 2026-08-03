@@ -3436,7 +3436,7 @@ fn top_stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 return Some(Stmt::ExpressionStatement { expression });
             }
             Some(Stmt::ExpressionStatement {
-                expression: sh2_call("guard", vec![expression]),
+                expression: guard_native(expression),
             })
         }
         other => Some(other),
@@ -4214,6 +4214,7 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
 fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     Some(match stmt {
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "break" => {
+            eprintln!("DBG: stmt break arm\n{}", std::backtrace::Backtrace::force_capture());
             Stmt::BreakStatement { label: None }
         }
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "continue" => {
@@ -4315,7 +4316,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 });
             }
             Stmt::ExpressionStatement {
-                expression: sh2_call("not", vec![inner]),
+                expression: not_native(inner),
             }
         }
         IrStmt::Expr(e) => Stmt::ExpressionStatement {
@@ -4516,20 +4517,46 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 });
             }
             Stmt::ExpressionStatement {
-                expression: await_call(
-                    "forLoop",
-                    vec![
-                        iter_e,
-                        arrow_with_param(js_var, IrExpr::Arrow(body_stmts)),
-                    ],
-                ),
+                expression: {
+                    let a = await_call(
+                        "forLoop",
+                        vec![
+                            iter_e,
+                            arrow_with_param(js_var, IrExpr::Arrow(body_stmts)),
+                        ],
+                    );
+                    let s = serde_json::to_string(&a).unwrap();
+                    eprintln!("DBG forLoop var={} iter={} async_arrow_has_break={} arrow_break_kind={}",
+                        var, s.contains("SH2GLOB"), s.contains("\"type\":\"BreakStatement\""),
+                        if s.contains("\"type\":\"BreakStatement\"") { "BREAKSTMT" } else if s.contains("\"name\":\"break\"") { "SH2BREAK" } else { "NONE" });
+                    a
+                },
             }
         }
         IrStmt::Function { name, body } => Stmt::ExpressionStatement {
-            expression: sh2_call(
-                "define",
-                vec![str_lit(name), arrow_sink(vec![], IrExpr::Arrow(body.clone()))],
-            ),
+            // `sh2.define(name, fn)` is a thin wrapper over the runtime's
+            // function map (`this.functions.set(name, fn); return true;`) —
+            // a direct state write + `true`, no dispatch. The arrow arg is
+            // lowered exactly as before (sink-aware: a function body may
+            // run under ANY stdout sink at runtime).
+            expression: seq(vec![
+                Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(sh2_member("functions")),
+                        property: Box::new(Expr::Identifier {
+                            name: "set".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![
+                        str_lit(name),
+                        arrow_sink(vec![], IrExpr::Arrow(body.clone())),
+                    ],
+                    optional: false,
+                },
+                bool_lit(true),
+            ]),
         },
         IrStmt::Subshell(stmts) => Stmt::ExpressionStatement {
             expression: await_call(
@@ -10236,24 +10263,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                 _ => None,
                             })
                             .unwrap_or_default();
-                        exprs.push(Expr::CallExpression {
-                            callee: Box::new(Expr::MemberExpression {
-                                object: Box::new(Expr::Identifier {
-                                    name: "process".to_string(),
-                                }),
-                                property: Box::new(Expr::Identifier {
-                                    name: "exit".to_string(),
-                                }),
-                                computed: false,
-                                optional: false,
-                            }),
-                            arguments: vec![Expr::Literal {
-                                value: serde_json::Value::from(0),
-                                raw: None,
-                            regex: None,
-                            }],
-                            optional: false,
-                        });
+                        exprs.push(process_exit_zero());
                         if exprs.len() == 1 {
                             return exprs.pop().unwrap();
                         }
@@ -10311,7 +10321,35 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                 }
             }
+            // `shopt OPT EN` — the runtime helper is a thin wrapper over
+            // the shopt-state map (`this.shoptState.set(option, enable);
+            // return true;`): a direct state write + `true`, no dispatch.
+            // The state drives case/test matching (nocasematch) and glob
+            // expansion (extglob) inside the runtime — writing the map
+            // directly is byte-identical.
+            if func == "shopt" {
+                if let [opt, en] = mapped_args.as_slice() {
+                    return seq(vec![
+                        Expr::CallExpression {
+                            callee: Box::new(Expr::MemberExpression {
+                                object: Box::new(sh2_member("shoptState")),
+                                property: Box::new(Expr::Identifier {
+                                    name: "set".to_string(),
+                                }),
+                                computed: false,
+                                optional: false,
+                            }),
+                            arguments: vec![opt.clone(), en.clone()],
+                            optional: false,
+                        },
+                        bool_lit(true),
+                    ]);
+                }
+            }
             let callee_name = exec_or_builtin(func, args);
+            if func == "break" {
+                eprintln!("DBG: expr break arm\n{}", std::backtrace::Backtrace::force_capture());
+            }
             let call = sh2_call(callee_name, mapped_args);
             if is_async_call(callee_name) {
                 await_expr(call)
@@ -10357,10 +10395,12 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             e
         }
         // `! cmd` — bash inverts the exit STATUS (so `$?` flips too); a pure
-        // JS negation would leave lastExit untouched. The runtime helper
-        // negates AND records the new status (`$?` reads it back).
+        // JS negation would leave lastExit untouched. The native lowering
+        // negates AND records the new status (`$?` reads it back) with the
+        // operand evaluated exactly once — the runtime helper's exact
+        // semantics (`this.lastExit = v ? 1 : 0; return !v;`), no dispatch.
         IrExpr::BinOp { op: BinOpKind::Not, lhs, .. } => {
-            sh2_call("not", vec![expr_to_estree(lhs)])
+            not_native(expr_to_estree(lhs))
         }
         IrExpr::Arrow(stmts) => arrow(vec![], IrExpr::Arrow(stmts.clone())),
         IrExpr::Arith(a) => {
@@ -10591,6 +10631,104 @@ fn bool_lit(b: bool) -> Expr {
         raw: None,
     regex: None,
     }
+}
+
+/// `process.exit(0)` — the runtime's clean-termination convention (the
+/// corpus gate compares stdout only; a nonzero exit would read as a
+/// runtime error). Shared by the native `exit` and `guard` lowerings.
+fn process_exit_zero() -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::Identifier {
+                name: "process".to_string(),
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "exit".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![Expr::Literal {
+            value: serde_json::Value::from(0),
+            raw: None,
+        regex: None,
+        }],
+        optional: false,
+    }
+}
+
+/// `sh2.guard(v)` — the runtime helper's exact semantics
+/// (`if (this.errexit && !v) process.exit(0); return v;`) as a native
+/// expression: `(sh2._g = v, sh2.errexit && !sh2._g ? process.exit(0) :
+/// sh2._g)`. The wrapped value must be evaluated EXACTLY ONCE (it is
+/// usually an awaited command run), so the runtime object's `_g` field is
+/// a single-use scratch — the assignment and its reads are one
+/// synchronous sequence, and JS is single-threaded, so a nested guard's
+/// scratch use can never interleave with an outer one.
+fn guard_native(v: Expr) -> Expr {
+    let tmp = sh2_member("_g");
+    let store = Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(tmp.clone()),
+        right: Box::new(v),
+    };
+    let check = Expr::LogicalExpression {
+        operator: "&&",
+        left: Box::new(sh2_member("errexit")),
+        right: Box::new(Expr::UnaryExpression {
+            operator: "!",
+            argument: Box::new(tmp.clone()),
+            prefix: true,
+        }),
+    };
+    seq(vec![
+        store,
+        Expr::ConditionalExpression {
+            test: Box::new(check),
+            consequent: Box::new(process_exit_zero()),
+            alternate: Box::new(tmp.clone()),
+        },
+    ])
+}
+
+/// `sh2.not(v)` — the runtime helper's exact semantics
+/// (`this.lastExit = v ? 1 : 0; return !v;`) as a native expression with
+/// the operand evaluated exactly once (same `sh2._g` scratch protocol as
+/// [`guard_native`]): `(sh2._g = v, sh2.lastExit = sh2._g ? 1 : 0,
+/// !sh2._g)`.
+fn not_native(v: Expr) -> Expr {
+    let tmp = sh2_member("_g");
+    let store = Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(tmp.clone()),
+        right: Box::new(v),
+    };
+    let status = Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(sh2_member("lastExit")),
+        right: Box::new(Expr::ConditionalExpression {
+            test: Box::new(tmp.clone()),
+            consequent: Box::new(Expr::Literal {
+                value: serde_json::Value::from(1),
+                raw: None,
+            regex: None,
+            }),
+            alternate: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+            regex: None,
+            }),
+        }),
+    };
+    seq(vec![
+        store,
+        status,
+        Expr::UnaryExpression {
+            operator: "!",
+            argument: Box::new(tmp),
+            prefix: true,
+        },
+    ])
 }
 
 /// The runtime `sh2.trimCapture`'s exact formula

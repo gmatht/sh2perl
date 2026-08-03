@@ -1214,8 +1214,12 @@ mod tests {
     #[test]
     fn function_lowers_to_define() {
         let json = to_json("greet() { echo hi; }");
-        assert!(json.contains("\"name\":\"define\""));
+        // the native define lowering: a direct `sh2.functions.set(name, fn)`
+        // state write + `true`, no dispatch
+        assert!(json.contains("\"name\":\"functions\""));
+        assert!(json.contains("\"name\":\"set\""));
         assert!(json.contains("greet"));
+        assert!(!json.contains("\"name\":\"define\""));
         assert!(!json.contains("unsupported"));
     }
 
@@ -1268,7 +1272,10 @@ mod tests {
     #[test]
     fn shopt_and_cstyle_for_lower() {
         let json = to_json("shopt -s extglob");
-        assert!(json.contains("\"name\":\"shopt\""));
+        // the native shopt lowering: a direct `sh2.shoptState.set(opt, en)`
+        // state write + `true`, no dispatch
+        assert!(json.contains("\"name\":\"shoptState\""));
+        assert!(!json.contains("\"name\":\"shopt\""));
         assert!(!json.contains("unsupported"));
         // the body is `echo $i` — a sync builtin call (no await) → the
         // c-style loop lowers to the SYNC runtime twin.
