@@ -2877,6 +2877,46 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
             _ => {}
         }
     }
+    // `let`/`eval`/`(( ))` args are ARITHMETIC EXPRESSIONS — every bare
+    // identifier is a variable the runtime touches (unlike plain string
+    // words, which mark_store_refs correctly ignores).
+    fn mark_all_idents(s: &str, out: &mut HashSet<String>) {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if (c.is_ascii_alphabetic() || c == '_')
+                && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let w = &s[start..i];
+                if is_ident(w) {
+                    out.insert(w.to_string());
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    fn mark_all_idents_args(e: &IrExpr, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Str(ss, _) => mark_all_idents(ss, out),
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    mark_all_idents_args(el, out);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    mark_all_idents_args(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
     fn mark_str_args(e: &IrExpr, string_ctx: &mut HashSet<String>) {
         match e {
             IrExpr::Str(ss, _) => mark_string_refs(ss, string_ctx),
@@ -2941,7 +2981,9 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // stay store-bound — a native binding would never see the
                 // write (and the native binding's value would be stale for
                 // every later read). Mirror of the string-lift walker.
-                if func == "exec" {
+                if func == "exec" || func == "builtin" {
+                    // `builtin` is the sync-builtin-dispatch callee (M8) —
+                    // same write-builtin semantics as exec-lowered builtins
                     if let Some(IrExpr::Str(cname, _)) = args.first() {
                         if matches!(
                             cname.as_str(),
@@ -2951,6 +2993,11 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                         ) {
                             for a in &args[1..] {
                                 mark_write_builtin_vars(a, excluded);
+                                // `let`/`(( ))`/`eval` args are EXPRESSIONS
+                                // ("i++") — mark EVERY identifier they touch
+                                // so a lifted native binding never desyncs
+                                // from the runtime's store write
+                                mark_all_idents_args(a, string_ctx);
                             }
                         }
                     }
@@ -9024,6 +9071,46 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
         // inside `$((...))`. See mark_store_refs.
         mark_store_refs(s, out);
     }
+    // `let`/`eval`/`(( ))` args are ARITHMETIC EXPRESSIONS — every bare
+    // identifier is a variable the runtime touches (unlike plain string
+    // words, which mark_store_refs correctly ignores).
+    fn mark_all_idents(s: &str, out: &mut HashSet<String>) {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if (c.is_ascii_alphabetic() || c == '_')
+                && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let w = &s[start..i];
+                if is_ident(w) {
+                    out.insert(w.to_string());
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    fn mark_all_idents_args(e: &IrExpr, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Str(ss, _) => mark_all_idents(ss, out),
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    mark_all_idents_args(el, out);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    mark_all_idents_args(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
     fn mark_str_args(e: &IrExpr, string_ctx: &mut HashSet<String>) {
         match e {
             IrExpr::Str(ss, _) => mark_string_refs(ss, string_ctx),
@@ -9130,7 +9217,9 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                         }
                     }
                 }
-                if func == "exec" {
+                if func == "exec" || func == "builtin" {
+                    // `builtin` is the sync-builtin-dispatch callee (M8) —
+                    // same write-builtin semantics as exec-lowered builtins
                     if let Some(IrExpr::Str(cname, _)) = args.first() {
                         if matches!(
                             cname.as_str(),
@@ -9140,6 +9229,11 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                         ) {
                             for a in &args[1..] {
                                 mark_write_builtin_vars(a, excluded);
+                                // `let`/`(( ))`/`eval` args are EXPRESSIONS
+                                // ("i++") — mark EVERY identifier they touch
+                                // so a lifted native binding never desyncs
+                                // from the runtime's store write
+                                mark_all_idents_args(a, string_ctx);
                             }
                         }
                     }
