@@ -5502,12 +5502,12 @@ fn native_capture_grep_cut(stages: &[IrExpr]) -> Option<Expr> {
     if name1 != "grep" || name2 != "cut" {
         return None;
     }
-    let (invert, pat, file): (bool, &str, &IrExpr) = match a1 {
-        [IrExpr::Str(pat, _), file] => (false, pat, file),
-        [IrExpr::Str(v, _), IrExpr::Str(pat, _), file] if v == "-v" => (true, pat, file),
+    let (invert, pat, file): (bool, String, &IrExpr) = match a1 {
+        [p, file] => (false, static_text(p)?, file),
+        [v, p, file] if static_text(v).as_deref() == Some("-v") => (true, static_text(p)?, file),
         _ => return None,
     };
-    let gpat = classify_grep_pat(pat)?;
+    let gpat = classify_grep_pat(&pat)?;
     let [IrExpr::Str(d, _), IrExpr::Str(dv, _), IrExpr::Str(f, _), IrExpr::Str(ff, _)] = a2
     else {
         return None;
