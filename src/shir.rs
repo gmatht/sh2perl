@@ -252,7 +252,6 @@ fn is_native_let_stmt(stmt: &IrStmt) -> bool {
 fn scan_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mut HashSet<usize>) {
     let mut read_pending = end_live;
     for stmt in stmts.iter().rev() {
-        eprintln!("DBGscan w={} r={} pending={} stmt={:?}", ir_stmt_writes_lastexit(stmt), ir_stmt_reads_status(stmt), read_pending, stmt);
         if ir_stmt_writes_lastexit(stmt) {
             if read_pending {
                 live.insert(stmt as *const IrStmt as usize);
@@ -360,7 +359,7 @@ fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, 
 /// expansion, identical builtin function, minus the async exec machinery
 /// (the whileLoopSync pattern — same semantics, no per-call promises).
 const SYNC_BUILTINS: &[&str] = &[
-    ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue", "declare",
+    ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue", "cut", "declare",
     "dirname", "echo", "eval", "exit", "export", "false", "head", "let", "local",
     "mapfile", "mktemp", "printf", "pwd", "read", "readarray", "readonly", "return", "seq",
     "set", "shift", "sort", "source", "stat", "tail", "test", "touch", "trap",
