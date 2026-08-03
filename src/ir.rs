@@ -74,6 +74,18 @@ pub enum ArithAst {
     Bin { op: &'static str, lhs: Box<ArithAst>, rhs: Box<ArithAst> },
     Un { op: &'static str, arg: Box<ArithAst> },
     Cond { test: Box<ArithAst>, then: Box<ArithAst>, else_: Box<ArithAst> },
+    /// `name op= rhs` (`=` / `+=` / `-=` / `*=`; `/=`/`%=` stay on the
+    /// runtime — the zero-divisor abort needs the helper). The expression
+    /// VALUE is the assigned value (bash semantics).
+    Assign {
+        var: String,
+        op: &'static str,
+        rhs: Box<ArithAst>,
+    },
+    /// `++name` / `name++` / `--name` / `name--` — delta ±1. The value is
+    /// the NEW value (prefix) or the OLD value (postfix), exactly bash's
+    /// arithmetic semantics.
+    IncDec { var: String, delta: i64, prefix: bool },
 }
 
 // ── Expressions ──────────────────────────────────────────────────────
