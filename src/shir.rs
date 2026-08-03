@@ -3963,6 +3963,23 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                         mark_str_args(a, string_ctx);
                     }
                 }
+                // a native `((i++))` / `let` inside a subshell/background
+                // writes a COPY in bash — a lifted module binding would be
+                // clobbered by the arrow (mirror of the Assign-target
+                // exclusion above), so mark the written vars excluded.
+                if in_copy && let_args_native {
+                    if let [IrExpr::Str(_cn, _), IrExpr::Array(cargs)] = args.as_slice() {
+                        for a in cargs {
+                            if let IrExpr::Str(sv, _) = a {
+                                if let Some(ast) = parse_arith_native(sv) {
+                                    for w in arith_written_vars(&ast) {
+                                        excluded.insert(w.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // `local i=3` / `read line` / `export FOO=x` in EXPRESSION
                 // position (inside function arrows / && chains the exec call
                 // arrives as IrStmt::Expr, not IrStmt::Exec): the runtime
@@ -3981,31 +3998,30 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                                 | "."
                         ) {
                             // A natively-lowered `let` (try_native_let — the
-                            // runtime never sees the args) and the bare
-                            // names of `typeset -i` declarations (numeric
-                            // witnesses — native number bindings) are not
-                            // store writes: skip the marks for them.
+                            // runtime never sees the args) and a VALIDATED
+                            // `-i` declaration (int_declare_names — the
+                            // declare writes nothing and references
+                            // nothing) are not store writes: skip the marks
+                            // for the WHOLE call. (The old per-name skip
+                            // was defeated by the exec arg shape — the
+                            // names live inside the Array wrapper at
+                            // args[1], so only the bare Str args matched,
+                            // while the `-i` flag's letters still marked
+                            // the name store-bound via mark_all_idents.)
                             let native_let = cname == "let" && let_args_native;
                             let intdecl = if cname == "let" { Vec::new() } else {
                                 int_declare_names(args).unwrap_or_default()
                             };
-                            for a in &args[1..] {
-                                if native_let {
-                                    continue;
+                            if !(native_let || !intdecl.is_empty()) {
+                                for a in &args[1..] {
+                                    mark_write_builtin_vars(a, excluded);
+                                    // `let`/`(( ))`/`eval` args are
+                                    // EXPRESSIONS ("i++") — mark EVERY
+                                    // identifier they touch so a lifted
+                                    // native binding never desyncs from
+                                    // the runtime's store write
+                                    mark_all_idents_args(a, string_ctx);
                                 }
-                                if !intdecl.is_empty() {
-                                    if let IrExpr::Str(sv, _) = a {
-                                        if !sv.contains('=') && intdecl.iter().any(|n| n == sv) {
-                                            continue;
-                                        }
-                                    }
-                                }
-                                mark_write_builtin_vars(a, excluded);
-                                // `let`/`(( ))`/`eval` args are EXPRESSIONS
-                                // ("i++") — mark EVERY identifier they touch
-                                // so a lifted native binding never desyncs
-                                // from the runtime's store write
-                                mark_all_idents_args(a, string_ctx);
                             }
                         }
                     }
@@ -4150,32 +4166,24 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                             | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source" | "."
                     ) {
                         // natively-lowered `let` args (try_native_let) and
-                        // the bare names of `typeset -i` declarations are
-                        // not store writes — skip their marks (mirror of
-                        // the expression-position block; a natively-written
-                        // var must not stay store-bound, and a runtime-
-                        // written var must not lift).
+                        // a VALIDATED `-i` declaration (int_declare_names)
+                        // are not store writes — skip their marks for the
+                        // WHOLE call (mirror of the expression-position
+                        // block; the old per-name skip was defeated by the
+                        // Array wrapper + flag letters — see above).
                         let native_let = cname == "let" && arith_let_args_native(args);
                         let intdecl = if cname == "let" { Vec::new() } else {
                             int_declare_names(args).unwrap_or_default()
                         };
-                        for a in args {
-                            if native_let {
-                                continue;
+                        if !(native_let || !intdecl.is_empty()) {
+                            for a in args {
+                                mark_write_builtin_vars(a, excluded);
+                                // `let`/`(( ))`/`eval` args are ARITHMETIC
+                                // EXPRESSIONS — mark EVERY identifier they
+                                // touch so a lifted native binding never
+                                // desyncs from a runtime store write
+                                mark_all_idents_args(a, string_ctx);
                             }
-                            if !intdecl.is_empty() {
-                                if let IrExpr::Str(sv, _) = a {
-                                    if !sv.contains('=') && intdecl.iter().any(|n| n == sv) {
-                                        continue;
-                                    }
-                                }
-                            }
-                            mark_write_builtin_vars(a, excluded);
-                            // `let`/`(( ))`/`eval` args are ARITHMETIC
-                            // EXPRESSIONS — mark EVERY identifier they
-                            // touch so a lifted native binding never
-                            // desyncs from a runtime store write
-                            mark_all_idents_args(a, string_ctx);
                         }
                     }
                 }
@@ -4297,6 +4305,11 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 }
             }
             IrStmt::Exec { args, .. } => {
+                // a native `(( ))` / `let` statement's written vars and an
+                // `-i` declaration's bare names are numeric assignment
+                // sources (see collect_native_arith_sources) — the lift
+                // fixpoint needs them exactly like IrStmt::Assign sources
+                collect_native_arith_sources(args, assigns);
                 for a in args {
                     collect_expr_assigns(a, assigns);
                 }
@@ -4332,7 +4345,12 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                     collect_assigns(st, assigns);
                 }
             }
-            IrExpr::Call { args, .. } => {
+            IrExpr::Call { func, args } => {
+                if func == "exec" {
+                    // the statement-form `(( ))` / `let` / `typeset -i`
+                    // (mirror of the IrStmt::Exec arm above)
+                    collect_native_arith_sources(args, assigns);
+                }
                 for a in args {
                     collect_expr_assigns(a, assigns);
                 }
@@ -10440,6 +10458,23 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                         mark_str_args(a, string_ctx);
                     }
                 }
+                // a native `((i++))` / `let` inside a subshell/background
+                // writes a COPY in bash — a lifted module binding would be
+                // clobbered by the arrow (mirror of the numeric-lift
+                // twin's exclusion), so mark the written vars excluded.
+                if in_copy && let_args_native {
+                    if let [IrExpr::Str(_cn, _), IrExpr::Array(cargs)] = args.as_slice() {
+                        for a in cargs {
+                            if let IrExpr::Str(sv, _) = a {
+                                if let Some(ast) = parse_arith_native(sv) {
+                                    for w in arith_written_vars(&ast) {
+                                        excluded.insert(w.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // `${x:=d}` WRITES the variable. The native lowering updates
                 // the JS binding via an assignment expression — but a
                 // default that cannot be fully inlined (a `$` ref to a
@@ -10471,31 +10506,30 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                                 | "."
                         ) {
                             // A natively-lowered `let` (try_native_let — the
-                            // runtime never sees the args) and the bare
-                            // names of `typeset -i` declarations (numeric
-                            // witnesses — native number bindings) are not
-                            // store writes: skip the marks for them.
+                            // runtime never sees the args) and a VALIDATED
+                            // `-i` declaration (int_declare_names — the
+                            // declare writes nothing and references
+                            // nothing) are not store writes: skip the marks
+                            // for the WHOLE call. (The old per-name skip
+                            // was defeated by the exec arg shape — the
+                            // names live inside the Array wrapper at
+                            // args[1], so only the bare Str args matched,
+                            // while the `-i` flag's letters still marked
+                            // the name store-bound via mark_all_idents.)
                             let native_let = cname == "let" && let_args_native;
                             let intdecl = if cname == "let" { Vec::new() } else {
                                 int_declare_names(args).unwrap_or_default()
                             };
-                            for a in &args[1..] {
-                                if native_let {
-                                    continue;
+                            if !(native_let || !intdecl.is_empty()) {
+                                for a in &args[1..] {
+                                    mark_write_builtin_vars(a, excluded);
+                                    // `let`/`(( ))`/`eval` args are
+                                    // EXPRESSIONS ("i++") — mark EVERY
+                                    // identifier they touch so a lifted
+                                    // native binding never desyncs from
+                                    // the runtime's store write
+                                    mark_all_idents_args(a, string_ctx);
                                 }
-                                if !intdecl.is_empty() {
-                                    if let IrExpr::Str(sv, _) = a {
-                                        if !sv.contains('=') && intdecl.iter().any(|n| n == sv) {
-                                            continue;
-                                        }
-                                    }
-                                }
-                                mark_write_builtin_vars(a, excluded);
-                                // `let`/`(( ))`/`eval` args are EXPRESSIONS
-                                // ("i++") — mark EVERY identifier they touch
-                                // so a lifted native binding never desyncs
-                                // from the runtime's store write
-                                mark_all_idents_args(a, string_ctx);
                             }
                         }
                     }
@@ -10627,32 +10661,24 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                             | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source" | "."
                     ) {
                         // natively-lowered `let` args (try_native_let) and
-                        // the bare names of `typeset -i` declarations are
-                        // not store writes — skip their marks (mirror of
-                        // the expression-position block; a natively-written
-                        // var must not stay store-bound, and a runtime-
-                        // written var must not lift).
+                        // a VALIDATED `-i` declaration (int_declare_names)
+                        // are not store writes — skip their marks for the
+                        // WHOLE call (mirror of the expression-position
+                        // block; the old per-name skip was defeated by the
+                        // Array wrapper + flag letters — see above).
                         let native_let = cname == "let" && arith_let_args_native(args);
                         let intdecl = if cname == "let" { Vec::new() } else {
                             int_declare_names(args).unwrap_or_default()
                         };
-                        for a in args {
-                            if native_let {
-                                continue;
+                        if !(native_let || !intdecl.is_empty()) {
+                            for a in args {
+                                mark_write_builtin_vars(a, excluded);
+                                // `let`/`(( ))`/`eval` args are ARITHMETIC
+                                // EXPRESSIONS — mark EVERY identifier they
+                                // touch so a lifted native binding never
+                                // desyncs from a runtime store write
+                                mark_all_idents_args(a, string_ctx);
                             }
-                            if !intdecl.is_empty() {
-                                if let IrExpr::Str(sv, _) = a {
-                                    if !sv.contains('=') && intdecl.iter().any(|n| n == sv) {
-                                        continue;
-                                    }
-                                }
-                            }
-                            mark_write_builtin_vars(a, excluded);
-                            // `let`/`(( ))`/`eval` args are ARITHMETIC
-                            // EXPRESSIONS — mark EVERY identifier they
-                            // touch so a lifted native binding never
-                            // desyncs from a runtime store write
-                            mark_all_idents_args(a, string_ctx);
                         }
                     }
                 }
@@ -10765,6 +10791,12 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                 }
             }
             IrStmt::Exec { args, .. } => {
+                // mirror of the numeric-lift twin: a native `(( ))` / `let`
+                // write and an `-i` declaration are ARITHMETIC sources —
+                // they disqualify a var from the string lift (a store-var
+                // keeps the runtime's int coercion; a native binding would
+                // desync from the setVar the arith write emits)
+                collect_native_arith_sources(args, assigns);
                 for a in args {
                     collect_expr_assigns(a, assigns);
                 }
@@ -10800,7 +10832,10 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                     collect_assigns(st, assigns);
                 }
             }
-            IrExpr::Call { args, .. } => {
+            IrExpr::Call { func, args } => {
+                if func == "exec" {
+                    collect_native_arith_sources(args, assigns);
+                }
                 for a in args {
                     collect_expr_assigns(a, assigns);
                 }

@@ -1282,6 +1282,34 @@ mod tests {
     }
 
     #[test]
+    fn intdecl_and_arith_stmt_lift_to_native() {
+        // Plan 3: a bare `typeset -i i` is a numeric WITNESS (the
+        // SH2_ASSUME_INTDECL lift) and a native `((i++))` / `let` statement
+        // is an ARITH source — together they lift `i` to a native JS
+        // binding: the per-iteration setVar/getVar chain disappears and the
+        // statement lowers to a bare `++i` (no `sh2.*` calls at all).
+        let json = to_json("typeset -i i\n((i++))");
+        // the declare itself stays a runtime call (the attribute write);
+        // the ARITH STATEMENT is fully native — no setVar/getVar/arith
+        assert!(!json.contains("\"name\":\"setVar\""));
+        assert!(!json.contains("\"name\":\"getVar\""));
+        assert!(!json.contains("\"name\":\"arith\""));
+        assert!(!json.contains("\"name\":\"exec\""));
+        // `((i++))` emits a native postfix update — check for the operator
+        assert!(json.contains("\"operator\":\"++\""));
+        // a non-numeric source blocks the lift too (the runtime coerces
+        // `i=foo` to 0 via the typeset attribute — a native binding would
+        // desync from the store)
+        let json3 = to_json("typeset -i i\ni=foo\n((i++))");
+        assert!(json3.contains("\"name\":\"setVar\""));
+        assert!(json3.contains("\"name\":\"getVar\""));
+        // the same lift works through `let` statements without any declare
+        let json4 = to_json("((i++))");
+        assert!(!json4.contains("\"name\":\"setVar\""));
+        assert!(!json4.contains("\"name\":\"getVar\""));
+    }
+
+    #[test]
     fn shopt_and_cstyle_for_lower() {
         let json = to_json("shopt -s extglob");
         // the native shopt lowering: a direct `sh2.shoptState.set(opt, en)`
