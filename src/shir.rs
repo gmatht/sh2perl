@@ -67,6 +67,290 @@ static FUNCTION_STACK: Mutex<Vec<(String, HashSet<String>)>> = Mutex::new(Vec::n
 /// flag never turns on, so guard emission is skipped entirely for programs
 /// that provably never enable it.
 static MAY_ERREXIT: Mutex<Option<bool>> = Mutex::new(None);
+/// LastExit-write liveness (Plan 4): per-statement "the `sh2.lastExit`
+/// write this statement performs is DEAD (no read observes it before the
+/// next write / the block's status consumer)" flags, keyed by statement
+/// pointer (stable between the pre-pass and emission — the IR tree is
+/// immutable there, and the *Sync loop lowering emits the ORIGINAL body
+/// references, never clones). Set per compilation by `shir_to_estree` via
+/// [`compute_lastexit_deadness`]; the `(( ))` statement lowering drops the
+/// status ternary + lastExit writes when a statement's write is dead (keep
+/// the side effect). Unset → conservative.
+static LASTEXIT_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+fn lastexit_write_is_dead(stmt: &IrStmt) -> bool {
+    LASTEXIT_DEAD
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.get(&(stmt as *const IrStmt as usize)).copied().unwrap_or(false))
+        .unwrap_or(false)
+}
+
+/// Plan 4 lastExit-write liveness (see [`compute_lastexit_deadness`]).
+/// `ir_stmt_writes_lastexit` is the WRITER predicate: every runtime call
+/// records its own status to lastExit — EXCEPT the pure writers that
+/// return true WITHOUT touching it (`setVar`/`setArray`/`shopt`/`define`;
+/// `break`/`continue`/`return` leave it untouched — they are IrStmt::Expr
+/// control signals, and the runtime's `return`/`break` helpers are only
+/// reached through fnCall dispatch). An over-approximated writer would
+/// shadow a LIVE write and break `$?`, so the set is exactly the runtime
+/// truth.
+fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
+    match stmt {
+        IrStmt::Exec { cmd, redirects, env, .. } => {
+            if !redirects.is_empty() || !env.is_empty() {
+                return true; // the runtime dispatch records its own status
+            }
+            match cmd {
+                IrExpr::Str(name, _) => {
+                    !matches!(name.as_str(), "setVar" | "setArray" | "shopt" | "define")
+                }
+                _ => true,
+            }
+        }
+        // loops/subshells/redirects/if/pipeline leave a final status
+        // (the loop runtime writes `bodyLastExit`; an if's status is its
+        // run arm's final write; a redirect's status is its inner's).
+        IrStmt::While { .. }
+        | IrStmt::DoWhile { .. }
+        | IrStmt::For { .. }
+        | IrStmt::If { .. }
+        | IrStmt::Subshell(_)
+        | IrStmt::Background(_)
+        | IrStmt::Block(_)
+        | IrStmt::Redirect { .. }
+        | IrStmt::Pipeline { .. } => true,
+        // `setVar`-style expression statements (never lastExit writers)
+        IrStmt::Expr(IrExpr::Call { func, .. }) => {
+            !matches!(func.as_str(), "setVar" | "setArray" | "shopt" | "define" | "break" | "continue" | "return")
+        }
+        _ => false,
+    }
+}
+
+/// Does an expression observe the PREVIOUS exit status? `$?` lowers to
+/// `IrExpr::Var("?")` (a `sh2.lastExit` read); a `$?` inside an arith
+/// string stays the literal text (the runtime evalArith reads the status).
+/// Over-approximated (single-quoted literal "$?" text included) — a
+/// spurious reader only keeps a write live (safe).
+fn ir_expr_reads_status(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Var(name, _) => name == "?",
+        IrExpr::Str(s, _) => s.contains("$?"),
+        IrExpr::Index { key, .. } => ir_expr_reads_status(key),
+        IrExpr::BinOp { lhs, rhs, .. } => ir_expr_reads_status(lhs) || ir_expr_reads_status(rhs),
+        IrExpr::Call { func, args } => {
+            // `$?` at word level lowers to `sh2.getVar("?")` (the runtime
+            // special-cases it to lastExit) — the Var("?") form appears
+            // on the lifted/native path
+            args.iter().any(ir_expr_reads_status)
+                || (func == "getVar"
+                    && matches!(args.as_slice(), [IrExpr::Str(n, _)] if n == "?"))
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            ir_expr_reads_status(obj) || args.iter().any(ir_expr_reads_status)
+        }
+        IrExpr::Ternary { cond, then, else_, .. } => {
+            ir_expr_reads_status(cond) || ir_expr_reads_status(then) || ir_expr_reads_status(else_)
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            ir_expr_reads_status(expr) || ir_expr_reads_status(default)
+        }
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            InterpPart::Lit(s) => s.contains("$?"),
+            InterpPart::Expr(e) => ir_expr_reads_status(e),
+        }),
+        // a command substitution inherits `$?` (bash runs it in a
+        // subshell) — the wrapped command may read the status
+        IrExpr::Capture { expr, .. } => ir_expr_reads_status(expr),
+        IrExpr::Array(items) => items.iter().any(ir_expr_reads_status),
+        // numeric literal range `start..end` — never a status read
+        IrExpr::Range { .. } => false,
+        IrExpr::Arrow(stmts) => ir_stmts_read_status(stmts),
+        _ => false,
+    }
+}
+
+fn ir_stmts_read_status(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(ir_stmt_reads_status)
+}
+
+/// Does a STATEMENT observe the previous exit status (so a write before it
+/// is live)? Readers: `and`/`or` (branch on the previous status), native
+/// `&&`/`||` (the `sh2.lastExit === 0` test), `exit`/`return` with no arg
+/// (carry the previous status), every `$?` expansion, and — transitively —
+/// a subshell/function/background body whose first actions may read the
+/// inherited status. Over-approximated: a spurious reader keeps a write
+/// live (safe); a MISSED reader would drop a live write (never).
+fn ir_stmt_reads_status(stmt: &IrStmt) -> bool {
+    match stmt {
+        IrStmt::Exec { cmd, args, .. } => {
+            if args.iter().any(ir_expr_reads_status) || ir_expr_reads_status(cmd) {
+                return true;
+            }
+            matches!(cmd, IrExpr::Str(name, _) if matches!(name.as_str(), "and" | "or" | "exit" | "return"))
+        }
+        IrStmt::Expr(e) => match e {
+            IrExpr::BinOp { op, .. } => matches!(op, BinOpKind::And | BinOpKind::Or),
+            IrExpr::Call { func, args } => {
+                args.iter().any(ir_expr_reads_status)
+                    || matches!(
+                        func.as_str(),
+                        "and" | "or" | "exit" | "return"
+                    )
+            }
+            other => ir_expr_reads_status(other),
+        },
+        IrStmt::While { cond, .. } | IrStmt::If { cond, .. } => ir_expr_reads_status(cond),
+        IrStmt::DoWhile { cond, .. } => ir_expr_reads_status(cond),
+        IrStmt::For { iter, .. } => ir_expr_reads_status(iter),
+        IrStmt::Assign { expr, .. } => ir_expr_reads_status(expr),
+        IrStmt::Declare { init, .. } => init.as_ref().map(ir_expr_reads_status).unwrap_or(false),
+        IrStmt::Output { value, .. } => ir_expr_reads_status(value),
+        IrStmt::WriteFile { path, content, .. } => {
+            ir_expr_reads_status(path) || ir_expr_reads_status(content)
+        }
+        IrStmt::Return(opt) => opt.as_ref().map(ir_expr_reads_status).unwrap_or(true),
+        IrStmt::Exit(opt) => opt.as_ref().map(ir_expr_reads_status).unwrap_or(true),
+        // subshell/background bodies may read the inherited status
+        IrStmt::Subshell(body) | IrStmt::Background(body) => ir_stmts_read_status(body),
+        IrStmt::Function { body, .. } => ir_stmts_read_status(body),
+        IrStmt::Redirect { inner, redirects } => {
+            ir_stmts_read_status(inner)
+                || redirects.iter().any(|r| match r {
+                    IrRedirect { fd: _, target, .. } => ir_expr_reads_status(target),
+                })
+        }
+        _ => false,
+    }
+}
+
+/// The statement-level `(( ))` / `let ARITH...` that lowers via
+/// [`try_native_let`] — the ONLY droppable lastExit writer (the status
+/// ternary exists solely to record lastExit + the boolean value). Matches
+/// both statement carriers (the general `IrStmt::Expr(Call("exec", …))`
+/// form and the `IrStmt::Exec` form).
+fn is_native_let_stmt(stmt: &IrStmt) -> bool {
+    match stmt {
+        IrStmt::Expr(IrExpr::Call { func, args, .. }) => {
+            func == "exec"
+                && matches!(args.as_slice(), [IrExpr::Str(n, _), IrExpr::Array(_)] if n == "let")
+        }
+        IrStmt::Exec { cmd, args, .. } => {
+            matches!(cmd, IrExpr::Str(n, _) if n == "let")
+                && matches!(args.as_slice(), [IrExpr::Str(n2, _), IrExpr::Array(_)] if n2 == "let")
+        }
+        _ => false,
+    }
+}
+
+/// Plan 4 — backward block scan: a statement's lastExit write is LIVE iff
+/// a reader (or the block's status consumer) observes it before the next
+/// writer. `end_live`: does the BLOCK's consumer read the block's final
+/// status? (loop runtime reads `this.lastExit` after the body; the program
+/// runner's final status; if-arm flows to the if's own liveness...)
+fn scan_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mut HashSet<usize>) {
+    let mut read_pending = end_live;
+    for stmt in stmts.iter().rev() {
+        eprintln!("DBGscan w={} r={} pending={} stmt={:?}", ir_stmt_writes_lastexit(stmt), ir_stmt_reads_status(stmt), read_pending, stmt);
+        if ir_stmt_writes_lastexit(stmt) {
+            if read_pending {
+                live.insert(stmt as *const IrStmt as usize);
+                read_pending = false;
+            }
+            // else: shadowed — dead (unless a reader between the write
+            // and the next writer observed it — handled above)
+        }
+        if ir_stmt_reads_status(stmt) {
+            read_pending = true;
+        }
+    }
+}
+
+fn walk_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mut HashSet<usize>) {
+    scan_lastexit_liveness(stmts, end_live, live);
+    for stmt in stmts {
+        let self_live = live.contains(&(stmt as *const IrStmt as usize));
+        match stmt {
+            IrStmt::While { body, .. } | IrStmt::For { body, .. } | IrStmt::Block(body) => {
+                walk_lastexit_liveness(body, self_live, live);
+            }
+            IrStmt::DoWhile { body, .. } => walk_lastexit_liveness(body, self_live, live),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                walk_lastexit_liveness(then, self_live, live);
+                for (_, arm) in elsifs {
+                    walk_lastexit_liveness(arm, self_live, live);
+                }
+                walk_lastexit_liveness(else_, self_live, live);
+            }
+            IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                walk_lastexit_liveness(body, self_live, live);
+            }
+            IrStmt::Redirect { inner, .. } => walk_lastexit_liveness(inner, self_live, live),
+            // a called function's status is recorded by fnCall — treat as
+            // live (conservative; refining to call-site liveness is a
+            // future plan entry)
+            IrStmt::Function { body, .. } => walk_lastexit_liveness(body, true, live),
+            _ => {}
+        }
+    }
+}
+
+/// Mark DEAD every native `(( ))` statement whose lastExit write is not in
+/// the live set (droppable) — only if its args actually parse natively
+/// (the ternary only exists on the `try_native_let` path).
+fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMap<usize, bool>) {
+    for stmt in stmts {
+        if is_native_let_stmt(stmt) && !live.contains(&(stmt as *const IrStmt as usize)) {
+            let args = match stmt {
+                IrStmt::Exec { args, .. } | IrStmt::Expr(IrExpr::Call { args, .. }) => args,
+                _ => unreachable!("is_native_let_stmt matched"),
+            };
+            if let [IrExpr::Str(_, _), IrExpr::Array(a)] = args.as_slice() {
+                if a.iter().all(|arg| match arg {
+                    IrExpr::Str(sv, _) => parse_arith_native(sv).is_some(),
+                    _ => false,
+                }) {
+                    dead.insert(stmt as *const IrStmt as usize, true);
+                }
+            }
+        }
+        match stmt {
+            IrStmt::While { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => mark_lastexit_dead(body, live, dead),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                mark_lastexit_dead(then, live, dead);
+                for (_, arm) in elsifs {
+                    mark_lastexit_dead(arm, live, dead);
+                }
+                mark_lastexit_dead(else_, live, dead);
+            }
+            IrStmt::Redirect { inner, .. } => mark_lastexit_dead(inner, live, dead),
+            IrStmt::Function { body, .. } => mark_lastexit_dead(body, live, dead),
+            _ => {}
+        }
+    }
+}
+
+/// Plan 4 — compute the per-statement lastExit-write deadness map. Runs in
+/// `shir_to_estree` before emission (the IR tree is immutable there). A
+/// possible `set -e` guard-wraps every top-level statement (the guard
+/// consumes the statement's value) — under errexit NO write is droppable
+/// and the pass returns empty.
+fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, bool> {
+    let mut dead = HashMap::new();
+    if errexit {
+        return dead;
+    }
+    let mut live: HashSet<usize> = HashSet::new();
+    walk_lastexit_liveness(&prog.stmts, true, &mut live);
+    mark_lastexit_dead(&prog.stmts, &live, &mut dead);
+    dead
+}
 /// Builtins the runtime implements as SYNC functions (harness
 /// sh2-namespace.mjs `builtins.*` — every non-async entry of builtins.json
 /// plus `test`, the bash test builtin the runtime implements on top of its
@@ -4144,6 +4428,11 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // after the lift/scan statics above (the optimistic body emission reads
     // them) and before the main emission (the fn-call sites consult it).
     *SYNC_FN_CALLS.lock().unwrap() = Some(fn_call_sync_set(prog, &functions));
+    // Plan 4 — lastExit-write liveness: which `(( ))` statements' status
+    // writes are unread (empty under a possible `set -e`). Runs before the
+    // emission (the IR tree is immutable here — the *Sync loop bodies are
+    // emitted from the ORIGINAL references, so the pointer keys hold).
+    *LASTEXIT_DEAD.lock().unwrap() = Some(compute_lastexit_deadness(prog, errexit));
     let mut body: Vec<Stmt> = Vec::new();
     // `let x = 0` (numeric) / `let x = ""` (string) at program top. bash
     // reads an unset var as 0 in arithmetic and "" as a string.
@@ -5120,9 +5409,24 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 expression: not_native(inner),
             }
         }
-        IrStmt::Expr(e) => Stmt::ExpressionStatement {
-            expression: expr_to_estree(e),
-        },
+        IrStmt::Expr(e) => {
+            // Plan 4: a native `(( ))` / `let ARITH` statement whose
+            // lastExit write is provably unread — the expr rewrite (below)
+            // would emit the status ternary + lastExit writes; drop them,
+            // keep the side effects (a bare `++i` in the hot loop). Never
+            // fired under a possible `set -e` (the guard consumes the
+            // value); conditions never reach this statement arm.
+            if let IrExpr::Call { func, args, .. } = e {
+                if func == "exec" && lastexit_write_is_dead(stmt) {
+                    if let Some(dead) = try_native_let_dead(args) {
+                        return Some(Stmt::ExpressionStatement { expression: dead });
+                    }
+                }
+            }
+            Stmt::ExpressionStatement {
+                expression: expr_to_estree(e),
+            }
+        }
         IrStmt::Assign { targets, expr } => {
             let target = &targets[0];
             if is_lifted(&target.var) && target.indices.is_empty() {
@@ -5271,12 +5575,12 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         }
         IrStmt::For { var, iter, body } => {
             let js_var = safe_ident(var);
-            let mut body_stmts = vec![];
+            let mut coercion: Option<IrStmt> = None;
             if is_lifted_num(var) {
                 // the forLoop items arrive as strings; coerce the param to
                 // a number in place (the closure param shadows the module
                 // let — a self-assign is exactly the coercion we want)
-                body_stmts.push(IrStmt::Assign {
+                coercion = Some(IrStmt::Assign {
                     targets: vec![AssignTarget {
                         var: var.clone(),
                         sigil: None,
@@ -5289,7 +5593,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 });
             } else if !is_lifted(var) {
                 // store sync (non-lifted loop var)
-                body_stmts.push(IrStmt::Assign {
+                coercion = Some(IrStmt::Assign {
                     targets: vec![AssignTarget {
                         var: var.clone(),
                         sigil: None,
@@ -5298,9 +5602,22 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     expr: IrExpr::Ident(js_var.clone()),
                 });
             }
+            // owned body (coercion + clones) for the async fallback
+            let mut body_stmts: Vec<IrStmt> = vec![];
+            if let Some(c) = &coercion {
+                body_stmts.push(c.clone());
+            }
             body_stmts.extend(body.clone());
             let iter_e = expr_to_estree(iter);
-            let body_e: Vec<Stmt> = body_stmts.iter().filter_map(stmt_to_estree).collect();
+            // the *Sync path emits the ORIGINAL body references — the
+            // liveness pre-pass (compute_lastexit_deadness) keys by
+            // statement pointer, so the loop bodies' dead-write marks must
+            // resolve to the same objects (clones would miss).
+            let body_e: Vec<Stmt> = coercion
+                .iter()
+                .chain(body.iter())
+                .filter_map(stmt_to_estree)
+                .collect();
             // Fast path: a provably-sync loop (the BODY needs no `await`)
             // lowers to the synchronous runtime loop — identical semantics
             // (flattening, GLOB_MAGIC items, BREAK/CONTINUE/RETURN signals,
@@ -5517,6 +5834,19 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 if let IrExpr::Str(name, _) = cmd {
                     if name == "let" {
                         if let Some(native) = try_native_let(args) {
+                            // Plan 4: the statement's lastExit write is
+                            // provably unread (compute_lastexit_deadness)
+                            // — drop the status ternary + lastExit writes,
+                            // keep the side effects (a bare `++i` in the
+                            // hot loop). Never fired under a possible
+                            // `set -e` (the guard consumes the value).
+                            if lastexit_write_is_dead(stmt) {
+                                if let Some(dead) = try_native_let_dead(args) {
+                                    return Some(Stmt::ExpressionStatement {
+                                        expression: dead,
+                                    });
+                                }
+                            }
                             return Some(Stmt::ExpressionStatement { expression: native });
                         }
                     }
@@ -7041,6 +7371,36 @@ fn try_native_let(args: &[IrExpr]) -> Option<Expr> {
                 parts.push(cond);
                 return Some(seq(parts));
             }
+        }
+    }
+    None
+}
+
+/// The DEAD-write twin of [`try_native_let`] (Plan 4 — see
+/// [`compute_lastexit_deadness`]): identical eligibility, but the status
+/// ternary + lastExit writes are dropped — the write is provably unread
+/// (no `$?`/status reader observes it before the next write or the block's
+/// consumer). The side effects stay: every arg is evaluated in order (a
+/// write-ful last arg runs its increment exactly once, as its expression's
+/// value), and the statement's value is the last arg's value (dropped by
+/// the ExpressionStatement — the value was only consumed via the ternary).
+fn try_native_let_dead(args: &[IrExpr]) -> Option<Expr> {
+    if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args {
+        if name == "let" && !a.is_empty() {
+            let mut vals: Vec<Expr> = Vec::new();
+            for arg in a {
+                match arg {
+                    IrExpr::Str(sv, _) => match parse_arith_native(sv) {
+                        Some(ast) => vals.push(arith_to_estree(&ast)),
+                        None => return None,
+                    },
+                    _ => return None,
+                }
+            }
+            if vals.len() == 1 {
+                return vals.pop();
+            }
+            return Some(seq(vals));
         }
     }
     None
