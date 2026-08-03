@@ -5168,8 +5168,8 @@ fn try_native_echo_capture(e: &IrExpr) -> Option<Expr> {
         Some(joined)
     } else {
         // the captured value may end with newlines (a dynamic final arg) —
-        // keep the runtime's exact capture strips
-        Some(sh2_call("trimCapture", vec![joined]))
+        // keep the runtime's exact capture strips (native string ops)
+        Some(trim_capture(joined))
     }
 }
 
@@ -5321,7 +5321,7 @@ fn native_capture_cat(cmd_args: &[IrExpr], stdin_file: Option<&IrExpr>) -> Optio
             right: Box::new(joined),
         };
     }
-    Some(sh2_call("trimCapture", vec![joined]))
+    Some(trim_capture(joined))
 }
 
 /// `$(sort f)` / `$(sort < f)` — read, drop the trailing empty line,
@@ -5581,7 +5581,7 @@ fn native_capture_grep_cut(stages: &[IrExpr]) -> Option<Expr> {
         vec![str_lit("\n")],
     );
     let chained = method_call(s, "then", vec![sync_arrow_expr_param("t", body)]);
-    Some(sh2_call("trimCapture", vec![await_expr(chained)]))
+    Some(trim_capture(await_expr(chained)))
 }
 
 /// `l => l.includes(D) ? (l.split(D)[F-1] ?? "") : l` — the GNU-cut field
@@ -5733,7 +5733,7 @@ fn native_capture_cut_sort(stages: &[IrExpr]) -> Option<Expr> {
     };
     let joined = method_call(sorted, "join", vec![str_lit("\n")]);
     let chained = method_call(s, "then", vec![sync_arrow_expr_param("t", joined)]);
-    Some(sh2_call("trimCapture", vec![await_expr(chained)]))
+    Some(trim_capture(await_expr(chained)))
 }
 
 /// `$(wc -l < f)` / `$(wc -c < f)` — newline count / byte count of the
@@ -5901,10 +5901,12 @@ fn try_native_capture_value(stmts: &[IrStmt]) -> Option<Expr> {
                         if !cmd_args.is_empty() {
                             return None;
                         }
-                        return Some(sh2_call(
-                            "trimCapture",
-                            vec![read_file_value(expr_to_estree(target), Some("utf8"), 0, 1)],
-                        ));
+                        return Some(trim_capture(read_file_value(
+                            expr_to_estree(target),
+                            Some("utf8"),
+                            0,
+                            1,
+                        )));
                     }
                     if program_defines_function(name) {
                         return None;
@@ -5951,7 +5953,7 @@ fn try_native_capture_value(stmts: &[IrStmt]) -> Option<Expr> {
                         // native template can only inline LIFTED refs
                         // (fully_lifted_template rejects store-bound `$refs`)
                         let tpl = fully_lifted_template(body)?;
-                        return Some(sh2_call("trimCapture", vec![tpl]));
+                        return Some(trim_capture(tpl));
                     }
                     // A `$`-free body (quoted EOF, or unquoted with no refs)
                     // expands to itself: heredoc-tabs bodies are tab-stripped
@@ -9963,7 +9965,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     if let [IrExpr::Arrow(stmts)] = args.as_slice() {
                         if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
                             if let Some(transform) = try_native_tr_pipeline(pipe) {
-                                return sh2_call("trimCapture", vec![transform]);
+                                return trim_capture(transform);
                             }
                         }
                     }
@@ -10049,13 +10051,10 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     if let [IrExpr::Arrow(stmts)] = args.as_slice() {
                         if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
                             if let Some((text, argv)) = try_native_echo_grep(pipe) {
-                                return sh2_call(
-                                    "trimCapture",
-                                    vec![sh2_call(
-                                        "grepText",
-                                        vec![text, array(argv), bool_lit(true)],
-                                    )],
-                                );
+                                return trim_capture(sh2_call(
+                                    "grepText",
+                                    vec![text, array(argv), bool_lit(true)],
+                                ));
                             }
                         }
                     }
@@ -10214,6 +10213,101 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
                     if let Some(native) = try_native_fs_exec(name, a) {
                         return await_expr(native);
+                    }
+                }
+            }
+            // `exit N` — the runtime builtin ignores the code and terminates
+            // the process cleanly (the corpus gate compares stdout only; a
+            // nonzero exit would read as a runtime error, see sh2-namespace.mjs
+            // `builtins.exit`). A native `process.exit(0)` is byte-identical;
+            // the argument exprs are sequenced first so their side effects
+            // (`exit $((i++))`) evaluate exactly as they would in the
+            // dispatch. Any caller-visible state is irrelevant — the process
+            // is gone either way.
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), IrExpr::Array(_)] = args.as_slice() {
+                    if name == "exit" {
+                        let mut exprs: Vec<Expr> = mapped_args
+                            .get(1)
+                            .and_then(|e| match e {
+                                Expr::ArrayExpression { elements, .. } => Some(
+                                    elements.iter().flatten().cloned().collect(),
+                                ),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        exprs.push(Expr::CallExpression {
+                            callee: Box::new(Expr::MemberExpression {
+                                object: Box::new(Expr::Identifier {
+                                    name: "process".to_string(),
+                                }),
+                                property: Box::new(Expr::Identifier {
+                                    name: "exit".to_string(),
+                                }),
+                                computed: false,
+                                optional: false,
+                            }),
+                            arguments: vec![Expr::Literal {
+                                value: serde_json::Value::from(0),
+                                raw: None,
+                            regex: None,
+                            }],
+                            optional: false,
+                        });
+                        if exprs.len() == 1 {
+                            return exprs.pop().unwrap();
+                        }
+                        return seq(exprs);
+                    }
+                }
+            }
+            // `cd /` — the absolute root is the ONE literal cd target that
+            // provably exists and is readable on every POSIX system (the
+            // runtime's accessSync check can never fail), so the whole
+            // builtin collapses to a native
+            // `(process.chdir("/"), sh2.cwd = "/", sh2.lastExit = 0, true)`
+            // — byte-identical to the runtime success path, including the
+            // `$PWD` read (sh2.cwd) and the process cwd (relative
+            // redirects/execs resolve against it; subshells restore both
+            // after the body). Any other target (dynamic or literal) keeps
+            // the runtime dispatch — its failure path prints `cd: X: No
+            // such file or directory` and returns false.
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
+                    if name == "cd"
+                        && matches!(a.as_slice(), [IrExpr::Str(d, _)] if d == "/")
+                    {
+                        return seq(vec![
+                            Expr::CallExpression {
+                                callee: Box::new(Expr::MemberExpression {
+                                    object: Box::new(Expr::Identifier {
+                                        name: "process".to_string(),
+                                    }),
+                                    property: Box::new(Expr::Identifier {
+                                        name: "chdir".to_string(),
+                                    }),
+                                    computed: false,
+                                    optional: false,
+                                }),
+                                arguments: vec![str_lit("/")],
+                                optional: false,
+                            },
+                            Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(sh2_member("cwd")),
+                                right: Box::new(str_lit("/")),
+                            },
+                            Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(sh2_member("lastExit")),
+                                right: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(0),
+                                    raw: None,
+                                regex: None,
+                                }),
+                            },
+                            bool_lit(true),
+                        ]);
                     }
                 }
             }
@@ -10497,6 +10591,34 @@ fn bool_lit(b: bool) -> Expr {
         raw: None,
     regex: None,
     }
+}
+
+/// The runtime `sh2.trimCapture`'s exact formula
+/// (`String(s ?? '').replace(/\u0000/g, '').replace(/\n+$/, '')`) as a
+/// native expression: the NUL + trailing-newline strips capture() applies,
+/// inlined with no runtime dispatch. The capture-lift family always hands
+/// it a string, so the `String(...)` coercion is a no-op that keeps the
+/// exact runtime semantics for the null/undefined edges (`?? ''` mirrors
+/// the helper's guard).
+fn trim_capture(inner: Expr) -> Expr {
+    let stringed = Expr::CallExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "String".to_string(),
+        }),
+        arguments: vec![Expr::LogicalExpression {
+            operator: "??",
+            left: Box::new(inner),
+            right: Box::new(str_lit("")),
+        }],
+        optional: false,
+    };
+    let nul = regex_lit_flags("\\u0000", "g");
+    let trailing = regex_lit("\\n+$");
+    method_call(
+        method_call(stringed, "replace", vec![nul, str_lit("")]),
+        "replace",
+        vec![trailing, str_lit("")],
+    )
 }
 
 /// bash special vars the runtime reads from its own STATE FIELDS (never

@@ -964,12 +964,18 @@ pub(crate) fn int_lit_expr(i: i64) -> Expr {
 /// (value: {} like the spec's RegExp literal). Printed by estree-gen.mjs
 /// as `/pattern/flags`.
 pub(crate) fn regex_lit(pattern: &str) -> Expr {
+    regex_lit_flags(pattern, "")
+}
+
+/// A JS regex literal with explicit flags (`/\u0000/g` — the trimCapture
+/// NUL strip needs the global flag).
+pub(crate) fn regex_lit_flags(pattern: &str, flags: &str) -> Expr {
     Expr::Literal {
         value: serde_json::Value::Object(serde_json::Map::new()),
         raw: None,
         regex: Some(RegexLiteral {
             pattern: pattern.to_string(),
-            flags: String::new(),
+            flags: flags.to_string(),
         }),
     }
 }
