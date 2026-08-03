@@ -7235,6 +7235,203 @@ fn try_native_tr_pipeline(pipe: &IrExpr) -> Option<Expr> {
 }
 
 
+/// `echo ARGS | grep [FLAGS] PAT` — exactly two pipeline stages, no
+/// redirects on either stage: the whole pipeline (async machinery, fd
+/// swapping, the grep subprocess spawn) collapses to ONE sync runtime
+/// call `sh2.grepText(text, argv, captureMode)` — the runtime mini-grep
+/// runs the line filter over the echoed text with exact GNU grep
+/// semantics for the supported flag set (see sh2-namespace.mjs
+/// `grepText`). The helper emits through the CURRENT fd-1 sink (module
+/// stdout at statement level, the capture buffer under `$(...)`, the
+/// redirect target under `> file` — exactly where the pipeline's last
+/// stage would write) and records `sh2.lastExit` (grep's status: 0 iff
+/// any line was selected) — the pipeline's two observable effects, byte-
+/// identical. Conservative: echo args must be natively joinable
+/// (echo_join_args guardrails — no glob/PS markers, no script-defined
+/// echo), every grep arg must be a static string, flags restricted to
+/// the set the runtime mini-grep implements (v/i/n/c/o/q/x single flags
+/// incl. combined shorts, A/B/C/m with an integer value, e/E/F, `--`),
+/// no FILE operands, at least one pattern, and patterns must be free of
+/// GNU-extension escapes (`\<` `\>` `\b` `\w` ...) whose JS-regex
+/// meaning differs.
+fn try_native_echo_grep(pipe: &IrExpr) -> Option<(Expr, Vec<Expr>)> {
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() != 2 {
+        return None;
+    }
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return None;
+    };
+    // stage 1: exec("echo", args) — the exact bytes echo writes (the
+    // runtime's join + `-e` escape processing + trailing newline)
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return None;
+    };
+    if f1 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
+        return None;
+    };
+    if name1 != "echo" {
+        return None;
+    }
+    let (joined, no_newline, _) = echo_join_args(echo_args)?;
+    let text = if no_newline {
+        joined
+    } else {
+        Expr::BinaryExpression {
+            operator: "+",
+            left: Box::new(joined),
+            right: Box::new(str_lit("\n")),
+        }
+    };
+    // stage 2: exec("grep", args)
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
+        return None;
+    };
+    if f2 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name2, _), IrExpr::Array(grep_args)] = a2.as_slice() else {
+        return None;
+    };
+    if name2 != "grep" {
+        return None;
+    }
+    let argv = grep_argv_safe(grep_args)?;
+    Some((text, argv))
+}
+
+/// The static text of an IR expression: a plain `Str` or a quoted word
+/// with no expansions (an all-literal Interpolate — `"hello"` arrives as
+/// Interpolate, not Str). Used by the grep-argv validator to accept both.
+fn static_text(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(s) => out.push_str(s),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Validate a grep argv (minus the command name) for the runtime mini-grep
+/// lift: every arg a static string (plain Str or an expansion-free quoted
+/// word); flags from the supported set (`--` ends options; single
+/// v/i/n/c/o/q/x — combined shorts allowed; -A/-B/-C/-m each followed by
+/// an integer; -e/-E/-F — the -e VALUE is a pattern); at most one
+/// positional arg (the pattern — any further positional is a FILE operand
+/// and keeps the runtime); at least one pattern total. The returned argv
+/// is the same static-string list, ready to hand to the runtime parser
+/// verbatim.
+fn grep_argv_safe(args: &[IrExpr]) -> Option<Vec<Expr>> {
+    let mut out: Vec<Expr> = Vec::new();
+    let mut positionals = 0usize;
+    let mut patterns = 0usize;
+    let mut after_dd = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let av = static_text(&args[i])?; // dynamic (template) arg → runtime
+        if !after_dd && av.starts_with('-') && av.len() > 1 {
+            let mut pushed = false;
+            match av.as_str() {
+                "--" => after_dd = true,
+                "-e" | "-E" | "-F" => {}
+                "-A" | "-B" | "-C" | "-m" => {
+                    let v = static_text(args.get(i + 1)?)?;
+                    if v.parse::<u64>().is_err() {
+                        return None;
+                    }
+                    out.push(str_lit(&av));
+                    out.push(str_lit(&v));
+                    pushed = true;
+                    i += 1;
+                }
+                s if s.len() > 1
+                    && s[1..].chars().all(|c| matches!(c, 'v' | 'i' | 'n' | 'c' | 'o' | 'q' | 'x')) =>
+                {
+                    // single-char flags, possibly combined (`-vi`)
+                }
+                _ => return None, // unknown flag (-w/-b/-r/-f/-l/-L/--color...) → runtime
+            }
+            if !pushed {
+                out.push(str_lit(&av));
+            }
+            if av == "-e" {
+                // the -e VALUE is the pattern — static + safe, or no lift
+                let p = static_text(args.get(i + 1)?)?;
+                if !grep_pattern_safe(&p) {
+                    return None;
+                }
+                out.push(str_lit(&p));
+                patterns += 1;
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // positional: the first is the pattern, any further is a FILE
+        positionals += 1;
+        if positionals > 1 {
+            return None;
+        }
+        if !grep_pattern_safe(&av) {
+            return None;
+        }
+        out.push(str_lit(&av));
+        patterns += 1;
+        i += 1;
+    }
+    if patterns == 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// A pattern is liftable to the JS regex engine only when its escapes are
+/// unambiguous: GNU-extension escapes (`\<` `\>` word boundaries, `\b`
+/// `\w` `\s` `\d` ... — backslash followed by an ASCII letter/digit)
+/// mean different things in JS, and a real newline would cross the line
+/// structure. Backslash + punctuation is fine (BRE/ERE escapes — `\+`
+/// `\(` `\.` — the runtime's converter maps them exactly).
+fn grep_pattern_safe(pat: &str) -> bool {
+    if pat.contains('\n') {
+        return false;
+    }
+    let bytes = pat.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            if i + 1 >= bytes.len() {
+                return false; // trailing backslash
+            }
+            if bytes[i + 1].is_ascii_alphanumeric() {
+                return false;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
 /// `$(echo args... | wc -l/-w/-c)` — the capture's pipeline is the sync
 /// echo builtin feeding the sync wc builtin: the captured value is a pure
 /// count over the echoed text, so the whole capture+pipeline+spawn
@@ -9684,6 +9881,23 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         );
                     }
                 }
+                // `echo ARGS | grep [FLAGS] PAT` — a sync runtime mini-grep
+                // (see `try_native_echo_grep`): the pipeline's fd-1 write +
+                // exit status are the helper's emit + lastExit, so the
+                // async pipeline machinery and the grep subprocess spawn
+                // disappear. Sink-correct everywhere — the helper emits
+                // through the current fd-1 target (module stdout, capture
+                // buffer, redirect target), exactly where the pipeline's
+                // last stage would write — and the sync call keeps
+                // &&/||/if/while contexts on their native/`*Sync` paths.
+                if !program_defines_function("echo") && !program_defines_function("grep") {
+                    if let Some((text, argv)) = try_native_echo_grep(e) {
+                        return sh2_call(
+                            "grepText",
+                            vec![text, array(argv), bool_lit(false)],
+                        );
+                    }
+                }
             }
             // `echo args > file` / `echo args >> file` in EXPRESSION
             // position (&&/|| operands, if-conditions): the native file
@@ -9820,6 +10034,28 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
                             if let Some(value) = native_capture_seq_slice(pipe) {
                                 return value;
+                            }
+                        }
+                    }
+                }
+                // `$(echo ARGS | grep [FLAGS] PAT)` — the echo|grep
+                // capture: the sync mini-grep computes the matched text
+                // natively (no spawns, no async capture arrow, no fd
+                // swapping); trimCapture applies the capture's NUL +
+                // trailing-newline strips; the helper records lastExit =
+                // grep's status (0 iff any line was selected — the
+                // `$(grep ...)` status `$?` observes).
+                if !program_defines_function("echo") && !program_defines_function("grep") {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
+                            if let Some((text, argv)) = try_native_echo_grep(pipe) {
+                                return sh2_call(
+                                    "trimCapture",
+                                    vec![sh2_call(
+                                        "grepText",
+                                        vec![text, array(argv), bool_lit(true)],
+                                    )],
+                                );
                             }
                         }
                     }
