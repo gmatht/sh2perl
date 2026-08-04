@@ -8325,7 +8325,52 @@ fn try_native_capture_value(stmts: &[IrStmt]) -> Option<Expr> {
                         _ => None,
                     };
                 }
-                // `$(cat <<EOF ...)` — a fd-0 HEREDOC wrapping `cat` with
+                // `$(cut OP <<< X)` — a fd-0 HERE-STRING feeding the cut
+                // builtin: bash appends the newline (input = X + "\n"), so
+                // the runtime's line model is exactly X.split('\n'), and
+                // the selection is a pure string-op chain over X (see
+                // `cut_value_expr`) — no spawn, no redirect machinery, no
+                // async capture arrow. The target renders as a value
+                // expression (store refs become getVar calls — the same
+                // String() the runtime applies), marker-free only (globs /
+                // raw bytes the native chain cannot reproduce).
+                if mode == "herestring" && fd == Some(0) {
+                    let [IrStmt::Expr(inner_e)] = inner_stmts.as_slice() else {
+                        return None;
+                    };
+                    let IrExpr::Call { func, args } = inner_e else {
+                        return None;
+                    };
+                    if !matches!(func.as_str(), "exec" | "builtin") {
+                        return None;
+                    }
+                    let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice()
+                    else {
+                        return None;
+                    };
+                    if name != "cut" || program_defines_function("cut") {
+                        return None;
+                    }
+                    let spec = parse_cut_args(cmd_args)?;
+                    let target = target?;
+                    if ir_expr_needs_runtime(target) {
+                        return None;
+                    }
+                    let text = Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "String".to_string(),
+                        }),
+                        arguments: vec![expr_to_estree(target)],
+                        optional: false,
+                    };
+                    let lines = method_call(text, "split", vec![str_lit("\n")]);
+                    // the capture trims trailing newlines — the emitted
+                    // +"\n" is a no-op
+                    let value = cut_value_expr(lines, &spec, false)?;
+                    return Some(trim_capture(value));
+                }
+                // `$(cat <<EOF ...)` / `$(cut OP <<EOF ...)` — a fd-0
+                // HEREDOC wrapping `cat` with
                 // no args: cat copies stdin (the heredoc body) to stdout,
                 // so the captured value is the body minus the capture
                 // strips. A non-interpolated body folds to a plain string
@@ -8349,6 +8394,38 @@ fn try_native_capture_value(stmts: &[IrStmt]) -> Option<Expr> {
                     else {
                         return None;
                     };
+                    if name == "cut" {
+                        // `cut OP <<EOF` — the stdin is the body (which
+                        // ends with \n): lines = body.split('\n') minus
+                        // the split's trailing ''. heredoc-tabs bodies are
+                        // tab-stripped at runtime — the native chain
+                        // cannot (keep the runtime); raw-byte marker
+                        // bodies neither (the runtime decodes them).
+                        if mode != "heredoc" || program_defines_function("cut") {
+                            return None;
+                        }
+                        let spec = parse_cut_args(cmd_args)?;
+                        let IrExpr::Str(body, _) = target? else {
+                            return None;
+                        };
+                        if body.chars().any(|c| (0xF800..=0xF8FF).contains(&(c as u32))) {
+                            return None;
+                        }
+                        let text = if interpolate && body.contains('$') {
+                            // the runtime expands the body from the store —
+                            // a native template can only inline LIFTED refs
+                            fully_lifted_template(body)?
+                        } else {
+                            str_lit(body)
+                        };
+                        let lines = method_call(
+                            method_call(text, "split", vec![str_lit("\n")]),
+                            "slice",
+                            vec![int_lit_expr(0), int_lit_expr(-1)],
+                        );
+                        let value = cut_value_expr(lines, &spec, false)?;
+                        return Some(trim_capture(value));
+                    }
                     if name != "cat" || !cmd_args.is_empty() || program_defines_function("cat") {
                         return None;
                     }
@@ -9867,6 +9944,429 @@ fn try_native_tr_pipeline(pipe: &IrExpr) -> Option<Expr> {
 /// no FILE operands, at least one pattern, and patterns must be free of
 /// GNU-extension escapes (`\<` `\>` `\b` `\w` ...) whose JS-regex
 /// meaning differs.
+/// A static `cut` argument list (the runtime builtin's exact grammar —
+/// harness/sh2-namespace.mjs `builtins.cut`): one of -f/-c/-b with a
+/// merged/sorted 1-based inclusive range list (`N`, `N-M`, `N-`, `-M`,
+/// comma-separated), `-d` (FIRST char only, GNU's rule), `-s`, and
+/// `--output-delimiter`. `None` keeps the runtime path: dynamic args,
+/// file operands, malformed lists, or a missing mode all lower to the
+/// runtime builtin (which reports GNU's error + exit 1 exactly).
+#[derive(Debug, Clone)]
+struct CutSpec {
+    mode: char,                      // 'f' | 'c' | 'b'
+    ranges: Vec<(i64, Option<i64>)>, // merged, sorted; hi None = open range
+    delim: String,                   // -d value (first char; '\t' default)
+    suppress: bool,                  // -s
+    out_delim: Option<String>,       // --output-delimiter
+}
+
+/// GNU cut's range-list grammar (`N`, `N-M`, `N-`, `-M`, comma lists),
+/// merged and sorted exactly like the runtime builtin (overlapping /
+/// adjacent ranges collapse — `-f1-3,2-4` is 1..4). `None` = malformed
+/// (`0`, a decreasing range, a bare `-`, garbage) → keep the runtime.
+fn parse_cut_ranges(s: &str) -> Option<Vec<(i64, Option<i64>)>> {
+    let mut ranges: Vec<(i64, Option<i64>)> = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        let (lo, hi): (i64, Option<i64>) =
+            if let Some(rest) = part.strip_prefix('-') {
+                if rest.is_empty() {
+                    return None;
+                }
+                (1, Some(rest.parse::<i64>().ok()?))
+            } else if let Some(idx) = part.find('-') {
+                let (a, b) = (&part[..idx], &part[idx + 1..]);
+                if a.is_empty() && b.is_empty() {
+                    return None;
+                }
+                let lo: i64 = if a.is_empty() { 1 } else { a.parse().ok()? };
+                let hi: Option<i64> = if b.is_empty() {
+                    None
+                } else {
+                    Some(b.parse::<i64>().ok()?)
+                };
+                if let Some(h) = hi {
+                    if h < lo {
+                        return None;
+                    }
+                }
+                (lo, hi)
+            } else {
+                let n: i64 = part.parse().ok()?;
+                (n, Some(n))
+            };
+        if lo < 1 {
+            return None;
+        }
+        ranges.push((lo, hi));
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_by_key(|(lo, hi)| (*lo, hi.unwrap_or(i64::MAX)));
+    let mut merged: Vec<(i64, Option<i64>)> = Vec::new();
+    for (lo, hi) in ranges {
+        if let Some(last) = merged.last_mut() {
+            let last_hi = last.1.unwrap_or(i64::MAX);
+            let this_hi = hi.unwrap_or(i64::MAX);
+            if lo <= last_hi + 1 {
+                if this_hi > last_hi {
+                    last.1 = hi; // keep None when the new range is open
+                }
+                continue;
+            }
+        }
+        merged.push((lo, hi));
+    }
+    Some(merged)
+}
+
+/// Parse a static cut ARG LIST (every arg an IrExpr::Str — dynamic args
+/// keep the runtime). Mirrors the runtime builtin's option loop exactly
+/// (including its `-d` first-char rule and the attached `-f1,3`/`-c3-5`
+/// forms); any file operand or unknown flag → None.
+fn parse_cut_args(args: &[IrExpr]) -> Option<CutSpec> {
+    let mut mode: Option<char> = None;
+    let mut ranges: Option<Vec<(i64, Option<i64>)>> = None;
+    let mut delim = String::from("\t");
+    let mut suppress = false;
+    let mut out_delim: Option<String> = None;
+    let mut i = 0;
+    let mut after_dd = false;
+    let n = args.len();
+    while i < n {
+        let IrExpr::Str(a, _) = &args[i] else {
+            return None;
+        };
+        let a = a.clone();
+        i += 1;
+        if !after_dd && a == "--" {
+            after_dd = true;
+            continue;
+        }
+        if after_dd {
+            return None; // file operands → runtime (stdin form only lifts)
+        }
+        if a == "--output-delimiter" {
+            let IrExpr::Str(v, _) = args.get(i)? else {
+                return None;
+            };
+            out_delim = Some(v.clone());
+            i += 1;
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--output-delimiter=") {
+            out_delim = Some(v.to_string());
+            continue;
+        }
+        if a == "-s" {
+            suppress = true;
+            continue;
+        }
+        if a == "-d" {
+            let IrExpr::Str(sv, _) = args.get(i)? else {
+                return None;
+            };
+            i += 1;
+            delim = sv.chars().next().map(String::from).unwrap_or_else(|| "\t".into());
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("-d") {
+            if !v.is_empty() {
+                // attached `-d:` — BEFORE the -f/-c/-b attached check
+                delim = v.chars().next().map(String::from).unwrap_or_else(|| "\t".into());
+                continue;
+            }
+        }
+        if a == "-f" || a == "-c" || a == "-b" {
+            let IrExpr::Str(sv, _) = args.get(i)? else {
+                return None;
+            };
+            i += 1;
+            mode = a.chars().nth(1);
+            ranges = parse_cut_ranges(sv);
+            continue;
+        }
+        if a.len() > 2
+            && (a.starts_with("-f") || a.starts_with("-c") || a.starts_with("-b"))
+        {
+            mode = a.chars().nth(1);
+            ranges = parse_cut_ranges(&a[2..]);
+            continue;
+        }
+        return None; // file operands / unknown flags → runtime
+    }
+    Some(CutSpec {
+        mode: mode?,
+        ranges: ranges?,
+        delim,
+        suppress,
+        out_delim,
+    })
+}
+
+/// The range predicate `(i >= lo && (hi === null || i <= hi)) || ...` —
+/// the merged-range membership test the -f filter / -c filter callbacks
+/// use (the runtime builtin's `positions(pos, L)` membership, with the
+/// open-range hi clamped per line by the slice/filter length).
+fn cut_range_pred(i: Expr, ranges: &[(i64, Option<i64>)]) -> Expr {
+    let mut terms: Vec<Expr> = Vec::new();
+    for (lo, hi) in ranges {
+        let ge = Expr::BinaryExpression {
+            operator: ">=",
+            left: Box::new(i.clone()),
+            right: Box::new(int_lit_expr(*lo)),
+        };
+        let le = match hi {
+            Some(h) => Expr::BinaryExpression {
+                operator: "<=",
+                left: Box::new(i.clone()),
+                right: Box::new(int_lit_expr(*h)),
+            },
+            None => bool_lit(true),
+        };
+        terms.push(Expr::LogicalExpression {
+            operator: "&&",
+            left: Box::new(ge),
+            right: Box::new(le),
+        });
+    }
+    let mut it = terms.into_iter();
+    let first = it.next().unwrap_or(bool_lit(false));
+    it.fold(first, |acc, t| Expr::LogicalExpression {
+        operator: "||",
+        left: Box::new(acc),
+        right: Box::new(t),
+    })
+}
+
+/// The per-line selection for a CutSpec over a line expression `l` — the
+/// runtime builtin's exact per-line rules (`builtins.cut`): -f picks the
+/// fields at the merged positions clamped to the line's split length
+/// (empty interior fields kept, trailing ones omitted, join with the
+/// output delimiter or the input one); a no-delimiter line passes through
+/// WHOLE (unless -s — which the CALLER drops from the line list, GNU's
+/// "the line vanishes entirely" rule); -c/-b pick code points
+/// (`[...line]`, the runtime's `positions` base).
+fn cut_sel_expr(spec: &CutSpec, l: &Expr) -> Option<Expr> {
+    let sel = match spec.mode {
+        'c' | 'b' => {
+            let cps = Expr::ArrayExpression {
+                elements: vec![Some(Expr::SpreadElement {
+                    argument: Box::new(l.clone()),
+                })],
+            };
+            match spec.ranges.as_slice() {
+                // -c1- / -b1- — every code point, in order: the identity
+                [(1, None)] => l.clone(),
+                [(lo, None)] => method_call(
+                    method_call(cps, "slice", vec![int_lit_expr(lo - 1)]),
+                    "join",
+                    vec![str_lit("")],
+                ),
+                [(lo, Some(hi))] => method_call(
+                    method_call(cps, "slice", vec![int_lit_expr(lo - 1), int_lit_expr(*hi)]),
+                    "join",
+                    vec![str_lit("")],
+                ),
+                // merged multi-range: filter by membership (the runtime's
+                // positions() enumeration is ascending — filter preserves it)
+                _ => {
+                    let i = ident("i");
+                    let pred = cut_range_pred(
+                        Expr::BinaryExpression {
+                            operator: "+",
+                            left: Box::new(i.clone()),
+                            right: Box::new(int_lit_expr(1)),
+                        },
+                        &spec.ranges,
+                    );
+                    let filtered = method_call(
+                        cps,
+                        "filter",
+                        vec![Expr::ArrowFunctionExpression {
+                            params: vec![ident("_"), i],
+                            body: ArrowBody::Expr(Box::new(pred)),
+                            expression: true,
+                            r#async: false,
+                        }],
+                    );
+                    method_call(filtered, "join", vec![str_lit("")])
+                }
+            }
+        }
+        'f' => {
+            let has_d = method_call(l.clone(), "includes", vec![str_lit(&spec.delim)]);
+            let fields = method_call(l.clone(), "split", vec![str_lit(&spec.delim)]);
+            let join_d = spec.out_delim.clone().unwrap_or_else(|| spec.delim.clone());
+            let no_delim = if spec.suppress {
+                // unreachable under -s (the caller's filter dropped the
+                // line) — kept for shape uniformity
+                str_lit("")
+            } else {
+                l.clone()
+            };
+            if spec.ranges == [(1, None)] && join_d == spec.delim {
+                // -f1- with the default output delimiter: every field in
+                // order — split+join is the identity; only the
+                // no-delimiter rule remains (`-s` handled by the caller)
+                Expr::ConditionalExpression {
+                    test: Box::new(has_d),
+                    consequent: Box::new(l.clone()),
+                    alternate: Box::new(no_delim),
+                }
+            } else {
+                let i = ident("i");
+                let pred = cut_range_pred(
+                    Expr::BinaryExpression {
+                        operator: "+",
+                        left: Box::new(i.clone()),
+                        right: Box::new(int_lit_expr(1)),
+                    },
+                    &spec.ranges,
+                );
+                let picked = method_call(
+                    fields,
+                    "filter",
+                    vec![Expr::ArrowFunctionExpression {
+                        params: vec![ident("_"), i],
+                        body: ArrowBody::Expr(Box::new(pred)),
+                        expression: true,
+                        r#async: false,
+                    }],
+                );
+                let picked_join = method_call(picked, "join", vec![str_lit(&join_d)]);
+                Expr::ConditionalExpression {
+                    test: Box::new(has_d),
+                    consequent: Box::new(picked_join),
+                    alternate: Box::new(no_delim),
+                }
+            }
+        }
+        _ => return None,
+    };
+    Some(sel)
+}
+
+/// The cut output for a stdin text value: `lines.map(sel).join('\n')`
+/// plus the trailing newline cut emits whenever the input ends with one
+/// (always true for the echo/here-string/heredoc feeds; false only for
+/// `echo -n`). `lines` is the caller-built line-list expression (the
+/// feed's split — see the call sites). With -s, no-delimiter lines are
+/// dropped from the list entirely (GNU: the line vanishes, no newline).
+fn cut_value_expr(lines: Expr, spec: &CutSpec, input_ends_nl: bool) -> Option<Expr> {
+    let chain = if spec.mode == 'f' && spec.suppress {
+        let l = ident("l");
+        let keep = method_call(l.clone(), "includes", vec![str_lit(&spec.delim)]);
+        method_call(lines, "filter", vec![sync_arrow_expr_param("l", keep)])
+    } else {
+        lines
+    };
+    let sel = cut_sel_expr(spec, &ident("l"))?;
+    let mapped = method_call(chain, "map", vec![sync_arrow_expr_param("l", sel)]);
+    let joined = method_call(mapped, "join", vec![str_lit("\n")]);
+    if input_ends_nl {
+        Some(Expr::BinaryExpression {
+            operator: "+",
+            left: Box::new(joined),
+            right: Box::new(str_lit("\n")),
+        })
+    } else {
+        Some(joined)
+    }
+}
+
+/// `echo ARGS | cut OP` — the two-stage pipeline whose LAST stage is the
+/// cut builtin with fully static args: the text is echo's exact output
+/// (the echo_join_args join; echo appends the trailing newline unless
+/// `-n`), and the selection is a pure string-op chain over it (see
+/// `cut_value_expr`) — no spawns, no pipeline machinery, no async
+/// capture arrow. Script-defined echo/cut functions shadow the builtins
+/// → keep the pipeline. Returns the (echo join expr, no_newline flag,
+/// raw cut args, parsed spec).
+fn try_native_echo_cut(pipe: &IrExpr) -> Option<(Expr, bool, Vec<IrExpr>, CutSpec)> {
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() != 2 {
+        return None;
+    }
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return None;
+    };
+    // stage 1: exec("echo", args) — the exact bytes echo writes
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return None;
+    };
+    if f1 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
+        return None;
+    };
+    if name1 != "echo" {
+        return None;
+    }
+    // raw-byte / glob / process-substitution markers: the runtime decodes
+    // them before cut sees the text — the native chain cannot (see
+    // ir_expr_needs_runtime)
+    if echo_args.iter().any(ir_expr_needs_runtime) {
+        return None;
+    }
+    let (joined, no_newline, _) = echo_join_args(echo_args)?;
+    // stage 2: exec("cut", args)
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
+        return None;
+    };
+    if f2 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name2, _), IrExpr::Array(cut_args)] = a2.as_slice() else {
+        return None;
+    };
+    if name2 != "cut" {
+        return None;
+    }
+    let spec = parse_cut_args(cut_args)?;
+    Some((joined, no_newline, cut_args.to_vec(), spec))
+}
+
+/// The cut stdin LINES expression for an echo-feed text: echo appends the
+/// trailing newline unless `-n`, so the input always ends with one — the
+/// runtime's line model (`input.split('\n')` with the final '' popped by
+/// the endsWith-newline branch) is exactly `text.split('\n')`; with `-n`
+/// the input is the text itself and may or may not end with a newline
+/// (the runtime pops the split's trailing '' only when it does).
+fn cut_echo_lines(text: Expr, no_newline: bool) -> Expr {
+    if no_newline {
+        method_call(
+            Expr::ConditionalExpression {
+                test: Box::new(method_call(
+                    text.clone(),
+                    "endsWith",
+                    vec![str_lit("\n")],
+                )),
+                consequent: Box::new(method_call(
+                    text.clone(),
+                    "slice",
+                    vec![int_lit_expr(0), int_lit_expr(-1)],
+                )),
+                alternate: Box::new(text.clone()),
+            },
+            "split",
+            vec![str_lit("\n")],
+        )
+    } else {
+        method_call(text, "split", vec![str_lit("\n")])
+    }
+}
+
 fn try_native_echo_grep(pipe: &IrExpr) -> Option<(Expr, Vec<Expr>)> {
     let IrExpr::Call { func, args } = pipe else {
         return None;
@@ -12665,6 +13165,37 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         );
                     }
                 }
+                // `echo ARGS | cut OP` — a sync runtime mini-cut (the
+                // cutText twin of grepText): the pipeline's fd-1 write +
+                // exit status are the helper's emit + lastExit (cut exits
+                // 0 on the statically-validated args), so the async
+                // pipeline machinery disappears. Sink-correct everywhere
+                // (module stdout, capture buffer, redirect target) — the
+                // same guardrails as the grep lift.
+                if !program_defines_function("echo") && !program_defines_function("cut") {
+                    if let Some((text, no_newline, cut_args, _)) = try_native_echo_cut(e) {
+                        // the helper receives the FULL cut input (echo adds
+                        // the trailing newline unless -n) so its endsWith-
+                        // newline rule matches the real pipeline
+                        let input = if no_newline {
+                            text
+                        } else {
+                            Expr::BinaryExpression {
+                                operator: "+",
+                                left: Box::new(text),
+                                right: Box::new(str_lit("\n")),
+                            }
+                        };
+                        return sh2_call(
+                            "cutText",
+                            vec![
+                                input,
+                                array(cut_args.iter().map(expr_to_estree).collect()),
+                                bool_lit(false),
+                            ],
+                        );
+                    }
+                }
             }
             // `echo args > file` / `echo args >> file` in EXPRESSION
             // position (&&/|| operands, if-conditions): the native file
@@ -12820,6 +13351,31 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                     "grepText",
                                     vec![text, array(argv), bool_lit(true)],
                                 ));
+                            }
+                        }
+                    }
+                }
+                // `$(echo ARGS | cut OP)` — the echo|cut capture: the
+                // value is a pure string-op chain over echo's exact output
+                // (see `cut_value_expr`) — no spawns, no pipeline
+                // machinery, no async capture arrow, no sh2 call at all.
+                // trimCapture applies the capture's NUL + trailing-
+                // newline strips (cut exits 0 on the statically-validated
+                // args, so the chain records 0/0 like the runtime).
+                if !program_defines_function("echo") && !program_defines_function("cut") {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
+                            if let Some((text, no_newline, _, spec)) = try_native_echo_cut(pipe) {
+                                // the capture trims trailing newlines, so
+                                // the emitted-bytes +"\n" is a no-op —
+                                // the value is the joined selection
+                                if let Some(value) = cut_value_expr(
+                                    cut_echo_lines(text, no_newline),
+                                    &spec,
+                                    false,
+                                ) {
+                                    return trim_capture(value);
+                                }
                             }
                         }
                     }

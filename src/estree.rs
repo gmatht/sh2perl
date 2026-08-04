@@ -143,6 +143,11 @@ pub enum Expr {
     ArrayExpression {
         elements: Vec<Option<Expr>>,
     },
+    // `[...l]` — the native cut-string lift's code-point split (the
+    // runtime cut builtin's exact `[...line]` positions base).
+    SpreadElement {
+        argument: Box<Expr>,
+    },
     LogicalExpression {
         operator: &'static str,
         left: Box<Expr>,
@@ -1062,6 +1067,61 @@ mod tests {
         assert!(json.contains("\"name\":\"String\""));
         assert!(!json.contains("pipeline"));
         assert!(!json.contains("\"name\":\"grep\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn echo_pipe_cut_lifts_to_native_slice() {
+        // `$(echo X | cut -c3-)` — the echo|cut capture: a pure string-op
+        // chain (split/map/slice/join) — no pipeline, no capture, no
+        // builtin dispatch.
+        let json = to_json("x=$(echo hi | cut -c3-)");
+        assert!(json.contains("\"name\":\"slice\""));
+        assert!(json.contains("\"name\":\"map\""));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"capture\""));
+        assert!(!json.contains("\"name\":\"cut\""));
+        assert!(!json.contains("unsupported"));
+        // -d/-f: a field pick — split/filter/join over the echoed text
+        let json2 = to_json("x=$(echo a:b:c | cut -d: -f2)");
+        assert!(json2.contains("\"name\":\"filter\""));
+        assert!(json2.contains("\"name\":\"includes\""));
+        assert!(!json2.contains("\"name\":\"pipeline\""));
+        assert!(!json2.contains("\"name\":\"cut\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn echo_pipe_cut_statement_uses_cuttext() {
+        // statement-form `echo X | cut OP` → the sync cutText helper
+        // (the grepText precedent) — no async pipeline machinery
+        let json = to_json("echo a:b | cut -d: -f1");
+        assert!(json.contains("\"name\":\"cutText\""));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn cut_herestring_capture_lifts_to_native() {
+        // `$(cut -c2 <<< X)` — the here-string feed is the same per-line
+        // selection over the target value; the split has no trailing ''
+        // (bash appends the newline, the runtime pops it)
+        let json = to_json("x=$(cut -c2 <<< hi)");
+        assert!(json.contains("\"name\":\"slice\""));
+        assert!(!json.contains("\"name\":\"capture\""));
+        assert!(!json.contains("\"name\":\"redirect\""));
+        assert!(!json.contains("\"name\":\"cut\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn cut_dynamic_args_not_lifted() {
+        // a dynamic cut arg (a variable position list) keeps the runtime
+        // pipeline + builtin
+        let json = to_json("x=$(echo a:b:c | cut -d: -f$n)");
+        assert!(json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"slice\""));
+        assert!(!json.contains("\"name\":\"filter\""));
         assert!(!json.contains("unsupported"));
     }
 
