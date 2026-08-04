@@ -260,3 +260,105 @@ Steps:
   - Variable lifetime shortening
 - **Testable IR** — you can write unit tests that check `IrProgram` structures
   without running full end-to-end tests
+
+## The sh2.* boundary: every shIR node has a rendering, none are unsupported
+
+The shIR is **kitchen-sink**: every construct the shell parser can produce
+has a node. No node is "forbidden" for a backend. The boundary between
+"what the shIR means" and "what each backend emits" is the **sh2.\* runtime
+namespace**, not a per-backend subset config.
+
+The invariant every backend relies on:
+
+> For every shIR node, there is **either** a language-native rendering
+> (the backend chooses its own idiom — `String.includes` in JS,
+> `index() != -1` in Perl, `str::contains` in Rust, `memmem` in C),
+> **or** a lowering to a `sh2.*` call (defined in
+> `docs/estree-contract.md` and `sh2-namespace.json` in the workspace
+> harness).
+
+There is no third state. There is no "this backend can't render X." A
+backend that hasn't yet learned a native idiom for a construct renders it
+as the corresponding `sh2.*` call; a backend that *can't* render a `sh2.*`
+call is, by construction, not a backend.
+
+### Three layers, three responsibilities
+
+1. **shIR** (kitchen sink, language-neutral intent) — `src/ir.rs` +
+   `src/shir.rs`. Every shell construct the parser produces has a node:
+   `Pipeline`, `Case`, `Redirect`, `Function`, `Subshell`, `Background`,
+   `Arrow`, `Arith`, `Array`, `Interpolate`, `BinOp`, `Ternary`, …
+2. **Shared library of passes** (`src/shir_passes/`) — analyses,
+   transforms, and pattern lifts that operate on the shIR. Produces a
+   `PassContext` (analysis verdicts) and a `Metric` (call-site tally).
+   The canonical pipeline runs identically for every backend — there is
+   no per-backend pass configuration.
+3. **Backend renderer** — `shir_to_estree` (JS), `ir_to_perl` (Perl),
+   and future `shir_to_<lang>` for C, Zig, Python, Lua, Java, Rust. Each
+   renderer walks the post-pipeline shIR and chooses, per node, between
+   language-native emission and a `sh2.*` call.
+
+### Why not a per-backend subset (MLIR-style dialects)?
+
+A pre-backend cut (`shir → shir_<lang>`) would foreclose on three things
+this design depends on:
+
+- **Empirical capability discovery** (M8). The corpus is the oracle; the
+  metric is the signal. Cutting the tree before the renderer removes
+  the constructs the worker is supposed to find lowerings for.
+- **Incremental backend addition.** A new backend is a renderer; the
+  shared library is free. A cut-based design turns each new backend
+  into a config-audit exercise against every existing shIR node.
+- **Capability gaps as data.** ESTREE 516/516, PERL 432/84 — the
+  *roadmap*, not a config. The 84 failing Perl tests are the to-do
+  list for the Perl generator, not a "Perl doesn't get node X" line
+  in a subset config.
+
+### What the shared library lowers
+
+The shared library (`src/shir_passes/`) handles lowerings that are
+**language-neutral**: the result is a `sh2.*` call that every backend
+can render, or a tree shape that every backend can choose to inline
+further. The current inventory:
+
+- **Constant folding** — provably-constant `$((...))` and Int BinOps
+  fold to literals (Rust evaluator; both backends).
+- **Dead assignment / dead declaration** — self-assignment removal,
+  unused `my $x;` elimination (both backends; the M3 guardrail proves
+  Perl output is unchanged).
+- **Import minimisation** — table-driven `use` emission; no per-feature
+  booleans in the generator (both backends).
+- **Pattern lifts** — `grep -q` / `case *P*)` / `[ = *P* ]` →
+  `sh2.contains`; `seq 1 N` → `sh2.range`; `${x//p/r}` →
+  `sh2.paramReplace`; `head/tail/wc` on known producers → native
+  counts; `while`/`for` with provably-sync bodies → *Sync loop
+  (10M-iter 2.64s → 0.23s); top-level `echo` → `process.stdout.write`
+  (when program-level safety invariants permit).
+
+### What the shared library does NOT do
+
+- **Language-native inlining.** A backend that wants `String.includes`
+  inlines the `sh2.contains` call itself; the shared library does not
+  pre-canonicalise. The shared pass produces the cheap shape; the
+  backend chooses the idiom.
+- **Type inference for static backends.** A C/Zig backend wants
+  `i64` for lifted numerics. The shared library produces the *lift
+  verdict* (`IrType::Int` via `analyze_var_types`); the static
+  backend maps `Int → i64`. The verdict is shared; the mapping is
+  per backend (Rust §3, Zig §3, C §3 each have their own table).
+- **sh2.\* contract evolution.** A new sh2.\* name is added by the
+  runtime contract (`sh2-namespace.json`), not by the shared library.
+  The library *invents* lifts that produce existing sh2.\* calls;
+  inventing a new sh2.\* call is a contract change.
+
+### The threading model
+
+The pre-pipeline analyses populate a `PassContext`; the renderer reads
+it by reference. This replaces the ten `static Mutex<Option<…>>`
+globals previously used to ferry analysis results between the
+pre-passes and the emission in shir.rs (the comment at shir.rs:5228
+explains the determinism-test race they were guarding). With the
+struct, the race goes away because the context is constructed once
+before any concurrent reader touches it. The metric is the pipeline's
+return value, not a global — the worker reads it from the harness,
+not from a shared static.
