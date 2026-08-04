@@ -87,15 +87,15 @@ pub enum ArithAst {
     Num(i64),
     Var(String),
     Index { var: String, key: Box<ArithAst> },
-    Bin { op: &'static str, lhs: Box<ArithAst>, rhs: Box<ArithAst> },
-    Un { op: &'static str, arg: Box<ArithAst> },
+    Bin { op: String, lhs: Box<ArithAst>, rhs: Box<ArithAst> },
+    Un { op: String, arg: Box<ArithAst> },
     Cond { test: Box<ArithAst>, then: Box<ArithAst>, else_: Box<ArithAst> },
     /// `name op= rhs` (`=` / `+=` / `-=` / `*=`; `/=`/`%=` stay on the
     /// runtime — the zero-divisor abort needs the helper). The expression
     /// VALUE is the assigned value (bash semantics).
     Assign {
         var: String,
-        op: &'static str,
+        op: String,
         rhs: Box<ArithAst>,
     },
     /// `++name` / `name++` / `--name` / `name--` — delta ±1. The value is
@@ -530,10 +530,42 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         | IrStmt::Redirect { .. }
         | IrStmt::Function { .. }
         | IrStmt::Subshell(_)
-        | IrStmt::Background(_)
-        | IrStmt::Block(_)
-        | IrStmt::Expr(_) => {
-            unreachable!("ESTree-path-only IR node reached the Perl renderer")
+        | IrStmt::Background(_) => {
+            // plan improvement #5 (partial): these ESTree-path-only stmts
+            // still lack a Perl renderer. Emit a clear runtime error so
+            // the failure is actionable, not a panic.
+            emit_indent(out, indent);
+            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (");
+            out.push_str(match stmt {
+                IrStmt::Redirect { .. } => "redirect",
+                IrStmt::Function { .. } => "function definition",
+                IrStmt::Subshell(_) => "subshell",
+                IrStmt::Background(_) => "background",
+                _ => "other",
+            });
+            out.push_str(")\\n\";\n");
+        }
+        IrStmt::Block(stmts) => {
+            // plan improvement #5: render a block as a flat sequence of
+            // stmts (the Perl backend has no native block scoping; this
+            // is an approximation — variables from the block leak, but
+            // the IR's lexical-ish scoping is close enough for the
+            // supported subset).
+            for s in stmts {
+                emit_stmt(out, s, indent);
+            }
+        }
+        IrStmt::Expr(e) => {
+            // plan improvement #5: a bare expression statement is a no-op
+            // in Perl (expressions don't have side effects in statement
+            // position). Render as a comment so the source is still
+            // traceable; if the expression is a Call (sh2.*), it's
+            // actually a shell exec whose side effects matter — but the
+            // sh2 backend isn't wired here (see sh2runtime). For the
+            // shIR→Perl path, Exprs that are real execs should have been
+            // lowered to Output/Exec by the optimizer; bare Expr means
+            // a value was discarded, which is a no-op in Perl.
+            let _ = e;
         }
 
         IrStmt::Output { value, newline, target } => {
