@@ -17,12 +17,14 @@ pub fn show_help(program_name: &str) {
     println!();
     println!("  parse --perl <input>           - Convert shell script to Perl");
     println!("  --mir <input>                  - Export Mid-level Intermediate Representation (MIR) as JSON");
+    println!("  --shir <input>                 - Export the language-neutral ShIR as JSON (backend contract, A1)");
     println!(
         "  --mir -O <input>               - Export optimized MIR with transformations applied"
     );
 
     println!();
     println!("  file --perl <filename>         - Convert shell script file to Perl");
+    println!("  file --shir <filename>         - Export ShIR JSON for a script file (backend contract, A1)");
 
     println!();
     println!("EXECUTION OPTIONS:");
