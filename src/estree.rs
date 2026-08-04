@@ -1347,9 +1347,15 @@ mod tests {
         assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("FOO"));
         assert!(!json.contains("unsupported"));
+        // `grep` is a native sync builtin now (the file/stdin mini-grep),
+        // so the env-carrying form also lowers to the sync twin; a name
+        // OUTSIDE the sync-builtin set keeps the async exec call.
         let json2 = to_json("FOO=bar grep x");
-        assert!(json2.contains("\"name\":\"exec\""));
+        assert!(json2.contains("\"name\":\"builtin\""));
         assert!(json2.contains("FOO"));
+        let json3 = to_json("FOO=bar ls x");
+        assert!(json3.contains("\"name\":\"exec\""));
+        assert!(json3.contains("FOO"));
     }
 
     #[test]
