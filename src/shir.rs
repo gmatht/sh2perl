@@ -3727,6 +3727,190 @@ fn int_declare_names(args: &[IrExpr]) -> Option<Vec<String>> {
     Some(names)
 }
 
+/// `local x=1` / `declare x=1` / `typeset x=1` / `readonly x=1` — a
+/// PURE-VALUE declaration: every arg is a plain `name=value` word (no flag
+/// args) whose value is free of shell metacharacters (`$`, quotes,
+/// backticks, backslash, globs, `~`, whitespace — the runtime's
+/// expandWord would be an identity on it). Returns the (name, value)
+/// pairs, or None for any other declaration shape (flags, dynamic values,
+/// array/assoc forms, bare names) — those stay runtime store writes.
+///
+/// The runtime's `local`/`declare` are plain store writes (no scope
+/// stack: fnCall only saves/restores `positional`, never variables —
+/// sh2-namespace.mjs `fnCall`/`builtins.local`), so a lifted native
+/// binding re-initialized by a native assignment on every call is
+/// EXACTLY the runtime model: same re-init per call, same cross-call
+/// persistence, no restore. The corpus is the oracle for the model's
+/// fidelity (it passes 100% today against this model).
+///
+/// ASSUMPTION (SH2_ASSUME_LOCAL_SCOPE=0 disables; default ON): the
+/// function-local variable scope is never OBSERVED across calls — no
+/// recursive or interleaved call reads a `local` between its re-inits,
+/// and no caller reads the store copy of a lifted local (reads through
+/// runtime strings — tests, eval, heredocs, `declare -p` — keep the
+/// name store-bound via string_ctx/excluded, so this is only about the
+/// model's missing scope restore, which the runtime already accepts).
+fn pure_value_declare(args: &[IrExpr]) -> Option<Vec<(String, String)>> {
+    if !assume_local_scope() {
+        return None;
+    }
+    let [IrExpr::Str(cname, _), IrExpr::Array(cargs)] = args else {
+        return None;
+    };
+    if !matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") {
+        return None;
+    }
+    let mut out = Vec::new();
+    for a in cargs {
+        let IrExpr::Str(sv, _) = a else { return None; };
+        if sv.starts_with('-') || sv.starts_with('+') {
+            return None;
+        }
+        // `mergeAssignArgs` merges `name=` followed by a bare word — the
+        // pure form has one `name=value` word per arg.
+        let (name, value) = sv.split_once('=')?;
+        if !plain_ident(name) {
+            return None;
+        }
+        if !value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | ',' | '+' | '-')
+        }) {
+            return None;
+        }
+        out.push((name.to_string(), value.to_string()));
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// SH2_ASSUME_LOCAL_SCOPE=0 — turn off the pure-value `local`/`declare`/
+/// `typeset`/`readonly` lift (see [`pure_value_declare`]).
+fn assume_local_scope() -> bool {
+    std::env::var("SH2_ASSUME_LOCAL_SCOPE").map_or(true, |v| v != "0")
+}
+
+/// The native lowering of a PURE-VALUE declaration whose names are ALL
+/// lifted (see [`pure_value_declare`]): `(name = value, ...,
+/// sh2.lastExit = 0, true)`. Numeric-lifted names get the i64 literal
+/// (the numeric lift only admits sources that parse as integers);
+/// string-lifted names get the string literal. Returns None when any
+/// name is store-bound — the whole call then stays on the runtime
+/// builtin (which writes the store for every arg).
+fn try_native_declare_stmt(args: &[IrExpr]) -> Option<Expr> {
+    let pairs = pure_value_declare(args)?;
+    if !pairs.iter().all(|(n, _)| is_lifted(n)) {
+        return None;
+    }
+    let mut exprs: Vec<Expr> = Vec::new();
+    for (name, value) in pairs {
+        let right = if is_lifted_num(&name) {
+            Expr::Literal {
+                value: serde_json::Value::from(value.trim().parse::<i64>().unwrap_or(0)),
+                raw: None,
+            regex: None,
+            }
+        } else {
+            str_lit(&value)
+        };
+        exprs.push(Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(Expr::Identifier { name }),
+            right: Box::new(right),
+        });
+    }
+    exprs.push(Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(sh2_member("lastExit")),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(0),
+            raw: None,
+        regex: None,
+        }),
+    });
+    exprs.push(bool_lit(true));
+    Some(seq(exprs))
+}
+
+/// `eval "NAME=VALUE NAME=VALUE..."` with STATIC args: the runtime builtin
+/// (sh2-namespace.mjs `builtins.eval`) spawns bash TWICE per call (once
+/// for output, once for the `set`-dump variable sync-back). A code string
+/// that provably parses as a plain space-separated assignment list — no
+/// `$`, quotes, backticks, backslash, globs, `~`, `;`, `(`, `&` ... (bash
+/// eval would treat every token as a literal assignment; nothing else the
+/// runtime eval does — function definitions, output, `$((...))` arith —
+/// can be expressed) — lowers to the exact same store writes + status:
+/// `(setVar(...)..., sh2.lastExit = 0, true)`, no spawns, no sync-back
+/// dump. Dynamic eval strings (runtime interpolation) keep the runtime
+/// builtin: the string may contain anything, and the two-spawn sync-back
+/// is the only faithful model the runtime has.
+fn try_native_eval(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Str(cname, _), IrExpr::Array(cargs)] = args else {
+        return None;
+    };
+    if cname != "eval" {
+        return None;
+    }
+    // every arg must be a static string (no runtime interpolation) — the
+    // builtin joins args with spaces, mirror that. A quoted word arrives
+    // as an Interpolate whose parts are ALL literal text (`"var=1"` →
+    // Interpolate([Lit("var=1")])); a bare word as a plain Str. Both
+    // are fully static — concatenate the literal parts.
+    let mut code = String::new();
+    for a in cargs {
+        let sv = match a {
+            IrExpr::Str(sv, _) => sv.clone(),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            _ => return None,
+        };
+        code.push_str(&sv);
+        code.push(' ');
+    }
+    let mut assigns: Vec<(String, String)> = Vec::new();
+    for tok in code.split_whitespace() {
+        let (name, value) = tok.split_once('=')?;
+        if !plain_ident(name) {
+            return None;
+        }
+        if !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | ',' | '+' | '-'))
+        {
+            return None;
+        }
+        assigns.push((name.to_string(), value.to_string()));
+    }
+    if assigns.is_empty() {
+        return None;
+    }
+    let mut exprs: Vec<Expr> = Vec::new();
+    for (name, value) in assigns {
+        exprs.push(sh2_call("setVar", vec![str_lit(&name), str_lit(&value)]));
+    }
+    exprs.push(Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(sh2_member("lastExit")),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(0),
+            raw: None,
+        regex: None,
+        }),
+    });
+    exprs.push(bool_lit(true));
+    Some(seq(exprs))
+}
+
 /// Add native-arithmetic assignment sources for the exec forms the walkers
 /// skip marking (see arith_let_args_native / int_declare_names): a
 /// natively-lowered `let` writes its args' targets natively (an
@@ -3743,6 +3927,30 @@ fn collect_native_arith_sources(args: &[IrExpr], assigns: &mut HashMap<String, V
             if let Some(names) = int_declare_names(args) {
                 for n in names {
                     assigns.entry(n).or_default().push(IrExpr::Int(0));
+                }
+            } else if let Some(pairs) = pure_value_declare(args) {
+                // no `-i` witness (int_declare_names rejects `=value` args
+                // and requires the flag) — a pure-value declaration is a
+                // real assignment: its value is an assignment SOURCE.
+                // Numeric lift accepts it when the value parses as an
+                // integer; the string lift accepts any value.
+                for (name, value) in pairs {
+                    assigns
+                        .entry(name)
+                        .or_default()
+                        .push(IrExpr::Str(value, StrStyle::SingleQuoted));
+                }
+            }
+        }
+        "local" => {
+            // `local` has no `-i` witness arm (the runtime's local ignores
+            // the int flag anyway) — only the pure-value source applies.
+            if let Some(pairs) = pure_value_declare(args) {
+                for (name, value) in pairs {
+                    assigns
+                        .entry(name)
+                        .or_default()
+                        .push(IrExpr::Str(value, StrStyle::SingleQuoted));
                 }
             }
         }
@@ -4238,7 +4446,14 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                             let intdecl = if cname == "let" { Vec::new() } else {
                                 int_declare_names(args).unwrap_or_default()
                             };
-                            if !(native_let || !intdecl.is_empty()) {
+                            // a PURE-VALUE `local x=1` declaration is not a store write (the
+                            // emit rewrites it to a native binding write — see pure_value_declare):
+                            // skip its marks too, unless the call sits in a subshell/background
+                            // (COPY semantics — the name must stay store-bound there, mirror of
+                            // the Assign-target exclusion).
+                            let pure_decl = !in_copy && pure_value_declare(args).is_some();
+                            if !(native_let || !intdecl.is_empty() || pure_decl) {
+
                                 for a in &args[1..] {
                                     mark_write_builtin_vars(a, excluded);
                                     // `let`/`(( ))`/`eval` args are
@@ -4401,7 +4616,14 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                         let intdecl = if cname == "let" { Vec::new() } else {
                             int_declare_names(args).unwrap_or_default()
                         };
-                        if !(native_let || !intdecl.is_empty()) {
+                        // a PURE-VALUE `local x=1` declaration is not a store write (the
+                        // emit rewrites it to a native binding write — see pure_value_declare):
+                        // skip its marks too, unless the call sits in a subshell/background
+                        // (COPY semantics — the name must stay store-bound there, mirror of
+                        // the Assign-target exclusion).
+                        let pure_decl = !in_copy && pure_value_declare(args).is_some();
+                        if !(native_let || !intdecl.is_empty() || pure_decl) {
+
                             for a in args {
                                 mark_write_builtin_vars(a, excluded);
                                 // `let`/`(( ))`/`eval` args are ARITHMETIC
@@ -5760,6 +5982,14 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         // would branch on a stale status), so lastExit is live after each
         // operand — a plain if on `sh2.lastExit === 0` is the runtime
         // helper's exact decision minus the async arrows + dispatch.
+        // AWAITED operands work too: the block statements run in the
+        // enclosing async context (module top level / async arrows), so
+        // `await l; if (cond) { await r; }` sequences identically to the
+        // runtime `and()`/`or()` helper (`await fnA(); if (lastExit …)
+        // await fnB();`) — the same decision, no per-evaluation promise
+        // machinery. The sync-function/*Sync-loop analyses scan the
+        // LOWERED body for awaits, so an awaited chain disqualifies its
+        // enclosing sync arrow consistently.
         IrStmt::Expr(IrExpr::BinOp {
             op: op @ (BinOpKind::And | BinOpKind::Or),
             lhs,
@@ -5769,45 +5999,34 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             let l = expr_to_estree(lhs);
             let r = expr_to_estree(rhs);
             *AND_OR_DEPTH.lock().unwrap() -= 1;
-            if !expr_has_await(&l) && !expr_has_await(&r) {
-                let is_and = matches!(op, BinOpKind::And);
-                let test = if is_and {
-                    last_exit_eq_zero()
-                } else {
-                    // `a || b`: run b only when a FAILED
-                    Expr::BinaryExpression {
-                        operator: "!==",
-                        left: Box::new(sh2_member("lastExit")),
-                        right: Box::new(Expr::Literal {
-                            value: serde_json::Value::from(0),
-                            raw: None,
-                        regex: None,
+            let is_and = matches!(op, BinOpKind::And);
+            let test = if is_and {
+                last_exit_eq_zero()
+            } else {
+                // `a || b`: run b only when a FAILED
+                Expr::BinaryExpression {
+                    operator: "!==",
+                    left: Box::new(sh2_member("lastExit")),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::from(0),
+                        raw: None,
+                    regex: None,
+                    }),
+                }
+            };
+            Stmt::BlockStatement {
+                body: vec![
+                    Stmt::ExpressionStatement { expression: l },
+                    Stmt::IfStatement {
+                        test,
+                        consequent: Box::new(Stmt::BlockStatement {
+                            body: vec![Stmt::ExpressionStatement {
+                                expression: r,
+                            }],
                         }),
-                    }
-                };
-                return Some(Stmt::BlockStatement {
-                    body: vec![
-                        Stmt::ExpressionStatement { expression: l },
-                        Stmt::IfStatement {
-                            test,
-                            consequent: Box::new(Stmt::BlockStatement {
-                                body: vec![Stmt::ExpressionStatement {
-                                    expression: r,
-                                }],
-                            }),
-                            alternate: None,
-                        },
-                    ],
-                });
-            }
-            Stmt::ExpressionStatement {
-                expression: await_call(
-                    if matches!(op, BinOpKind::And) { "and" } else { "or" },
-                    vec![
-                        arrow(vec![], IrExpr::Arrow(vec![IrStmt::Expr((**lhs).clone())])),
-                        arrow(vec![], IrExpr::Arrow(vec![IrStmt::Expr((**rhs).clone())])),
-                    ],
-                ),
+                        alternate: None,
+                    },
+                ],
             }
         }
         // bash `! cmd` at STATEMENT level: run cmd, then flip the recorded
@@ -6386,6 +6605,38 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             argument: opt.as_ref().map(expr_to_estree),
         },
         IrStmt::Exec { cmd, args, capture: _, redirects, env } => {
+            // `local x=1` / `declare x=1` / `typeset x=1` / `readonly x=1`
+            // with PURE-VALUE args whose names are ALL lifted (see
+            // pure_value_declare): a native binding write sequence —
+            // `(x = 1, sh2.lastExit = 0, true)` — the runtime builtin's
+            // exact store-write model (no scope stack, re-init per call)
+            // minus the dispatch. The re-init is REQUIRED for the lift:
+            // bash (and the runtime model) re-initializes a local on every
+            // call, so a module binding must be re-assigned at the same
+            // point. The runtime builtin also sets lastExit=0 and returns
+            // truthy — mirror both (the trailing `true` keeps &&/||/guard
+            // contexts on their native paths). Redirects/env forms keep
+            // the runtime dispatch.
+            if env.is_empty() && redirects.is_empty() {
+                if let IrExpr::Str(name, _) = cmd {
+                    if let Some(native) = try_native_declare_stmt(args) {
+                        return Some(Stmt::ExpressionStatement { expression: native });
+                    }
+                }
+            }
+            // `eval "NAME=VALUE..."` with a STATIC pure-assignment string
+            // (see try_native_eval): the runtime builtin spawns bash twice
+            // per call — the native store-write sequence replaces both
+            // spawns with the exact same store writes + status.
+            if env.is_empty() && redirects.is_empty() {
+                if let IrExpr::Str(name, _) = cmd {
+                    if name == "eval" {
+                        if let Some(native) = try_native_eval(args) {
+                            return Some(Stmt::ExpressionStatement { expression: native });
+                        }
+                    }
+                }
+            }
             // `rm` / `mkdir` with plain args: a native `sh2.fs.*` promise
             // chain — no spawn, no dispatch (see `try_native_fs_exec`).
             // Redirects/env forms keep the runtime (the redirect wrapper
@@ -11094,7 +11345,14 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                             let intdecl = if cname == "let" { Vec::new() } else {
                                 int_declare_names(args).unwrap_or_default()
                             };
-                            if !(native_let || !intdecl.is_empty()) {
+                            // a PURE-VALUE `local x=1` declaration is not a store write (the
+                            // emit rewrites it to a native binding write — see pure_value_declare):
+                            // skip its marks too, unless the call sits in a subshell/background
+                            // (COPY semantics — the name must stay store-bound there, mirror of
+                            // the Assign-target exclusion).
+                            let pure_decl = !in_copy && pure_value_declare(args).is_some();
+                            if !(native_let || !intdecl.is_empty() || pure_decl) {
+
                                 for a in &args[1..] {
                                     mark_write_builtin_vars(a, excluded);
                                     // `let`/`(( ))`/`eval` args are
@@ -11244,7 +11502,14 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                         let intdecl = if cname == "let" { Vec::new() } else {
                             int_declare_names(args).unwrap_or_default()
                         };
-                        if !(native_let || !intdecl.is_empty()) {
+                        // a PURE-VALUE `local x=1` declaration is not a store write (the
+                        // emit rewrites it to a native binding write — see pure_value_declare):
+                        // skip its marks too, unless the call sits in a subshell/background
+                        // (COPY semantics — the name must stay store-bound there, mirror of
+                        // the Assign-target exclusion).
+                        let pure_decl = !in_copy && pure_value_declare(args).is_some();
+                        if !(native_let || !intdecl.is_empty() || pure_decl) {
+
                             for a in args {
                                 mark_write_builtin_vars(a, excluded);
                                 // `let`/`(( ))`/`eval` args are ARITHMETIC
@@ -11550,6 +11815,33 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
                     if let Some(call) = try_native_fn_call(name, a) {
                         return call;
+                    }
+                }
+            }
+            // `local x=1` / `declare x=1` / ... with PURE-VALUE args whose
+            // names are ALL lifted (expression position — &&/|| operands,
+            // pipeline stages): the native binding-write sequence, same as
+            // the statement form (see try_native_declare_stmt) — the
+            // trailing `true` is the builtin's truthy return the &&/||
+            // chains branch on.
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), ..] = args.as_slice() {
+                    if matches!(name.as_str(), "local" | "declare" | "typeset" | "readonly") {
+                        if let Some(native) = try_native_declare_stmt(args) {
+                            return native;
+                        }
+                    }
+                }
+            }
+            // `eval "NAME=VALUE..."` with a STATIC pure-assignment string
+            // (expression position): the native store-write sequence — no
+            // double bash spawn per evaluation (see try_native_eval).
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), ..] = args.as_slice() {
+                    if name == "eval" {
+                        if let Some(native) = try_native_eval(args) {
+                            return native;
+                        }
                     }
                 }
             }
@@ -12309,37 +12601,27 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // A native JS `&&` would consult the return VALUE of the left
             // operand instead — capture() returns the captured STRING and
             // assign() returns true, so `r=$(cmd) || ...` (and friends) would
-            // branch on the wrong thing. When BOTH operands lower without an
-            // await, the runtime helpers' exact decision is a native
-            // sequence on the recorded status (see native_and_or); the
-            // runtime helper sequences both sides and checks lastExit
-            // otherwise (operands with awaits stay async arrows).
+            // branch on the wrong thing. The native sequence (see
+            // native_and_or) mirrors the runtime helpers' exact decision on
+            // the recorded status for BOTH sync and awaited operands: the
+            // seq's awaits run in the enclosing async context (module top
+            // level / async arrows — the sync-arrow and *Sync-loop analyses
+            // scan the lowered body and disqualify awaited chains
+            // consistently), so `(await l, sh2.lastExit === 0 ? (await r,
+            // …) : false)` is the `sh2.and` helper's exact body minus the
+            // per-evaluation promise machinery.
             *AND_OR_DEPTH.lock().unwrap() += 1;
             let l = expr_to_estree(lhs);
             let r = expr_to_estree(rhs);
             *AND_OR_DEPTH.lock().unwrap() -= 1;
-            if !expr_has_await(&l) && !expr_has_await(&r) {
-                return native_and_or(BinOpKind::And, l, r);
-            }
-            let e = await_call(
-                "and",
-                vec![arrow(vec![], (**lhs).clone()), arrow(vec![], (**rhs).clone())],
-            );
-            e
+            native_and_or(BinOpKind::And, l, r)
         }
         IrExpr::BinOp { op: BinOpKind::Or, lhs, rhs } => {
             *AND_OR_DEPTH.lock().unwrap() += 1;
             let l = expr_to_estree(lhs);
             let r = expr_to_estree(rhs);
             *AND_OR_DEPTH.lock().unwrap() -= 1;
-            if !expr_has_await(&l) && !expr_has_await(&r) {
-                return native_and_or(BinOpKind::Or, l, r);
-            }
-            let e = await_call(
-                "or",
-                vec![arrow(vec![], (**lhs).clone()), arrow(vec![], (**rhs).clone())],
-            );
-            e
+            native_and_or(BinOpKind::Or, l, r)
         }
         // `! cmd` — bash inverts the exit STATUS (so `$?` flips too); a pure
         // JS negation would leave lastExit untouched. The native lowering
