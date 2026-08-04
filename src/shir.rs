@@ -6745,6 +6745,78 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     && !lowered_stmts_have_signals(&body_e)
                     && for_iter_flattenable(iter)
                 {
+                    // Store-sync elimination (the SELF_CONTAINED read
+                    // pattern, doc in forof_sync_elim_ok): a STORE-BACKED
+                    // loop var whose body only ever observes it through
+                    // `sh2.getVar(var)` (rewritten to the native binding)
+                    // and never writes it — the per-iteration
+                    // `sh2.setVar(var, i)` sync collapses to ONE pre-loop
+                    // store read (the empty-iterable case keeps the
+                    // pre-loop value, exactly like bash) + ONE post-loop
+                    // store write. A call eliminated from a 10k-iteration
+                    // loop is worth 10k call sites in runtime terms.
+                    let mut sync_elim: Option<(Vec<Stmt>, String)> = None;
+                    if let Some(sync) = &coercion {
+                        let is_store_sync = !is_lifted(var)
+                            && matches!(sync, IrStmt::Assign { targets, .. }
+                                if targets.len() == 1 && targets[0].var == *var);
+                        if is_store_sync && forof_sync_elim_ok(&body_e[1..], var) {
+                            let mut body2: Vec<Stmt> = vec![Stmt::ExpressionStatement {
+                                // the per-iteration store sync becomes a
+                                // native temp write (the post-loop setVar
+                                // stores the LAST value; the pre-loop read
+                                // covers the empty-iterable case)
+                                expression: Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(Expr::Identifier {
+                                        name: format!("__sh2_for_last_{js_var}"),
+                                    }),
+                                    right: Box::new(Expr::Identifier {
+                                        name: js_var.clone(),
+                                    }),
+                                },
+                            }];
+                            body2.extend(body_e[1..].to_vec());
+                            forof_rewrite_getvar(&mut body2, var, &js_var);
+                            let temp = format!("__sh2_for_last_{js_var}");
+                            let mut out: Vec<Stmt> = vec![Stmt::VariableDeclaration {
+                                kind: "let",
+                                declarations: vec![VariableDeclarator {
+                                    type_: "VariableDeclarator",
+                                    id: Expr::Identifier {
+                                        name: temp.clone(),
+                                    },
+                                    init: Some(sh2_call("getVar", vec![str_lit(var)])),
+                                }],
+                            }];
+                            out.push(Stmt::ForOfStatement {
+                                left: Box::new(Stmt::VariableDeclaration {
+                                    kind: "let",
+                                    declarations: vec![VariableDeclarator {
+                                        type_: "VariableDeclarator",
+                                        id: Expr::Identifier {
+                                            name: js_var.clone(),
+                                        },
+                                        init: None,
+                                    }],
+                                }),
+                                right: flatten_for_iter(iter),
+                                body: Box::new(Stmt::BlockStatement { body: body2 }),
+                            });
+                            out.push(Stmt::ExpressionStatement {
+                                expression: sh2_call(
+                                    "setVar",
+                                    vec![str_lit(var), Expr::Identifier {
+                                        name: temp,
+                                    }],
+                                ),
+                            });
+                            sync_elim = Some((out, js_var.clone()));
+                        }
+                    }
+                    if let Some((out, _)) = sync_elim {
+                        return Some(Stmt::BlockStatement { body: out });
+                    }
                     return Some(Stmt::ForOfStatement {
                         left: Box::new(Stmt::VariableDeclaration {
                             kind: "let",
@@ -7142,6 +7214,33 @@ fn str_operand(e: &str) -> Option<Expr> {
         });
     }
     None
+}
+
+/// `==` / `!=` operand: like `test_value_operand` but with the guards the
+/// equality path needs — a quoted `*` / `?` / `[` operand is a PATTERN the
+/// runtime glob-matches (never a literal), and an unquoted word must be
+/// strictly literal (an unquoted `=` / `<` / `>` would have tokenized into
+/// separate test tokens → the runtime parse errors → the whole test is
+/// false; str_operand's rule). Quoted and `$`-forms additionally read
+/// store vars and positionals natively (getVar / `sh2.positional`).
+fn eq_test_operand(e: &str) -> Option<Expr> {
+    let e = e.trim();
+    if let Some(inner) = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        if inner.contains(['*', '?', '[']) {
+            return None; // glob pattern — the runtime glob-matches
+        }
+        return test_value_operand(&format!("\"{inner}\""));
+    }
+    if let Some(inner) = e.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
+        if inner.contains(['*', '?', '[']) {
+            return None;
+        }
+        return test_value_operand(&format!("'{inner}'"));
+    }
+    if e.starts_with('$') {
+        return test_value_operand(e);
+    }
+    str_operand(e)
 }
 
 /// `[ "$x" = *P* ]` family: the RIGHT side is a [`CasePat`] glob (the
@@ -11607,8 +11706,8 @@ fn try_native_test(s: &str) -> Option<Expr> {
                     if let Some(native) = try_native_glob_test(lhs, rhs, op == "!=") {
                         return Some(native);
                     }
-                    let l = str_operand(lhs)?;
-                    let r = str_operand(rhs)?;
+                    let l = eq_test_operand(lhs)?;
+                    let r = eq_test_operand(rhs)?;
                     // `nocasematch` makes `==`/`!=` (and `[[ ]]` glob
                     // matches) case-insensitive: the runtime lowercases
                     // BOTH sides (evalTest `=`/`==`/`!=`). A native bare
@@ -11653,6 +11752,115 @@ fn try_native_test(s: &str) -> Option<Expr> {
                 }
             }
             idx += 1;
+        }
+    }
+    // Compound `-a` / `-o` chains: the runtime's parseTest binds `-a`
+    // tighter than `-o` (`or()` calls `and()`), `!` negates ONE primary,
+    // and both short-circuit — a native `&&`/`||` chain of native leaves
+    // (each leaf recurses into this same lowering) is the exact value
+    // minus the string tokenize/parse/dispatch. Only top-level
+    // connectors count: quoted `-a`/`-o` text and paren-grouped
+    // compounds stay on the runtime.
+    try_native_compound_test(s)
+}
+
+/// Split on a top-level ` -conn ` connector (outside quotes and parens),
+/// returning the parts. None when the connector does not appear.
+fn split_test_connector<'a>(s: &'a str, conn: &str) -> Option<Vec<&'a str>> {
+    let b = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_q = false;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                in_q = !in_q;
+                i += 1;
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            b' ' if depth == 0 && !in_q && s[i + 1..].starts_with(conn) && {
+                let after = i + 1 + conn.len();
+                after < s.len() && s[after..].starts_with(' ')
+            } => {
+                parts.push(&s[start..i]);
+                i += 1 + conn.len() + 1;
+                start = i;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.push(&s[start..]);
+    Some(parts)
+}
+
+/// One compound-test leaf: a leading `!` negates the leaf (the runtime's
+/// `not()` binds to a single primary — `! A -a B` is `(!A) -a B`);
+/// `!(` is an extglob pattern, never a negation.
+fn try_native_test_leaf(s: &str) -> Option<Expr> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('!') {
+        if rest.starts_with('(') {
+            return None;
+        }
+        let inner = try_native_test(rest)?;
+        return Some(Expr::UnaryExpression {
+            operator: "!",
+            argument: Box::new(inner),
+            prefix: true,
+        });
+    }
+    try_native_test(s)
+}
+
+fn try_native_compound_test(s: &str) -> Option<Expr> {
+    let s = s.trim();
+    if s.contains(['(', ')']) {
+        return None; // paren-grouped compounds stay on the runtime
+    }
+    // `-o` splits first (`-a` binds tighter, so `A -o B -a C` is
+    // `A || (B && C)` — the -a recursion happens inside each -o leaf)
+    if let Some(parts) = split_test_connector(s, "-o") {
+        if parts.len() > 1 {
+            let mut it = parts.into_iter();
+            let mut acc = try_native_test_leaf(it.next()?)?;
+            for p in it {
+                let r = try_native_test_leaf(p)?;
+                acc = Expr::LogicalExpression {
+                    operator: "||",
+                    left: Box::new(acc),
+                    right: Box::new(r),
+                };
+            }
+            return Some(acc);
+        }
+    }
+    if let Some(parts) = split_test_connector(s, "-a") {
+        if parts.len() > 1 {
+            let mut it = parts.into_iter();
+            let mut acc = try_native_test_leaf(it.next()?)?;
+            for p in it {
+                let r = try_native_test_leaf(p)?;
+                acc = Expr::LogicalExpression {
+                    operator: "&&",
+                    left: Box::new(acc),
+                    right: Box::new(r),
+                };
+            }
+            return Some(acc);
         }
     }
     None
@@ -14461,6 +14669,281 @@ fn native_and_or(op: BinOpKind, l: Expr, r: Expr) -> Expr {
             },
         ]),
         _ => unreachable!("native_and_or: only And/Or"),
+    }
+}
+
+/// sh2-callee name of a lowered CallExpression (`sh2.getVar` → `"getVar"`),
+/// or None for any other callee shape.
+fn sh2_callee_name(e: &Expr) -> Option<&str> {
+    if let Expr::CallExpression { callee, .. } = e {
+        if let Expr::MemberExpression { object, property, .. } = callee.as_ref() {
+            if let Expr::Identifier { name } = object.as_ref() {
+                if name == "sh2" {
+                    if let Expr::Identifier { name } = property.as_ref() {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The literal store-name argument of a sh2 call (`sh2.setVar("i", v)` →
+/// Some("i")), only for a plain string-literal first argument.
+fn sh2_name_arg(e: &Expr) -> Option<&str> {
+    if let Expr::CallExpression { arguments, .. } = e {
+        if let Some(Expr::Literal { value, .. }) = arguments.first() {
+            return value.as_str();
+        }
+    }
+    None
+}
+
+/// Native-ForOf store-sync elimination — eligibility scan over the loop
+/// body (minus the sync statement itself). The optimization replaces the
+/// per-iteration `sh2.setVar(var, i)` store sync + the body's
+/// `sh2.getVar(var)` reads with a native binding read, one pre-loop
+/// store read and one post-loop store write. It is ONLY sound when the
+/// body cannot observe the store's `var` through any other channel:
+///   (a) any sh2.* call outside the allow-list {getVar, setVar, setArray,
+///       setArrayAppend, assign} — a runtime call could read or write
+///       `var` through the store (test strings, eval, fnCall/exec of
+///       script functions, param ops, `read`/`shift` builtins, ...);
+///   (b) a store WRITE to `var` (setVar/assign/setArray/setArrayAppend
+///       with a literal `var` name — incl. a nested for-loop on the same
+///       var, whose own sync/post-write are exactly such writes);
+///   (c) a dynamic name argument (getVar/setVar with a non-literal name
+///       could resolve to `var` at runtime).
+/// Native non-sh2 constructs (echo writes, arith, comparisons) cannot
+/// touch the store — always allowed.
+fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
+    fn expr_ok(e: &Expr, var: &str) -> bool {
+        match e {
+            Expr::CallExpression { callee, arguments, .. } => {
+                if !expr_ok(callee, var) || arguments.iter().any(|a| !expr_ok(a, var)) {
+                    return false;
+                }
+                match sh2_callee_name(e) {
+                    Some("getVar") => match arguments.first() {
+                        // literal-name getVars are fine: `var` reads are
+                        // rewritten to the binding, other names read the
+                        // store as usual
+                        Some(Expr::Literal { .. }) => true,
+                        _ => false, // dynamic name — could resolve to var
+                    },
+                    Some("setVar") | Some("setArray") | Some("setArrayAppend")
+                    | Some("assign") => match sh2_name_arg(e) {
+                        Some(n) => n != var,
+                        None => false,
+                    },
+                    Some(_) => false, // any other sh2 call disqualifies
+                    None => true,
+                }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                expr_ok(object, var) && expr_ok(property, var)
+            }
+            Expr::TemplateLiteral { expressions, .. } => {
+                expressions.iter().all(|e| expr_ok(e, var))
+            }
+            Expr::AwaitExpression { argument } => expr_ok(argument, var),
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                params.iter().all(|p| expr_ok(p, var))
+                    && match body {
+                        ArrowBody::Expr(e) => expr_ok(e, var),
+                        ArrowBody::Block(s) => stmt_ok(s, var),
+                    }
+            }
+            Expr::ObjectExpression { properties } => properties
+                .iter()
+                .all(|p| expr_ok(&p.key, var) && expr_ok(&p.value, var)),
+            Expr::ArrayExpression { elements } => elements
+                .iter()
+                .flatten()
+                .all(|e| expr_ok(e, var)),
+            Expr::SequenceExpression { expressions } => {
+                expressions.iter().all(|e| expr_ok(e, var))
+            }
+            Expr::SpreadElement { argument } => expr_ok(argument, var),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                expr_ok(left, var) && expr_ok(right, var)
+            }
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => expr_ok(test, var) && expr_ok(consequent, var) && expr_ok(alternate, var),
+            Expr::UnaryExpression { argument, .. } => expr_ok(argument, var),
+            _ => true,
+        }
+    }
+    fn stmt_ok(s: &Stmt, var: &str) -> bool {
+        match s {
+            Stmt::ExpressionStatement { expression } => expr_ok(expression, var),
+            Stmt::BlockStatement { body } => body.iter().all(|b| stmt_ok(b, var)),
+            Stmt::IfStatement { test, consequent, alternate } => {
+                expr_ok(test, var)
+                    && stmt_ok(consequent, var)
+                    && alternate.as_deref().map_or(true, |a| stmt_ok(a, var))
+            }
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr_ok(discriminant, var)
+                    && cases.iter().all(|c| {
+                        c.test.as_ref().map_or(true, |t| expr_ok(t, var))
+                            && c.consequent.iter().all(|s2| stmt_ok(s2, var))
+                    })
+            }
+            Stmt::WhileStatement { test, body } => expr_ok(test, var) && stmt_ok(body, var),
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt_ok(left, var) && expr_ok(right, var) && stmt_ok(body, var)
+            }
+            Stmt::VariableDeclaration { declarations, .. } => declarations.iter().all(|d| {
+                d.init.as_ref().map_or(true, |i| expr_ok(i, var))
+            }),
+            Stmt::ReturnStatement { argument } => {
+                argument.as_ref().map_or(true, |a| expr_ok(a, var))
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => true,
+        }
+    }
+    stmts.iter().all(|s| stmt_ok(s, var))
+}
+
+/// Rewrite `sh2.getVar(var)` calls inside a lowered statement to the
+/// native binding `js_var` (the ForOf binding holds the exact value the
+/// store sync would have written). Only exact literal-name matches are
+/// touched.
+fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
+    fn expr_rewrite(e: &mut Expr, var: &str, js_var: &str) {
+        let callee_name = sh2_callee_name(e).map(|s| s.to_string());
+        match e {
+            Expr::CallExpression { callee, arguments, .. } => {
+                if callee_name.as_deref() == Some("getVar")
+                    && matches!(
+                        arguments.first(),
+                        Some(Expr::Literal { value, .. }) if value.as_str() == Some(var)
+                    )
+                {
+                    *e = Expr::Identifier {
+                        name: js_var.to_string(),
+                    };
+                    return;
+                }
+                expr_rewrite(callee, var, js_var);
+                for a in arguments.iter_mut() {
+                    expr_rewrite(a, var, js_var);
+                }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                expr_rewrite(object, var, js_var);
+                expr_rewrite(property, var, js_var);
+            }
+            Expr::TemplateLiteral { expressions, .. } => {
+                for e2 in expressions.iter_mut() {
+                    expr_rewrite(e2, var, js_var);
+                }
+            }
+            Expr::AwaitExpression { argument } => expr_rewrite(argument, var, js_var),
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params.iter_mut() {
+                    expr_rewrite(p, var, js_var);
+                }
+                match body {
+                    ArrowBody::Expr(e) => expr_rewrite(e, var, js_var),
+                    ArrowBody::Block(s) => stmt_rewrite(s, var, js_var),
+                }
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties.iter_mut() {
+                    expr_rewrite(&mut p.key, var, js_var);
+                    expr_rewrite(&mut p.value, var, js_var);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() {
+                    expr_rewrite(el, var, js_var);
+                }
+            }
+            Expr::SequenceExpression { expressions } => {
+                for el in expressions.iter_mut() {
+                    expr_rewrite(el, var, js_var);
+                }
+            }
+            Expr::SpreadElement { argument } => expr_rewrite(argument, var, js_var),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                expr_rewrite(left, var, js_var);
+                expr_rewrite(right, var, js_var);
+            }
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expr_rewrite(test, var, js_var);
+                expr_rewrite(consequent, var, js_var);
+                expr_rewrite(alternate, var, js_var);
+            }
+            Expr::UnaryExpression { argument, .. } => expr_rewrite(argument, var, js_var),
+            _ => {}
+        }
+    }
+    fn stmt_rewrite(s: &mut Stmt, var: &str, js_var: &str) {
+        match s {
+            Stmt::ExpressionStatement { expression } => expr_rewrite(expression, var, js_var),
+            Stmt::BlockStatement { body } => {
+                for b in body.iter_mut() {
+                    stmt_rewrite(b, var, js_var);
+                }
+            }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                expr_rewrite(test, var, js_var);
+                stmt_rewrite(consequent, var, js_var);
+                if let Some(a) = alternate {
+                    stmt_rewrite(a, var, js_var);
+                }
+            }
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr_rewrite(discriminant, var, js_var);
+                for c in cases.iter_mut() {
+                    if let Some(t) = &mut c.test {
+                        expr_rewrite(t, var, js_var);
+                    }
+                    for s2 in c.consequent.iter_mut() {
+                        stmt_rewrite(s2, var, js_var);
+                    }
+                }
+            }
+            Stmt::WhileStatement { test, body } => {
+                expr_rewrite(test, var, js_var);
+                stmt_rewrite(body, var, js_var);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt_rewrite(left, var, js_var);
+                expr_rewrite(right, var, js_var);
+                stmt_rewrite(body, var, js_var);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations.iter_mut() {
+                    if let Some(i) = &mut d.init {
+                        expr_rewrite(i, var, js_var);
+                    }
+                }
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument {
+                    expr_rewrite(a, var, js_var);
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    for s in stmts.iter_mut() {
+        stmt_rewrite(s, var, js_var);
     }
 }
 
