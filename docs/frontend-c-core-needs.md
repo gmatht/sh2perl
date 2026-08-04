@@ -15,9 +15,13 @@ to C": GHC, Nim, Zig's C backend, DSLs) — so C is a uniquely valuable
 target** (C → ShIR → JS/Perl/Python/Lua/Rust/Zig). The shell IR is
 ~80% of what a C frontend needs (imperative control flow, fds, the store);
 the gaps are exactly where shell and C differ: **types, pointers,
-goto/switch, casts**. The tractable target is a **portable C subset**
-with defined semantics (no UB, bounded pointers) — full C is a research
-project. The extension is one-directional: C adds type/memory/control
+goto/switch, casts**. FOR NOW the tractable target is a **portable C
+subset** with defined semantics (no UB, bounded pointers); full C is,
+for now, a research project. This boundary is deliberately provisional
+— the ESTree worker OWNS the core and is free to propose clever
+solutions (pointer emulation, defined-UB semantics, better
+control-flow transforms) that lift parts of the subset; the corpus +
+round-trip oracle judge. The extension is one-directional: C adds type/memory/control
 nodes; the shell-command nodes (`Pipeline`/`Redirect`/`Capture`/
 `Subshell`/`Glob`) stay unused by the C frontend.
 
@@ -120,11 +124,12 @@ machine; reducible → loops/labels) so the IR can carry the label form
 and each backend applies its transform — or the C frontend *rejects*
 irreducible goto (a subset decision).
 
-## 5. The pointer subset (the gate)
+## 5. The pointer subset (the gate — FOR NOW)
 
 Full C pointers → the dynamic backends need memory emulation (a heap of
-objects + an address table) — heavy, slow, and semantically leaky. The
-portable subset:
+objects + an address table) — heavy, slow, and semantically leaky. FOR
+NOW the portable subset (the worker may later propose a
+memory-emulation model that lifts it):
 
 - **Arrays by (base, len)** — passed as pairs; no pointer arithmetic.
 - **`&x` / `*p` only for pass-by-reference** — the call-by-reference
@@ -143,9 +148,16 @@ portable subset:
 
 The subset contract (§6) is what makes the emulation matrix small.
 
-## 6. The subset contract (the C-side no-UB document)
+## 6. The subset contract — FOR NOW (the C-side no-UB document)
 
-The frontend accepts only **defined-semantics portable C**:
+**The boundary is provisional, not a permanent design decision.** The
+ESTree worker owns the core; the contract below is the phase-1 envelope
+that makes the frontend tractable, and the worker is free to think of
+clever solutions that lift it (defined-UB semantics, a memory-emulation
+model, richer preprocessor support, function-like macros — each judged
+by the corpus + round-trip oracle, exactly the bash-fidelity-contract
+discipline). FOR NOW the frontend accepts only **defined-semantics
+portable C**:
 - signed arithmetic wraps (the arith contract's wrapping — no UB);
 - no uninitialized reads; no `setjmp`/`longjmp`; no varargs; no
   recursion beyond a (bounded, target-tunable) depth; no raw
@@ -156,6 +168,11 @@ The frontend accepts only **defined-semantics portable C**:
   subset) — resolved by the preprocessor stage;
 - I/O through the bridge: `printf/puts/fprintf` → `Output`/`WriteFile`;
   `scanf/getchar` → `read`; `FILE*` → the fd table.
+
+Future directions the worker may pursue beyond the envelope (each an
+independent plan entry when it gets there): pointer/memory emulation for
+the dynamic backends, defined-UB arithmetic, full goto with a state
+machine, function-like macros.
 
 ## 7. The architecture (frontend-only)
 
@@ -176,7 +193,7 @@ The frontend accepts only **defined-semantics portable C**:
 | F2 | the new nodes: Cast/Sizeof/Member/Comma/AddrOf/Deref, Label/Goto/CSwitch, Function-signature/storage | `src/ir.rs` (additive; backends ignore) |
 | F3 | the **goto-reduction contract** (reducible → labels; irreducible → state machine; or reject) | docs + the structural gate |
 | F4 | the **pointer-subset contract** + the per-backend pass-by-ref matrix | docs |
-| F5 | the **no-UB subset contract** (wrapping, no UB, bounded recursion) | docs — the C-side sibling of the bash-fidelity contracts |
+| F5 | the **no-UB subset contract — FOR NOW** (wrapping, no UB, bounded recursion; the worker is free to lift it with cleverer solutions) | docs — the C-side sibling of the bash-fidelity contracts |
 | F6 | the I/O bridge (printf/scanf/FILE* → Output/read/fd) | the frontend's lowering (no IR change) |
 | F7 | the round-trip oracle: `C → --shir → C` corpus (identity test) | harness |
 | F8 | the C-subset frontend itself (parser + lowering) | new crate/frontend |
@@ -192,8 +209,8 @@ frontend proper; F8 is the frontend itself — the last, biggest step.
   shell path; the backends are untouched.
 - Hard: the type lattice + conversions (the 80%); goto on the
   no-goto backends (Python/JS); pointer emulation on the dynamic
-  backends — which is why the SUBSET is the design, not an
-  afterthought.
+  backends — which is why the SUBSET is the phase-1 design — a FOR NOW
+  boundary the worker may later lift with cleverer solutions.
 - The value is proportional to the subset's size: a no-pointer,
   no-goto, wrapping-semantics portable subset covers the "string +
   integer + printf" programs that dominate real C-in-the-wild DSL
