@@ -18,9 +18,14 @@ use serde_json::{json, Value};
 
 /// Serialize an `IrProgram` to compact ShIR JSON (deterministic).
 pub fn shir_to_shir_json(prog: &IrProgram) -> String {
-    // Ask A2: attach the type verdicts before serializing.
+    // Ask A2: attach the type verdicts before serializing — unless the
+    // caller (the C frontend) already populated them from its own type
+    // analysis (the shell lift's verdicts don't apply to a C-produced
+    // IR).
     let mut prog = prog.clone();
-    prog.var_types = crate::shir::analyze_var_types(&prog);
+    if prog.var_types.is_empty() {
+        prog.var_types = crate::shir::analyze_var_types(&prog);
+    }
     program_json(&prog, CONTRACT_VERSION).to_string()
 }
 
