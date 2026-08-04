@@ -7,6 +7,7 @@ pub mod ir;
 pub mod debug;
 pub mod estree;
 pub mod shir;
+pub mod bc;
 pub mod generator;
 pub mod mir_simple;
 pub mod shared_utils;
