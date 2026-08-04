@@ -11708,6 +11708,22 @@ fn try_native_test(s: &str) -> Option<Expr> {
                     }
                     let l = eq_test_operand(lhs)?;
                     let r = eq_test_operand(rhs)?;
+                    // bash `=` / `==` / `!=` is a STRING comparison: the
+                    // operands are the STRING expansions (`$i` → the
+                    // string form of the number). A numeric-lifted var is
+                    // a JS number and `$?`/`$#` are numeric state fields
+                    // — a bare `===` would compare number-vs-string and
+                    // ALWAYS be false. Compare the String() forms
+                    // (String(lit) is identity; String(num) is the shell
+                    // expansion) — this is the -n/-z unary path's and
+                    // glob path's existing convention.
+                    let stringify = |e: Expr| Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "String".to_string(),
+                        }),
+                        arguments: vec![e],
+                        optional: false,
+                    };
                     // `nocasematch` makes `==`/`!=` (and `[[ ]]` glob
                     // matches) case-insensitive: the runtime lowercases
                     // BOTH sides (evalTest `=`/`==`/`!=`). A native bare
@@ -11746,8 +11762,8 @@ fn try_native_test(s: &str) -> Option<Expr> {
                     }
                     return Some(Expr::BinaryExpression {
                         operator: js,
-                        left: Box::new(l),
-                        right: Box::new(r),
+                        left: Box::new(stringify(l)),
+                        right: Box::new(stringify(r)),
                     });
                 }
             }
