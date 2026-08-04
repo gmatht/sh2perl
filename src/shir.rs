@@ -623,7 +623,7 @@ pub(crate) const SYNC_BUILTINS: &[&str] = &[
     ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue", "cut", "declare",
     "dirname", "echo", "eval", "exit", "export", "false", "head", "let", "local",
     "mapfile", "mktemp", "printf", "pwd", "read", "readarray", "readonly", "return", "seq",
-    "set", "shift", "sort", "source", "stat", "tail", "test", "touch", "trap",
+    "sed", "set", "shift", "sort", "source", "stat", "tail", "test", "touch", "tr", "trap",
     "true", "type", "typeset", "uniq", "unset", "wc",
 ];
 /// Names of every function the program defines (IrStmt::Function), set per
