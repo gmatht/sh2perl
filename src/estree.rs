@@ -1102,7 +1102,10 @@ mod tests {
         // native join; other captures keep the await sh2.capture call.
         let json3 = to_json("x=$(echo hi)");
         assert!(json3.contains("\"type\":\"AssignmentExpression\""));
-        assert!(json3.contains("\"name\":\"join\""));
+        // the pure echo capture folds to a single literal (the join of one
+        // literal arg is the literal itself — no runtime join machinery)
+        assert!(json3.contains("\"value\":\"hi\""));
+        assert!(!json3.contains("\"name\":\"join\""));
         assert!(!json3.contains("\"name\":\"setVar\""));
         assert!(!json3.contains("unsupported"));
         let json4 = to_json("x=$(date)");
