@@ -2855,7 +2855,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                     _ => "~",
                 };
                 return Some(ArithAst::Un {
-                    op,
+                    op: op.to_string(),
                     arg: Box::new(unary(chars, pos)?),
                 });
             }
@@ -2871,7 +2871,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
             *pos += 2;
             let exp = pow(chars, pos)?;
             return Some(ArithAst::Bin {
-                op: "**",
+                op: "**".to_string(),
                 lhs: Box::new(base),
                 rhs: Box::new(exp),
             });
@@ -2887,7 +2887,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                 *pos += 1;
                 let rhs = pow(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "*",
+                    op: "*".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -2895,7 +2895,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                 *pos += 1;
                 let rhs = pow(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "/",
+                    op: "/".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -2903,7 +2903,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                 *pos += 1;
                 let rhs = pow(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "%",
+                    op: "%".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -2921,7 +2921,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                 *pos += 1;
                 let rhs = mul(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "+",
+                    op: "+".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -2929,7 +2929,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                 *pos += 1;
                 let rhs = mul(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "-",
+                    op: "-".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -2945,14 +2945,14 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
             if eat2(chars, pos, "<<") {
                 let rhs = add(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "<<",
+                    op: "<<".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
             } else if eat2(chars, pos, ">>") {
                 let rhs = add(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: ">>",
+                    op: ">>".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -2986,7 +2986,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                 *pos += if two { 2 } else { 1 };
                 let rhs = shift(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op,
+                    op: op.to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -3002,14 +3002,14 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
             if eat2(chars, pos, "==") {
                 let rhs = rel(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "==",
+                    op: "==".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
             } else if eat2(chars, pos, "!=") {
                 let rhs = rel(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "!=",
+                    op: "!=".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -3026,7 +3026,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                 *pos += 1;
                 let rhs = eq(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "&",
+                    op: "&".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -3043,7 +3043,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                 *pos += 1;
                 let rhs = band(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "^",
+                    op: "^".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -3060,7 +3060,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                 *pos += 1;
                 let rhs = bxor(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "|",
+                    op: "|".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -3076,7 +3076,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
             if eat2(chars, pos, "&&") {
                 let rhs = bor(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "&&",
+                    op: "&&".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -3092,7 +3092,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
             if eat2(chars, pos, "||") {
                 let rhs = land(chars, pos)?;
                 lhs = ArithAst::Bin {
-                    op: "||",
+                    op: "||".to_string(),
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                 };
@@ -3169,7 +3169,7 @@ fn parse_arith(src: &str) -> Option<ArithAst> {
                 let rhs = assignment(chars, pos)?;
                 return Some(ArithAst::Assign {
                     var: name,
-                    op,
+                    op: op.to_string(),
                     rhs: Box::new(rhs),
                 });
             }
@@ -3222,7 +3222,7 @@ fn arith_var_read(name: &str) -> Expr {
         })
     };
     Expr::LogicalExpression {
-        operator: "||",
+        operator: "||".to_string(),
         left: Box::new(Expr::CallExpression {
             callee: Box::new(Expr::Identifier {
                 name: "Number".to_string(),
@@ -3268,11 +3268,11 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
             }
             let cur = arith_var_read(var);
             let bin = |op: &'static str, l: Expr, r: Expr| Expr::BinaryExpression {
-                operator: op,
+                operator: op.to_string(),
                 left: Box::new(l),
                 right: Box::new(r),
             };
-            let new_val = match *op {
+            let new_val = match op.as_str() {
                 "=" => rhs_e.clone(),
                 "+=" => bin("+", cur, rhs_e.clone()),
                 "-=" => bin("-", cur, rhs_e.clone()),
@@ -3305,7 +3305,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
         ArithAst::IncDec { var, delta, prefix } => {
             if is_lifted_num(var) {
                 return Expr::UnaryExpression {
-                    operator: if *delta > 0 { "++" } else { "--" },
+                    operator: if *delta > 0 {"++".to_string()} else {"--".to_string()},
                     argument: Box::new(Expr::Identifier {
                         name: var.clone(),
                     }),
@@ -3319,7 +3319,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
             regex: None,
             };
             let new_val = Expr::BinaryExpression {
-                operator: if *delta > 0 { "+" } else { "-" },
+                operator: if *delta > 0 {"+".to_string()} else {"-".to_string()},
                 left: Box::new(cur),
                 right: Box::new(int1()),
             };
@@ -3327,7 +3327,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 arith_var_read(var)
             } else {
                 Expr::BinaryExpression {
-                    operator: if *delta > 0 { "-" } else { "+" },
+                    operator: if *delta > 0 {"-".to_string()} else {"+".to_string()},
                     left: Box::new(arith_var_read(var)),
                     right: Box::new(int1()),
                 }
@@ -3350,7 +3350,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
             ])
         }
         ArithAst::Index { var, key } => Expr::LogicalExpression {
-            operator: "||",
+            operator: "||".to_string(),
             left: Box::new(Expr::CallExpression {
                 callee: Box::new(Expr::Identifier {
                     name: "Number".to_string(),
@@ -3395,7 +3395,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                                 optional: false,
                             }),
                             arguments: vec![Expr::BinaryExpression {
-                                operator: "/",
+                                operator: "/".to_string(),
                                 left: Box::new(arith_to_estree(lhs)),
                                 right: Box::new(r),
                             }],
@@ -3403,7 +3403,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                         }
                     } else {
                         Expr::BinaryExpression {
-                            operator: "%",
+                            operator: "%".to_string(),
                             left: Box::new(arith_to_estree(lhs)),
                             right: Box::new(r),
                         }
@@ -3421,7 +3421,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 // bash yields 0/1; JS logicals yield one of the operands
                 Expr::ConditionalExpression {
                     test: Box::new(Expr::LogicalExpression {
-                        operator: op,
+                        operator: op.to_string(),
                         left: Box::new(arith_to_estree(lhs)),
                         right: Box::new(arith_to_estree(rhs)),
                     }),
@@ -3436,11 +3436,11 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     regex: None,
                     }),
                 }
-            } else if matches!(*op, "<" | "<=" | ">" | ">=" | "==" | "!=") {
+            } else if matches!(op.as_str(), "<" | "<=" | ">" | ">=" | "==" | "!=") {
                 // bash comparisons yield 0/1; JS yields booleans
                 Expr::ConditionalExpression {
                     test: Box::new(Expr::BinaryExpression {
-                        operator: op,
+                        operator: op.to_string(),
                         left: Box::new(arith_to_estree(lhs)),
                         right: Box::new(arith_to_estree(rhs)),
                     }),
@@ -3457,7 +3457,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 }
             } else {
                 Expr::BinaryExpression {
-                    operator: op,
+                    operator: op.to_string(),
                     left: Box::new(arith_to_estree(lhs)),
                     right: Box::new(arith_to_estree(rhs)),
                 }
@@ -3468,7 +3468,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 // bash ! yields 0/1; JS ! yields a boolean
                 Expr::ConditionalExpression {
                     test: Box::new(Expr::UnaryExpression {
-                        operator: "!",
+                        operator: "!".to_string(),
                         argument: Box::new(arith_to_estree(arg)),
                         prefix: true,
                     }),
@@ -3485,7 +3485,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 }
             } else {
                 Expr::UnaryExpression {
-                    operator: op,
+                    operator: op.to_string(),
                     argument: Box::new(arith_to_estree(arg)),
                     prefix: true,
                 }
@@ -5565,7 +5565,7 @@ fn try_native_case(
                 name: "String".to_string(),
             }),
             arguments: vec![Expr::LogicalExpression {
-                operator: "??",
+                operator: "??".to_string(),
                 left: Box::new(Expr::Identifier {
                     name: id.to_string(),
                 }),
@@ -5635,7 +5635,7 @@ fn try_native_case(
                 optional: false,
             },
             CasePat::Exact(lit) => Expr::BinaryExpression {
-                operator: "===",
+                operator: "===".to_string(),
                 left: Box::new(value),
                 right: Box::new(str_lit(lit)),
             },
@@ -5668,7 +5668,7 @@ fn try_native_case(
             test = Some(match test {
                 None => t,
                 Some(prev) => Expr::LogicalExpression {
-                    operator: "||",
+                    operator: "||".to_string(),
                     left: Box::new(prev),
                     right: Box::new(t),
                 },
@@ -6137,7 +6137,7 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
         joined
     } else {
         Expr::BinaryExpression {
-            operator: "+",
+            operator: "+".to_string(),
             left: Box::new(joined),
             right: Box::new(str_lit("\n")),
         }
@@ -6378,7 +6378,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             } else {
                 // `a || b`: run b only when a FAILED
                 Expr::BinaryExpression {
-                    operator: "!==",
+                    operator: "!==".to_string(),
                     left: Box::new(sh2_member("lastExit")),
                     right: Box::new(Expr::Literal {
                         value: serde_json::Value::from(0),
@@ -6704,10 +6704,10 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             // process.exit(0);`)
                             tracked.push(Stmt::IfStatement {
                                 test: Expr::LogicalExpression {
-                                    operator: "&&",
+                                    operator: "&&".to_string(),
                                     left: Box::new(sh2_member("errexit")),
                                     right: Box::new(Expr::BinaryExpression {
-                                        operator: "!==",
+                                        operator: "!==".to_string(),
                                         left: Box::new(sh2_member("lastExit")),
                                         right: Box::new(Expr::Literal {
                                             value: serde_json::Value::from(0),
@@ -7378,14 +7378,14 @@ fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
             CasePat::Prefix(lit) => str_op("startsWith", str_lit(&lit_str(lit))),
             CasePat::Suffix(lit) => str_op("endsWith", str_lit(&lit_str(lit))),
             CasePat::Exact(lit) => Expr::BinaryExpression {
-                operator: "===",
+                operator: "===".to_string(),
                 left: Box::new(value.clone()),
                 right: Box::new(str_lit(&lit_str(lit))),
             },
         };
         if negate {
             Expr::UnaryExpression {
-                operator: "!",
+                operator: "!".to_string(),
                 argument: Box::new(inc),
                 prefix: true,
             }
@@ -7896,7 +7896,7 @@ fn native_capture_cat(cmd_args: &[IrExpr], stdin_file: Option<&IrExpr>) -> Optio
     let mut joined = reads.pop().expect("cat has at least one read");
     for r in reads.into_iter().rev() {
         joined = Expr::BinaryExpression {
-            operator: "+",
+            operator: "+".to_string(),
             left: Box::new(r),
             right: Box::new(joined),
         };
@@ -7959,7 +7959,7 @@ fn native_capture_sort(cmd_args: &[IrExpr], stdin_file: Option<&IrExpr>) -> Opti
                 regex: None,
                 },
                 Expr::UnaryExpression {
-                    operator: "-",
+                    operator: "-".to_string(),
                     argument: Box::new(Expr::Literal {
                         value: serde_json::Value::from(1),
                         raw: None,
@@ -8119,7 +8119,7 @@ fn native_capture_grep_cut(stages: &[IrExpr]) -> Option<Expr> {
         };
         if invert {
             Expr::UnaryExpression {
-                operator: "!",
+                operator: "!".to_string(),
                 prefix: true,
                 argument: Box::new(pred),
             }
@@ -8141,7 +8141,7 @@ fn native_capture_grep_cut(stages: &[IrExpr]) -> Option<Expr> {
             optional: false,
         };
         let picked = Expr::LogicalExpression {
-            operator: "??",
+            operator: "??".to_string(),
             left: Box::new(idx),
             right: Box::new(str_lit("")),
         };
@@ -8182,7 +8182,7 @@ fn cut_field_of(l: Expr, delim: &str, field: usize) -> Expr {
         optional: false,
     };
     let picked = Expr::LogicalExpression {
-        operator: "??",
+        operator: "??".to_string(),
         left: Box::new(idx),
         right: Box::new(str_lit("")),
     };
@@ -8249,7 +8249,7 @@ fn native_capture_cut_sort(stages: &[IrExpr]) -> Option<Expr> {
             t.clone(),
             "slice",
             vec![int_lit_expr(0), Expr::UnaryExpression {
-                operator: "-",
+                operator: "-".to_string(),
                 prefix: true,
                 argument: Box::new(int_lit_expr(1)),
             }],
@@ -8262,7 +8262,7 @@ fn native_capture_cut_sort(stages: &[IrExpr]) -> Option<Expr> {
         // (a, b) => ((parseFloat(a) || 0) < (parseFloat(b) || 0) ? -1 :
         //            (parseFloat(a) || 0) > (parseFloat(b) || 0) ? 1 : 0)
         let num = |x: Expr| Expr::LogicalExpression {
-            operator: "||",
+            operator: "||".to_string(),
             left: Box::new(Expr::CallExpression {
                 callee: Box::new(Expr::Identifier {
                     name: "parseFloat".to_string(),
@@ -8277,12 +8277,12 @@ fn native_capture_cut_sort(stages: &[IrExpr]) -> Option<Expr> {
         let na = num(a.clone());
         let nb = num(b.clone());
         let lt = Expr::BinaryExpression {
-            operator: "<",
+            operator: "<".to_string(),
             left: Box::new(na.clone()),
             right: Box::new(nb.clone()),
         };
         let gt = Expr::BinaryExpression {
-            operator: ">",
+            operator: ">".to_string(),
             left: Box::new(na),
             right: Box::new(nb),
         };
@@ -8294,7 +8294,7 @@ fn native_capture_cut_sort(stages: &[IrExpr]) -> Option<Expr> {
                 body: ArrowBody::Expr(Box::new(Expr::ConditionalExpression {
                     test: Box::new(lt),
                     consequent: Box::new(Expr::UnaryExpression {
-                        operator: "-",
+                        operator: "-".to_string(),
                         prefix: true,
                         argument: Box::new(int_lit_expr(1)),
                     }),
@@ -8341,7 +8341,7 @@ fn native_capture_wc(cmd_args: &[IrExpr], stdin_file: &IrExpr) -> Option<Expr> {
                 optional: false,
             };
             Expr::BinaryExpression {
-                operator: "-",
+                operator: "-".to_string(),
                 left: Box::new(Expr::MemberExpression {
                     object: Box::new(split),
                     property: Box::new(Expr::Identifier {
@@ -8792,7 +8792,7 @@ fn try_native_let(args: &[IrExpr]) -> Option<Expr> {
             if parseable {
                 let (last_v, _last_writes) = vals.pop().expect("non-empty let");
                 let nonzero = |v: &Expr| Expr::BinaryExpression {
-                    operator: "!==",
+                    operator: "!==".to_string(),
                     left: Box::new(v.clone()),
                     right: Box::new(Expr::Literal {
                         value: serde_json::Value::from(0),
@@ -8952,12 +8952,12 @@ fn native_fs_remove_result(op: Expr, force: bool) -> Expr {
             }],
             body: ArrowBody::Expr(Box::new(Expr::ConditionalExpression {
                 test: Box::new(Expr::LogicalExpression {
-                    operator: "&&",
+                    operator: "&&".to_string(),
                     left: Box::new(Expr::Identifier {
                         name: "e".to_string(),
                     }),
                     right: Box::new(Expr::BinaryExpression {
-                        operator: "===",
+                        operator: "===".to_string(),
                         left: Box::new(Expr::MemberExpression {
                             object: Box::new(Expr::Identifier {
                                 name: "e".to_string(),
@@ -9036,7 +9036,7 @@ fn native_fs_status_chain(results: Vec<Expr>) -> Expr {
         name: "s".to_string(),
     };
     let no_failure = Expr::UnaryExpression {
-        operator: "!",
+        operator: "!".to_string(),
         prefix: true,
         argument: Box::new(Expr::CallExpression {
             callee: Box::new(Expr::MemberExpression {
@@ -9778,7 +9778,7 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
                         expressions.push(match conv {
                             's' => arg,
                             'd' | 'i' => Expr::LogicalExpression {
-                                operator: "||",
+                                operator: "||".to_string(),
                                 left: Box::new(Expr::CallExpression {
                                     callee: Box::new(Expr::Identifier {
                                         name: "parseInt".to_string(),
@@ -10147,7 +10147,7 @@ fn echo_text(joined: Expr, no_newline: bool) -> Expr {
             regex: _,
         } => str_lit(&format!("{sv}\n")),
         _ => Expr::BinaryExpression {
-            operator: "+",
+            operator: "+".to_string(),
             left: Box::new(joined),
             right: Box::new(str_lit("\n")),
         },
@@ -10482,20 +10482,20 @@ fn cut_range_pred(i: Expr, ranges: &[(i64, Option<i64>)]) -> Expr {
     let mut terms: Vec<Expr> = Vec::new();
     for (lo, hi) in ranges {
         let ge = Expr::BinaryExpression {
-            operator: ">=",
+            operator: ">=".to_string(),
             left: Box::new(i.clone()),
             right: Box::new(int_lit_expr(*lo)),
         };
         let le = match hi {
             Some(h) => Expr::BinaryExpression {
-                operator: "<=",
+                operator: "<=".to_string(),
                 left: Box::new(i.clone()),
                 right: Box::new(int_lit_expr(*h)),
             },
             None => bool_lit(true),
         };
         terms.push(Expr::LogicalExpression {
-            operator: "&&",
+            operator: "&&".to_string(),
             left: Box::new(ge),
             right: Box::new(le),
         });
@@ -10503,7 +10503,7 @@ fn cut_range_pred(i: Expr, ranges: &[(i64, Option<i64>)]) -> Expr {
     let mut it = terms.into_iter();
     let first = it.next().unwrap_or(bool_lit(false));
     it.fold(first, |acc, t| Expr::LogicalExpression {
-        operator: "||",
+        operator: "||".to_string(),
         left: Box::new(acc),
         right: Box::new(t),
     })
@@ -10544,7 +10544,7 @@ fn cut_sel_expr(spec: &CutSpec, l: &Expr) -> Option<Expr> {
                     let i = ident("i");
                     let pred = cut_range_pred(
                         Expr::BinaryExpression {
-                            operator: "+",
+                            operator: "+".to_string(),
                             left: Box::new(i.clone()),
                             right: Box::new(int_lit_expr(1)),
                         },
@@ -10588,7 +10588,7 @@ fn cut_sel_expr(spec: &CutSpec, l: &Expr) -> Option<Expr> {
                 let i = ident("i");
                 let pred = cut_range_pred(
                     Expr::BinaryExpression {
-                        operator: "+",
+                        operator: "+".to_string(),
                         left: Box::new(i.clone()),
                         right: Box::new(int_lit_expr(1)),
                     },
@@ -10636,7 +10636,7 @@ fn cut_value_expr(lines: Expr, spec: &CutSpec, input_ends_nl: bool) -> Option<Ex
     let joined = method_call(mapped, "join", vec![str_lit("\n")]);
     if input_ends_nl {
         Some(Expr::BinaryExpression {
-            operator: "+",
+            operator: "+".to_string(),
             left: Box::new(joined),
             right: Box::new(str_lit("\n")),
         })
@@ -10771,7 +10771,7 @@ fn try_native_echo_grep(pipe: &IrExpr) -> Option<(Expr, Vec<Expr>)> {
         joined
     } else {
         Expr::BinaryExpression {
-            operator: "+",
+            operator: "+".to_string(),
             left: Box::new(joined),
             right: Box::new(str_lit("\n")),
         }
@@ -10984,7 +10984,7 @@ fn native_capture_echo_wc(pipe: &IrExpr) -> Option<Expr> {
         joined
     } else {
         Expr::BinaryExpression {
-            operator: "+",
+            operator: "+".to_string(),
             left: Box::new(joined),
             right: Box::new(str_lit("\n")),
         }
@@ -11013,7 +11013,7 @@ fn native_capture_echo_wc(pipe: &IrExpr) -> Option<Expr> {
         // newline count: text.split("\n").length - 1 (the runtime's
         // `(text.match(/\n/g) || []).length`)
         "-l" => Expr::BinaryExpression {
-            operator: "-",
+            operator: "-".to_string(),
             left: Box::new(len(method(
                 text,
                 "split",
@@ -11122,7 +11122,7 @@ fn native_capture_echo_pipeline(pipe: &IrExpr) -> Option<Expr> {
         joined
     } else {
         Expr::BinaryExpression {
-            operator: "+",
+            operator: "+".to_string(),
             left: Box::new(joined),
             right: Box::new(str_lit("\n")),
         }
@@ -11742,7 +11742,7 @@ fn try_native_test(s: &str) -> Option<Expr> {
                     optional: false,
                 };
                 return Some(Expr::BinaryExpression {
-                    operator: if want_empty { "===" } else { "!==" },
+                    operator: if want_empty {"===".to_string()} else {"!==".to_string()},
                     left: Box::new(val),
                     right: Box::new(str_lit("")),
                 });
@@ -11872,7 +11872,7 @@ fn try_native_test(s: &str) -> Option<Expr> {
             let (r, r_risky) = num_operand(rhs)?;
             if !l_risky && !r_risky {
                 return Some(Expr::BinaryExpression {
-                    operator: js,
+                    operator: js.to_string(),
                     left: Box::new(l),
                     right: Box::new(r),
                 });
@@ -11895,7 +11895,7 @@ fn try_native_test(s: &str) -> Option<Expr> {
             };
             let nan_ok = |e: &Expr| -> Expr {
                 Expr::UnaryExpression {
-                    operator: "!",
+                    operator: "!".to_string(),
                     argument: Box::new(Expr::CallExpression {
                         callee: Box::new(Expr::MemberExpression {
                             object: Box::new(Expr::Identifier {
@@ -11916,18 +11916,18 @@ fn try_native_test(s: &str) -> Option<Expr> {
             let mut guarded = nan_ok(&l);
             if r_risky {
                 guarded = Expr::LogicalExpression {
-                    operator: "&&",
+                    operator: "&&".to_string(),
                     left: Box::new(guarded),
                     right: Box::new(nan_ok(&r)),
                 };
             }
             let cmp = Expr::BinaryExpression {
-                operator: js,
+                operator: js.to_string(),
                 left: Box::new(num(l)),
                 right: Box::new(num(r)),
             };
             return Some(Expr::LogicalExpression {
-                operator: "&&",
+                operator: "&&".to_string(),
                 left: Box::new(guarded),
                 right: Box::new(cmp),
             });
@@ -12025,13 +12025,13 @@ fn try_native_test(s: &str) -> Option<Expr> {
                             optional: false,
                         };
                         return Some(Expr::BinaryExpression {
-                            operator: js,
+                            operator: js.to_string(),
                             left: Box::new(lc(l)),
                             right: Box::new(lc(r)),
                         });
                     }
                     return Some(Expr::BinaryExpression {
-                        operator: js,
+                        operator: js.to_string(),
                         left: Box::new(stringify(l)),
                         right: Box::new(stringify(r)),
                     });
@@ -12104,7 +12104,7 @@ fn try_native_test_leaf(s: &str) -> Option<Expr> {
         }
         let inner = try_native_test(rest)?;
         return Some(Expr::UnaryExpression {
-            operator: "!",
+            operator: "!".to_string(),
             argument: Box::new(inner),
             prefix: true,
         });
@@ -12126,7 +12126,7 @@ fn try_native_compound_test(s: &str) -> Option<Expr> {
             for p in it {
                 let r = try_native_test_leaf(p)?;
                 acc = Expr::LogicalExpression {
-                    operator: "||",
+                    operator: "||".to_string(),
                     left: Box::new(acc),
                     right: Box::new(r),
                 };
@@ -12141,7 +12141,7 @@ fn try_native_compound_test(s: &str) -> Option<Expr> {
             for p in it {
                 let r = try_native_test_leaf(p)?;
                 acc = Expr::LogicalExpression {
-                    operator: "&&",
+                    operator: "&&".to_string(),
                     left: Box::new(acc),
                     right: Box::new(r),
                 };
@@ -12370,7 +12370,7 @@ fn positional_read(name: &str) -> Option<Expr> {
             let d = name.parse::<u32>().ok()?;
             if (1..=9).contains(&d) {
                 Some(Expr::LogicalExpression {
-                    operator: "??",
+                    operator: "??".to_string(),
                     left: Box::new(Expr::MemberExpression {
                         object: Box::new(positional()),
                         property: Box::new(Expr::Literal {
@@ -12441,7 +12441,7 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
         optional: false,
     };
     let bin = |l: Expr, op: &'static str, r: Expr| Expr::BinaryExpression {
-        operator: op,
+        operator: op.to_string(),
         left: Box::new(l),
         right: Box::new(r),
     };
@@ -12734,7 +12734,7 @@ fn try_native_file_test(s: &str) -> Option<Expr> {
     let chain = await_expr(then);
     if negate {
         Some(Expr::UnaryExpression {
-            operator: "!",
+            operator: "!".to_string(),
             argument: Box::new(chain),
             prefix: true,
         })
@@ -12795,7 +12795,7 @@ fn file_test_check(f: char, s: Expr) -> Option<Expr> {
         optional: false,
     };
     let bin = |l: Expr, op: &'static str, r: Expr| Expr::BinaryExpression {
-        operator: op,
+        operator: op.to_string(),
         left: Box::new(l),
         right: Box::new(r),
     };
@@ -12854,7 +12854,7 @@ fn file_test_check(f: char, s: Expr) -> Option<Expr> {
         // `-s`: regular file with a nonzero size (the runtime's
         // `st.isFile() && st.size > 0`)
         's' => Expr::LogicalExpression {
-            operator: "&&",
+            operator: "&&".to_string(),
             left: Box::new(mode_check(0o100000)),
             right: Box::new(bin(member(s, "size"), ">", int_lit(0))),
         },
@@ -13974,7 +13974,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                             text
                         } else {
                             Expr::BinaryExpression {
-                                operator: "+",
+                                operator: "+".to_string(),
                                 left: Box::new(text),
                                 right: Box::new(str_lit("\n")),
                             }
@@ -14685,7 +14685,7 @@ fn await_expr(inner: Expr) -> Expr {
 /// the dispatch (the whileLoopSync precedent).
 fn last_exit_eq_zero() -> Expr {
     Expr::BinaryExpression {
-        operator: "===",
+        operator: "===".to_string(),
         left: Box::new(sh2_member("lastExit")),
         right: Box::new(Expr::Literal {
             value: serde_json::Value::from(0),
@@ -14747,10 +14747,10 @@ fn guard_native(v: Expr) -> Expr {
         right: Box::new(v),
     };
     let check = Expr::LogicalExpression {
-        operator: "&&",
+        operator: "&&".to_string(),
         left: Box::new(sh2_member("errexit")),
         right: Box::new(Expr::UnaryExpression {
-            operator: "!",
+            operator: "!".to_string(),
             argument: Box::new(tmp.clone()),
             prefix: true,
         }),
@@ -14798,7 +14798,7 @@ fn not_native(v: Expr) -> Expr {
         store,
         status,
         Expr::UnaryExpression {
-            operator: "!",
+            operator: "!".to_string(),
             argument: Box::new(tmp),
             prefix: true,
         },
@@ -14818,7 +14818,7 @@ fn trim_capture(inner: Expr) -> Expr {
             name: "String".to_string(),
         }),
         arguments: vec![Expr::LogicalExpression {
-            operator: "??",
+            operator: "??".to_string(),
             left: Box::new(inner),
             right: Box::new(str_lit("")),
         }],
@@ -14889,7 +14889,7 @@ fn native_special_var(name: &str) -> Option<Expr> {
             let d = name.parse::<u32>().ok()?;
             if (1..=9).contains(&d) {
                 Some(Expr::LogicalExpression {
-                    operator: "??",
+                    operator: "??".to_string(),
                     left: Box::new(Expr::MemberExpression {
                         object: Box::new(positional()),
                         property: Box::new(Expr::Literal {
@@ -14917,7 +14917,7 @@ fn native_special_var(name: &str) -> Option<Expr> {
 fn arith_is_nonzero(a: &ArithAst) -> bool {
     match a {
         ArithAst::Num(v) => *v != 0,
-        ArithAst::Un { op, arg } => matches!(*op, "-" | "+") && arith_is_nonzero(arg),
+        ArithAst::Un { op, arg } => matches!(op.as_str(), "-" | "+") && arith_is_nonzero(arg),
         _ => false,
     }
 }

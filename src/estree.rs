@@ -149,12 +149,12 @@ pub enum Expr {
         argument: Box<Expr>,
     },
     LogicalExpression {
-        operator: &'static str,
+        operator: String,
         left: Box<Expr>,
         right: Box<Expr>,
     },
     BinaryExpression {
-        operator: &'static str,
+        operator: String,
         left: Box<Expr>,
         right: Box<Expr>,
     },
@@ -169,7 +169,7 @@ pub enum Expr {
         alternate: Box<Expr>,
     },
     UnaryExpression {
-        operator: &'static str,
+        operator: String,
         argument: Box<Expr>,
         prefix: bool,
     },

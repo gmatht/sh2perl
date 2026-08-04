@@ -431,6 +431,31 @@ pub fn parse_file_to_perl(filename: &str) {
     }
 }
 
+/// Parse a shell file and emit raw ESTree JSON (no perl exec, no diff).
+/// For machine consumers / byte-equality tests. Plan improvement #6.
+pub fn parse_file_to_estree_raw(filename: &str) {
+    match read_cli_input(filename) {
+        Ok(bytes) => {
+            let content = match String::from_utf8(bytes.clone()) {
+                Ok(s) => s,
+                Err(_) => bytes.iter().map(|&b| {
+                    if b < 0x80 { b as char } else { char::from_u32(0xF800 + b as u32).unwrap_or('?') }
+                }).collect(),
+            };
+            let commands = match debashl::Parser::new(&content).parse() {
+                Ok(c) => c,
+                Err(e) => { eprintln!("Parse error: {}", e); return; }
+            };
+            let prog = debashl::shir::ast_to_ir(&commands);
+            match debashl::shir::shir_to_estree_json(&prog) {
+                Ok(s) => print!("{}", s),
+                Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
+            }
+        }
+        Err(e) => { eprintln!("read {}: {}", filename, e); std::process::exit(1); }
+    }
+}
+
 /// Parse a shell file and emit **standard ESTree JSON** (v0 backend,
 /// `sh2.*` runtime namespace — see src/estree.rs / PLAN.md §1.2).
 pub fn parse_file_to_estree(filename: &str) {
@@ -510,28 +535,45 @@ pub fn parse_file_to_shir(filename: &str) {
     println!("{}", debashl::shir_json::shir_to_shir_json(&prog));
 }
 
-/// Parse shell input (direct string or file) and emit ShIR JSON.
-pub fn export_shir(input: &str) {
-    let commands = match Parser::new(input).parse() {
+/// Plan improvement #5: ingest ShIR JSON and emit Perl source
+/// via the Perl backend (which consumes the same IrProgram as the
+/// neutral shIR — no bridge needed). Closes the frontend → shIR → Perl
+/// path for arbitrary source languages.
+pub fn parse_shir_json_to_perl(filename: &str) {
+    let content = match std::fs::read_to_string(filename) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("Parse error: {}", e);
-            return;
-        }
+        Err(e) => { eprintln!("read {}: {}", filename, e); return; }
     };
-    let prog = debashl::shir::ast_to_ir(&commands);
-    println!("{}", debashl::shir_json::shir_to_shir_json(&prog));
+    let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+    };
+    let perl = debashl::ir::ir_to_perl(&prog);
+    print!("{}", perl);
 }
 
-/// Plan §2.3: raw export (unoptimized, no A2 var_types). Pin the
-/// `F(S)_raw == C(S)_raw` boundary.
+/// Parse shell input and emit ShIR JSON. `raw=true` omits the trailing
+/// newline (the contract for machine consumers); `raw=false` adds it
+/// (human-readable default). Fixes the long-standing --shir --raw lie.
+pub fn export_shir(input: &str, raw: bool) {
+    let commands = match Parser::new(input).parse() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("Parse error: {}", e); return; }
+    };
+    let prog = debashl::shir::ast_to_ir(&commands);
+    let json = debashl::shir_json::shir_to_shir_json(&prog);
+    if raw { print!("{}", json); } else { println!("{}", json); }
+}
+
+/// Plan §2.3: raw export (unoptimized, no A2 var_types). Always raw
+/// (no trailing newline) — by definition. Pins F(S)_raw == C(S)_raw.
 pub fn export_shir_raw(input: &str) {
     let commands = match Parser::new(input).parse() {
         Ok(c) => c,
         Err(e) => { eprintln!("Parse error: {}", e); return; }
     };
     let prog = debashl::shir::ast_to_ir_raw(&commands);
-    println!("{}", debashl::shir_json::shir_to_shir_json_raw(&prog));
+    print!("{}", debashl::shir_json::shir_to_shir_json_raw(&prog));
 }
 
 /// Plan §2.2: ingest a ShIR JSON file, run it through the ESTree
