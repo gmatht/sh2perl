@@ -619,7 +619,7 @@ fn mark_loop_status_deadness(st: &IrStmt, live: &HashSet<usize>, dead: &mut Hash
 /// `sh2.builtin("echo", args)` dispatch: identical arg flattening/glob
 /// expansion, identical builtin function, minus the async exec machinery
 /// (the whileLoopSync pattern — same semantics, no per-call promises).
-const SYNC_BUILTINS: &[&str] = &[
+pub(crate) const SYNC_BUILTINS: &[&str] = &[
     ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue", "cut", "declare",
     "dirname", "echo", "eval", "exit", "export", "false", "head", "let", "local",
     "mapfile", "mktemp", "printf", "pwd", "read", "readarray", "readonly", "return", "seq",
@@ -1356,7 +1356,36 @@ pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
         requires: vec![],
         stmts,
         subs: vec![],
+        var_types: vec![],
     }
+}
+
+/// Conservative type annotations for static backends (ask A2). The verdicts
+/// are exactly the JS path's lift analyses: `numeric_lift_vars` (every
+/// assignment provably numeric → native number) and `string_lift_vars`
+/// (every assignment provably a string literal → native string). Vars in
+/// neither set keep the runtime store (shell vars are strings; Any).
+/// Sorted by name for deterministic serialization.
+pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
+    let numeric = numeric_lift_vars(prog);
+    let string = string_lift_vars(prog, &numeric);
+    let mut names: std::collections::HashSet<String> = numeric.iter().cloned().collect();
+    for s in &string {
+        names.insert(s.clone());
+    }
+    let mut names: Vec<String> = names.into_iter().collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|n| {
+            let t = if numeric.contains(&n) {
+                crate::ir::IrType::Int
+            } else {
+                crate::ir::IrType::Str
+            };
+            (n, t)
+        })
+        .collect()
 }
 
 fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
@@ -15222,6 +15251,12 @@ fn safe_ident(name: &str) -> String {
         "typeof", "instanceof", "in", "of", "try", "catch", "finally", "throw",
         "this", "super", "import", "export", "default", "extends", "static",
         "yield", "await", "null", "true", "false", "void", "debugger", "arguments",
+        // C keywords not already reserved above (ask A6): the emitted
+        // identifier set must be C-safe too. Output-preserving on the
+        // corpus (no example names a loop var after a C keyword).
+        "int", "long", "char", "short", "float", "double", "unsigned", "signed",
+        "sizeof", "struct", "union", "enum", "const", "extern", "goto", "typedef",
+        "volatile", "register", "auto", "restrict", "_Bool", "_Complex",
     ];
     if RESERVED.contains(&name) {
         format!("{name}_")
