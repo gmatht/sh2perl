@@ -10,7 +10,6 @@ pub mod shir;
 pub mod shir_json;
 
 pub mod shir_json_in;
-pub mod shir_passes;
 pub mod bc;
 pub mod generator;
 pub mod mir_simple;
