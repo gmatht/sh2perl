@@ -675,26 +675,6 @@ fn native_echo_fn(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Names of script-defined functions whose CALLS lower to a DIRECT native
-/// JS call (see [`native_direct_fn_set`]): the module-level `let f`
-/// binding (a fallback arrow until the define runs) called through the
-/// runtime's `sh2.callDirect` — no per-call Map lookup, no arg
-/// flattening/magic scan, no positional save/restore (the analysis
-/// guarantees the body never touches positionals and the call-site args
-/// are magic-free). The define site emits `sh2.functions.set("f", f =
-/// <arrow>)` — the native binding and the runtime's function map stay in
-/// sync for the async exec dispatch. Set per compilation by
-/// `shir_to_estree`; unset → conservative (keep the fnCall dispatch).
-static NATIVE_DIRECT_FNS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-fn native_direct_fn(name: &str) -> bool {
-    NATIVE_DIRECT_FNS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.contains(name))
-        .unwrap_or(false)
-}
-
 /// Recursive IrStmt walk collecting every `IrStmt::Function` name — a
 /// same-named script function shadows a builtin anywhere in the program
 /// (definitions inside bodies/arrows count).
@@ -1291,268 +1271,6 @@ fn fn_call_sync_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<St
         }
     }
     sync
-}
-
-/// Is `name` a POSITIONAL-parameter reference (`$1..$9` / `${10}` / `$@` /
-/// `$*` / `$#` — everything the function-call machinery saves/restores;
-/// `$0` is argv0, immutable, and excluded)? Digit names (10+) too.
-fn is_positional_name(name: &str) -> bool {
-    !name.is_empty()
-        && (name == "@" || name == "*" || name == "#" || name.chars().all(|c| c.is_ascii_digit()))
-}
-
-/// The positional-name test minus `$0` (argv0 — immutable during the
-/// script, never saved/restored by the function-call machinery).
-fn is_fn_positional_name(name: &str) -> bool {
-    name != "0" && is_positional_name(name)
-}
-
-/// Does a runtime-expanded STRING contain a positional reference (`$1` /
-/// `$@` / `${10}` — the runtime's expandWord resolves them from the
-/// positional state)? Quote-aware (single-quoted and `\$`-escaped refs
-/// are literal, per bash's expansion rules). Runtime-consumed strings
-/// (exec/builtin args, test strings, arith strings, heredoc bodies, case
-/// patterns, ...) keep raw `$refs` for the runtime to expand, so a
-/// positional read can hide inside a plain Str IR node (`local n=$1`).
-/// Over-detection is SAFE here (disqualifies the direct call);
-/// under-detection would break the positional save/restore.
-fn str_has_positional_ref(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    let n = bytes.len();
-    let mut i = 0;
-    while i < n {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'\'' => {
-                i += 1;
-                while i < n && bytes[i] != b'\'' {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'$' => {
-                let mut j = i + 1;
-                if j < n && bytes[j] == b'{' {
-                    j += 1;
-                    let start = j;
-                    while j < n
-                        && (bytes[j].is_ascii_alphanumeric()
-                            || bytes[j] == b'_'
-                            || bytes[j] == b'@'
-                            || bytes[j] == b'*'
-                            || bytes[j] == b'#')
-                    {
-                        j += 1;
-                    }
-                    if is_fn_positional_name(&s[start..j]) {
-                        return true;
-                    }
-                    i = j;
-                } else if j < n {
-                    // `$N` / `$@` / `$*` / `$#` — single char after `$`
-                    // (`$10` is `${1}0` in bash — the digit check catches
-                    // it; `$0` is argv0, excluded)
-                    let c = bytes[j] as char;
-                    if (c.is_ascii_digit() && c != '0') || matches!(c, '@' | '*' | '#') {
-                        return true;
-                    }
-                    i = j;
-                } else {
-                    i = j;
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    false
-}
-
-/// Does an expression READ or WRITE the runtime's positional state? Reads:
-/// `$1..$9` / `$@` / `$*` / `$#` — as bare/interpolated words they lower to
-/// `getVar` calls (word_ir) or Var refs (interpolation parts), as
-/// `${N...}` expansions to `sh2.param` calls with a positional name.
-/// Writes: `set -- ...` / bare `set ...` / `shift` calls (the positional-
-/// assignment builtins — the fnCall path's save/restore would undo them
-/// after the call; a direct native call must not skip that). Conservative:
-/// any `set`/`shift`/`eval`/`source`/`.` call in the body disqualifies
-/// (eval/source could touch positionals through strings).
-fn expr_touches_positionals(e: &IrExpr) -> bool {
-    match e {
-        IrExpr::Var(n, _) => is_fn_positional_name(n),
-        // a raw runtime-consumed string may carry `$1`-style refs the
-        // runtime expands from the positional state (`local n=$1`)
-        IrExpr::Str(sv, _) => str_has_positional_ref(sv),
-        IrExpr::Call { func, args } => {
-            if func == "getVar" {
-                if let Some(IrExpr::Str(n, _)) = args.first() {
-                    return is_fn_positional_name(n);
-                }
-            }
-            if func == "param" {
-                if let Some(IrExpr::Str(n, _)) = args.get(1) {
-                    return is_fn_positional_name(n);
-                }
-            }
-            if matches!(func.as_str(), "exec" | "builtin") {
-                if let Some(IrExpr::Str(cname, _)) = args.first() {
-                    if matches!(cname.as_str(), "set" | "shift" | "eval" | "source" | ".") {
-                        return true;
-                    }
-                }
-            }
-            args.iter().any(expr_touches_positionals)
-        }
-        IrExpr::Array(elems) => elems.iter().any(expr_touches_positionals),
-        IrExpr::Object(props) => props.iter().any(|(_, v)| expr_touches_positionals(v)),
-        IrExpr::Index { key, .. } => expr_touches_positionals(key),
-        IrExpr::BinOp { lhs, rhs, .. } => {
-            expr_touches_positionals(lhs) || expr_touches_positionals(rhs)
-        }
-        IrExpr::MethodCall { obj, args, .. } => {
-            expr_touches_positionals(obj) || args.iter().any(expr_touches_positionals)
-        }
-        IrExpr::Ternary { cond, then, else_, .. } => {
-            expr_touches_positionals(cond)
-                || expr_touches_positionals(then)
-                || expr_touches_positionals(else_)
-        }
-        IrExpr::DefinedOr { expr, default } => {
-            expr_touches_positionals(expr) || expr_touches_positionals(default)
-        }
-        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
-            InterpPart::Expr(inner) => expr_touches_positionals(inner),
-            _ => false,
-        }),
-        IrExpr::Capture { expr, .. } => expr_touches_positionals(expr),
-        IrExpr::Arrow(stmts) => stmts.iter().any(stmt_touches_positionals),
-        _ => false,
-    }
-}
-
-fn stmt_touches_positionals(st: &IrStmt) -> bool {
-    match st {
-        IrStmt::Expr(e) => expr_touches_positionals(e),
-        IrStmt::Output { value, .. } => expr_touches_positionals(value),
-        IrStmt::Assign { expr, .. } => expr_touches_positionals(expr),
-        IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
-            expr_touches_positionals(cond) || body.iter().any(stmt_touches_positionals)
-        }
-        IrStmt::If {
-            cond,
-            then,
-            elsifs,
-            else_,
-        } => {
-            expr_touches_positionals(cond)
-                || then.iter().any(stmt_touches_positionals)
-                || else_.iter().any(stmt_touches_positionals)
-                || elsifs.iter().any(|(_, b)| b.iter().any(stmt_touches_positionals))
-        }
-        IrStmt::Exec { cmd, args, env, .. } => {
-            expr_touches_positionals(cmd)
-                || args.iter().any(expr_touches_positionals)
-                || env.iter().any(|(_, v)| expr_touches_positionals(v))
-        }
-        IrStmt::Pipeline { stages, .. } => {
-            stages.iter().any(|s| s.iter().any(stmt_touches_positionals))
-        }
-        IrStmt::Function { body, .. } | IrStmt::Block(body) => {
-            body.iter().any(stmt_touches_positionals)
-        }
-        IrStmt::Subshell(body) | IrStmt::Background(body) => {
-            body.iter().any(stmt_touches_positionals)
-        }
-        IrStmt::Redirect { inner, redirects } => {
-            inner.iter().any(stmt_touches_positionals)
-                || redirects.iter().any(|r| expr_touches_positionals(&r.target))
-        }
-        IrStmt::Case {
-            discriminant,
-            clauses,
-        } => {
-            expr_touches_positionals(discriminant)
-                || clauses.iter().any(|c| {
-                    // the runtime expandWord's case patterns (a `$1`
-                    // pattern expands the positional)
-                    c.patterns.iter().any(|p| str_has_positional_ref(p))
-                        || c.body.iter().any(stmt_touches_positionals)
-                })
-        }
-        IrStmt::For { iter, body, .. } => {
-            expr_touches_positionals(iter) || body.iter().any(stmt_touches_positionals)
-        }
-        IrStmt::Declare { vars, .. } => vars.iter().any(|v| is_positional_name(&v.name)),
-        IrStmt::Return(opt) | IrStmt::Exit(opt) => {
-            opt.as_ref().map(expr_touches_positionals).unwrap_or(false)
-        }
-        IrStmt::WriteFile { path, content, .. } => {
-            expr_touches_positionals(path) || expr_touches_positionals(content)
-        }
-        _ => false,
-    }
-}
-
-/// Native-DIRECT-call eligibility (the fnCall→callDirect lowering): a
-/// SYNC-set function whose transitive sync-call closure never touches the
-/// runtime's positional state — the fnCall path's per-call arg flattening,
-/// magic expansion, Map lookup and positional save/restore become a plain
-/// `sh2.callDirect(f, args)` on a module-level `let f` binding (the
-/// binding falls back to the fnCall command-not-found tail until the
-/// define runs; the define writes both the binding and the runtime map).
-/// A JS-keyword or lifted-variable name would collide with the module
-/// binding; the `__sh2_` prefix is reserved for emitter temps.
-fn native_direct_fn_set(
-    prog: &IrProgram,
-    sync: &HashSet<String>,
-) -> HashSet<String> {
-    let mut bodies: HashMap<String, Vec<&[IrStmt]>> = HashMap::new();
-    collect_fn_bodies(&prog.stmts, &mut bodies);
-    let functions: HashSet<String> = bodies.keys().cloned().collect();
-    let mut calls: HashMap<String, HashSet<String>> = HashMap::new();
-    for (name, defs) in &bodies {
-        let mut set = HashSet::new();
-        for body in defs {
-            collect_fn_calls(body, &functions, &mut set);
-        }
-        calls.insert(name.clone(), set);
-    }
-    let mut out = HashSet::new();
-    'outer: for name in sync {
-        if is_js_keyword(name)
-            || name.starts_with("__sh2_")
-            || is_lifted_num(name)
-            || is_lifted_str(name)
-        {
-            continue;
-        }
-        // transitive closure over the sync-called graph: a sync call runs
-        // inside this function's frame WITHOUT its own positional
-        // save/restore, so every reachable sync body must be positional-
-        // free too. Async-called targets dispatch through the exec path,
-        // which does its own save/restore — self-contained.
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut stack: Vec<String> = vec![name.clone()];
-        while let Some(f) = stack.pop() {
-            if !seen.insert(f.clone()) {
-                continue;
-            }
-            if !sync.contains(&f) {
-                continue;
-            }
-            for body in bodies.get(&f).map(|v| v.iter()).into_iter().flatten() {
-                if body.iter().any(stmt_touches_positionals) {
-                    continue 'outer;
-                }
-            }
-            if let Some(cs) = calls.get(&f) {
-                for g in cs {
-                    stack.push(g.clone());
-                }
-            }
-        }
-        out.insert(name.clone());
-    }
-    out
 }
 
 /// Serializes whole-program compilations: the lift/scan statics above are
@@ -5498,13 +5216,6 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // lift/scan statics (the emission reads them) and before the main
     // emission.
     *NATIVE_ECHO_FNS.lock().unwrap() = Some(native_echo_fn_set(prog, &functions));
-    // Native-DIRECT-call analysis (see [`native_direct_fn_set`]): which
-    // sync-set functions lower to direct `sh2.callDirect` calls on a
-    // module-level `let f` binding. Must run after the lift/scan statics
-    // (the binding-name collision guard reads the lifted sets) and the
-    // sync fixpoint (the eligibility base), before the main emission.
-    let sync_fns = SYNC_FN_CALLS.lock().unwrap().clone().unwrap_or_default();
-    *NATIVE_DIRECT_FNS.lock().unwrap() = Some(native_direct_fn_set(prog, &sync_fns));
     // Plan 4 — lastExit-write liveness: which `(( ))` statements' status
     // writes are unread (empty under a possible `set -e`). Runs before the
     // emission (the IR tree is immutable here — the *Sync loop bodies are
@@ -5557,36 +5268,6 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
                     value: serde_json::Value::String(String::new()),
                     raw: None,
                 regex: None,
-                }),
-            }],
-        });
-    }
-    // Native-direct function bindings (see [`NATIVE_DIRECT_FNS`]): a
-    // module-level `let f` that falls back to the fnCall command-not-found
-    // tail (`sh2.callUndefined` — builtin fallback, else report + status
-    // 127, exactly fnCall's behavior for an undefined target) until the
-    // define site assigns the real arrow. The rest-param forwards the call
-    // args so the fallback stays arg-exact.
-    for name in NATIVE_DIRECT_FNS.lock().unwrap().as_ref().unwrap().iter() {
-        body.push(Stmt::VariableDeclaration {
-            kind: "let",
-            declarations: vec![VariableDeclarator {
-                type_: "VariableDeclarator",
-                id: Expr::Identifier { name: name.clone() },
-                init: Some(Expr::ArrowFunctionExpression {
-                    params: vec![Expr::RestElement {
-                        argument: Box::new(Expr::Identifier {
-                            name: "__sh2_args".to_string(),
-                        }),
-                    }],
-                    body: ArrowBody::Expr(Box::new(sh2_call(
-                        "callUndefined",
-                        vec![str_lit(name), Expr::Identifier {
-                            name: "__sh2_args".to_string(),
-                        }],
-                    ))),
-                    expression: true,
-                    r#async: false,
                 }),
             }],
         });
@@ -7219,35 +6900,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }),
                     arguments: vec![
                         str_lit(name),
-                        // A NATIVE-DIRECT function (see [`NATIVE_DIRECT_FNS`])
-                        // additionally assigns the module-level `let f`
-                        // binding (`f = <arrow>` — the assignment value is
-                        // the arrow, so the map registration is unchanged).
-                        // The binding and the map stay in sync: direct call
-                        // sites read the binding, the async exec dispatch
-                        // reads the map, both see the same closure.
-                        if native_direct_fn(name) {
-                            Expr::AssignmentExpression {
-                                operator: "=".to_string(),
-                                left: Box::new(Expr::Identifier {
-                                    name: name.clone(),
-                                }),
-                                right: Box::new(if fn_call_is_sync(name) {
-                                    if native_echo_fn(name) {
-                                        arrow_native_echo_sync(
-                                            vec![],
-                                            IrExpr::Arrow(body.clone()),
-                                        )
-                                    } else {
-                                        arrow_sink_sync(vec![], IrExpr::Arrow(body.clone()))
-                                    }
-                                } else if native_echo_fn(name) {
-                                    arrow_native_echo(vec![], IrExpr::Arrow(body.clone()))
-                                } else {
-                                    arrow_sink(vec![], IrExpr::Arrow(body.clone()))
-                                }),
-                            }
-                        } else if fn_call_is_sync(name) {
+                        if fn_call_is_sync(name) {
                             if native_echo_fn(name) {
                                 // eligible: the body may lower echo/printf
                                 // to native writes — no sink-depth bump
@@ -9045,76 +8698,11 @@ fn try_native_fn_call(name: &str, args: &[IrExpr]) -> Option<Expr> {
     if !fn_call_is_sync(name) {
         return None;
     }
-    // Native-DIRECT call (see [`NATIVE_DIRECT_FNS`]): the module-level
-    // `let f` binding called through `sh2.callDirect(f, args)` — no Map
-    // lookup, no arg flattening/magic scan, no positional save/restore
-    // (the analysis proved the transitive closure positional-free; the
-    // call-site args are provably magic-free — the runtime's GLOB/PS/
-    // BADSUB/array-literal expansion would be skipped otherwise). The
-    // args stay EAGER (the array literal evaluates before callDirect runs,
-    // exactly the fnCall arg order) and the helper replicates fnCall's
-    // status semantics exactly (RETURN-signal catch, numeric/'0'/'1'
-    // return-value recording, the final `lastExit === 0` boolean).
-    if native_direct_fn(name) && args.iter().all(fn_call_arg_clean) {
-        let arg_exprs: Vec<Expr> = args.iter().map(expr_to_estree).collect();
-        let has_await = arg_exprs.iter().any(expr_has_await);
-        if !has_await {
-            let mut call_args = vec![Expr::Identifier {
-                name: name.to_string(),
-            }];
-            if !arg_exprs.is_empty() {
-                call_args.push(Expr::ArrayExpression {
-                    elements: arg_exprs.into_iter().map(Some).collect(),
-                });
-            }
-            return Some(sh2_call("callDirect", call_args));
-        }
-    }
     let a = expr_to_estree(&IrExpr::Array(args.to_vec()));
     if expr_has_await(&a) {
         return None;
     }
     Some(sh2_call("fnCall", vec![str_lit(name), a]))
-}
-
-/// Is an fnCall argument provably MAGIC-FREE for the direct-call path —
-/// the runtime's exec/fnCall arg expansion (GLOB_MAGIC globbing,
-/// PS_MAGIC process-substitution paths, BADSUB skip-command, array-literal
-/// placeholder dropping) must not be skipped? Literals (without the magic
-/// prefixes), lifted/store Var reads (native or `sh2.getVar` — both plain
-/// strings), native arith, and the string-returning runtime calls
-/// (getVar/param/test/trimCapture/dirname/basename) qualify. Anything that
-/// could carry a magic marker or an array value (which the fnCall
-/// flattener spreads into MULTIPLE positionals) keeps the fnCall path.
-fn fn_call_arg_clean(a: &IrExpr) -> bool {
-    match a {
-        IrExpr::Str(sv, _) => {
-            // the emitter's own magic markers (GLOB_MAGIC globbing /
-            // PS_MAGIC process-substitution paths) — the runtime would
-            // expand them, the direct call must not skip that. BADSUB /
-            // array-literal magics are runtime-internal (never emitted
-            // literally); the Call arm below excludes their producers.
-            !sv.starts_with(GLOB_MAGIC) && !sv.starts_with(PS_MAGIC)
-        }
-        IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_) | IrExpr::Ident(_) => true,
-        IrExpr::Var(..) | IrExpr::Arith(_) => true,
-        IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
-            InterpPart::Lit(_) => true,
-            InterpPart::Expr(inner) => fn_call_arg_clean(inner),
-        }),
-        IrExpr::Call { func, args } => match func.as_str() {
-            "getVar" | "test" | "trimCapture" => true,
-            // `param` can return BADSUB_MAGIC for the `${!prefix*[@]}`
-            // bad-substitution shapes (the runtime skips the whole
-            // command, status 1) — only plain-name params are magic-free.
-            "param" => match args.get(1) {
-                Some(IrExpr::Str(n, _)) => !n.starts_with('!'),
-                _ => false,
-            },
-            _ => false,
-        },
-        _ => false,
-    }
 }
 
             // `let ARITH...` / `(( ARITH ))` — a statement/condition whose
