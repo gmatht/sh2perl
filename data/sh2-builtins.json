@@ -2,11 +2,6 @@
   "_comment": "A4 namespace spec: sh2.* runtime namespace + purity (mirrors shir_json.rs call_purity + shir.rs SYNC_BUILTINS). Frontends derive from this file; the Rust side must match (consistency test in sh2perl). The full per-call purity table (call_purity) has more entries than SYNC_BUILTINS (getVar→Emulable, fs.*→Fs, control signals, etc.) — the SYNC_BUILTINS list is the 'exec(cmd in SYNC_BUILTINS → Emulable) subset used by the exec purity arm.",
   "contract_version": 1,
   "sync_builtins": [
-    ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue",
-    "cut", "declare", "dirname", "echo", "eval", "exit", "export", "false",
-    "head", "let", "local", "mapfile", "mktemp", "printf", "pwd", "read",
-    "readarray", "readonly", "return", "sed", "seq", "set", "shift", "sort",
-    "source", "stat", "tail", "test", "touch", "tr", "trap", "true", "type",
-    "typeset", "uniq", "unset", "wc"
+    ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue", "cut", "declare", "dirname", "echo", "eval", "exit", "export", "false", "head", "let", "local", "mapfile", "mktemp", "printf", "pwd", "read", "readarray", "readonly", "return", "sed", "seq", "set", "shift", "sort", "source", "stat", "tail", "test", "touch", "tr", "trap", "true", "type", "typeset", "uniq", "unset", "wc", "grep"
   ]
 }
