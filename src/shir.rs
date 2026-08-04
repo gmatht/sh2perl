@@ -8,6 +8,7 @@
 //! (Case/Redirect/Function/Subshell/Background/Arrow/...) are ESTree-path only.
 
 use crate::ast::*;
+use crate::bc::eval as bc_eval;
 use crate::estree::*;
 use crate::ir::*;
 use std::collections::{HashMap, HashSet};
@@ -4303,6 +4304,26 @@ fn assume_intdecl() -> bool {
 /// lowering (the runtime cstyleForSync twin stays; see try_native_cstyle_for).
 fn assume_cfor() -> bool {
     std::env::var("SH2_ASSUME_CFOR").map_or(true, |v| v != "0")
+}
+
+/// SH2_BC_NATIVE=0 — turn off the native `bc` capture lowering
+/// (`$(echo EXPR | bc)` keeps the real spawn, maximal fidelity). DEFAULT
+/// ON: the corpus oracle gates the subset (src/bc.rs matches real GNU bc
+/// 77/77 differential + unit tests), so the aggressive lowering stays
+/// unless it regresses.
+///
+/// Documented assumption: a bc expression fed by script `$vars` (the
+/// primes `sqrt($n)` form) holds a non-negative bc number within double
+/// precision (2^53). The native JS path computes in doubles
+/// (`Math.floor(Math.sqrt(Number(x)))`) — bc is exact fixed-point — so a
+/// huge operand (>= 2^53), a non-numeric one (unset var → bc's `sqrt()`
+/// syntax error), or a negative one (bc's "Square root of a negative
+/// number" runtime error) would diverge from the real bc output ("" on
+/// error, exit 1). The corpus cannot observe these (the primes loop feeds
+/// integers >= 2; static programs fold through src/bc.rs EXACTLY);
+/// scripts that can must set SH2_BC_NATIVE=0.
+fn bc_native_enabled() -> bool {
+    std::env::var("SH2_BC_NATIVE").map_or(true, |v| v != "0")
 }
 
 fn mark_store_refs(s: &str, out: &mut HashSet<String>) {
@@ -9863,6 +9884,168 @@ fn try_native_echo_dead(args: &[IrExpr]) -> Option<Expr> {
     Some(printf_write_expr(echo_text(joined, no_newline)))
 }
 
+/// `$(echo EXPR | bc)` — a native bc evaluation (SH2_BC_NATIVE, default
+/// ON; see [`bc_native_enabled`]): the spawn + async capture machinery
+/// collapse to a compile-time fold (static EXPR, via src/bc.rs's exact
+/// GNU-bc semantics + output format) or a native `sqrt($var)` expression
+/// (the primes `is_prime` pattern). `words` = captureWords context
+/// (unquoted `$(...)` — the runtime word-splits the output): the fold
+/// then only fires when the value is provably a single word, and the
+/// emitted one-element array is exactly the `capture().split(/\s+/)`
+/// result.
+fn native_capture_echo_bc(pipe: &IrExpr, words: bool) -> Option<Expr> {
+    if !bc_native_enabled() {
+        return None;
+    }
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() != 2 {
+        return None;
+    }
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return None;
+    };
+    // stage 1: exec/builtin "echo" — the exact bytes echo writes
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return None;
+    };
+    if !matches!(f1.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
+        return None;
+    };
+    if name1 != "echo" {
+        return None;
+    }
+    // raw-byte / glob / process-substitution markers: the runtime expands
+    // them before bc sees the text — the native path cannot (see
+    // ir_expr_needs_runtime)
+    if echo_args.iter().any(ir_expr_needs_runtime) {
+        return None;
+    }
+    // stage 2: exec("bc") with NO args
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
+        return None;
+    };
+    if f2 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name2, _), IrExpr::Array(bc_args)] = a2.as_slice() else {
+        return None;
+    };
+    if name2 != "bc" || !bc_args.is_empty() {
+        return None;
+    }
+    // echo flags (-e/-n) then exactly ONE real arg (multiple args join to
+    // a space-separated multi-statement program — keep the spawn)
+    let mut flag_done = false;
+    let mut arg: Option<&IrExpr> = None;
+    for a in echo_args {
+        if !flag_done {
+            if let IrExpr::Str(sv, _) = a {
+                if sv == "-e" || sv == "-n" {
+                    continue;
+                }
+            }
+            flag_done = true;
+        }
+        if arg.is_some() {
+            return None;
+        }
+        arg = Some(a);
+    }
+    let arg = arg?;
+    // STATIC program — the compile-time fold (src/bc.rs's exact semantics
+    // + output format, 77/77 vs real bc). A quoted arg arrives as an
+    // Interpolate with only Lit parts ("2+3" → template); concatenate
+    // them — the runtime's expandWord joins the parts with the refs'
+    // values, so all-Lit == the literal text.
+    let text: Option<String> = match arg {
+        IrExpr::Str(sv, _) => Some(sv.clone()),
+        IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => {
+            Some(parts.iter().map(|p| match p {
+                InterpPart::Lit(s) => s.clone(),
+                _ => unreachable!("all-Lit checked"),
+            }).collect())
+        }
+        _ => None,
+    };
+    if let Some(sv) = text {
+        let out = bc_eval(&sv).ok()?;
+        if words && out.chars().any(char::is_whitespace) {
+            return None;
+        }
+        return Some(str_lit(out.trim_end_matches('\n')));
+    }
+    match arg {
+        // `sqrt($var)` — a single interpolation inside the sqrt parens:
+        // bc's scale-0 sqrt of an integer is the truncated root
+        // (Math.floor of the double root; see bc_native_enabled for the
+        // documented operand assumption)
+        IrExpr::Interpolate(parts) => {
+            let [InterpPart::Lit(l1), InterpPart::Expr(inner), InterpPart::Lit(l2)] =
+                parts.as_slice()
+            else {
+                return None;
+            };
+            if l1.trim_end() != "sqrt(" || l2.trim_start() != ")" {
+                return None;
+            }
+            let num = Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "Number".to_string(),
+                }),
+                arguments: vec![expr_to_estree(inner)],
+                optional: false,
+            };
+            let root = Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier {
+                        name: "Math".to_string(),
+                    }),
+                    property: Box::new(Expr::Identifier {
+                        name: "sqrt".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![num],
+                optional: false,
+            };
+            let fl = Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier {
+                        name: "Math".to_string(),
+                    }),
+                    property: Box::new(Expr::Identifier {
+                        name: "floor".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![root],
+                optional: false,
+            };
+            Some(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "String".to_string(),
+                }),
+                arguments: vec![fl],
+                optional: false,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// The echo text value: the joined args, plus the trailing newline the
 /// builtin appends (unless `-n`). A literal join folds the `+ "\n"` into
 /// the literal.
@@ -13912,6 +14095,32 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 if let [IrExpr::Arrow(stmts)] = args.as_slice() {
                     if let Some(value) = try_native_capture_value(stmts) {
                         return value;
+                    }
+                }
+            }
+            // `$(echo EXPR | bc)` — a native bc evaluation (SH2_BC_NATIVE,
+            // default ON; see [`native_capture_echo_bc`]): the spawn +
+            // async capture machinery collapse to a compile-time fold
+            // (static EXPR) or a native sqrt-of-var expression — the
+            // primes `is_prime` chain goes sync end-to-end. The
+            // captureWords form (unquoted `$(...)` — the runtime
+            // word-splits the output) only fires when the value is
+            // provably a single word: the emitted one-element array is
+            // exactly the `capture().split(/\s+/)` result.
+            if func == "capture" || func == "captureWords" {
+                if !program_defines_function("echo") && !program_defines_function("bc") {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
+                            if let Some(value) =
+                                native_capture_echo_bc(pipe, func == "captureWords")
+                            {
+                                return if func == "captureWords" {
+                                    array(vec![value])
+                                } else {
+                                    value
+                                };
+                            }
+                        }
                     }
                 }
             }

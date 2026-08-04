@@ -1,11 +1,11 @@
 //! bc.rs — a self-contained GNU-bc-subset evaluator.
 //!
-//! PURE STD — no external crates, no I/O, no links into the crate: the
-//! file compiles standalone (`rustc --test src/bc.rs`) and is NOT declared
-//! in lib.rs. The emitter wires it in under the `SH2_BC_NATIVE=1` gate
-//! (default OFF — the corpus keeps the real `bc` spawn): constant
-//! `$(echo EXPR | bc)` captures fold at compile time via [`eval`], and
-//! this module's EXACT output format (verified against GNU bc below) is
+//! PURE STD — no external crates, no I/O: the file compiles standalone
+//! (`rustc --test src/bc.rs`). The emitter wires it in under the
+//! `SH2_BC_NATIVE` gate (DEFAULT ON — the corpus oracle gates correctness;
+//! set `SH2_BC_NATIVE=0` to keep the real `bc` spawn, maximal fidelity):
+//! constant `$(echo EXPR | bc)` captures fold at compile time via [`eval`],
+//! and this module's EXACT output format (verified against GNU bc below) is
 //! the reference the runtime JS shapes must match.
 //!
 //! Semantics targets — verified against real GNU bc (the corpus oracle):

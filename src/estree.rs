@@ -1236,6 +1236,31 @@ mod tests {
     }
 
     #[test]
+    fn bc_capture_lowers_to_native() {
+        // Plan 8 (SH2_BC_NATIVE, default ON): `$(echo EXPR | bc)` capture
+        // pipelines collapse to a native expression — a STATIC program
+        // folds at compile time (src/bc.rs eval), the `sqrt($var)` form
+        // (the primes is_prime pattern) becomes
+        // `String(Math.floor(Math.sqrt(Number(...))))`. No spawn, no
+        // pipeline/capture machinery, no async.
+        let json = to_json("echo $(echo \"2+3\" | bc)");
+        assert!(json.contains("\"value\":\"5\\n\""), "static bc program folds");
+        assert!(!json.contains("\"name\":\"capture\""));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(!json.contains("unsupported"));
+        // the runtime-var sqrt form (store-bound $n → sh2.getVar)
+        let json2 = to_json("read n; echo \"$(echo \"sqrt($n)\" | bc)\"");
+        assert!(json2.contains("\"name\":\"sqrt\""), "native sqrt expr");
+        assert!(json2.contains("\"name\":\"floor\""));
+        assert!(json2.contains("\"name\":\"getVar\""));
+        assert!(!json2.contains("\"name\":\"pipeline\""));
+        assert!(!json2.contains("\"name\":\"capture\""));
+        assert!(!json2.contains("\"name\":\"exec\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
     fn case_lowers_to_switch_statement() {
         // `case` with simple patterns lifts to a native if/else-if chain
         // (no runtime dispatch) — see try_native_case in shir.rs.
