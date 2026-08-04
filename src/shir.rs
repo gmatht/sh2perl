@@ -295,9 +295,29 @@ fn walk_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mut HashSet<u
     }
 }
 
+/// The `echo ARGS...` / `printf FMT ARGS...` statements that lower via
+/// [`try_native_echo`] / [`try_native_printf`] — the other droppable
+/// lastExit writers (the seq `(write, sh2.lastExit = 0, true)`). Same
+/// carrier shape as the native let (the general
+/// `IrStmt::Expr(Call("exec", …))` form).
+fn is_native_echo_stmt(stmt: &IrStmt) -> bool {
+    match stmt {
+        IrStmt::Expr(IrExpr::Call { func, args, .. }) => {
+            func == "exec"
+                && matches!(
+                    args.as_slice(),
+                    [IrExpr::Str(n, _), IrExpr::Array(_)] if n == "echo" || n == "printf"
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Mark DEAD every native `(( ))` statement whose lastExit write is not in
 /// the live set (droppable) — only if its args actually parse natively
-/// (the ternary only exists on the `try_native_let` path).
+/// (the ternary only exists on the `try_native_let` path). Same for the
+/// native `echo` statement (the emission-side dead variant re-checks the
+/// sink/glob guards before dropping the write).
 fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMap<usize, bool>) {
     for stmt in stmts {
         if is_native_let_stmt(stmt) && !live.contains(&(stmt as *const IrStmt as usize)) {
@@ -313,6 +333,12 @@ fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMa
                     dead.insert(stmt as *const IrStmt as usize, true);
                 }
             }
+        }
+        // the native echo/printf `(sh2.lastExit = 0)` write is droppable
+        // when unread (the statement-level dead variant in `stmt_to_estree`
+        // re-checks the sink/glob guards before dropping)
+        if is_native_echo_stmt(stmt) && !live.contains(&(stmt as *const IrStmt as usize)) {
+            dead.insert(stmt as *const IrStmt as usize, true);
         }
         match stmt {
             IrStmt::While { body, .. }
@@ -340,13 +366,21 @@ fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMa
 /// possible `set -e` guard-wraps every top-level statement (the guard
 /// consumes the statement's value) — under errexit NO write is droppable
 /// and the pass returns empty.
+///
+/// The PROGRAM-FINAL status is NOT observable in the ESTree backend: the
+/// runner's exit code is 0 unless the `exit` builtin fired (it reads
+/// lastExit itself and is scanned as a reader), `_finish()` never reads
+/// lastExit, EXIT trap handlers run under REAL bash via spawnSync (they
+/// see bash's own status, not sh2.lastExit), and the corpus harness
+/// compares stdout only. So the program-level `end_live` is FALSE — the
+/// final statement's write is dead unless a later statement reads it.
 fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, bool> {
     let mut dead = HashMap::new();
     if errexit {
         return dead;
     }
     let mut live: HashSet<usize> = HashSet::new();
-    walk_lastexit_liveness(&prog.stmts, true, &mut live);
+    walk_lastexit_liveness(&prog.stmts, false, &mut live);
     mark_lastexit_dead(&prog.stmts, &live, &mut dead);
     dead
 }
@@ -624,6 +658,22 @@ fn fn_call_is_sync(name: &str) -> bool {
         .unwrap_or(false) // unset → conservative: keep the async exec path
 }
 
+/// Names of script-defined functions whose bodies may lower `echo`/
+/// `printf` to native `process.stdout.write` (see [`native_echo_fn_set`]):
+/// every possible call site runs with the default stdout sink, so the
+/// define arrow is emitted WITHOUT the sink-depth bump. Set per
+/// compilation by `shir_to_estree`; unset → conservative (no native echo
+/// in function bodies — the current behavior).
+static NATIVE_ECHO_FNS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+fn native_echo_fn(name: &str) -> bool {
+    NATIVE_ECHO_FNS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
+
 /// Recursive IrStmt walk collecting every `IrStmt::Function` name — a
 /// same-named script function shadows a builtin anywhere in the program
 /// (definitions inside bodies/arrows count).
@@ -805,8 +855,7 @@ fn collect_fn_calls(
     stmts: &[IrStmt],
     functions: &HashSet<String>,
     out: &mut HashSet<String>,
-) {
-    fn walk_stmts(stmts: &[IrStmt], functions: &HashSet<String>, out: &mut HashSet<String>) {
+) {    fn walk_stmts(stmts: &[IrStmt], functions: &HashSet<String>, out: &mut HashSet<String>) {
         for st in stmts {
             match st {
                 IrStmt::Exec { cmd, args, .. } => {
@@ -916,6 +965,244 @@ fn collect_fn_calls(
     walk_stmts(stmts, functions, out);
 }
 
+/// Defined functions whose bodies may lower `echo`/`printf` to native
+/// `process.stdout.write` (see [`NATIVE_ECHO_FNS`]): the define arrow is
+/// emitted WITHOUT the sink-depth bump, so the body's echo/printf go
+/// native. Eligibility — every POSSIBLE call site of the function runs
+/// with the default stdout sink:
+///   * no static site (exec / sync fnCall / `command F` builtin) inside a
+///     capture/captureWords/pipeline/redirect argument — the runtime
+///     swaps fdTargets[1] there, and the native write would bypass it;
+///   * no static site with an attached redirect (`f > file` is a redirect
+///     body, which is the same disqualifier);
+///   * no DYNAMIC-name exec / `command` site inside a swapped context —
+///     the runtime dispatch resolves any defined function by name, so a
+///     dynamic site is a potential site of every function;
+///   * no persistent fd-1 redirect anywhere (`exec >file` — the global
+///     PROGRAM_PERSIST_FD1 guard already suppresses native echo
+///     everywhere, so the set is empty then anyway).
+/// Subshell/background/block bodies COPY or share the current sink — a
+/// call inside them is clean iff the enclosing context is clean, so those
+/// propagate the flag instead of swapping it.
+fn native_echo_fn_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<String> {
+    // disqualify(name): a swapped-context site of a specific function
+    let mut bad: HashSet<String> = HashSet::new();
+    // disqualify_all(): a swapped-context DYNAMIC site (could be any fn)
+    let mut bad_all = false;
+    fn stmt_walk(
+        st: &IrStmt,
+        swapped: bool,
+        functions: &HashSet<String>,
+        bad: &mut HashSet<String>,
+        bad_all: &mut bool,
+    ) {
+        match st {
+            IrStmt::Exec { cmd, args, redirects, .. } => {
+                let site_swapped = swapped || !redirects.is_empty();
+                match cmd {
+                    IrExpr::Str(name, _) => {
+                        if functions.contains(name) {
+                            if site_swapped {
+                                bad.insert(name.clone());
+                            }
+                        } else if name == "command" {
+                            // `command F ...` — the runtime builtin
+                            // dispatches defined functions too
+                            if let Some(IrExpr::Array(els)) = args.first() {
+                                if let Some(first) = els.first() {
+                                    match first {
+                                        IrExpr::Str(f, _) if functions.contains(f) => {
+                                            if site_swapped {
+                                                bad.insert(f.clone());
+                                            }
+                                        }
+                                        // `command -v F` / `-V` never call
+                                        IrExpr::Str(f, _) if f.starts_with('-') => {}
+                                        _ => {
+                                            if site_swapped {
+                                                *bad_all = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // dynamic command name — a potential site of any
+                        // defined function
+                        if site_swapped {
+                            *bad_all = true;
+                        }
+                    }
+                }
+                for a in args {
+                    expr_walk(a, swapped, functions, bad, bad_all);
+                }
+            }
+            IrStmt::Expr(e) => expr_walk(e, swapped, functions, bad, bad_all),
+            // a redirect body runs with swapped fdTargets
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner {
+                    stmt_walk(b, true, functions, bad, bad_all);
+                }
+            }
+            // pipeline stages run with swapped fdTargets
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        stmt_walk(b, true, functions, bad, bad_all);
+                    }
+                }
+            }
+            // subshell/background/block copy or share the current sink
+            IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body)
+            | IrStmt::Function { body, .. } => {
+                for b in body {
+                    stmt_walk(b, swapped, functions, bad, bad_all);
+                }
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                expr_walk(cond, swapped, functions, bad, bad_all);
+                for b in body {
+                    stmt_walk(b, swapped, functions, bad, bad_all);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                expr_walk(cond, swapped, functions, bad, bad_all);
+                for b in then.iter().chain(else_) {
+                    stmt_walk(b, swapped, functions, bad, bad_all);
+                }
+                for (_, arm) in elsifs {
+                    for b in arm {
+                        stmt_walk(b, swapped, functions, bad, bad_all);
+                    }
+                }
+            }
+            IrStmt::For { iter, body, .. } => {
+                expr_walk(iter, swapped, functions, bad, bad_all);
+                for b in body {
+                    stmt_walk(b, swapped, functions, bad, bad_all);
+                }
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                expr_walk(discriminant, swapped, functions, bad, bad_all);
+                for c in clauses {
+                    for b in &c.body {
+                        stmt_walk(b, swapped, functions, bad, bad_all);
+                    }
+                }
+            }
+            IrStmt::Assign { expr, .. } => expr_walk(expr, swapped, functions, bad, bad_all),
+            _ => {}
+        }
+    }
+    fn expr_walk(
+        e: &IrExpr,
+        swapped: bool,
+        functions: &HashSet<String>,
+        bad: &mut HashSet<String>,
+        bad_all: &mut bool,
+    ) {
+        match e {
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    stmt_walk(st, swapped, functions, bad, bad_all);
+                }
+            }
+            IrExpr::Capture { expr, .. } => expr_walk(expr, true, functions, bad, bad_all),
+            IrExpr::Call { func, args } => {
+                let site_swapped = swapped
+                    || matches!(
+                        func.as_str(),
+                        "capture" | "captureWords" | "pipeline" | "redirect"
+                    );
+                if func == "exec" || func == "fnCall" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        if functions.contains(name) {
+                            if site_swapped {
+                                bad.insert(name.clone());
+                            }
+                        } else if func == "exec" && name == "command" {
+                            if let Some(IrExpr::Array(els)) = args.get(1) {
+                                if let Some(first) = els.first() {
+                                    match first {
+                                        IrExpr::Str(f, _) if functions.contains(f) => {
+                                            if site_swapped {
+                                                bad.insert(f.clone());
+                                            }
+                                        }
+                                        IrExpr::Str(f, _) if f.starts_with('-') => {}
+                                        _ => {
+                                            if site_swapped {
+                                                *bad_all = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if site_swapped {
+                        *bad_all = true;
+                    }
+                }
+                // capture/captureWords/pipeline/redirect run their args
+                // under a swapped sink; everything else propagates
+                for a in args {
+                    expr_walk(a, site_swapped, functions, bad, bad_all);
+                }
+            }
+            IrExpr::Array(items) => {
+                for it in items {
+                    expr_walk(it, swapped, functions, bad, bad_all);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    expr_walk(v, swapped, functions, bad, bad_all);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_walk(lhs, swapped, functions, bad, bad_all);
+                expr_walk(rhs, swapped, functions, bad, bad_all);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                expr_walk(obj, swapped, functions, bad, bad_all);
+                for a in args {
+                    expr_walk(a, swapped, functions, bad, bad_all);
+                }
+            }
+            IrExpr::Ternary { cond, then, else_, .. } => {
+                expr_walk(cond, swapped, functions, bad, bad_all);
+                expr_walk(then, swapped, functions, bad, bad_all);
+                expr_walk(else_, swapped, functions, bad, bad_all);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                expr_walk(expr, swapped, functions, bad, bad_all);
+                expr_walk(default, swapped, functions, bad, bad_all);
+            }
+            IrExpr::Index { key, .. } => expr_walk(key, swapped, functions, bad, bad_all),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(inner) = p {
+                        expr_walk(inner, swapped, functions, bad, bad_all);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for st in &prog.stmts {
+        stmt_walk(st, false, functions, &mut bad, &mut bad_all);
+    }
+    if bad_all {
+        return HashSet::new();
+    }
+    functions.difference(&bad).cloned().collect()
+}
+///
 /// The sync-function fixpoint (see [`SYNC_FN_CALLS`]).
 ///
 /// A function's emitted arrow may be run without `await` only when its
@@ -4893,6 +5180,12 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // after the lift/scan statics above (the optimistic body emission reads
     // them) and before the main emission (the fn-call sites consult it).
     *SYNC_FN_CALLS.lock().unwrap() = Some(fn_call_sync_set(prog, &functions));
+    // Native-echo-in-function analysis (see [`native_echo_fn_set`]): the
+    // define arrows of eligible functions lower WITHOUT the sink-depth
+    // bump, so their echo/printf statements go native. Must run after the
+    // lift/scan statics (the emission reads them) and before the main
+    // emission.
+    *NATIVE_ECHO_FNS.lock().unwrap() = Some(native_echo_fn_set(prog, &functions));
     // Plan 4 — lastExit-write liveness: which `(( ))` statements' status
     // writes are unread (empty under a possible `set -e`). Runs before the
     // emission (the IR tree is immutable here — the *Sync loop bodies are
@@ -4906,7 +5199,13 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let mut loop_status_dead = HashMap::new();
     if !errexit {
         let mut live: HashSet<usize> = HashSet::new();
-        walk_lastexit_liveness(&prog.stmts, true, &mut live);
+        // Program-final `end_live` is FALSE — see compute_lastexit_deadness:
+        // nothing in the ESTree backend observes the final statement's
+        // status (the runner exits 0, `_finish` never reads lastExit, EXIT
+        // traps run under real bash). A trailing loop's per-iteration
+        // `__sh2_loop_last = sh2.lastExit` tracking is therefore dead
+        // weight — the native while lowers to a bare `while (cond) { body }`.
+        walk_lastexit_liveness(&prog.stmts, false, &mut live);
         for st in &prog.stmts {
             mark_loop_status_deadness(st, &live, &mut loop_status_dead);
         }
@@ -6078,6 +6377,28 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     if let Some(dead) = try_native_let_dead(args) {
                         return Some(Stmt::ExpressionStatement { expression: dead });
                     }
+                    // Plan 4 dead-write twin for echo: same guards as the
+                    // expr-level echo lowering (default stdout sink,
+                    // no script-function shadow, no persistent fd-1) — the
+                    // native echo drops its `(sh2.lastExit = 0)` write.
+                    if *ECHO_SINK_DEPTH.lock().unwrap() == 0
+                        && !program_defines_function("echo")
+                        && !PROGRAM_PERSIST_FD1.lock().unwrap().unwrap_or(true)
+                    {
+                        if let Some(dead) = try_native_echo_dead(args) {
+                            return Some(Stmt::ExpressionStatement { expression: dead });
+                        }
+                    }
+                    // Plan 4 dead-write twin for printf (same guards as
+                    // the expr-level printf lowering)
+                    if *ECHO_SINK_DEPTH.lock().unwrap() == 0
+                        && !program_defines_function("printf")
+                        && !PROGRAM_PERSIST_FD1.lock().unwrap().unwrap_or(true)
+                    {
+                        if let Some(dead) = try_native_printf_dead(args) {
+                            return Some(Stmt::ExpressionStatement { expression: dead });
+                        }
+                    }
                 }
             }
             Stmt::ExpressionStatement {
@@ -6478,7 +6799,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     arguments: vec![
                         str_lit(name),
                         if fn_call_is_sync(name) {
-                            arrow_sink_sync(vec![], IrExpr::Arrow(body.clone()))
+                            if native_echo_fn(name) {
+                                // eligible: the body may lower echo/printf
+                                // to native writes — no sink-depth bump
+                                // (see [`native_echo_fn_set`])
+                                arrow_native_echo_sync(vec![], IrExpr::Arrow(body.clone()))
+                            } else {
+                                arrow_sink_sync(vec![], IrExpr::Arrow(body.clone()))
+                            }
+                        } else if native_echo_fn(name) {
+                            arrow_native_echo(vec![], IrExpr::Arrow(body.clone()))
                         } else {
                             arrow_sink(vec![], IrExpr::Arrow(body.clone()))
                         },
@@ -6970,6 +7300,19 @@ fn echo_arg_to_estree(a: &IrExpr) -> Option<Expr> {
     match a {
         IrExpr::Str(sv, _) if sv.starts_with(GLOB_MAGIC) => None,
         IrExpr::Str(sv, _) => Some(str_lit(sv)),
+        // an interpolation whose parts are ALL literals is a compile-time
+        // string ("test" parses as Interpolate([Lit]) in the double-quoted
+        // form) — fold it so the echo join can become a single literal too
+        IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => {
+            let s: String = parts
+                .iter()
+                .map(|p| match p {
+                    InterpPart::Lit(s) => s.clone(),
+                    _ => unreachable!("all-Lit checked"),
+                })
+                .collect();
+            Some(str_lit(&s))
+        }
         IrExpr::Array(elems) => {
             let mut out: Vec<Expr> = Vec::new();
             for el in elems {
@@ -7103,6 +7446,21 @@ fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
     };
     let mut joined: Expr = if arg_exprs.is_empty() {
         str_lit("")
+    } else if arg_exprs.iter().all(|e| {
+        matches!(e, Expr::Literal { value: serde_json::Value::String(_), .. })
+    }) {
+        // all-literal fold: the runtime's `[a, b].join(" ")` is exactly
+        // `a + " " + b` — a single compile-time literal, no per-iteration
+        // array/join/String() machinery
+        let s = arg_exprs
+            .iter()
+            .map(|e| match e {
+                Expr::Literal { value: serde_json::Value::String(sv), .. } => sv.as_str(),
+                _ => unreachable!("all-Lit checked"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        str_lit(&s)
     } else {
         let mut arr = Expr::ArrayExpression {
             elements: arg_exprs.into_iter().map(Some).collect(),
@@ -7166,6 +7524,24 @@ fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
                 optional: false,
             };
         }
+    }
+    // Compile-time fold: when every join element is a literal string, the
+    // join (and the -e replaces) are a single literal — `echo "test"`
+    // becomes `process.stdout.write("test\n")` with no per-iteration
+    // array/join/String() machinery. The runtime's `[a, b].join(" ")` is
+    // exactly `a + " " + b`, and the split/join replaces are the global
+    // replaces applied here, so the fold is byte-identical.
+    if let Expr::Literal {
+        value: serde_json::Value::String(sv),
+        raw: _,
+        regex: _,
+    } = &joined
+    {
+        let mut s = sv.clone();
+        if esc {
+            s = s.replace("\\n", "\n").replace("\\t", "\t");
+        }
+        joined = str_lit(&s);
     }
     Some((joined, no_newline, last_clean))
 }
@@ -9191,8 +9567,38 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
         }
     };
     // (process.stdout.write(value), sh2.lastExit = 0, true)
-    Some(seq(vec![
-        printf_write_expr(value),
+    Some(printf_status_seq(printf_write_expr(value)))
+}
+
+/// The bare write (no status record) — shared by [`try_native_printf`]
+/// (which wraps it in the status seq) and the Plan 4 dead-write twin
+/// `try_native_printf_dead`.
+fn try_native_printf_write(args: &[IrExpr]) -> Option<Expr> {
+    try_native_printf(args).map(|e| match e {
+        // the live form's value is `(write, sh2.lastExit = 0, true)` —
+        // the dead form is the bare write (the first seq element)
+        Expr::SequenceExpression { expressions } if expressions.len() == 3 => {
+            expressions[0].clone()
+        }
+        // the spec-less dynamic path is `(args-array, write)` — no
+        // status record to drop; keep it as-is
+        other => other,
+    })
+}
+
+/// `try_native_printf` twin for the Plan 4 dead-write path (see
+/// `try_native_echo_dead`): a printf statement whose lastExit write is
+/// provably unread emits the bare `process.stdout.write(value)`.
+fn try_native_printf_dead(args: &[IrExpr]) -> Option<Expr> {
+    try_native_printf_write(args)
+}
+
+/// `(write, sh2.lastExit = 0, true)` — the native printf/echo status
+/// sequence (the write, the builtin's status record, the always-truthy
+/// value the errexit guard / chain links consume).
+fn printf_status_seq(write: Expr) -> Expr {
+    seq(vec![
+        write,
         Expr::AssignmentExpression {
             operator: "=".to_string(),
             left: Box::new(sh2_member("lastExit")),
@@ -9203,7 +9609,7 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
             }),
         },
         bool_lit(true),
-    ]))
+    ])
 }
 
 /// `process.stdout.write(value)` — shared by the native echo / printf
@@ -9243,16 +9649,7 @@ fn try_native_echo(args: &[IrExpr]) -> Option<Expr> {
         return None;
     }
     let (joined, no_newline, _) = echo_join_args(echo_args)?;
-    let text: Expr = if no_newline {
-        joined
-    } else {
-        Expr::BinaryExpression {
-            operator: "+",
-            left: Box::new(joined),
-            right: Box::new(str_lit("\n")),
-        }
-    };
-    let write = printf_write_expr(text);
+    let write = printf_write_expr(echo_text(joined, no_newline));
     // (process.stdout.write(text), sh2.lastExit = 0, true)
     Some(seq(vec![
         write,
@@ -9267,6 +9664,48 @@ fn try_native_echo(args: &[IrExpr]) -> Option<Expr> {
         },
         bool_lit(true),
     ]))
+}
+
+/// `try_native_echo` twin for the Plan 4 dead-write path (`stmt_to_estree`
+/// consults `lastexit_write_is_dead`): the statement's lastExit write is
+/// provably unread, so the `(sh2.lastExit = 0)` write is dropped — the
+/// bare `process.stdout.write(text)` is all the runtime-observable effect.
+/// Only reachable when errexit is off (the top-level guard, which consumes
+/// the statement's value, is skipped then), so the statement value is
+/// unused and the write expression alone is a valid statement.
+fn try_native_echo_dead(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args else {
+        return None;
+    };
+    if name != "echo" {
+        return None;
+    }
+    if echo_args.iter().any(ir_expr_needs_runtime) {
+        return None;
+    }
+    let (joined, no_newline, _) = echo_join_args(echo_args)?;
+    Some(printf_write_expr(echo_text(joined, no_newline)))
+}
+
+/// The echo text value: the joined args, plus the trailing newline the
+/// builtin appends (unless `-n`). A literal join folds the `+ "\n"` into
+/// the literal.
+fn echo_text(joined: Expr, no_newline: bool) -> Expr {
+    if no_newline {
+        return joined;
+    }
+    match joined {
+        Expr::Literal {
+            value: serde_json::Value::String(sv),
+            raw: _,
+            regex: _,
+        } => str_lit(&format!("{sv}\n")),
+        _ => Expr::BinaryExpression {
+            operator: "+",
+            left: Box::new(joined),
+            right: Box::new(str_lit("\n")),
+        },
+    }
 }
 
 /// `$(echo X | tr SET1 SET2)` / `$(echo X | tr -d SET` — a pure string
@@ -12723,6 +13162,20 @@ fn arrow_sink_sync(params: Vec<Expr>, body: IrExpr) -> Expr {
     let out = arrow_body_async(params, body, false);
     *ECHO_SINK_DEPTH.lock().unwrap() -= 1;
     out
+}
+
+/// `arrow_sink` twins for functions provably never called under a swapped
+/// stdout sink (see [`native_echo_fn_set`]): the define arrow lowers
+/// WITHOUT the sink-depth bump, so its echo/printf statements lower to
+/// native `process.stdout.write`. The runtime runs the same arrow under
+/// the default sink on every call by construction.
+fn arrow_native_echo(params: Vec<Expr>, body: IrExpr) -> Expr {
+    arrow_body(params, body)
+}
+
+/// Sync twin of [`arrow_native_echo`] (see [`arrow_sink_sync`]).
+fn arrow_native_echo_sync(params: Vec<Expr>, body: IrExpr) -> Expr {
+    arrow_body_async(params, body, false)
 }
 
 fn arrow_body(params: Vec<Expr>, body: IrExpr) -> Expr {
