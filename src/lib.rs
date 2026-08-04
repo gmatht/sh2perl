@@ -8,6 +8,7 @@ pub mod debug;
 pub mod estree;
 pub mod shir;
 pub mod shir_json;
+pub mod c_backend; // worktree-local: C backend renderer (branch backend/c)
 pub mod bc;
 pub mod generator;
 pub mod mir_simple;
