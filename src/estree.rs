@@ -89,6 +89,13 @@ pub struct VariableDeclarator {
     pub init: Option<Expr>,
 }
 
+/// The `regex` property of a JS regex Literal (pattern + flags).
+#[derive(Debug, Clone, Serialize)]
+pub struct RegexLiteral {
+    pub pattern: String,
+    pub flags: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum Expr {
@@ -98,6 +105,11 @@ pub enum Expr {
     Literal {
         value: serde_json::Value,
         raw: Option<String>,
+        // A JS regex literal (`/\s+/`) — standard ESTree carries it as a
+        // `regex` property on the Literal node (value: {}). Emitted only
+        // by the native wc -w lowering (the runtime's word-count split).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        regex: Option<RegexLiteral>,
     },
     TemplateLiteral {
         quasis: Vec<TemplateElement>,
@@ -131,6 +143,11 @@ pub enum Expr {
     ArrayExpression {
         elements: Vec<Option<Expr>>,
     },
+    // `[...l]` — the native cut-string lift's code-point split (the
+    // runtime cut builtin's exact `[...line]` positions base).
+    SpreadElement {
+        argument: Box<Expr>,
+    },
     LogicalExpression {
         operator: &'static str,
         left: Box<Expr>,
@@ -155,6 +172,9 @@ pub enum Expr {
         operator: &'static str,
         argument: Box<Expr>,
         prefix: bool,
+    },
+    SequenceExpression {
+        expressions: Vec<Expr>,
     },
 }
 
@@ -452,12 +472,13 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
                 .map(|el| el.map(|e| fix_expr(e, in_arrow, in_func)))
                 .collect(),
         },
-        Expr::Literal { value, raw } => Expr::Literal {
+        Expr::Literal { value, raw, regex } => Expr::Literal {
             value: match value {
                 serde_json::Value::String(s) => serde_json::Value::String(map_raw_bytes(&s)),
                 other => other,
             },
             raw,
+            regex,
         },
         Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
             quasis: quasis
@@ -493,6 +514,24 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             operator,
             argument: Box::new(fix_expr(*argument, in_arrow, in_func)),
             prefix,
+        },
+        Expr::SequenceExpression { expressions } => Expr::SequenceExpression {
+            expressions: expressions
+                .into_iter()
+                .map(|e| fix_expr(e, in_arrow, in_func))
+                .collect(),
+        },
+        // the errexit-guard wrapper (`sh2._g = await sh2.forLoop(...)`)
+        // puts loop calls inside an assignment — traverse it so loop-body
+        // break/continue/return still get rewritten to sh2.* signals.
+        Expr::AssignmentExpression {
+            operator,
+            left,
+            right,
+        } => Expr::AssignmentExpression {
+            operator,
+            left: Box::new(fix_expr(*left, in_arrow, in_func)),
+            right: Box::new(fix_expr(*right, in_arrow, in_func)),
         },
         other => other,
     }
@@ -901,6 +940,60 @@ pub(crate) fn str_lit(s: &str) -> Expr {
     Expr::Literal {
         value: serde_json::Value::String(s.to_string()),
         raw: None,
+        regex: None,
+    }
+}
+
+/// `obj.name(args...)` — a method call on an arbitrary object expression
+/// (the native string-op chains of the capture lifts).
+pub(crate) fn method_call(obj: Expr, name: &str, args: Vec<Expr>) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(obj),
+            property: Box::new(Expr::Identifier {
+                name: name.to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: args,
+        optional: false,
+    }
+}
+
+/// A bare identifier expression.
+pub(crate) fn ident(name: &str) -> Expr {
+    Expr::Identifier {
+        name: name.to_string(),
+    }
+}
+
+/// An integer literal expression.
+pub(crate) fn int_lit_expr(i: i64) -> Expr {
+    Expr::Literal {
+        value: serde_json::Value::from(i),
+        raw: None,
+        regex: None,
+    }
+}
+
+/// A JS regex literal (`/\s+/`) — the ESTree `Literal`-with-`regex` shape
+/// (value: {} like the spec's RegExp literal). Printed by estree-gen.mjs
+/// as `/pattern/flags`.
+pub(crate) fn regex_lit(pattern: &str) -> Expr {
+    regex_lit_flags(pattern, "")
+}
+
+/// A JS regex literal with explicit flags (`/\u0000/g` — the trimCapture
+/// NUL strip needs the global flag).
+pub(crate) fn regex_lit_flags(pattern: &str, flags: &str) -> Expr {
+    Expr::Literal {
+        value: serde_json::Value::Object(serde_json::Map::new()),
+        raw: None,
+        regex: Some(RegexLiteral {
+            pattern: pattern.to_string(),
+            flags: flags.to_string(),
+        }),
     }
 }
 
@@ -942,12 +1035,23 @@ mod tests {
     }
 
     #[test]
-    fn echo_lowers_to_exec_call() {
+    fn echo_lowers_to_builtin_call() {
+        // `echo` with literal args at the default stdout sink → a NATIVE
+        // `process.stdout.write` sequence (no dispatch at all); echo args
+        // the runtime would transform (globs, process substitutions) keep
+        // the sync builtin call (`sh2.builtin("echo", ...)`, no await).
         let json = to_json("echo hello world");
         assert!(json.contains("\"type\":\"Program\""));
-        assert!(json.contains("\"name\":\"exec\""));
+        assert!(json.contains("\"name\":\"write\""));
+        assert!(json.contains("\"name\":\"process\""));
         assert!(json.contains("hello"));
+        assert!(!json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("\"name\":\"exec\""));
         assert!(!json.contains("unsupported"));
+        // a GLOB arg keeps the runtime builtin (it glob-expands)
+        let json2 = to_json("echo *.txt");
+        assert!(json2.contains("\"name\":\"builtin\""));
+        assert!(!json2.contains("\"name\":\"write\""));
     }
 
     #[test]
@@ -963,6 +1067,61 @@ mod tests {
         assert!(json.contains("\"name\":\"String\""));
         assert!(!json.contains("pipeline"));
         assert!(!json.contains("\"name\":\"grep\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn echo_pipe_cut_lifts_to_native_slice() {
+        // `$(echo X | cut -c3-)` — the echo|cut capture: a pure string-op
+        // chain (split/map/slice/join) — no pipeline, no capture, no
+        // builtin dispatch.
+        let json = to_json("x=$(echo hi | cut -c3-)");
+        assert!(json.contains("\"name\":\"slice\""));
+        assert!(json.contains("\"name\":\"map\""));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"capture\""));
+        assert!(!json.contains("\"name\":\"cut\""));
+        assert!(!json.contains("unsupported"));
+        // -d/-f: a field pick — split/filter/join over the echoed text
+        let json2 = to_json("x=$(echo a:b:c | cut -d: -f2)");
+        assert!(json2.contains("\"name\":\"filter\""));
+        assert!(json2.contains("\"name\":\"includes\""));
+        assert!(!json2.contains("\"name\":\"pipeline\""));
+        assert!(!json2.contains("\"name\":\"cut\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn echo_pipe_cut_statement_uses_cuttext() {
+        // statement-form `echo X | cut OP` → the sync cutText helper
+        // (the grepText precedent) — no async pipeline machinery
+        let json = to_json("echo a:b | cut -d: -f1");
+        assert!(json.contains("\"name\":\"cutText\""));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn cut_herestring_capture_lifts_to_native() {
+        // `$(cut -c2 <<< X)` — the here-string feed is the same per-line
+        // selection over the target value; the split has no trailing ''
+        // (bash appends the newline, the runtime pops it)
+        let json = to_json("x=$(cut -c2 <<< hi)");
+        assert!(json.contains("\"name\":\"slice\""));
+        assert!(!json.contains("\"name\":\"capture\""));
+        assert!(!json.contains("\"name\":\"redirect\""));
+        assert!(!json.contains("\"name\":\"cut\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn cut_dynamic_args_not_lifted() {
+        // a dynamic cut arg (a variable position list) keeps the runtime
+        // pipeline + builtin
+        let json = to_json("x=$(echo a:b:c | cut -d: -f$n)");
+        assert!(json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"slice\""));
+        assert!(!json.contains("\"name\":\"filter\""));
         assert!(!json.contains("unsupported"));
     }
 
@@ -997,17 +1156,32 @@ mod tests {
         let json2 = to_json("x=hello");
         assert!(json2.contains("\"type\":\"AssignmentExpression\""));
         assert!(!json2.contains("\"name\":\"setVar\""));
-        // a capture source (not liftable) stays in the runtime store
+        // a capture source LIFTS too: `x=$(cmd)` is a native assignment of
+        // the capture value (the runtime capture always yields a string) —
+        // no store round-trip. A pure echo capture lowers all the way to a
+        // native join; other captures keep the await sh2.capture call.
         let json3 = to_json("x=$(echo hi)");
-        assert!(json3.contains("\"name\":\"setVar\""));
+        assert!(json3.contains("\"type\":\"AssignmentExpression\""));
+        // the pure echo capture folds to a single literal (the join of one
+        // literal arg is the literal itself — no runtime join machinery)
+        assert!(json3.contains("\"value\":\"hi\""));
+        assert!(!json3.contains("\"name\":\"join\""));
+        assert!(!json3.contains("\"name\":\"setVar\""));
         assert!(!json3.contains("unsupported"));
+        let json4 = to_json("x=$(date)");
+        assert!(json4.contains("\"type\":\"AssignmentExpression\""));
+        assert!(json4.contains("\"name\":\"capture\""));
+        assert!(!json4.contains("\"name\":\"setVar\""));
     }
 
     #[test]
     fn if_then_else_lowers_to_if_statement() {
+        // `[ -f /tmp/x ]` is a file test — a native async lstat chain
+        // (no sh2.test string parse, no dispatch, no blocking lstatSync).
         let json = to_json("if [ -f /tmp/x ]; then echo yes; else echo no; fi");
         assert!(json.contains("\"type\":\"IfStatement\""));
-        assert!(json.contains("\"name\":\"test\""));
+        assert!(json.contains("\"name\":\"lstat\""));
+        assert!(!json.contains("\"name\":\"test\""));
         assert!(!json.contains("unsupported"));
     }
 
@@ -1019,10 +1193,15 @@ mod tests {
         assert!(json.contains("\"type\":\"Identifier\""));
         assert!(!json.contains("\"name\":\"getVar\""));
         assert!(!json.contains("unsupported"));
-        // a non-liftable var (capture source) stays a store read in templates
+        // a CAPTURE source lifts to a native binding; a read/write-builtin
+        // var (read/declare/local/export...) stays a store read
         let json2 = to_json("name=$(echo world)\necho \"Hello $name\"");
-        assert!(json2.contains("\"name\":\"getVar\""));
+        assert!(!json2.contains("\"name\":\"getVar\""));
+        assert!(json2.contains("\"name\":\"join\""));
         assert!(!json2.contains("unsupported"));
+        let json3 = to_json("read name\necho \"Hello $name\"");
+        assert!(json3.contains("\"name\":\"getVar\""));
+        assert!(!json3.contains("unsupported"));
     }
 
     #[test]
@@ -1057,6 +1236,31 @@ mod tests {
     }
 
     #[test]
+    fn bc_capture_lowers_to_native() {
+        // Plan 8 (SH2_BC_NATIVE, default ON): `$(echo EXPR | bc)` capture
+        // pipelines collapse to a native expression — a STATIC program
+        // folds at compile time (src/bc.rs eval), the `sqrt($var)` form
+        // (the primes is_prime pattern) becomes
+        // `String(Math.floor(Math.sqrt(Number(...))))`. No spawn, no
+        // pipeline/capture machinery, no async.
+        let json = to_json("echo $(echo \"2+3\" | bc)");
+        assert!(json.contains("\"value\":\"5\\n\""), "static bc program folds");
+        assert!(!json.contains("\"name\":\"capture\""));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(!json.contains("unsupported"));
+        // the runtime-var sqrt form (store-bound $n → sh2.getVar)
+        let json2 = to_json("read n; echo \"$(echo \"sqrt($n)\" | bc)\"");
+        assert!(json2.contains("\"name\":\"sqrt\""), "native sqrt expr");
+        assert!(json2.contains("\"name\":\"floor\""));
+        assert!(json2.contains("\"name\":\"getVar\""));
+        assert!(!json2.contains("\"name\":\"pipeline\""));
+        assert!(!json2.contains("\"name\":\"capture\""));
+        assert!(!json2.contains("\"name\":\"exec\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
     fn case_lowers_to_switch_statement() {
         // `case` with simple patterns lifts to a native if/else-if chain
         // (no runtime dispatch) — see try_native_case in shir.rs.
@@ -1071,15 +1275,23 @@ mod tests {
 
     #[test]
     fn redirect_lowers_to_redirect_call() {
+        // `echo hi > out.txt` lowers ALL the way to a native file write
+        // (await sh2.fs.writeFile) — no redirect fd-swap, no dispatch.
         let json = to_json("echo hi > out.txt");
-        assert!(json.contains("\"name\":\"redirect\""));
-        // Property keys serialize as {key: Identifier{name}, value: Literal}.
-        assert!(json.contains("\"name\":\"mode\""));
-        assert!(json.contains("\"value\":\"w\""));
-        assert!(json.contains("\"name\":\"fd\""));
-        assert!(json.contains("\"value\":1"));
-        assert!(json.contains("\"type\":\"ObjectExpression\""));
+        assert!(json.contains("\"name\":\"writeFile\""));
+        assert!(!json.contains("\"name\":\"redirect\""));
+        assert!(!json.contains("\"name\":\"builtin\""));
         assert!(!json.contains("unsupported"));
+        // non-echo bodies keep the runtime redirect
+        let json2 = to_json("ls > out.txt");
+        assert!(json2.contains("\"name\":\"redirect\""));
+        // Property keys serialize as {key: Identifier{name}, value: Literal}.
+        assert!(json2.contains("\"name\":\"mode\""));
+        assert!(json2.contains("\"value\":\"w\""));
+        assert!(json2.contains("\"name\":\"fd\""));
+        assert!(json2.contains("\"value\":1"));
+        assert!(json2.contains("\"type\":\"ObjectExpression\""));
+        assert!(!json2.contains("unsupported"));
     }
 
     #[test]
@@ -1102,8 +1314,12 @@ mod tests {
     #[test]
     fn function_lowers_to_define() {
         let json = to_json("greet() { echo hi; }");
-        assert!(json.contains("\"name\":\"define\""));
+        // the native define lowering: a direct `sh2.functions.set(name, fn)`
+        // state write + `true`, no dispatch
+        assert!(json.contains("\"name\":\"functions\""));
+        assert!(json.contains("\"name\":\"set\""));
         assert!(json.contains("greet"));
+        assert!(!json.contains("\"name\":\"define\""));
         assert!(!json.contains("unsupported"));
     }
 
@@ -1124,9 +1340,16 @@ mod tests {
     #[test]
     fn env_var_prefix_is_exec_env_arg() {
         let json = to_json("FOO=bar echo hi");
-        assert!(json.contains("\"name\":\"exec\""));
+        // `echo` is a sync builtin, so the env-carrying exec lowers to the
+        // sync twin `sh2.builtin(..., {FOO: ...})` (the runtime applies the
+        // command-scoped env exactly like the async exec path); a NON-builtin
+        // name keeps the async exec call.
+        assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("FOO"));
         assert!(!json.contains("unsupported"));
+        let json2 = to_json("FOO=bar grep x");
+        assert!(json2.contains("\"name\":\"exec\""));
+        assert!(json2.contains("FOO"));
     }
 
     #[test]
@@ -1147,12 +1370,46 @@ mod tests {
     }
 
     #[test]
+    fn intdecl_and_arith_stmt_lift_to_native() {
+        // Plan 3: a bare `typeset -i i` is a numeric WITNESS (the
+        // SH2_ASSUME_INTDECL lift) and a native `((i++))` / `let` statement
+        // is an ARITH source — together they lift `i` to a native JS
+        // binding: the per-iteration setVar/getVar chain disappears and the
+        // statement lowers to a bare `++i` (no `sh2.*` calls at all).
+        let json = to_json("typeset -i i\n((i++))");
+        // the declare itself stays a runtime call (the attribute write);
+        // the ARITH STATEMENT is fully native — no setVar/getVar/arith
+        assert!(!json.contains("\"name\":\"setVar\""));
+        assert!(!json.contains("\"name\":\"getVar\""));
+        assert!(!json.contains("\"name\":\"arith\""));
+        assert!(!json.contains("\"name\":\"exec\""));
+        // `((i++))` emits a native postfix update — check for the operator
+        assert!(json.contains("\"operator\":\"++\""));
+        // a non-numeric source blocks the lift too (the runtime coerces
+        // `i=foo` to 0 via the typeset attribute — a native binding would
+        // desync from the store)
+        let json3 = to_json("typeset -i i\ni=foo\n((i++))");
+        assert!(json3.contains("\"name\":\"setVar\""));
+        assert!(json3.contains("\"name\":\"getVar\""));
+        // the same lift works through `let` statements without any declare
+        let json4 = to_json("((i++))");
+        assert!(!json4.contains("\"name\":\"setVar\""));
+        assert!(!json4.contains("\"name\":\"getVar\""));
+    }
+
+    #[test]
     fn shopt_and_cstyle_for_lower() {
         let json = to_json("shopt -s extglob");
-        assert!(json.contains("\"name\":\"shopt\""));
+        // the native shopt lowering: a direct `sh2.shoptState.set(opt, en)`
+        // state write + `true`, no dispatch
+        assert!(json.contains("\"name\":\"shoptState\""));
+        assert!(!json.contains("\"name\":\"shopt\""));
         assert!(!json.contains("unsupported"));
+        // the body is `echo $i` — a sync builtin call (no await) → the
+        // c-style loop lowers to the SYNC runtime twin.
         let json2 = to_json("for ((i=0; i<3; i++)); do echo $i; done");
-        assert!(json2.contains("\"name\":\"cstyleFor\""));
+        assert!(json2.contains("\"name\":\"cstyleForSync\""));
+        assert!(!json2.contains("\"name\":\"cstyleFor\""));
         assert!(!json2.contains("unsupported"));
     }
 
@@ -1169,10 +1426,12 @@ mod tests {
     fn longoption_dollar_brace_expands() {
         // `--x="${X}"`: the LongOption lexer path merges the quoted string
         // as raw text, arriving as the bare literal `--x=${X}`. The transform
-        // splits it so the parameter expansion is evaluated (sh2.param).
+        // splits it so the parameter expansion is evaluated — natively now
+        // (X is a lifted string binding: `${X}` → bare `X`).
         let json = to_json("X=test; echo --x=\"${X}\"");
         assert!(json.contains("--x="));
-        assert!(json.contains("\"name\":\"param\""));
+        assert!(json.contains("\"type\":\"Identifier\",\"name\":\"X\""));
+        assert!(!json.contains("\"name\":\"param\""));
         assert!(!json.contains("\"name\":\"unsupported\""));
         // Single-quoted `${x}` (no `=`) stays literal; `\\${x}` (escaped
         // dollar) keeps its backslash — both must NOT be expanded.
@@ -1200,10 +1459,13 @@ mod tests {
     fn dollardollar_stays_inside_redirect_target() {
         // `cmd 2>/tmp/x.$$`: the parser cuts the `$$` off the redirect target
         // and pushes it onto the args. The transform re-attaches it to the
-        // target (interpolation with getVar("$")) and drops the bogus arg.
-        let json = to_json("realpath /bin 2>/tmp/realpath_stderr.$$");
+        // target (interpolation with the pid) and drops the bogus arg.
+        let json = to_json("realpath /bin 2>/tmp/realpath_stderr.$$").replace('\\', "");
         assert!(json.contains("/tmp/realpath_stderr."));
-        assert!(json.contains("\"name\":\"getVar\""));
+        // `$$` lowers to a direct `String(process.pid)` read, no dispatch
+        assert!(json.contains("process"));
+        assert!(json.contains("pid"));
+        assert!(!json.contains("\"name\":\"getVar\""));
         // the exec args must NOT contain the bare `$` expansion anymore
         let args = json
             .split("\"name\":\"exec\"")
@@ -1218,9 +1480,12 @@ mod tests {
     fn dollardollar_arg_joins_into_one_word() {
         // `cat /tmp/x.$$` — the `$$` arg is re-joined with the literal prefix
         // into a single interpolated word (one exec arg, not two).
-        let json = to_json("cat /tmp/realpath_stderr.$$");
+        let json = to_json("cat /tmp/realpath_stderr.$$").replace('\\', "");
         assert!(json.contains("/tmp/realpath_stderr."));
-        assert!(json.contains("\"name\":\"getVar\""));
+        // `$$` lowers to a direct `String(process.pid)` read, no dispatch
+        assert!(json.contains("process"));
+        assert!(json.contains("pid"));
+        assert!(!json.contains("\"name\":\"getVar\""));
         assert!(!json.contains("\"name\":\"unsupported\""));
     }
 
@@ -1280,16 +1545,22 @@ mod tests {
     fn process_substitution_lowers_without_unsupported() {
         // <(cmd) as an argument position: the redirect becomes a here-string
         // (captured producer stdout) and a materialized-path argument is
-        // appended for the runtime to turn into a temp file.
+        // appended for the runtime to turn into a temp file. `<(echo a)`
+        // is a pure echo capture — lowered natively (the joined literal
+        // provably cannot end with a newline, so even the trimCapture
+        // wrapper drops), no async capture machinery.
         let json = to_json("diff <(echo a) <(echo b)");
         assert!(!json.contains("\"name\":\"unsupported\""));
         assert!(!json.contains("\"value\":\"unsupported\""));
-        assert!(json.contains("\"name\":\"capture\""));
+        assert!(!json.contains("\"name\":\"trimCapture\""));
         assert!(json.contains("\"name\":\"exec\""));
         // mapfile is stdin-only: no appended path argument, still no gate leak
+        // (the producer's capture is lowered as a here-string fd-0 redirect
+        // feeding the sync mapfile builtin — no async capture machinery).
         let json2 = to_json("mapfile -t lines < <(printf 'x\\ny\\n')");
         assert!(!json2.contains("\"name\":\"unsupported\""));
         assert!(!json2.contains("\"value\":\"unsupported\""));
-        assert!(json2.contains("\"name\":\"capture\""));
+        assert!(json2.contains("\"name\":\"redirect\""));
+        assert!(json2.contains("\"name\":\"builtin\""));
     }
 }

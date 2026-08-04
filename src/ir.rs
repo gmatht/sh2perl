@@ -27,6 +27,22 @@ pub enum Sigil {
     Hash,
 }
 
+// ── Type annotations (ask A2: serialize the numeric/string lift verdicts) ──
+//
+// Conservative typing for static backends (C): what the JS path's
+// `numeric_lift_vars` / `string_lift_vars` (src/shir.rs) provably admit.
+//   Int  -> every assignment is provably numeric (native `long long` / number)
+//   Str  -> every assignment is provably a string literal (native char*)
+//   Any  -> runtime store (mixed/unknown typing; shell vars are strings)
+// Populated by `shir::analyze_var_types`; serialized in the ShIR JSON
+// (ask A1). Existing backends ignore it (additive only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum IrType {
+    Int,
+    Str,
+    Any,
+}
+
 // ── Binary operators ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +90,18 @@ pub enum ArithAst {
     Bin { op: &'static str, lhs: Box<ArithAst>, rhs: Box<ArithAst> },
     Un { op: &'static str, arg: Box<ArithAst> },
     Cond { test: Box<ArithAst>, then: Box<ArithAst>, else_: Box<ArithAst> },
+    /// `name op= rhs` (`=` / `+=` / `-=` / `*=`; `/=`/`%=` stay on the
+    /// runtime — the zero-divisor abort needs the helper). The expression
+    /// VALUE is the assigned value (bash semantics).
+    Assign {
+        var: String,
+        op: &'static str,
+        rhs: Box<ArithAst>,
+    },
+    /// `++name` / `name++` / `--name` / `name--` — delta ±1. The value is
+    /// the NEW value (prefix) or the OLD value (postfix), exactly bash's
+    /// arithmetic semantics.
+    IncDec { var: String, delta: i64, prefix: bool },
 }
 
 // ── Expressions ──────────────────────────────────────────────────────
@@ -367,6 +395,10 @@ pub struct IrProgram {
     pub stmts: Vec<IrStmt>,
     /// Subroutine definitions
     pub subs: Vec<IrSub>,
+    /// Conservative type annotations (ask A2): (var name, verdict), sorted
+    /// by name for deterministic serialization. Empty until
+    /// `shir::analyze_var_types` runs. Existing backends ignore it.
+    pub var_types: Vec<(String, IrType)>,
 }
 
 // ── Backend: IR → Perl text ─────────────────────────────────────────
@@ -2111,6 +2143,7 @@ impl IrProgram {
             requires: vec![],
             stmts: vec![IrStmt::RawText(code.to_string())],
             subs: vec![],
+            var_types: vec![],
         }
     }
 }

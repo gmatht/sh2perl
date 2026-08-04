@@ -485,6 +485,74 @@ pub fn parse_file_to_estree(filename: &str) {
     }
 }
 
+/// Parse a shell file and emit **ShIR JSON** (ask A1) — the
+/// language-neutral serialized IR for non-Rust backends (C, python, zig,
+/// go). Includes var-type verdicts (A2) and purity classification (A3).
+/// See src/shir_json.rs / docs/backend-c-core-needs.md §8.
+pub fn parse_file_to_shir(filename: &str) {
+    let commands = match read_cli_input(filename) {
+        Ok(bytes) => {
+            let content = String::from_utf8(bytes).unwrap_or_default();
+            match Parser::new(&content).parse() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Parse error: {}", e);
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Error reading file {}: {}", filename, e);
+            return;
+        }
+    };
+    let prog = debashl::shir::ast_to_ir(&commands);
+    println!("{}", debashl::shir_json::shir_to_shir_json(&prog));
+}
+
+/// Parse shell input (direct string or file) and emit ShIR JSON.
+pub fn export_shir(input: &str) {
+    let commands = match Parser::new(input).parse() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            return;
+        }
+    };
+    let prog = debashl::shir::ast_to_ir(&commands);
+    println!("{}", debashl::shir_json::shir_to_shir_json(&prog));
+}
+
+/// Plan §2.3: raw export (unoptimized, no A2 var_types). Pin the
+/// `F(S)_raw == C(S)_raw` boundary.
+pub fn export_shir_raw(input: &str) {
+    let commands = match Parser::new(input).parse() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("Parse error: {}", e); return; }
+    };
+    let prog = debashl::shir::ast_to_ir_raw(&commands);
+    println!("{}", debashl::shir_json::shir_to_shir_json_raw(&prog));
+}
+
+/// Plan §2.2: ingest a ShIR JSON file, run it through the ESTree
+/// backend. Closes the pipe (frontend JSON → core → backend). The
+/// Perl backend consumes its own IR flavor and cannot ingest the
+/// neutral ShIR directly (see plan §1.3).
+pub fn parse_shir_json_to_estree(filename: &str) {
+    let content = match std::fs::read_to_string(filename) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("read {}: {}", filename, e); return; }
+    };
+    let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+    };
+    match debashl::shir::shir_to_estree_json(&prog) {
+        Ok(s) => println!("{}", s),
+        Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
+    }
+}
+
 pub fn interactive_mode() {
     println!("Interactive mode - type 'quit' to exit");
     println!("{}", "=".repeat(50));

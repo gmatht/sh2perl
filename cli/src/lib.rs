@@ -48,8 +48,9 @@ pub(crate) fn with_virtual_stdin<T>(f: impl FnOnce(Option<&[u8]>) -> T) -> T {
 
 // Import from our new modules
 use crate::cli_commands::{
-    export_mir, interactive_mode, lex_input, parse_backticks_to_perl, parse_file,
-    parse_file_to_estree, parse_file_to_perl, parse_input, parse_system_to_perl, parse_to_perl,
+    export_mir, export_shir, interactive_mode, lex_input, parse_backticks_to_perl, parse_file,
+    parse_file_to_estree, parse_file_to_perl, parse_file_to_shir, export_shir_raw, parse_shir_json_to_estree, parse_input, parse_system_to_perl,
+    parse_to_perl,
     parse_to_perl_inline, parse_to_perl_with_opts,
     run_generated,
 };
@@ -600,6 +601,28 @@ exit $main_exit_code;
                 }
                 let filename = &args[3];
                 parse_file_to_estree(filename);
+            } else if args.len() >= 3 && args[2] == "--shir" {
+                if args.len() < 4 {
+                    println!("Error: file --shir requires filename");
+                    return;
+                }
+                let filename = &args[3];
+                parse_file_to_shir(filename);
+            } else if args.len() >= 3 && args[2] == "--shir-raw" {
+                if args.len() < 4 {
+                    println!("Error: file --shir-raw requires filename");
+                    return;
+                }
+                let filename = &args[3];
+                let content = std::fs::read_to_string(filename).unwrap_or_else(|e| { eprintln!("read {}: {}", filename, e); std::process::exit(1); });
+                cli_commands::export_shir_raw(&content);
+            } else if args.len() >= 3 && args[2] == "--shir-in-estree" {
+                if args.len() < 4 {
+                    println!("Error: file --shir-in-estree requires filename");
+                    return;
+                }
+                let filename = &args[3];
+                parse_shir_json_to_estree(filename);
             } else if args.len() >= 3 && args[2] == "--perl-critic-only" {
                 if args.len() < 4 {
                     println!("Error: file --perl-critic-only requires filename");
@@ -660,6 +683,48 @@ exit $main_exit_code;
                 }
             } else {
                 cli_commands::parse_perl_critic_only(input);
+            }
+        }
+        "--shir" => {
+            if args.len() < 3 {
+                println!("Error: --shir command requires input");
+                return;
+            }
+            let input = &args[2];
+            // file-like input (contains .sh or no spaces) → try as file, else direct
+            if input.contains(".sh") || !input.contains(' ') {
+                match fs::read_to_string(input) {
+                    Ok(content) => export_shir(&content),
+                    Err(_) => export_shir(input),
+                }
+            } else {
+                export_shir(input);
+            }
+        }
+        "--shir-raw" => {
+            if args.len() < 3 { println!("Error: --shir-raw requires input"); return; }
+            let input = &args[2];
+            if input.contains(".sh") || !input.contains(' ') {
+                match fs::read_to_string(input) {
+                    Ok(c) => cli_commands::export_shir_raw(&c),
+                    Err(_) => cli_commands::export_shir_raw(input),
+                }
+            } else { cli_commands::export_shir_raw(input); }
+        }
+        "--shir-in-estree" => {
+            if args.len() < 3 { println!("Error: --shir-in-estree requires input"); return; }
+            let input = &args[2];
+            let content = match fs::read_to_string(input) {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+            };
+            match debashl::shir::shir_to_estree_json(&prog) {
+                Ok(s) => println!("{}", s),
+                Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
             }
         }
         "--mir" => {
