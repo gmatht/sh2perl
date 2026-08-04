@@ -1360,6 +1360,21 @@ pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
     }
 }
 
+/// Raw lowering (plan §2.3): skip the shared optimization passes
+/// (constant folding, dead-assignment elimination). Use with
+/// `shir_json::shir_to_shir_json_raw` to pin the `F(S)_raw == C(S)_raw`
+/// boundary — frontend output, unoptimized, unattached-annotations.
+pub fn ast_to_ir_raw(commands: &[Command]) -> IrProgram {
+    let stmts = commands.iter().filter_map(stmt_for_command).collect::<Vec<_>>();
+    IrProgram {
+        imports: vec![],
+        requires: vec![],
+        stmts,
+        subs: vec![],
+        var_types: vec![],
+    }
+}
+
 /// Conservative type annotations for static backends (ask A2). The verdicts
 /// are exactly the JS path's lift analyses: `numeric_lift_vars` (every
 /// assignment provably numeric → native number) and `string_lift_vars`
