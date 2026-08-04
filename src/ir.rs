@@ -565,6 +565,24 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             // shIR→Perl path, Exprs that are real execs should have been
             // lowered to Output/Exec by the optimizer; bare Expr means
             // a value was discarded, which is a no-op in Perl.
+            // the C frontend's break/continue (IrStmt::Expr(Call("break")))
+            // are the shell's control signals — Perl's native loop
+            // controls (last/next)
+            if let IrExpr::Call { func, .. } = e {
+                match func.as_str() {
+                    "break" => {
+                        emit_indent(out, indent);
+                        out.push_str("last;\n");
+                        return;
+                    }
+                    "continue" => {
+                        emit_indent(out, indent);
+                        out.push_str("next;\n");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             let _ = e;
         }
 

@@ -6,6 +6,7 @@ pub mod parser;
 pub mod ir;
 pub mod debug;
 pub mod estree;
+pub mod cfront;
 pub mod shir;
 pub mod shir_json;
 

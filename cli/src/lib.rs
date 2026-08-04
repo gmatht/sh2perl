@@ -609,6 +609,25 @@ exit $main_exit_code;
                 }
                 let filename = &args[3];
                 parse_file_to_estree_raw(filename);
+            } else if args.len() >= 3 && args[2] == "--c" {
+                if args.len() < 4 {
+                    println!("Error: file --c requires filename");
+                    return;
+                }
+                let filename = &args[3];
+                let src = std::fs::read_to_string(filename).unwrap_or_else(|e| {
+                    eprintln!("Error reading file {}: {}", filename, e);
+                    std::process::exit(1);
+                });
+                match debashl::cfront::c_to_ir(&src) {
+                    Ok(prog) => {
+                        println!("{}", debashl::shir_json::shir_to_shir_json(&prog))
+                    }
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                }
             } else if args.len() >= 3 && args[2] == "--shir" {
                 if args.len() < 4 {
                     println!("Error: file --shir requires filename");
@@ -699,6 +718,39 @@ exit $main_exit_code;
             } else {
                 cli_commands::parse_perl_critic_only(input);
             }
+        }
+        "c" => {
+            // the minimal C frontend: parse a portable-C subset and emit
+            // the SAME ShIR JSON contract the shell frontend produces
+            // (frontend-c-core-needs.md)
+            if args.len() < 3 {
+                println!("Error: c command requires input");
+                return;
+            }
+            let input = &args[2];
+            let src = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e);
+                    std::process::exit(1);
+                }
+                s
+            } else if std::path::Path::new(input).exists() {
+                std::fs::read_to_string(input).unwrap_or_else(|e| {
+                    eprintln!("Error reading file {}: {}", input, e);
+                    std::process::exit(1);
+                })
+            } else {
+                input.to_string()
+            };
+            match debashl::cfront::c_to_ir(&src) {
+                Ok(prog) => println!("{}", debashl::shir_json::shir_to_shir_json(&prog)),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            }
+            return;
         }
         "--shir" => {
             if args.len() < 3 {
