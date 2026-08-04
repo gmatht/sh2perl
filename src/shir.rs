@@ -11050,6 +11050,256 @@ fn native_capture_printf(e: &IrExpr) -> Option<Expr> {
     Some(str_lit(out.trim_end_matches('\n')))
 }
 
+/// A test OPERAND read (`-n "$x"`, `"$x" =~ pat`): quoted or bare
+/// `$name` / `${name}` (lifted binding → native identifier; special var →
+/// native state read; store var → getVar), a single-quoted literal (the
+/// runtime's tokenizer keeps single-quoted content raw — no expansion),
+/// or a literal with no expansion or quote characters. Mirrors the
+/// runtime tokenizer's operand collection + expansion exactly.
+fn test_value_operand(op: &str) -> Option<Expr> {
+    let op = op.trim();
+    if let Some(inner) = op.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
+        if inner.chars().any(|c| matches!(c, '\'' | '$' | '`' | '\\')) {
+            return None;
+        }
+        return Some(str_lit(inner));
+    }
+    let bare = op
+        .strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .unwrap_or(op);
+    if let Some(name) = bare
+        .strip_prefix("${")
+        .and_then(|x| x.strip_suffix('}'))
+        .or_else(|| bare.strip_prefix('$'))
+    {
+        if name.starts_with('!') || name.starts_with('#')
+            || name.contains('[') || name.contains('@') || name.contains('*')
+        {
+            return None;
+        }
+        if is_lifted(name) {
+            return Some(Expr::Identifier { name: name.to_string() });
+        }
+        if let Some(native) = native_special_var(name) {
+            return Some(native);
+        }
+        if !is_plain_ident(name) {
+            return None;
+        }
+        return Some(sh2_call("getVar", vec![str_lit(name)]));
+    }
+    if !bare.is_empty()
+        && !bare
+            .chars()
+            .any(|c| matches!(c, '$' | '`' | '\\' | '"' | '\'' | ' ' | '\t'))
+    {
+        return Some(str_lit(bare));
+    }
+    None
+}
+
+/// Conservative JS-RegExp validity check (sound, not complete): accepts
+/// only patterns that provably compile in V8/node. The runtime's `=~` is
+/// `try { new RegExp(r).test(l) } catch { false }` — an invalid pattern
+/// yields FALSE at runtime, so a native regex LITERAL (which would fail
+/// at module PARSE time) is only safe when the pattern provably compiles;
+/// anything this checker cannot prove falls back to the runtime call.
+fn js_regex_valid(p: &str) -> bool {
+    let cs: Vec<char> = p.chars().collect();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    let mut can_quantify = false;
+    while i < cs.len() {
+        let c = cs[i];
+        match c {
+            '\\' => {
+                let Some(&e) = cs.get(i + 1) else { return false };
+                // valid escapes: \d \D \s \S \w \W \b \B \f \n \r \t
+                // \v \0, or identity escapes (\ + non-alphanumeric);
+                // anything else (\x \u \c \1..\9 …) is conservative-rejected
+                let ok = matches!(e, 'd'|'D'|'s'|'S'|'w'|'W'|'b'|'B'|'f'|'n'|'r'|'t'|'v'|'0')
+                    || !e.is_ascii_alphanumeric();
+                if !ok {
+                    return false;
+                }
+                can_quantify = true;
+                i += 2;
+            }
+            '[' => {
+                // character class: scan to the first `]` (a `]` right after
+                // `[` / `[^` is a literal member — `[[:space:]]` is a class
+                // whose first member is `[`)
+                i += 1;
+                if i < cs.len() && cs[i] == '^' {
+                    i += 1;
+                }
+                let mut closed = false;
+                while i < cs.len() {
+                    if cs[i] == '\\' {
+                        let Some(&e) = cs.get(i + 1) else { return false };
+                        let ok = matches!(e, 'd'|'D'|'s'|'S'|'w'|'W'|'b'|'B'|'f'|'n'|'r'|'t'|'v'|'0')
+                            || !e.is_ascii_alphanumeric();
+                        if !ok {
+                            return false;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if cs[i] == ']' {
+                        closed = true;
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    return false;
+                }
+                can_quantify = true;
+            }
+            '(' => {
+                // `(?:` / `(?=` / `(?!` group opens; any other `?` right
+                // after `(` is not a valid JS group construct
+                if i + 2 < cs.len() && cs[i + 1] == '?' && matches!(cs[i + 2], ':' | '=' | '!') {
+                    i += 3;
+                } else if i + 1 < cs.len() && cs[i + 1] == '?' {
+                    return false;
+                } else {
+                    i += 1;
+                }
+                depth += 1;
+                can_quantify = false;
+            }
+            ')' => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+                can_quantify = true;
+                i += 1;
+            }
+            '|' | '^' | '$' => {
+                can_quantify = false;
+                i += 1;
+            }
+            '*' | '+' | '?' => {
+                if !can_quantify {
+                    return false;
+                }
+                can_quantify = false;
+                i += 1;
+            }
+            '{' => {
+                // `{n}` / `{n,}` / `{n,m}` — a quantifier when an atom
+                // precedes; a bare `{` is a literal in JS. A quantifier
+                // with nothing to repeat is invalid — reject (sound).
+                let mut j = i + 1;
+                let mut digits = 0usize;
+                while j < cs.len() && cs[j].is_ascii_digit() {
+                    digits += 1;
+                    j += 1;
+                }
+                if digits > 0 && j < cs.len() && cs[j] == '}' {
+                    if !can_quantify {
+                        return false;
+                    }
+                    can_quantify = false;
+                    i = j + 1;
+                    continue;
+                }
+                if digits > 0 && j < cs.len() && cs[j] == ',' {
+                    let mut j2 = j + 1;
+                    while j2 < cs.len() && cs[j2].is_ascii_digit() {
+                        j2 += 1;
+                    }
+                    if j2 < cs.len() && cs[j2] == '}' {
+                        if !can_quantify {
+                            return false;
+                        }
+                        can_quantify = false;
+                        i = j2 + 1;
+                        continue;
+                    }
+                }
+                // literal `{` — valid JS
+                can_quantify = true;
+                i += 1;
+            }
+            _ => {
+                can_quantify = true;
+                i += 1;
+            }
+        }
+    }
+    depth == 0
+}
+
+/// The `=~` RHS pattern as a JS regex-literal string. The runtime keeps
+/// the pattern token raw except `$`-expansions (the tokenizer expands
+/// `$name` / `${...}` / `$((...))` / `$(...)` / `$'...'` inside the word)
+/// and strips surrounding quotes (bash: quoting the pattern makes it
+/// literal text — the runtime's expandWord returns the same string). A
+/// `$` that cannot start an expansion (a trailing `$` — the anchor) stays
+/// literal. The pattern must also provably compile as a JS regex (see
+/// `js_regex_valid` — a native literal that fails would crash at module
+/// PARSE time; the runtime catches construction errors → false). Bare `/`
+/// is escaped for the literal form (`\/` — same regex, parse-safe).
+fn regex_test_pattern(rhs: &str) -> Option<String> {
+    let rhs = rhs.trim();
+    let pat = rhs
+        .strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .or_else(|| rhs.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')))
+        .unwrap_or(rhs);
+    if pat.is_empty()
+        || pat
+            .chars()
+            .any(|c| matches!(c, '"' | '\'' | '`' | '\n' | '\r' | '\t'))
+    {
+        return None;
+    }
+    let cs: Vec<char> = pat.chars().collect();
+    for (i, &c) in cs.iter().enumerate() {
+        if c == '$' {
+            match cs.get(i + 1) {
+                None => {} // trailing `$` — the anchor, stays literal
+                Some(&n)
+                    if n == '(' || n == '\''
+                        || n.is_ascii_alphanumeric()
+                        || n == '_'
+                        || matches!(n, '#' | '@' | '*' | '?' | '$' | '{') =>
+                {
+                    return None; // would be expanded by the runtime
+                }
+                _ => {}
+            }
+        }
+    }
+    if !js_regex_valid(&pat) {
+        return None;
+    }
+    // escape bare `/` for the regex literal (a `/` directly in the
+    // literal text would terminate it); `\/` is the same regex
+    let mut out = String::with_capacity(pat.len());
+    let mut it = pat.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            out.push(c);
+            if let Some(&n) = it.peek() {
+                out.push(n);
+                it.next();
+            }
+        } else if c == '/' {
+            out.push('\\');
+            out.push('/');
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
 /// Native lowering for a SIMPLE test expression whose operands are all
 /// lifted numeric variables (or integer literals): `"$count" -lt 100`
 /// becomes `count < 100` — no runtime test-string round-trip. Returns None
@@ -11128,6 +11378,55 @@ fn try_native_test(s: &str) -> Option<Expr> {
                     right: Box::new(str_lit("")),
                 });
             }
+        }
+    }
+    // `=~` regex family: the runtime's evalTest is exactly
+    // `new RegExp(r).test(l)` (an invalid pattern is caught → false), so
+    // a native regex-literal `.test(l)` with the operands inlined is
+    // value-identical when the pattern provably compiles (see
+    // `js_regex_valid`). The regex literal is stateless (no /g flag —
+    // exactly the runtime's fresh `new RegExp(r)` per evaluation). The
+    // `=~` scan must run BEFORE the string-op loop (`=` would consume
+    // the `=` of `=~`).
+    {
+        let mut in_q = false;
+        let mut ix = 0usize;
+        let mut eq_tilde = None;
+        let b = s.as_bytes();
+        while ix < b.len() {
+            if b[ix] == b'"' {
+                in_q = !in_q;
+                ix += 1;
+                continue;
+            }
+            if !in_q && s[ix..].starts_with("=~") {
+                eq_tilde = Some(ix);
+                break;
+            }
+            ix += 1;
+        }
+        if let Some(ix) = eq_tilde {
+            let value = test_value_operand(&s[..ix])?;
+            let pat = regex_test_pattern(&s[ix + 2..])?;
+            let val = Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "String".to_string(),
+                }),
+                arguments: vec![value],
+                optional: false,
+            };
+            return Some(Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(regex_lit(&pat)),
+                    property: Box::new(Expr::Identifier {
+                        name: "test".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![val],
+                optional: false,
+            });
         }
     }
     // numeric ops first (their standalone tokens are unambiguous)
