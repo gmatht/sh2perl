@@ -50,7 +50,25 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
     let var_types = var_types_from(obj.get("var_types"), "Program.var_types")?;
     let subs = subs_from(obj.get("subs"), "Program.subs")?;
     let stmts = stmts_from(obj.get("stmts"), "Program.stmts")?;
-    Ok(IrProgram { imports, requires, stmts, subs, var_types })
+    let stmt_lines = match obj.get("stmt_lines") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| {
+                let s = v.get("stmt")?.as_u64()? as usize;
+                let l = v.get("line")?.as_u64()? as usize;
+                Some((s, l))
+            })
+            .collect(),
+        _ => vec![],
+    };
+    Ok(IrProgram {
+        imports,
+        requires,
+        stmts,
+        subs,
+        var_types,
+        stmt_lines,
+    })
 }
 
 fn subs_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrSub>, String> {

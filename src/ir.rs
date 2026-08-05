@@ -399,6 +399,11 @@ pub struct IrProgram {
     /// by name for deterministic serialization. Empty until
     /// `shir::analyze_var_types` runs. Existing backends ignore it.
     pub var_types: Vec<(String, IrType)>,
+    /// Source line numbers per top-level statement — (stmt index, source
+    /// line) pairs, sorted by index. Populated by the C frontend (the
+    /// `--output-lineno` option); the shell path leaves it empty. The
+    /// Perl renderer appends ` # line N` comments when present.
+    pub stmt_lines: Vec<(usize, usize)>,
 }
 
 // ── Backend: IR → Perl text ─────────────────────────────────────────
@@ -480,8 +485,22 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
     // (emitted by generator as Declare stmts, handled below)
 
     // Top-level statements
-    for stmt in &stmts {
+    for (idx, stmt) in stmts.iter().enumerate() {
+        let line = prog
+            .stmt_lines
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, l)| *l);
+        let before = out.len();
         emit_stmt(&mut out, stmt, 0);
+        if let Some(l) = line {
+            // a SHORT comment at the end of the statement's first line:
+            // `$sum += $i;  # line 7` — the source-mapping convention
+            let added = &out[before..];
+            if let Some(nl) = added.find('\n') {
+                out.insert_str(before + nl, &format!("  # line {l}"));
+            }
+        }
     }
     out.push('\n');
 
@@ -2194,6 +2213,7 @@ impl IrProgram {
             stmts: vec![IrStmt::RawText(code.to_string())],
             subs: vec![],
             var_types: vec![],
+            stmt_lines: vec![],
         }
     }
 }

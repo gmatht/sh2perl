@@ -37,14 +37,19 @@ enum Tok {
     Op(String),
 }
 
-fn lex(src: &str) -> Result<Vec<Tok>, String> {
+fn lex(src: &str) -> Result<Vec<(Tok, usize)>, String> {
     let b = src.as_bytes();
     let mut i = 0;
+    let mut line = 1usize;
     let mut toks = Vec::new();
     while i < b.len() {
         let c = b[i] as char;
         match c {
-            ' ' | '\t' | '\r' | '\n' => i += 1,
+            ' ' | '\t' | '\r' => i += 1,
+            '\n' => {
+                i += 1;
+                line += 1;
+            }
             '#' => {
                 // preprocessor line — consume to the newline (the
                 // #include/#define stage is a later slice)
@@ -67,12 +72,12 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     }
                     let v = i64::from_str_radix(&src[start + 2..i], 16)
                         .map_err(|_| "cfront: bad hex literal".to_string())?;
-                    toks.push(Tok::IntLit(v));
+                    toks.push((Tok::IntLit(v), line));
                 } else {
                     let v = src[start..i]
                         .parse::<i64>()
                         .map_err(|_| "cfront: bad int literal".to_string())?;
-                    toks.push(Tok::IntLit(v));
+                    toks.push((Tok::IntLit(v), line));
                 }
                 if i < b.len() && b[i] as char == '.' {
                     return Err(
@@ -116,7 +121,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                         _ => s.push(ch),
                     }
                 }
-                toks.push(Tok::StrLit(s));
+                toks.push((Tok::StrLit(s), line));
             }
             '\'' => {
                 i += 1;
@@ -139,7 +144,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     return Err("cfront: bad char literal".to_string());
                 }
                 i += 1;
-                toks.push(Tok::CharLit(ch));
+                toks.push((Tok::CharLit(ch), line));
             }
             'a'..='z' | 'A'..='Z' | '_' => {
                 let start = i;
@@ -149,7 +154,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 {
                     i += 1;
                 }
-                toks.push(Tok::Ident(src[start..i].to_string()));
+                toks.push((Tok::Ident(src[start..i].to_string()), line));
             }
             '+' | '-' | '*' | '/' | '%' | '=' | '!' | '<' | '>' | '&'
             | '|' | '^' | '~' | '?' | ':' | '(' | ')' | '[' | ']' | '{'
@@ -161,12 +166,12 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 if i + 1 < b.len() {
                     let pair = &src[i..i + 2];
                     if let Some(op) = two.iter().find(|o| **o == pair) {
-                        toks.push(Tok::Op(op.to_string()));
+                        toks.push((Tok::Op(op.to_string()), line));
                         i += 2;
                         continue;
                     }
                 }
-                toks.push(Tok::Op(src[i..i + 1].to_string()));
+                toks.push((Tok::Op(src[i..i + 1].to_string()), line));
                 i += 1;
             }
             other => {
@@ -182,9 +187,15 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
 // ── parser ───────────────────────────────────────────────────────────
 
 struct Parser {
-    toks: Vec<Tok>,
+    toks: Vec<(Tok, usize)>,
     pos: usize,
     var_types: Vec<(String, crate::ir::IrType)>,
+    /// one source line per emitted statement, in emission order
+    stmt_lines: Vec<usize>,
+    /// statement-recursion depth — only depth-0 (top-level) statements
+    /// record their lines (the nested ones live inside If/While nodes,
+    /// not in prog.stmts)
+    depth: usize,
     /// >0 while parsing a C-for body: the for lowers to a While whose
     /// update sits at the body end, so a `continue` (Perl next / JS
     /// continue) would SKIP the update and loop forever. Rejected for
@@ -194,14 +205,25 @@ struct Parser {
 
 impl Parser {
     fn peek(&self) -> Option<&Tok> {
-        self.toks.get(self.pos)
+        self.toks.get(self.pos).map(|(t, _)| t)
     }
     fn next(&mut self) -> Option<Tok> {
-        let t = self.toks.get(self.pos).cloned();
+        let t = self.toks.get(self.pos).cloned().map(|(t, _)| t);
         if t.is_some() {
             self.pos += 1;
         }
         t
+    }
+    /// the source line of the current token (statement starts)
+    fn current_line(&self) -> usize {
+        let l = self.toks.get(self.pos).map(|(_, l)| *l).unwrap_or(0);
+        l
+    }
+    /// record `count` emitted statements as starting at `line`
+    fn note_lines(&mut self, count: usize, line: usize) {
+        for _ in 0..count {
+            self.stmt_lines.push(line);
+        }
     }
     fn eat_op(&mut self, op: &str) -> bool {
         if matches!(self.peek(), Some(Tok::Op(o)) if *o == op) {
@@ -497,6 +519,20 @@ impl Parser {
 
     // ── statements ───────────────────────────────────────────────────
     fn stmt(&mut self) -> Result<Vec<IrStmt>, String> {
+        let top = self.depth == 0;
+        let line = self.current_line();
+        self.depth += 1;
+        let r = self.stmt_inner();
+        self.depth -= 1;
+        if top {
+            if let Ok(v) = &r {
+                self.note_lines(v.len(), line);
+            }
+        }
+        r
+    }
+
+    fn stmt_inner(&mut self) -> Result<Vec<IrStmt>, String> {
         if self.eat_op("{") {
             let mut body = Vec::new();
             while !self.eat_op("}") {
@@ -564,6 +600,7 @@ impl Parser {
             self.expect_op("(")?;
             let init = self.stmt_for_init()?;
             self.expect_op(";")?;
+            let mut init_stmts = init;
             let cond = if self.eat_op(";") {
                 IrExpr::Int(1)
             } else {
@@ -587,13 +624,11 @@ impl Parser {
             if let Some(u) = upd {
                 inner.push(u);
             }
-            return Ok(vec![
-                init,
-                IrStmt::While {
-                    cond,
-                    body: inner,
-                },
-            ]);
+            init_stmts.push(IrStmt::While {
+                cond,
+                body: inner,
+            });
+            return Ok(init_stmts);
         }
         if self.eat_kw("return") {
             // main's return IS the program exit — the shell `Exit` node
@@ -627,15 +662,15 @@ impl Parser {
                 args: vec![],
             })]);
         }
-        Ok(vec![self.decl_or_expr_stmt()?])
+        self.decl_or_expr_stmt()
     }
 
     /// The for-loop init: a declaration OR an assignment/expr.
-    fn stmt_for_init(&mut self) -> Result<IrStmt, String> {
+    fn stmt_for_init(&mut self) -> Result<Vec<IrStmt>, String> {
         if let Some((_, verdict)) = self.parse_type()? {
             self.decl_list(true, verdict)
         } else {
-            self.expr_stmt_no_semi()
+            Ok(vec![self.expr_stmt_no_semi()?])
         }
     }
 
@@ -644,7 +679,7 @@ impl Parser {
         &mut self,
         no_semi: bool,
         verdict: crate::ir::IrType,
-    ) -> Result<IrStmt, String> {
+    ) -> Result<Vec<IrStmt>, String> {
         let mut out = Vec::new();
         loop {
             let name = match self.next() {
@@ -698,21 +733,19 @@ impl Parser {
                 );
             }
         }
-        if out.len() == 1 {
-            Ok(out.pop().unwrap())
-        } else if out.is_empty() {
-            Ok(IrStmt::Expr(IrExpr::Int(0)))
+        if out.is_empty() {
+            Ok(vec![IrStmt::Expr(IrExpr::Int(0))])
         } else {
-            Ok(IrStmt::Block(out))
+            Ok(out)
         }
     }
 
-    fn decl_or_expr_stmt(&mut self) -> Result<IrStmt, String> {
+    fn decl_or_expr_stmt(&mut self) -> Result<Vec<IrStmt>, String> {
         if let Some((_, verdict)) = self.parse_type()? {
             // the type was consumed; the declaration list follows
             self.decl_list(false, verdict)
         } else {
-            self.expr_stmt()
+            Ok(vec![self.expr_stmt()?])
         }
     }
 
@@ -734,8 +767,8 @@ impl Parser {
         // (lookahead into OWNED values first — the mutable calls below
         // can't run while a borrow of self.toks is live)
         let head: Option<(String, String)> = match (
-            self.toks.get(self.pos).cloned(),
-            self.toks.get(self.pos + 1).cloned(),
+            self.toks.get(self.pos).map(|(t, _)| t).cloned(),
+            self.toks.get(self.pos + 1).map(|(t, _)| t).cloned(),
         ) {
             (Some(Tok::Ident(n)), Some(Tok::Op(op))) => Some((n, op)),
             _ => None,
@@ -860,7 +893,7 @@ impl Parser {
 }
 
 fn name_is_next_var(p: &Parser) -> bool {
-    matches!(p.toks.get(p.pos + 1), Some(Tok::Ident(_)))
+    matches!(p.toks.get(p.pos + 1).map(|(t, _)| t), Some(Tok::Ident(_)))
 }
 
 /// `printf("x=%d, %s", i, s)` → Interpolate([Lit("x="), Expr(i), ...]).
@@ -922,6 +955,8 @@ pub fn c_to_ir(src: &str) -> Result<IrProgram, String> {
         toks,
         pos: 0,
         var_types: Vec::new(),
+        stmt_lines: Vec::new(),
+        depth: 0,
         for_continue_depth: 0,
     };
     let mut stmts: Vec<IrStmt> = Vec::new();
@@ -976,6 +1011,7 @@ pub fn c_to_ir(src: &str) -> Result<IrProgram, String> {
             } else {
                 IrExpr::Int(0)
             };
+            p.note_lines(1, p.current_line());
             stmts.push(IrStmt::Assign {
                 targets: vec![crate::ir::AssignTarget {
                     var: name,
@@ -998,12 +1034,21 @@ pub fn c_to_ir(src: &str) -> Result<IrProgram, String> {
     let mut var_types = p.var_types;
     var_types.sort_by(|a, b| a.0.cmp(&b.0));
     var_types.dedup_by(|a, b| a.0 == b.0);
+    // the statement lines: (top-level stmt index, source line) — the
+    // stmt_lines parallel prog.stmts in emission order
+    let stmt_lines: Vec<(usize, usize)> = p
+        .stmt_lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (i, *l))
+        .collect();
     Ok(IrProgram {
         imports: vec![],
         requires: vec![],
         stmts,
         subs: vec![],
         var_types,
+        stmt_lines,
     })
 }
 
