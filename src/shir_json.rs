@@ -50,6 +50,7 @@ fn program_json(p: &IrProgram, contract_version: u32) -> Value {
         "imports": p.imports,
         "requires": p.requires,
         "var_types": p.var_types.iter().map(|(n, t)| json!({"name": n, "type": t})).collect::<Vec<_>>(),
+        "stmt_lines": p.stmt_lines.iter().map(|(i, l)| json!({"stmt": i, "line": l})).collect::<Vec<_>>(),
         "subs": p.subs.iter().map(sub_json).collect::<Vec<_>>(),
         "stmts": p.stmts.iter().map(stmt_json).collect::<Vec<_>>(),
     })
