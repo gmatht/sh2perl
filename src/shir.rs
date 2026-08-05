@@ -11609,6 +11609,215 @@ fn native_capture_echo_pipeline(pipe: &IrExpr) -> Option<Expr> {
     }
 }
 
+/// The parsed shape of an awk program for the echo|awk inline lift
+/// (see [`try_native_echo_awk`]): a single action block that prints one
+/// field (`{print $N}` / `{print$N}` / `{print $0}`) or the sum of two
+/// fields (`{print $N + $M}`), with an optional literal `-F sep`
+/// (single char). Anything else (regex conditions, `for`/`if` bodies,
+/// BEGIN/END, file operands, dynamic args) keeps the pipeline.
+#[derive(Debug, Clone)]
+struct AwkPrintSpec {
+    /// `-F sep` — the literal field separator (default FS: whitespace
+    /// runs — awk's exact default).
+    fs_sep: Option<String>,
+    kind: AwkPrintKind,
+}
+
+#[derive(Debug, Clone)]
+enum AwkPrintKind {
+    /// `{print $0}` — the whole line.
+    WholeLine,
+    /// `{print $N}` — field N (1-based; missing → empty string).
+    Field(u32),
+    /// `{print $N + $M}` — awk arithmetic (non-numeric fields coerce
+    /// to 0; the result prints as a number).
+    Sum(u32, u32),
+}
+
+/// Parse the awk argv (`-F` flags + the single-quoted program; NO file
+/// operands — stdin only). Returns None for any other shape.
+fn parse_awk_print_args(args: &[IrExpr]) -> Option<AwkPrintSpec> {
+    let mut fs_sep = None;
+    let mut prog: Option<&str> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let IrExpr::Str(s, _) = &args[i] else {
+            return None;
+        };
+        if s == "-F" {
+            let IrExpr::Str(sep, _) = args.get(i + 1)? else {
+                return None;
+            };
+            if sep.chars().count() != 1 {
+                return None;
+            }
+            fs_sep = Some(sep.clone());
+            i += 2;
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("-F") {
+            if rest.chars().count() != 1 {
+                return None;
+            }
+            fs_sep = Some(rest.to_string());
+            i += 1;
+            continue;
+        }
+        if prog.is_some() {
+            return None; // a file operand (or a second program) — stdin-only lift
+        }
+        prog = Some(s);
+        i += 1;
+    }
+    let prog = prog?.trim();
+    let body = prog.strip_prefix('{')?.strip_suffix('}')?.trim();
+    // `print$N` (no space — `awk '{print$3}'`) or `print $N`
+    let rest = body.strip_prefix("print")?.trim_start();
+    fn parse_field(s: &str) -> Option<(u32, &str)> {
+        let s = s.strip_prefix('$')?;
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        let n: u32 = digits.parse().ok()?;
+        Some((n, &s[digits.len()..]))
+    }
+    let (n, after) = parse_field(rest)?;
+    let after = after.trim();
+    let kind = if after.is_empty() {
+        if n == 0 {
+            AwkPrintKind::WholeLine
+        } else {
+            AwkPrintKind::Field(n)
+        }
+    } else {
+        // `$N + $M` — the only supported operator (awk arithmetic)
+        let after = after.strip_prefix('+')?.trim_start();
+        let (m, tail) = parse_field(after)?;
+        if !tail.trim().is_empty() || n == 0 || m == 0 {
+            return None;
+        }
+        AwkPrintKind::Sum(n, m)
+    };
+    Some(AwkPrintSpec { fs_sep, kind })
+}
+
+/// The awk field-list expression for one input line `l`: the split on
+/// the `-F` separator (literal) or awk's default FS (whitespace runs,
+/// leading/trailing ignored — `trim().split(/\s+/)`).
+fn awk_fields_expr(l: Expr, spec: &AwkPrintSpec) -> Expr {
+    match &spec.fs_sep {
+        Some(sep) => method_call(l, "split", vec![str_lit(sep)]),
+        None => method_call(
+            method_call(l, "trim", vec![]),
+            "split",
+            vec![regex_lit("\\s+")],
+        ),
+    }
+}
+
+/// The per-line print value for the parsed program: `$0` → the line,
+/// `$N` → `fields[N-1] ?? ""`, `$N + $M` → awk's numeric sum string.
+fn awk_print_sel_expr(l: Expr, spec: &AwkPrintSpec) -> Expr {
+    let field_at = |fields: Expr, n: u32| -> Expr {
+        Expr::LogicalExpression {
+            operator: "??".to_string(),
+            left: Box::new(Expr::MemberExpression {
+                object: Box::new(fields),
+                property: Box::new(int_lit_expr(i64::from(n - 1))),
+                computed: true,
+                optional: false,
+            }),
+            right: Box::new(str_lit("")),
+        }
+    };
+    match &spec.kind {
+        AwkPrintKind::WholeLine => l,
+        AwkPrintKind::Field(n) => field_at(awk_fields_expr(l, spec), *n),
+        AwkPrintKind::Sum(n, m) => {
+            let num = |e: Expr| Expr::LogicalExpression {
+                operator: "||".to_string(),
+                left: Box::new(Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "Number".to_string(),
+                    }),
+                    arguments: vec![e],
+                    optional: false,
+                }),
+                right: Box::new(int_lit_expr(0)),
+            };
+            let f = awk_fields_expr(l, spec);
+            let sum = Expr::BinaryExpression {
+                operator: "+".to_string(),
+                left: Box::new(num(field_at(f.clone(), *n))),
+                right: Box::new(num(field_at(f, *m))),
+            };
+            Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "String".to_string(),
+                }),
+                arguments: vec![sum],
+                optional: false,
+            }
+        }
+    }
+}
+
+/// `$(echo ARGS | awk '{print $N}')` — the two-stage pipeline whose
+/// LAST stage is the awk builtin with a static field-print program (see
+/// [`parse_awk_print_args`]): the value is a pure string-op chain over
+/// echo's exact output (the `echo_join_args` join; echo appends the
+/// trailing newline unless `-n`) — awk's per-record field extraction,
+/// joined with newlines, plus awk's own trailing newline (the capture
+/// strips it). No spawns, no pipeline machinery, no async capture
+/// arrow. Script-defined echo/awk functions shadow the builtins → keep
+/// the pipeline. Returns the (echo join expr, no_newline flag, parsed
+/// spec).
+fn try_native_echo_awk(pipe: &IrExpr) -> Option<(Expr, bool, AwkPrintSpec)> {
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() != 2 {
+        return None;
+    }
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return None;
+    };
+    if f1 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
+        return None;
+    };
+    if name1 != "echo" || echo_args.iter().any(ir_expr_needs_runtime) {
+        return None;
+    }
+    let (joined, no_newline, _) = echo_join_args(echo_args)?;
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
+        return None;
+    };
+    if f2 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name2, _), IrExpr::Array(awk_args)] = a2.as_slice() else {
+        return None;
+    };
+    if name2 != "awk" {
+        return None;
+    }
+    let spec = parse_awk_print_args(awk_args)?;
+    Some((joined, no_newline, spec))
+}
+
 /// The echo builtin's OUTPUT TEXT as a compile-time string: the args
 /// joined with single spaces (the runtime's exact `-e`/`-n` handling),
 /// plus the trailing newline unless `-n`. None when any arg is not a
@@ -14662,6 +14871,59 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
                             if let Some(value) = native_capture_seq_slice(pipe) {
                                 return value;
+                            }
+                        }
+                    }
+                }
+                // `$(echo ARGS | awk '{print $N}')` — the echo|awk
+                // capture: the value is a pure field-extraction chain
+                // over echo's exact output (see `try_native_echo_awk`;
+                // awk prints per-record lines + a trailing newline, the
+                // capture strips it) — no spawns, no async pipeline
+                // machinery. The `{print $N + $M}` arithmetic form
+                // lowers to the native numeric sum.
+                if !program_defines_function("echo") && !program_defines_function("awk") {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
+                            if let Some((text, no_newline, spec)) = try_native_echo_awk(pipe) {
+                                // the input lines: echo's text (echo appends
+                                // the trailing newline unless `-n`); awk
+                                // treats the final newline as the record
+                                // terminator, never part of the last record
+                                let base = if no_newline {
+                                    text
+                                } else {
+                                    Expr::ConditionalExpression {
+                                        test: Box::new(method_call(
+                                            text.clone(),
+                                            "endsWith",
+                                            vec![str_lit("\n")],
+                                        )),
+                                        consequent: Box::new(method_call(
+                                            text.clone(),
+                                            "slice",
+                                            vec![int_lit_expr(0), int_lit_expr(-1)],
+                                        )),
+                                        alternate: Box::new(text),
+                                    }
+                                };
+                                let lines = method_call(base, "split", vec![str_lit("\n")]);
+                                let sel = awk_print_sel_expr(ident("l"), &spec);
+                                let mapped = method_call(
+                                    lines,
+                                    "map",
+                                    vec![sync_arrow_expr_param("l", sel)],
+                                );
+                                let joined = method_call(mapped, "join", vec![str_lit("\n")]);
+                                // awk emits a trailing newline after every
+                                // record (even `echo -n` input — the text is
+                                // still one record); the capture strips it
+                                let value = Expr::BinaryExpression {
+                                    operator: "+".to_string(),
+                                    left: Box::new(joined),
+                                    right: Box::new(str_lit("\n")),
+                                };
+                                return trim_capture(value);
                             }
                         }
                     }
