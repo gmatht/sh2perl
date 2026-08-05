@@ -7664,7 +7664,11 @@ fn str_operand(e: &str) -> Option<Expr> {
 fn eq_test_operand(e: &str) -> Option<Expr> {
     let e = e.trim();
     if let Some(inner) = e.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
-        if inner.contains(['*', '?', '[']) {
+        // a glob metachar inside quotes is a glob in `[[ ]]` context
+        // (the runtime glob-matches `=` operands) — EXCEPT `?` right
+        // after `$`, which is the `$?` status-var sigil, not a glob
+        // (`"$?"` reads the runtime's lastExit field natively).
+        if inner.contains(['*', '[']) || (inner.contains('?') && !inner.contains("$?")) {
             return None; // glob pattern — the runtime glob-matches
         }
         return test_value_operand(&format!("\"{inner}\""));
@@ -12111,10 +12115,13 @@ fn try_native_test(s: &str) -> Option<Expr> {
         if let Some(rest) = s.strip_prefix(flag) {
             let operand = rest.trim();
             let read: Option<Expr> = (|| {
-                let bare = operand
+                let (bare, quoted) = match operand
                     .strip_prefix('"')
                     .and_then(|x| x.strip_suffix('"'))
-                    .unwrap_or(operand);
+                {
+                    Some(b) => (b, true),
+                    None => (operand, false),
+                };
                 // `$name` / `${name}` — the runtime expands the operand
                 // from the store; lifted bindings read natively.
                 if let Some(name) = bare
@@ -12137,6 +12144,13 @@ fn try_native_test(s: &str) -> Option<Expr> {
                         return None;
                     }
                     return Some(sh2_call("getVar", vec![str_lit(name)]));
+                }
+                // `""` — a quoted EMPTY literal: `[ -z "" ]` is always
+                // true, `[ -n "" ]` always false — a plain "" string
+                // compare. Unquoted-empty operands (`[ -z ]` — the flag
+                // itself is the string) stay on the runtime.
+                if bare.is_empty() && quoted {
+                    return Some(str_lit(""));
                 }
                 // literal operand — no `$`, backtick, backslash, quotes or
                 // whitespace (the tokenizer would split on those)
@@ -12226,7 +12240,17 @@ fn try_native_test(s: &str) -> Option<Expr> {
     let string_ops: [(&str, &str); 3] = [("==", "==="), ("!=", "!=="), ("=", "===")];
     for (op, js) in numeric_ops {
         let pat = format!(" {op} ");
-        if let Some(p) = s.find(&pat) {
+        // scan ALL ` -op ` positions (not just the first): an earlier
+        // position whose operands do not both lower may be a FALSE match
+        // inside a compound (`[ A -gt 1 -a B -lt 2 ]` — the first `-gt`
+        // match has the compound tail as its rhs). Skipping a failed
+        // position and continuing is exactly the compound path's job
+        // (each leaf then lowers on its own); the single-op cases are
+        // unaffected (their one position either lowers or falls through
+        // to the runtime).
+        let mut from = 0usize;
+        while let Some(off) = s[from..].find(&pat) {
+            let p = from + off;
             let (lhs, rhs) = (&s[..p], &s[p + 2 + op.len()..]);
             // numeric comparison operands. Each lowers to (expr, mayNaN):
             // a MAY-NaN operand (store var / positional string) needs the
@@ -12284,8 +12308,16 @@ fn try_native_test(s: &str) -> Option<Expr> {
                 }
                 None
             }
-            let (l, l_risky) = num_operand(lhs)?;
-            let (r, r_risky) = num_operand(rhs)?;
+            let l = num_operand(lhs);
+            let r = num_operand(rhs);
+            let (Some((l, l_risky)), Some((r, r_risky))) = (l, r) else {
+                // an operand failed to lower — this ` -op ` position is a
+                // false match (a compound tail / quoted text); keep
+                // scanning for the real operator (the compound path at
+                // the end handles multi-op tests leaf by leaf).
+                from = p + pat.len();
+                continue;
+            };
             if !l_risky && !r_risky {
                 return Some(Expr::BinaryExpression {
                     operator: js.to_string(),
@@ -12392,8 +12424,17 @@ fn try_native_test(s: &str) -> Option<Expr> {
                     if let Some(native) = try_native_glob_test(lhs, rhs, op == "!=") {
                         return Some(native);
                     }
-                    let l = eq_test_operand(lhs)?;
-                    let r = eq_test_operand(rhs)?;
+                    let l = eq_test_operand(lhs);
+                    let r = eq_test_operand(rhs);
+                    let (Some(l), Some(r)) = (l, r) else {
+                        // an operand failed to lower — this operator
+                        // position is a false match (a compound tail / a
+                        // quoted `=` in text); keep scanning: the
+                        // compound path at the end handles `-a`/`-o`
+                        // multi-op tests leaf by leaf.
+                        idx += 1;
+                        continue;
+                    };
                     // bash `=` / `==` / `!=` is a STRING comparison: the
                     // operands are the STRING expansions (`$i` → the
                     // string form of the number). A numeric-lifted var is
@@ -12528,11 +12569,75 @@ fn try_native_test_leaf(s: &str) -> Option<Expr> {
     try_native_test(s)
 }
 
+/// True when the test string contains any `=`/`==`/`!=`/numeric-op token
+/// OUTSIDE quotes — i.e. the single-op scans skipped a failed position
+/// (see the numeric/string-op loops in [`try_native_test`]). The compound
+/// cap applies only to the lowerings those skips newly enable: compounds
+/// reachable in the pre-skip baseline (pure unary/`-a`/`-o` chains) must
+/// keep their old behavior, while a skipped-op compound that would trade
+/// one runtime test for several getVars stays on the runtime call.
+fn test_has_op_token(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut in_q = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            // single-quoted region: skip to the close (no escapes in sh)
+            if let Some(close) = s[i + 1..].find('\'') {
+                i += close + 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b[i] == b'"' {
+            in_q = !in_q;
+            i += 1;
+            continue;
+        }
+        if !in_q && (s[i..].starts_with("==") || s[i..].starts_with("!=") || b[i] == b'=') {
+            return true;
+        }
+        if !in_q && b[i] == b'-' && i + 1 < b.len() {
+            let rest = &s[i + 1..];
+            if rest.starts_with("eq ")
+                || rest.starts_with("ne ")
+                || rest.starts_with("lt ")
+                || rest.starts_with("le ")
+                || rest.starts_with("gt ")
+                || rest.starts_with("ge ")
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn try_native_compound_test(s: &str) -> Option<Expr> {
     let s = s.trim();
     if s.contains(['(', ')']) {
         return None; // paren-grouped compounds stay on the runtime
     }
+    // Compose a compound native; refuse it when its sh2.* CALL count
+    // exceeds the single runtime `sh2.test` call it would replace (a
+    // compound of store-var leaves would trade 1 test for N getVars — a
+    // net call-site metric loss even though the runtime work drops; the
+    // improvement loop auto-stashes metric regressions). Pure-literal
+    // compounds (0 calls) and single-read compounds (1 call, e.g. one
+    // store var + literals) lower; multi-read compounds stay on the
+    // runtime call. The cap applies ONLY to the compounds the op-loop
+    // skips newly enable (an op token present — see
+    // [`test_has_op_token`]): baseline-reachable pure-`-a`/`-o`/unary
+    // compounds keep their pre-existing (uncapped) lowering.
+    let cap = |acc: Expr| -> Option<Expr> {
+        if !test_has_op_token(s) || expr_sh2_call_count(&acc) <= 1 {
+            Some(acc)
+        } else {
+            None
+        }
+    };
     // `-o` splits first (`-a` binds tighter, so `A -o B -a C` is
     // `A || (B && C)` — the -a recursion happens inside each -o leaf)
     if let Some(parts) = split_test_connector(s, "-o") {
@@ -12547,7 +12652,7 @@ fn try_native_compound_test(s: &str) -> Option<Expr> {
                     right: Box::new(r),
                 };
             }
-            return Some(acc);
+            return cap(acc);
         }
     }
     if let Some(parts) = split_test_connector(s, "-a") {
@@ -12562,7 +12667,7 @@ fn try_native_compound_test(s: &str) -> Option<Expr> {
                     right: Box::new(r),
                 };
             }
-            return Some(acc);
+            return cap(acc);
         }
     }
     None
@@ -14213,19 +14318,35 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         // operands are pure reads, so evaluating `t` twice
                         // is side-effect-free; the chain's lastExit checks
                         // then work with NO dispatch and NO string re-parse
-                        // per evaluation. Only sh2-argument-FREE natives
-                        // qualify: a store-var operand would lower to
-                        // getVar calls (the runtime test is ONE call —
-                        // converting it into several getVars is a net
-                        // metric loss, and the sync getVars gain nothing
-                        // over the runtime test's single store read).
-                        if !expr_contains_sh2(&native) {
+                        // per evaluation. Eligible natives: at most ONE
+                        // sh2.* call (a store-var / positional READ — the
+                        // runtime test is one call, so a single-read native
+                        // is metric-neutral and strictly faster; two+ reads
+                        // would be a net metric loss and gain nothing over
+                        // the runtime test's single store read) and no
+                        // awaits (file tests — the sequence context is
+                        // sync; an await chain would break the enclosing
+                        // async analysis). The native test is evaluated
+                        // EXACTLY ONCE into the runtime's `_g` scratch
+                        // (the guard/not protocol — a duplicated native
+                        // would double its getVar reads, and the metric
+                        // would count them twice):
+                        // `(sh2._g = t, sh2.lastExit = sh2._g ? 0 : 1,
+                        // sh2._g)`. The seq is one synchronous run, so a
+                        // nested scratch use can never interleave.
+                        if expr_sh2_call_count(&native) <= 1 && !expr_has_await(&native) {
+                            let tmp = sh2_member("_g");
                             return seq(vec![
+                                Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(tmp.clone()),
+                                    right: Box::new(native.clone()),
+                                },
                                 Expr::AssignmentExpression {
                                     operator: "=".to_string(),
                                     left: Box::new(sh2_member("lastExit")),
                                     right: Box::new(Expr::ConditionalExpression {
-                                        test: Box::new(native.clone()),
+                                        test: Box::new(tmp.clone()),
                                         consequent: Box::new(Expr::Literal {
                                             value: serde_json::Value::from(0),
                                             raw: None,
@@ -14238,7 +14359,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                         }),
                                     }),
                                 },
-                                native,
+                                tmp,
                             ]);
                         }
                     }
@@ -15074,12 +15195,102 @@ fn expr_has_await(e: &Expr) -> bool {
 /// reads are store vars would trade one `sh2.test` call for several
 /// `sh2.getVar` calls.
 fn expr_contains_sh2(e: &Expr) -> bool {
-    serde_json::to_string(e)
-        .map(|s| {
-            s.contains("\"object\":{\"type\":\"Identifier\",\"name\":\"sh2\"}")
-                || s.contains("\"name\":\"sh2\",\"type\":\"Identifier\"")
-        })
-        .unwrap_or(true)
+    expr_sh2_call_count(e) > 0
+}
+
+/// Count the `sh2.*` dispatch CALLS in a lowered expression — the metric's
+/// tally shape (CallExpression whose callee is `sh2.<name>`). State-field
+/// member READS (`sh2.lastExit`, `sh2.positional[i]`, `sh2.cwd`) are not
+/// dispatches and don't count. Used by the and/or test lowering: a native
+/// test with at most ONE sh2 call (a store-var/positional read) is
+/// metric-neutral vs the single runtime `sh2.test` call it replaces, and
+/// strictly faster (no tokenize/parse/dispatch) — two+ reads would be a
+/// net metric loss and stay on the runtime call.
+fn expr_sh2_call_count(e: &Expr) -> usize {
+    fn walk(e: &Expr, n: &mut usize) {
+        match e {
+            Expr::CallExpression {
+                callee,
+                arguments,
+                ..
+            } => {
+                if let Expr::MemberExpression { object, .. } = callee.as_ref() {
+                    if let Expr::Identifier { name } = object.as_ref() {
+                        if name == "sh2" {
+                            *n += 1;
+                        }
+                    }
+                }
+                walk(callee, n);
+                for a in arguments {
+                    walk(a, n);
+                }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            Expr::TemplateLiteral {
+                quasis: _,
+                expressions,
+            } => {
+                for a in expressions {
+                    walk(a, n);
+                }
+            }
+            Expr::MemberExpression {
+                object, property, ..
+            } => {
+                walk(object, n);
+                walk(property, n);
+            }
+            Expr::AwaitExpression { argument } => walk(argument, n),
+            Expr::ArrowFunctionExpression {
+                params, body, ..
+            } => {
+                for p in params {
+                    walk(p, n);
+                }
+                match body {
+                    ArrowBody::Expr(x) => walk(x, n),
+                    ArrowBody::Block(_) => {}
+                }
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties {
+                    walk(&p.key, n);
+                    walk(&p.value, n);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter().flatten() {
+                    walk(el, n);
+                }
+            }
+            Expr::SpreadElement { argument } => walk(argument, n),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                walk(left, n);
+                walk(right, n);
+            }
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => {
+                walk(test, n);
+                walk(consequent, n);
+                walk(alternate, n);
+            }
+            Expr::UnaryExpression { argument, .. } => walk(argument, n),
+            Expr::SequenceExpression { expressions } => {
+                for a in expressions {
+                    walk(a, n);
+                }
+            }
+        }
+    }
+    let mut n = 0usize;
+    walk(e, &mut n);
+    n
 }
 
 fn stmts_have_await(stmts: &[Stmt]) -> bool {
@@ -15695,3 +15906,8 @@ fn safe_ident(name: &str) -> String {
         name.to_string()
     }
 }
+
+
+
+
+

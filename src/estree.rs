@@ -1126,6 +1126,52 @@ mod tests {
     }
 
     #[test]
+    fn and_or_chain_store_var_tests_lower_native() {
+        // `[[ "$a" == "x" ]] && [[ "$b" == "y" ]]` — the chain links
+        // branch on lastExit, so each test records its status natively
+        // (`(sh2._g = String(sh2.getVar(a)) === "x", sh2.lastExit =
+        // sh2._g ? 0 : 1, sh2._g)` — the `_g` scratch evaluates the read
+        // EXACTLY ONCE, keeping the call-site count at ONE getVar vs the
+        // single runtime test it replaces). No sh2.test dispatch, no
+        // string tokenize/parse per evaluation.
+        let json = to_json(
+            "if [[ \"$a\" == \"x\" ]] && [[ \"$b\" == \"y\" ]]; then echo yes; fi",
+        );
+        // the sh2.test DISPATCH is gone (a regex-literal `.test()` method
+        // call has a different callee shape and may legitimately appear)
+        assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        assert!(json.contains("\"name\":\"getVar\""));
+        assert!(json.contains("\"name\":\"_g\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn compound_test_lowers_to_native_or() {
+        // `[[ "$2" == "test" || "$2" == "debug" ]]` — the test-level
+        // `-o` compound: each leaf lowers (positional reads — ZERO
+        // dispatches) and the leaves join with a native `||` — the
+        // runtime test call (tokenize + parse + dispatch) disappears.
+        let json = to_json(
+            "if [[ \"$1\" =~ ^[0-9]+$ ]] && [[ \"$2\" == \"test\" || \"$2\" == \"debug\" ]]; then echo ok; fi",
+        );
+        assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        assert!(json.contains("\"name\":\"positional\""));
+        assert!(json.contains("\"operator\":\"||\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn status_equality_lowers_to_lastexit_read() {
+        // `[ "$?" = "0" ]` — the `$?` sigil is a status-field read, not
+        // a glob `?`: `String(sh2.lastExit) === "0"`, zero dispatches.
+        let json = to_json("if [ \"$?\" = \"0\" ]; then echo zero; fi");
+        assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        assert!(json.contains("\"name\":\"lastExit\""));
+        assert!(json.contains("\"name\":\"String\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
     fn grep_with_regex_pattern_not_lifted() {
         // BRE metacharacters disqualify the lift: `grep 'a.c'` is a regex,
         // not a substring test — the pipeline must stay.
