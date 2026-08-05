@@ -417,7 +417,15 @@ fn compute_async_region_loops(prog: &IrProgram) -> HashSet<usize> {
     fn stmt_walk(st: &IrStmt, in_async: bool, out: &mut HashSet<usize>) {
         match st {
             IrStmt::While { body, .. } | IrStmt::For { body, .. } => {
-                if in_async {
+                // A loop the sync-ok-loops transform marked `sync_ok`
+                // (provably ≤~200ms total, or output-free and finite) may
+                // run as ONE sync chunk even inside a producer context:
+                // the runtime `_capExceeded` bound exists to stop INFINITE
+                // producers, and a sync_ok loop is finite by construction
+                // (its cost bound is an upper bound). The existing sync
+                // gate then emits it with the native for-of / native while
+                // path — zero runtime surface.
+                if in_async && !crate::transforms::sync_ok_loops::sync_ok(st) {
                     out.insert(st as *const IrStmt as usize);
                 }
                 for b in body {
@@ -1664,6 +1672,13 @@ pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
     // Then apply worker-submitted transforms (gated by DEBASHC_TRANSFORMS;
     // the estree worker compiles them in + bisects on the corpus).
     let mut stmts = crate::ir::optimize_stmts(&commands.iter().filter_map(stmt_for_command).collect::<Vec<_>>());
+    // Serialize against the shir_to_estree compile lock: the
+    // sync-ok-loops transform stores per-compilation POINTER-keyed
+    // verdicts in shared statics, and a parallel compilation's unlocked
+    // write could tear them mid-emission (the determinism unit tests
+    // compile concurrently). Never re-entered: shir_to_estree does not
+    // call ast_to_ir and ast_to_ir does not call shir_to_estree.
+    let _compile_guard = COMPILE_LOCK.lock().unwrap();
     crate::transforms::apply(&mut stmts);
     IrProgram {
         imports: vec![],
@@ -5592,6 +5607,15 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // keep the runtime loop — a native loop would lose the producer bound),
     // (b) which loops' final status write is dead (the native while drops
     // the status tracking for them).
+    // The sync-ok-loops verdicts are (re)computed HERE, under the compile
+    // lock, so the pointer keys the emission reads are THIS compilation's
+    // (the transform's ast_to_ir hook also runs it, but the statics are
+    // per-compilation global state — parallel compilations would tear
+    // them between the ast_to_ir write and this read). Gated by
+    // DEBASHC_TRANSFORMS like the transform machinery itself.
+    if crate::transforms::transform_enabled("sync-ok-loops") {
+        crate::transforms::sync_ok_loops::apply_to(&prog.stmts);
+    }
     *ASYNC_REGION_LOOPS.lock().unwrap() = Some(compute_async_region_loops(prog));
     let mut loop_status_dead = HashMap::new();
     if !errexit {
@@ -5760,6 +5784,12 @@ const ALWAYS_TRUE_BUILTINS: &[&str] = &[
 /// Does the lowered expression call an sh2.* runtime function that
 /// provably returns truthy on every path (so a guard wrapper is a no-op)?
 fn call_is_always_true(e: &Expr) -> bool {
+    // An awaited runtime call — `await sh2.forLoopBatch(...)` — is the
+    // batch twins' shape (the *Sync twins emit un-awaited); unwrap so the
+    // guard-skip rule treats them identically.
+    if let Expr::AwaitExpression { argument } = e {
+        return call_is_always_true(argument);
+    }
     // The native echo / `true` / `:` / `false` sequences (see
     // try_native_echo and the status lowering): `(write, sh2.lastExit = N,
     // B)` — always truthy (the echo builtin never fails with the default
@@ -5799,7 +5829,8 @@ fn call_is_always_true(e: &Expr) -> bool {
     };
     match prop.as_str() {
         // runtime helpers that always return truthy
-        "setVar" | "setArray" | "shopt" | "forLoopSync" | "whileLoopSync" => true,
+        "setVar" | "setArray" | "shopt" | "forLoopSync" | "whileLoopSync"
+        | "forLoopBatch" | "whileLoopBatch" => true,
         "builtin" => match arguments.first() {
             Some(Expr::Literal { value, .. }) => match value {
                 serde_json::Value::String(bn) => ALWAYS_TRUE_BUILTINS.contains(&bn.as_str()),
@@ -7355,6 +7386,27 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         body: Box::new(Stmt::BlockStatement { body: inner }),
                     });
                 }
+                // Checkpointed loop (the sync-ok-loops transform's
+                // `batch_ok` verdict) — see the For lowering: the runtime
+                // `whileLoopBatch` runs sync chunks of 1024 with a
+                // `setImmediate` yield between chunks instead of the
+                // blocking `whileLoopSync`, keeping the event loop
+                // responsive for interleaved background jobs while
+                // preserving bash's output order, the lastExit protocol
+                // and the capture bound. Await-legal contexts only (see
+                // `in_sync_arrow`).
+                if crate::transforms::sync_ok_loops::batch_ok(stmt) && !in_sync_arrow() {
+                    return Some(Stmt::ExpressionStatement {
+                        expression: await_call(
+                            "whileLoopBatch",
+                            vec![
+                                sync_arrow_expr(cond_e),
+                                sync_arrow_block(body_stmts),
+                                int_lit_expr(1024),
+                            ],
+                        ),
+                    });
+                }
                 return Some(Stmt::ExpressionStatement {
                     expression: sh2_call(
                         "whileLoopSync",
@@ -7525,6 +7577,29 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         }),
                         right: flatten_for_iter(iter),
                         body: Box::new(Stmt::BlockStatement { body: body_e }),
+                    });
+                }
+                // Checkpointed loop (the sync-ok-loops transform's
+                // `batch_ok` verdict): the loop failed the native gate
+                // (async region / glob iterable / signals) but its body is
+                // sync-executable — the per-iteration await of the async
+                // `forLoop` would be pure overhead. The runtime
+                // `forLoopBatch` runs it as sync chunks of 1024 with a
+                // `setImmediate` yield between chunks: bash's output order
+                // and the capture bound preserved, at ~1/1024 of the await
+                // cost. Emitted only where `await` is legal — inside an
+                // async arrow or at module top level, NEVER inside a
+                // provably-sync function body (`in_sync_arrow`).
+                if crate::transforms::sync_ok_loops::batch_ok(stmt) && !in_sync_arrow() {
+                    return Some(Stmt::ExpressionStatement {
+                        expression: await_call(
+                            "forLoopBatch",
+                            vec![
+                                iter_e,
+                                sync_arrow_with_param(js_var, body_e),
+                                int_lit_expr(1024),
+                            ],
+                        ),
                     });
                 }
                 return Some(Stmt::ExpressionStatement {
@@ -15850,7 +15925,31 @@ fn arrow_body(params: Vec<Expr>, body: IrExpr) -> Expr {
     arrow_body_async(params, body, true)
 }
 
+/// Emission depth inside a NON-async arrow body (provably-sync function
+/// define arrows — `arrow_sink_sync`/`arrow_native_echo_sync`). `await` is
+/// illegal there, so the checkpointed `forLoopBatch`/`whileLoopBatch`
+/// emission (which must be awaited) is suppressed while it is nonzero. The
+/// *Sync loop bodyFn arrows (`sync_arrow_*`) lower their bodies BEFORE the
+/// wrap, so they need no bump here — an await introduced inside one
+/// propagates into the ENCLOSING statement list, which the enclosing
+/// loop's `stmts_have_await` gate sees and flips to the async form.
+static SYNC_ARROW_DEPTH: Mutex<usize> = Mutex::new(0);
+fn in_sync_arrow() -> bool {
+    *SYNC_ARROW_DEPTH.lock().unwrap() > 0
+}
+
 fn arrow_body_async(params: Vec<Expr>, body: IrExpr, r#async: bool) -> Expr {
+    if !r#async {
+        *SYNC_ARROW_DEPTH.lock().unwrap() += 1;
+    }
+    let out = arrow_body_async_inner(params, body, r#async);
+    if !r#async {
+        *SYNC_ARROW_DEPTH.lock().unwrap() -= 1;
+    }
+    out
+}
+
+fn arrow_body_async_inner(params: Vec<Expr>, body: IrExpr, r#async: bool) -> Expr {
     match &body {
         IrExpr::Arrow(stmts) if stmts.len() == 1 && matches!(stmts[0], IrStmt::Expr(_)) => {
             let inner = match &stmts[0] {

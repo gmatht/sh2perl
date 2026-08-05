@@ -1192,6 +1192,48 @@ mod tests {
     }
 
     #[test]
+    fn batch_ok_glob_for_lowers_to_forLoopBatch() {
+        // The sync-ok-loops transform's `batch_ok` verdict (the core
+        // request estree-20260805-045731): a top-level for loop whose body
+        // is sync-executable but whose GLOB iterable disqualifies the
+        // native for-of (the runtime must glob-expand) emits the
+        // checkpointed `await sh2.forLoopBatch(iter, body, 1024)` instead
+        // of the blocking `forLoopSync` — sync chunks of 1024 with a
+        // setImmediate yield, same flatten/glob/signal semantics.
+        let json = to_json("for f in *.sh; do echo \"$f\"; done");
+        assert!(json.contains("\"name\":\"forLoopBatch\""));
+        assert!(json.contains("\"value\":1024"));
+        assert!(json.contains("\"type\":\"AwaitExpression\""));
+        assert!(!json.contains("\"name\":\"forLoopSync\""));
+        assert!(!json.contains("\"type\":\"ForOfStatement\""));
+        // a PLAIN (glob-free) iterable keeps the native for-of — no batch
+        let json2 = to_json("for i in a b c; do echo $i; done");
+        assert!(json2.contains("\"type\":\"ForOfStatement\""));
+        assert!(!json2.contains("\"name\":\"forLoopBatch\""));
+        // a batch_ok loop with an AWAITING body (a capture assign inside)
+        // never takes the batch path — the sync bodyFn cannot await
+        let json3 = to_json("for i in 1 2 3; do x=$(ls); done");
+        assert!(!json3.contains("\"name\":\"forLoopBatch\""));
+        assert!(!json3.contains("\"name\":\"forLoopSync\""));
+        assert!(!json3.contains("\"type\":\"ForOfStatement\""));
+        assert!(json3.contains("\"name\":\"forLoop\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn sync_ok_capture_loop_stays_native_for_of() {
+        // A cheap capture loop (`{1..1000}`, ~3ms ≤ the 200ms budget) is
+        // sync_ok: the existing sync gate emits the native for-of inside
+        // the capture arrow — no runtime loop call at all.
+        let json = to_json("x=$(for i in {1..1000}; do echo $i; done)\necho ${x:0:1}");
+        assert!(json.contains("\"type\":\"ForOfStatement\""));
+        assert!(!json.contains("\"name\":\"forLoop\""));
+        assert!(!json.contains("\"name\":\"forLoopSync\""));
+        assert!(!json.contains("\"name\":\"forLoopBatch\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
     fn assignment_lowers_to_setvar() {
         // provably-numeric/string variables are LIFTED to native JS writes
         // (`x = 42` / `x = \"hello\"`), no runtime store round-trip
