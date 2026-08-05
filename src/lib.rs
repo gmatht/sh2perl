@@ -12,6 +12,7 @@ pub mod shir_json;
 pub mod shir_json_in;
 pub mod shir_passes;
 pub mod bc;
+pub mod perl_backend; // worktree-local: Perl backend renderer (branch backend/perl)
 pub mod generator;
 pub mod mir_simple;
 pub mod shared_utils;
