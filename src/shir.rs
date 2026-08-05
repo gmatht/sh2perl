@@ -4668,15 +4668,18 @@ fn assume_cfor() -> bool {
 /// unless it regresses.
 ///
 /// Documented assumption: a bc expression fed by script `$vars` (the
-/// primes `sqrt($n)` form) holds a non-negative bc number within double
+/// primes `sqrt($n)` form, or the general var-operand `$sum + $i` form —
+/// see [`bc_var_capture`]) holds bc INTEGER values within double
 /// precision (2^53). The native JS path computes in doubles
-/// (`Math.floor(Math.sqrt(Number(x)))`) — bc is exact fixed-point — so a
-/// huge operand (>= 2^53), a non-numeric one (unset var → bc's `sqrt()`
-/// syntax error), or a negative one (bc's "Square root of a negative
-/// number" runtime error) would diverge from the real bc output ("" on
-/// error, exit 1). The corpus cannot observe these (the primes loop feeds
-/// integers >= 2; static programs fold through src/bc.rs EXACTLY);
-/// scripts that can must set SH2_BC_NATIVE=0.
+/// (`Math.floor(Math.sqrt(Number(x)))` / `String(Number(a) + Number(b))`)
+/// — bc is exact fixed-point — so a huge operand (>= 2^53), a non-numeric
+/// one (unset var → bc's `sqrt()` syntax error), or a fractional one
+/// (bc's `.75` output format vs JS `0.75`) would diverge from the real bc
+/// output ("" on error, exit 1). The corpus cannot observe these (the
+/// primes loop feeds integers >= 2; the bc-native loop's `$sum` starts at
+/// the integer 0 and every iteration adds an integer loop var — the
+/// integer invariant propagates; static programs fold through src/bc.rs
+/// EXACTLY); scripts that can must set SH2_BC_NATIVE=0.
 fn bc_native_enabled() -> bool {
     std::env::var("SH2_BC_NATIVE").map_or(true, |v| v != "0")
 }
@@ -10638,8 +10641,10 @@ fn try_native_echo_dead(args: &[IrExpr]) -> Option<Expr> {
 /// `$(echo EXPR | bc)` — a native bc evaluation (SH2_BC_NATIVE, default
 /// ON; see [`bc_native_enabled`]): the spawn + async capture machinery
 /// collapse to a compile-time fold (static EXPR, via src/bc.rs's exact
-/// GNU-bc semantics + output format) or a native `sqrt($var)` expression
-/// (the primes `is_prime` pattern). `words` = captureWords context
+/// GNU-bc semantics + output format), a native `sqrt($var)` expression
+/// (the primes `is_prime` pattern), or a native var-operand arithmetic
+/// expression (`$sum + $i` — see [`bc_var_capture`]). `words` =
+/// captureWords context
 /// (unquoted `$(...)` — the runtime word-splits the output): the fold
 /// then only fires when the value is provably a single word, and the
 /// emitted one-element array is exactly the `capture().split(/\s+/)`
@@ -10742,15 +10747,15 @@ fn native_capture_echo_bc(pipe: &IrExpr, words: bool) -> Option<Expr> {
         // (Math.floor of the double root; see bc_native_enabled for the
         // documented operand assumption)
         IrExpr::Interpolate(parts) => {
-            let [InterpPart::Lit(l1), InterpPart::Expr(inner), InterpPart::Lit(l2)] =
+            // `sqrt($var)` — a single interpolation inside the sqrt
+            // parens: bc's scale-0 sqrt of an integer is the truncated
+            // root (Math.floor of the double root; see bc_native_enabled
+            // for the documented operand assumption)
+            if let [InterpPart::Lit(l1), InterpPart::Expr(inner), InterpPart::Lit(l2)] =
                 parts.as_slice()
-            else {
-                return None;
-            };
-            if l1.trim_end() != "sqrt(" || l2.trim_start() != ")" {
-                return None;
-            }
-            // SH2_BC_NATIVE=exact: the wasm bc number core (sh2.bcSqrt —
+            {
+                if l1.trim_end() == "sqrt(" && l2.trim_start() == ")" {
+                    // SH2_BC_NATIVE=exact: the wasm bc number core (sh2.bcSqrt —
             // posixutils-rs Number(BigDecimal)) — exact arbitrary
             // precision + scale, SYNC (wasm is pure CPU — the *Sync loop
             // gates stay green). Errors (negative, non-numeric) → "" like
@@ -10784,51 +10789,257 @@ fn native_capture_echo_bc(pipe: &IrExpr, words: bool) -> Option<Expr> {
                     optional: false,
                 });
             }
-            let num = Expr::CallExpression {
+                    let num = Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "Number".to_string(),
+                        }),
+                        arguments: vec![expr_to_estree(inner)],
+                        optional: false,
+                    };
+                    let root = Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: "Math".to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "sqrt".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        arguments: vec![num],
+                        optional: false,
+                    };
+                    let fl = Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: "Math".to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "floor".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        arguments: vec![root],
+                        optional: false,
+                    };
+                    return Some(Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "String".to_string(),
+                        }),
+                        arguments: vec![fl],
+                        optional: false,
+                    });
+                }
+            }
+            // `$a + $b` / `($a + $b) / $c` — the general var-operand
+            // form (see bc_var_capture): native bc scale-0 integer
+            // arithmetic over the interpolated operands, no spawn.
+            bc_var_capture(parts)
+        }
+        _ => None,
+    }
+}
+
+/// The strict literal-text scan for the var-operand bc form: the
+/// interpolated argument's literal parts may contain only decimal digits,
+/// whitespace, and the `+ - * / % ( )` operators (bc's scale-0 integer
+/// subset). ANY other character keeps the spawn: letters (`sqrt`,
+/// `scale`, bc variables, hex `x`), `.` (fractional literals — the double
+/// path cannot reproduce bc's exact fractional output format), `;`
+/// (multi-statement programs), `^` (bc POWER vs bash XOR — the two
+/// grammars disagree), comparisons, `#` (bash base prefixes), quotes.
+fn bc_var_lit_ok(s: &str) -> bool {
+    s.chars().all(|c| {
+        c.is_ascii_digit()
+            || c.is_whitespace()
+            || matches!(c, '+' | '-' | '*' | '/' | '%' | '(' | ')')
+    })
+}
+
+/// `ArithAst` → native JS for the var-operand bc form. Every `__bcvK`
+/// placeholder maps to `Number(<slot K's expression>)` — bash vars are
+/// strings, the double path needs numbers. Only `+ - * / %` binaries,
+/// unary `+`/`-`, integer literals and slot vars are allowed; anything
+/// else (bash `^` XOR, `**`, comparisons, `++`, assignments, index ops,
+/// ternaries) returns None → the spawn stands. `/` lowers to
+/// `Math.trunc(a / b)` — bc's scale-0 division truncates toward zero,
+/// plain JS division would leave a fraction; `%` lowers to JS `%` (for
+/// integers both give the sign-of-dividend remainder).
+fn bc_arith_to_js(a: &ArithAst, slots: &[&IrExpr]) -> Option<Expr> {
+    match a {
+        ArithAst::Num(i) => Some(Expr::Literal {
+            value: serde_json::Value::from(*i),
+            raw: None,
+            regex: None,
+        }),
+        ArithAst::Var(v) => {
+            let idx = v.strip_prefix("__bcv")?.parse::<usize>().ok()?;
+            Some(Expr::CallExpression {
                 callee: Box::new(Expr::Identifier {
                     name: "Number".to_string(),
                 }),
-                arguments: vec![expr_to_estree(inner)],
+                arguments: vec![expr_to_estree(slots.get(idx)?)],
                 optional: false,
-            };
-            let root = Expr::CallExpression {
-                callee: Box::new(Expr::MemberExpression {
-                    object: Box::new(Expr::Identifier {
-                        name: "Math".to_string(),
+            })
+        }
+        ArithAst::Bin { op, lhs, rhs } => {
+            let l = bc_arith_to_js(lhs, slots)?;
+            let r = bc_arith_to_js(rhs, slots)?;
+            match op.as_str() {
+                "+" | "-" | "*" => Some(Expr::BinaryExpression {
+                    operator: op.clone(),
+                    left: Box::new(l),
+                    right: Box::new(r),
+                }),
+                "/" => Some(Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "Math".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "trunc".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
                     }),
-                    property: Box::new(Expr::Identifier {
-                        name: "sqrt".to_string(),
-                    }),
-                    computed: false,
+                    arguments: vec![Expr::BinaryExpression {
+                        operator: "/".to_string(),
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    }],
                     optional: false,
                 }),
-                arguments: vec![num],
-                optional: false,
-            };
-            let fl = Expr::CallExpression {
-                callee: Box::new(Expr::MemberExpression {
-                    object: Box::new(Expr::Identifier {
-                        name: "Math".to_string(),
-                    }),
-                    property: Box::new(Expr::Identifier {
-                        name: "floor".to_string(),
-                    }),
-                    computed: false,
-                    optional: false,
+                "%" => Some(Expr::BinaryExpression {
+                    operator: "%".to_string(),
+                    left: Box::new(l),
+                    right: Box::new(r),
                 }),
-                arguments: vec![root],
-                optional: false,
-            };
-            Some(Expr::CallExpression {
-                callee: Box::new(Expr::Identifier {
-                    name: "String".to_string(),
-                }),
-                arguments: vec![fl],
-                optional: false,
+                _ => None,
+            }
+        }
+        ArithAst::Un { op, arg } if op == "-" || op == "+" => {
+            Some(Expr::UnaryExpression {
+                operator: op.clone(),
+                argument: Box::new(bc_arith_to_js(arg, slots)?),
+                prefix: true,
             })
         }
         _ => None,
     }
+}
+
+/// Collect the translated JS divisor expressions of every `/` and `%`
+/// site (post-order, matching the evaluation order of the emitted tree).
+/// bc aborts the WHOLE program with no stdout when any divisor evaluates
+/// to zero — the guard must therefore test the divisor's VALUE (a nested
+/// `a / (b / c)` aborts on `b / c == 0`, not just `c == 0`). All operand
+/// expressions are pure reads, so the double evaluation the guard
+/// introduces is safe.
+fn bc_arith_divisors<'a>(
+    a: &'a ArithAst,
+    slots: &[&IrExpr],
+    out: &mut Vec<Expr>,
+) -> Option<()> {
+    match a {
+        ArithAst::Bin { op, lhs, rhs } => {
+            bc_arith_divisors(lhs, slots, out)?;
+            if op == "/" || op == "%" {
+                // a literal divisor is never zero (the strict scan only
+                // admits decimal digits) — only var/expr divisors need
+                // the guard
+                if !matches!(rhs.as_ref(), ArithAst::Num(_)) {
+                    out.push(bc_arith_to_js(rhs, slots)?);
+                }
+            }
+            bc_arith_divisors(rhs, slots, out)
+        }
+        ArithAst::Un { arg, .. } => bc_arith_divisors(arg, slots, out),
+        _ => Some(()),
+    }
+}
+
+/// `$(echo "$sum + $i" | bc)` — the general var-operand bc program
+/// (SH2_BC_NATIVE fast tier, see [`bc_native_enabled`] for the documented
+/// operand assumption): every Expr slot of the interpolated echo argument
+/// becomes an operand, the literal text must pass [`bc_var_lit_ok`], and
+/// the whole program must parse as bc's scale-0 integer arithmetic
+/// (via the bash-arith parser — the two grammars agree on `+ - * / %`,
+/// parens, unary minus, decimal literals, and left associativity; `^`
+/// and everything else bails to the spawn). The value is
+/// `String(<js arith>)` — for integer operands within 2^53 the double
+/// path is exact and String() prints the same digits as bc — with a
+/// `(divisor === 0) ? "" : ...` guard per `/`/`%` site (bc's no-stdout
+/// abort). Always a single word (integers have no whitespace), so the
+/// captureWords form is safe too.
+fn bc_var_capture(parts: &[InterpPart]) -> Option<Expr> {
+    let mut src = String::new();
+    let mut slots: Vec<&IrExpr> = Vec::new();
+    for p in parts {
+        match p {
+            InterpPart::Lit(s) => {
+                if !bc_var_lit_ok(s) {
+                    return None;
+                }
+                src.push_str(s);
+            }
+            InterpPart::Expr(e) => {
+                slots.push(e);
+                src.push_str(&format!("__bcv{}", slots.len() - 1));
+            }
+        }
+    }
+    // all-Lit arguments fold at compile time above; a var form needs at
+    // least one slot
+    if slots.is_empty() {
+        return None;
+    }
+    let ast = parse_arith(&src)?;
+    let value = bc_arith_to_js(&ast, &slots)?;
+    let mut divs = Vec::new();
+    bc_arith_divisors(&ast, &slots, &mut divs)?;
+    let result = Expr::CallExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "String".to_string(),
+        }),
+        arguments: vec![value],
+        optional: false,
+    };
+    if divs.is_empty() {
+        return Some(result);
+    }
+    // bc aborts the whole program (no stdout → the capture is "")
+    // when ANY divisor evaluates to zero
+    let mut guard = Expr::BinaryExpression {
+        operator: "===".to_string(),
+        left: Box::new(divs[0].clone()),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(0),
+            raw: None,
+            regex: None,
+        }),
+    };
+    for d in &divs[1..] {
+        guard = Expr::LogicalExpression {
+            operator: "||".to_string(),
+            left: Box::new(guard),
+            right: Box::new(Expr::BinaryExpression {
+                operator: "===".to_string(),
+                left: Box::new(d.clone()),
+                right: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                    regex: None,
+                }),
+            }),
+        };
+    }
+    Some(Expr::ConditionalExpression {
+        test: Box::new(guard),
+        consequent: Box::new(str_lit("")),
+        alternate: Box::new(result),
+    })
 }
 
 /// The echo text value: the joined args, plus the trailing newline the
