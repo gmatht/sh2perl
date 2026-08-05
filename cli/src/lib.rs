@@ -614,14 +614,29 @@ exit $main_exit_code;
                     println!("Error: file --c requires filename");
                     return;
                 }
-                let filename = &args[3];
+                let mut output_lineno = false;
+                let mut filename = &args[3];
+                if filename == "--output-lineno" {
+                    if args.len() < 5 {
+                        println!("Error: file --c --output-lineno requires filename");
+                        return;
+                    }
+                    output_lineno = true;
+                    filename = &args[4];
+                }
                 let src = std::fs::read_to_string(filename).unwrap_or_else(|e| {
                     eprintln!("Error reading file {}: {}", filename, e);
                     std::process::exit(1);
                 });
                 match debashl::cfront::c_to_ir(&src) {
-                    Ok(prog) => {
-                        println!("{}", debashl::shir_json::shir_to_shir_json(&prog))
+                    Ok(mut prog) => {
+                        if !output_lineno {
+                            prog.stmt_lines.clear();
+                        }
+                        println!(
+                            "{}",
+                            debashl::shir_json::shir_to_shir_json(&prog)
+                        );
                     }
                     Err(e) => {
                         eprintln!("{}", e);
@@ -727,7 +742,19 @@ exit $main_exit_code;
                 println!("Error: c command requires input");
                 return;
             }
-            let input = &args[2];
+            // --output-lineno: keep the per-statement source line numbers
+            // in the JSON (the Perl renderer turns them into ` # line N`
+            // end-of-line comments)
+            let mut output_lineno = false;
+            let mut input = &args[2];
+            if input == "--output-lineno" {
+                if args.len() < 4 {
+                    println!("Error: c --output-lineno requires input");
+                    return;
+                }
+                output_lineno = true;
+                input = &args[3];
+            }
             let src = if input == "-" {
                 let mut s = String::new();
                 if let Err(e) = std::io::stdin().read_to_string(&mut s) {
@@ -744,7 +771,15 @@ exit $main_exit_code;
                 input.to_string()
             };
             match debashl::cfront::c_to_ir(&src) {
-                Ok(prog) => println!("{}", debashl::shir_json::shir_to_shir_json(&prog)),
+                Ok(mut prog) => {
+                    if !output_lineno {
+                        prog.stmt_lines.clear();
+                    }
+                    println!(
+                        "{}",
+                        debashl::shir_json::shir_to_shir_json(&prog)
+                    );
+                }
                 Err(e) => {
                     eprintln!("{}", e);
                     std::process::exit(1);
