@@ -69,3 +69,4 @@ file_00[0-9]
 ?*${*
 test.py
 x.py
+target-core/

@@ -322,6 +322,20 @@ impl Render {
             }
             IrExpr::Arith(a) => vec![Part::Arg(self.arith(a), true)],
             IrExpr::BinOp { .. } => vec![Part::Arg(self.expr(e), true)],
+            IrExpr::Call { func, args } => {
+                let args = args.clone();
+                // getVar("x") → ident if x is typed, else stub
+                if func == "getVar" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        if self.var_types.contains_key(name) {
+                            return vec![Part::Arg(self.c_ident(name), self.is_num(name))];
+                        }
+                    }
+                    return vec![Part::Arg(self.call(func, &args), false)];
+                }
+                // other calls: render the call expression; default to non-num
+                vec![Part::Arg(self.call(func, &args), self.expr_is_num(e))]
+            }
             other => {
                 self.mark_todo(&format!("echo arg {:?}", other));
                 vec![Part::Arg("0".into(), true)]
@@ -450,6 +464,91 @@ impl Render {
                 let code = e.as_ref().map(|x| self.expr(x)).unwrap_or_else(|| "0".into());
                 self.emit(&format!("return {code};"));
             }
+            IrStmt::For { var, iter, body } => {
+                // Emit a C for loop over an index variable; each iteration
+                // assigns the loop var from a static items array. Supports
+                // Int vars with numeric items and string vars with string
+                // items; anything else → TODO inside the loop body.
+                let items = match iter {
+                    IrExpr::Array(items) => items.clone(),
+                    _ => {
+                        self.mark_todo("for iter not Array");
+                        return;
+                    }
+                };
+                let n = items.len();
+                if n == 0 {
+                    return;
+                }
+                let var_name = self.c_ident(var);
+                let is_num = self.is_num(var);
+                let arr_id = format!("_for_{var_name}");
+                if is_num {
+                    let mut values = Vec::new();
+                    let mut ok = true;
+                    for item in &items {
+                        match item {
+                            IrExpr::Int(i) => values.push(i.to_string()),
+                            IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
+                                Ok(n) => values.push(n.to_string()),
+                                Err(_) => {
+                                    self.mark_todo("for item not numeric");
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            _ => {
+                                self.mark_todo("for item type");
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok { return; }
+                    self.emit(&format!(
+                        "static const long long {arr_id}[] = {{{}}};",
+                        values.join(", ")
+                    ));
+                    self.emit(&format!(
+                        "for (size_t _i_{var_name} = 0; _i_{var_name} < {n}; _i_{var_name}++) {{"
+                    ));
+                    self.depth += 1;
+                    self.emit(&format!("long long {var_name} = {arr_id}[_i_{var_name}];"));
+                    for s in body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                } else {
+                    let mut values = Vec::new();
+                    let mut ok = true;
+                    for item in &items {
+                        match item {
+                            IrExpr::Str(s, _) => values.push(Self::cstr(s)),
+                            _ => {
+                                self.mark_todo("for item type");
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok { return; }
+                    self.emit(&format!(
+                        "static const char* {arr_id}[] = {{{}}};",
+                        values.join(", ")
+                    ));
+                    self.emit(&format!(
+                        "for (size_t _i_{var_name} = 0; _i_{var_name} < {n}; _i_{var_name}++) {{"
+                    ));
+                    self.depth += 1;
+                    self.emit(&format!("char* {var_name} = (char*){arr_id}[_i_{var_name}];"));
+                    for s in body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                }
+            }
             other => self.mark_todo(&format!("stmt {:?}", other)),
         }
     }
@@ -475,11 +574,17 @@ impl Render {
 
     fn program(&mut self, prog: &IrProgram) {
         // Pass 1: collect declared vars (assign targets, declare lists,
-        // Var reads) so declarations can be hoisted before use.
+        // Var reads) so declarations can be hoisted before use. Also
+        // collect for-loop variables so we can exclude them from the
+        // top-level pre-declaration (they are declared inside the loop).
         let mut vars: BTreeSet<String> = BTreeSet::new();
-        collect_vars(&prog.stmts, &mut vars);
+        let mut for_vars: BTreeSet<String> = BTreeSet::new();
+        collect_vars_full(&prog.stmts, &mut vars, &mut for_vars);
         for (n, _) in &prog.var_types {
             vars.insert(n.clone());
+        }
+        for v in &for_vars {
+            vars.remove(v);
         }
 
         // Pass 2: render the body first (helper flags known before preamble).
@@ -535,6 +640,16 @@ impl Render {
 /// Collect every variable name referenced by statements (assign targets,
 /// declare lists, Var reads).
 fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    collect_vars_full(stmts, out, &mut BTreeSet::new());
+}
+
+/// Like `collect_vars`, but also returns the set of for-loop variables
+/// (which are declared inside the loop, not at function top).
+fn collect_vars_full(
+    stmts: &[IrStmt],
+    out: &mut BTreeSet<String>,
+    for_vars: &mut BTreeSet<String>,
+) {
     for s in stmts {
         match s {
             IrStmt::Assign { targets, expr } => {
@@ -566,6 +681,13 @@ fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 if let Some(x) = e {
                     collect_vars_expr(x, out);
                 }
+            }
+            IrStmt::For { var, iter, body } => {
+                // The for-loop variable is declared inside the loop; don't
+                // pre-declare it at function top.
+                for_vars.insert(var.clone());
+                collect_vars_expr(iter, out);
+                collect_vars_full(body, out, for_vars);
             }
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => collect_vars(b, out),
             _ => {}

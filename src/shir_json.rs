@@ -21,15 +21,27 @@ pub fn shir_to_shir_json(prog: &IrProgram) -> String {
     // Ask A2: attach the type verdicts before serializing.
     let mut prog = prog.clone();
     prog.var_types = crate::shir::analyze_var_types(&prog);
-    let v = program_json(&prog);
-    serde_json::to_string(&v).expect("serialize ShIR JSON")
+    program_json(&prog, CONTRACT_VERSION).to_string()
 }
+
+/// "Raw" export for the frontend/optimizer boundary (plan §2.3):
+/// no `analyze_var_types` (no A2 annotations); the caller builds the IR
+/// with `ast_to_ir_raw` to also skip `optimize_stmts`. Same node
+/// serialization (purity is a per-node property, not a post-attach).
+/// Use to pin `F(S)_raw == C(S)_raw` and `O(F(S)) == C(S)`.
+pub fn shir_to_shir_json_raw(prog: &IrProgram) -> String {
+    program_json(prog, CONTRACT_VERSION).to_string()
+}
+
+/// Current contract version (plan §2.1). Bump on any breaking shape change.
+pub const CONTRACT_VERSION: u32 = 1;
 
 // ── Program / subs ───────────────────────────────────────────────────
 
-fn program_json(p: &IrProgram) -> Value {
+fn program_json(p: &IrProgram, contract_version: u32) -> Value {
     json!({
         "type": "Program",
+        "contract_version": contract_version,
         "imports": p.imports,
         "requires": p.requires,
         "var_types": p.var_types.iter().map(|(n, t)| json!({"name": n, "type": t})).collect::<Vec<_>>(),

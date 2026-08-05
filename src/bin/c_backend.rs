@@ -18,7 +18,11 @@ fn main() {
         eprintln!("usage: c_backend <file.sh>");
         std::process::exit(2);
     }
-    let content = std::fs::read_to_string(&args[1]).expect("read input file");
+    // Corpus files may be ISO-8859-1 etc. (utf8-non-utf8-content.sh);
+    // the core parses lossily too, so mirror it here instead of panicking
+    // on invalid UTF-8.
+    let bytes = std::fs::read(&args[1]).expect("read input file");
+    let content = String::from_utf8_lossy(&bytes);
     let commands = match Parser::new(&content).parse() {
         Ok(c) => c,
         Err(e) => {
