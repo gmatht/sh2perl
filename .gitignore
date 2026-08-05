@@ -9,6 +9,9 @@ purify.out
 
 # Rust/Cargo build artifacts
 target/
+target-core/
+backends/*/target/
+backends/*/target-core/
 logs/
 
 # Test work directories and temporary outputs
