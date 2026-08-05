@@ -26,6 +26,9 @@ pub fn shir_to_shir_json(prog: &IrProgram) -> String {
     if prog.var_types.is_empty() {
         prog.var_types = crate::shir::analyze_var_types(&prog);
     }
+    if prog.var_lengths.is_empty() {
+        prog.var_lengths = crate::shir::analyze_string_lengths(&prog);
+    }
     program_json(&prog, CONTRACT_VERSION).to_string()
 }
 
@@ -51,6 +54,7 @@ fn program_json(p: &IrProgram, contract_version: u32) -> Value {
         "requires": p.requires,
         "var_types": p.var_types.iter().map(|(n, t)| json!({"name": n, "type": t})).collect::<Vec<_>>(),
         "stmt_lines": p.stmt_lines.iter().map(|(i, l)| json!({"stmt": i, "line": l})).collect::<Vec<_>>(),
+        "var_lengths": p.var_lengths.iter().map(|(n, l)| json!({"name": n, "max_len": l})).collect::<Vec<_>>(),
         "subs": p.subs.iter().map(sub_json).collect::<Vec<_>>(),
         "stmts": p.stmts.iter().map(stmt_json).collect::<Vec<_>>(),
     })
