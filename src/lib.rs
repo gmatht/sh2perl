@@ -11,6 +11,7 @@ pub mod shir_json;
 
 pub mod shir_json_in;
 pub mod shir_passes;
+pub mod zig_backend;
 pub mod bc;
 pub mod generator;
 pub mod mir_simple;

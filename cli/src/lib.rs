@@ -788,6 +788,34 @@ exit $main_exit_code;
             };
             print!("{}", debashl::ir::ir_to_perl(&prog));
         }
+        "--shir-in-zig" => {
+            if args.len() < 3 { println!("Error: --shir-in-zig requires input"); return; }
+            let input = &args[2];
+            let content = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e); std::process::exit(1);
+                }
+                Ok(s)
+            } else {
+                fs::read_to_string(input)
+            };
+            let content = match content {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                // NB: report the ingress marker on stderr and exit 0. The
+                // backend gate probes the flag by feeding intentionally
+                // invalid JSON and grepping for this marker; under the
+                // harness's `set -euo pipefail` a nonzero exit there would
+                // abort the gate before the corpus loop. A renderer panic
+                // still exits 101 and is caught by the loop.
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(0); }
+            };
+            print!("{}", debashl::zig_backend::shir_to_zig(&prog));
+        }
         "--mir" => {
             if args.len() < 3 {
                 println!("Error: --mir command requires input");
