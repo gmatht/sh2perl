@@ -11,6 +11,7 @@ pub mod shir_json;
 
 pub mod shir_json_in;
 pub mod shir_passes;
+pub mod python_backend; // worktree-local: python backend renderer (branch backend/python)
 pub mod bc;
 pub mod generator;
 pub mod mir_simple;
