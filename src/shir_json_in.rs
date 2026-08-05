@@ -61,6 +61,17 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
             .collect(),
         _ => vec![],
     };
+    let var_lengths = match obj.get("var_lengths") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| {
+                let n = v.get("name")?.as_str()?.to_string();
+                let l = v.get("max_len").and_then(|x| x.as_u64());
+                Some((n, l))
+            })
+            .collect(),
+        _ => vec![],
+    };
     Ok(IrProgram {
         imports,
         requires,
@@ -68,6 +79,7 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
         subs,
         var_types,
         stmt_lines,
+        var_lengths,
     })
 }
 

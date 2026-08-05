@@ -416,7 +416,9 @@ fn loop_status_write_dead(stmt: &IrStmt) -> bool {
 fn compute_async_region_loops(prog: &IrProgram) -> HashSet<usize> {
     fn stmt_walk(st: &IrStmt, in_async: bool, out: &mut HashSet<usize>) {
         match st {
-            IrStmt::While { body, .. } | IrStmt::For { body, .. } => {
+            IrStmt::While { body, .. }
+        | IrStmt::For { body, .. }
+        | IrStmt::DoWhile { body, .. } => {
                 // A loop the sync-ok-loops transform marked `sync_ok`
                 // (provably ≤~200ms total, or output-free and finite) may
                 // run as ONE sync chunk even inside a producer context:
@@ -1687,6 +1689,7 @@ pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
         subs: vec![],
         var_types: vec![],
         stmt_lines: vec![],
+        var_lengths: vec![],
     }
 }
 
@@ -1703,6 +1706,7 @@ pub fn ast_to_ir_raw(commands: &[Command]) -> IrProgram {
         subs: vec![],
         var_types: vec![],
         stmt_lines: vec![],
+        var_lengths: vec![],
     }
 }
 
@@ -1712,6 +1716,382 @@ pub fn ast_to_ir_raw(commands: &[Command]) -> IrProgram {
 /// (every assignment provably a string literal → native string). Vars in
 /// neither set keep the runtime store (shell vars are strings; Any).
 /// Sorted by name for deterministic serialization.
+/// Conservative max-string-length analysis (the transform the C backend
+/// asked for: fixed buffers instead of heap/`char*`). A fixed-point over
+/// the assignments: each var's bound is the max over its assignment RHS
+/// lengths (Str literals, Interpolate = the literal parts + the
+/// interpolated vars' bounds); captures/calls/binops are unbounded
+/// (None); a loop-accumulated `s="$s$x"` grows past the cap each
+/// iteration and flips to None (the cap guarantees termination).
+pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
+    const CAP: u64 = 1024; // a false bound from an unbounded loop is worse than none
+    const ITER_LIMIT: usize = 1024;
+    use crate::ir::{InterpPart, IrExpr, IrStmt};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // collect the assignment targets + the RHS exprs
+    let mut assigns: Vec<(String, &IrExpr)> = Vec::new();
+    fn walk<'a>(stmts: &'a [IrStmt], assigns: &mut Vec<(String, &'a IrExpr)>) {
+        for st in stmts {
+            match st {
+                IrStmt::Assign { targets, expr } => {
+                    for t in targets {
+                        if t.indices.is_empty() {
+                            assigns.push((t.var.clone(), expr));
+                        }
+                    }
+                }
+                // `local name=value` / `declare name=value` / `export
+                // name=value` — the shell's declaration assignments: the
+                // exec/builtin call's args carry "name=" + the value
+                IrStmt::Expr(IrExpr::Call { func, args }) => {
+                    let decl_name = match args.first() {
+                        Some(IrExpr::Str(n, _))
+                            if matches!(n.as_str(), "local" | "declare" | "readonly" | "export") =>
+                        {
+                            Some(n.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(decl) = decl_name {
+                        if let Some(IrExpr::Array(elems)) = args.get(1) {
+                            let mut i = 0;
+                            while i < elems.len() {
+                                if let IrExpr::Str(nv, _) = &elems[i] {
+                                    if let Some((name, value)) = nv.split_once('=') {
+                                        if !name.is_empty() {
+                                            // the value may be inline ("" for
+                                            // `name=$(...)`) or the NEXT array
+                                            // element: ["sqrt_n=", [value]]
+                                            let next = elems.get(i + 1);
+                                            let v: &IrExpr = match next {
+                                                Some(IrExpr::Array(inner))
+                                                    if inner.len() == 1 =>
+                                                {
+                                                    &inner[0]
+                                                }
+                                                Some(other) => other,
+                                                None if !value.contains('$') => {
+                                                    // inline literal
+                                                    Box::leak(Box::new(IrExpr::Str(
+                                                        value.to_string(),
+                                                        crate::ir::StrStyle::DoubleQuoted,
+                                                    )))
+                                                }
+                                                None => break,
+                                            };
+                                            assigns.push((name.to_string(), v));
+                                            if matches!(next, Some(IrExpr::Array(_))) {
+                                                i += 2;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                                i += 1;
+                            }
+                            let _ = decl;
+                        }
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, assigns);
+                    for (_, arm) in elsifs {
+                        walk(arm, assigns);
+                    }
+                    walk(else_, assigns);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body)
+                | IrStmt::Block(body)
+                | IrStmt::Redirect { inner: body, .. } => walk(body, assigns),
+                IrStmt::Function { body, .. } => walk(body, assigns),
+                _ => {}
+            }
+        }
+    }
+    walk(&prog.stmts, &mut assigns);
+
+    let names: BTreeSet<String> = assigns.iter().map(|(n, _)| n.clone()).collect();
+    let mut lens: BTreeMap<String, Option<u64>> =
+        names.iter().map(|n| (n.clone(), Some(0))).collect();
+
+    fn expr_len(e: &IrExpr, lens: &BTreeMap<String, Option<u64>>, cap: u64) -> Option<u64> {
+        match e {
+            IrExpr::Str(sv, _) => Some(sv.len() as u64),
+            IrExpr::Int(_) => Some(20), // the max digit count
+            IrExpr::Var(n, _) => lens.get(n).copied().flatten(),
+            IrExpr::Interpolate(parts) => {
+                let mut total = 0u64;
+                for p in parts {
+                    let l = match p {
+                        InterpPart::Lit(s) => s.len() as u64,
+                        InterpPart::Expr(e) => expr_len(e, lens, cap)?,
+                    };
+                    total = total.saturating_add(l);
+                    if total > cap {
+                        return None;
+                    }
+                }
+                Some(total)
+            }
+            IrExpr::Capture { expr, .. } => {
+                // a capture's bound depends on the CAPTURED COMMAND: bc
+                // yields a fixed-width number; the filters (grep/sed/tr/
+                // head/tail/sort/uniq/cut/cat/...) yield output no larger
+                // than the input — bounded by the pipeline's FIRST stage
+                // when that is a bounded echo; everything else is
+                // unbounded (the user's design: e.g. the primes'
+                // `$(echo "sqrt($n)" | bc)` -> 40).
+                capture_bound(expr, lens, cap)
+            }
+            IrExpr::Call { func, args } if func == "getVar" => match args.first() {
+                Some(IrExpr::Str(n, _)) => lens.get(n).copied().flatten(),
+                _ => None,
+            },
+            // the runtime capture: sh2.capture([wrapped command]) — the
+            // bound comes from the CAPTURED command (bc/wc/hash fixed
+            // widths, the filters <= the input, grep -q/-c options)
+            IrExpr::Call { func, args } if func == "capture" => match args.first() {
+                Some(body) => capture_bound(body, lens, cap),
+                _ => None,
+            },
+            // BinOps ARE bounded: `a . b` (Concat) = max(a)+max(b); the
+            // numeric ops yield a number (<= 20 chars); the comparisons/
+            // logicals yield 0/1 (1 char).
+            IrExpr::BinOp { op, lhs, rhs } => match op {
+                BinOpKind::Concat => {
+                    let l = expr_len(lhs, lens, cap)?;
+                    let r = expr_len(rhs, lens, cap)?;
+                    Some(l.saturating_add(r))
+                }
+                BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Gt
+                | BinOpKind::Le | BinOpKind::Ge | BinOpKind::And | BinOpKind::Or
+                | BinOpKind::Not => Some(1),
+                _ => Some(20), // the numeric/bitwise ops -> a number
+            },
+            // $((...)) -> a number
+            IrExpr::Arith(_) => Some(20),
+            _ => None, // calls / arrays — unbounded
+        }
+    }
+
+    /// The capture's wrapped command -> the pipeline's stages. The
+    /// shapes: `Call("pipeline", [Array([Arrow, ...])])`, an exec whose
+    /// ARGS are the arrow stages (`Call("exec", [Arrow, Arrow])`), or a
+    /// bare Arrow whose body's first statement is the command call.
+    fn capture_stages(e: &IrExpr) -> Vec<&IrExpr> {
+        match e {
+            IrExpr::Call { func, args } if func == "pipeline" => match args.first() {
+                Some(IrExpr::Array(items)) => items.iter().collect(),
+                _ => vec![e],
+            },
+            IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+                // the stages may sit in the exec's args directly
+                // ([Arrow, Arrow]) or wrapped in a single Array
+                // ([Array([Arrow, Arrow])]) — both appear in the corpus
+                if let Some(IrExpr::Array(items)) = args.first() {
+                    if items.iter().all(|a| matches!(a, IrExpr::Arrow(_))) {
+                        return items.iter().collect();
+                    }
+                }
+                let stages: Vec<&IrExpr> =
+                    args.iter().filter(|a| matches!(a, IrExpr::Arrow(_))).collect();
+                if stages.is_empty() {
+                    vec![e]
+                } else {
+                    stages
+                }
+            }
+            IrExpr::Arrow(stmts) => stmts.iter().find_map(|st| match st {
+                // a single-command stage: the call IS the stage
+                IrStmt::Expr(e @ IrExpr::Call { .. }) => {
+                    let func = match e {
+                        IrExpr::Call { func, .. } => func,
+                        _ => unreachable!(),
+                    };
+                    let args = match e {
+                        IrExpr::Call { args, .. } => args,
+                        _ => unreachable!(),
+                    };
+                    if !matches!(func.as_str(), "exec" | "builtin" | "pipeline") {
+                        return Some(vec![e]);
+                    }
+                    // the inner call's args ARE the stages (or the
+                    // pipeline's [Array([Arrow, ...])]) — borrow them from
+                    // the ORIGINAL arrow (no temporaries)
+                    if let Some(IrExpr::Array(items)) = args.first() {
+                        if items.iter().all(|a| matches!(a, IrExpr::Arrow(_))) {
+                            return Some(items.iter().collect());
+                        }
+                    }
+                    let stages: Vec<&IrExpr> = args
+                        .iter()
+                        .filter(|a| matches!(a, IrExpr::Arrow(_)))
+                        .collect();
+                    if stages.is_empty() {
+                        Some(vec![e])
+                    } else {
+                        Some(stages)
+                    }
+                }
+                _ => None,
+            }).unwrap_or_default(),
+            _ => vec![e],
+        }
+    }
+
+    /// The command name of a pipeline stage (an Arrow wrapping the call,
+    /// or a bare Call — both shapes appear).
+    fn stage_cmd(stage: &IrExpr) -> Option<String> {
+        match stage {
+            IrExpr::Arrow(stmts) => stmts.iter().find_map(|st| match st {
+                IrStmt::Expr(IrExpr::Call { func, args }) => match func.as_str() {
+                    "exec" | "builtin" => match args.first() {
+                        Some(IrExpr::Str(n, _)) => Some(n.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            }),
+            IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+                match args.first() {
+                    Some(IrExpr::Str(n, _)) => Some(n.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn capture_bound(
+        e: &IrExpr,
+        lens: &BTreeMap<String, Option<u64>>,
+        cap: u64,
+    ) -> Option<u64> {
+        let stages: Vec<&IrExpr> = capture_stages(e);
+        // the LAST stage's command name
+        let last = stages.last()?;
+        let cmd_name = stage_cmd(last)?;
+        // the grep OPTIONS change the bound: -q emits nothing, -c emits
+        // a count (a number), the rest filter (<= the input)
+        let grep_arg = |args: &[IrExpr]| -> Option<String> {
+            args.iter().find_map(|a| match a {
+                IrExpr::Str(sv, _) if sv.starts_with('-') && sv.len() == 2 => Some(sv.clone()),
+                _ => None,
+            })
+        };
+        let last_flag: Option<String> = match last {
+            IrExpr::Arrow(stmts) => stmts.iter().find_map(|st| match st {
+                IrStmt::Expr(IrExpr::Call { args, .. }) => {
+                    let a = args.get(1).and_then(|x| match x {
+                        IrExpr::Array(items) => Some(items.as_slice()),
+                        _ => None,
+                    })?;
+                    grep_arg(a).map(|s| s.to_string())
+                }
+                _ => None,
+            }),
+            _ => None,
+        };
+        match cmd_name.as_str() {
+            // zero-output builtins — the capture is the empty string
+            "true" | "false" | ":" | "test" | "[" | "[[" | "grep"
+                if last_flag.as_deref() == Some("-q") =>
+            {
+                Some(0)
+            }
+            // fixed-width outputs
+            "bc" => Some(40), // an arbitrary-precision number (the primes sqrt case)
+            "wc" => Some(20), // always numbers (the -l/-w/-c counts)
+            "grep" if last_flag.as_deref() == Some("-c") => Some(20), // a count
+            "md5sum" => Some(32),
+            "sha1sum" => Some(40),
+            "sha256sum" => Some(64),
+            "sha512sum" => Some(128),
+            "date" => Some(30), // the timestamp
+            "umask" => Some(4), // an octal
+            "expr" => Some(20), // a number (or a short string)
+            "seq" => None,      // the item count unknown
+            // echo: the output is the args' joined lengths (skip the
+            // command name; the real args live in the trailing Array) —
+            // the stage may be an Arrow wrapping the call, or a bare Call
+            "echo" | "printf" => {
+                // the stage's call args: an Arrow wrapping the call, or a
+                // bare Call — both shapes appear
+                let call_args: Vec<&IrExpr> = match last {
+                    IrExpr::Arrow(stmts) => stmts
+                        .iter()
+                        .find_map(|st| match st {
+                            IrStmt::Expr(IrExpr::Call { args, .. }) => {
+                                Some(args.iter().collect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                    IrExpr::Call { args, .. } => args.iter().collect(),
+                    _ => Vec::new(),
+                };
+                let mut total = 0u64;
+                for a in &call_args {
+                    let l = match a {
+                        IrExpr::Array(items) => {
+                            let mut t = 0u64;
+                            for it in items.iter() {
+                                t = t.saturating_add(expr_len(it, lens, cap)?);
+                            }
+                            t
+                        }
+                        other => expr_len(other, lens, cap)?,
+                    };
+                    total = total.saturating_add(l).saturating_add(1);
+                }
+                if total > cap {
+                    None
+                } else {
+                    Some(total)
+                }
+            }
+            // the filters: output <= input — the FIRST stage's bound
+            "grep" | "sed" | "tr" | "head" | "tail" | "sort" | "uniq"
+            | "cut" | "cat" | "paste" | "rev" | "join" | "basename"
+            | "dirname" | "comm" => {
+                let first = stages.first()?;
+                capture_bound(first, lens, cap)
+            }
+            _ => None,
+        }
+    }
+
+    for _ in 0..ITER_LIMIT {
+        let mut changed = false;
+        for (name, rhs) in &assigns {
+            let cur = lens[name];
+            if cur.is_none() {
+                continue;
+            }
+            let l = expr_len(rhs, &lens, CAP);
+            let new = match l {
+                Some(v) if v > CAP => None,
+                Some(v) => Some(v.max(cur.unwrap_or(0))),
+                None => None,
+            };
+            if new != cur {
+                lens.insert(name.clone(), new);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    lens.into_iter().collect()
+}
+
 pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
     let numeric = numeric_lift_vars(prog);
     let string = string_lift_vars(prog, &numeric);
@@ -1732,6 +2112,244 @@ pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
             (n, t)
         })
         .collect()
+}
+
+// ── Integer range analysis (spike; M8-adjacent) ──────────────────────
+// Refines the A2 `Int` verdict into a WIDTH (u32/i32/i64) by tracking a
+// conservative integer interval per variable through straight-line code.
+// Nothing here changes emitted output — it is the proof layer backends
+// (C/GLSL/wasm) consult for narrower integer types. Bash arithmetic is
+// 64-bit wrapped, so an op result is kept only when it provably cannot
+// overflow; unprovable provenance (cmdsub, exec, read, loops without a
+// fixpoint) → None (Any). Returns var -> (lo, hi) for provably-integer
+// vars.
+
+pub fn analyze_var_ranges(prog: &IrProgram) -> HashMap<String, (i64, i64)> {
+    let mut state: HashMap<String, Option<(i64, i64)>> = HashMap::new();
+    for s in &prog.stmts {
+        walk_stmt_ranges(s, &mut state);
+    }
+    state
+        .into_iter()
+        .filter_map(|(n, r)| r.map(|r| (n, r)))
+        .collect()
+}
+
+/// Width a [lo, hi] range maps to (target type table — C/Rust/GLSL).
+pub fn range_width_name(lo: i64, hi: i64) -> &'static str {
+    if lo >= 0 && hi <= u32::MAX as i64 {
+        "u32"
+    } else if lo >= i32::MIN as i64 && hi <= i32::MAX as i64 {
+        "i32"
+    } else {
+        "i64"
+    }
+}
+
+type Range = Option<(i64, i64)>;
+
+fn join(a: Range, b: Range) -> Range {
+    match (a, b) {
+        (Some((l1, h1)), Some((l2, h2))) => Some((l1.min(l2), h1.max(h2))),
+        _ => None,
+    }
+}
+
+fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
+    match s {
+        IrStmt::Assign { targets, expr } if targets.len() == 1 && targets[0].indices.is_empty() => {
+            let name = targets[0].var.clone();
+            state.insert(name, ir_range(expr, state));
+        }
+        // multi-target / indexed assignments — no single-variable range
+        IrStmt::Assign { .. } => {}
+        IrStmt::Expr(IrExpr::Call { func, args })
+            if func == "setVar"
+                && matches!(args.as_slice(), [IrExpr::Str(_, _), _]) =>
+        {
+            if let [IrExpr::Str(name, _), e] = args.as_slice() {
+                state.insert(name.clone(), ir_range(e, state));
+            }
+        }
+        IrStmt::Block(stmts) => {
+            for s in stmts {
+                walk_stmt_ranges(s, state);
+            }
+        }
+        IrStmt::Redirect { inner, .. } => {
+            for s in inner {
+                walk_stmt_ranges(s, state);
+            }
+        }
+        IrStmt::If { cond: _, then, elsifs, else_ } => {
+            let mut s1 = state.clone();
+            for s in then {
+                walk_stmt_ranges(s, &mut s1);
+            }
+            let mut s2 = state.clone();
+            for (_, b) in elsifs {
+                for s in b {
+                    walk_stmt_ranges(s, &mut s2);
+                }
+            }
+            for s in else_ {
+                walk_stmt_ranges(s, &mut s2);
+            }
+            // meet (join): a var's range after the if is the union of what
+            // each branch (or the pre-state, when a branch didn't assign it)
+            // produced.
+            let mut merged: HashMap<String, Range> = HashMap::new();
+            for (k, v) in s1 {
+                let w = s2.get(&k).copied().flatten();
+                merged.insert(k, join(v, w));
+            }
+            for (k, v) in s2 {
+                if !merged.contains_key(&k) {
+                    let j = join(v, state.get(&k).copied().flatten());
+                    merged.insert(k, j);
+                }
+            }
+            *state = merged;
+        }
+        IrStmt::While { body, .. }
+        | IrStmt::For { body, .. }
+        | IrStmt::DoWhile { body, .. } => {
+            // No fixpoint in the spike: vars assigned inside a loop body are
+            // unbounded → Any. (Step 2: widen + loop-cond bounding.)
+            let mut assigned: HashSet<String> = HashSet::new();
+            for s in body {
+                collect_assigned(s, &mut assigned);
+            }
+            for n in assigned {
+                state.insert(n, None);
+            }
+        }
+        // Subshell / Background / Function: definitions or child scopes —
+        // they cannot change the parent's ranges.
+        IrStmt::Subshell(_)
+        | IrStmt::Background(_)
+        | IrStmt::Function { .. }
+        | IrStmt::Case { .. }
+        | IrStmt::Pipeline { .. }
+        | IrStmt::Return(_)
+        | IrStmt::Exit(_)
+        | IrStmt::SetChildError(_)
+        | IrStmt::Require(_)
+        | IrStmt::RawText(_)
+        | IrStmt::Output { .. }
+        | IrStmt::WriteFile { .. }
+        | IrStmt::Declare { .. }
+        | IrStmt::DeclareArray { .. }
+        | IrStmt::Die { .. }
+        | IrStmt::Warn { .. }
+        | IrStmt::Exec { .. }
+        | IrStmt::Expr(_) => {}
+    }
+}
+
+fn collect_assigned(s: &IrStmt, out: &mut HashSet<String>) {
+    match s {
+        IrStmt::Assign { targets, .. } => {
+            for t in targets {
+                out.insert(t.var.clone());
+            }
+        }
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" => {
+            if let [IrExpr::Str(name, _), _] = args.as_slice() {
+                out.insert(name.clone());
+            }
+        }
+        IrStmt::Block(stmts) | IrStmt::Subshell(stmts) => {
+            for s in stmts {
+                collect_assigned(s, out);
+            }
+        }
+        IrStmt::If { cond: _, then, elsifs, else_ } => {
+            for s in then {
+                collect_assigned(s, out);
+            }
+            for (_, b) in elsifs {
+                for s in b {
+                    collect_assigned(s, out);
+                }
+            }
+            for s in else_ {
+                collect_assigned(s, out);
+            }
+        }
+        IrStmt::While { body, .. }
+        | IrStmt::For { body, .. }
+        | IrStmt::DoWhile { body, .. } => {
+            for s in body {
+                collect_assigned(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn ir_range(e: &IrExpr, state: &HashMap<String, Range>) -> Range {
+    match e {
+        IrExpr::Int(i) => Some((*i, *i)),
+        // bash vars are strings; a literal that parses as an integer is
+        // provably that value (matches the numeric lift's "sources that
+        // parse as integers").
+        IrExpr::Str(sv, _) => sv.trim().parse::<i64>().ok().map(|n| (n, n)),
+        IrExpr::Var(n, _) => state.get(n).copied().flatten(),
+        IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
+            [IrExpr::Str(n, _)] => state.get(n).copied().flatten(),
+            _ => None,
+        },
+        IrExpr::Arith(a) => arith_range(a, state),
+        _ => None,
+    }
+}
+
+fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
+    match a {
+        ArithAst::Num(i) => Some((*i, *i)),
+        ArithAst::Var(n) => state.get(n).copied().flatten(),
+        ArithAst::Bin { op, lhs, rhs } => {
+            let (l, r) = (arith_range(lhs, state)?, arith_range(rhs, state)?);
+            let (l0, l1, r0, r1) = (l.0, l.1, r.0, r.1);
+            match op.as_str() {
+                "+" => Some((l0.checked_add(r0)?, l1.checked_add(r1)?)),
+                "-" => Some((l0.checked_sub(r1)?, l1.checked_sub(r0)?)),
+                "*" => {
+                    // min/max over all four endpoint products; None on overflow
+                    let ps = [
+                        l0.checked_mul(r0)?,
+                        l0.checked_mul(r1)?,
+                        l1.checked_mul(r0)?,
+                        l1.checked_mul(r1)?,
+                    ];
+                    Some((*ps.iter().min()?, *ps.iter().max()?))
+                }
+                "/" => {
+                    if r0 <= 0 && r1 >= 0 {
+                        return None; // possible division by zero
+                    }
+                    let qs = [
+                        l0.checked_div(r0)?,
+                        l0.checked_div(r1)?,
+                        l1.checked_div(r0)?,
+                        l1.checked_div(r1)?,
+                    ];
+                    Some((*qs.iter().min()?, *qs.iter().max()?))
+                }
+                _ => None, // % , ^, ... conservative
+            }
+        }
+        ArithAst::Un { op, arg } => {
+            let (lo, hi) = arith_range(arg, state)?;
+            match op.as_str() {
+                "-" => Some((-hi, -lo)),
+                "+" => Some((lo, hi)),
+                _ => None,
+            }
+        }
+        _ => None, // Index / Cond / Assign / IncDec — step 2
+    }
 }
 
 fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
@@ -16848,3 +17466,83 @@ fn safe_ident(name: &str) -> String {
 
 
 
+
+#[cfg(test)]
+mod range_analysis_tests {
+    use super::*;
+
+    fn ranges_of(src: &str) -> HashMap<String, (i64, i64)> {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        analyze_var_ranges(&prog)
+    }
+
+    #[test]
+    fn straight_line_widths() {
+        // x: literal 1 → u32; y: arith 1+1 → u32; z: cmdsub → Any; w: -5 → i32
+        let r = ranges_of("x=1\ny=$((x+1))\nz=$(echo 5)\nw=-5");
+        assert_eq!(r.get("x"), Some(&(1, 1)));
+        assert_eq!(r.get("y"), Some(&(2, 2)));
+        assert!(!r.contains_key("z"), "cmdsub provenance must be Any");
+        assert_eq!(r.get("w"), Some(&(-5, -5)));
+        assert_eq!(range_width_name(1, 1), "u32");
+        assert_eq!(range_width_name(-5, -5), "i32");
+        assert_eq!(range_width_name(0, 4_000_000_000), "u32");
+        assert_eq!(range_width_name(0, 10_000_000_000), "i64");
+    }
+
+    #[test]
+    fn branch_join_and_loop_invalidation() {
+        // if cond; then x=1; else x=1000000; fi → x ∈ [1, 1000000] → u32
+        let r = ranges_of("if [ a ]; then x=1; else x=1000000; fi");
+        assert_eq!(r.get("x"), Some(&(1, 1_000_000)));
+        // loop-assigned var → Any (no fixpoint in the spike)
+        let r2 = ranges_of("i=1\nwhile [ $i -lt 5 ]; do i=$((i+1)); done");
+        assert!(!r2.contains_key("i"), "loop body must invalidate to Any");
+        // a var NOT touched by the loop keeps its range
+        let r3 = ranges_of("i=1\nj=2\nwhile [ $i -lt 5 ]; do i=$((i+1)); done");
+        assert_eq!(r3.get("j"), Some(&(2, 2)));
+    }
+
+    #[test]
+    #[ignore] // corpus-wide tally — run on demand: cargo test -- --ignored --nocapture
+    fn corpus_var_width_tally() {
+        let mut widths: HashMap<&'static str, usize> = HashMap::new();
+        widths.insert("u32", 0);
+        widths.insert("i32", 0);
+        widths.insert("i64", 0);
+        let mut total_proven = 0usize;
+        let mut total_numeric = 0usize;
+        let mut files = 0usize;
+        let mut narrowed_files = 0usize;
+        for entry in std::fs::read_dir("examples").unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "sh").unwrap_or(false) {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                let Ok(cmds) = crate::Parser::new(&src).parse() else { continue };
+                let prog = ast_to_ir(&cmds);
+                let ranges = analyze_var_ranges(&prog);
+                files += 1;
+                let numeric = numeric_lift_vars(&prog);
+                total_numeric += numeric.len();
+                let mut file_had_narrow = false;
+                for (n, (lo, hi)) in &ranges {
+                    total_proven += 1;
+                    let w = range_width_name(*lo, *hi);
+                    *widths.get_mut(w).unwrap() += 1;
+                    if w != "i64" {
+                        file_had_narrow = true;
+                    }
+                    let _ = n;
+                }
+                if file_had_narrow {
+                    narrowed_files += 1;
+                }
+            }
+        }
+        eprintln!(
+            "RANGE TALLY: files={} numeric_lift_vars={} range_proven={} widths={:?} files_with_narrow={}",
+            files, total_numeric, total_proven, widths, narrowed_files
+        );
+    }
+}

@@ -1049,6 +1049,7 @@ pub fn c_to_ir(src: &str) -> Result<IrProgram, String> {
         subs: vec![],
         var_types,
         stmt_lines,
+        var_lengths: vec![],
     })
 }
 

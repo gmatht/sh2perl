@@ -404,6 +404,13 @@ pub struct IrProgram {
     /// `--output-lineno` option); the shell path leaves it empty. The
     /// Perl renderer appends ` # line N` comments when present.
     pub stmt_lines: Vec<(usize, usize)>,
+    /// Conservative max-string-length annotations (a transform sibling of
+    /// the A2 verdicts): per variable, the provable upper bound on the
+    /// string's byte length (None = unbounded — captures, loops, runtime
+    /// input). Populated by `shir::analyze_string_lengths`; the C backend
+    /// uses it to emit fixed buffers (`char s[64]`) instead of heap/`char*`.
+    /// Existing backends ignore it (additive only).
+    pub var_lengths: Vec<(String, Option<u64>)>,
 }
 
 // ── Backend: IR → Perl text ─────────────────────────────────────────
@@ -2214,6 +2221,7 @@ impl IrProgram {
             subs: vec![],
             var_types: vec![],
             stmt_lines: vec![],
+            var_lengths: vec![],
         }
     }
 }
