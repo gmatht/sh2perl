@@ -34,6 +34,7 @@ pub use parser::commands::Parser;
 pub use parser::utilities::ParserUtilities;
 // pub use mir::*; // TODO: Fix MIR implementation
 pub use generator::Generator;
+pub mod sh_backend; // worktree-local: pure POSIX-sh renderer (branch backend/sh)
 #[cfg(test)]
 pub mod estree_debug_tests {
     use super::*;
