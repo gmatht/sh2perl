@@ -87,15 +87,15 @@ pub enum ArithAst {
     Num(i64),
     Var(String),
     Index { var: String, key: Box<ArithAst> },
-    Bin { op: &'static str, lhs: Box<ArithAst>, rhs: Box<ArithAst> },
-    Un { op: &'static str, arg: Box<ArithAst> },
+    Bin { op: String, lhs: Box<ArithAst>, rhs: Box<ArithAst> },
+    Un { op: String, arg: Box<ArithAst> },
     Cond { test: Box<ArithAst>, then: Box<ArithAst>, else_: Box<ArithAst> },
     /// `name op= rhs` (`=` / `+=` / `-=` / `*=`; `/=`/`%=` stay on the
     /// runtime — the zero-divisor abort needs the helper). The expression
     /// VALUE is the assigned value (bash semantics).
     Assign {
         var: String,
-        op: &'static str,
+        op: String,
         rhs: Box<ArithAst>,
     },
     /// `++name` / `name++` / `--name` / `name--` — delta ±1. The value is
@@ -399,6 +399,11 @@ pub struct IrProgram {
     /// by name for deterministic serialization. Empty until
     /// `shir::analyze_var_types` runs. Existing backends ignore it.
     pub var_types: Vec<(String, IrType)>,
+    /// Source line numbers per top-level statement — (stmt index, source
+    /// line) pairs, sorted by index. Populated by the C frontend (the
+    /// `--output-lineno` option); the shell path leaves it empty. The
+    /// Perl renderer appends ` # line N` comments when present.
+    pub stmt_lines: Vec<(usize, usize)>,
 }
 
 // ── Backend: IR → Perl text ─────────────────────────────────────────
@@ -480,8 +485,22 @@ pub fn ir_to_perl(prog: &IrProgram) -> String {
     // (emitted by generator as Declare stmts, handled below)
 
     // Top-level statements
-    for stmt in &stmts {
+    for (idx, stmt) in stmts.iter().enumerate() {
+        let line = prog
+            .stmt_lines
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, l)| *l);
+        let before = out.len();
         emit_stmt(&mut out, stmt, 0);
+        if let Some(l) = line {
+            // a SHORT comment at the end of the statement's first line:
+            // `$sum += $i;  # line 7` — the source-mapping convention
+            let added = &out[before..];
+            if let Some(nl) = added.find('\n') {
+                out.insert_str(before + nl, &format!("  # line {l}"));
+            }
+        }
     }
     out.push('\n');
 
@@ -530,10 +549,60 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         | IrStmt::Redirect { .. }
         | IrStmt::Function { .. }
         | IrStmt::Subshell(_)
-        | IrStmt::Background(_)
-        | IrStmt::Block(_)
-        | IrStmt::Expr(_) => {
-            unreachable!("ESTree-path-only IR node reached the Perl renderer")
+        | IrStmt::Background(_) => {
+            // plan improvement #5 (partial): these ESTree-path-only stmts
+            // still lack a Perl renderer. Emit a clear runtime error so
+            // the failure is actionable, not a panic.
+            emit_indent(out, indent);
+            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (");
+            out.push_str(match stmt {
+                IrStmt::Redirect { .. } => "redirect",
+                IrStmt::Function { .. } => "function definition",
+                IrStmt::Subshell(_) => "subshell",
+                IrStmt::Background(_) => "background",
+                _ => "other",
+            });
+            out.push_str(")\\n\";\n");
+        }
+        IrStmt::Block(stmts) => {
+            // plan improvement #5: render a block as a flat sequence of
+            // stmts (the Perl backend has no native block scoping; this
+            // is an approximation — variables from the block leak, but
+            // the IR's lexical-ish scoping is close enough for the
+            // supported subset).
+            for s in stmts {
+                emit_stmt(out, s, indent);
+            }
+        }
+        IrStmt::Expr(e) => {
+            // plan improvement #5: a bare expression statement is a no-op
+            // in Perl (expressions don't have side effects in statement
+            // position). Render as a comment so the source is still
+            // traceable; if the expression is a Call (sh2.*), it's
+            // actually a shell exec whose side effects matter — but the
+            // sh2 backend isn't wired here (see sh2runtime). For the
+            // shIR→Perl path, Exprs that are real execs should have been
+            // lowered to Output/Exec by the optimizer; bare Expr means
+            // a value was discarded, which is a no-op in Perl.
+            // the C frontend's break/continue (IrStmt::Expr(Call("break")))
+            // are the shell's control signals — Perl's native loop
+            // controls (last/next)
+            if let IrExpr::Call { func, .. } = e {
+                match func.as_str() {
+                    "break" => {
+                        emit_indent(out, indent);
+                        out.push_str("last;\n");
+                        return;
+                    }
+                    "continue" => {
+                        emit_indent(out, indent);
+                        out.push_str("next;\n");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            let _ = e;
         }
 
         IrStmt::Output { value, newline, target } => {
@@ -2144,6 +2213,7 @@ impl IrProgram {
             stmts: vec![IrStmt::RawText(code.to_string())],
             subs: vec![],
             var_types: vec![],
+            stmt_lines: vec![],
         }
     }
 }

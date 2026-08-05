@@ -149,12 +149,12 @@ pub enum Expr {
         argument: Box<Expr>,
     },
     LogicalExpression {
-        operator: &'static str,
+        operator: String,
         left: Box<Expr>,
         right: Box<Expr>,
     },
     BinaryExpression {
-        operator: &'static str,
+        operator: String,
         left: Box<Expr>,
         right: Box<Expr>,
     },
@@ -169,7 +169,7 @@ pub enum Expr {
         alternate: Box<Expr>,
     },
     UnaryExpression {
-        operator: &'static str,
+        operator: String,
         argument: Box<Expr>,
         prefix: bool,
     },
@@ -1126,6 +1126,52 @@ mod tests {
     }
 
     #[test]
+    fn and_or_chain_store_var_tests_lower_native() {
+        // `[[ "$a" == "x" ]] && [[ "$b" == "y" ]]` — the chain links
+        // branch on lastExit, so each test records its status natively
+        // (`(sh2._g = String(sh2.getVar(a)) === "x", sh2.lastExit =
+        // sh2._g ? 0 : 1, sh2._g)` — the `_g` scratch evaluates the read
+        // EXACTLY ONCE, keeping the call-site count at ONE getVar vs the
+        // single runtime test it replaces). No sh2.test dispatch, no
+        // string tokenize/parse per evaluation.
+        let json = to_json(
+            "if [[ \"$a\" == \"x\" ]] && [[ \"$b\" == \"y\" ]]; then echo yes; fi",
+        );
+        // the sh2.test DISPATCH is gone (a regex-literal `.test()` method
+        // call has a different callee shape and may legitimately appear)
+        assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        assert!(json.contains("\"name\":\"getVar\""));
+        assert!(json.contains("\"name\":\"_g\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn compound_test_lowers_to_native_or() {
+        // `[[ "$2" == "test" || "$2" == "debug" ]]` — the test-level
+        // `-o` compound: each leaf lowers (positional reads — ZERO
+        // dispatches) and the leaves join with a native `||` — the
+        // runtime test call (tokenize + parse + dispatch) disappears.
+        let json = to_json(
+            "if [[ \"$1\" =~ ^[0-9]+$ ]] && [[ \"$2\" == \"test\" || \"$2\" == \"debug\" ]]; then echo ok; fi",
+        );
+        assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        assert!(json.contains("\"name\":\"positional\""));
+        assert!(json.contains("\"operator\":\"||\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn status_equality_lowers_to_lastexit_read() {
+        // `[ "$?" = "0" ]` — the `$?` sigil is a status-field read, not
+        // a glob `?`: `String(sh2.lastExit) === "0"`, zero dispatches.
+        let json = to_json("if [ \"$?\" = \"0\" ]; then echo zero; fi");
+        assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        assert!(json.contains("\"name\":\"lastExit\""));
+        assert!(json.contains("\"name\":\"String\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
     fn grep_with_regex_pattern_not_lifted() {
         // BRE metacharacters disqualify the lift: `grep 'a.c'` is a regex,
         // not a substring test — the pipeline must stay.
@@ -1143,6 +1189,48 @@ mod tests {
         let json = to_json("echo hi | grep hi > /dev/null 2> /dev/null; echo $?");
         assert!(!json.contains("contains"));
         assert!(json.contains("pipeline"));
+    }
+
+    #[test]
+    fn batch_ok_glob_for_lowers_to_forLoopBatch() {
+        // The sync-ok-loops transform's `batch_ok` verdict (the core
+        // request estree-20260805-045731): a top-level for loop whose body
+        // is sync-executable but whose GLOB iterable disqualifies the
+        // native for-of (the runtime must glob-expand) emits the
+        // checkpointed `await sh2.forLoopBatch(iter, body, 1024)` instead
+        // of the blocking `forLoopSync` — sync chunks of 1024 with a
+        // setImmediate yield, same flatten/glob/signal semantics.
+        let json = to_json("for f in *.sh; do echo \"$f\"; done");
+        assert!(json.contains("\"name\":\"forLoopBatch\""));
+        assert!(json.contains("\"value\":1024"));
+        assert!(json.contains("\"type\":\"AwaitExpression\""));
+        assert!(!json.contains("\"name\":\"forLoopSync\""));
+        assert!(!json.contains("\"type\":\"ForOfStatement\""));
+        // a PLAIN (glob-free) iterable keeps the native for-of — no batch
+        let json2 = to_json("for i in a b c; do echo $i; done");
+        assert!(json2.contains("\"type\":\"ForOfStatement\""));
+        assert!(!json2.contains("\"name\":\"forLoopBatch\""));
+        // a batch_ok loop with an AWAITING body (a capture assign inside)
+        // never takes the batch path — the sync bodyFn cannot await
+        let json3 = to_json("for i in 1 2 3; do x=$(ls); done");
+        assert!(!json3.contains("\"name\":\"forLoopBatch\""));
+        assert!(!json3.contains("\"name\":\"forLoopSync\""));
+        assert!(!json3.contains("\"type\":\"ForOfStatement\""));
+        assert!(json3.contains("\"name\":\"forLoop\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn sync_ok_capture_loop_stays_native_for_of() {
+        // A cheap capture loop (`{1..1000}`, ~3ms ≤ the 200ms budget) is
+        // sync_ok: the existing sync gate emits the native for-of inside
+        // the capture arrow — no runtime loop call at all.
+        let json = to_json("x=$(for i in {1..1000}; do echo $i; done)\necho ${x:0:1}");
+        assert!(json.contains("\"type\":\"ForOfStatement\""));
+        assert!(!json.contains("\"name\":\"forLoop\""));
+        assert!(!json.contains("\"name\":\"forLoopSync\""));
+        assert!(!json.contains("\"name\":\"forLoopBatch\""));
+        assert!(!json.contains("unsupported"));
     }
 
     #[test]
@@ -1258,6 +1346,28 @@ mod tests {
         assert!(!json2.contains("\"name\":\"capture\""));
         assert!(!json2.contains("\"name\":\"exec\""));
         assert!(!json2.contains("unsupported"));
+        // the general var-operand form (`$sum + $i` — the in-loop bc
+        // capture): native `String(Number(sum) + Number(i))`, no spawn
+        let json3 = to_json("sum=0; for i in 1 2 3; do sum=$(echo \"$sum + $i\" | bc); done; echo $sum");
+        assert!(json3.contains("\"name\":\"Number\""), "native var arith");
+        assert!(json3.contains("\"operator\":\"+\""));
+        assert!(!json3.contains("\"name\":\"pipeline\""));
+        assert!(!json3.contains("\"name\":\"capture\""));
+        assert!(!json3.contains("\"name\":\"exec\""));
+        assert!(!json3.contains("\"name\":\"forLoop\""), "the loop goes native for-of");
+        assert!(!json3.contains("unsupported"));
+        // `/` lowers to Math.trunc with a zero-divisor guard (bc aborts
+        // with no stdout) — the guard is a `divisor === 0` comparison
+        let json4 = to_json("a=7; b=2; echo $(echo \"$a / $b\" | bc)");
+        assert!(json4.contains("\"name\":\"trunc\""), "scale-0 division");
+        assert!(json4.contains("\"operator\":\"===\""), "zero-divisor guard");
+        assert!(!json4.contains("\"name\":\"exec\""));
+        assert!(!json4.contains("unsupported"));
+        // `^` is bc POWER but bash-arith XOR — the var form must NOT
+        // mis-parse it: the spawn stays
+        let json5 = to_json("a=2; echo $(echo \"$a ^ 3\" | bc)");
+        assert!(json5.contains("\"name\":\"exec\""), "^ keeps the spawn");
+        assert!(!json5.contains("unsupported"));
     }
 
     #[test]
@@ -1347,9 +1457,15 @@ mod tests {
         assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("FOO"));
         assert!(!json.contains("unsupported"));
+        // `grep` is a native sync builtin now (the file/stdin mini-grep),
+        // so the env-carrying form also lowers to the sync twin; a name
+        // OUTSIDE the sync-builtin set keeps the async exec call.
         let json2 = to_json("FOO=bar grep x");
-        assert!(json2.contains("\"name\":\"exec\""));
+        assert!(json2.contains("\"name\":\"builtin\""));
         assert!(json2.contains("FOO"));
+        let json3 = to_json("FOO=bar ls x");
+        assert!(json3.contains("\"name\":\"exec\""));
+        assert!(json3.contains("FOO"));
     }
 
     #[test]

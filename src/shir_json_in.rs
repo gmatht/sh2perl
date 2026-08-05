@@ -50,7 +50,25 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
     let var_types = var_types_from(obj.get("var_types"), "Program.var_types")?;
     let subs = subs_from(obj.get("subs"), "Program.subs")?;
     let stmts = stmts_from(obj.get("stmts"), "Program.stmts")?;
-    Ok(IrProgram { imports, requires, stmts, subs, var_types })
+    let stmt_lines = match obj.get("stmt_lines") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| {
+                let s = v.get("stmt")?.as_u64()? as usize;
+                let l = v.get("line")?.as_u64()? as usize;
+                Some((s, l))
+            })
+            .collect(),
+        _ => vec![],
+    };
+    Ok(IrProgram {
+        imports,
+        requires,
+        stmts,
+        subs,
+        var_types,
+        stmt_lines,
+    })
 }
 
 fn subs_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrSub>, String> {
@@ -488,12 +506,12 @@ fn arith_from(v: &Value, where_: &str) -> Result<ArithAst, String> {
             let op = req_str(o, "op", where_)?; // kept as &str literal in ArithAst
             let lhs = arith_from(req(o, "lhs", where_)?, &format!("{where_}.lhs"))?;
             let rhs = arith_from(req(o, "rhs", where_)?, &format!("{where_}.rhs"))?;
-            ArithAst::Bin { op: to_static(op), lhs: Box::new(lhs), rhs: Box::new(rhs) }
+            ArithAst::Bin { op: op.to_string(), lhs: Box::new(lhs), rhs: Box::new(rhs) }
         }
         "Un" => {
             let op = req_str(o, "op", where_)?;
             let arg = arith_from(req(o, "arg", where_)?, &format!("{where_}.arg"))?;
-            ArithAst::Un { op: to_static(op), arg: Box::new(arg) }
+            ArithAst::Un { op: op.to_string(), arg: Box::new(arg) }
         }
         "Cond" => {
             let test = arith_from(req(o, "test", where_)?, &format!("{where_}.test"))?;
@@ -505,7 +523,7 @@ fn arith_from(v: &Value, where_: &str) -> Result<ArithAst, String> {
             let var = req_str(o, "var", where_)?.to_string();
             let op = req_str(o, "op", where_)?;
             let rhs = arith_from(req(o, "rhs", where_)?, &format!("{where_}.rhs"))?;
-            ArithAst::Assign { var, op: to_static(op), rhs: Box::new(rhs) }
+            ArithAst::Assign { var, op: op.to_string(), rhs: Box::new(rhs) }
         }
         "IncDec" => {
             let var = req_str(o, "var", where_)?.to_string();
@@ -632,7 +650,7 @@ mod tests {
     #[test]
     fn contract_version_required() {
         let mut prog = IrProgram { imports: vec![], requires: vec![],
-            stmts: vec![], subs: vec![], var_types: vec![] };
+            stmts: vec![], subs: vec![], var_types: vec![], stmt_lines: vec![] };
         let json = shir_to_shir_json(&prog);
         // valid
         assert!(shir_json_to_ir(&json).is_ok());
@@ -661,6 +679,58 @@ mod tests {
         let from_json: std::collections::BTreeSet<&str> = arr.iter().map(|x| x.as_str().unwrap()).collect();
         let from_rust: std::collections::BTreeSet<&str> = crate::shir::SYNC_BUILTINS.iter().copied().collect();
         assert_eq!(from_json, from_rust, "A4 namespace (data/sh2-builtins.json) SYNC_BUILTINS drifted from shir.rs");
+    }
+
+    // Plan improvement #4 (safe half): corpus roundtrip property test.
+    // For every example in the corpus, parse → ast_to_ir → shir_to_shir_json
+    // → shir_json_to_ir → shir_to_shir_json; the two serialized forms must
+    // be BYTE-IDENTICAL. Catches any future drift between the hand-built
+    // serializer (shir_json.rs) and deserializer (shir_json_in.rs) — the
+    // exact bug class that the serde-derive refactor (the bigger #4) is
+    // meant to prevent. Errors skip (parse/ingress failures are not the
+    // concern of this test; we only assert the serializer/deserializer
+    // round-trip on examples that BOTH sides accept).
+    #[test]
+    fn corpus_roundtrip_byte_equal() {
+        use std::fs;
+        use crate::parser::commands::Parser;
+        use crate::ir::IrProgram;
+        let corpus = std::path::Path::new("examples");
+        if !corpus.exists() {
+            // corpus not present in this build (e.g. the test is run from
+            // a different checkout); skip rather than fail.
+            eprintln!("corpus not at {}; skipping roundtrip test", corpus.display());
+            return;
+        }
+        let mut total = 0usize;
+        let mut drf  = 0usize; // deserialization failed (skip)
+        let mut pass = 0usize;
+        let mut diffs: Vec<(String, String)> = Vec::new(); // (file, reason)
+        for entry in fs::read_dir(corpus).expect("read corpus dir") {
+            let entry = entry.expect("read dir entry");
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("sh") { continue; }
+            total += 1;
+            let src = fs::read_to_string(&p).unwrap_or_default();
+            let cmds = match Parser::new(&src).parse() {
+                Ok(c) => c, Err(_) => continue,
+            };
+            let prog1: IrProgram = crate::shir::ast_to_ir(&cmds);
+            let j1 = crate::shir_json::shir_to_shir_json(&prog1);
+            let prog2 = match shir_json_to_ir(&j1) {
+                Ok(p) => p, Err(_) => { drf += 1; continue; }
+            };
+            let j2 = crate::shir_json::shir_to_shir_json(&prog2);
+            if j1 == j2 {
+                pass += 1;
+            } else {
+                diffs.push((p.display().to_string(), format!("len {} vs {}", j1.len(), j2.len())));
+            }
+        }
+        assert!(diffs.is_empty(), "{}/{} examples have serializer/deserializer drift: {:?}",
+                diffs.len(), total, diffs);
+        eprintln!("corpus_roundtrip: {} examples, {} byte-equal, {} deser-failed (skipped)",
+                  total, pass, drf);
     }
 
 }
