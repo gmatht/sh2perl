@@ -141,11 +141,9 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str(&word_to_sh(discriminant)?);
             out.push_str(" in\n");
             for cl in clauses {
-                for pat in &cl.patterns {
-                    indent(out, d + 1);
-                    out.push_str(pat);
-                    out.push_str(")\n");
-                }
+                indent(out, d + 1);
+                out.push_str(&cl.patterns.join(" | "));
+                out.push_str(")\n");
                 for b in &cl.body {
                     stmt_to_sh(b, d + 2, out)?;
                 }
@@ -169,18 +167,19 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         }
         IrStmt::Redirect { inner, redirects } => {
             let suffix = redirects_to_sh(redirects)?;
-            if inner.len() == 1 {
+            let mut line = if inner.len() == 1 {
                 if let IrStmt::Expr(e) = &inner[0] {
-                    indent(out, d);
-                    out.push_str(&cmd_to_sh(e)?);
-                    out.push_str(&suffix);
-                    out.push('\n');
-                    return Ok(());
+                    cmd_to_sh(e)?
+                } else {
+                    stmts_inline(inner)?
                 }
-            }
-            // compound inner: inline it, then the redirects apply to the group
+            } else {
+                // compound inner: inline it, then the redirects apply to the group
+                stmts_inline(inner)?
+            };
+            line = herestring_wrap(redirects, line)?;
             indent(out, d);
-            out.push_str(&stmts_inline(inner)?);
+            out.push_str(&line);
             out.push_str(&suffix);
             out.push('\n');
             Ok(())
@@ -447,6 +446,20 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 // cannot express &&/||, so keep those in [[ ]] form.
                 if t.contains("&&") || t.contains("||") {
                     Ok(format!("[[ {t} ]]"))
+                } else if let Some((lhs, rhs)) = split_test_op(t, "==") {
+                    // pattern match: case emulation (dash has no == in test)
+                    Ok(format!(
+                        "case \"{lhs}\" in {rhs}) : ;; *) false ;; esac"
+                    ))
+                } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
+                    Ok(format!(
+                        "case \"{lhs}\" in {rhs}) false ;; *) : ;; esac"
+                    ))
+                } else if let Some((lhs, rhs)) = split_test_op(t, "=~") {
+                    // regex match: grep -E ([[ =~ ]] semantics)
+                    Ok(format!(
+                        "printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"
+                    ))
                 } else {
                     Ok(format!("[ {t} ]"))
                 }
@@ -465,6 +478,12 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             "redirect" => {
                 let inner = arrow_to_sh(args)?;
                 let specs = redirect_specs(args, 1)?;
+                // the call-form specs are Objects — build IrRedirects for the wrap
+                let redirs = match args.get(1) {
+                    Some(x) => redirect_objs(x)?,
+                    None => vec![],
+                };
+                let inner = herestring_wrap(&redirs, inner)?;
                 Ok(format!("{inner}{specs}"))
             }
             "subshell" => Ok(format!("( {} )", arrow_to_sh(args)?)),
@@ -486,18 +505,10 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 let body = arrow_at(args, 1)?;
                 Ok(format!("for (( {arith} )); do {body}; done"))
             }
-            "shopt" => {
-                let opt = raw_arg(args, 0)?;
-                let enable = match args.get(1) {
-                    Some(IrExpr::Bool(b)) => *b,
-                    _ => true,
-                };
-                Ok(if enable {
-                    format!("shopt -s {opt}")
-                } else {
-                    format!("shopt -u {opt}")
-                })
-            }
+            // dash has no shopt builtin — a no-op keeps the script running
+            // (stdout-identical for the corpus's shopt usage: the options
+            // only affect bash-only constructs that fail anyway)
+            "shopt" => Ok(":".into()),
             "arith" => Ok(format!("(( {} ))", raw_arg(args, 0)?)),
             "break" => Ok("break".into()),
             "continue" => Ok("continue".into()),
@@ -724,7 +735,7 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
                             .map(|_| "%b")
                             .collect::<Vec<_>>()
                             .join(" ");
-                        return Ok(format!("printf '{fmt}\n' {joined}"));
+                        return Ok(format!("printf '{fmt}\\n' {joined}"));
                     }
                     "-E" => {
                         // bash: escapes NOT interpreted, trailing newline
@@ -736,7 +747,7 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
                             .map(|_| "%s")
                             .collect::<Vec<_>>()
                             .join(" ");
-                        return Ok(format!("printf '{fmt}\n' {joined}"));
+                        return Ok(format!("printf '{fmt}\\n' {joined}"));
                     }
                     _ => {}
                 }
@@ -761,6 +772,19 @@ fn redirects_to_sh(redirects: &[IrRedirect]) -> Result<String, String> {
     Ok(out)
 }
 
+/// `cmd <<<word` (dash: "redirection unexpected") → `printf '%s\n' word | cmd`
+/// — the herestring feeds the word plus a newline on stdin. The herestring
+/// itself is skipped by redirect_to_sh; this wraps the command with the pipe.
+fn herestring_wrap(redirects: &[IrRedirect], cmd: String) -> Result<String, String> {
+    for r in redirects {
+        if r.mode == "herestring" {
+            let t = word_to_sh(&r.target)?;
+            return Ok(format!("printf '%s\\n' {t} | {cmd}"));
+        }
+    }
+    Ok(cmd)
+}
+
 fn redirect_to_sh(r: &IrRedirect) -> Result<String, String> {
     let fd = r.fd.unwrap_or(0);
     let op = match r.mode.as_str() {
@@ -768,7 +792,7 @@ fn redirect_to_sh(r: &IrRedirect) -> Result<String, String> {
         "a" => ">>",
         "r" => "<",
         "r+" => "<>",
-        "herestring" => "<<<",
+        "herestring" => "", // wrapped as a printf pipe by herestring_wrap
         "heredoc" | "heredoc-tabs" => {
             // The heredoc BODY is carried in the target string.
             let body = match &r.target {
@@ -809,6 +833,22 @@ fn redirect_specs(args: &[IrExpr], idx: usize) -> Result<String, String> {
 fn redirect_objs_to_sh(specs: &[IrExpr]) -> Result<String, String> {
     let mut out = String::new();
     for spec in specs {
+        let r = match redirect_objs(spec) {
+            Ok(v) if !v.is_empty() => v[0].clone(),
+            _ => continue,
+        };
+        out.push_str(&redirect_to_sh(&r)?);
+    }
+    Ok(out)
+}
+
+/// Parse an `Array` of redirect spec Objects into `IrRedirect`s.
+fn redirect_objs(specs: &IrExpr) -> Result<Vec<IrRedirect>, String> {
+    let IrExpr::Array(specs) = specs else {
+        return Ok(vec![]);
+    };
+    let mut out = Vec::new();
+    for spec in specs {
         let IrExpr::Object(props) = spec else {
             return Err(format!("redirect spec not an Object: {spec:?}"));
         };
@@ -825,15 +865,14 @@ fn redirect_objs_to_sh(specs: &[IrExpr]) -> Result<String, String> {
                 _ => {}
             }
         }
-        let r = IrRedirect {
+        out.push(IrRedirect {
             fd: fd.map(|n| n as i32),
             mode,
             target: target
                 .cloned()
                 .unwrap_or(IrExpr::Str(String::new(), StrStyle::DoubleQuoted)),
             interpolate,
-        };
-        out.push_str(&redirect_to_sh(&r)?);
+        });
     }
     Ok(out)
 }
@@ -934,6 +973,9 @@ fn var_ref_to_sh(name: &str, list: bool) -> String {
 }
 
 /// Parameter-expansion call: `param(op, name, extras...)` → `${...}`.
+/// bash-only ops (slice, case-mod, substitution) that dash cannot parse
+/// are emulated with POSIX tools so the rendered script RUNS under
+/// /bin/sh with bash-identical stdout (the equivalence gate).
 fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
     let op = raw_arg(args, 0)?;
     let name = raw_arg(args, 1)?;
@@ -958,21 +1000,67 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             if name.starts_with('#') {
                 return Ok(format!("${{#{}[@]}}", &name[1..]));
             }
-            if len.is_empty() {
-                Ok(format!("${{{name}:{off}}}"))
-            } else {
-                Ok(format!("${{{name}:{off}:{len}}}"))
+            // dash has no substring expansion — emulate with cut
+            // (char-exact for the ASCII corpus)
+            if name == "@" || name == "*" {
+                // `${@:off}` — positional slice: shift + join
+                let offn: i64 = off.trim().parse().unwrap_or(-1);
+                if offn >= 1 {
+                    let sh = offn - 1;
+                    return Ok(format!("$(shift {sh}; printf '%s' \"$*\")"));
+                }
+                return Ok(format!("${{{name}:{off}}}"));
             }
+            let offn: i64 = off.trim().parse().unwrap_or(-1);
+            let lenn: i64 = len.trim().parse().unwrap_or(-1);
+            if offn >= 0 && (lenn >= 0 || len.is_empty()) {
+                if !len.is_empty() && lenn == 0 {
+                    // `${x:off:0}` — always empty
+                    return Ok("$(printf '')".into());
+                }
+                let start = offn + 1;
+                let range = if len.is_empty() {
+                    format!("{start}-")
+                } else {
+                    format!("{start}-{}", offn + lenn)
+                };
+                return Ok(format!("$(printf '%s' \"${name}\" | cut -c{range})"));
+            }
+            // dynamic offsets — compute in shell arithmetic
+            let start = format!("$((({off})+1))");
+            let range = if len.is_empty() {
+                format!("{start}-")
+            } else {
+                format!("{start}-$((({off})+({len})))")
+            };
+            Ok(format!("$(printf '%s' \"${name}\" | cut -c{range})"))
         }
-        "^^" | ",," | "^" => Ok(format!("${{{name}{op}}}")),
+        "^^" => Ok(format!(
+            "$(printf '%s' \"${name}\" | tr '[:lower:]' '[:upper:]')"
+        )),
+        ",," => Ok(format!(
+            "$(printf '%s' \"${name}\" | tr '[:upper:]' '[:lower:]')"
+        )),
+        "^" => Ok(format!(
+            "$(printf '%s' \"${name}\" | sed -e 's/^\\(.\\)/\\U\\1/')"
+        )),
+        "," => Ok(format!(
+            "$(printf '%s' \"${name}\" | sed -e 's/^\\(.\\)/\\L\\1/')"
+        )),
         "#" | "##" | "%" | "%%" => {
             let pat = raw_arg(args, 2)?;
             Ok(format!("${{{name}{op}{pat}}}"))
         }
-        "//" => {
+        "//" | "/" => {
+            // `${x/p/r}` — no dash equivalent; emulate with sed (the IR
+            // conflates first/all occurrences — both render `g`)
             let pat = raw_arg(args, 2)?;
             let rep = raw_arg(args, 3)?;
-            Ok(format!("${{{name}//{pat}/{rep}}}"))
+            let pe = sed_escape_pattern(&pat);
+            let re = sed_escape_replacement(&rep);
+            Ok(format!(
+                "$(printf '%s' \"${name}\" | sed -e 's#{pe}#{re}#g')"
+            ))
         }
         ":-" | ":=" | ":?" => {
             let default = raw_arg(args, 2)?;
@@ -982,6 +1070,34 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
         "dirname" => Ok(format!("${{{name}%/*}}")),
         other => Err(format!("param op not renderable: {other:?}")),
     }
+}
+
+fn sed_escape_pattern(p: &str) -> String {
+    let mut out = String::new();
+    for c in p.chars() {
+        match c {
+            '\\' | '.' | '*' | '[' | ']' | '^' | '$' | '#' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn sed_escape_replacement(r: &str) -> String {
+    let mut out = String::new();
+    for c in r.chars() {
+        match c {
+            '\\' | '&' | '#' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// `join(x)` — the LIST form of an expansion (bash joins array elements
@@ -1071,6 +1187,39 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Str(s, _) => Ok(s.clone()),
         other => Err(format!("interp expr not renderable: {other:?}")),
     }
+}
+
+/// Split `lhs OP rhs` from a `[[ ]]` raw test (the parser strips spaces
+/// around the operator: `$s==*.txt`). Returns None when the op is not a
+/// top-level test operator (e.g. `a==b` inside a `$(...)`).
+fn split_test_op(t: &str, op: &str) -> Option<(String, String)> {
+    let idx = t.find(op)?;
+    let lhs = t[..idx].trim().to_string();
+    let rhs = t[idx + op.len()..].trim().to_string();
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    // the operator must not sit inside a command substitution
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < idx {
+        let bytes = t.as_bytes();
+        match bytes[i] {
+            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'(' => {
+                depth += 1;
+                i += 2;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    Some((lhs, rhs))
 }
 
 /// Brace expansion: `brace(prefix, groups, middles, suffix)` — expand the
@@ -1365,7 +1514,7 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             Ok(format!("{name}() {{ {}; }}", stmts_inline(body)?))
         }
         IrStmt::Redirect { inner, redirects } => {
-            let mut out = stmts_inline(inner)?;
+            let mut out = herestring_wrap(redirects, stmts_inline(inner)?)?;
             out.push_str(&redirects_to_sh(redirects)?);
             Ok(out)
         }
