@@ -21,10 +21,12 @@ pub type TransformFn = fn(&mut Vec<IrStmt>) -> bool;
 /// `pub mod <name>;` above) when a worker-submitted transform is accepted
 /// into the crate. Each entry is (name, transform_fn).
 pub mod sub; // placeholder so the module compiles with an empty registry
+pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
         // (name, <name>::transform) — estree worker adds entries here
+        ("sync-ok-loops", sync_ok_loops::transform),
     ]
 }
 
@@ -53,4 +55,15 @@ pub fn apply(stmts: &mut Vec<IrStmt>) -> bool {
         }
     }
     changed
+}
+
+/// Is a named transform enabled under the `DEBASHC_TRANSFORMS` gate
+/// (empty/unset = ALL)? The renderer hooks that READ a transform's
+/// verdict statics must consult the same gate, so the bisect machinery
+/// (env-gated, no rebuild) can disable a transform end-to-end — including
+/// the verdict computation a hook would otherwise re-run under the
+/// compile lock (see shir.rs `shir_to_estree`: `sync-ok-loops`).
+pub fn transform_enabled(name: &str) -> bool {
+    let enabled = enabled_names();
+    enabled.is_empty() || enabled.iter().any(|e| e == name)
 }

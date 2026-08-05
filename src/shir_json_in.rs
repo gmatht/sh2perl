@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn contract_version_required() {
         let mut prog = IrProgram { imports: vec![], requires: vec![],
-            stmts: vec![], subs: vec![], var_types: vec![] };
+            stmts: vec![], subs: vec![], var_types: vec![], stmt_lines: vec![] };
         let json = shir_to_shir_json(&prog);
         // valid
         assert!(shir_json_to_ir(&json).is_ok());
