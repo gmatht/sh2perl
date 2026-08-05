@@ -34,6 +34,7 @@ pub use parser::commands::Parser;
 pub use parser::utilities::ParserUtilities;
 // pub use mir::*; // TODO: Fix MIR implementation
 pub use generator::Generator;
+pub mod java_backend; // worktree-local: Java renderer (branch backend/java)
 #[cfg(test)]
 pub mod estree_debug_tests {
     use super::*;
