@@ -552,6 +552,18 @@ pub fn parse_shir_json_to_perl(filename: &str) {
     print!("{}", perl);
 }
 
+pub fn parse_shir_json_to_rust(filename: &str) {
+    let content = match std::fs::read_to_string(filename) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("read {}: {}", filename, e); return; }
+    };
+    let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+    };
+    print!("{}", debashl::rust_backend::shir_to_rust(&prog));
+}
+
 /// Parse shell input and emit ShIR JSON. `raw=true` omits the trailing
 /// newline (the contract for machine consumers); `raw=false` adds it
 /// (human-readable default). Fixes the long-standing --shir --raw lie.
