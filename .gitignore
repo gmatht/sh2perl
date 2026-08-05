@@ -72,3 +72,10 @@ file_00[0-9]
 ?*${*
 test.py
 x.py
+
+# history-purge junk classes — NEVER commit (all were in the old history)
+debug_comparison*
+perl_specific_results.txt
+filtered.git/
+examples/file[0-9].txt
+backends/*/loop-*.pid
