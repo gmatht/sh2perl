@@ -1304,6 +1304,28 @@ mod tests {
         assert!(!json2.contains("\"name\":\"capture\""));
         assert!(!json2.contains("\"name\":\"exec\""));
         assert!(!json2.contains("unsupported"));
+        // the general var-operand form (`$sum + $i` — the in-loop bc
+        // capture): native `String(Number(sum) + Number(i))`, no spawn
+        let json3 = to_json("sum=0; for i in 1 2 3; do sum=$(echo \"$sum + $i\" | bc); done; echo $sum");
+        assert!(json3.contains("\"name\":\"Number\""), "native var arith");
+        assert!(json3.contains("\"operator\":\"+\""));
+        assert!(!json3.contains("\"name\":\"pipeline\""));
+        assert!(!json3.contains("\"name\":\"capture\""));
+        assert!(!json3.contains("\"name\":\"exec\""));
+        assert!(!json3.contains("\"name\":\"forLoop\""), "the loop goes native for-of");
+        assert!(!json3.contains("unsupported"));
+        // `/` lowers to Math.trunc with a zero-divisor guard (bc aborts
+        // with no stdout) — the guard is a `divisor === 0` comparison
+        let json4 = to_json("a=7; b=2; echo $(echo \"$a / $b\" | bc)");
+        assert!(json4.contains("\"name\":\"trunc\""), "scale-0 division");
+        assert!(json4.contains("\"operator\":\"===\""), "zero-divisor guard");
+        assert!(!json4.contains("\"name\":\"exec\""));
+        assert!(!json4.contains("unsupported"));
+        // `^` is bc POWER but bash-arith XOR — the var form must NOT
+        // mis-parse it: the spawn stays
+        let json5 = to_json("a=2; echo $(echo \"$a ^ 3\" | bc)");
+        assert!(json5.contains("\"name\":\"exec\""), "^ keeps the spawn");
+        assert!(!json5.contains("unsupported"));
     }
 
     #[test]
