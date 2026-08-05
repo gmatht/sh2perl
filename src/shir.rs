@@ -13707,18 +13707,37 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     // read of the runtime's positional state, the exact value its getVar
     // would yield; sound inside function bodies too because the runtime's
     // call machinery saves/restores `positional` around script-function
-    // calls), or nothing (a store var → keep the runtime call).
+    // calls), or a STORE var (a `sh2.getVar` read — the exact value the
+    // runtime's param would read from the store; the string ops lower
+    // native, skipping the param dispatch/switch).
     let value: Option<Expr> = if is_lifted(name) {
         Some(Expr::Identifier {
             name: name.clone(),
         })
     } else {
-        positional_read(name)
+        positional_read(name).or_else(|| Some(sh2_call("getVar", vec![str_lit(name)])))
     };
     let value = value?;
     // positional writes (`${1:=d}`) and `:?` exits stay on the runtime.
     let is_positional = positional_read(name).is_some() && !is_lifted(name);
-    let id = || value.clone();
+    // Ops that read the value more than once (first-char case, glob-strip,
+    // default-value): for a STORE var the native must evaluate the getVar
+    // EXACTLY ONCE into the runtime's `_g` scratch (the Plan 15 guard
+    // protocol) — a duplicated getVar would double the store reads and the
+    // metric would count them twice. The reads below then come from
+    // `sh2._g` and the whole native is wrapped in the single-eval seq.
+    // (`sh2._g = sh2.getVar(name), <native with _g reads>). The seq is one
+    // synchronous run and the native contains only pure string ops, so a
+    // nested scratch use (an inner param in an argument position) can
+    // never interleave with the outer read.
+    let store_backed = !is_lifted(name) && positional_read(name).is_none();
+    let multi_read = matches!(op.as_str(), "^" | "," | "#" | "##" | "%" | "%%" | ":-");
+    let (id_src, wrap): (Expr, Option<Expr>) = if store_backed && multi_read {
+        (sh2_member("_g"), Some(value.clone()))
+    } else {
+        (value.clone(), None)
+    };
+    let id = || id_src.clone();
     let val = || Expr::CallExpression {
         callee: Box::new(Expr::Identifier {
             name: "String".to_string(),
@@ -13761,7 +13780,7 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     let literal_pattern = |p: &str| {
         !p.is_empty() && p.is_ascii() && !p.chars().any(|c| matches!(c, '*' | '?' | '['))
     };
-    match op.as_str() {
+    let native = match op.as_str() {
         // ${x} — a plain read of the binding (like the getVar lift)
         "" => Some(id()),
         // ${#x} — string length
@@ -13791,22 +13810,69 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
             let [_, _, IrExpr::Str(p, _)] = args else {
                 return None;
             };
-            if !literal_pattern(p) {
-                return None;
-            }
-            let len = p.chars().count() as i64;
-            if op.starts_with('#') {
-                Some(cond(
-                    method(val(), "startsWith", vec![str_lit(p)]),
-                    method(val(), "slice", vec![int_lit(len)]),
-                    val(),
-                ))
+            // LITERAL pattern — shortest == longest for literal patterns,
+            // exactly like the runtime's literal fast paths.
+            if literal_pattern(p) {
+                let len = p.chars().count() as i64;
+                if op.starts_with('#') {
+                    Some(cond(
+                        method(val(), "startsWith", vec![str_lit(p)]),
+                        method(val(), "slice", vec![int_lit(len)]),
+                        val(),
+                    ))
+                } else {
+                    Some(cond(
+                        method(val(), "endsWith", vec![str_lit(p)]),
+                        method(val(), "slice", vec![int_lit(0), int_lit(-len)]),
+                        val(),
+                    ))
+                }
             } else {
-                Some(cond(
-                    method(val(), "endsWith", vec![str_lit(p)]),
-                    method(val(), "slice", vec![int_lit(0), int_lit(-len)]),
-                    val(),
-                ))
+            // SINGLE-STAR glob patterns — the stringop3 bench family and
+            // the corpus idioms (`${f%.*}` ext-strip, `${x##*/}` basename,
+            // `${s#*:}` field-skip): `*P` for the prefix ops (# / ##),
+            // `P*` for the suffix ops (% / %%). The runtime's glob matcher
+            // treats `*` as ANY string (parameter-expansion patterns match
+            // `/` too — unlike pathname expansion), so the shortest
+            // prefix ending in P is the FIRST occurrence of the literal
+            // core and the longest is the LAST: indexOf/lastIndexOf + the
+            // core length. A core with further glob metachars / a bare
+            // `*` (no core) stays on the runtime.
+            let core = if op.starts_with('#') {
+                p.strip_prefix('*')
+            } else {
+                p.strip_suffix('*')
+            };
+            let Some(core) = core else { return None; };
+            if core.is_empty() || !literal_pattern(core) {
+                None
+            } else {
+                let clen = core.chars().count() as i64;
+                // `#` (shortest prefix) and `%%` (longest suffix) are the
+                // FIRST occurrence; `##` (longest prefix) and `%` (shortest
+                // suffix) are the LAST.
+                let first = op == "#" || op == "%%";
+                let ix = if first {
+                    method(val(), "indexOf", vec![str_lit(core)])
+                } else {
+                    method(val(), "lastIndexOf", vec![str_lit(core)])
+                };
+                if op.starts_with('#') {
+                    // strip through the occurrence (prefix removal)
+                    Some(cond(
+                        bin(ix.clone(), ">=", int_lit(0)),
+                        method(val(), "slice", vec![bin(ix.clone(), "+", int_lit(clen))]),
+                        val(),
+                    ))
+                } else {
+                    // strip up to the occurrence (suffix removal)
+                    Some(cond(
+                        bin(ix.clone(), ">=", int_lit(0)),
+                        method(val(), "slice", vec![int_lit(0), ix.clone()]),
+                        val(),
+                    ))
+                }
+            }
             }
         }
         // ${x//p/r} — replace ALL occurrences (split/join; the runtime's
@@ -13835,7 +13901,10 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
         // `:=` write stays on the runtime (its setVar path is the
         // store/positional authority).
         ":-" | ":=" => {
-            if op == ":=" && is_positional {
+            if op == ":=" && (is_positional || store_backed) {
+                // positional / store `:=` WRITES the binding: a native
+                // write to the `_g` scratch or a getVar call would be
+                // wrong (the runtime setVar is the store authority).
                 return None;
             }
             let [_, _, IrExpr::Str(d, _)] = args else {
@@ -13955,6 +14024,19 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
         // :? and everything else: the value-override form (runtime keeps
         // the string-op logic; only the value source changes).
         _ => None,
+    };
+    // Store-var single-eval wrap (see `wrap` above): the native was built
+    // reading `sh2._g`; assign the store read once, then the native.
+    match (native, wrap) {
+        (Some(e), Some(store)) => Some(seq(vec![
+            Expr::AssignmentExpression {
+                operator: "=".to_string(),
+                left: Box::new(sh2_member("_g")),
+                right: Box::new(store),
+            },
+            e,
+        ])),
+        (r, _) => r,
     }
 }
 
