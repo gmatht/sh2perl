@@ -5823,6 +5823,14 @@ enum CasePat {
     Prefix(String),
     Suffix(String),
     Exact(String),
+    /// A pattern outside the four string-op shapes, translated to an
+    /// anchored JS regex SOURCE (without the `^`/`$` — the emitted test
+    /// anchors via the replace-compare, see [`CasePat::Glob`] in
+    /// `try_native_case`): `?` single-any, `[...]` character classes,
+    /// mid-star literals (`i*86`), escaped meta chars (`\$`, `\(`). The
+    /// translation mirrors the runtime's parseGlob/classMatch grammar
+    /// exactly.
+    Glob(String),
 }
 
 fn classify_case_pat(pat: &str) -> Option<CasePat> {
@@ -5849,29 +5857,178 @@ fn classify_case_pat(pat: &str) -> Option<CasePat> {
     if !bare.is_empty() && bare.chars().all(|c| c == '*') {
         return Some(CasePat::Any);
     }
-    // `*lit*`, `lit*`, `*lit` — exactly one star on either side.
+    // `*lit*`, `lit*`, `*lit` — exactly one star on either side, a clean
+    // literal inside (a meta char inside falls through to the general
+    // glob translation below instead of bailing to the runtime — e.g.
+    // `*[0-9]*` is a substring test on a character class).
     if let Some(inner) = bare.strip_prefix('*') {
         if let Some(inner) = inner.strip_suffix('*') {
-            if inner.is_empty() || has_meta(inner) {
-                return None;
+            if !inner.is_empty() && !has_meta(inner) {
+                return Some(CasePat::Substr(inner.to_string()));
             }
-            return Some(CasePat::Substr(inner.to_string()));
+        } else if !inner.is_empty() && !has_meta(inner) {
+            return Some(CasePat::Suffix(inner.to_string()));
         }
-        if inner.is_empty() || has_meta(inner) {
-            return None;
-        }
-        return Some(CasePat::Suffix(inner.to_string()));
     }
     if let Some(inner) = bare.strip_suffix('*') {
-        if inner.is_empty() || has_meta(inner) {
-            return None;
+        if !inner.is_empty() && !has_meta(inner) {
+            return Some(CasePat::Prefix(inner.to_string()));
         }
-        return Some(CasePat::Prefix(inner.to_string()));
     }
-    if has_meta(bare) {
-        return None;
+    if !has_meta(bare) {
+        return Some(CasePat::Exact(bare.to_string()));
     }
-    Some(CasePat::Exact(bare.to_string()))
+    // The string-op shapes rejected it — try the general glob grammar
+    // (`?`, `[...]` classes, mid-star literals, escaped metachars). Only
+    // patterns the RUNTIME would leave unexpanded qualify (`glob_to_regex`
+    // rejects `$`/extglob); anything else keeps the runtime switch form.
+    glob_to_regex(bare).map(CasePat::Glob)
+}
+
+/// Escape a literal char for a JS regex OUTSIDE a character class.
+fn regex_escape_lit(c: char) -> String {
+    match c {
+        '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' | '/' => {
+            let mut s = String::from("\\");
+            s.push(c);
+            s
+        }
+        _ => c.to_string(),
+    }
+}
+
+/// Escape a literal char for INSIDE a JS regex character class.
+fn regex_escape_class(c: char) -> String {
+    match c {
+        '\\' | ']' | '^' | '-' | '[' => {
+            let mut s = String::from("\\");
+            s.push(c);
+            s
+        }
+        // NB: `\b` inside a JS class is BACKSPACE, not the literal b —
+        // the runtime's classMatch treats `\x` as the literal x, so the
+        // escaped letter is emitted UNescaped.
+        _ => c.to_string(),
+    }
+}
+
+/// Render a glob class BODY (the chars between `[` and `]`) as a JS
+/// regex class body, mirroring the runtime's classMatch scan exactly:
+/// `\x` escapes (a trailing `\` is a literal backslash), `c-d` ranges
+/// (a `-` whose third char exists and isn't `]`), everything else a
+/// literal char.
+fn glob_class_to_regex(cls: &str) -> String {
+    let mut out = String::new();
+    let mut cs = cls.chars().peekable();
+    while let Some(c) = cs.next() {
+        if c == '\\' {
+            match cs.next() {
+                Some(n) => out.push_str(&regex_escape_class(n)),
+                None => out.push_str("\\\\"), // trailing `\`: literal
+            }
+            continue;
+        }
+        if cs.peek() == Some(&'-') {
+            // `c-d`: a range when a third char follows and it isn't ']'.
+            let mut it = cs.clone();
+            it.next(); // the '-'
+            if let Some(d) = it.next() {
+                if d != ']' {
+                    cs.next(); // consume '-'
+                    cs.next(); // consume d
+                    out.push(c);
+                    out.push('-');
+                    out.push(d);
+                    continue;
+                }
+            }
+        }
+        out.push_str(&regex_escape_class(c));
+    }
+    out
+}
+
+/// Translate a `case` glob pattern to an anchored JS regex SOURCE
+/// (without the anchors — the emitted test uses the replace-compare, see
+/// `try_native_case`), mirroring the runtime's parseGlob grammar: `*` →
+/// `.*`, `?` → `.`, `\x` → the literal x, `[`…`]` classes (with
+/// `!`/`^` negation, an unterminated `[` staying a literal, an empty
+/// class matching nothing — or anything when negated — exactly like
+/// classMatch), everything else a literal. Returns None when the RUNTIME
+/// would expand or re-parse the pattern first: a bare `$` (expandWord's
+/// parameter/cmdsub expansion), a bare `(`/`)` (parseGlob's extglob
+/// groups), and `\$name`-shaped escapes (the runtime's expandWord is
+/// NOT backslash-aware and expands them anyway).
+fn glob_to_regex(pat: &str) -> Option<String> {
+    let mut out = String::from("^");
+    let mut chars = pat.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '\\' => {
+                let Some(n) = chars.next() else {
+                    out.push_str("\\\\"); // trailing `\`: literal (parseGlob)
+                    continue;
+                };
+                if n == '$' {
+                    // `\$name`: the runtime's expandWord expands it (its
+                    // `$name` regex is not escape-aware) — mirror by
+                    // refusing (the pattern stays on the runtime switch).
+                    if let Some(&nxt) = chars.peek() {
+                        if nxt.is_ascii_alphanumeric()
+                            || matches!(nxt, '_' | '{' | '(' | '@' | '#' | '*' | '?' | '$')
+                        {
+                            return None;
+                        }
+                    }
+                }
+                out.push_str(&regex_escape_lit(n));
+            }
+            '[' => {
+                // parseGlob: optional `!`/`^` negation, then chars up to
+                // the FIRST `]` (an unterminated `[` is a literal).
+                let mut cls = String::new();
+                let mut neg = false;
+                if let Some(&n) = chars.peek() {
+                    if n == '!' || n == '^' {
+                        neg = true;
+                        chars.next();
+                    }
+                }
+                let mut closed = false;
+                for n in chars.by_ref() {
+                    if n == ']' {
+                        closed = true;
+                        break;
+                    }
+                    cls.push(n);
+                }
+                if !closed {
+                    out.push_str("\\[");
+                } else if cls.is_empty() {
+                    // classMatch on an empty class: never a hit (or
+                    // ALWAYS a hit when negated — a `[!]` matches any
+                    // one char).
+                    if neg {
+                        out.push('.');
+                    } else {
+                        out.push_str("[^\\s\\S]");
+                    }
+                } else {
+                    out.push('[');
+                    if neg {
+                        out.push('^');
+                    }
+                    out.push_str(&glob_class_to_regex(&cls));
+                    out.push(']');
+                }
+            }
+            '(' | ')' | '$' => return None, // extglob / runtime expansion
+            _ => out.push_str(&regex_escape_lit(c)),
+        }
+    }
+    Some(out)
 }
 
 /// Lower a `case` whose EVERY pattern is one of the [`CasePat`] shapes to a
@@ -5933,6 +6090,58 @@ fn try_native_case(
             base
         }
     };
+    // Glob patterns exec a fresh regex literal into a per-pattern const
+    // (one exec per case evaluation, exactly the runtime's per-evaluation
+    // globMatch); the exec runs on the SAME coerced value string the
+    // length compare uses, so that const is declared once too.
+    let glob_temps: HashMap<String, String> = pats
+        .iter()
+        .flatten()
+        .filter_map(|p| match p {
+            CasePat::Glob(re) => Some(re.clone()),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(i, re)| (re, format!("$g{i}")))
+        .collect();
+    let value_decl = (!glob_temps.is_empty()).then(|| {
+        Stmt::VariableDeclaration {
+            kind: "const",
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: Expr::Identifier {
+                    name: CASE_VALUE_TMP.to_string(),
+                },
+                init: Some(value_expr(CASE_TMP)),
+            }],
+        }
+    });
+    let glob_decls: Vec<Stmt> = glob_temps
+        .iter()
+        .map(|(re, temp)| Stmt::VariableDeclaration {
+            kind: "const",
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: Expr::Identifier {
+                    name: temp.clone(),
+                },
+                init: Some(Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(regex_lit_flags(re, "s")),
+                        property: Box::new(Expr::Identifier {
+                            name: "exec".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![Expr::Identifier {
+                        name: CASE_VALUE_TMP.to_string(),
+                    }],
+                    optional: false,
+                }),
+            }],
+        })
+        .collect();
     let pat_test = |pat: &CasePat| -> Expr {
         let value = value_expr(CASE_TMP);
         match pat {
@@ -5982,6 +6191,64 @@ fn try_native_case(
                 left: Box::new(value),
                 right: Box::new(str_lit(lit)),
             },
+            // The glob translation (see `glob_to_regex`): the pattern's
+            // regex is exec'd ONCE into a const (below), and the test
+            // requires the match to span the WHOLE value — `$gN[0].length
+            // === $sh_case_v.length`. (A bare `/^RE$/` `.test` would be
+            // WRONG on two counts: JS `$` also matches before a trailing
+            // `\n`, so `case a in a)` would match the value "a\n"; and
+            // an empty value with a non-matching regex would compare
+            // `"".replace(/^RE$/, "") === ""` — a false positive. The
+            // exec+length form is exact. The `s` flag makes `.`/`.*`
+            // cross newlines like glob's `?`/`*`.)
+            CasePat::Glob(re) => {
+                let temp = glob_temps.get(re).expect("glob temp precomputed");
+                let m = || Expr::Identifier {
+                    name: temp.clone(),
+                };
+                Expr::LogicalExpression {
+                    operator: "&&".to_string(),
+                    left: Box::new(Expr::BinaryExpression {
+                        operator: "!==".to_string(),
+                        left: Box::new(m()),
+                        right: Box::new(Expr::Literal {
+                            value: serde_json::Value::Null,
+                            raw: None,
+                            regex: None,
+                        }),
+                    }),
+                    right: Box::new(Expr::BinaryExpression {
+                        operator: "===".to_string(),
+                        left: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::MemberExpression {
+                                object: Box::new(m()),
+                                property: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(0),
+                                    raw: None,
+                                    regex: None,
+                                }),
+                                computed: true,
+                                optional: false,
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "length".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        right: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: CASE_VALUE_TMP.to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "length".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                    }),
+                }
+            }
         }
     };
     // Clause body: same break/continue → sh2.* signal mapping as the switch
@@ -6025,19 +6292,20 @@ fn try_native_case(
         alt = Some(Box::new(stmt));
     }
     Some(Stmt::BlockStatement {
-        body: vec![
-            Stmt::VariableDeclaration {
-                kind: "const",
-                declarations: vec![VariableDeclarator {
-                    type_: "VariableDeclarator",
-                    id: Expr::Identifier {
-                        name: CASE_TMP.to_string(),
-                    },
-                    init: Some(expr_to_estree(discriminant)),
-                }],
-            },
-            *alt.expect("at least one clause"),
-        ],
+        body: std::iter::once(Stmt::VariableDeclaration {
+            kind: "const",
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: Expr::Identifier {
+                    name: CASE_TMP.to_string(),
+                },
+                init: Some(expr_to_estree(discriminant)),
+            }],
+        })
+        .chain(value_decl)
+        .chain(glob_decls)
+        .chain(std::iter::once(*alt.expect("at least one clause")))
+        .collect(),
     })
 }
 
@@ -6315,6 +6583,10 @@ fn ir_may_enable_nocasematch(prog: &IrProgram) -> bool {
 /// in a shell variable name, so `$sh_case` can never collide with a lifted
 /// variable's native JS binding.
 const CASE_TMP: &str = "$sh_case";
+/// The coerced case VALUE (`String($sh_case ?? '')`, lowercased under
+/// nocasematch) — bound once when a glob pattern needs the exec/length
+/// compare on the exact same string.
+const CASE_VALUE_TMP: &str = "$sh_case_v";
 
 /// Whether the program contains a PERSISTENT fd-1 redirect (a bare
 /// `exec` builtin with a redirect — `exec >file`, `exec 1>&2`, `exec 1>&-`;
@@ -7750,6 +8022,12 @@ fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
                 left: Box::new(value.clone()),
                 right: Box::new(str_lit(&lit_str(lit))),
             },
+            // The caller gates to Substr/Prefix/Suffix before calling
+            // build — a Glob pattern (regex translation) never reaches
+            // the test-lowering match. Keep the arm for exhaustiveness.
+            CasePat::Glob(_) => unreachable!(
+                "glob patterns are filtered before the test-lowering match"
+            ),
         };
         if negate {
             Expr::UnaryExpression {
