@@ -842,13 +842,19 @@ fn redirect_objs_to_sh(specs: &[IrExpr]) -> Result<String, String> {
     Ok(out)
 }
 
-/// Parse an `Array` of redirect spec Objects into `IrRedirect`s.
+/// Parse an `Array` of redirect spec Objects into `IrRedirect`s. The
+/// specs arrive as an Array in the call-form (`Call("redirect",
+/// [Arrow, Array([Object, ...])])`) but as a bare Object element in the
+/// `IrStmt::Exec` redirects field and `redirect_objs_to_sh`'s per-spec
+/// iteration — accept both shapes (an Object IS one spec).
 fn redirect_objs(specs: &IrExpr) -> Result<Vec<IrRedirect>, String> {
-    let IrExpr::Array(specs) = specs else {
-        return Ok(vec![]);
+    let items: Vec<&IrExpr> = match specs {
+        IrExpr::Array(items) => items.iter().collect(),
+        IrExpr::Object(_) => vec![specs],
+        _ => return Ok(vec![]),
     };
     let mut out = Vec::new();
-    for spec in specs {
+    for spec in items {
         let IrExpr::Object(props) = spec else {
             return Err(format!("redirect spec not an Object: {spec:?}"));
         };
