@@ -10,6 +10,7 @@ pub mod cfront;
 pub mod shir;
 pub mod transforms;
 pub mod shir_json;
+pub mod js_backend; // worktree-local: JS backend renderer (branch backend/js)
 
 pub mod shir_json_in;
 pub mod bc;

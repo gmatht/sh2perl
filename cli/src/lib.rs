@@ -50,7 +50,7 @@ pub(crate) fn with_virtual_stdin<T>(f: impl FnOnce(Option<&[u8]>) -> T) -> T {
 // Import from our new modules
 use crate::cli_commands::{
     export_mir, export_shir, interactive_mode, lex_input, parse_backticks_to_perl, parse_file,
-    parse_file_to_estree, parse_file_to_perl, parse_file_to_shir, export_shir_raw, parse_shir_json_to_estree, parse_shir_json_to_perl, parse_file_to_estree_raw, parse_input, parse_system_to_perl,
+    parse_file_to_estree, parse_file_to_perl, parse_file_to_shir, export_shir_raw, parse_shir_json_to_estree, parse_shir_json_to_js, parse_shir_json_to_perl, parse_file_to_estree_raw, parse_input, parse_system_to_perl,
     parse_to_perl,
     parse_to_perl_inline, parse_to_perl_with_opts,
     run_generated,
@@ -672,6 +672,13 @@ exit $main_exit_code;
                 }
                 let filename = &args[3];
                 parse_shir_json_to_estree(filename);
+            } else if args.len() >= 3 && args[2] == "--shir-in-js" {
+                if args.len() < 4 {
+                    println!("Error: file --shir-in-js requires filename");
+                    return;
+                }
+                let filename = &args[3];
+                parse_shir_json_to_js(filename);
             } else if args.len() >= 3 && args[2] == "--perl-critic-only" {
                 if args.len() < 4 {
                     println!("Error: file --perl-critic-only requires filename");
@@ -874,6 +881,28 @@ exit $main_exit_code;
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
             print!("{}", debashl::ir::ir_to_perl(&prog));
+        }
+        "--shir-in-js" => {
+            if args.len() < 3 { println!("Error: --shir-in-js requires input"); return; }
+            let input = &args[2];
+            let content = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e); std::process::exit(1);
+                }
+                Ok(s)
+            } else {
+                fs::read_to_string(input)
+            };
+            let content = match content {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+            };
+            print!("{}", debashl::js_backend::shir_to_js(&prog));
         }
         "--mir" => {
             if args.len() < 3 {
