@@ -53,6 +53,16 @@ pub enum Stmt {
         test: Expr,
         body: Box<Stmt>,
     },
+    /// The native numeric-range loop — `for (let i = lo; i <= hi; i++)`
+    /// — the `seq_range_for` transform's target (the hand-js ideal for
+    /// `for i in $(seq lo hi)`). init is a `VariableDeclaration`
+    /// (`let i = lo`); test the `< =` bound; update `i++`.
+    ForStatement {
+        init: Box<Stmt>,
+        test: Expr,
+        update: Expr,
+        body: Box<Stmt>,
+    },
     ForOfStatement {
         left: Box<Stmt>,
         right: Expr,
@@ -372,6 +382,25 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
         } => Stmt::ForOfStatement {
             left,
             right: fix_expr(right, in_arrow, in_func),
+            body: Box::new(
+                fix_stmt(*body, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
+                    body: vec![],
+                }),
+            ),
+        },
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
+            body,
+        } => Stmt::ForStatement {
+            init: Box::new(
+                fix_stmt(*init, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
+                    body: vec![],
+                }),
+            ),
+            test: fix_expr(test, in_arrow, in_func),
+            update: fix_expr(update, in_arrow, in_func),
             body: Box::new(
                 fix_stmt(*body, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
                     body: vec![],
@@ -1218,6 +1247,77 @@ mod tests {
         assert!(!json3.contains("\"type\":\"ForOfStatement\""));
         assert!(json3.contains("\"name\":\"forLoop\""));
         assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn seq_range_for_lowers_to_native_for_statement() {
+        // `for i in $(seq 1 10000)` — the seq_range_for transform
+        // rewrites the captureWords iterable to a Range, and the emitter
+        // lowers it to a native JS counter loop
+        // (`for (let i = 1; i <= 10000; i++)`) — the hand-written ideal.
+        // No capture, no runtime loop call, no item list, no per-iteration
+        // coercion.
+        let json = to_json("for i in $(seq 1 3); do echo $i; done");
+        assert!(json.contains("\"type\":\"ForStatement\""));
+        assert!(json.contains("\"operator\":\"<=\""));
+        assert!(json.contains("\"operator\":\"++\""));
+        assert!(!json.contains("\"name\":\"captureWords\""));
+        assert!(!json.contains("\"name\":\"forLoop\""));
+        assert!(!json.contains("\"type\":\"ForOfStatement\""));
+        assert!(!json.contains("unsupported"));
+        // the sqrt1337 shape: the grep test lifts to String(...).includes
+        // AND the loop var lifts to a native number — `i * i`, no
+        // `(Number(i) || 0)` coercion
+        let json2 = to_json(
+            "for i in $(seq 1 10000); do if echo $((i*i)) | grep 1337 >/dev/null 2>/dev/null; then echo $i; fi; done",
+        );
+        assert!(json2.contains("\"type\":\"ForStatement\""));
+        assert!(json2.contains("\"name\":\"includes\""));
+        assert!(json2.contains("\"operator\":\"*\""));
+        assert!(!json2.contains("\"name\":\"Number\""), "no (Number(i) || 0) coercion");
+        assert!(!json2.contains("\"name\":\"captureWords\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn seq_range_for_conservative_cases() {
+        // 3-arg step forms (`seq A S B`) keep the runtime path
+        let json = to_json("for i in $(seq 1 2 10); do echo $i; done");
+        assert!(json.contains("\"name\":\"captureWords\""));
+        assert!(!json.contains("\"type\":\"ForStatement\""));
+        // leading-zero args (`seq 01 10` — GNU pads, bash arith is octal)
+        let json2 = to_json("for i in $(seq 01 10); do echo $i; done");
+        assert!(json2.contains("\"name\":\"captureWords\""));
+        assert!(!json2.contains("\"type\":\"ForStatement\""));
+        // a body WRITE to the loop var keeps word-list semantics (a
+        // counter's i++ would read the body-written value)
+        let json3 = to_json("for i in $(seq 1 3); do i=99; echo $i; done");
+        assert!(json3.contains("\"name\":\"captureWords\""));
+        assert!(!json3.contains("\"type\":\"ForStatement\""));
+        // a nested loop binding the SAME var keeps the OUTER on the word
+        // path (bash clobbers i in the body; a counter's i++ would read
+        // the body-written value). The INNER loop — whose own body never
+        // writes its var — still transforms independently.
+        let json4 = to_json(
+            "for i in $(seq 1 2); do for i in $(seq 10 12); do echo $i; done; done",
+        );
+        assert!(json4.contains("\"name\":\"captureWords\""), "outer keeps the word list");
+        assert!(json4.contains("\"type\":\"ForOfStatement\""), "outer is a word loop");
+        assert!(json4.contains("\"type\":\"ForStatement\""), "inner is a counter loop");
+    }
+
+    #[test]
+    fn seq_range_for_post_loop_read_stores_last_value() {
+        // the loop var read AFTER the loop stays store-backed — the
+        // store-sync elimination emits a pre-loop getVar into a temp, the
+        // per-iteration temp write, and a post-loop setVar of the LAST
+        // value (bash leaves $i = 10000)
+        let json = to_json("for i in $(seq 1 3); do echo $i; done; echo $i");
+        assert!(json.contains("\"type\":\"ForStatement\""));
+        assert!(json.contains("\"name\":\"__sh2_for_last_i\""));
+        assert!(json.contains("\"name\":\"setVar\""));
+        assert!(!json.contains("\"name\":\"captureWords\""));
+        assert!(!json.contains("unsupported"));
     }
 
     #[test]

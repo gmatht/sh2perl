@@ -43,6 +43,48 @@ pub enum IrType {
     Any,
 }
 
+// ── Const/var annotations (the const-markup transform) ──────────────────
+//
+// Conservative const/var verdicts for static backends (C): per assigned
+// variable, whether it can be emitted `const`/`readonly`. A variable is
+// `Const` only when it has exactly one static assignment site that
+// executes at most once (outside loops/function bodies) and is never
+// written by the runtime store (`read`, `mapfile`, `unset`), by native
+// arithmetic (`x++`, `((x=1))`), or by an array-element write, and the
+// program has no dynamic write (`eval`/`source`). Anything else is
+// `Var`. Missing from the list = never assigned (pure reads).
+// Populated by `shir::analyze_var_const`; serialized in the ShIR JSON
+// (ask A1). Existing backends ignore it (additive only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VarKind {
+    Const,
+    Var,
+}
+
+// ── Lifetime annotations (the variable-lifetime analysis) ────────────
+//
+// Conservative lifetime verdicts for static backends (C): per variable,
+// the live span in statement positions of a pre-order walk (first access
+// .. last access) and whether the value's storage may escape the current
+// scope (array-element store, closure capture, function return). The C
+// backend uses the span for per-point buffer sizing and buffer reuse,
+// and the escape bit for the copy-vs-move / stack-vs-heap decision.
+// Populated by `shir_passes::lifetime::analyze_var_lifetimes`;
+// serialized in the ShIR JSON (ask A1). Existing backends ignore it
+// (additive only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VarLifetime {
+    /// First access (def or use) position in the pre-order statement walk.
+    pub first: usize,
+    /// Last access position in the pre-order statement walk.
+    pub last: usize,
+    /// True when the value's storage may be retained beyond the scope
+    /// where it was produced (array-element store, closure capture,
+    /// function return) — cannot be a stack local that is moved from
+    /// or reused.
+    pub escapes: bool,
+}
+
 // ── Binary operators ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -411,6 +453,26 @@ pub struct IrProgram {
     /// uses it to emit fixed buffers (`char s[64]`) instead of heap/`char*`.
     /// Existing backends ignore it (additive only).
     pub var_lengths: Vec<(String, Option<u64>)>,
+    /// Conservative const/var verdicts (the const-markup transform,
+    /// sibling of the A2 type verdicts and `var_lengths`): per ASSIGNED
+    /// variable, `Const` when it is written exactly once (single static
+    /// assignment site) and that site executes at most once per run
+    /// (outside loops/function bodies) and is not a runtime-store write
+    /// (`read`/`unset`/`eval`/native arith `x++`/array-element). Sorted by
+    /// name for deterministic serialization. Populated by
+    /// `shir::analyze_var_const`; the C backend emits `const` for `Const`
+    /// verdicts. Existing backends ignore it (additive only).
+    pub var_const: Vec<(String, VarKind)>,
+    /// Conservative variable-lifetime annotations (the analysis's
+    /// sibling of `var_types`/`var_lengths`/`var_const`): per variable,
+    /// the live span in statement positions of a pre-order walk and
+    /// whether the value's storage escapes the scope (array store /
+    /// closure / return). Populated by
+    /// `shir_passes::lifetime::analyze_var_lifetimes`; the C backend
+    /// uses it for per-point buffer sizing, buffer reuse, and the
+    /// copy-vs-move / stack-vs-heap decision. Existing backends ignore
+    /// it (additive only).
+    pub var_lifetimes: Vec<(String, VarLifetime)>,
 }
 
 // ── Backend: IR → Perl text ─────────────────────────────────────────
@@ -2222,6 +2284,8 @@ impl IrProgram {
             var_types: vec![],
             stmt_lines: vec![],
             var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
         }
     }
 }

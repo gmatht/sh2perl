@@ -22,11 +22,13 @@ pub type TransformFn = fn(&mut Vec<IrStmt>) -> bool;
 /// into the crate. Each entry is (name, transform_fn).
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
+pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
         // (name, <name>::transform) — estree worker adds entries here
         ("sync-ok-loops", sync_ok_loops::transform),
+        ("seq-range-for", seq_range_for::transform),
     ]
 }
 

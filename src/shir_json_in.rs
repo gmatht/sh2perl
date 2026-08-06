@@ -72,6 +72,8 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
             .collect(),
         _ => vec![],
     };
+    let var_const = var_const_from(obj.get("var_const"), "Program.var_const")?;
+    let var_lifetimes = var_lifetimes_from(obj.get("var_lifetimes"), "Program.var_lifetimes")?;
     Ok(IrProgram {
         imports,
         requires,
@@ -80,6 +82,8 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
         var_types,
         stmt_lines,
         var_lengths,
+        var_const,
+        var_lifetimes,
     })
 }
 
@@ -112,6 +116,55 @@ fn var_types_from(v: Option<&Value>, where_: &str) -> Result<Vec<(String, IrType
                     other => return Err(format!("{where_}[{i}].type: {other} not in Int/Str")),
                 };
                 Ok((n, irt))
+            }).collect()
+        }
+    }
+}
+
+/// Const/var verdicts (`var_const`): `[{"name": n, "kind": "Const"|"Var"}]`.
+/// Missing field → empty (no verdicts attached — the caller may run
+/// `shir::analyze_var_const` itself). Unknown kinds are rejected.
+fn var_const_from(v: Option<&Value>, where_: &str) -> Result<Vec<(String, VarKind)>, String> {
+    match v {
+        None => Ok(vec![]),
+        Some(x) => {
+            let a = arr(Some(x), where_)?;
+            a.iter().enumerate().map(|(i, e)| {
+                let o = require_obj(e, &format!("{where_}[{i}]"))?;
+                let n = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();
+                let k = req_str(o, "kind", &format!("{where_}[{i}]"))?;
+                let vk = match k {
+                    "Const" => VarKind::Const,
+                    "Var" => VarKind::Var,
+                    other => return Err(format!("{where_}[{i}].kind: {other} not in Const/Var")),
+                };
+                Ok((n, vk))
+            }).collect()
+        }
+    }
+}
+
+/// Lifetime verdicts (`var_lifetimes`):
+/// `[{"name": n, "first": F, "last": L, "escapes": B}]`. Missing
+/// field → empty (the caller may run
+/// `shir_passes::lifetime::analyze_var_lifetimes` itself). Missing
+/// `first`/`last`/`escapes` defaults are rejected (the serializer always
+/// emits all three).
+fn var_lifetimes_from(v: Option<&Value>, where_: &str) -> Result<Vec<(String, VarLifetime)>, String> {
+    match v {
+        None => Ok(vec![]),
+        Some(x) => {
+            let a = arr(Some(x), where_)?;
+            a.iter().enumerate().map(|(i, e)| {
+                let o = require_obj(e, &format!("{where_}[{i}]"))?;
+                let n = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();
+                let f = o.get("first").and_then(|x| x.as_u64())
+                    .ok_or_else(|| format!("{where_}[{i}]: missing first"))? as usize;
+                let l = o.get("last").and_then(|x| x.as_u64())
+                    .ok_or_else(|| format!("{where_}[{i}]: missing last"))? as usize;
+                let esc = o.get("escapes").and_then(|x| x.as_bool())
+                    .ok_or_else(|| format!("{where_}[{i}]: missing escapes"))?;
+                Ok((n, VarLifetime { first: f, last: l, escapes: esc }))
             }).collect()
         }
     }
@@ -662,7 +715,8 @@ mod tests {
     #[test]
     fn contract_version_required() {
         let mut prog = IrProgram { imports: vec![], requires: vec![],
-            stmts: vec![], subs: vec![], var_types: vec![], stmt_lines: vec![] };
+            stmts: vec![], subs: vec![], var_types: vec![], stmt_lines: vec![],
+            var_lengths: vec![], var_const: vec![], var_lifetimes: vec![] };
         let json = shir_to_shir_json(&prog);
         // valid
         assert!(shir_json_to_ir(&json).is_ok());

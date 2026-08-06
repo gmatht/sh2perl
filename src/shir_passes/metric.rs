@@ -334,6 +334,10 @@ mod tests {
             stmts,
             subs: vec![],
             var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
         }
     }
 
