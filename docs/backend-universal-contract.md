@@ -141,6 +141,49 @@ limitation is the worst (helpers mandatory).
   non-JS backend is *always sync* (no promise machinery — a
   simplification); JS needs the tag to pick `*Sync` twins.
 
+### 5.6 Numeric-range for loops (`for i in $(seq A B)`)
+
+The `seq_range_for` core transform (in flight, stash 6b31498) lowers
+`for i in $(seq 1 10000)` to a native range loop. **Every backend must
+consume ALL THREE iter shapes** (the reference unwrap is
+`c_backend::seq_iter_range`, branch `backend/c`):
+
+| iter shape | when |
+|---|---|
+| `Array([Range { start, end }])` | post-transform `--shir` (current main) — unwrap the one-element array |
+| bare `Range { start, end }` | the shape several backends already match (go/rust/zig For arms) — support it too |
+| `Array([Call("captureWords", [Arrow([Expr(Call("exec", [Str("seq"), …])])])])])` | pre-lift cores (a worktree that hasn't merged the transform) |
+
+**The core is conservative — do NOT lift these yourself** (they arrive
+as the captureWords word-list form and stay on the runtime path):
+3-arg step `seq A S B`; leading-zero args (`seq 01 10`); a body WRITE
+to the loop var; nested loops binding the same var (the outer one). A
+`Range`/seq iter the core emits is always step 1, inclusive both ends,
+no leading zeros.
+
+Per-language lowering (sqrt1337's `for i in $(seq 1 10000)`):
+
+| backend | idiom |
+|---|---|
+| C | `for (<width> i = 1; i <= 10000; i++)` — width via `range_width_name` (u32/i32/i64) |
+| JS | native `for (let i = 1; i <= 10000; i++)` (ForStatement) |
+| Perl | `for my $i (1..10000)` — *pending fix*: current output iterates once over a joined string (core-request perl-20260806-sqrt1337-seq-for.md) |
+| Python | `for i in range(a, b + 1)` |
+| Go / Rust / Zig | native counter loop over an Int-typed var |
+
+Loop-var typing: the A2 verdict for the loop var is usually `Str`
+(captureWords yields strings) — the numeric lift must override it to
+`Int` for the loop scope (and exclude it from the function-top
+pre-declaration). The `contains` call (PureCpu — the grep-lift) is
+inlined per backend, never stubbed: C `strstr(s, p) != NULL`, Rust
+`s.contains(p)`, Go `strings.Contains(s, p)`, JS `String(x).includes(p)`,
+Python `p in s`.
+
+Verification: `show_sqrt_langs.sh` (workspace root) runs sqrt1337.sh
+through every backend and diffs each output vs bash (`3657 5598 7165`).
+Current state: **c, js, sh pass**; perl blocked by the filed bug;
+go/rust/python/zig pending the unwrap + `contains` inlining above.
+
 ## 6. The `sh2.*` namespace as data (A4)
 
 The 39-callee corpus surface (`arith, arithEval, arrayIndex, arrayItems,
