@@ -12054,18 +12054,48 @@ fn fs_promise_status(base: Expr, ok: i64, err: i64) -> Expr {
 
 /// A plain literal path arg the native readers accept: non-empty, no
 /// GLOB_MAGIC / PS_MAGIC markers, not a flag (`-` or leading `-`).
+/// A STORE/LIFTED VAR read (`$(cat "$tmp")` — the arg is `getVar("tmp")`
+/// for a store-bound name or a bare lifted binding) is also accepted:
+/// the runtime's exec flattener passes a QUOTED single-word expansion
+/// through verbatim (no field-splitting — the unquoted form arrives as
+/// a `split(...)` call, which never matches), so the native readFile
+/// receives exactly the string the builtin would. The name must be a
+/// plain identifier (a `name[key]` subscript read can yield the
+/// ARITH_BAD_MAGIC marker, which the native chain would treat as a
+/// path). The value is rendered via `expr_to_estree` — the same store
+/// read the runtime would perform.
 fn is_plain_path_arg(e: &IrExpr) -> Option<String> {
-    let IrExpr::Str(sv, _) = e else {
-        return None;
-    };
-    if sv.is_empty()
-        || sv.starts_with(GLOB_MAGIC)
-        || sv.starts_with(PS_MAGIC)
-        || sv.starts_with('-')
-    {
-        return None;
+    match e {
+        IrExpr::Str(sv, _) => {
+            if sv.is_empty()
+                || sv.starts_with(GLOB_MAGIC)
+                || sv.starts_with(PS_MAGIC)
+                || sv.starts_with('-')
+            {
+                return None;
+            }
+            Some(sv.clone())
+        }
+        IrExpr::Var(n, _) => {
+            if is_plain_ident(n) {
+                Some(n.clone())
+            } else {
+                None
+            }
+        }
+        IrExpr::Call { func, args } if func == "getVar" => {
+            if let [IrExpr::Str(n, _)] = args.as_slice() {
+                if is_plain_ident(n) {
+                    Some(n.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
-    Some(sv.clone())
 }
 
 /// `$(mktemp -d)` — a unique temp DIRECTORY (the capture's only statement
@@ -12133,6 +12163,73 @@ fn native_capture_mktemp_dir(e: &IrExpr) -> Option<Expr> {
         0,
         1,
     )))
+}
+
+/// `$(mktemp TPL)` — the FILE form of the temp-creating capture (the
+/// `-d` form has the native fs.mkdtemp path above): the value is the
+/// created unique FILE's path. Node has no mkstemp, so the native
+/// lowering is the runtime's value-returning twin `sh2.mktempValue`
+/// (the dirname/basename pattern — mirrors builtins.mktemp minus the
+/// emit, same lastExit protocol: 0 + path, 1 + "" on a too-few-X
+/// template or exhausted retries). The capture strips the builtin's
+/// trailing newline — the twin returns the bare path. Conservative:
+/// every arg a static string, at most one positional (the template),
+/// no flags other than `-d` (dir — handled above) / `-u` (dry) /
+/// `-t` / `--suffix` — the twin's arg parse mirrors the builtin's, so
+/// the full static flag surface lifts; dynamic args (template from a
+/// var) keep the runtime builtin (the flattener's value is the same,
+/// but the builtin path is already sync — the win here is removing the
+/// capture machinery + dispatch for the common literal-template form).
+fn native_capture_mktemp_file(e: &IrExpr) -> Option<Expr> {
+    if !mktemp_native_enabled() {
+        return None;
+    }
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if func != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(cargs)] = args.as_slice() else {
+        return None;
+    };
+    if name != "mktemp" {
+        return None;
+    }
+    let mut has_dir = false;
+    let mut positionals = 0usize;
+    let mut out_args: Vec<Expr> = Vec::new();
+    for a in cargs {
+        match a {
+            IrExpr::Str(sv, _) => {
+                if sv == "-d" {
+                    has_dir = true; // dir form — the mkdtemp path above
+                }
+                if sv.starts_with('-') && sv != "-" && !sv.starts_with("--suffix=") {
+                    // -u / -t / --suffix / other flags pass through to
+                    // the twin (its parse mirrors the builtin)
+                }
+                if !sv.starts_with('-') {
+                    positionals += 1;
+                }
+                out_args.push(str_lit(sv));
+            }
+            _ => return None, // dynamic arg — keep the runtime builtin
+        }
+    }
+    if has_dir || positionals > 1 {
+        return None;
+    }
+    if cargs.iter().any(|a| matches!(a, IrExpr::Str(sv, _)
+        if sv.contains(GLOB_MAGIC) || sv.contains(PS_MAGIC)
+            || sv.chars().any(|c| (0xF800..=0xF8FF).contains(&(c as u32)))))
+    {
+        return None;
+    }
+    // the twin returns the bare path; lastExit records the status —
+    // exactly the capture's value (the builtin's trailing newline is
+    // stripped by the capture either way).
+    Some(sh2_call("mktempValue", vec![array(out_args)]))
 }
 
 /// `$(cat f...)` / `$(cat < f)` — the capture's value is the files'
@@ -12578,6 +12675,75 @@ fn native_capture_cut_sort(stages: &[IrExpr]) -> Option<Expr> {
     Some(trim_capture(await_expr(chained)))
 }
 
+/// `$(cat FILE | head -N)` / `$(cat FILE | head -c N)` — the capture's
+/// pipeline is cat (single file, no flags) feeding head with a literal
+/// count: the value is the first N lines / bytes of the file — a native
+/// readFile + slice chain (no spawn, no async pipeline machinery).
+/// Mirrors the runtime builtins exactly: head -N takes the first N lines
+/// (`s.split('\n').slice(0, n).join('\n')` with the trailing-newline
+/// rule when more lines remain), head -c N takes the first N bytes
+/// (`s.slice(0, c)`); the capture strips trailing newlines via
+/// trimCapture. cat's exit is 1 on a missing file → readFile rejects →
+/// the (lastExit=1, "") catch — the runtime cat's exact status/value.
+/// The file arg may be a literal path or a store/lifted var read (the
+/// is_plain_path_arg shapes); any other head/cat flag shape keeps the
+/// runtime.
+fn native_capture_cat_head(stages: &[IrExpr]) -> Option<Expr> {
+    if stages.len() != 2 {
+        return None;
+    }
+    let (name1, a1) = pipeline_stage_exec(&stages[0])?;
+    let (name2, a2) = pipeline_stage_exec(&stages[1])?;
+    if name1 != "cat" || name2 != "head" {
+        return None;
+    }
+    // cat: exactly one plain path arg (no stdin marker `-`, no flags)
+    let [file] = a1 else {
+        return None;
+    };
+    let file_expr = native_fs_path_arg(file)?;
+    // head: `-N` / `-n N` / `-nN` (lines) or `-c N` / `-cN` (bytes),
+    // literal non-negative count, no FILE operands (the corpus shape is
+    // stdin-only)
+    let (bytes, n): (bool, u64) = match a2 {
+        [IrExpr::Str(sv, _)] if sv.len() > 2 && sv.starts_with('-') => {
+            match sv.as_bytes()[1] {
+                b'n' => (false, sv[2..].parse().ok()?),
+                b'c' => (true, sv[2..].parse().ok()?),
+                _ => return None,
+            }
+        }
+        [IrExpr::Str(sv, _)] if sv.starts_with('-') && sv.len() > 1 => {
+            (false, sv[1..].parse().ok()?)
+        }
+        [IrExpr::Str(nf, _), IrExpr::Str(nv, _)]
+            if matches!(nf.as_str(), "-n" | "-c") =>
+        {
+            (nf == "-c", nv.parse().ok()?)
+        }
+        _ => return None,
+    };
+    let s = read_file_promise(file_expr, Some("utf8"), 0, 1);
+    let t = ident("t");
+    let value = if bytes {
+        // head -c N: the first N bytes (UTF-8 slice — the runtime's
+        // String.slice on the decoded text, same as builtins.head)
+        method_call(t.clone(), "slice", vec![int_lit_expr(0), int_lit_expr(n as i64)])
+    } else {
+        // head -N: first N lines. `t.split('\n')` — the runtime splits
+        // the RAW content (a trailing newline yields a final empty
+        // element, exactly like builtins.head's split); slice(0, n) +
+        // join('\n') is the runtime's `keep.join('\n')` (the trailing
+        // newline builtins.head appends when lines remain is stripped
+        // by the capture anyway).
+        let lines = method_call(t.clone(), "split", vec![str_lit("\n")]);
+        let keep = method_call(lines, "slice", vec![int_lit_expr(0), int_lit_expr(n as i64)]);
+        method_call(keep, "join", vec![str_lit("\n")])
+    };
+    let chained = method_call(s, "then", vec![sync_arrow_expr_param("t", value)]);
+    Some(trim_capture(await_expr(chained)))
+}
+
 /// `$(wc -l < f)` / `$(wc -c < f)` — newline count / byte count of the
 /// redirected file (the runtime builtin's exact formulas; the fd-0
 /// redirect form is the one the corpus uses — the `wc -l f` filename-arg
@@ -12925,7 +13091,9 @@ fn try_native_capture_value(stmts: &[IrStmt]) -> Option<Expr> {
                 let [IrExpr::Array(stages)] = args.as_slice() else {
                     return None;
                 };
-                native_capture_grep_cut(stages).or_else(|| native_capture_cut_sort(stages))
+                native_capture_grep_cut(stages)
+                    .or_else(|| native_capture_cut_sort(stages))
+                    .or_else(|| native_capture_cat_head(stages))
             }
             _ => None,
         },
@@ -20027,11 +20195,16 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 // `$(mktemp -d)` — the capture's only statement is the
                 // sync mktemp builtin with -d: the value is the created
                 // unique temp directory (see `native_capture_mktemp_dir`)
-                // — no fd swap, no blocking mkdirSync, no dispatch.
+                // — no fd swap, no blocking mkdirSync, no dispatch. The
+                // FILE form `$(mktemp TPL)` lowers to the value twin
+                // `sh2.mktempValue` (see `native_capture_mktemp_file`).
                 if !program_defines_function("mktemp") {
                     if let [IrExpr::Arrow(stmts)] = args.as_slice() {
                         if let [IrStmt::Expr(inner)] = stmts.as_slice() {
                             if let Some(value) = native_capture_mktemp_dir(inner) {
+                                return value;
+                            }
+                            if let Some(value) = native_capture_mktemp_file(inner) {
                                 return value;
                             }
                         }
