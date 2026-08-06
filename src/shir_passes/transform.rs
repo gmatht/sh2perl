@@ -26,7 +26,7 @@ impl super::Transform for ConstantFold {
     }
     fn run(&self, prog: &mut IrProgram, _ctx: &PassContext) {
         // Stage 0: the real fold is still in `ir::optimize_stmts`, called
-        // from `ir_to_perl` and from `shir::ast_to_ir`. The M3 guardrail
+        // from `shir_to_perl` and from `shir::ast_to_ir`. The M3 guardrail
         // proves the output is unchanged when the migration lands.
         let _ = prog;
     }

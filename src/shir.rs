@@ -4,7 +4,7 @@
 //! IR nodes (plus `sh2.*`-namespace calls expressed via `IrExpr::Call`); the
 //! ESTree emitter consumes this IR via `shir_to_estree`, so the shell→ESTree
 //! lowering logic lives in one place (PLAN.md §3). The Perl generator builds
-//! its own IR flavor for `ir_to_perl`; the neutral nodes here
+//! its own IR flavor for `shir_to_perl`; the neutral nodes here
 //! (Case/Redirect/Function/Subshell/Background/Arrow/...) are ESTree-path only.
 
 use crate::ast::*;
@@ -17609,7 +17609,25 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         // `(sh2._g = t, sh2.lastExit = sh2._g ? 0 : 1,
                         // sh2._g)`. The seq is one synchronous run, so a
                         // nested scratch use can never interleave.
-                        if expr_sh2_call_count(&native) <= 1 && !expr_has_await(&native) {
+                        //
+                        // AWAITED natives (file tests — the async
+                        // `sh2.fs.lstat/access` chains) are legal here too
+                        // OUTSIDE a provably-sync function define arrow:
+                        // `(sh2._g = await t, ...)` runs the getVar reads
+                        // before the await (the single-eval protocol
+                        // holds — the then-arrow uses the promise value,
+                        // and the final `sh2._g` read resumes atomically
+                        // after the assignment), and the chain's enclosing
+                        // context is async by construction (module top
+                        // level / async arrows — the sync-arrow and
+                        // *Sync-loop gates scan the LOWERED body and
+                        // disqualify awaited chains consistently). Inside
+                        // a sync arrow (`in_sync_arrow`) the await would
+                        // be a SyntaxError — the runtime test stays there.
+                        let awaited_ok = !in_sync_arrow();
+                        if expr_sh2_call_count(&native) <= 1
+                            && (!expr_has_await(&native) || awaited_ok)
+                        {
                             let tmp = sh2_member("_g");
                             return seq(vec![
                                 Expr::AssignmentExpression {

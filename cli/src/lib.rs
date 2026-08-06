@@ -873,7 +873,7 @@ exit $main_exit_code;
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
-            print!("{}", debashl::ir::ir_to_perl(&prog));
+            print!("{}", debashl::ir::shir_to_perl(&prog));
         }
         "--mir" => {
             if args.len() < 3 {

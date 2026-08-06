@@ -2,7 +2,7 @@ pub mod ast;
 pub mod ast_words;
 pub mod lexer;
 pub mod parser;
-// pub mod mir; // TODO: Fix MIR implementation
+
 pub mod ir;
 pub mod debug;
 pub mod estree;
@@ -33,7 +33,7 @@ pub use ast::*;
 pub use lexer::{Lexer, Token};
 pub use parser::commands::Parser;
 pub use parser::utilities::ParserUtilities;
-// pub use mir::*; // TODO: Fix MIR implementation
+
 pub use generator::Generator;
 #[cfg(test)]
 pub mod estree_debug_tests {

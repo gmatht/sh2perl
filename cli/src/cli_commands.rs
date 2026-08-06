@@ -548,7 +548,7 @@ pub fn parse_shir_json_to_perl(filename: &str) {
         Ok(p) => p,
         Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
     };
-    let perl = debashl::ir::ir_to_perl(&prog);
+    let perl = debashl::ir::shir_to_perl(&prog);
     print!("{}", perl);
 }
 

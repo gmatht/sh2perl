@@ -1,8 +1,19 @@
 /// Intermediate Representation for code generation.
 ///
 /// The generator produces an `IrProgram` from the shell AST.  The Perl
-/// backend `ir_to_perl()` converts it to Perl text.  `RawText`/`RawExpr`
+/// backend `shir_to_perl()` converts it to Perl text.  `RawText`/`RawExpr`
 /// hold unimigrated code so conversion can happen function by function.
+///
+/// **Layering (who owns Perl text):** the AST-side `Generator`
+/// (`src/generator/`) is the primary Perl renderer — it owns the text for
+/// constructs that have not yet migrated to the IR, and `shir_to_perl` is
+/// its ShIR-consumer wrapper (the sibling of `shir_to_estree`). Migrated
+/// constructs flow as real IR nodes: the Generator emits them, `emit_stmt`/
+/// `ir_expr_to_perl` render them, and `IrProgram::from_raw_perl` wraps the
+/// remainder in a single `RawText` blob so the whole program can flow
+/// through the ShIR pipeline (`--shir` → `--shir-in-perl`). When the
+/// migration completes (all Generator functions emit IR nodes), the
+/// wrapper and the Generator's text-building side both go away.
 ///
 /// ShIR direction (PLAN.md §3/§8): this module is being generalized from a
 /// Perl-only IR into a language-neutral ShIR that both the Perl backend and
@@ -515,7 +526,16 @@ fn stmt_uses_say(stmt: &IrStmt) -> bool {
 ///
 /// Style decisions (say vs print, parentheses style, indentation) are
 /// made here, not in the generator.
-pub fn ir_to_perl(prog: &IrProgram) -> String {
+///
+/// Role: this is the ShIR-consumer wrapper of the Perl backend — the
+/// sibling of `shir_to_estree`. The AST-side `Generator` (`src/generator/`)
+/// owns Perl text for constructs that have not yet migrated to the IR;
+/// `ast_to_ir` wraps that output in a single `RawText` blob via
+/// `IrProgram::from_raw_perl` (the migration bridge). As constructs
+/// migrate, the Generator emits real IR nodes and this renderer emits
+/// them as Perl; `from_raw_perl` becomes unnecessary when the Generator
+/// emits pure IR nodes. See PLAN.md §3 and `docs/ir-design.md`.
+pub fn shir_to_perl(prog: &IrProgram) -> String {
     let mut out = String::new();
 
     // Shebang
@@ -686,7 +706,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 }
             } else if *newline {
                 // Use `print` with \n when called via piecemeal stmt_to_perl()
-                // (which cannot manage imports).  Full ir_to_perl() switches to `say`.
+                // (which cannot manage imports).  Full shir_to_perl() switches to `say`.
                 // Try to embed \n directly into string literals for cleaner output.
                 if let Some(embedded) = try_embed_newline_in_string_literal(&expr) {
                     emit_indent(out, indent);
