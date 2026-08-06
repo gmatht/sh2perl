@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::IrStmt;
+use crate::ir::{IrStmt, VarKind};
 
 /// All analysis verdicts, populated by the analysis passes, read by the
 /// renderer (`shir_to_estree`, `ir_to_perl`, future `shir_to_<lang>`).
@@ -28,6 +28,31 @@ pub struct PassContext {
     /// Per-function local lifts: fn name → set of locals lifted to `let`.
     /// Populated by [`crate::shir_passes::analysis::LocalLift`].
     pub lifted_local: HashMap<String, HashSet<String>>,
+
+    // ── Variable lifetimes (the C backend's per-point buffer sizing) ──
+    /// Per-variable live span `(first, last)` in statement positions of a
+    /// pre-order walk — the C generator's per-point buffer-sizing and
+    /// buffer-reuse input (a bounded var whose whole span fits inside one
+    /// loop iteration can reuse a buffer; a var dead after `last` can be
+    /// freed/moved there). Populated by
+    /// [`crate::shir_passes::lifetime::VarLifetimes`].
+    pub var_live_ranges: HashMap<String, (usize, usize)>,
+
+    /// Variables whose storage may be retained beyond the current scope
+    /// (array-element stores, closure captures, function returns). These
+    /// cannot be stack-locals or moved-from; the C generator must copy
+    /// or heap-allocate them.
+    pub var_escapes: HashSet<String>,
+
+    /// Const/var verdicts per assigned variable (the const-markup
+    /// transform): name → `Const` (single assignment site, executes at
+    /// most once, no runtime/arith/index writes, no dynamic write) or
+    /// `Var`. Populated by
+    /// [`crate::shir_passes::analysis::ConstVar`]; consumed by
+    /// [`crate::shir_passes::transform::ConstMarkup`] to attach
+    /// `IrProgram.var_const`, and by renderers that can emit
+    /// `const`/`readonly`.
+    pub const_vars: HashMap<String, VarKind>,
 
     // ── Program-level safety (M6 + M8) ───────────────────────────
     /// `set -e` may be enabled somewhere in this program.
@@ -87,6 +112,13 @@ impl PassContext {
         self.lifted_numeric.contains(name) || self.lifted_string.contains(name)
     }
 
+    /// True when the const-markup analysis proved the variable is written
+    /// exactly once (a `Const` verdict). Missing names are not const (the
+    /// conservative default for a shell variable).
+    pub fn is_const(&self, name: &str) -> bool {
+        self.const_vars.get(name) == Some(&VarKind::Const)
+    }
+
     /// The sh2.* namespace is the floor: every backend renders the
     /// contract; backends may inline further for language idiom.
     /// This helper is the canonical "is this a sh2.* call?" check.
@@ -144,6 +176,20 @@ mod tests {
         assert!(ctx.is_lifted("i"));
         assert!(ctx.is_lifted("name"));
         assert!(!ctx.is_lifted("x"));
+    }
+
+    #[test]
+    fn is_const_defaults_to_false() {
+        let mut ctx = PassContext::default();
+        // nothing analyzed → nothing is const (conservative default)
+        assert!(!ctx.is_const("x"));
+        ctx.const_vars
+            .insert("x".to_string(), crate::ir::VarKind::Const);
+        assert!(ctx.is_const("x"));
+        // an explicit Var verdict is not const
+        ctx.const_vars
+            .insert("y".to_string(), crate::ir::VarKind::Var);
+        assert!(!ctx.is_const("y"));
     }
 
     #[test]

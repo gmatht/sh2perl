@@ -2229,6 +2229,31 @@ pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> 
         }
     }
 
+    /// Bare identifier tokens inside an arithmetic expression string
+    /// (`let x++` / `let "x = 5"` / `((x+=1))`): every identifier is a
+    /// potential runtime-store write — mirror of mark_all_idents.
+    fn arith_idents(s: &str, out: &mut Vec<String>) {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c.is_ascii_alphabetic() || c == '_' {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                {
+                    i += 1;
+                }
+                let w = &s[start..i];
+                if crate::shared_utils::SharedUtils::is_variable_name(w) {
+                    out.push(w.to_string());
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// The builtin-command shape shared by `IrStmt::Exec` and the
     /// `Call("exec"/"builtin", …)` expression form: args[0] = the command
     /// name, args[1] = the arg-list Array. Classifies the write, if any.
@@ -2256,11 +2281,17 @@ pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> 
             return;
         }
         if cname == "let" {
-            // `let x=5` / `let x++` — the runtime evaluates arith strings;
-            // every bare identifier is a potential write (mirror of
-            // mark_all_idents for the exec arg shape). Conservative.
+            // `let x=5` / `let x++` / `((x+=1))` — the runtime evaluates
+            // arith strings; every bare identifier is a potential write
+            // (mirror of mark_all_idents for the exec arg shape).
+            // Conservative: `let x=5` as the only write lands Var (a
+            // missed const, never a wrong one).
             let mut names = Vec::new();
-            builtin_names(rest, &mut names);
+            for a in rest {
+                if let IrExpr::Str(sv, _) = a {
+                    arith_idents(sv, &mut names);
+                }
+            }
             for n in names {
                 acc.runtime_written.insert(n);
             }
@@ -2290,6 +2321,13 @@ pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> 
             }
             IrExpr::Call { func, args } => {
                 if func == "setVar" {
+                    if let [IrExpr::Str(name, _), _] = args.as_slice() {
+                        site(acc, name, multi_run);
+                    }
+                }
+                if func == "setArray" {
+                    // `arr=(a b c)` / `declare -a arr=(…)` — the array
+                    // declaration is a single assignment site
                     if let [IrExpr::Str(name, _), _] = args.as_slice() {
                         site(acc, name, multi_run);
                     }
@@ -2372,10 +2410,14 @@ pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> 
         match st {
             IrStmt::Assign { targets, expr } => {
                 for t in targets {
-                    if t.indices.is_empty() {
+                    // array-element writes arrive either with a non-empty
+                    // `indices` list or with the index baked into the name
+                    // (`arr[1]=z` → var "arr[1]") — the store owns the
+                    // element either way.
+                    if t.indices.is_empty() && !t.var.contains('[') {
                         site(acc, &t.var, multi_run);
                     } else {
-                        acc.index_written.insert(t.var.clone());
+                        acc.index_written.insert(t.var.split('[').next().unwrap_or(&t.var).to_string());
                     }
                 }
                 walk_expr(expr, acc, multi_run);
@@ -2497,11 +2539,15 @@ pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> 
     }
 
     let mut names: Vec<String> = acc.sites.keys().cloned().collect();
+    names.extend(acc.runtime_written.iter().cloned());
+    names.extend(acc.arith_written.iter().cloned());
+    names.extend(acc.index_written.iter().cloned());
     names.sort();
+    names.dedup();
     names
         .into_iter()
         .map(|n| {
-            let is_const = acc.sites[&n] == 1
+            let is_const = acc.sites.get(&n).copied() == Some(1)
                 && !acc.multi_run.contains(&n)
                 && !acc.runtime_written.contains(&n)
                 && !acc.arith_written.contains(&n)
@@ -18150,5 +18196,92 @@ mod range_analysis_tests {
             "RANGE TALLY: files={} numeric_lift_vars={} range_proven={} widths={:?} files_with_narrow={}",
             files, total_numeric, total_proven, widths, narrowed_files
         );
+    }
+}
+
+mod const_analysis_tests {
+    use super::*;
+
+    fn consts_of(src: &str) -> Vec<(String, crate::ir::VarKind)> {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        analyze_var_const(&prog)
+    }
+
+    fn kind<'a>(v: &'a [(String, crate::ir::VarKind)], n: &str) -> Option<crate::ir::VarKind> {
+        v.iter().find(|(x, _)| x == n).map(|(_, k)| *k)
+    }
+
+    #[test]
+    fn single_assignment_is_const() {
+        let v = consts_of("x=5\necho $x");
+        assert_eq!(kind(&v, "x"), Some(crate::ir::VarKind::Const));
+    }
+
+    #[test]
+    fn reassignment_is_var() {
+        let v = consts_of("x=5\nx=6");
+        assert_eq!(kind(&v, "x"), Some(crate::ir::VarKind::Var));
+    }
+
+    #[test]
+    fn loop_vars_and_loop_accumulators_are_var() {
+        let v = consts_of("sum=0\nfor i in 1 2 3; do sum=$((sum + i)); done");
+        // `sum` is assigned twice (init + accumulate) and `i` per iteration
+        assert_eq!(kind(&v, "sum"), Some(crate::ir::VarKind::Var));
+        assert_eq!(kind(&v, "i"), Some(crate::ir::VarKind::Var));
+    }
+
+    #[test]
+    fn read_builtin_writes_are_var() {
+        let v = consts_of("read line\necho $line");
+        assert_eq!(kind(&v, "line"), Some(crate::ir::VarKind::Var));
+    }
+
+    #[test]
+    fn eval_disqualifies_everything() {
+        let v = consts_of("x=5\neval \"$cmd\"");
+        assert_eq!(kind(&v, "x"), Some(crate::ir::VarKind::Var));
+    }
+
+    #[test]
+    fn function_body_assignment_is_var() {
+        // a function may run 0..N times — its writes are multi-run
+        let v = consts_of("f() { x=5; }\nf");
+        assert_eq!(kind(&v, "x"), Some(crate::ir::VarKind::Var));
+    }
+
+    #[test]
+    fn local_declaration_is_var_in_function() {
+        // single site, but inside a function body → multi-run → Var
+        let v = consts_of("f() { local x=5; echo $x; }\nf");
+        assert_eq!(kind(&v, "x"), Some(crate::ir::VarKind::Var));
+    }
+
+    #[test]
+    fn readonly_decl_is_const() {
+        let v = consts_of("readonly limit=10\necho $limit");
+        assert_eq!(kind(&v, "limit"), Some(crate::ir::VarKind::Const));
+    }
+
+    #[test]
+    fn native_arith_write_is_var() {
+        let v = consts_of("x=1\n((x++))");
+        assert_eq!(kind(&v, "x"), Some(crate::ir::VarKind::Var));
+    }
+
+    #[test]
+    fn array_element_write_is_var() {
+        let v = consts_of("arr=(a b c)\narr[1]=z");
+        assert_eq!(kind(&v, "arr"), Some(crate::ir::VarKind::Var));
+    }
+
+    #[test]
+    fn conditional_single_assignment_stays_const() {
+        // one site, executes at most once → still Const (the C backend may
+        // only consume it for unconditional top-level sites; the markup is
+        // the conservative verdict)
+        let v = consts_of("if true; then y=5; fi\necho $y");
+        assert_eq!(kind(&v, "y"), Some(crate::ir::VarKind::Const));
     }
 }

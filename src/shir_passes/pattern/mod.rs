@@ -72,6 +72,9 @@ mod tests {
             stmts: vec![],
             subs: vec![],
             var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
         };
         let n = walk_exprs(&prog, |_| None);
         assert_eq!(n, 0);
@@ -88,6 +91,9 @@ mod tests {
             stmts: vec![IrStmt::Expr(IrExpr::Int(42))],
             subs: vec![],
             var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
         };
         let n = walk_exprs(&prog, |_| Some(IrExpr::Int(0)));
         assert_eq!(n, 0);

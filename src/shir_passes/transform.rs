@@ -62,9 +62,31 @@ impl super::Transform for ImportMinimize {
     }
 }
 
+/// Attach the const/var verdicts to the IR: `IrProgram.var_const` is
+/// populated from the [`analysis::ConstVar`] verdicts in `PassContext`
+/// (sorted by name for deterministic serialization). This is the
+/// "extend the shIR with the const/var markup" step of the pipeline —
+/// after it runs, every consumer of `IrProgram` (renderers, the ShIR
+/// JSON contract via `shir_json.rs`) sees the markup without recomputing
+/// it. Idempotent: re-running overwrites with the same verdicts.
+pub struct ConstMarkup;
+
+impl super::Transform for ConstMarkup {
+    fn name(&self) -> &'static str {
+        "const_markup"
+    }
+    fn run(&self, prog: &mut IrProgram, ctx: &PassContext) {
+        let mut verdicts: Vec<(String, crate::ir::VarKind)> =
+            ctx.const_vars.iter().map(|(n, k)| (n.clone(), *k)).collect();
+        verdicts.sort_by(|a, b| a.0.cmp(&b.0));
+        prog.var_const = verdicts;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shir_passes::Transform as _;
     use crate::ir::IrProgram;
 
     fn empty_prog() -> IrProgram {
@@ -74,6 +96,9 @@ mod tests {
             stmts: vec![],
             subs: vec![],
             var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
         }
     }
 
@@ -83,6 +108,7 @@ mod tests {
             Box::new(ConstantFold),
             Box::new(DeadAssignmentElim),
             Box::new(ImportMinimize),
+            Box::new(ConstMarkup),
         ];
         let mut names: Vec<&str> = transforms.iter().map(|t| t.name()).collect();
         names.sort();
@@ -97,10 +123,11 @@ mod tests {
 
     #[test]
     fn transforms_are_pure_pass_through_in_stage_0() {
-        // Stage 0 contract: the transforms are stubs that must not
-        // mutate the program. The migration lands in stage 1; this
-        // test pins the no-op behaviour so a premature wiring-up is
-        // caught immediately.
+        // Stage 0 contract: the migrated-later transforms are stubs that
+        // must not mutate the program (ConstMarkup is the exception — it
+        // is the real const-markup transform and is tested separately).
+        // The migration lands in stage 1; this test pins the no-op
+        // behaviour so a premature wiring-up is caught immediately.
         let mut prog = empty_prog();
         let ctx = PassContext::default();
         let snapshot = prog.clone();
@@ -113,5 +140,38 @@ mod tests {
             t.run(&mut prog, &ctx);
         }
         assert_eq!(prog, snapshot);
+    }
+
+    #[test]
+    fn const_markup_attaches_sorted_verdicts() {
+        use crate::ir::{IrExpr, IrStmt};
+        let mut ctx = PassContext::default();
+        ctx.const_vars
+            .insert("z".to_string(), crate::ir::VarKind::Var);
+        ctx.const_vars
+            .insert("x".to_string(), crate::ir::VarKind::Const);
+        let mut prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Expr(IrExpr::Int(1))],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+        };
+        ConstMarkup.run(&mut prog, &ctx);
+        // sorted by name: x before z
+        assert_eq!(
+            prog.var_const,
+            vec![
+                ("x".to_string(), crate::ir::VarKind::Const),
+                ("z".to_string(), crate::ir::VarKind::Var),
+            ]
+        );
+        // idempotent
+        let before = prog.var_const.clone();
+        ConstMarkup.run(&mut prog, &ctx);
+        assert_eq!(prog.var_const, before);
     }
 }
