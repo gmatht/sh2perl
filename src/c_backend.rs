@@ -98,7 +98,7 @@ pub struct Render {
     need_lower: bool,
     need_slice: bool,
     /// named-temp counter for statement-level snprintf buffers
-    /// (`char _sN[64]; snprintf(_sN, ...)` before the enclosing stmt)
+    /// (`char _sN[cap]; snprintf(_sN, ...)` before the enclosing stmt)
     temp_seq: usize,
     todo: usize,
 }
@@ -394,7 +394,14 @@ impl Render {
                     let needle_c = if self.expr_is_num(needle) {
                         let t = format!("_s{}", self.temp_seq);
                         self.temp_seq += 1;
-                        self.emit(&format!("char {t}[64];"));
+                        // size the temp to the value's proven width:
+                        // u32 11 ("4294967295"), i32 12 ("-2147483648"),
+                        // i64 21 ("-9223372036854775808") — each + NUL.
+                        // snprintf truncates, so this is headroom, not
+                        // correctness; the range analysis proves the value
+                        // fits (its width is what we sized against).
+                        let cap = width_buf_len(self.expr_width(needle));
+                        self.emit(&format!("char {t}[{cap}];"));
                         let e = self.expr(needle);
                         // (long long) cast: the operand may be a narrowed
                         // u32/i32 var; the cast canonicalizes the vararg
@@ -791,6 +798,29 @@ impl Render {
         self.var_widths.get(name).copied().unwrap_or(Width::I64)
     }
 
+    /// The width of a numeric expression: a typed var's width, or the
+    /// range-derived width of an arith result (None range → i64). Used to
+    /// size stringification temps exactly.
+    fn expr_width(&self, e: &IrExpr) -> Width {
+        match e {
+            IrExpr::Var(name, _) | IrExpr::Ident(name) => self.width_of_var(name),
+            IrExpr::Arith(a) => {
+                let state: HashMap<String, Option<(i64, i64)>> = self
+                    .var_ranges
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Some(*v)))
+                    .collect();
+                match arith_range_local(a, &state) {
+                    Some((lo, hi)) => {
+                        Width::from_range_name(crate::shir::range_width_name(lo, hi))
+                    }
+                    None => Width::I64,
+                }
+            }
+            _ => Width::I64,
+        }
+    }
+
     /// Render an expression as a C integer (Int-typed assignment target).
     fn expr_as_num(&mut self, e: &IrExpr) -> String {
         match e {
@@ -1008,6 +1038,19 @@ fn is_ident(s: &str) -> bool {
 }
 
 // ── numeric-range wiring (core's analyze_var_ranges / range_width_name) ──
+
+/// Byte size (chars + '\0') of a decimal string for the given width:
+///   u32 `"4294967295"`        → 10 + 1 = 11
+///   i32 `"-2147483648"`       → 11 + 1 = 12
+///   i64 `"-9223372036854775808"` → 20 + 1 = 21 (u64's 20 digits too,
+///      so 21 is the universal 64-bit bound)
+fn width_buf_len(w: Width) -> usize {
+    match w {
+        Width::U32 => 11,
+        Width::I32 => 12,
+        Width::I64 => 21,
+    }
+}
 
 /// Detect a `Range` iterable and the shell `for x in $(seq a b)` shape
 /// (core-lowered `Array([Range])` or pre-lift captureWords → arrow →
