@@ -770,13 +770,36 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             match stmts_to_shell_cmd(inner) {
                 Some(mut cmd) => {
                     let mut ok = true;
+                    let mut heredocs: Vec<(String, String)> = Vec::new();
                     for r in redirects {
                         let fd = r.fd.unwrap_or(1);
                         let target = call_arg_str(&r.target).unwrap_or_default();
-                        if !append_redirect_frag(&mut cmd, fd as i64, &r.mode, &target) {
-                            ok = false;
-                            break;
+                        match r.mode.as_str() {
+                            "heredoc" => {
+                                // <<EOF — the body is the target; feed it via
+                                // bash heredoc syntax at the end of the command.
+                                let delim = if r.interpolate { "_SH2DOC_" } else { "'_SH2DOC_'" };
+                                cmd.push_str(&format!(" <<{}", delim));
+                                heredocs.push(("_SH2DOC_".to_string(), target));
+                            }
+                            "herestring" => {
+                                cmd.push_str(&format!(" <<< '{}'", target.replace('\'', "'\\\\''")));
+                            }
+                            _ => {
+                                if !append_redirect_frag(&mut cmd, fd as i64, &r.mode, &target) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
                         }
+                    }
+                    for (delim, body) in heredocs {
+                        cmd.push('\n');
+                        cmd.push_str(&body);
+                        if !body.ends_with('\n') {
+                            cmd.push('\n');
+                        }
+                        cmd.push_str(&delim);
                     }
                     if ok {
                         emit_indent(out, indent);
