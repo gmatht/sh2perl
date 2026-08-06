@@ -1105,15 +1105,20 @@ mod tests {
 
     #[test]
     fn echo_single_arg_skips_the_join() {
-        // `echo $i` — one non-literal arg: `[String(i)].join(" ")` is
+        // `echo "$i"` — one QUOTED non-literal arg: `[String(i)].join(" ")` is
         // exactly `String(i)` (a one-element join never inserts the
         // separator), so the emitter emits the bare value — no array /
-        // join machinery. Multi-arg echo keeps the join (the separator).
-        let json = to_json("i=42; echo $i");
+        // join machinery. An UNQUOTED `echo $i` is a field-split arg (the
+        // A1 split marker) and legitimately takes the flat/join path (the
+        // shortcut would comma-join a multi-word value).
+        let json = to_json("i=42; echo \"$i\"");
         assert!(json.contains("\"name\":\"String\""));
         assert!(!json.contains("\"name\":\"join\""), "single arg: no join");
         assert!(!json.contains("\"type\":\"ArrayExpression\""), "single arg: no array");
         assert!(!json.contains("unsupported"));
+        // unquoted: the split arg keeps the flat/join path
+        let json_unq = to_json("i=42; echo $i");
+        assert!(json_unq.contains("\"name\":\"join\""));
         // two args keep the word-join
         let json2 = to_json("i=42; echo $i $i");
         assert!(json2.contains("\"name\":\"join\""));
