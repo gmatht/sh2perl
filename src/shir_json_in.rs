@@ -712,6 +712,26 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// The const-markup round-trips: `--shir` attaches the verdicts
+    /// (LIMIT const, i/sum var), the reader ingests them, and re-serializing
+    /// is byte-identical.
+    #[test]
+    fn var_const_roundtrip() {
+        let json = round_trip("LIMIT=10\nsum=0\nfor i in 1 2; do sum=$((sum+i)); done\necho $LIMIT $sum");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let vc = v.get("var_const").and_then(|x| x.as_array());
+        assert!(vc.is_some(), "var_const missing from serialized ShIR: {json}");
+        let vc = vc.unwrap();
+        assert_eq!(vc.len(), 3, "expected LIMIT/i/sum verdicts, got {vc:?}");
+        let names: Vec<&str> = vc.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["LIMIT", "i", "sum"], "sorted by name");
+        let kinds: Vec<&str> = vc.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["Const", "Var", "Var"]);
+        // unknown kind rejected
+        let bad = json.replace("\"Var\"", "\"Maybe\"");
+        assert!(shir_json_to_ir(&bad).is_err());
+    }
+
     #[test]
     fn contract_version_required() {
         let mut prog = IrProgram { imports: vec![], requires: vec![],
