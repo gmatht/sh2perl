@@ -4,12 +4,16 @@
 //! `shir_to_c(&IrProgram) -> String`.
 //!
 //! Uses the core's A2 type verdicts (`IrProgram.var_types`): `Int` vars →
-//! C `long long`, `Str` vars → `char*`, anything else → runtime store
-//! (`char*` + sh2.* stubs in this draft). Identifiers are mangled against
-//! C keywords (A6-consistent). Everything outside the lowable subset
-//! (numeric arith, echo/printf, if/else, simple assignment) emits a
-//! compile-able `sh2.*` stub or a `/* TODO(unsupported) */` marker, so
-//! the draft always compiles.
+//! C `long long` narrowed by the range analysis (`analyze_var_ranges` +
+//! `range_width_name`, M8 spike) to `unsigned int`/`int` when the
+//! conservative [lo, hi] provably fits — the var AND every arith expr
+//! mentioning it must stay in width (a var's width covers its arithmetic
+//! RESULTS, not just its own values). `Str` vars → `char*`, anything
+//! else → runtime store (`char*` + sh2.* stubs in this draft).
+//! Identifiers are mangled against C keywords (A6-consistent). Everything
+//! outside the lowable subset (numeric arith, echo/printf, if/else,
+//! simple assignment) emits a compile-able `sh2.*` stub or a
+//! `/* TODO(unsupported) */` marker, so the draft always compiles.
 //!
 //! Also consumes the core's conservative string-length analysis
 //! (`IrProgram.var_lengths`, fbedac4): a Str var with a known bound N
@@ -20,9 +24,9 @@
 //! assert is the debug-mode tripwire; under NDEBUG `strncpy` truncates.
 //! Unbounded (None) vars stay `char*`.
 //!
-//! The naive string/number coercion here is exactly the "C needs type
-//! inference" gap PLAN.md v2 flagged; the design doc surfaces it as the
-//! next work item.
+//! The naive string/number coercion here is the residual "C needs type
+//! inference" gap PLAN.md v2 flagged (the numeric width side is now
+//! covered by the range analysis; the string side stays open).
 
 use crate::ir::{ArithAst, IrExpr, IrProgram, IrStmt, IrType, InterpPart};
 use std::collections::{BTreeSet, HashMap};
@@ -30,6 +34,45 @@ use std::collections::{BTreeSet, HashMap};
 enum Part {
     Lit(String),
     Arg(String, bool),
+}
+
+/// C width from the core's range analysis (`range_width_name`): an
+/// Int-typed var whose conservative [lo, hi] value range provably fits
+/// a narrower type than `long long` is declared at that width. Ordering
+/// for widening: I64 > I32 > U32 (by signed capacity — the analysis
+/// stays consistent, so a var's own range and the ranges of the arith
+/// exprs mentioning it always share a common width).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Width {
+    U32,
+    I32,
+    I64,
+}
+
+impl Width {
+    fn c_type(self) -> &'static str {
+        match self {
+            Width::U32 => "unsigned int",
+            Width::I32 => "int",
+            Width::I64 => "long long",
+        }
+    }
+
+    fn from_range_name(name: &str) -> Width {
+        match name {
+            "u32" => Width::U32,
+            "i32" => Width::I32,
+            _ => Width::I64,
+        }
+    }
+
+    fn widen(self, other: Width) -> Width {
+        match (self, other) {
+            (Width::I64, _) | (_, Width::I64) => Width::I64,
+            (Width::I32, _) | (_, Width::I32) => Width::I32,
+            _ => Width::U32,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -42,6 +85,13 @@ pub struct Render {
     /// analyze_string_lengths); None = unbounded. Only vars in the
     /// analysis' assign set appear.
     var_lengths: HashMap<String, Option<u64>>,
+    /// var name -> conservative [lo, hi] (analyze_var_ranges + the
+    /// Range/seq for-iter seeds the analysis doesn't track).
+    var_ranges: HashMap<String, (i64, i64)>,
+    /// var name -> effective C width: the widest of the var's own range
+    /// and every arith-expr result range mentioning it (a var's width
+    /// must cover its arithmetic results, not just its own values).
+    var_widths: HashMap<String, Width>,
     /// distinct sh2.* callee names that need stubs
     sh2_calls: BTreeSet<String>,
     need_upper: bool,
@@ -64,9 +114,20 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // JSON path; the library path must run the same ones.
     prog.var_types = crate::shir::analyze_var_types(&prog);
     prog.var_lengths = crate::shir::analyze_string_lengths(&prog);
+    // Range analysis (M8 spike): conservative [lo, hi] per assigned var,
+    // + the Range/seq for-iter seeds the analysis doesn't track (loop
+    // vars are excluded from its assign set).
+    let mut ranges = crate::shir::analyze_var_ranges(&prog);
+    seed_loop_var_ranges(&prog.stmts, &mut ranges);
+    // Effective widths: a var's width must cover every arith-expr result
+    // mentioning it (e.g. i in [1, 70000] is u32, but i*i needs i64), so
+    // narrow only when the var AND all its arithmetic stay in width.
+    let widths = effective_widths(&prog, &ranges);
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.var_lengths = prog.var_lengths.iter().cloned().collect();
+    r.var_ranges = ranges;
+    r.var_widths = widths;
     r.program(&prog);
     r.out.join("\n")
 }
@@ -335,7 +396,10 @@ impl Render {
                         self.temp_seq += 1;
                         self.emit(&format!("char {t}[64];"));
                         let e = self.expr(needle);
-                        self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", {e});"));
+                        // (long long) cast: the operand may be a narrowed
+                        // u32/i32 var; the cast canonicalizes the vararg
+                        // type to match %lld regardless of width
+                        self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", (long long)({e}));"));
                         t
                     } else {
                         self.expr(needle)
@@ -542,7 +606,7 @@ impl Render {
                     let name = self.c_ident(&d.name);
                     if self.is_num(&d.name) {
                         let v = init_expr.clone().unwrap_or_else(|| "0".into());
-                        self.emit(&format!("long long {name} = {v};"));
+                        self.emit(&format!("{} {name} = {v};", self.width_of_var(&d.name).c_type()));
                     } else if let Some(b) = self.buf_bound(&d.name) {
                         self.emit(&format!("char {name}[{}] = \"\";", b + 1));
                         if let Some(v) = init_expr.clone() {
@@ -600,7 +664,7 @@ impl Render {
                 // var is usually Str (captureWords returns strings), so the
                 // lift overrides it to Int for the loop scope and restores
                 // it afterwards.
-                if let Some((first, last, step)) = self.seq_range(iter) {
+                if let Some((first, last, step)) = seq_iter_range(iter) {
                     let name = self.c_ident(var);
                     let prev_type = self.var_types.get(var).copied();
                     self.var_types.insert(var.clone(), IrType::Int);
@@ -610,8 +674,12 @@ impl Render {
                         -1 => format!("{name}--"),
                         s => format!("{name} += {s}"),
                     };
+                    // the loop var's width comes from the range analysis
+                    // (seed + every arith expr in the body that mentions
+                    // it) — `for (int i = 1; ...)` when [lo, hi] fits
+                    let ty = self.width_of_var(var).c_type();
                     self.emit(&format!(
-                        "for (long long {name} = {first}; {name} {cmp} {last}; {upd}) {{"
+                        "for ({ty} {name} = {first}; {name} {cmp} {last}; {upd}) {{"
                     ));
                     self.depth += 1;
                     for s in body {
@@ -717,93 +785,10 @@ impl Render {
         }
     }
 
-    /// Detect the shell `for x in $(seq a b)` iter (the captureWords →
-    /// arrow → exec "seq" shape) and a core-lowered `IrExpr::Range`.
-    /// Returns (first, last, step):
-    ///   - `Range { start, end }` → (start, end, 1)
-    ///   - `Array([Call("captureWords", [Arrow([Expr(Call("exec",
-    ///       [Str("seq"), Array(numargs])]))])])])` → parsed numeric seq
-    ///     args, `seq [FIRST [INCREMENT]] LAST`
-    /// Anything else (general word lists, non-seq commands) → None, so the
-    /// caller falls back to the array-items path or a TODO marker.
-    fn seq_range(&self, iter: &IrExpr) -> Option<(i64, i64, i64)> {
-        match iter {
-            IrExpr::Range { start, end } => Some((*start, *end, 1)),
-            IrExpr::Array(items) if items.len() == 1 => {
-                match items.first() {
-                    // core-lowered `seq_range_for` (in flight in the
-                    // single-owner core): Array([Range{start,end}]). The
-                    // core is conservative (3-arg steps, leading zeros,
-                    // body writes, nested same-var binds stay on the
-                    // word path), so a Range here is always step 1.
-                    Some(IrExpr::Range { start, end }) => Some((*start, *end, 1)),
-                    // pre-lift shell shape (the worktree's own core):
-                    // Array([Call("captureWords", [Arrow([Expr(Call(
-                    //   "exec", [Str("seq"), Array(numargs])]))])])])
-                    Some(cap) => self.seq_capture_words(cap),
-                    None => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Parse the pre-lift `captureWords → arrow → exec "seq"` iterable
-    /// (seq [FIRST [INCREMENT]] LAST); None → not a numeric seq.
-    fn seq_capture_words(&self, cap: &IrExpr) -> Option<(i64, i64, i64)> {
-        let IrExpr::Call { func, args } = cap else {
-            return None;
-        };
-        if func != "captureWords" {
-            return None;
-        }
-        let arrow = args.first()?;
-        let IrExpr::Arrow(body) = arrow else {
-            return None;
-        };
-        if body.len() != 1 {
-            return None;
-        }
-        let stmt = body.first()?;
-        let exec_call = match stmt {
-            IrStmt::Expr(e) => e,
-            _ => return None,
-        };
-        let IrExpr::Call { func, args } = exec_call else {
-            return None;
-        };
-        if func != "exec" {
-            return None;
-        }
-        let IrExpr::Str(cmd, _) = args.first()? else {
-            return None;
-        };
-        if cmd != "seq" {
-            return None;
-        }
-        let IrExpr::Array(seqargs) = args.get(1)? else {
-            return None;
-        };
-        if seqargs.is_empty() || seqargs.len() > 3 {
-            return None;
-        }
-        let num = |e: &IrExpr| -> Option<i64> {
-            match e {
-                IrExpr::Str(s, _) => s.trim().parse::<i64>().ok(),
-                IrExpr::Int(n) => Some(*n),
-                _ => None,
-            }
-        };
-        let last = num(seqargs.last()?)?;
-        let (first, step) = match seqargs.len() {
-            1 => (1, 1),
-            2 => (num(&seqargs[0])?, 1),
-            _ => (num(&seqargs[0])?, num(&seqargs[1])?),
-        };
-        if step == 0 {
-            return None;
-        }
-        Some((first, last, step))
+    /// The effective C width of an Int-typed var (from the range
+    /// analysis; missing = no proof → long long).
+    fn width_of_var(&self, name: &str) -> Width {
+        self.var_widths.get(name).copied().unwrap_or(Width::I64)
     }
 
     /// Render an expression as a C integer (Int-typed assignment target).
@@ -847,7 +832,7 @@ impl Render {
         for v in &vars {
             let name = self.c_ident(v);
             if self.is_num(v) {
-                self.emit(&format!("long long {name} = 0;"));
+                self.emit(&format!("{} {name} = 0;", self.width_of_var(v).c_type()));
             } else if let Some(b) = self.buf_bound(v) {
                 // the fixed-buffer transform: the var_lengths analysis
                 // proves len(v) <= b, so the buffer is b+1 bytes
@@ -1020,4 +1005,369 @@ fn is_ident(s: &str) -> bool {
     !s.is_empty()
         && s.chars().next().unwrap().is_ascii_alphabetic()
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+// ── numeric-range wiring (core's analyze_var_ranges / range_width_name) ──
+
+/// Detect a `Range` iterable and the shell `for x in $(seq a b)` shape
+/// (core-lowered `Array([Range])` or pre-lift captureWords → arrow →
+/// exec "seq"); returns (first, last, step). Anything else → None.
+fn seq_iter_range(iter: &IrExpr) -> Option<(i64, i64, i64)> {
+    match iter {
+        IrExpr::Range { start, end } => Some((*start, *end, 1)),
+        IrExpr::Array(items) if items.len() == 1 => match items.first() {
+            Some(IrExpr::Range { start, end }) => Some((*start, *end, 1)),
+            Some(cap) => seq_capture_words(cap),
+            None => None,
+        },
+        _ => None,
+    }
+}
+
+/// Parse the pre-lift `captureWords → arrow → exec "seq"` iterable
+/// (seq [FIRST [INCREMENT]] LAST); None → not a numeric seq.
+fn seq_capture_words(cap: &IrExpr) -> Option<(i64, i64, i64)> {
+    let IrExpr::Call { func, args } = cap else {
+        return None;
+    };
+    if func != "captureWords" {
+        return None;
+    }
+    let arrow = args.first()?;
+    let IrExpr::Arrow(body) = arrow else {
+        return None;
+    };
+    if body.len() != 1 {
+        return None;
+    }
+    let stmt = body.first()?;
+    let exec_call = match stmt {
+        IrStmt::Expr(e) => e,
+        _ => return None,
+    };
+    let IrExpr::Call { func, args } = exec_call else {
+        return None;
+    };
+    if func != "exec" {
+        return None;
+    }
+    let IrExpr::Str(cmd, _) = args.first()? else {
+        return None;
+    };
+    if cmd != "seq" {
+        return None;
+    }
+    let IrExpr::Array(seqargs) = args.get(1)? else {
+        return None;
+    };
+    if seqargs.is_empty() || seqargs.len() > 3 {
+        return None;
+    }
+    let num = |e: &IrExpr| -> Option<i64> {
+        match e {
+            IrExpr::Str(s, _) => s.trim().parse::<i64>().ok(),
+            IrExpr::Int(n) => Some(*n),
+            _ => None,
+        }
+    };
+    let last = num(seqargs.last()?)?;
+    let (first, step) = match seqargs.len() {
+        1 => (1, 1),
+        2 => (num(&seqargs[0])?, 1),
+        _ => (num(&seqargs[0])?, num(&seqargs[1])?),
+    };
+    if step == 0 {
+        return None;
+    }
+    Some((first, last, step))
+}
+
+/// Seed loop-var ranges from Range/seq For iters — `analyze_var_ranges`
+/// doesn't track for-loop bindings (its For arm marks body-assigned vars
+/// unbounded). Nested loops and branches are walked; an existing range
+/// joins (widens) with the seed.
+fn seed_loop_var_ranges(stmts: &[IrStmt], ranges: &mut HashMap<String, (i64, i64)>) {
+    for s in stmts {
+        match s {
+            IrStmt::For { var, iter, body } => {
+                if let Some((first, last, _)) = seq_iter_range(iter) {
+                    let (lo, hi) = (first.min(last), first.max(last));
+                    match ranges.get(var) {
+                        Some((l0, h0)) => {
+                            ranges.insert(var.clone(), ((*l0).min(lo), (*h0).max(hi)));
+                        }
+                        None => {
+                            ranges.insert(var.clone(), (lo, hi));
+                        }
+                    }
+                }
+                seed_loop_var_ranges(body, ranges);
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                seed_loop_var_ranges(b, ranges);
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                seed_loop_var_ranges(then, ranges);
+                for (_, b) in elsifs {
+                    seed_loop_var_ranges(b, ranges);
+                }
+                seed_loop_var_ranges(else_, ranges);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                seed_loop_var_ranges(body, ranges);
+            }
+            IrStmt::Redirect { inner, .. } => seed_loop_var_ranges(inner, ranges),
+            _ => {}
+        }
+    }
+}
+
+/// Effective C width per Int-typed var: the widest of the var's own
+/// [lo, hi] (range_width_name) and every arith-expr result range that
+/// mentions it. Sound: a var's width must cover the RESULTS of the
+/// arithmetic computed on it, not just its own values — `i` in
+/// [1, 70000] is u32, but `(i * i)` needs i64. An arith expr whose range
+/// is unknown (None) forces i64 — no proof, no narrowing.
+fn effective_widths(
+    prog: &IrProgram,
+    ranges: &HashMap<String, (i64, i64)>,
+) -> HashMap<String, Width> {
+    let state: HashMap<String, Option<(i64, i64)>> =
+        ranges.iter().map(|(k, v)| (k.clone(), Some(*v))).collect();
+    let mut widths: HashMap<String, Width> = HashMap::new();
+    for (name, (lo, hi)) in ranges {
+        widths.insert(
+            name.clone(),
+            Width::from_range_name(crate::shir::range_width_name(*lo, *hi)),
+        );
+    }
+    walk_widths_stmts(&prog.stmts, &state, &mut widths);
+    widths
+}
+
+fn walk_widths_stmts(
+    stmts: &[IrStmt],
+    state: &HashMap<String, Option<(i64, i64)>>,
+    widths: &mut HashMap<String, Width>,
+) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { expr, .. } => walk_widths_expr(expr, state, widths),
+            IrStmt::Declare { init, .. } => {
+                if let Some(e) = init {
+                    walk_widths_expr(e, state, widths);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for e in elements {
+                    walk_widths_expr(e, state, widths);
+                }
+            }
+            IrStmt::Output { value, .. } => walk_widths_expr(value, state, widths),
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_widths_expr(path, state, widths);
+                walk_widths_expr(content, state, widths);
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                walk_widths_expr(cond, state, widths);
+                walk_widths_stmts(then, state, widths);
+                for (c, b) in elsifs {
+                    walk_widths_expr(c, state, widths);
+                    walk_widths_stmts(b, state, widths);
+                }
+                walk_widths_stmts(else_, state, widths);
+            }
+            IrStmt::For { iter, body, .. } => {
+                walk_widths_expr(iter, state, widths);
+                walk_widths_stmts(body, state, widths);
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_widths_expr(cond, state, widths);
+                walk_widths_stmts(body, state, widths);
+            }
+            IrStmt::Exit(e) | IrStmt::Return(e) => {
+                if let Some(x) = e {
+                    walk_widths_expr(x, state, widths);
+                }
+            }
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                walk_widths_expr(expr, state, widths);
+            }
+            IrStmt::SetChildError(e) => walk_widths_expr(e, state, widths),
+            IrStmt::Expr(e) => walk_widths_expr(e, state, widths),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                walk_widths_stmts(b, state, widths);
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                walk_widths_stmts(inner, state, widths);
+                for r in redirects {
+                    walk_widths_expr(&r.target, state, widths);
+                }
+            }
+            IrStmt::Function { body, .. } => walk_widths_stmts(body, state, widths),
+            IrStmt::Case { discriminant, clauses } => {
+                walk_widths_expr(discriminant, state, widths);
+                for c in clauses {
+                    walk_widths_stmts(&c.body, state, widths);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    walk_widths_stmts(st, state, widths);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_widths_expr(
+    e: &IrExpr,
+    state: &HashMap<String, Option<(i64, i64)>>,
+    widths: &mut HashMap<String, Width>,
+) {
+    match e {
+        IrExpr::Arith(a) => {
+            let rng = arith_range_local(a, state);
+            let mut vs = Vec::new();
+            arith_vars(a, &mut vs);
+            for v in vs {
+                match rng {
+                    Some((lo, hi)) => {
+                        let w = Width::from_range_name(crate::shir::range_width_name(lo, hi));
+                        let cur = widths.get(&v).copied().unwrap_or(Width::I64);
+                        widths.insert(v, cur.widen(w));
+                    }
+                    None => {
+                        // no proof the expr stays in width → no narrowing
+                        widths.insert(v, Width::I64);
+                    }
+                }
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            walk_widths_expr(lhs, state, widths);
+            walk_widths_expr(rhs, state, widths);
+        }
+        IrExpr::Index { key, .. } => walk_widths_expr(key, state, widths),
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                walk_widths_expr(a, state, widths);
+            }
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            walk_widths_expr(obj, state, widths);
+            for a in args {
+                walk_widths_expr(a, state, widths);
+            }
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            walk_widths_expr(cond, state, widths);
+            walk_widths_expr(then, state, widths);
+            walk_widths_expr(else_, state, widths);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            walk_widths_expr(expr, state, widths);
+            walk_widths_expr(default, state, widths);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    walk_widths_expr(x, state, widths);
+                }
+            }
+        }
+        IrExpr::Capture { expr, .. } => walk_widths_expr(expr, state, widths),
+        IrExpr::Array(items) => {
+            for i in items {
+                walk_widths_expr(i, state, widths);
+            }
+        }
+        IrExpr::Arrow(body) => walk_widths_stmts(body, state, widths),
+        IrExpr::Object(props) => {
+            for (_, v) in props {
+                walk_widths_expr(v, state, widths);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Local copy of the core's (private) `arith_range`: the conservative
+/// [lo, hi] of an ArithAst over the per-var ranges. The renderer needs
+/// it to prove an arith expr's RESULT fits its operands' widths before
+/// narrowing; the core keeps it private (single-owner), so the copy
+/// lives renderer-side. Mirrors shir.rs arith_range exactly.
+fn arith_range_local(
+    a: &ArithAst,
+    state: &HashMap<String, Option<(i64, i64)>>,
+) -> Option<(i64, i64)> {
+    match a {
+        ArithAst::Num(i) => Some((*i, *i)),
+        ArithAst::Var(n) => state.get(n).copied().flatten(),
+        ArithAst::Bin { op, lhs, rhs } => {
+            let (l, r) = (arith_range_local(lhs, state)?, arith_range_local(rhs, state)?);
+            let (l0, l1, r0, r1) = (l.0, l.1, r.0, r.1);
+            match op.as_str() {
+                "+" => Some((l0.checked_add(r0)?, l1.checked_add(r1)?)),
+                "-" => Some((l0.checked_sub(r1)?, l1.checked_sub(r0)?)),
+                "*" => {
+                    let ps = [
+                        l0.checked_mul(r0)?,
+                        l0.checked_mul(r1)?,
+                        l1.checked_mul(r0)?,
+                        l1.checked_mul(r1)?,
+                    ];
+                    Some((*ps.iter().min()?, *ps.iter().max()?))
+                }
+                "/" => {
+                    if r0 <= 0 && r1 >= 0 {
+                        return None; // possible division by zero
+                    }
+                    let qs = [
+                        l0.checked_div(r0)?,
+                        l0.checked_div(r1)?,
+                        l1.checked_div(r0)?,
+                        l1.checked_div(r1)?,
+                    ];
+                    Some((*qs.iter().min()?, *qs.iter().max()?))
+                }
+                _ => None, // %, ^, comparisons, ... conservative
+            }
+        }
+        ArithAst::Un { op, arg } => {
+            let (lo, hi) = arith_range_local(arg, state)?;
+            match op.as_str() {
+                "-" => Some((-hi, -lo)),
+                "+" => Some((lo, hi)),
+                _ => None,
+            }
+        }
+        _ => None, // Index / Cond / Assign / IncDec
+    }
+}
+
+/// Every variable name an ArithAst mentions (reads; a bare `var =` write
+/// target is excluded — its RHS vars are included).
+fn arith_vars(a: &ArithAst, out: &mut Vec<String>) {
+    match a {
+        ArithAst::Var(n) => out.push(n.clone()),
+        ArithAst::Index { var, key } => {
+            out.push(var.clone());
+            arith_vars(key, out);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_vars(lhs, out);
+            arith_vars(rhs, out);
+        }
+        ArithAst::Un { arg, .. } => arith_vars(arg, out),
+        ArithAst::Cond { test, then, else_, .. } => {
+            arith_vars(test, out);
+            arith_vars(then, out);
+            arith_vars(else_, out);
+        }
+        ArithAst::Assign { rhs, .. } => arith_vars(rhs, out),
+        ArithAst::IncDec { var, .. } => out.push(var.clone()),
+        ArithAst::Num(_) => {}
+    }
 }

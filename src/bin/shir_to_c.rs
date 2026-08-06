@@ -22,6 +22,13 @@ use std::io::{self, Read};
 fn main() {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).expect("read stdin");
-    let prog = debashl::shir_json_in::shir_json_to_ir(&input).expect("parse ShIR JSON");
+    let prog = match debashl::shir_json_in::shir_json_to_ir(&input) {
+        Ok(p) => p,
+        Err(e) => {
+            // empty/non-JSON input (parse-broken scripts emit no ShIR)
+            eprintln!("shir_to_c: ShIR JSON ingress: {e}");
+            std::process::exit(1);
+        }
+    };
     print!("{}", debashl::c_backend::shir_to_c(&prog));
 }
