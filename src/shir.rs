@@ -14591,30 +14591,39 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                 };
                 return Some(method(sl, "join", vec![str_lit(" ")]));
             }
-            let [_, _, IrExpr::Str(off, _), IrExpr::Str(len, _)] = args else {
-                return None;
-            };
-            let int_of = |t: &str| {
-                let t = t.trim();
-                if t.is_empty() {
-                    Some(0i64)
-                } else if t.starts_with('-') {
-                    t[1..].parse::<i64>().ok().map(|v| -v)
-                } else {
-                    t.parse::<i64>().ok()
-                }
-            };
-            let o = int_of(off)?;
-            if len.trim().is_empty() {
-                Some(method(val(), "slice", vec![int_lit(o)]))
+        // A plain-name slice may be an ARRAY: `${arr[@]:o:l}` parses with
+        // the BARE name (the `[@]` is dropped by the parser), and the
+        // runtime's param decides via its arrays map (element slice vs
+        // char slice). Only LIFTED names are provably scalar — the lift
+        // analyses never lift array names (subscript writes are
+        // excluded) — so store-backed names stay on the runtime param.
+        if !is_lifted(name) {
+            return None;
+        }
+        let [_, _, IrExpr::Str(off, _), IrExpr::Str(len, _)] = args else {
+            return None;
+        };
+        let int_of = |t: &str| {
+            let t = t.trim();
+            if t.is_empty() {
+                Some(0i64)
+            } else if t.starts_with('-') {
+                t[1..].parse::<i64>().ok().map(|v| -v)
             } else {
-                let l = int_of(len)?;
-                Some(method(
-                    val(),
-                    "slice",
-                    vec![int_lit(o), int_lit(o + l)],
-                ))
+                t.parse::<i64>().ok()
             }
+        };
+        let o = int_of(off)?;
+        if len.trim().is_empty() {
+            Some(method(val(), "slice", vec![int_lit(o)]))
+        } else {
+            let l = int_of(len)?;
+            Some(method(
+                val(),
+                "slice",
+                vec![int_lit(o), int_lit(o + l)],
+            ))
+        }
         }
         // ${x##*/} — the parser's basename/dirname ops: pure string work
         // (trailing-slash strip + last-component split — mirror the
