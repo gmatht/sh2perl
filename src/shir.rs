@@ -97,6 +97,25 @@ fn lastexit_write_is_dead(stmt: &IrStmt) -> bool {
         .unwrap_or(false)
 }
 
+/// For-loop statements that must PERSIST the loop variable's final value
+/// into its native binding after the loop (see [`analyze_loop_var_refs`]):
+/// the loop var is LIFTED and referenced OUTSIDE its loop body, and the
+/// loop sits OUTSIDE a copy region (subshell/background/capture — bash
+/// writes there are copy-local, so the module binding must not be
+/// clobbered; those loops keep the shadowed binding and their vars stay
+/// store-bound instead). Keyed by statement pointer (stable between the
+/// analysis and emission — the IR tree is immutable there). Unset →
+/// conservative (no persist).
+static LOOP_PERSIST: Mutex<Option<HashMap<usize, ()>>> = Mutex::new(None);
+fn loop_persist_needed(stmt: &IrStmt, var: &str) -> bool {
+    LOOP_PERSIST
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.contains_key(&(stmt as *const IrStmt as usize)) && is_lifted(var))
+        .unwrap_or(false)
+}
+
 /// Plan 4 lastExit-write liveness (see [`compute_lastexit_deadness`]).
 /// `ir_stmt_writes_lastexit` is the WRITER predicate: every runtime call
 /// records its own status to lastExit — EXCEPT the pure writers that
@@ -5954,6 +5973,16 @@ fn is_js_keyword(name: &str) -> bool {
 /// Is a for-loop ITERATION provably numeric? Some(true) = all items are
 /// numeric (brace ranges, numeric arrays, Range); Some(false) = known
 /// strings; None = unknown (command substitution, $@, ...).
+/// A for-item string must be a CANONICAL decimal integer (exact
+/// round-trip through i64): `05`/`+5`/`-0`/` 5` stay strings — the
+/// numeric lift's `Number("05")` coercion would lose the leading zeros
+/// (bash keeps the raw string in the variable, so `echo $i` prints
+/// `05`). Canonical items make the Number coercion exact, which the
+/// loop-var persistence (see [`analyze_loop_var_refs`]) relies on.
+fn canonical_int_item(sv: &str) -> bool {
+    matches!(sv.parse::<i64>(), Ok(v) if v.to_string() == sv)
+}
+
 fn iter_numeric(e: &IrExpr) -> Option<bool> {
     /// the brace items arrive as a Json value: nested arrays of range
     /// objects (`{1..5}`) or literal strings (`{a,b}`)
@@ -5970,7 +5999,7 @@ fn iter_numeric(e: &IrExpr) -> Option<bool> {
                 }
             }
             serde_json::Value::String(sv) => {
-                if sv.trim().parse::<i64>().is_err() {
+                if !canonical_int_item(sv) {
                     *found = false;
                 }
             }
@@ -5997,7 +6026,7 @@ fn iter_numeric(e: &IrExpr) -> Option<bool> {
             for el in elems {
                 match el {
                     IrExpr::Str(sv, _) => {
-                        if sv.trim().parse::<i64>().is_err() {
+                        if !canonical_int_item(sv) {
                             numeric = false;
                         }
                     }
@@ -6104,89 +6133,46 @@ fn collect_for_iters(prog: &IrProgram) -> HashMap<String, IrExpr> {
     out
 }
 
-/// A lifted FOR-loop variable must be referenced ONLY inside its own loop
-/// body: the closure param shadows the module `let` and the store sync is
-/// dropped, so any read/write after the loop sees the stale initial value.
-/// Remove from both lift sets any loop var referenced outside its loop.
-fn drop_externally_referenced_loop_vars(
+/// A lifted FOR-loop variable referenced OUTSIDE its loop body: the
+/// shadowed loop binding (`for (let i of …)` / the runtime loop's closure
+/// param) would leave the module `let` at its stale initial value, so the
+/// loop emission must PERSIST the final value into the module binding (see
+/// [`LOOP_PERSIST`] / `loop_persist_needed`).
+///
+/// The persistence is sound only where the module binding IS the variable:
+/// outside COPY regions (subshell/background/capture bodies — bash writes
+/// there are copy-local, and the runtime's store copy/restore or the
+/// shadowed binding keep the parent value). A loop var referenced outside
+/// its loop with ANY loop inside a copy region stays store-bound (dropped
+/// from both lift sets — the pre-existing conservative behavior). Loops in
+/// functions/pipelines/redirects are NOT copy regions (the runtime runs
+/// those in-process on the shared store — the model the lift walkers use).
+///
+/// Returns the lift sets MINUS the dropped vars; fills [`LOOP_PERSIST`]
+/// with the For-statement pointers that need the persist machinery.
+fn analyze_loop_var_refs(
     prog: &IrProgram,
     num: &HashSet<String>,
     str: &HashSet<String>,
 ) -> (HashSet<String>, HashSet<String>) {
-    let mut for_vars: HashSet<String> = HashSet::new();
-    fn collect_for_vars(st: &IrStmt, out: &mut HashSet<String>) {
-        match st {
-            IrStmt::For { var, body, .. } => {
-                out.insert(var.clone());
-                for b in body {
-                    collect_for_vars(b, out);
-                }
-            }
-            IrStmt::While { body, .. }
-            | IrStmt::DoWhile { body, .. }
-            | IrStmt::Block(body)
-            | IrStmt::Function { body, .. }
-            | IrStmt::Subshell(body)
-            | IrStmt::Background(body) => {
-                for b in body {
-                    collect_for_vars(b, out);
-                }
-            }
-            IrStmt::If { then, elsifs, else_, .. } => {
-                for b in then.iter().chain(else_) {
-                    collect_for_vars(b, out);
-                }
-                for (_, b) in elsifs {
-                    for stm in b {
-                        collect_for_vars(stm, out);
-                    }
-                }
-            }
-            IrStmt::Pipeline { stages, .. } => {
-                for stage in stages {
-                    for b in stage {
-                        collect_for_vars(b, out);
-                    }
-                }
-            }
-            IrStmt::Redirect { inner, .. } => {
-                for b in inner {
-                    collect_for_vars(b, out);
-                }
-            }
-            IrStmt::Case { clauses, .. } => {
-                for c in clauses {
-                    for b in &c.body {
-                        collect_for_vars(b, out);
-                    }
-                }
-            }
-            IrStmt::Expr(e) => collect_for_vars_expr(e, out),
-            _ => {}
-        }
-    }
-    fn collect_for_vars_expr(e: &IrExpr, out: &mut HashSet<String>) {
-        match e {
-            IrExpr::Arrow(stmts) => {
-                for st in stmts {
-                    collect_for_vars(st, out);
-                }
-            }
-            IrExpr::Call { args, .. } => {
-                for a in args {
-                    collect_for_vars_expr(a, out);
-                }
-            }
-            _ => {}
-        }
-    }
-    for st in &prog.stmts {
-        collect_for_vars(st, &mut for_vars);
-    }
-
-    // every reference to a var, tagged with the enclosing For-var stack
+    // per-For-stmt: (stmt ptr, var, loop inside a copy region)
+    let mut loops: Vec<(usize, String, bool)> = Vec::new();
+    // vars with any ref outside their loop stack
     let mut external: HashSet<String> = HashSet::new();
-    fn ref_expr(e: &IrExpr, stack: &[String], external: &mut HashSet<String>) {
+
+    // a capture/subshell/background body is a COPY region — bash writes
+    // there are copy-local (the runtime's subshell store copy/restore
+    // makes the store-backed model exact; a native binding would leak)
+    fn copy_arrow_call(func: &str) -> bool {
+        matches!(func, "capture" | "captureWords" | "subshell" | "background")
+    }
+    fn ref_expr(
+        e: &IrExpr,
+        stack: &[String],
+        external: &mut HashSet<String>,
+        in_copy: bool,
+        loops: &mut Vec<(usize, String, bool)>,
+    ) {
         match e {
             IrExpr::Var(n, _) => {
                 if !stack.contains(&n.clone()) {
@@ -6208,64 +6194,74 @@ fn drop_externally_referenced_loop_vars(
                         }
                     }
                 }
+                let inner_copy = in_copy || copy_arrow_call(func);
                 for a in args {
-                    ref_expr(a, stack, external);
+                    ref_expr(a, stack, external, inner_copy, loops);
                 }
             }
             IrExpr::Arrow(stmts) => {
                 for st in stmts {
-                    ref_stmt(st, stack, external);
+                    ref_stmt(st, stack, external, in_copy, loops);
                 }
             }
             IrExpr::BinOp { lhs, rhs, .. } => {
-                ref_expr(lhs, stack, external);
-                ref_expr(rhs, stack, external);
+                ref_expr(lhs, stack, external, in_copy, loops);
+                ref_expr(rhs, stack, external, in_copy, loops);
             }
             IrExpr::Ternary { cond, then, else_, .. } => {
-                ref_expr(cond, stack, external);
-                ref_expr(then, stack, external);
-                ref_expr(else_, stack, external);
+                ref_expr(cond, stack, external, in_copy, loops);
+                ref_expr(then, stack, external, in_copy, loops);
+                ref_expr(else_, stack, external, in_copy, loops);
             }
-            IrExpr::Capture { expr, .. } => ref_expr(expr, stack, external),
+            IrExpr::Capture { expr, .. } => {
+                ref_expr(expr, stack, external, true, loops);
+            }
             IrExpr::Array(elems) => {
                 for el in elems {
-                    ref_expr(el, stack, external);
+                    ref_expr(el, stack, external, in_copy, loops);
+                }
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                ref_expr(expr, stack, external, in_copy, loops);
+                ref_expr(default, stack, external, in_copy, loops);
+            }
+            IrExpr::Index { key, .. } => ref_expr(key, stack, external, in_copy, loops),
+            IrExpr::MethodCall { obj, args, .. } => {
+                ref_expr(obj, stack, external, in_copy, loops);
+                for a in args {
+                    ref_expr(a, stack, external, in_copy, loops);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    ref_expr(v, stack, external, in_copy, loops);
                 }
             }
             IrExpr::Interpolate(parts) => {
                 for p in parts {
                     if let InterpPart::Expr(inner) = p {
-                        ref_expr(inner, stack, external);
+                        ref_expr(inner, stack, external, in_copy, loops);
                     }
-                }
-            }
-            IrExpr::DefinedOr { expr, default } => {
-                ref_expr(expr, stack, external);
-                ref_expr(default, stack, external);
-            }
-            IrExpr::Index { key, .. } => ref_expr(key, stack, external),
-            IrExpr::MethodCall { obj, args, .. } => {
-                ref_expr(obj, stack, external);
-                for a in args {
-                    ref_expr(a, stack, external);
-                }
-            }
-            IrExpr::Object(props) => {
-                for (_, v) in props {
-                    ref_expr(v, stack, external);
                 }
             }
             _ => {}
         }
     }
-    fn ref_stmt(st: &IrStmt, stack: &[String], external: &mut HashSet<String>) {
+    fn ref_stmt(
+        st: &IrStmt,
+        stack: &[String],
+        external: &mut HashSet<String>,
+        in_copy: bool,
+        loops: &mut Vec<(usize, String, bool)>,
+    ) {
         match st {
             IrStmt::For { var, iter, body } => {
+                loops.push((st as *const IrStmt as usize, var.clone(), in_copy));
                 let mut s2 = stack.to_vec();
                 s2.push(var.clone());
-                ref_expr(iter, &s2, external);
+                ref_expr(iter, &s2, external, in_copy, loops);
                 for b in body {
-                    ref_stmt(b, &s2, external);
+                    ref_stmt(b, &s2, external, in_copy, loops);
                 }
             }
             IrStmt::Assign { targets, expr } => {
@@ -6274,7 +6270,7 @@ fn drop_externally_referenced_loop_vars(
                         external.insert(t.var.clone());
                     }
                 }
-                ref_expr(expr, stack, external);
+                ref_expr(expr, stack, external, in_copy, loops);
             }
             IrStmt::Declare { vars, .. } => {
                 for v in vars {
@@ -6285,72 +6281,99 @@ fn drop_externally_referenced_loop_vars(
             }
             IrStmt::While { cond, body, .. }
             | IrStmt::DoWhile { cond, body, .. } => {
-                ref_expr(cond, stack, external);
+                ref_expr(cond, stack, external, in_copy, loops);
                 for b in body {
-                    ref_stmt(b, stack, external);
+                    ref_stmt(b, stack, external, in_copy, loops);
                 }
             }
             IrStmt::If { cond, then, elsifs, else_, .. } => {
-                ref_expr(cond, stack, external);
+                ref_expr(cond, stack, external, in_copy, loops);
                 for b in then.iter().chain(else_) {
-                    ref_stmt(b, stack, external);
+                    ref_stmt(b, stack, external, in_copy, loops);
                 }
                 for (_, b) in elsifs {
                     for stm in b {
-                        ref_stmt(stm, stack, external);
+                        ref_stmt(stm, stack, external, in_copy, loops);
                     }
                 }
             }
             IrStmt::Exec { cmd, args, .. } => {
-                ref_expr(cmd, stack, external);
+                ref_expr(cmd, stack, external, in_copy, loops);
                 for a in args {
-                    ref_expr(a, stack, external);
+                    ref_expr(a, stack, external, in_copy, loops);
                 }
             }
             IrStmt::Pipeline { stages, .. } => {
                 for stage in stages {
                     for b in stage {
-                        ref_stmt(b, stack, external);
+                        ref_stmt(b, stack, external, in_copy, loops);
                     }
                 }
             }
-            IrStmt::Function { body, .. } | IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+            // subshell/background: COPY semantics — writes inside are
+            // copy-local (mirror of the lift walkers' in_copy)
+            IrStmt::Function { body, .. } | IrStmt::Block(body) => {
                 for b in body {
-                    ref_stmt(b, stack, external);
+                    ref_stmt(b, stack, external, in_copy, loops);
+                }
+            }
+            IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                for b in body {
+                    ref_stmt(b, stack, external, true, loops);
                 }
             }
             IrStmt::Redirect { inner, redirects } => {
                 for b in inner {
-                    ref_stmt(b, stack, external);
+                    ref_stmt(b, stack, external, in_copy, loops);
                 }
                 for r in redirects {
-                    ref_expr(&r.target, stack, external);
+                    ref_expr(&r.target, stack, external, in_copy, loops);
                 }
             }
             IrStmt::Case { discriminant, clauses } => {
-                ref_expr(discriminant, stack, external);
+                ref_expr(discriminant, stack, external, in_copy, loops);
                 for c in clauses {
                     for b in &c.body {
-                        ref_stmt(b, stack, external);
+                        ref_stmt(b, stack, external, in_copy, loops);
                     }
                 }
             }
-            IrStmt::Expr(e) => ref_expr(e, stack, external),
-            IrStmt::Output { value, .. } => ref_expr(value, stack, external),
+            IrStmt::Expr(e) => ref_expr(e, stack, external, in_copy, loops),
+            IrStmt::Output { value, .. } => ref_expr(value, stack, external, in_copy, loops),
             _ => {}
         }
     }
     for st in &prog.stmts {
-        ref_stmt(st, &[], &mut external);
+        ref_stmt(st, &[], &mut external, false, &mut loops);
     }
 
     let mut num2 = num.clone();
     let mut str2 = str.clone();
-    for v in &for_vars {
-        if external.contains(v) {
-            num2.remove(v);
-            str2.remove(v);
+    // a var with ANY loop inside a copy region AND any external ref stays
+    // store-bound (the persist machinery would leak the copy-local loop
+    // writes into the module binding)
+    let mut dropped: HashSet<String> = HashSet::new();
+    for (_, var, in_copy) in &loops {
+        if *in_copy && external.contains(var) {
+            dropped.insert(var.clone());
         }
+    }
+    // the persist map: lifted loop vars, externally referenced, loops
+    // outside copy regions
+    let mut persist: HashMap<usize, ()> = HashMap::new();
+    for (ptr, var, in_copy) in &loops {
+        if !in_copy
+            && !dropped.contains(var)
+            && (num.contains(var) || str.contains(var))
+            && external.contains(var)
+        {
+            persist.insert(*ptr, ());
+        }
+    }
+    *LOOP_PERSIST.lock().unwrap() = Some(persist);
+    for v in &dropped {
+        num2.remove(v);
+        str2.remove(v);
     }
     (num2, str2)
 }
@@ -7667,7 +7690,7 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
 
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let _compile_guard = COMPILE_LOCK.lock().unwrap();
-    let (num, str) = drop_externally_referenced_loop_vars(
+    let (num, str) = analyze_loop_var_refs(
         prog,
         &numeric_lift_vars(prog),
         &string_lift_vars(prog, &numeric_lift_vars(prog)),
@@ -9671,6 +9694,67 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 .chain(body.iter())
                 .filter_map(stmt_to_estree)
                 .collect();
+            // LIFTED loop var referenced outside its loop (see
+            // [`analyze_loop_var_refs`] / `loop_persist_needed`): the
+            // shadowed binding (`for (let i of …)` / the native-range
+            // `let i`) must persist its final value into the MODULE
+            // binding — the pre-loop read covers the empty-iterable case
+            // (bash keeps the prior value), the per-iteration temp write
+            // captures the last item AFTER the lifted-num coercion
+            // (position 1 — the temp holds the NUMBER, keeping the
+            // numeric binding's invariant; string bindings hold the raw
+            // item), and the post-loop assignment restores the module
+            // binding. Mirror of the store-sync-elim shape below.
+            let persist_block = |make_loop: Box<dyn FnOnce(Vec<Stmt>) -> Stmt>| -> Stmt {
+                let temp = format!("__sh2_for_last_{js_var}");
+                // the temp write must come AFTER the lifted-num coercion
+                // (`i = Number(i)`) — the temp then holds the NUMBER
+                // (the module binding's invariant); a string binding has
+                // no coercion, the raw item is exact
+                let temp_write = Stmt::ExpressionStatement {
+                    expression: Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(Expr::Identifier {
+                            name: temp.clone(),
+                        }),
+                        right: Box::new(Expr::Identifier {
+                            name: js_var.clone(),
+                        }),
+                    },
+                };
+                let mut body2: Vec<Stmt> = Vec::new();
+                if coercion.is_some() {
+                    body2.push(body_e[0].clone());
+                    body2.push(temp_write);
+                    body2.extend(body_e[1..].iter().cloned());
+                } else {
+                    body2.push(temp_write);
+                    body2.extend(body_e.iter().cloned());
+                }
+                let mut out: Vec<Stmt> = vec![Stmt::VariableDeclaration {
+                    kind: "let",
+                    declarations: vec![VariableDeclarator {
+                        type_: "VariableDeclarator",
+                        id: Expr::Identifier {
+                            name: temp.clone(),
+                        },
+                        init: Some(Expr::Identifier {
+                            name: js_var.clone(),
+                        }),
+                    }],
+                }];
+                out.push(make_loop(body2));
+                out.push(Stmt::ExpressionStatement {
+                    expression: Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(Expr::Identifier {
+                            name: js_var.clone(),
+                        }),
+                        right: Box::new(Expr::Identifier { name: temp }),
+                    },
+                });
+                Stmt::BlockStatement { body: out }
+            };
             // Native counter loop (the ladder's top rung for a range
             // iterable): `for (let i = lo; i <= hi; i++)` — the
             // hand-written ideal (PLAN §9.1 `seq 1 N → native range`).
@@ -9743,6 +9827,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }
                     if let Some(out) = sync_elim {
                         return Some(Stmt::BlockStatement { body: out });
+                    }
+                    // the persist twin for the native-range form (the
+                    // counter is a NUMBER from the `let i = lo` init —
+                    // the temp holds it directly, no coercion exists on
+                    // this path)
+                    if loop_persist_needed(stmt, var) {
+                        let js_var2 = js_var.clone();
+                        return Some(persist_block(Box::new(move |b2| {
+                            native_range_for(js_var2, lo, hi, b2)
+                        })));
                     }
                     return Some(native_range_for(js_var.clone(), lo, hi, body_e));
                 }
@@ -9853,6 +9947,28 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     if let Some((out, _)) = sync_elim {
                         return Some(Stmt::BlockStatement { body: out });
                     }
+                    // the persist twin for the native for-of form (the
+                    // shadowed `let i` keeps the module binding stale —
+                    // the temp + post-loop assignment restore it)
+                    if loop_persist_needed(stmt, var) {
+                        let js_var2 = js_var.clone();
+                        return Some(persist_block(Box::new(move |b2| {
+                            Stmt::ForOfStatement {
+                                left: Box::new(Stmt::VariableDeclaration {
+                                    kind: "let",
+                                    declarations: vec![VariableDeclarator {
+                                        type_: "VariableDeclarator",
+                                        id: Expr::Identifier {
+                                            name: js_var2.clone(),
+                                        },
+                                        init: None,
+                                    }],
+                                }),
+                                right: flatten_for_iter(iter),
+                                body: Box::new(Stmt::BlockStatement { body: b2 }),
+                            }
+                        })));
+                    }
                     return Some(Stmt::ForOfStatement {
                         left: Box::new(Stmt::VariableDeclaration {
                             kind: "let",
@@ -9877,26 +9993,127 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 // cost. Emitted only where `await` is legal — inside an
                 // async arrow or at module top level, NEVER inside a
                 // provably-sync function body (`in_sync_arrow`).
+                // Persist twin for the RUNTIME loop paths (the persist
+                // set, see loop_persist_needed): the closure PARAM shadows
+                // the module binding, so the final item is synced into the
+                // store per iteration (`sh2.setVar`) and read back after
+                // the loop — Number-coerced for the numeric binding's
+                // invariant (the store holds the item's string form,
+                // which the canonical-item guarantee makes exact).
+                let persist_sync: Option<Stmt> = if loop_persist_needed(stmt, var) {
+                    Some(Stmt::ExpressionStatement {
+                        expression: sh2_call(
+                            "setVar",
+                            vec![
+                                str_lit(var),
+                                Expr::Identifier {
+                                    name: js_var.clone(),
+                                },
+                            ],
+                        ),
+                    })
+                } else {
+                    None
+                };
+                let persist_readback: Option<Stmt> = if persist_sync.is_some() {
+                    Some(Stmt::ExpressionStatement {
+                        expression: Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(Expr::Identifier {
+                                name: js_var.clone(),
+                            }),
+                            right: Box::new(if is_lifted_num(var) {
+                                Expr::CallExpression {
+                                    callee: Box::new(Expr::Identifier {
+                                        name: "Number".to_string(),
+                                    }),
+                                    arguments: vec![sh2_call("getVar", vec![str_lit(var)])],
+                                    optional: false,
+                                }
+                            } else {
+                                sh2_call("getVar", vec![str_lit(var)])
+                            }),
+                        },
+                    })
+                } else {
+                    None
+                };
+                let mut loop_body: Vec<Stmt> = Vec::new();
+                if let Some(ps) = &persist_sync {
+                    loop_body.push(ps.clone());
+                }
+                loop_body.extend(body_e.iter().cloned());
                 if crate::transforms::sync_ok_loops::batch_ok(stmt) && !in_sync_arrow() {
-                    return Some(Stmt::ExpressionStatement {
+                    let mut out: Vec<Stmt> = vec![Stmt::ExpressionStatement {
                         expression: await_call(
                             "forLoopBatch",
                             vec![
                                 iter_e,
-                                sync_arrow_with_param(js_var, body_e),
+                                sync_arrow_with_param(js_var, loop_body),
                                 int_lit_expr(1024),
                             ],
                         ),
+                    }];
+                    if let Some(rb) = persist_readback {
+                        out.push(rb);
+                    }
+                    return Some(if out.len() == 1 {
+                        out.pop().unwrap()
+                    } else {
+                        Stmt::BlockStatement { body: out }
                     });
                 }
-                return Some(Stmt::ExpressionStatement {
+                let mut out: Vec<Stmt> = vec![Stmt::ExpressionStatement {
                     expression: sh2_call(
                         "forLoopSync",
-                        vec![iter_e, sync_arrow_with_param(js_var, body_e)],
+                        vec![iter_e, sync_arrow_with_param(js_var, loop_body)],
                     ),
+                }];
+                if let Some(rb) = persist_readback {
+                    out.push(rb);
+                }
+                return Some(if out.len() == 1 {
+                    out.pop().unwrap()
+                } else {
+                    Stmt::BlockStatement { body: out }
                 });
             }
-            Stmt::ExpressionStatement {
+            let persist_readback: Option<Stmt> = if loop_persist_needed(stmt, var) {
+                // the async path's per-iteration sync: an IR setVar call
+                // (the closure param shadows the module binding)
+                body_stmts.insert(
+                    0,
+                    IrStmt::Expr(IrExpr::Call {
+                        func: "setVar".to_string(),
+                        args: vec![
+                            IrExpr::Str(var.clone(), StrStyle::SingleQuoted),
+                            IrExpr::Ident(js_var.clone()),
+                        ],
+                    }),
+                );
+                Some(Stmt::ExpressionStatement {
+                    expression: Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(Expr::Identifier {
+                            name: js_var.clone(),
+                        }),
+                        right: Box::new(if is_lifted_num(var) {
+                            Expr::CallExpression {
+                                callee: Box::new(Expr::Identifier {
+                                    name: "Number".to_string(),
+                                }),
+                                arguments: vec![sh2_call("getVar", vec![str_lit(var)])],
+                                optional: false,
+                            }
+                        } else {
+                            sh2_call("getVar", vec![str_lit(var)])
+                        }),
+                    },
+                })
+            } else {
+                None
+            };
+            let call = Stmt::ExpressionStatement {
                 expression: await_call(
                     "forLoop",
                     vec![
@@ -9904,6 +10121,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         arrow_with_param(js_var, IrExpr::Arrow(body_stmts)),
                     ],
                 ),
+            };
+            if let Some(rb) = persist_readback {
+                Stmt::BlockStatement {
+                    body: vec![call, rb],
+                }
+            } else {
+                call
             }
         }
         IrStmt::Function { name, body } => {
