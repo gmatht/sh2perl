@@ -1855,7 +1855,9 @@ mod tests {
         assert!(json.contains("\"name\":\"redirect\""));
         assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("\"value\":\"read\""));
-        assert!(json.contains("\"key\":\"IFS\""));
+        // the env object's property key is an Identifier (prop() renders
+        // `key: {type: Identifier, name: IFS}`)
+        assert!(json.contains("\"name\":\"IFS\""));
         assert!(json.contains("\"value\":\",\""));
         // the env must NOT land on a separate `true` command
         assert!(!json.contains("\"value\":\"true\""));

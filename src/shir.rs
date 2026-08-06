@@ -6754,7 +6754,22 @@ fn int_declare_names(args: &[IrExpr]) -> Option<Vec<String>> {
 /// runtime strings — tests, eval, heredocs, `declare -p` — keep the
 /// name store-bound via string_ctx/excluded, so this is only about the
 /// model's missing scope restore, which the runtime already accepts).
-fn pure_value_declare(args: &[IrExpr]) -> Option<Vec<(String, String)>> {
+/// The assignment-source form of a `local`/`declare`/`typeset`/
+/// `readonly` call — the generalized [`pure_value_declare`] (the pure
+/// literal is the `Str` case): every NAME-VALUE pair the runtime's
+/// declaration builtins would store, as the IrExpr that produces the
+/// same string natively. Bare names (`local x`), flag forms
+/// (`local -a arr`), and unsupported values return None — the runtime
+/// builtin keeps those.
+///
+/// Two IR shapes (mirrored from the runtime's `mergeAssignArgs`):
+///   - a single raw word (`local v=1` / `local v=$1` — the parser keeps
+///     the RAW word text, the runtime re-expands it via expandWord), or
+///     an ALL-LITERAL Interpolate (`local v="abc"` — a quoted
+///     literal-only string IS the plain text, expandWord is an identity);
+///   - the SPLIT form `local name="$1"` → `["name=", <expr>]` — the
+///     value arrives as the next array element (already-expanded).
+fn declare_sources(args: &[IrExpr]) -> Option<Vec<(String, IrExpr)>> {
     if !assume_local_scope() {
         return None;
     }
@@ -6764,12 +6779,6 @@ fn pure_value_declare(args: &[IrExpr]) -> Option<Vec<(String, String)>> {
     if !matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") {
         return None;
     }
-    // The word may arrive as a plain Str (`local v=1`) or as an
-    // ALL-LITERAL Interpolate (`local v="abc"` / `local v=""` — the
-    // parser wraps quoted strings in an interpolation; a literal-only
-    // interpolation IS the plain string, expandWord is an identity).
-    // Any Expr part (`$var`, captures) disqualifies — dynamic values
-    // stay on the runtime builtin.
     fn word_text(e: &IrExpr) -> Option<String> {
         match e {
             IrExpr::Str(s, _) => Some(s.clone()),
@@ -6789,10 +6798,31 @@ fn pure_value_declare(args: &[IrExpr]) -> Option<Vec<(String, String)>> {
             _ => None,
         }
     }
-    fn value_ok(value: &str) -> bool {
-        value.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | ',' | '+' | '-')
-        })
+    // The split-form VALUE is already an IrExpr: an all-literal
+    // Interpolate / Str (→ the raw text), or a getVar of a positional or
+    // plain-var name (→ the same read the runtime's expandWord performs).
+    fn value_of(e: &IrExpr) -> Option<IrExpr> {
+        match e {
+            IrExpr::Str(_, _) | IrExpr::Interpolate(_) => {
+                decl_value_source(&word_text(e)?)
+            }
+            IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
+                // positional (`$1`..`$9`, `$@`, `$*` — the string-valued
+                // positionals; `$0` is argv0, `$#` the count — keep both
+                // on the runtime) or a plain var name
+                [IrExpr::Str(n, _)]
+                    if (n.len() == 1
+                        && (matches!(n.as_str(), "@" | "*")
+                            || n.as_bytes()[0].is_ascii_digit()))
+                        && n != "0"
+                        || plain_ident(n) =>
+                {
+                    Some(e.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
     let mut out = Vec::new();
     let mut i = 0;
@@ -6804,30 +6834,101 @@ fn pure_value_declare(args: &[IrExpr]) -> Option<Vec<(String, String)>> {
             return None;
         }
         // `local v="..."` parses as TWO elements (`v=` + the quoted
-        // literal); `mergeAssignArgs` merges them at runtime — mirror the
+        // value); `mergeAssignArgs` merges them at runtime — mirror the
         // merge here. A bare word without `=` is a plain (no-value) decl —
-        // not a pure-value pair.
+        // not a value pair.
         if let Some(rest) = sv.strip_suffix('=') {
             if plain_ident(rest) {
-                if let Some(next) = cargs.get(i + 1).and_then(word_text) {
-                    if !next.starts_with('-') && !next.contains('=') && value_ok(&next) {
-                        out.push((rest.to_string(), next));
+                if let Some(next) = cargs.get(i + 1) {
+                    if let Some(src) = value_of(next) {
+                        out.push((rest.to_string(), src));
                         i += 2;
                         continue;
                     }
                 }
-                return None; // `name=` with a non-literal value
+                return None; // `name=` with an unsupported value
             }
         }
-        let (name, value) = sv.split_once('=')?;
+        let (name, value) = match sv.split_once('=') {
+            Some(pair) => pair,
+            // a bare word (`local x` / `declare y`) — the runtime's
+            // declaration builtin sets the name to "" (no value); the
+            // same "" source (the runtime local/declare store exactly
+            // the empty string)
+            None => {
+                if plain_ident(&sv) {
+                    out.push((sv.clone(), st("")));
+                    i += 1;
+                    continue;
+                }
+                return None;
+            }
+        };
         if !plain_ident(name) {
             return None;
         }
-        if !value_ok(value) {
-            return None;
-        }
-        out.push((name.to_string(), value.to_string()));
+        let src = decl_value_source(value)?;
+        out.push((name.to_string(), src));
         i += 1;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Parse a declaration word's VALUE text (`local x=<value>`) into an
+/// assignment source. Accepted:
+///   - a pure literal (the `value_ok` charset — the exact text the
+///     runtime's declaration builtin stores, no expansion needed) → `Str`;
+///   - a single positional read (`$1`..`$9`, `${1}`..`${9}`, `$@`, `$*`,
+///     `${@}`, `${*}`) → `getVar("<n>")` — the native positional read
+///     (`sh2.positional[i] ?? ""` / `.join(" ")`) is EXACTLY what the
+///     runtime's expandWord yields for these shapes;
+///   - a plain variable read (`$NAME` / `${NAME}`) → `getVar("NAME")` —
+///     the lift fixpoints' transitivity judges it (lifted → native
+///     identifier; store-bound → the runtime read — the same value).
+/// Everything else (braced operators `${x:-d}`, `$(( ))`, mixed text,
+/// cmdsubs, `$10`+ — bash's `${1}0` —, `$0`, `$#`) stays on the runtime
+/// builtin: the general expansion is expandWord's contract.
+fn decl_value_source(value: &str) -> Option<IrExpr> {
+    if value.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | ',' | '+' | '-')
+    }) {
+        return Some(st(value));
+    }
+    // strip one brace level: `${1}` / `${@}` / `${name}`
+    let inner = match value.strip_prefix("${") {
+        Some(rest) => rest.strip_suffix('}')?,
+        None => value.strip_prefix('$')?,
+    };
+    if inner.is_empty() {
+        return None;
+    }
+    if plain_ident(inner) {
+        return Some(call("getVar", vec![st(inner)]));
+    }
+    // single-digit positionals and the `@`/`*` joins (`$1`..`$9`,
+    // `$@`, `$*`); `$0`/`$#`/multi-digit stay on the runtime
+    if inner.len() == 1
+        && inner != "0"
+        && (matches!(inner, "@" | "*") || inner.as_bytes()[0].is_ascii_digit())
+    {
+        return Some(call("getVar", vec![st(inner)]));
+    }
+    None
+}
+
+/// The pure-literal subset of [`declare_sources`] (kept for the
+/// callers that only handle literal values).
+fn pure_value_declare(args: &[IrExpr]) -> Option<Vec<(String, String)>> {
+    let pairs = declare_sources(args)?;
+    let mut out = Vec::new();
+    for (n, e) in pairs {
+        match e {
+            IrExpr::Str(sv, _) => out.push((n, sv)),
+            _ => return None,
+        }
     }
     if out.is_empty() {
         return None;
@@ -6891,22 +6992,49 @@ fn mktemp_native_enabled() -> bool {
 /// string-lifted names get the string literal. Returns None when any
 /// name is store-bound — the whole call then stays on the runtime
 /// builtin (which writes the store for every arg).
+/// The native value expression for a lifted-decl source (see
+/// [`declare_sources`]): numeric-lifted names hold canonical integers (a
+/// Str source that round-trips, or a getVar of a numeric-lifted name —
+/// that binding's number); string-/local-lifted names hold the exact
+/// STRING bash stores (positional reads via the native `sh2.positional`
+/// access — the exact value the runtime's expandWord yields).
+fn decl_source_to_estree(name: &str, src: &IrExpr) -> Expr {
+    match src {
+        IrExpr::Str(sv, _) => {
+            if is_lifted_num(name) {
+                Expr::Literal {
+                    value: serde_json::Value::from(sv.trim().parse::<i64>().unwrap_or(0)),
+                    raw: None,
+                regex: None,
+                }
+            } else {
+                str_lit(sv)
+            }
+        }
+        IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
+            [IrExpr::Str(n, _)] if is_lifted(n) => Expr::Identifier { name: n.clone() },
+            // positional / special — the native read (`sh2.positional[i]
+            // ?? ""`, `.join(" ")`); a store var can never reach here
+            // (the fixpoint only accepts lifted or positional sources)
+            _ => expr_to_estree(src),
+        },
+        _ => expr_to_estree(src),
+    }
+}
+
+/// `local x=1` / `declare x=1` / ... with value sources whose names are
+/// ALL lifted (expression position — &&/|| operands, pipeline stages):
+/// the native binding-write sequence `(x = <value>, ...,
+/// sh2.lastExit = 0, true)` — the runtime builtin's exact store-write
+/// model (no scope stack, re-init per call) minus the dispatch.
 fn try_native_declare_stmt(args: &[IrExpr]) -> Option<Expr> {
-    let pairs = pure_value_declare(args)?;
+    let pairs = declare_sources(args)?;
     if !pairs.iter().all(|(n, _)| is_lifted(n)) {
         return None;
     }
     let mut exprs: Vec<Expr> = Vec::new();
-    for (name, value) in pairs {
-        let right = if is_lifted_num(&name) {
-            Expr::Literal {
-                value: serde_json::Value::from(value.trim().parse::<i64>().unwrap_or(0)),
-                raw: None,
-            regex: None,
-            }
-        } else {
-            str_lit(&value)
-        };
+    for (name, src) in pairs {
+        let right = decl_source_to_estree(&name, &src);
         exprs.push(Expr::AssignmentExpression {
             operator: "=".to_string(),
             left: Box::new(Expr::Identifier { name }),
@@ -6940,39 +7068,30 @@ fn try_native_declare_stmt(args: &[IrExpr]) -> Option<Expr> {
 /// numbers); all other lifted names hold the STRING (bash's value model
 /// — `local v=01; echo $v` must print "01").
 fn try_native_local_decl_stmt(args: &[IrExpr]) -> Option<Vec<Stmt>> {
-    let pairs = pure_value_declare(args)?;
+    let pairs = declare_sources(args)?;
     if !pairs.iter().all(|(n, _)| is_local_lifted(n)) {
         return None;
     }
-    let nums: HashSet<String> = LIFTED_NUMERIC
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap_or_default();
+    // Compute the value expressions BEFORE the FUNCTION_STACK lock:
+    // decl_source_to_estree consults the lift sets / expr_to_estree,
+    // which lock the same mutexes (non-reentrant — a deadlock).
+    let values: Vec<(String, Expr)> = pairs
+        .iter()
+        .map(|(n, src)| (n.clone(), decl_source_to_estree(n, src)))
+        .collect();
     let mut decls: Vec<VariableDeclarator> = Vec::new();
     let mut assigns: Vec<Stmt> = Vec::new();
-    let value_lit = |name: &str, value: &str| {
-        if nums.contains(name) {
-            Expr::Literal {
-                value: serde_json::Value::from(value.trim().parse::<i64>().unwrap_or(0)),
-                raw: None,
-            regex: None,
-            }
-        } else {
-            str_lit(value)
-        }
-    };
     let mut out: Vec<Stmt> = Vec::new();
     {
         let mut stack = FUNCTION_STACK.lock().unwrap();
         let (_, seen) = stack.last_mut()?;
-        for (name, value) in pairs {
+        for (name, value) in values {
             if seen.contains(&name) {
                 assigns.push(Stmt::ExpressionStatement {
                     expression: Expr::AssignmentExpression {
                         operator: "=".to_string(),
                         left: Box::new(Expr::Identifier { name: name.clone() }),
-                        right: Box::new(value_lit(&name, &value)),
+                        right: Box::new(value),
                     },
                 });
             } else {
@@ -6980,7 +7099,7 @@ fn try_native_local_decl_stmt(args: &[IrExpr]) -> Option<Vec<Stmt>> {
                 decls.push(VariableDeclarator {
                     type_: "VariableDeclarator",
                     id: Expr::Identifier { name: name.clone() },
-                    init: Some(value_lit(&name, &value)),
+                    init: Some(value),
                 });
             }
         }
@@ -7104,29 +7223,24 @@ fn collect_native_arith_sources(args: &[IrExpr], assigns: &mut HashMap<String, V
                 for n in names {
                     assigns.entry(n).or_default().push(IrExpr::Int(0));
                 }
-            } else if let Some(pairs) = pure_value_declare(args) {
+            } else if let Some(pairs) = declare_sources(args) {
                 // no `-i` witness (int_declare_names rejects `=value` args
-                // and requires the flag) — a pure-value declaration is a
-                // real assignment: its value is an assignment SOURCE.
-                // Numeric lift accepts it when the value parses as an
-                // integer; the string lift accepts any value.
-                for (name, value) in pairs {
-                    assigns
-                        .entry(name)
-                        .or_default()
-                        .push(IrExpr::Str(value, StrStyle::SingleQuoted));
+                // and requires the flag) — a value declaration is a real
+                // assignment: its source is an assignment SOURCE. Numeric
+                // lift accepts it when the source parses as an integer
+                // (or is a lifted numeric var); the string lift accepts
+                // any string source.
+                for (name, src) in pairs {
+                    assigns.entry(name).or_default().push(src);
                 }
             }
         }
         "local" => {
             // `local` has no `-i` witness arm (the runtime's local ignores
-            // the int flag anyway) — only the pure-value source applies.
-            if let Some(pairs) = pure_value_declare(args) {
-                for (name, value) in pairs {
-                    assigns
-                        .entry(name)
-                        .or_default()
-                        .push(IrExpr::Str(value, StrStyle::SingleQuoted));
+            // the int flag anyway) — only the value-source arm applies.
+            if let Some(pairs) = declare_sources(args) {
+                for (name, src) in pairs {
+                    assigns.entry(name).or_default().push(src);
                 }
             }
         }
@@ -7634,6 +7748,17 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                         mark_str_args(a, string_ctx);
                     }
                 }
+                // `cstyleFor` headers and `arith` strings are ARITHMETIC
+                // text the runtime evaluates via evalArith — bare
+                // identifiers are STORE reads (mark_str_args' `$`-ref scan
+                // would miss ` i = 2; i <= n; i++ `) — mark ALL
+                // identifiers so a lifted binding never desyncs from the
+                // runtime loop.
+                if matches!(func.as_str(), "cstyleFor" | "arith") {
+                    for a in args {
+                        mark_all_idents_args(a, string_ctx);
+                    }
+                }
                 // a native `((i++))` / `let` inside a subshell/background
                 // writes a COPY in bash — a lifted module binding would be
                 // clobbered by the arrow (mirror of the Assign-target
@@ -7684,14 +7809,37 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                                 int_declare_names(args).unwrap_or_default()
                             };
                             // a PURE-VALUE `local x=1` declaration is not a store write (the
-                            // emit rewrites it to a native binding write — see pure_value_declare):
+                            // emit rewrites it to a native binding write — see declare_sources):
                             // skip its marks too, unless the call sits in a subshell/background
                             // (COPY semantics — the name must stay store-bound there, mirror of
                             // the Assign-target exclusion).
-                            let pure_decl = !in_copy && pure_value_declare(args).is_some();
+                            let pure_decl = !in_copy && declare_sources(args).is_some();
                             if !(native_let || !intdecl.is_empty() || pure_decl) {
 
-                                for a in &args[1..] {
+                                // the decl words live inside the Array
+                                // wrapper at args[1] (`local -a arr` →
+                                // ["-a", "arr"]) — flatten it; flag words
+                                // (`-a`, `-i`, `-r`...) are not variables,
+                                // their letters must not be marked
+                                // store-bound (the `-a` flag would poison
+                                // a var named `a`). `let`/`eval` args are
+                                // expressions/code — fully marked.
+                                let mark_args: Vec<&IrExpr> = args
+                                    .iter()
+                                    .skip(1)
+                                    .flat_map(|a| match a {
+                                        IrExpr::Array(elems) => elems.iter().collect(),
+                                        other => vec![other],
+                                    })
+                                    .collect();
+                                for a in mark_args {
+                                    if cname != "let"
+                                        && cname != "eval"
+                                        && matches!(a, IrExpr::Str(sv, _)
+                                            if sv.starts_with('-') || sv.starts_with('+'))
+                                    {
+                                        continue;
+                                    }
                                     mark_write_builtin_vars(a, excluded);
                                     // `let`/`(( ))`/`eval` args are
                                     // EXPRESSIONS ("i++") — mark EVERY
@@ -7878,10 +8026,28 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                         // skip its marks too, unless the call sits in a subshell/background
                         // (COPY semantics — the name must stay store-bound there, mirror of
                         // the Assign-target exclusion).
-                        let pure_decl = !in_copy && pure_value_declare(args).is_some();
+                        let pure_decl = !in_copy && declare_sources(args).is_some();
                         if !(native_let || !intdecl.is_empty() || pure_decl) {
 
-                            for a in args {
+                            // flatten the words wrapper (args[1]) and
+                            // skip flag words (`-a`, `-i`...) — their
+                            // letters are not variables
+                            let mark_args: Vec<&IrExpr> = args
+                                .iter()
+                                .skip(1)
+                                .flat_map(|a| match a {
+                                    IrExpr::Array(elems) => elems.iter().collect(),
+                                    other => vec![other],
+                                })
+                                .collect();
+                            for a in mark_args {
+                                if cname != "let"
+                                    && cname != "eval"
+                                    && matches!(a, IrExpr::Str(sv, _)
+                                        if sv.starts_with('-') || sv.starts_with('+'))
+                                {
+                                    continue;
+                                }
                                 mark_write_builtin_vars(a, excluded);
                                 // `let`/`(( ))`/`eval` args are ARITHMETIC
                                 // EXPRESSIONS — mark EVERY identifier they
@@ -8103,7 +8269,14 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // the setVar path's arithEval catches → "".
                 IrExpr::Arith(a) => !arith_has_div_mod(a),
                 IrExpr::Int(_) => true,
-                IrExpr::Str(sv, _) => sv.trim().parse::<i64>().is_ok(),
+                // the canonical-decimal round-trip (the `x=05` guard): a
+                // STRING source is numeric only when its text IS the
+                // canonical decimal of its value — `05`/`-0`/`+5`/` 5 `
+                // would print differently from the parsed number (bash
+                // stores the exact string; the numeric lift must never
+                // rewrite it). Matches the for-items' `canonical_int_item`
+                // convention.
+                IrExpr::Str(sv, _) => canonical_int_item(sv),
                 IrExpr::Var(n, _) => lifted.contains(n.as_str()),
                 IrExpr::Call { func, args } if func == "getVar" => {
                     matches!(args.as_slice(), [IrExpr::Str(n, _)] if lifted.contains(n.as_str()))
@@ -9877,8 +10050,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     IrExpr::Interpolate(parts) => interpolate_to_estree(parts),
                     IrExpr::Var(n, _) => Expr::Identifier { name: n.clone() },
                     IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
-                        [IrExpr::Str(n, _)] => Expr::Identifier { name: n.clone() },
-                        _ => unreachable!("lifted getVar source"),
+                        [IrExpr::Str(n, _)] if is_lifted(n) => Expr::Identifier { name: n.clone() },
+                        // a positional / special source (`x=$1` — the
+                        // fixpoint accepts the getVar positional family):
+                        // the native read (`sh2.positional[i] ?? ""`,
+                        // `.join(" ")`) — the exact value the runtime's
+                        // getVar yields
+                        _ => expr_to_estree(expr),
                     },
                     // string-lifted capture source: `x=$(cmd)` →
                     // `x = await sh2.capture(...)` (or the native
@@ -17969,6 +18147,18 @@ fn lift_walk_expr(
                     lift_mark_str_args(a, string_ctx);
                 }
             }
+            // `cstyleFor` headers and `arith` strings are ARITHMETIC text
+            // the runtime evaluates via evalArith — bare identifiers are
+            // STORE reads (` i = 2; i <= n; i++ ` reads `n` from the
+            // store), exactly like `let`/`(( ))` args. The `$`-ref scan
+            // (lift_mark_str_args) would miss them — mark ALL identifiers
+            // so a lifted binding never desyncs from the runtime loop.
+            if matches!(func.as_str(), "cstyleFor" | "arith") {
+                for a in args {
+                    eprintln!("SITE-cstyle {}", match a { IrExpr::Str(s,_) => s.clone(), _ => "?".into() });
+                    lift_mark_all_idents_args(a, string_ctx);
+                }
+            }
             // a native `((i++))` / `let` inside a subshell/background
             // writes a COPY in bash — a lifted module binding would be
             // clobbered by the arrow (mirror of the numeric-lift
@@ -18036,10 +18226,28 @@ fn lift_walk_expr(
                         // skip its marks too, unless the call sits in a subshell/background
                         // (COPY semantics — the name must stay store-bound there, mirror of
                         // the Assign-target exclusion).
-                        let pure_decl = !in_copy && pure_value_declare(args).is_some();
+                        let pure_decl = !in_copy && declare_sources(args).is_some();
                         if !(native_let || !intdecl.is_empty() || pure_decl) {
 
-                            for a in &args[1..] {
+                            // flatten the words wrapper (args[1]) and
+                            // skip flag words (`-a`, `-i`, `-r`...) —
+                            // their letters are not variables
+                            let mark_args: Vec<&IrExpr> = args
+                                .iter()
+                                .skip(1)
+                                .flat_map(|a| match a {
+                                    IrExpr::Array(elems) => elems.iter().collect(),
+                                    other => vec![other],
+                                })
+                                .collect();
+                            for a in mark_args {
+                                if cname != "let"
+                                    && cname != "eval"
+                                    && matches!(a, IrExpr::Str(sv, _)
+                                        if sv.starts_with('-') || sv.starts_with('+'))
+                                {
+                                    continue;
+                                }
                                 lift_mark_write_builtin_vars(a, excluded);
                                 // `let`/`(( ))`/`eval` args are
                                 // EXPRESSIONS ("i++") — mark EVERY
@@ -18209,10 +18417,28 @@ fn lift_walk_stmt(
                     // skip its marks too, unless the call sits in a subshell/background
                     // (COPY semantics — the name must stay store-bound there, mirror of
                     // the Assign-target exclusion).
-                    let pure_decl = !in_copy && pure_value_declare(args).is_some();
+                    let pure_decl = !in_copy && declare_sources(args).is_some();
                     if !(native_let || !intdecl.is_empty() || pure_decl) {
 
-                        for a in args {
+                        // flatten the words wrapper (args[1]) and skip
+                        // flag words (`-a`, `-i`...) — their letters are
+                        // not variables
+                        let mark_args: Vec<&IrExpr> = args
+                            .iter()
+                            .skip(1)
+                            .flat_map(|a| match a {
+                                IrExpr::Array(elems) => elems.iter().collect(),
+                                other => vec![other],
+                            })
+                            .collect();
+                        for a in mark_args {
+                            if cname != "let"
+                                && cname != "eval"
+                                && matches!(a, IrExpr::Str(sv, _)
+                                    if sv.starts_with('-') || sv.starts_with('+'))
+                            {
+                                continue;
+                            }
                             lift_mark_write_builtin_vars(a, excluded);
                             // `let`/`(( ))`/`eval` args are ARITHMETIC
                             // EXPRESSIONS — mark EVERY identifier they
@@ -18336,7 +18562,7 @@ fn lift_stmt_is_pure_decl(st: &IrStmt, name: &str) -> bool {
         }
         _ => return false,
     };
-    pure_value_declare(args)
+    declare_sources(args)
         .map(|pairs| pairs.iter().any(|(n, _)| n == name))
         .unwrap_or(false)
 }
@@ -18617,7 +18843,7 @@ fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
                     }
                     _ => {
                         if let Some(a) = args {
-                            if let Some(pairs) = pure_value_declare(a) {
+                            if let Some(pairs) = declare_sources(a) {
                                 for (n, _) in pairs {
                                     candidates.insert(n);
                                 }
@@ -18820,6 +19046,15 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                 // ...); the runtime never sees a lifted var.
                 IrExpr::Call { func, args } if func == "capture" => {
                     matches!(args.as_slice(), [IrExpr::Arrow(_)])
+                }
+                // a POSITIONAL source (`local n=$1` / `x=$1` →
+                // getVar("1")): the native positional read always yields
+                // a string — the exact value the runtime's expandWord /
+                // getVar produce. `$@`/`$*` join, `$#` counts — the
+                // getVar positional family.
+                IrExpr::Call { func, args } if func == "getVar" => {
+                    matches!(args.as_slice(), [IrExpr::Str(n, _)]
+                        if lifted.contains(n.as_str()) || positional_name(n))
                 }
                 _ => false,
             });
@@ -20170,7 +20405,7 @@ fn stmt_is_local_decl(stmt: &IrStmt) -> bool {
         }
         _ => None,
     };
-    args.is_some_and(|a| pure_value_declare(a).is_some())
+    args.is_some_and(|a| declare_sources(a).is_some())
 }
 
 /// Is this a [`try_native_local_decl_stmt`] block (a `let` first + the
