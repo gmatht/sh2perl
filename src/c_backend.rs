@@ -48,6 +48,9 @@ pub struct Render {
     need_lower: bool,
     need_includes: bool,
     need_slice: bool,
+    /// numeric -> string (sprintf into a static buffer), for contains()
+    /// on Int-typed args and other %s consumers
+    need_str: bool,
     todo: usize,
 }
 
@@ -321,6 +324,26 @@ impl Render {
                 }
                 self.sh2_stub("getVar", args, "getVar")
             }
+            // contains(needle, pattern) — PureCpu (the grep -q / case *P*)
+            // lift). strstr is exact-substring; identical for literal
+            // patterns. Int-typed needles go through c_str() so they can
+            // be %s-consumed.
+            "contains" => {
+                if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
+                    self.need_includes = true;
+                    let needle_c = if self.expr_is_num(needle) {
+                        self.need_str = true;
+                        format!("c_str({})", self.expr(needle))
+                    } else {
+                        self.expr(needle)
+                    };
+                    return format!(
+                        "c_includes((char*)({needle_c}), (char*)({}))",
+                        self.expr(pattern)
+                    );
+                }
+                self.sh2_stub("contains", args, "contains")
+            }
             // test("...") — mini evaluator for the common numeric/string
             // patterns; anything else → runtime stub.
             "test" => {
@@ -566,6 +589,41 @@ impl Render {
                 self.emit(&format!("return {code};"));
             }
             IrStmt::For { var, iter, body } => {
+                // seq-range lift: `for x in $(seq a b)` (captureWords →
+                // arrow → exec "seq") OR a core-lowered IrExpr::Range →
+                // traditional numeric C loop. The A2 verdict for the loop
+                // var is usually Str (captureWords returns strings), so the
+                // lift overrides it to Int for the loop scope and restores
+                // it afterwards.
+                if let Some((first, last, step)) = self.seq_range(iter) {
+                    let name = self.c_ident(var);
+                    let prev_type = self.var_types.get(var).copied();
+                    self.var_types.insert(var.clone(), IrType::Int);
+                    let cmp = if step > 0 { "<=" } else { ">=" };
+                    let upd = match step {
+                        1 => format!("{name}++"),
+                        -1 => format!("{name}--"),
+                        s => format!("{name} += {s}"),
+                    };
+                    self.emit(&format!(
+                        "for (long long {name} = {first}; {name} {cmp} {last}; {upd}) {{"
+                    ));
+                    self.depth += 1;
+                    for s in body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                    match prev_type {
+                        Some(t) => {
+                            self.var_types.insert(var.clone(), t);
+                        }
+                        None => {
+                            self.var_types.remove(var);
+                        }
+                    }
+                    return;
+                }
                 // Emit a C for loop over an index variable; each iteration
                 // assigns the loop var from a static items array. Supports
                 // Int vars with numeric items and string vars with string
@@ -654,6 +712,95 @@ impl Render {
         }
     }
 
+    /// Detect the shell `for x in $(seq a b)` iter (the captureWords →
+    /// arrow → exec "seq" shape) and a core-lowered `IrExpr::Range`.
+    /// Returns (first, last, step):
+    ///   - `Range { start, end }` → (start, end, 1)
+    ///   - `Array([Call("captureWords", [Arrow([Expr(Call("exec",
+    ///       [Str("seq"), Array(numargs])]))])])])` → parsed numeric seq
+    ///     args, `seq [FIRST [INCREMENT]] LAST`
+    /// Anything else (general word lists, non-seq commands) → None, so the
+    /// caller falls back to the array-items path or a TODO marker.
+    fn seq_range(&self, iter: &IrExpr) -> Option<(i64, i64, i64)> {
+        match iter {
+            IrExpr::Range { start, end } => Some((*start, *end, 1)),
+            IrExpr::Array(items) if items.len() == 1 => {
+                match items.first() {
+                    // core-lowered `seq_range_for` (in flight in the
+                    // single-owner core): Array([Range{start,end}]). The
+                    // core is conservative (3-arg steps, leading zeros,
+                    // body writes, nested same-var binds stay on the
+                    // word path), so a Range here is always step 1.
+                    Some(IrExpr::Range { start, end }) => Some((*start, *end, 1)),
+                    // pre-lift shell shape (the worktree's own core):
+                    // Array([Call("captureWords", [Arrow([Expr(Call(
+                    //   "exec", [Str("seq"), Array(numargs])]))])])])
+                    Some(cap) => self.seq_capture_words(cap),
+                    None => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse the pre-lift `captureWords → arrow → exec "seq"` iterable
+    /// (seq [FIRST [INCREMENT]] LAST); None → not a numeric seq.
+    fn seq_capture_words(&self, cap: &IrExpr) -> Option<(i64, i64, i64)> {
+        let IrExpr::Call { func, args } = cap else {
+            return None;
+        };
+        if func != "captureWords" {
+            return None;
+        }
+        let arrow = args.first()?;
+        let IrExpr::Arrow(body) = arrow else {
+            return None;
+        };
+        if body.len() != 1 {
+            return None;
+        }
+        let stmt = body.first()?;
+        let exec_call = match stmt {
+            IrStmt::Expr(e) => e,
+            _ => return None,
+        };
+        let IrExpr::Call { func, args } = exec_call else {
+            return None;
+        };
+        if func != "exec" {
+            return None;
+        }
+        let IrExpr::Str(cmd, _) = args.first()? else {
+            return None;
+        };
+        if cmd != "seq" {
+            return None;
+        }
+        let IrExpr::Array(seqargs) = args.get(1)? else {
+            return None;
+        };
+        if seqargs.is_empty() || seqargs.len() > 3 {
+            return None;
+        }
+        let num = |e: &IrExpr| -> Option<i64> {
+            match e {
+                IrExpr::Str(s, _) => s.trim().parse::<i64>().ok(),
+                IrExpr::Int(n) => Some(*n),
+                _ => None,
+            }
+        };
+        let last = num(seqargs.last()?)?;
+        let (first, step) = match seqargs.len() {
+            1 => (1, 1),
+            2 => (num(&seqargs[0])?, 1),
+            _ => (num(&seqargs[0])?, num(&seqargs[1])?),
+        };
+        if step == 0 {
+            return None;
+        }
+        Some((first, last, step))
+    }
+
     /// Render an expression as a C integer (Int-typed assignment target).
     fn expr_as_num(&mut self, e: &IrExpr) -> String {
         match e {
@@ -732,6 +879,12 @@ impl Render {
         self.emit("#include <math.h>");
         self.emit("#include <assert.h>"); // debug-only length asserts (NDEBUG compiles out)
         self.emit("");
+        if self.need_includes {
+            self.emit("static int c_includes(const char* s, const char* p) { return strstr(s, p) != NULL; }");
+        }
+        if self.need_str {
+            self.emit("static char* c_str(long long n) { static char b[64]; sprintf(b, \"%lld\", n); return b; }");
+        }
         if !self.sh2_calls.is_empty() {
             self.emit("/* sh2.* runtime stubs — TODO: implement (harness/sh2-namespace.json) */");
             let names: Vec<String> = self.sh2_calls.iter().cloned().collect();
