@@ -1742,15 +1742,26 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
     use crate::ir::{InterpPart, IrExpr, IrStmt};
     use std::collections::{BTreeMap, BTreeSet};
 
-    // collect the assignment targets + the RHS exprs
-    let mut assigns: Vec<(String, &IrExpr)> = Vec::new();
-    fn walk<'a>(stmts: &'a [IrStmt], assigns: &mut Vec<(String, &'a IrExpr)>) {
+    // ranges of the loop counters (whole-program, joined) — the length
+    // analysis consults them for while-loop trip bounds
+    let ranges = analyze_var_ranges(prog);
+
+    // collect the assignment targets + RHS exprs, with the max number of
+    // executions (the product of the enclosing loop trips; Some(1) at top
+    // level; None when any enclosing loop is unbounded)
+    let mut assigns: Vec<(String, &IrExpr, Option<u64>)> = Vec::new();
+    fn walk<'a>(
+        stmts: &'a [IrStmt],
+        assigns: &mut Vec<(String, &'a IrExpr, Option<u64>)>,
+        trip: Option<u64>,
+        ranges: &HashMap<String, (i64, i64)>,
+    ) {
         for st in stmts {
             match st {
                 IrStmt::Assign { targets, expr } => {
                     for t in targets {
                         if t.indices.is_empty() {
-                            assigns.push((t.var.clone(), expr));
+                            assigns.push((t.var.clone(), expr, trip));
                         }
                     }
                 }
@@ -1793,7 +1804,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                                                 }
                                                 None => break,
                                             };
-                                            assigns.push((name.to_string(), v));
+                                            assigns.push((name.to_string(), v, trip));
                                             if matches!(next, Some(IrExpr::Array(_))) {
                                                 i += 2;
                                                 continue;
@@ -1808,44 +1819,105 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                     }
                 }
                 IrStmt::If { then, elsifs, else_, .. } => {
-                    walk(then, assigns);
+                    walk(then, assigns, trip, ranges);
                     for (_, arm) in elsifs {
-                        walk(arm, assigns);
+                        walk(arm, assigns, trip, ranges);
                     }
-                    walk(else_, assigns);
+                    walk(else_, assigns, trip, ranges);
                 }
-                IrStmt::While { body, .. }
-                | IrStmt::For { body, .. }
-                | IrStmt::DoWhile { body, .. }
-                | IrStmt::Subshell(body)
+                IrStmt::While { cond, body } => {
+                    let t = trip_from_bound(cond_bound(cond), body, ranges);
+                    walk(body, assigns, mul_trip(trip, t), ranges);
+                }
+                IrStmt::DoWhile { body, cond, until } => {
+                    let b = cond_bound(cond);
+                    let b = if *until {
+                        b.map(|(v, c, n)| (v, cmp_flip(c), n))
+                    } else {
+                        b
+                    };
+                    let t = trip_from_bound(b, body, ranges);
+                    walk(body, assigns, mul_trip(trip, t), ranges);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    let t = for_iter_trip(iter);
+                    walk(body, assigns, mul_trip(trip, t), ranges);
+                }
+                IrStmt::Subshell(body)
                 | IrStmt::Background(body)
                 | IrStmt::Block(body)
-                | IrStmt::Redirect { inner: body, .. } => walk(body, assigns),
-                IrStmt::Function { body, .. } => walk(body, assigns),
+                | IrStmt::Redirect { inner: body, .. } => walk(body, assigns, trip, ranges),
+                IrStmt::Function { body, .. } => walk(body, assigns, trip, ranges),
                 _ => {}
             }
         }
     }
-    walk(&prog.stmts, &mut assigns);
+    walk(&prog.stmts, &mut assigns, Some(1), &ranges);
 
-    let names: BTreeSet<String> = assigns.iter().map(|(n, _)| n.clone()).collect();
+    /// The max iterations of a loop whose cond pins a counter var
+    /// (`[ $i -lt 100 ]`): entry bound from the whole-program ranges (a
+    /// sound under-estimate of the entry lo — over-estimates the trip),
+    /// step from the body's provable +k writes. None = unbounded.
+    fn trip_from_bound(
+        bound: Option<(String, Cmp, i64)>,
+        body: &[IrStmt],
+        ranges: &HashMap<String, (i64, i64)>,
+    ) -> Option<u64> {
+        let (v, c, n) = bound?;
+        let (blo, bhi) = ranges.get(&v).copied()?;
+        let (mn, _) = body_step_bounds(body, &v)?;
+        while_iterations(c, n, blo, bhi, mn)
+    }
+
+    /// Multiply the enclosing trip by a loop's trip (cap the product).
+    fn mul_trip(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.saturating_mul(y).min(1_000_000)),
+            _ => None,
+        }
+    }
+
+    let names: BTreeSet<String> = assigns.iter().map(|(n, _, _)| n.clone()).collect();
     let mut lens: BTreeMap<String, Option<u64>> =
         names.iter().map(|n| (n.clone(), Some(0))).collect();
 
-    fn expr_len(e: &IrExpr, lens: &BTreeMap<String, Option<u64>>, cap: u64, depth: u32) -> Option<u64> {
+    fn expr_len(
+        e: &IrExpr,
+        lens: &BTreeMap<String, Option<u64>>,
+        cap: u64,
+        depth: u32,
+    ) -> Option<u64> {
+        expr_len_skip(e, lens, cap, depth, None)
+    }
+
+    /// Like `expr_len` but reads of `skip` count as 0 — the per-execution
+    /// added length of a self-accumulating assignment (`s="$s$x"` → |x|).
+    fn expr_len_skip(
+        e: &IrExpr,
+        lens: &BTreeMap<String, Option<u64>>,
+        cap: u64,
+        depth: u32,
+        skip: Option<&str>,
+    ) -> Option<u64> {
         if depth > MAX_DEPTH {
             return None;
         }
         match e {
             IrExpr::Str(sv, _) => Some(sv.len() as u64),
             IrExpr::Int(_) => Some(20), // the max digit count
-            IrExpr::Var(n, _) => lens.get(n).copied().flatten(),
+            IrExpr::Var(n, _) => {
+                if skip == Some(n.as_str()) {
+                    Some(0)
+                } else {
+                    lens.get(n).copied().flatten()
+                }
+            }
             IrExpr::Interpolate(parts) => {
                 let mut total = 0u64;
                 for p in parts {
                     let l = match p {
                         InterpPart::Lit(s) => s.len() as u64,
-                        InterpPart::Expr(e) => expr_len(e, lens, cap, depth + 1)?,
+                        InterpPart::Expr(e) => expr_len_skip(e, lens, cap, depth + 1, skip)?,
                     };
                     total = total.saturating_add(l);
                     if total > cap {
@@ -1862,17 +1934,34 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                 // when that is a bounded echo; everything else is
                 // unbounded (the user's design: e.g. the primes'
                 // `$(echo "sqrt($n)" | bc)` -> 40).
-                capture_bound(expr, lens, cap, depth + 1)
+                capture_bound_skip(expr, lens, cap, depth + 1, skip)
             }
             IrExpr::Call { func, args } if func == "getVar" => match args.first() {
-                Some(IrExpr::Str(n, _)) => lens.get(n).copied().flatten(),
+                Some(IrExpr::Str(n, _)) => {
+                    if skip == Some(n.as_str()) {
+                        Some(0)
+                    } else {
+                        lens.get(n).copied().flatten()
+                    }
+                }
+                _ => None,
+            },
+            // the runtime `s+=x` — the value's length is the added part
+            IrExpr::Call { func, args } if func == "assign" => match args.as_slice() {
+                [IrExpr::Str(n, _), IrExpr::Str(op, _), value] if op == "+=" => {
+                    if skip == Some(n.as_str()) {
+                        expr_len_skip(value, lens, cap, depth + 1, skip)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             },
             // the runtime capture: sh2.capture([wrapped command]) — the
             // bound comes from the CAPTURED command (bc/wc/hash fixed
             // widths, the filters <= the input, grep -q/-c options)
             IrExpr::Call { func, args } if func == "capture" => match args.first() {
-                Some(body) => capture_bound(body, lens, cap, depth + 1),
+                Some(body) => capture_bound_skip(body, lens, cap, depth + 1, skip),
                 _ => None,
             },
             // BinOps ARE bounded: `a . b` (Concat) = max(a)+max(b); the
@@ -1880,8 +1969,8 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
             // logicals yield 0/1 (1 char).
             IrExpr::BinOp { op, lhs, rhs } => match op {
                 BinOpKind::Concat => {
-                    let l = expr_len(lhs, lens, cap, depth + 1)?;
-                    let r = expr_len(rhs, lens, cap, depth + 1)?;
+                    let l = expr_len_skip(lhs, lens, cap, depth + 1, skip)?;
+                    let r = expr_len_skip(rhs, lens, cap, depth + 1, skip)?;
                     Some(l.saturating_add(r))
                 }
                 BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Gt
@@ -1984,11 +2073,12 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
         }
     }
 
-    fn capture_bound(
+    fn capture_bound_skip(
         e: &IrExpr,
         lens: &BTreeMap<String, Option<u64>>,
         cap: u64,
         depth: u32,
+        skip: Option<&str>,
     ) -> Option<u64> {
         if depth > MAX_DEPTH {
             return None;
@@ -2062,11 +2152,11 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                         IrExpr::Array(items) => {
                             let mut t = 0u64;
                             for it in items.iter() {
-                                t = t.saturating_add(expr_len(it, lens, cap, depth + 1)?);
+                                t = t.saturating_add(expr_len_skip(it, lens, cap, depth + 1, skip)?);
                             }
                             t
                         }
-                        other => expr_len(other, lens, cap, depth + 1)?,
+                        other => expr_len_skip(other, lens, cap, depth + 1, skip)?,
                     };
                     total = total.saturating_add(l).saturating_add(1);
                 }
@@ -2090,28 +2180,271 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                     None
                 } else {
                     let first = stages.first()?;
-                    capture_bound(first, lens, cap, depth + 1)
+                    capture_bound_skip(first, lens, cap, depth + 1, skip)
                 }
             }
             _ => None,
         }
     }
 
+    // how many times does the RHS read the target? (0 = not
+    // self-accumulating; 1 = linear accumulation `s="$s$x"`;
+    // ≥ 2 = compounding `s="$s$s"` — unbounded, never bounded)
+    fn count_var_reads(e: &IrExpr, v: &str) -> usize {
+        match e {
+            IrExpr::Var(n, _) => (n == v) as usize,
+            IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
+                [IrExpr::Str(n, _)] => (n == v) as usize,
+                _ => 0,
+            },
+            IrExpr::Call { func, args } => {
+                if func == "assign" {
+                    // the name arg is a WRITE — count only the value
+                    return args.iter().skip(1).map(|a| count_var_reads(a, v)).sum();
+                }
+                args.iter().map(|a| count_var_reads(a, v)).sum()
+            }
+            IrExpr::Interpolate(parts) => parts
+                .iter()
+                .map(|p| match p {
+                    InterpPart::Lit(_) => 0,
+                    InterpPart::Expr(e) => count_var_reads(e, v),
+                })
+                .sum(),
+            IrExpr::BinOp { lhs, rhs, .. } => count_var_reads(lhs, v) + count_var_reads(rhs, v),
+            IrExpr::Arith(a) => arith_count_reads(a, v),
+            IrExpr::Index { var, key, .. } => (var == v) as usize + count_var_reads(key, v),
+            IrExpr::Capture { expr, .. } => count_var_reads(expr, v),
+            IrExpr::Array(items) => items.iter().map(|i| count_var_reads(i, v)).sum(),
+            IrExpr::Arrow(stmts) => stmts.iter().map(|s| stmt_count_reads(s, v)).sum(),
+            IrExpr::Ternary { cond, then, else_, .. } => {
+                count_var_reads(cond, v)
+                    + count_var_reads(then, v)
+                    + count_var_reads(else_, v)
+            }
+            IrExpr::DefinedOr { expr, default, .. } => {
+                count_var_reads(expr, v) + count_var_reads(default, v)
+            }
+            IrExpr::Object(entries) => entries.iter().map(|(_, x)| count_var_reads(x, v)).sum(),
+            IrExpr::MethodCall { obj, args, .. } => {
+                count_var_reads(obj, v) + args.iter().map(|a| count_var_reads(a, v)).sum::<usize>()
+            }
+            // Str/Int/Bool/Ident/Json/Range/RawExpr/Regex — no reads
+            _ => 0,
+        }
+    }
+
+    fn stmt_count_reads(s: &IrStmt, v: &str) -> usize {
+        match s {
+            IrStmt::Assign { expr, .. } => count_var_reads(expr, v),
+            IrStmt::Expr(e) => count_var_reads(e, v),
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                count_var_reads(cond, v)
+                    + then.iter().map(|s| stmt_count_reads(s, v)).sum::<usize>()
+                    + elsifs
+                        .iter()
+                        .map(|(c, b)| {
+                            count_var_reads(c, v)
+                                + b.iter().map(|s| stmt_count_reads(s, v)).sum::<usize>()
+                        })
+                        .sum::<usize>()
+                    + else_.iter().map(|s| stmt_count_reads(s, v)).sum::<usize>()
+            }
+            // loop bodies may read v (their trip bounds are handled
+            // separately) — a conservative count suffices here
+            IrStmt::While { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::DoWhile { body, .. } => body.iter().map(|s| stmt_count_reads(s, v)).sum(),
+            IrStmt::Block(b)
+            | IrStmt::Subshell(b)
+            | IrStmt::Background(b)
+            | IrStmt::Redirect { inner: b, .. } => {
+                b.iter().map(|s| stmt_count_reads(s, v)).sum()
+            }
+            IrStmt::Output { value, .. } => count_var_reads(value, v),
+            IrStmt::WriteFile { path, content, .. } => {
+                count_var_reads(path, v) + count_var_reads(content, v)
+            }
+            _ => 0,
+        }
+    }
+
+    fn arith_count_reads(a: &ArithAst, v: &str) -> usize {
+        match a {
+            ArithAst::Var(n) => (n == v) as usize,
+            ArithAst::Num(_) => 0,
+            ArithAst::Index { var, key, .. } => {
+                (var == v) as usize + arith_count_reads(key, v)
+            }
+            ArithAst::Bin { lhs, rhs, .. } => arith_count_reads(lhs, v) + arith_count_reads(rhs, v),
+            ArithAst::Un { arg, .. } => arith_count_reads(arg, v),
+            ArithAst::Cond { test, then, else_, .. } => {
+                arith_count_reads(test, v)
+                    + arith_count_reads(then, v)
+                    + arith_count_reads(else_, v)
+            }
+            ArithAst::Assign { var, rhs, .. } => {
+                (var == v) as usize + arith_count_reads(rhs, v)
+            }
+            ArithAst::IncDec { var, .. } => (var == v) as usize,
+        }
+    }
+
+    /// A numeric accumulator (`i=$((i+1))`, `n+=2`, `sum=$(… | bc)`): the
+    /// result is a number, so the bound is the fixed number/capture width
+    /// — the trip does NOT multiply (a counter's VALUE grows, not its
+    /// width).
+    fn is_numeric_accum(e: &IrExpr) -> bool {
+        // a capture whose pipeline's LAST stage is a fixed-width numeric
+        // producer (the same table capture_bound uses) — both the
+        // `IrExpr::Capture` node and the runtime `capture` call
+        let numeric_last_stage = |body: &IrExpr| {
+            matches!(
+                capture_stages(body)
+                    .last()
+                    .and_then(|s| stage_cmd(s))
+                    .as_deref(),
+                Some(
+                    "bc" | "expr" | "wc" | "date" | "umask" | "md5sum"
+                    | "sha1sum" | "sha256sum" | "sha512sum",
+                )
+            )
+        };
+        match e {
+            IrExpr::Arith(_) => true,
+            IrExpr::Call { func, args } if func == "assign" => match args.as_slice() {
+                [IrExpr::Str(_, _), IrExpr::Str(op, _), value] if op == "+=" => match value {
+                    IrExpr::Int(_) | IrExpr::Arith(_) => true,
+                    IrExpr::Str(sv, _) => sv.trim().parse::<i64>().is_ok(),
+                    _ => false,
+                },
+                _ => false,
+            },
+            IrExpr::Capture { expr, .. } => numeric_last_stage(expr),
+            IrExpr::Call { func, args } if func == "capture" => match args.first() {
+                Some(body) => numeric_last_stage(body),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The numeric accumulator's bound: the fixed number width (20) or the
+    /// capture producer's fixed width (bc 40, hashes …) — NOT trip·Δ.
+    fn numeric_accum_new(
+        e: &IrExpr,
+        lens: &BTreeMap<String, Option<u64>>,
+        cap: u64,
+        depth: u32,
+    ) -> Option<u64> {
+        match e {
+            IrExpr::Arith(_) => Some(20),
+            IrExpr::Call { func, args } if func == "assign" => match args.as_slice() {
+                [IrExpr::Str(_, _), IrExpr::Str(op, _), value] if op == "+=" => {
+                    expr_len(value, lens, cap, depth + 1)
+                }
+                _ => None,
+            },
+            IrExpr::Capture { .. } => expr_len(e, lens, cap, depth + 1),
+            IrExpr::Call { func, args } if func == "capture" => {
+                expr_len(e, lens, cap, depth + 1)
+            }
+            _ => None,
+        }
+    }
+
+    let reads: Vec<usize> = assigns
+        .iter()
+        .map(|(v, rhs, _)| count_var_reads(rhs, v))
+        .collect();
+
+    // Phase A — the baselines v0: fixpoint over the non-accumulating
+    // assignments only (every assignment to a var is one write; max over
+    // writes converges to the final single-write bound). A var with no
+    // non-accumulating assignment keeps Some(0) (unset reads as "").
     for _ in 0..ITER_LIMIT {
         let mut changed = false;
-        for (name, rhs) in &assigns {
-            let cur = lens[name];
+        for (i, (v, rhs, _)) in assigns.iter().enumerate() {
+            if reads[i] > 0 {
+                continue;
+            }
+            let cur = lens[v];
             if cur.is_none() {
                 continue;
             }
             let l = expr_len(rhs, &lens, CAP, 0);
             let new = match l {
-                Some(v) if v > CAP => None,
-                Some(v) => Some(v.max(cur.unwrap_or(0))),
+                Some(x) if x > CAP => None,
+                Some(x) => Some(x.max(cur.unwrap_or(0))),
                 None => None,
             };
             if new != cur {
-                lens.insert(name.clone(), new);
+                lens.insert(v.clone(), new);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let v0 = lens.clone();
+
+    // Phase B — the unified fixpoint: accumulating assignments get a
+    // direct bound (numeric accumulators cap at the 20-char number width;
+    // string accumulators at v0 + trip·Δ where Δ = one execution's added
+    // length with the self-reference zeroed); everything else
+    // re-evaluates against the full lens so an overwrite sees another
+    // var's final (accumulated) bound. Monotone, terminates (the cap
+    // absorbs; a None is final).
+    for _ in 0..ITER_LIMIT {
+        let mut changed = false;
+        for (i, (v, rhs, trip)) in assigns.iter().enumerate() {
+            let cur = lens[v];
+            if cur.is_none() {
+                continue;
+            }
+            let new = if reads[i] == 0 {
+                match expr_len(rhs, &lens, CAP, 0) {
+                    Some(x) if x > CAP => None,
+                    Some(x) => Some(x),
+                    None => None,
+                }
+            } else if reads[i] >= 2 {
+                // compounding growth (s="$s$s") — unbounded
+                None
+            } else if is_numeric_accum(rhs) {
+                // a counter's value grows, not its width
+                numeric_accum_new(rhs, &lens, CAP, 0)
+            } else {
+                match (trip, v0.get(v).copied().flatten()) {
+                    (Some(t), Some(base)) => {
+                        match expr_len_skip(rhs, &lens, CAP, 0, Some(v)) {
+                            Some(d) => {
+                                let total = base.saturating_add(t.saturating_mul(d));
+                                if total > CAP {
+                                    None
+                                } else {
+                                    Some(total)
+                                }
+                            }
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            let new = match (cur, new) {
+                (Some(c), Some(n)) => Some(c.max(n)),
+                _ => None,
+            };
+            if new != cur {
+                lens.insert(v.clone(), new);
                 changed = true;
             }
         }
@@ -2601,6 +2934,478 @@ fn join(a: Range, b: Range) -> Range {
     }
 }
 
+// ── Loop fixpoint machinery (widen + loop-cond bounding) ─────────────
+// The spike's "Step 2": a `while [ $i -lt 100 ]; do i=$((i+1)); done`
+// counter now lands in [lo, 100] instead of Any. The fixed-point
+// iteration widens outward-moving bounds to the ±i64 arithmetic extremes
+// (bash arith is 64-bit wrapped — sound and terminating), then pulls the
+// loop variable back by the entry invariant (`v < 100` → hi ≤ 99) and by
+// the trip count for the OTHER carried counters (i ≤ pre_lo + trip·step).
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+}
+
+fn cmp_flip(c: Cmp) -> Cmp {
+    // NOT(v < n) = v >= n, NOT(v <= n) = v > n, ...
+    match c {
+        Cmp::Lt => Cmp::Ge,
+        Cmp::Le => Cmp::Gt,
+        Cmp::Gt => Cmp::Le,
+        Cmp::Ge => Cmp::Lt,
+        Cmp::Eq => Cmp::Eq,
+    }
+}
+
+/// Apply a `while var cmp n` entry invariant to a range (cap the side the
+/// comparison pins; None when the range is impossible).
+fn cap_by_cmp(r: (i64, i64), c: Cmp, n: i64) -> Range {
+    let (lo, hi) = r;
+    match c {
+        Cmp::Lt => {
+            if n == i64::MIN {
+                return None;
+            }
+            let hi2 = hi.min(n - 1);
+            if lo > hi2 {
+                None
+            } else {
+                Some((lo, hi2))
+            }
+        }
+        Cmp::Le => {
+            let hi2 = hi.min(n);
+            if lo > hi2 {
+                None
+            } else {
+                Some((lo, hi2))
+            }
+        }
+        Cmp::Gt => {
+            if n == i64::MAX {
+                return None;
+            }
+            let lo2 = lo.max(n + 1);
+            if lo2 > hi {
+                None
+            } else {
+                Some((lo2, hi))
+            }
+        }
+        Cmp::Ge => {
+            let lo2 = lo.max(n);
+            if lo2 > hi {
+                None
+            } else {
+                Some((lo2, hi))
+            }
+        }
+        Cmp::Eq => {
+            if lo <= n && n <= hi {
+                Some((n, n))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The numeric bound a `while`/`until` condition pins on a variable:
+/// `[ $i -lt 100 ]`, `(( i < 100 ))` (the parser lowers it to
+/// `let "i < 100"`), or the `until` negation. `(var, cmp, n)` = "the loop
+/// continues while `var cmp n`". String compares (`[[ ]]`), grep-lifted
+/// conds, file tests — None (no numeric bound).
+fn cond_bound(cond: &IrExpr) -> Option<(String, Cmp, i64)> {
+    match cond {
+        IrExpr::Call { func, args } if func == "test" => match args.as_slice() {
+            [IrExpr::Str(text, _)] => test_text_bound(text),
+            _ => None,
+        },
+        // `while (( i < 100 ))` — the parser emits `let "i < 100"`
+        IrExpr::Call { func, args } if func == "exec" => match args.as_slice() {
+            [IrExpr::Str(name, _), IrExpr::Array(items)] if name == "let" => {
+                match items.as_slice() {
+                    [IrExpr::Str(text, _)] => arith_text_bound(text),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        // `until cond` wraps the cond in BinOp(Not, cond, cond)
+        IrExpr::BinOp {
+            op: BinOpKind::Not,
+            lhs,
+            ..
+        } => cond_bound(lhs).map(|(v, c, n)| (v, cmp_flip(c), n)),
+        _ => None,
+    }
+}
+
+/// `[ $i -lt 100 ]` / `[ 100 -gt $i ]` — single-bracket NUMERIC tests
+/// only (`-lt/-le/-gt/-ge/-eq`); `<`/`>` are string compares and are NOT
+/// trusted as numeric bounds.
+fn test_text_bound(text: &str) -> Option<(String, Cmp, i64)> {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let var =
+        |s: &str| s.strip_prefix('$').filter(|n| !n.is_empty()).map(str::to_string);
+    let num = |s: &str| s.parse::<i64>().ok();
+    let cmp = |s: &str| match s {
+        "-lt" => Some(Cmp::Lt),
+        "-le" => Some(Cmp::Le),
+        "-gt" => Some(Cmp::Gt),
+        "-ge" => Some(Cmp::Ge),
+        "-eq" => Some(Cmp::Eq),
+        _ => None,
+    };
+    if let (Some(v), Some(c), Some(n)) = (var(parts[0]), cmp(parts[1]), num(parts[2])) {
+        Some((v, c, n))
+    } else if let (Some(n), Some(c), Some(v)) = (num(parts[0]), cmp(parts[1]), var(parts[2])) {
+        // `[ 100 -gt $i ]` ⇔ `$i -lt 100`
+        Some((v, cmp_flip(c), n))
+    } else {
+        None
+    }
+}
+
+/// `let "i < 100"` — numeric arithmetic comparisons only.
+fn arith_text_bound(text: &str) -> Option<(String, Cmp, i64)> {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let var = |s: &str| {
+        if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    };
+    let num = |s: &str| s.parse::<i64>().ok();
+    let cmp = |s: &str| match s {
+        "<" => Some(Cmp::Lt),
+        "<=" => Some(Cmp::Le),
+        ">" => Some(Cmp::Gt),
+        ">=" => Some(Cmp::Ge),
+        "==" | "=" => Some(Cmp::Eq),
+        _ => None,
+    };
+    if let (Some(v), Some(c), Some(n)) = (var(parts[0]), cmp(parts[1]), num(parts[2])) {
+        Some((v, c, n))
+    } else if let (Some(n), Some(c), Some(v)) = (num(parts[0]), cmp(parts[1]), var(parts[2])) {
+        Some((v, cmp_flip(c), n))
+    } else {
+        None
+    }
+}
+
+/// The for-loop variable's range from its iterable: min/max over integer
+/// items (`for i in 1 2 3`), a Range node (`for i in $(seq 1 100)` after
+/// the seq_range_for transform), or None (a non-numeric item → Any).
+fn for_iter_range(iter: &IrExpr) -> Range {
+    match iter {
+        IrExpr::Array(items) => {
+            let mut lo = i64::MAX;
+            let mut hi = i64::MIN;
+            for it in items {
+                match ir_range(it, &HashMap::new()) {
+                    Some((l, h)) => {
+                        lo = lo.min(l);
+                        hi = hi.max(h);
+                    }
+                    None => return None,
+                }
+            }
+            if lo <= hi {
+                Some((lo, hi))
+            } else {
+                None // empty item list — the loop never runs
+            }
+        }
+        IrExpr::Range { start, end } => Some(((*start).min(*end), (*start).max(*end))),
+        _ => None,
+    }
+}
+
+/// The for-loop's iteration count (trip): item count / range span.
+fn for_iter_trip(iter: &IrExpr) -> Option<u64> {
+    match iter {
+        IrExpr::Array(items) => Some(items.len() as u64),
+        IrExpr::Range { start, end } => {
+            let span = ((*start as i128) - (*end as i128)).unsigned_abs() + 1;
+            Some(span.min(u64::MAX as u128) as u64)
+        }
+        _ => None,
+    }
+}
+
+/// The literal step of `v = v + k` / `v = k + v` / `v += k` with k ≥ 1.
+fn plus_step(expr: &IrExpr, v: &str) -> Option<i64> {
+    match expr {
+        IrExpr::Arith(a) => match a.as_ref() {
+            ArithAst::Bin { op, lhs, rhs } if op == "+" => {
+                match (lhs.as_ref(), rhs.as_ref()) {
+                    (ArithAst::Var(n), ArithAst::Num(k))
+                    | (ArithAst::Num(k), ArithAst::Var(n))
+                        if n == v =>
+                    {
+                        if *k >= 1 {
+                            Some(*k)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        IrExpr::Call { func, args } if func == "assign" => match args.as_slice() {
+            [IrExpr::Str(n, _), IrExpr::Str(op, _), e] if n == v && op == "+=" => {
+                match ir_range(e, &HashMap::new()) {
+                    Some((lo, hi)) if lo >= 1 && hi >= lo => Some(lo),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The per-iteration step bounds of var v in a loop body — provable only
+/// when EVERY write to v (on every path) is `v = v + k` / `v += k` with
+/// literal k ≥ 1. Returns (min_step, max_step); None → not a provable
+/// counter (the widening stands alone). min drives the trip count (fewer
+/// iterations when the body may add more); max drives the other vars'
+/// trip caps.
+fn body_step_bounds(stmts: &[IrStmt], v: &str) -> Option<(i64, i64)> {
+    let mut mn: Option<i64> = None;
+    let mut mx: Option<i64> = None;
+    for s in stmts {
+        let r: Option<(i64, i64)> = match s {
+            IrStmt::Assign { targets, expr } => {
+                if targets.iter().any(|t| t.indices.is_empty() && t.var == v) {
+                    return plus_step(expr, v).map(|k| (k, k));
+                }
+                None
+            }
+            IrStmt::Block(b)
+            | IrStmt::Subshell(b)
+            | IrStmt::Background(b)
+            | IrStmt::Redirect { inner: b, .. } => body_step_bounds(b, v),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                // every path through the body must increase v
+                let (a, b) = body_step_bounds(then, v)?;
+                let mut lo = a;
+                let mut hi = b;
+                for (_, arm) in elsifs {
+                    let (x, y) = body_step_bounds(arm, v)?;
+                    lo = lo.min(x);
+                    hi = hi.max(y);
+                }
+                let (x, y) = body_step_bounds(else_, v)?;
+                Some((lo.min(x), hi.max(y)))
+            }
+            // statements that don't write v impose no constraint
+            _ => None,
+        };
+        if let Some((lo, hi)) = r {
+            mn = Some(mn.map_or(lo, |m| m.min(lo)));
+            mx = Some(mx.map_or(hi, |m| m.max(hi)));
+        }
+    }
+    mn.zip(mx)
+}
+
+/// Iterations of `while v cmp n` when v starts inside [blo, bhi] and the
+/// body moves it by ≥ step per iteration (monotone). Sound over-approx
+/// (i128 math avoids overflow).
+fn while_iterations(cmp: Cmp, n: i64, blo: i64, bhi: i64, step: i64) -> Option<u64> {
+    let n = n as i128;
+    let blo = blo as i128;
+    let bhi = bhi as i128;
+    let step = step as i128;
+    let iters = match cmp {
+        Cmp::Lt => {
+            if n <= blo {
+                0
+            } else {
+                (n - blo + step - 1) / step
+            }
+        }
+        Cmp::Le => {
+            if n < blo {
+                0
+            } else {
+                (n - blo + step) / step
+            }
+        }
+        Cmp::Gt => {
+            if n >= bhi {
+                0
+            } else {
+                (bhi - n + step - 1) / step
+            }
+        }
+        Cmp::Ge => {
+            if n > bhi {
+                0
+            } else {
+                (bhi - n + step) / step
+            }
+        }
+        Cmp::Eq => {
+            if blo <= n && n <= bhi {
+                1
+            } else {
+                0
+            }
+        }
+    };
+    Some(iters.min(u64::MAX as i128) as u64)
+}
+
+const FIXPOINT_ITER_LIMIT: usize = 1024;
+
+/// Iterate a loop body to a widened fixed point (the range analysis's
+/// loop arm). `skip_var` (the for-loop variable) is never carried — the
+/// item list re-sets it every iteration. `bound` pins the entry range of
+/// one variable (`while v cmp n`). Post-state = pre ∪ (body's last write
+/// evaluated from the entry invariant — the loop may never run, and the
+/// final write may overshoot the bound by a step).
+fn loop_fixpoint(
+    state: &mut HashMap<String, Range>,
+    body: &[IrStmt],
+    skip_var: Option<&str>,
+    bound: Option<(String, Cmp, i64)>,
+) {
+    let pre = state.clone();
+    let mut carried: HashSet<String> = HashSet::new();
+    for s in body {
+        collect_assigned(s, &mut carried);
+    }
+    if let Some(sk) = skip_var {
+        carried.remove(sk);
+    }
+    if carried.is_empty() {
+        return; // the loop cannot change any variable's range
+    }
+
+    // the cond variable's entry range (for the trip count)
+    let (cond_var, cmp, n) = match &bound {
+        Some((v, c, n)) => (Some(v.clone()), *c, *n),
+        None => (None, Cmp::Lt, 0),
+    };
+    let cond_pre = cond_var.as_ref().and_then(|v| pre.get(v).copied().flatten());
+
+    // trip: how many times can the loop run? Requires the cond var to be
+    // a provable counter with a known entry lower bound.
+    let trip: Option<u64> = match (&cond_var, cond_pre) {
+        (Some(v), Some((blo, bhi))) => match body_step_bounds(body, v) {
+            Some((mn, _)) => while_iterations(cmp, n, blo, bhi, mn),
+            None => None,
+        },
+        _ => None,
+    };
+
+    // entry-invariant state (widening + caps)
+    let mut ls = pre.clone();
+    for _ in 0..FIXPOINT_ITER_LIMIT {
+        let mut ns = ls.clone();
+        for s in body {
+            walk_stmt_ranges(s, &mut ns);
+        }
+        if let Some(sk) = skip_var {
+            // the for-loop variable is re-set from the item list
+            if let Some(r) = pre.get(sk).copied().flatten() {
+                ns.insert(sk.to_string(), Some(r));
+            }
+        }
+        let mut changed = false;
+        for v in &carried {
+            let before = ls.get(v).copied().flatten();
+            let after = ns.get(v).copied().flatten();
+            let mut joined = join(after, before);
+            // widening: a bound that moved outward becomes ±i64 (bash
+            // arithmetic is 64-bit wrapped — sound and terminating)
+            if let (Some((blo, bhi)), Some((jlo, jhi))) = (before, joined) {
+                let wlo = if jlo < blo { i64::MIN } else { jlo };
+                let whi = if jhi > bhi { i64::MAX } else { jhi };
+                joined = Some((wlo, whi));
+            }
+            // entry invariant: while v cmp n → cap the entry range
+            if let (Some((bv, bc, bn)), Some(r)) = (&bound, joined) {
+                if bv == v {
+                    joined = cap_by_cmp(r, *bc, *bn);
+                }
+            }
+            // trip cap: a carried counter can move at most trip·step
+            if let (Some(t), Some(r)) = (trip, joined) {
+                if let Some((_, max_step)) = body_step_bounds(body, v) {
+                    let t = t.saturating_mul(max_step as u64);
+                    let lo0 = pre
+                        .get(v)
+                        .copied()
+                        .flatten()
+                        .map_or(i64::MIN, |r| r.0);
+                    let hi0 = pre
+                        .get(v)
+                        .copied()
+                        .flatten()
+                        .map_or(i64::MAX, |r| r.1);
+                    // increasing counter: v ≤ pre_lo + trip·step
+                    let cap_hi = lo0.saturating_add(t as i64);
+                    // decreasing counter: v ≥ pre_hi − trip·step
+                    let cap_lo = hi0.saturating_sub(t as i64);
+                    joined = Some((r.0.max(cap_lo), r.1.min(cap_hi)));
+                }
+            }
+            if joined != before {
+                ls.insert(v.clone(), joined);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // post-loop: pre ∪ (the body's last write, from the entry invariant)
+    let mut post = pre.clone();
+    for v in &carried {
+        // insert the invariant even when it is None — a carried var whose
+        // entry range is unknown stays unknown after the loop (the single
+        // write from `pre` alone would be unsound)
+        post.insert(v.clone(), ls.get(v).copied().flatten());
+    }
+    for s in body {
+        walk_stmt_ranges(s, &mut post);
+    }
+    // join the pre-loop values back (the loop may never run)
+    for v in &carried {
+        let a = post.get(v).copied().flatten();
+        let b = pre.get(v).copied().flatten();
+        post.insert(v.clone(), join(a, b));
+    }
+    // the for-loop variable: the item range (bash re-sets it per
+    // iteration; an empty list keeps the pre-loop value)
+    if let Some(sk) = skip_var {
+        if let Some(r) = pre.get(sk).copied().flatten() {
+            post.insert(sk.to_string(), Some(r));
+        }
+    }
+    *state = post;
+}
+
+
 fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
     match s {
         IrStmt::Assign { targets, expr } if targets.len() == 1 && targets[0].indices.is_empty() => {
@@ -2657,18 +3462,25 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             }
             *state = merged;
         }
-        IrStmt::While { body, .. }
-        | IrStmt::For { body, .. }
-        | IrStmt::DoWhile { body, .. } => {
-            // No fixpoint in the spike: vars assigned inside a loop body are
-            // unbounded → Any. (Step 2: widen + loop-cond bounding.)
-            let mut assigned: HashSet<String> = HashSet::new();
-            for s in body {
-                collect_assigned(s, &mut assigned);
+        IrStmt::While { cond, body } => {
+            loop_fixpoint(state, body, None, cond_bound(cond));
+        }
+        IrStmt::DoWhile { body, cond, until } => {
+            let b = cond_bound(cond);
+            let b = if *until {
+                b.map(|(v, c, n)| (v, cmp_flip(c), n))
+            } else {
+                b
+            };
+            loop_fixpoint(state, body, None, b);
+        }
+        IrStmt::For { var, iter, body } => {
+            // the loop variable is re-set from the item list every
+            // iteration (bash semantics — body writes to it are lost)
+            if let Some(r) = for_iter_range(iter) {
+                state.insert(var.clone(), Some(r));
             }
-            for n in assigned {
-                state.insert(n, None);
-            }
+            loop_fixpoint(state, body, Some(var), None);
         }
         // Subshell / Background / Function: definitions or child scopes —
         // they cannot change the parent's ranges.
@@ -2700,8 +3512,10 @@ fn collect_assigned(s: &IrStmt, out: &mut HashSet<String>) {
                 out.insert(t.var.clone());
             }
         }
-        IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" => {
-            if let [IrExpr::Str(name, _), _] = args.as_slice() {
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" || func == "assign" => {
+            // setVar(name, v) and the runtime `assign(name, op, v)` form
+            // (v+=1, a && v=x) both name the target first
+            if let [IrExpr::Str(name, _), ..] = args.as_slice() {
                 out.insert(name.clone());
             }
         }
@@ -2744,6 +3558,19 @@ fn ir_range(e: &IrExpr, state: &HashMap<String, Range>) -> Range {
         IrExpr::Var(n, _) => state.get(n).copied().flatten(),
         IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
             [IrExpr::Str(n, _)] => state.get(n).copied().flatten(),
+            _ => None,
+        },
+        // the runtime `assign(name, op, v)` form: v+=k shifts the range,
+        // v=v keeps the value's range (bash semantics)
+        IrExpr::Call { func, args } if func == "assign" => match args.as_slice() {
+            [IrExpr::Str(n, _), IrExpr::Str(op, _), e] if op == "+=" => {
+                let k = ir_range(e, state)?;
+                match state.get(n).copied().flatten() {
+                    Some((lo, hi)) => Some((lo.checked_add(k.0)?, hi.checked_add(k.1)?)),
+                    None => Some(k),
+                }
+            }
+            [IrExpr::Str(_, _), IrExpr::Str(op, _), e] if op == "=" => ir_range(e, state),
             _ => None,
         },
         IrExpr::Arith(a) => arith_range(a, state),
@@ -18121,85 +18948,7 @@ fn safe_ident(name: &str) -> String {
 
 
 
-#[cfg(test)]
-mod range_analysis_tests {
-    use super::*;
 
-    fn ranges_of(src: &str) -> HashMap<String, (i64, i64)> {
-        let cmds = crate::Parser::new(src).parse().expect("parse");
-        let prog = ast_to_ir(&cmds);
-        analyze_var_ranges(&prog)
-    }
-
-    #[test]
-    fn straight_line_widths() {
-        // x: literal 1 → u32; y: arith 1+1 → u32; z: cmdsub → Any; w: -5 → i32
-        let r = ranges_of("x=1\ny=$((x+1))\nz=$(echo 5)\nw=-5");
-        assert_eq!(r.get("x"), Some(&(1, 1)));
-        assert_eq!(r.get("y"), Some(&(2, 2)));
-        assert!(!r.contains_key("z"), "cmdsub provenance must be Any");
-        assert_eq!(r.get("w"), Some(&(-5, -5)));
-        assert_eq!(range_width_name(1, 1), "u32");
-        assert_eq!(range_width_name(-5, -5), "i32");
-        assert_eq!(range_width_name(0, 4_000_000_000), "u32");
-        assert_eq!(range_width_name(0, 10_000_000_000), "i64");
-    }
-
-    #[test]
-    fn branch_join_and_loop_invalidation() {
-        // if cond; then x=1; else x=1000000; fi → x ∈ [1, 1000000] → u32
-        let r = ranges_of("if [ a ]; then x=1; else x=1000000; fi");
-        assert_eq!(r.get("x"), Some(&(1, 1_000_000)));
-        // loop-assigned var → Any (no fixpoint in the spike)
-        let r2 = ranges_of("i=1\nwhile [ $i -lt 5 ]; do i=$((i+1)); done");
-        assert!(!r2.contains_key("i"), "loop body must invalidate to Any");
-        // a var NOT touched by the loop keeps its range
-        let r3 = ranges_of("i=1\nj=2\nwhile [ $i -lt 5 ]; do i=$((i+1)); done");
-        assert_eq!(r3.get("j"), Some(&(2, 2)));
-    }
-
-    #[test]
-    #[ignore] // corpus-wide tally — run on demand: cargo test -- --ignored --nocapture
-    fn corpus_var_width_tally() {
-        let mut widths: HashMap<&'static str, usize> = HashMap::new();
-        widths.insert("u32", 0);
-        widths.insert("i32", 0);
-        widths.insert("i64", 0);
-        let mut total_proven = 0usize;
-        let mut total_numeric = 0usize;
-        let mut files = 0usize;
-        let mut narrowed_files = 0usize;
-        for entry in std::fs::read_dir("examples").unwrap().flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "sh").unwrap_or(false) {
-                let src = std::fs::read_to_string(&path).unwrap_or_default();
-                let Ok(cmds) = crate::Parser::new(&src).parse() else { continue };
-                let prog = ast_to_ir(&cmds);
-                let ranges = analyze_var_ranges(&prog);
-                files += 1;
-                let numeric = numeric_lift_vars(&prog);
-                total_numeric += numeric.len();
-                let mut file_had_narrow = false;
-                for (n, (lo, hi)) in &ranges {
-                    total_proven += 1;
-                    let w = range_width_name(*lo, *hi);
-                    *widths.get_mut(w).unwrap() += 1;
-                    if w != "i64" {
-                        file_had_narrow = true;
-                    }
-                    let _ = n;
-                }
-                if file_had_narrow {
-                    narrowed_files += 1;
-                }
-            }
-        }
-        eprintln!(
-            "RANGE TALLY: files={} numeric_lift_vars={} range_proven={} widths={:?} files_with_narrow={}",
-            files, total_numeric, total_proven, widths, narrowed_files
-        );
-    }
-}
 
 mod const_analysis_tests {
     use super::*;
@@ -18287,3 +19036,228 @@ mod const_analysis_tests {
         assert_eq!(kind(&v, "y"), Some(crate::ir::VarKind::Const));
     }
 }
+
+#[cfg(test)]
+mod range_analysis_tests {
+    use super::*;
+
+    fn ranges_of(src: &str) -> HashMap<String, (i64, i64)> {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        analyze_var_ranges(&prog)
+    }
+
+    #[test]
+    fn straight_line_widths() {
+        // x: literal 1 → u32; y: arith 1+1 → u32; z: cmdsub → Any; w: -5 → i32
+        let r = ranges_of("x=1\ny=$((x+1))\nz=$(echo 5)\nw=-5");
+        assert_eq!(r.get("x"), Some(&(1, 1)));
+        assert_eq!(r.get("y"), Some(&(2, 2)));
+        assert!(!r.contains_key("z"), "cmdsub provenance must be Any");
+        assert_eq!(r.get("w"), Some(&(-5, -5)));
+        assert_eq!(range_width_name(1, 1), "u32");
+        assert_eq!(range_width_name(-5, -5), "i32");
+        assert_eq!(range_width_name(0, 4_000_000_000), "u32");
+        assert_eq!(range_width_name(0, 10_000_000_000), "i64");
+    }
+
+    #[test]
+    fn branch_join_and_loop_fixpoint() {
+        // if cond; then x=1; else x=1000000; fi → x ∈ [1, 1000000] → u32
+        let r = ranges_of("if [ a ]; then x=1; else x=1000000; fi");
+        assert_eq!(r.get("x"), Some(&(1, 1_000_000)));
+        // the loop-counter fixpoint: i=1; while i<5: i=i+1 → [1, 5]
+        // (the loop runs at most 4 times from 1, the last write overshoots
+        // the bound by one step, and i=1 is reachable when it never runs)
+        let r2 = ranges_of("i=1\nwhile [ $i -lt 5 ]; do i=$((i+1)); done");
+        assert_eq!(r2.get("i"), Some(&(1, 5)));
+        // a var NOT touched by the loop keeps its range
+        let r3 = ranges_of("i=1\nj=2\nwhile [ $i -lt 5 ]; do i=$((i+1)); done");
+        assert_eq!(r3.get("j"), Some(&(2, 2)));
+        // a non-counter loop (body doesn't prove monotone +1) — the
+        // entry invariant cannot be pinned: the widening hits the i64
+        // arithmetic extremes, i+1 overflows it, and the invariant goes
+        // Any (sound: the loop could run unboundedly)
+        let r4 = ranges_of("i=1\nwhile :; do i=$((i+1)); done");
+        assert!(!r4.contains_key("i"));
+    }
+
+    #[test]
+    fn counting_loop_fixpoint() {
+        // bench-count.sh: the cond var AND the other counter both land in
+        // u32 (cond cap __n ≤ 999 during the loop; trip cap i ≤ 1 + 1000)
+        let src = "i=1\n__n=0\nwhile [ $__n -lt 1000 ]; do i=$((i+1)); __n=$((__n+1)); done";
+        let r = ranges_of(src);
+        assert_eq!(r.get("__n"), Some(&(0, 1000)));
+        assert_eq!(r.get("i"), Some(&(1, 1002)));
+        assert_eq!(range_width_name(0, 1000), "u32");
+        assert_eq!(range_width_name(1, 1002), "u32");
+        // `until` flips the comparison: until i >= 100 ⇔ while i < 100
+        let r2 = ranges_of("i=0\nuntil [ $i -ge 100 ]; do i=$((i+1)); done");
+        assert_eq!(r2.get("i"), Some(&(0, 100)));
+        // `(( i < 100 ))` lowers to `let "i < 100"`
+        let r3 = ranges_of("i=0\nwhile (( i < 100 )); do i=$((i+1)); done");
+        assert_eq!(r3.get("i"), Some(&(0, 100)));
+    }
+
+    #[test]
+    fn for_loop_ranges() {
+        // integer item list → the loop var's range; body writes are lost
+        let r = ranges_of("for i in 1 2 3; do echo $i; done");
+        assert_eq!(r.get("i"), Some(&(1, 3)));
+        // non-numeric item → Any
+        let r2 = ranges_of("for f in *.txt; do echo $f; done");
+        assert!(!r2.contains_key("f"));
+        // Range iterable (the seq_range_for transform's shape)
+        let cmds = crate::Parser::new("for i in x; do echo $i; done")
+            .parse()
+            .expect("parse");
+        let mut prog = ast_to_ir(&cmds);
+        if let IrStmt::For { iter, .. } = &mut prog.stmts[0] {
+            *iter = IrExpr::Range { start: 5, end: 1 };
+        }
+        let r3 = analyze_var_ranges(&prog);
+        assert_eq!(r3.get("i"), Some(&(1, 5)));
+    }
+
+    #[test]
+    #[ignore] // corpus-wide tally — run on demand: cargo test -- --ignored --nocapture
+    fn corpus_var_width_tally() {
+        let mut widths: HashMap<&'static str, usize> = HashMap::new();
+        widths.insert("u32", 0);
+        widths.insert("i32", 0);
+        widths.insert("i64", 0);
+        let mut total_proven = 0usize;
+        let mut total_numeric = 0usize;
+        let mut files = 0usize;
+        let mut narrowed_files = 0usize;
+        for entry in std::fs::read_dir("examples").unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "sh").unwrap_or(false) {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                let Ok(cmds) = crate::Parser::new(&src).parse() else { continue };
+                let prog = ast_to_ir(&cmds);
+                let ranges = analyze_var_ranges(&prog);
+                files += 1;
+                let numeric = numeric_lift_vars(&prog);
+                total_numeric += numeric.len();
+                let mut file_had_narrow = false;
+                for (n, (lo, hi)) in &ranges {
+                    total_proven += 1;
+                    let w = range_width_name(*lo, *hi);
+                    *widths.get_mut(w).unwrap() += 1;
+                    if w != "i64" {
+                        file_had_narrow = true;
+                    }
+                    let _ = n;
+                }
+                if file_had_narrow {
+                    narrowed_files += 1;
+                }
+            }
+        }
+        eprintln!(
+            "RANGE TALLY: files={} numeric_lift_vars={} range_proven={} widths={:?} files_with_narrow={}",
+            files, total_numeric, total_proven, widths, narrowed_files
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod length_analysis_tests {
+    use super::*;
+
+    fn lens_of(src: &str) -> std::collections::HashMap<String, Option<u64>> {
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        analyze_string_lengths(&prog).into_iter().collect()
+    }
+
+    #[test]
+    fn single_execution_accumulation_is_bounded() {
+        // `s="$s$x"` runs ONCE at top level — s = x, not None (the old
+        // flat fixpoint kept re-applying the assignment and hit the cap)
+        let r = lens_of("x=hello\ns=\"$s$x\"");
+        assert_eq!(r.get("s"), Some(&Some(5)));
+        assert_eq!(r.get("x"), Some(&Some(5)));
+    }
+
+    #[test]
+    fn bounded_loop_accumulation() {
+        // s accumulates 3×|x| over a 3-iteration for loop
+        let r = lens_of("x=hello\ns=\nfor i in 1 2 3; do s=\"$s$x\"; done");
+        assert_eq!(r.get("s"), Some(&Some(15)));
+    }
+
+    #[test]
+    fn unbounded_loop_stays_unbounded() {
+        // while : (no cond bound) → the accumulation cannot be capped
+        let r = lens_of("x=hello\nwhile :; do s=\"$s$x\"; done");
+        assert_eq!(r.get("s"), Some(&None));
+    }
+
+    #[test]
+    fn numeric_counter_is_number_width_not_trip_times() {
+        // a counter's VALUE grows, not its width → 20 chars, not 20×trip
+        let r = lens_of("i=1\nwhile [ $i -lt 1000 ]; do i=$((i+1)); done");
+        assert_eq!(r.get("i"), Some(&Some(20)));
+    }
+
+    #[test]
+    fn compounding_growth_is_unbounded() {
+        // s doubles every iteration — not linear, no bound
+        let r = lens_of("s=a\nfor i in 1 2 3; do s=\"$s$s\"; done");
+        assert_eq!(r.get("s"), Some(&None));
+    }
+
+    #[test]
+    fn overwrite_in_loop_is_one_write() {
+        // x=$(cmd) in a loop: the last write wins — the single capture
+        // bound, not the trip times it
+        let r = lens_of("i=0\nwhile [ $i -lt 3 ]; do x=$(echo abc); i=$((i+1)); done");
+        let single = lens_of("x=$(echo abc)");
+        assert_eq!(r.get("x"), single.get("x"), "loop overwrite == one write");
+    }
+
+    #[test]
+    #[ignore] // corpus-wide tally — run on demand: cargo test -- --ignored --nocapture
+    fn corpus_length_tally() {
+        let mut total_vars = 0usize;
+        let mut total_bounded = 0usize;
+        let mut total_unbounded = 0usize;
+        let mut total_len = 0u64;
+        let mut files = 0usize;
+        let mut files_with_bounds = 0usize;
+        for entry in std::fs::read_dir("examples").unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "sh").unwrap_or(false) {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                let Ok(cmds) = crate::Parser::new(&src).parse() else { continue };
+                let prog = ast_to_ir(&cmds);
+                let lens = analyze_string_lengths(&prog);
+                files += 1;
+                total_vars += lens.len();
+                let mut file_had_bound = false;
+                for (_, l) in &lens {
+                    match l {
+                        Some(n) => {
+                            total_bounded += 1;
+                            total_len += n;
+                            file_had_bound = true;
+                        }
+                        None => total_unbounded += 1,
+                    }
+                }
+                if file_had_bound {
+                    files_with_bounds += 1;
+                }
+            }
+        }
+        eprintln!(
+            "LENGTH TALLY: files={} vars={} bounded={} unbounded={} total_len={} files_with_bounds={}",
+            files, total_vars, total_bounded, total_unbounded, total_len, files_with_bounds
+        );
+    }
+}
+
