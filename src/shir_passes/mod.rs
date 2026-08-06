@@ -136,7 +136,7 @@ impl Pipeline {
     /// The pipeline is pure: the input program is not mutated. Backends
     /// that want the post-pipeline IR use the returned program; the
     /// current shir.rs / ir.rs entry points (`shir_to_estree`,
-    /// `ir_to_perl`) accept a pre-pipeline `&IrProgram` and rely on the
+    /// `shir_to_perl`) accept a pre-pipeline `&IrProgram` and rely on the
     /// renderer to do the work, so this method is for the new entry
     /// point `shir_to_<lang>` and for tests.
     pub fn run(&self, prog: &IrProgram) -> (PassContext, IrProgram, Metric) {

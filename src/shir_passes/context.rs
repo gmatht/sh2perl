@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ir::{IrStmt, VarKind};
 
 /// All analysis verdicts, populated by the analysis passes, read by the
-/// renderer (`shir_to_estree`, `ir_to_perl`, future `shir_to_<lang>`).
+/// renderer (`shir_to_estree`, `shir_to_perl`, future `shir_to_<lang>`).
 #[derive(Default)]
 pub struct PassContext {
     // ── Variable lifts (M6 + M8) ─────────────────────────────────
