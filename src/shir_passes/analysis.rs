@@ -205,6 +205,7 @@ mod tests {
             stmt_lines: vec![],
             var_lengths: vec![],
             var_const: vec![],
+            var_lifetimes: vec![],
         }
     }
 
@@ -329,6 +330,7 @@ mod tests {
             stmt_lines: vec![],
             var_lengths: vec![],
             var_const: vec![],
+            var_lifetimes: vec![],
         };
         let mut ctx = PassContext::default();
         ConstVar.run(&prog, &mut ctx);

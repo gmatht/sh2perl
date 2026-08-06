@@ -75,6 +75,7 @@ mod tests {
             stmt_lines: vec![],
             var_lengths: vec![],
             var_const: vec![],
+            var_lifetimes: vec![],
         };
         let n = walk_exprs(&prog, |_| None);
         assert_eq!(n, 0);
@@ -94,6 +95,7 @@ mod tests {
             stmt_lines: vec![],
             var_lengths: vec![],
             var_const: vec![],
+            var_lifetimes: vec![],
         };
         let n = walk_exprs(&prog, |_| Some(IrExpr::Int(0)));
         assert_eq!(n, 0);

@@ -1051,6 +1051,7 @@ pub fn c_to_ir(src: &str) -> Result<IrProgram, String> {
         stmt_lines,
         var_lengths: vec![],
         var_const: vec![],
+            var_lifetimes: vec![],
     })
 }
 

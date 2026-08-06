@@ -61,6 +61,30 @@ pub enum VarKind {
     Var,
 }
 
+// ── Lifetime annotations (the variable-lifetime analysis) ────────────
+//
+// Conservative lifetime verdicts for static backends (C): per variable,
+// the live span in statement positions of a pre-order walk (first access
+// .. last access) and whether the value's storage may escape the current
+// scope (array-element store, closure capture, function return). The C
+// backend uses the span for per-point buffer sizing and buffer reuse,
+// and the escape bit for the copy-vs-move / stack-vs-heap decision.
+// Populated by `shir_passes::lifetime::analyze_var_lifetimes`;
+// serialized in the ShIR JSON (ask A1). Existing backends ignore it
+// (additive only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VarLifetime {
+    /// First access (def or use) position in the pre-order statement walk.
+    pub first: usize,
+    /// Last access position in the pre-order statement walk.
+    pub last: usize,
+    /// True when the value's storage may be retained beyond the scope
+    /// where it was produced (array-element store, closure capture,
+    /// function return) — cannot be a stack local that is moved from
+    /// or reused.
+    pub escapes: bool,
+}
+
 // ── Binary operators ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -439,6 +463,16 @@ pub struct IrProgram {
     /// `shir::analyze_var_const`; the C backend emits `const` for `Const`
     /// verdicts. Existing backends ignore it (additive only).
     pub var_const: Vec<(String, VarKind)>,
+    /// Conservative variable-lifetime annotations (the analysis's
+    /// sibling of `var_types`/`var_lengths`/`var_const`): per variable,
+    /// the live span in statement positions of a pre-order walk and
+    /// whether the value's storage escapes the scope (array store /
+    /// closure / return). Populated by
+    /// `shir_passes::lifetime::analyze_var_lifetimes`; the C backend
+    /// uses it for per-point buffer sizing, buffer reuse, and the
+    /// copy-vs-move / stack-vs-heap decision. Existing backends ignore
+    /// it (additive only).
+    pub var_lifetimes: Vec<(String, VarLifetime)>,
 }
 
 // ── Backend: IR → Perl text ─────────────────────────────────────────
@@ -2251,6 +2285,7 @@ impl IrProgram {
             stmt_lines: vec![],
             var_lengths: vec![],
             var_const: vec![],
+            var_lifetimes: vec![],
         }
     }
 }

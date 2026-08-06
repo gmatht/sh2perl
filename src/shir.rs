@@ -1699,6 +1699,7 @@ pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
         stmt_lines: vec![],
         var_lengths: vec![],
         var_const: vec![],
+        var_lifetimes: vec![],
     }
 }
 
@@ -1717,6 +1718,7 @@ pub fn ast_to_ir_raw(commands: &[Command]) -> IrProgram {
         stmt_lines: vec![],
         var_lengths: vec![],
         var_const: vec![],
+        var_lifetimes: vec![],
     }
 }
 
