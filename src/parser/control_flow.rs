@@ -2114,6 +2114,10 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
             nullglob: false,
             failglob: false,
             dotglob: false,
+            // `[[ ]]` (this site — the double-bracket parser in
+            // control_flow.rs) vs `[ ]` (commands.rs) — the A1 test Call
+            // carries the style as a trailing tag arg.
+            double: true,
         },
     }))
 }

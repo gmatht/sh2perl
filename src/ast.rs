@@ -198,6 +198,13 @@ pub struct TestModifiers {
     pub nullglob: bool,
     pub failglob: bool,
     pub dotglob: bool,
+    /// `[[ ]]` (double-bracket) vs `[ ]` (single) — the two have
+    /// DIFFERENT operators and semantics (word splitting, extglob
+    /// patterns, =~ regex, no empty-arg ambiguity). The A1 test Call
+    /// carries the bracket style as a trailing tag arg (core request
+    /// extglob-nocasematch-20260806) so backends can lower the two
+    /// faithfully instead of reverse-engineering the text.
+    pub double: bool,
 }
 
 impl Default for TestModifiers {
@@ -209,6 +216,7 @@ impl Default for TestModifiers {
             nullglob: false,
             failglob: false,
             dotglob: false,
+            double: false,
         }
     }
 }

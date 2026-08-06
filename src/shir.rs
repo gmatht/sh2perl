@@ -3709,7 +3709,19 @@ fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
     Some(match cmd {
         Command::BlankLine => return None,
         Command::TestExpression(t) => {
-            IrStmt::Expr(call("test", vec![st(&t.expression)]))
+            // `[[ ]]` tests carry a trailing tag arg (core request
+            // extglob-nocasematch-20260806): the double-bracket style has
+            // different semantics (no word splitting, extglob patterns,
+            // =~ regex, no empty-arg ambiguity). Additive — a backend
+            // that ignores the tag keeps its current behavior.
+            if t.modifiers.double {
+                IrStmt::Expr(call(
+                    "test",
+                    vec![st(&t.expression), st("[[")],
+                ))
+            } else {
+                IrStmt::Expr(call("test", vec![st(&t.expression)]))
+            }
         }
         Command::Simple(sc) => exec_stmt(&sc.name, &sc.args, &sc.env_vars, &sc.redirects),
         Command::BuiltinCommand(bc) => exec_stmt(
@@ -4432,7 +4444,13 @@ fn is_safe_grep_literal(pat: &str) -> bool {
 
 fn command_to_ir(cmd: &Command) -> IrExpr {
     match cmd {
-        Command::TestExpression(t) => call("test", vec![st(&t.expression)]),
+        Command::TestExpression(t) => {
+            if t.modifiers.double {
+                call("test", vec![st(&t.expression), st("[[")])
+            } else {
+                call("test", vec![st(&t.expression)])
+            }
+        },
         Command::Simple(sc) => exec_expr(&sc.name, &sc.args, &sc.env_vars, &sc.redirects),
         Command::BuiltinCommand(bc) => exec_expr(
             &Word::Literal(bc.name.clone(), None),
@@ -18329,7 +18347,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // runtime call there (the injected template still inlines
             // lifted values).
             if func == "test" {
-                if let [IrExpr::Str(sv, _)] = args.as_slice() {
+                // The `[[ ]]` style tag (core request
+                // extglob-nocasematch-20260806) is a trailing Str arg —
+                // strip it; the tag is metadata for future backends, the
+                // current lowering already handles the double-bracket
+                // corpus via the test-string grammar.
+                let sv: Option<&String> = match args.as_slice() {
+                    [IrExpr::Str(sv, _)] => Some(sv),
+                    [IrExpr::Str(sv, _), IrExpr::Str(tag, _)] if tag == "[[" => Some(sv),
+                    _ => None,
+                };
+                if let Some(sv) = sv {
                     if *AND_OR_DEPTH.lock().unwrap() == 0 {
                         if let Some(native) = try_native_test(sv) {
                             return native;
