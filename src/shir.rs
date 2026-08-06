@@ -10457,6 +10457,11 @@ fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
             .collect::<Vec<_>>()
             .join(" ");
         str_lit(&s)
+    } else if arg_exprs.len() == 1 && !flat {
+        // a single non-literal arg: `[x].join(" ")` is exactly `x` (a
+        // one-element join never inserts the separator) — the common
+        // `echo $var` shape skips the array + join machinery entirely
+        arg_exprs.pop().unwrap()
     } else {
         let mut arr = Expr::ArrayExpression {
             elements: arg_exprs.into_iter().map(Some).collect(),

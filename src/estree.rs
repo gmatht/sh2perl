@@ -1084,6 +1084,34 @@ mod tests {
     }
 
     #[test]
+    fn echo_single_arg_skips_the_join() {
+        // `echo $i` — one non-literal arg: `[String(i)].join(" ")` is
+        // exactly `String(i)` (a one-element join never inserts the
+        // separator), so the emitter emits the bare value — no array /
+        // join machinery. Multi-arg echo keeps the join (the separator).
+        let json = to_json("i=42; echo $i");
+        assert!(json.contains("\"name\":\"String\""));
+        assert!(!json.contains("\"name\":\"join\""), "single arg: no join");
+        assert!(!json.contains("\"type\":\"ArrayExpression\""), "single arg: no array");
+        assert!(!json.contains("unsupported"));
+        // two args keep the word-join
+        let json2 = to_json("i=42; echo $i $i");
+        assert!(json2.contains("\"name\":\"join\""));
+        assert!(json2.contains("\"type\":\"ArrayExpression\""));
+        assert!(!json2.contains("unsupported"));
+        // an ARRAY-VALUED single arg (unquoted `$(...)` captureWords — the
+        // runtime splices its words) must still splice + join — it is not
+        // a scalar; a capture ASSIGNED to a var is a scalar string
+        let json3 = to_json("echo $(echo 1 2 3)");
+        assert!(json3.contains("\"name\":\"join\""));
+        assert!(json3.contains("\"name\":\"flat\""));
+        assert!(!json3.contains("unsupported"));
+        let json4 = to_json("x=$(echo 1 2 3); echo $x");
+        assert!(!json4.contains("\"name\":\"join\""), "capture-assigned var is a scalar");
+        assert!(!json4.contains("unsupported"));
+    }
+
+    #[test]
     fn grep_null_test_lifts_to_contains() {
         // `if echo $x | grep P >/dev/null 2>/dev/null` (discarded-output grep
         // as a test) is a substring test — no echo/grep spawns, no pipeline;
@@ -1382,10 +1410,13 @@ mod tests {
         assert!(!json.contains("\"name\":\"getVar\""));
         assert!(!json.contains("unsupported"));
         // a CAPTURE source lifts to a native binding; a read/write-builtin
-        // var (read/declare/local/export...) stays a store read
+        // var (read/declare/local/export...) stays a store read. The echo
+        // has ONE interpolated arg — the single-arg collapse emits the
+        // bare template, no join.
         let json2 = to_json("name=$(echo world)\necho \"Hello $name\"");
         assert!(!json2.contains("\"name\":\"getVar\""));
-        assert!(json2.contains("\"name\":\"join\""));
+        assert!(!json2.contains("\"name\":\"join\""), "single interpolated arg: no join");
+        assert!(json2.contains("\"type\":\"TemplateLiteral\""));
         assert!(!json2.contains("unsupported"));
         let json3 = to_json("read name\necho \"Hello $name\"");
         assert!(json3.contains("\"name\":\"getVar\""));
