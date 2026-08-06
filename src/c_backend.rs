@@ -127,7 +127,7 @@ pub struct Render {
     var_lengths: HashMap<String, Option<u64>>,
     /// var name -> conservative [lo, hi] (analyze_var_ranges + the
     /// Range/seq for-iter seeds the analysis doesn't track).
-    var_ranges: HashMap<String, (i64, i64)>,
+    var_ranges: HashMap<String, (i128, i128)>,
     /// var name -> const/var verdict (the const-markup analysis): `Const`
     /// vars with a single literal top-level assignment render as C
     /// `const` declarations initialized from that literal, and the
@@ -465,7 +465,7 @@ impl Render {
             let init = if self.is_num(v) {
                 match &rhs {
                     IrExpr::Int(i) => Some(i.to_string()),
-                    IrExpr::Str(s, _) => s.trim().parse::<i64>().ok().map(|n| n.to_string()),
+                    IrExpr::Str(s, _) => s.trim().parse::<i128>().ok().map(|n| n.to_string()),
                     _ => None,
                 }
             } else {
@@ -1145,7 +1145,7 @@ impl Render {
         match e {
             IrExpr::Var(name, _) | IrExpr::Ident(name) => self.width_of_var(name),
             IrExpr::Arith(a) => {
-                let state: HashMap<String, Option<(i64, i64)>> = self
+                let state: HashMap<String, Option<(i128, i128)>> = self
                     .var_ranges
                     .iter()
                     .map(|(k, v)| (k.clone(), Some(*v)))
@@ -1675,11 +1675,11 @@ fn width_buf_len(w: Width) -> usize {
 /// Detect a `Range` iterable and the shell `for x in $(seq a b)` shape
 /// (core-lowered `Array([Range])` or pre-lift captureWords → arrow →
 /// exec "seq"); returns (first, last, step). Anything else → None.
-fn seq_iter_range(iter: &IrExpr) -> Option<(i64, i64, i64)> {
+fn seq_iter_range(iter: &IrExpr) -> Option<(i128, i128, i128)> {
     match iter {
-        IrExpr::Range { start, end } => Some((*start, *end, 1)),
+        IrExpr::Range { start, end } => Some((*start as i128, *end as i128, 1i128)),
         IrExpr::Array(items) if items.len() == 1 => match items.first() {
-            Some(IrExpr::Range { start, end }) => Some((*start, *end, 1)),
+            Some(IrExpr::Range { start, end }) => Some((*start as i128, *end as i128, 1i128)),
             Some(cap) => seq_capture_words(cap),
             None => None,
         },
@@ -1689,7 +1689,7 @@ fn seq_iter_range(iter: &IrExpr) -> Option<(i64, i64, i64)> {
 
 /// Parse the pre-lift `captureWords → arrow → exec "seq"` iterable
 /// (seq [FIRST [INCREMENT]] LAST); None → not a numeric seq.
-fn seq_capture_words(cap: &IrExpr) -> Option<(i64, i64, i64)> {
+fn seq_capture_words(cap: &IrExpr) -> Option<(i128, i128, i128)> {
     let IrExpr::Call { func, args } = cap else {
         return None;
     };
@@ -1726,10 +1726,10 @@ fn seq_capture_words(cap: &IrExpr) -> Option<(i64, i64, i64)> {
     if seqargs.is_empty() || seqargs.len() > 3 {
         return None;
     }
-    let num = |e: &IrExpr| -> Option<i64> {
+    let num = |e: &IrExpr| -> Option<i128> {
         match e {
-            IrExpr::Str(s, _) => s.trim().parse::<i64>().ok(),
-            IrExpr::Int(n) => Some(*n),
+            IrExpr::Str(s, _) => s.trim().parse::<i128>().ok(),
+            IrExpr::Int(n) => Some(*n as i128),
             _ => None,
         }
     };
@@ -1749,7 +1749,7 @@ fn seq_capture_words(cap: &IrExpr) -> Option<(i64, i64, i64)> {
 /// doesn't track for-loop bindings (its For arm marks body-assigned vars
 /// unbounded). Nested loops and branches are walked; an existing range
 /// joins (widens) with the seed.
-fn seed_loop_var_ranges(stmts: &[IrStmt], ranges: &mut HashMap<String, (i64, i64)>) {
+fn seed_loop_var_ranges(stmts: &[IrStmt], ranges: &mut HashMap<String, (i128, i128)>) {
     for s in stmts {
         match s {
             IrStmt::For { var, iter, body } => {
@@ -1793,9 +1793,9 @@ fn seed_loop_var_ranges(stmts: &[IrStmt], ranges: &mut HashMap<String, (i64, i64
 /// is unknown (None) forces i64 — no proof, no narrowing.
 fn effective_widths(
     prog: &IrProgram,
-    ranges: &HashMap<String, (i64, i64)>,
+    ranges: &HashMap<String, (i128, i128)>,
 ) -> HashMap<String, Width> {
-    let state: HashMap<String, Option<(i64, i64)>> =
+    let state: HashMap<String, Option<(i128, i128)>> =
         ranges.iter().map(|(k, v)| (k.clone(), Some(*v))).collect();
     let mut widths: HashMap<String, Width> = HashMap::new();
     for (name, (lo, hi)) in ranges {
@@ -1810,7 +1810,7 @@ fn effective_widths(
 
 fn walk_widths_stmts(
     stmts: &[IrStmt],
-    state: &HashMap<String, Option<(i64, i64)>>,
+    state: &HashMap<String, Option<(i128, i128)>>,
     widths: &mut HashMap<String, Width>,
 ) {
     for s in stmts {
@@ -1886,7 +1886,7 @@ fn walk_widths_stmts(
 
 fn walk_widths_expr(
     e: &IrExpr,
-    state: &HashMap<String, Option<(i64, i64)>>,
+    state: &HashMap<String, Option<(i128, i128)>>,
     widths: &mut HashMap<String, Width>,
 ) {
     match e {
@@ -1963,10 +1963,10 @@ fn walk_widths_expr(
 /// lives renderer-side. Mirrors shir.rs arith_range exactly.
 fn arith_range_local(
     a: &ArithAst,
-    state: &HashMap<String, Option<(i64, i64)>>,
-) -> Option<(i64, i64)> {
+    state: &HashMap<String, Option<(i128, i128)>>,
+) -> Option<(i128, i128)> {
     match a {
-        ArithAst::Num(i) => Some((*i, *i)),
+        ArithAst::Num(i) => Some((*i as i128, *i as i128)),
         ArithAst::Var(n) => state.get(n).copied().flatten(),
         ArithAst::Bin { op, lhs, rhs } => {
             let (l, r) = (arith_range_local(lhs, state)?, arith_range_local(rhs, state)?);
