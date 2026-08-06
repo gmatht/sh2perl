@@ -2359,6 +2359,24 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                                 ));
                             }
 
+                            // Trailing junk after `]` in a NON-@ subscript
+                            // (e.g. `${arr[1]>2}`): bash rejects the whole
+                            // expansion as a "bad substitution" (skips the
+                            // command, status 1). A `:` continuation is a
+                            // valid element slice (`${arr[1]:0:2}`) — kept
+                            // as-is below (pre-existing behavior).
+                            let after_bracket = &braced_content[bracket_end + 1..];
+                            if !after_bracket.is_empty() && !after_bracket.starts_with(':') {
+                                return Ok(Word::ParameterExpansion(
+                                    ParameterExpansion {
+                                        variable: braced_content.to_string(),
+                                        operator: ParameterExpansionOperator::BadSubstitution,
+                                        is_mutable: true,
+                                    },
+                                    None,
+                                ));
+                            }
+
                             return Ok(Word::MapAccess(map_name.to_string(), key.to_string(), None));
                         }
                         // else: fall through to parameter expansion checks below
@@ -3968,6 +3986,17 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 } else if rest.starts_with('/') {
                     // This is ${arr[1]/pattern/replacement} - substitution on an array element
                     // We'll handle this later - for now, just treat as array access
+                } else if !rest.is_empty() && !rest.starts_with(':') {
+                    // Trailing junk after `]` (e.g. `${arr[1]>2}`, `${arr[1]foo}`):
+                    // bash rejects the whole expansion as a "bad substitution"
+                    // (skips the command, status 1). A `:` continuation is a
+                    // valid element slice — falls through below (pre-existing
+                    // behavior).
+                    return Ok(ParameterExpansion {
+                        variable: content.to_string(),
+                        operator: ParameterExpansionOperator::BadSubstitution,
+                        is_mutable: true,
+                    });
                 }
 
                 // This is array/map access - we'll handle this in the generator
@@ -4185,6 +4214,28 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 is_mutable: true,
             })
         } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else if let Some(quest_pos) = content.find('?') {
+        // ${var?error} - error if var is UNSET (the `?` without a colon;
+        // `:?` is handled above). Must come AFTER the -/=- branches so
+        // `${var-?}` / `${var=-?}` stay default-value forms. Patterns with
+        // `?` (${var%?}, ${var#?}, ${var/pat?/rep}) are handled by their
+        // own branches above.
+        if quest_pos > 0 {
+            let var_name = &content[..quest_pos];
+            let error_msg = &content[quest_pos + 1..];
+            Ok(ParameterExpansion {
+                variable: var_name.to_string(),
+                operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                is_mutable: true,
+            })
+        } else {
+            // `${?}` — the `$?` special var in braces
             Ok(ParameterExpansion {
                 variable: content.to_string(),
                 operator: ParameterExpansionOperator::None,

@@ -1067,11 +1067,15 @@ mod tests {
     fn if_empty_else_lastexit_dropped_when_unread() {
         // `if c; then ...; fi` with NO else synthesizes a false-path
         // `sh2.lastExit = 0` (bash: false cond + no else → $? = 0). The
-        // Plan 4 liveness now marks it dead when nothing reads the if's
+        // Plan 4 liveness marks it dead when nothing reads the if's
         // status — the if lowers to a plain `if (c) { ... }`, no else.
+        // NOTE: the PROGRAM-FINAL status IS a reader now (the runner's
+        // `sh2._finish()` exits with `sh2.lastExit` — bash's exit code is
+        // the last command's status and the corpus gate compares exit
+        // codes), so a program-final if KEEPS its false-path write.
         let json = to_json("if false; then echo yes; fi");
         assert!(json.contains("\"type\":\"IfStatement\""));
-        assert!(json.contains("\"alternate\":null"), "dead status write → no else");
+        assert!(json.contains("\"alternate\":{\"type\""), "program-final status read → else kept");
         assert!(!json.contains("unsupported"));
         // a READER keeps the write: `; echo $?` observes the false-path 0
         let json2 = to_json("if false; then echo yes; fi; echo $?");

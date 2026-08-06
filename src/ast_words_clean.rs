@@ -37,6 +37,9 @@ impl std::fmt::Display for ParameterExpansion {
             ParameterExpansionOperator::ErrorIfUnset(error) => {
                 write!(f, "${{{0}:?{1}}}", self.variable, error)
             }
+            ParameterExpansionOperator::BadSubstitution => {
+                write!(f, "${{{0}}}", self.variable)
+            }
             ParameterExpansionOperator::Basename => write!(f, "${{{0}##*/}}", self.variable),
             ParameterExpansionOperator::Dirname => write!(f, "${{{0}%/*}}", self.variable),
             ParameterExpansionOperator::ArraySlice(offset, length) => {
@@ -72,7 +75,11 @@ pub enum ParameterExpansionOperator {
     // Default values
     DefaultValue(String),  // :-default
     AssignDefault(String), // :=default
-    ErrorIfUnset(String),  // :?error
+    ErrorIfUnset(String),  // :?error / ?error
+
+    // Invalid ${...} content (e.g. `${arr[1]>2}`) — bash prints "bad
+    // substitution", skips the whole command (status 1), keeps going.
+    BadSubstitution,
 
     // Path manipulation
     Basename, // ##*/
