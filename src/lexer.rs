@@ -1242,9 +1242,16 @@ impl Lexer {
     pub fn split_overgreedy_sq(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
         let bytes = input.as_bytes();
         let mut result: Vec<(Token, usize, usize)> = Vec::new();
+        // When a bogus SQS is dropped because it overlaps a preceding DQS, the
+        // covered original tokens (the over-greedy match's artifacts) must be
+        // skipped too; the re-lexed region replaces them wholesale.
+        let mut skip_until = 0usize;
 
         for token in tokens.drain(..) {
             let (tok, start, end) = token;
+            if start < skip_until {
+                continue;
+            }
             if tok != Token::SingleQuotedString {
                 result.push((tok, start, end));
                 continue;
@@ -1255,8 +1262,77 @@ impl Lexer {
             // closing `'` of one SQS is mistakenly treated as the opening `'`
             // of a new SQS.  In that case, emit a bare SingleQuote for the
             // overlapping character and re-lex the tail (the rest of this token).
-            if let Some(&(Token::SingleQuotedString, prev_start, prev_end)) = result.last() {
-                if start > prev_start && start < prev_end {
+            if let Some(&(ref prev_tok, prev_start, prev_end)) = result.last() {
+                if (matches!(
+                    *prev_tok,
+                    Token::SingleQuotedString | Token::DoubleQuotedString
+                )) && start > prev_start
+                    && start < prev_end
+                {
+                    if *prev_tok == Token::DoubleQuotedString {
+                        // The opening `'` is a quote INSIDE the previous DQS
+                        // (a single-quoted segment within a "$(...)" string),
+                        // which logos over-greedily paired with a quote on a
+                        // LATER line (dqs-nested-awk-sed.sh: the line-9 DQS's
+                        // inner `'s|\(.*\)/.*|\1|'` closed at 470 and logos
+                        // paired it with line 10's `printf '` opening quote,
+                        // eating the whole `printf 'pretty_name=[%s]\n'`). The
+                        // DQS already covers everything up to prev_end; the
+                        // SQS is bogus — drop it and re-lex from the DQS end
+                        // through the end of the SQS's line (all of that line's
+                        // tokens are artifacts of the same over-greedy match).
+                        let line_end = (end..input.len())
+                            .find(|&i| bytes[i] == b'\n')
+                            .map(|i| i + 1)
+                            .unwrap_or(input.len());
+                        let region = &input[prev_end..line_end];
+                        let region_start = prev_end;
+                        let mut off = 0usize;
+                        while off < region.len() {
+                            let remaining = &region[off..];
+                            let mut sub = Token::lexer(remaining);
+                            let mut had_ok = false;
+                            while let Some(token_result) = sub.next() {
+                                let span = sub.span();
+                                match token_result {
+                                    Ok(t) => {
+                                        result.push((
+                                            t,
+                                            region_start + off + span.start,
+                                            region_start + off + span.end,
+                                        ));
+                                        had_ok = true;
+                                    }
+                                    Err(_) => continue,
+                                }
+                            }
+                            if had_ok {
+                                if let Some(&(_, _, last_end)) = result.last() {
+                                    off = last_end - region_start;
+                                } else {
+                                    off = region.len();
+                                }
+                            } else {
+                                let ch = region.as_bytes()[off];
+                                if ch == b'\'' {
+                                    result.push((
+                                        Token::SingleQuote,
+                                        region_start + off,
+                                        region_start + off + 1,
+                                    ));
+                                } else if ch == b'"' {
+                                    result.push((
+                                        Token::DoubleQuote,
+                                        region_start + off,
+                                        region_start + off + 1,
+                                    ));
+                                }
+                                off += 1;
+                            }
+                        }
+                        skip_until = line_end;
+                        continue;
+                    }
                     // Opening ' is actually the closing quote of the previous SQS.
                     result.push((Token::SingleQuote, start, start + 1));
                     // Re-lex the content after this bare quote.

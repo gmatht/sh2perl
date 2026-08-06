@@ -145,9 +145,17 @@ impl Parser {
                         break;
                     }
                     Some(Token::DoubleSemicolon) => {
-                        commands.truncate(line_start);
-                        self.lexer.next();
-                        return Ok(commands);
+                        // `;;` outside a case body is a syntax error in
+                        // bash (the whole script aborts, exit 2) — a real
+                        // parse failure, not a recoverable one. The old
+                        // truncate-and-succeed recovery silently DROPPED the
+                        // rest of the script and exited 0 (parse-double-
+                        // semicolon.sh, parse-error-doublesemicolon.sh:
+                        // bash=2 vs estree=0). The CLI's parse-error
+                        // fallback now reproduces bash's verdict.
+                        return Err(ParserError::InvalidSyntax(
+                            "`;;` outside case context".to_string(),
+                        ));
                     }
                     Some(Token::ParenClose) => {
                         // A stray `)` after a command (outside any

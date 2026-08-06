@@ -1,6 +1,36 @@
 use debashl::ast::Word;
 use debashl::mir_simple::MirCommand;
 use debashl::{Generator, Lexer, Parser};
+
+/// The ESTree fallback emitted when the parser REJECTS a script: bash also
+/// rejects it (syntax error — every corpus file that reaches this path has
+/// bash exit 2 and empty stdout), so the transpiled program must reproduce
+/// the verdict: no stdout, exit 2 (the stderr diagnostic is not compared).
+/// Before this fallback the CLI printed nothing on stdout, the gate
+/// materialized an empty Program, and the runner exited 0 — "exit code
+/// (bash=2 estree=0)" failures for every parse-error corpus test.
+fn parse_error_estree_fallback() -> String {
+    serde_json::json!({
+        "type": "Program",
+        "sourceType": "module",
+        "body": [{
+            "type": "ExpressionStatement",
+            "expression": {
+                "type": "CallExpression",
+                "callee": {
+                    "type": "MemberExpression",
+                    "object": {"type": "Identifier", "name": "process"},
+                    "property": {"type": "Identifier", "name": "exit"},
+                    "computed": false,
+                    "optional": false
+                },
+                "arguments": [{"type": "Literal", "value": 2, "raw": "2"}],
+                "optional": false
+            }
+        }]
+    })
+    .to_string()
+}
 use std::fs;
 use std::io::Read;
 use std::io::Write;
@@ -485,6 +515,10 @@ pub fn parse_file_to_estree(filename: &str) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Parse error: {}", e);
+                    // bash rejects the same file (syntax error, exit 2, no
+                    // stdout) — emit the exit-2 fallback program so the
+                    // runner's verdict matches bash's.
+                    println!("{}", parse_error_estree_fallback());
                     return;
                 }
             };
@@ -522,6 +556,18 @@ pub fn parse_file_to_shir(filename: &str) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Parse error: {}", e);
+                    // parse-gaps core request: a parse failure must never
+                    // produce EMPTY stdout (frontends die "invalid JSON:
+                    // EOF"). Emit the canonical empty Program — the same
+                    // shape `--shir` produces for an empty file — so the
+                    // A1 contract stays ingestible. Genuinely-incomplete
+                    // scripts (parse-paren-after-do.sh, parse-unexpected-
+                    // end-of-input.sh) are faithfully an empty program
+                    // (bash rejects them too).
+                    println!(
+                        "{}",
+                        debashl::shir_json::shir_to_shir_json(&debashl::shir::ast_to_ir(&[]))
+                    );
                     return;
                 }
             }
@@ -558,7 +604,15 @@ pub fn parse_shir_json_to_perl(filename: &str) {
 pub fn export_shir(input: &str, raw: bool) {
     let commands = match Parser::new(input).parse() {
         Ok(c) => c,
-        Err(e) => { eprintln!("Parse error: {}", e); return; }
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            // parse-gaps core request: graceful fallback — a parse failure
+            // emits the canonical empty Program (never empty stdout, which
+            // frontends read as "invalid JSON: EOF").
+            let json = debashl::shir_json::shir_to_shir_json(&debashl::shir::ast_to_ir(&[]));
+            if raw { print!("{}", json); } else { println!("{}", json); }
+            return;
+        }
     };
     let prog = debashl::shir::ast_to_ir(&commands);
     let json = debashl::shir_json::shir_to_shir_json(&prog);
