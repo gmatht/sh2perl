@@ -48,9 +48,9 @@ pub struct Render {
     need_lower: bool,
     need_includes: bool,
     need_slice: bool,
-    /// numeric -> string (caller-buffer snprintf into a compound-literal
-    /// temp), for contains() on Int-typed args and other %s consumers
-    need_str: bool,
+    /// named-temp counter for statement-level snprintf buffers
+    /// (`char _sN[64]; snprintf(_sN, ...)` before the enclosing stmt)
+    temp_seq: usize,
     todo: usize,
 }
 
@@ -326,20 +326,20 @@ impl Render {
             }
             // contains(needle, pattern) — PureCpu (the grep -q / case *P*)
             // lift). strstr is exact-substring; identical for literal
-            // patterns. Int-typed needles go through c_str() so they can
-            // be %s-consumed.
+            // patterns. An Int-typed needle is stringified with a named
+            // temp + snprintf at statement level (snprintf returns int,
+            // so it cannot stand in an expression; the temp lines are
+            // emitted right before the enclosing statement).
             "contains" => {
                 if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
                     self.need_includes = true;
                     let needle_c = if self.expr_is_num(needle) {
-                        self.need_str = true;
-                        // fresh block-scope buffer per evaluation (C99
-                        // compound literal): no shared static state, so
-                        // two c_str calls in one expression cannot alias.
-                        format!(
-                            "c_str((char[64]){{0}}, sizeof(char[64]), {})",
-                            self.expr(needle)
-                        )
+                        let t = format!("_s{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!("char {t}[64];"));
+                        let e = self.expr(needle);
+                        self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", {e});"));
+                        t
                     } else {
                         self.expr(needle)
                     };
@@ -887,9 +887,6 @@ impl Render {
         self.emit("");
         if self.need_includes {
             self.emit("static int c_includes(const char* s, const char* p) { return strstr(s, p) != NULL; }");
-        }
-        if self.need_str {
-            self.emit("static char* c_str(char* buf, size_t cap, long long n) { snprintf(buf, cap, \"%lld\", n); return buf; }");
         }
         if !self.sh2_calls.is_empty() {
             self.emit("/* sh2.* runtime stubs — TODO: implement (harness/sh2-namespace.json) */");
