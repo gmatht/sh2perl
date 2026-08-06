@@ -48,8 +48,8 @@ pub struct Render {
     need_lower: bool,
     need_includes: bool,
     need_slice: bool,
-    /// numeric -> string (sprintf into a static buffer), for contains()
-    /// on Int-typed args and other %s consumers
+    /// numeric -> string (caller-buffer snprintf into a compound-literal
+    /// temp), for contains() on Int-typed args and other %s consumers
     need_str: bool,
     todo: usize,
 }
@@ -333,7 +333,13 @@ impl Render {
                     self.need_includes = true;
                     let needle_c = if self.expr_is_num(needle) {
                         self.need_str = true;
-                        format!("c_str({})", self.expr(needle))
+                        // fresh block-scope buffer per evaluation (C99
+                        // compound literal): no shared static state, so
+                        // two c_str calls in one expression cannot alias.
+                        format!(
+                            "c_str((char[64]){{0}}, sizeof(char[64]), {})",
+                            self.expr(needle)
+                        )
                     } else {
                         self.expr(needle)
                     };
@@ -883,7 +889,7 @@ impl Render {
             self.emit("static int c_includes(const char* s, const char* p) { return strstr(s, p) != NULL; }");
         }
         if self.need_str {
-            self.emit("static char* c_str(long long n) { static char b[64]; sprintf(b, \"%lld\", n); return b; }");
+            self.emit("static char* c_str(char* buf, size_t cap, long long n) { snprintf(buf, cap, \"%lld\", n); return buf; }");
         }
         if !self.sh2_calls.is_empty() {
             self.emit("/* sh2.* runtime stubs — TODO: implement (harness/sh2-namespace.json) */");
