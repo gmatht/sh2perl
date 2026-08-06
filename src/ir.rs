@@ -1788,13 +1788,13 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
 /// Split a test-chain: returns (cond-string, tail) where tail is the first
 /// non-test node after the leading tests. Handles left-assoc chains
 /// (t1 && t2 && cmd) and mixed ops.
-fn split_test_tail(e: &IrExpr) -> Option<(String, Option<&IrExpr>)> {
+fn split_test_tail(e: &IrExpr) -> Option<(String, Option<&IrExpr>, Option<BinOpKind>)> {
     match e {
-        IrExpr::Call { func, .. } if func == "test" => Some((ir_expr_to_perl(e), None)),
+        IrExpr::Call { func, .. } if func == "test" => Some((ir_expr_to_perl(e), None, None)),
         IrExpr::BinOp { lhs, op, rhs }
             if matches!(op, BinOpKind::And | BinOpKind::Or) =>
         {
-            let (lcond, ltail) = split_test_tail(lhs)?;
+            let (lcond, ltail, _) = split_test_tail(lhs)?;
             let joiner = if matches!(op, BinOpKind::And) {
                 " && "
             } else {
@@ -1802,25 +1802,26 @@ fn split_test_tail(e: &IrExpr) -> Option<(String, Option<&IrExpr>)> {
             };
             match (ltail, rhs.as_ref()) {
                 // lhs ended in a test (no inner tail): rhs continues the
-                // chain (another test) or is the tail.
+                // chain (another test) or is the tail (connector = op).
                 (None, r) => {
                     if let IrExpr::Call { func, .. } = r {
                         if func == "test" {
-                            let (rcond, rtail) = split_test_tail(r)?;
+                            let (rcond, rtail, _) = split_test_tail(r)?;
                             Some((
                                 format!("({}){}({})", lcond, joiner, rcond),
                                 rtail,
+                                None,
                             ))
                         } else {
-                            Some((lcond, Some(r)))
+                            Some((lcond, Some(r), Some(op.clone())))
                         }
                     } else {
-                        Some((lcond, Some(r)))
+                        Some((lcond, Some(r), Some(op.clone())))
                     }
                 }
                 // lhs had an inner tail (t && cmd1) — the outer rhs is the
                 // else-branch for the if/else caller.
-                (Some(_), r) => Some((lcond, Some(r))),
+                (Some(_), r) => Some((lcond, Some(r), None)),
             }
         }
         _ => None,
@@ -1835,7 +1836,7 @@ fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
     // (test [&&/|| test]* [&& then]) || else → if/else
     if let IrExpr::BinOp { lhs, op: BinOpKind::Or, rhs } = e {
         if let IrExpr::BinOp { lhs: l2, op: BinOpKind::And, rhs: then_cmd } = lhs.as_ref() {
-            if let Some((cond, ltail)) = split_test_tail(l2) {
+            if let Some((cond, ltail, _)) = split_test_tail(l2) {
                 if ltail.is_none() {
                     if let (Some(t), Some(els)) = (expr_to_cmd(then_cmd), expr_to_cmd(rhs)) {
                         return Some(format!(
@@ -1849,28 +1850,52 @@ fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
             }
         }
     }
-    let (cond, tail) = split_test_tail(e)?;
+    let (cond, tail, connector) = split_test_tail(e)?;
     // Control-flow tail: continue/break/exit.
     if let Some(tail_expr) = tail {
+        // connector: And → run the tail when cond holds; Or → when it
+        // doesn't (bash `t || cmd` = if-not).
+        let negated = matches!(connector, Some(BinOpKind::Or));
         if let IrExpr::Call { func, args } = tail_expr {
             match func.as_str() {
-                "continue" => return Some(format!("({}) || next;", cond)),
-                "break" => return Some(format!("({}) || last;", cond)),
+                "continue" => {
+                    return Some(if negated {
+                        format!("({}) || next;", cond)
+                    } else {
+                        format!("({}) && next;", cond)
+                    })
+                }
+                "break" => {
+                    return Some(if negated {
+                        format!("({}) || last;", cond)
+                    } else {
+                        format!("({}) && last;", cond)
+                    })
+                }
                 "exit" => {
                     let code = args
                         .first()
                         .map(render_word)
                         .unwrap_or_else(|| "1".to_string());
-                    return Some(format!("({}) || exit {};", cond, code));
+                    return Some(if negated {
+                        format!("({}) || exit {};", cond, code)
+                    } else {
+                        format!("({}) && exit {};", cond, code)
+                    });
                 }
                 _ => {}
             }
         }
         // Command tail: if-guard around the shell-out.
         if let Some(cmd) = expr_to_cmd(tail_expr) {
+            let c = if negated {
+                format!("!({})", cond)
+            } else {
+                cond.clone()
+            };
             return Some(format!(
                 "if ({c}) {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
-                c = cond,
+                c = c,
                 q = safe_perl_q_string(&cmd)
             ));
         }
