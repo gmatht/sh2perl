@@ -2979,9 +2979,14 @@ impl Parser {
 
         let expression = expression_parts.join("");
 
+        let mut modifiers = self.get_current_shopt_state();
+        // `[[ ]]` (double-bracket — the caller consumed the `[[` already)
+        // vs `[ ]` (single): the A1 test Call carries the style as a
+        // trailing tag arg (core request extglob-nocasematch-20260806).
+        modifiers.double = is_double_bracket;
         Ok(Command::TestExpression(TestExpression {
             expression,
-            modifiers: self.get_current_shopt_state(),
+            modifiers,
         }))
     }
 
