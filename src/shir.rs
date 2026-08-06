@@ -1575,6 +1575,14 @@ fn estree_stmt_reads_positional(s: &Stmt) -> bool {
         Stmt::WhileStatement { test, body } => {
             estree_reads_positional(test) || estree_stmt_reads_positional(body)
         }
+        Stmt::ForStatement {
+            init, test, update, body,
+        } => {
+            estree_stmt_reads_positional(init)
+                || estree_reads_positional(test)
+                || estree_reads_positional(update)
+                || estree_stmt_reads_positional(body)
+        }
         Stmt::ForOfStatement {
             left,
             right,
@@ -1690,6 +1698,7 @@ pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
         var_types: vec![],
         stmt_lines: vec![],
         var_lengths: vec![],
+        var_const: vec![],
     }
 }
 
@@ -1707,6 +1716,7 @@ pub fn ast_to_ir_raw(commands: &[Command]) -> IrProgram {
         var_types: vec![],
         stmt_lines: vec![],
         var_lengths: vec![],
+        var_const: vec![],
     }
 }
 
@@ -2128,6 +2138,376 @@ pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
                 crate::ir::IrType::Str
             };
             (n, t)
+        })
+        .collect()
+}
+
+/// Conservative const/var verdicts (the const-markup transform; sibling
+/// of the A2 type verdicts and `analyze_string_lengths`). Per ASSIGNED
+/// variable, `Const` when it is written exactly once and that write
+/// executes at most once per run; `Var` otherwise.
+///
+/// Rules — all must hold for a `Const` verdict:
+///   - exactly ONE static assignment site: a single `Assign` target, one
+///     `local/declare/readonly/export name=value` declaration, one
+///     `setVar` write, one `Declare`/`DeclareArray` init (a bare `declare
+///     x` declares the empty value, so it counts as a site). A `for` loop
+///     variable is a site but is disqualified below (assigned per
+///     iteration);
+///   - the site executes at most once: NOT inside a loop body and NOT
+///     inside a function body (a function may run 0..N times; a loop site
+///     runs per iteration);
+///   - the var is never written by a runtime-store builtin (`read`,
+///     `readarray`, `mapfile`, `unset`), by a `let`/`(( ))` arithmetic
+///     statement, by native arith (`x++`, `((x=1))` in `$(( ))`), or by an
+///     array-element write (`arr[i]=v` — the store owns the element);
+///   - the program contains no dynamic write (a bare `eval`/`source`/`.`
+///     call anywhere can assign any name → every var `Var`).
+///
+/// Everything else is `Var` (over-conservatism is the safe direction: a
+/// missed `const` costs an optimisation, a wrong one breaks a backend's
+/// compilation). Sorted by name for deterministic serialization; every
+/// assigned var gets a verdict so the markup answers "const or var?"
+/// completely (missing names = never assigned, pure reads).
+pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> {
+    use crate::ir::{ArithAst, IrExpr, IrStmt, VarKind};
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Default)]
+    struct Acc {
+        /// static assignment-site count per var
+        sites: HashMap<String, usize>,
+        /// vars with a site inside a loop or function body (runs 0..N times)
+        multi_run: HashSet<String>,
+        /// vars written by a runtime-store builtin (read/mapfile/unset/let)
+        runtime_written: HashSet<String>,
+        /// vars written by native arith (`x++`, `((x=1))`, `$((x+=1))`)
+        arith_written: HashSet<String>,
+        /// vars written by an array-element write (`arr[i]=v`)
+        index_written: HashSet<String>,
+        /// a bare eval/source/. call exists → every var Var
+        dynamic: bool,
+    }
+
+    fn site(acc: &mut Acc, name: &str, multi_run: bool) {
+        *acc.sites.entry(name.to_string()).or_insert(0) += 1;
+        if multi_run {
+            acc.multi_run.insert(name.to_string());
+        }
+    }
+
+    /// Runtime-store write builtins: the store owns the name — the value
+    /// arrives from outside the program (stdin, files) or the name is
+    /// destroyed, so the var can never be `Const`.
+    const STORE_WRITE: &[&str] = &["read", "readarray", "mapfile", "unset"];
+    /// Declaration-with-assignment builtins: `local x=5`, `declare -r x=5`,
+    /// `readonly x=5`, `export FOO=bar` — a real assignment site (and the
+    /// shell's own const story: `readonly`).
+    const DECL_ASSIGN: &[&str] = &["local", "declare", "readonly", "export", "typeset"];
+    /// Dynamic writes: cannot be tracked statically — disqualify everything.
+    const DYNAMIC_WRITE: &[&str] = &["eval", "source", "."];
+
+    /// Identifier names written by a builtin's arg list (the args Array at
+    /// args[1]): each `Str` is `name` or `name=value`; flags (`-i`) and
+    /// non-identifier words are skipped — mirror of mark_write_builtin_vars.
+    fn builtin_names(args: &[IrExpr], out: &mut Vec<String>) {
+        for a in args {
+            match a {
+                IrExpr::Array(elems) => {
+                    for el in elems {
+                        builtin_names(std::slice::from_ref(el), out);
+                    }
+                }
+                IrExpr::Str(sv, _) => {
+                    let name = sv.split('=').next().unwrap_or("");
+                    if crate::shared_utils::is_variable_name(name) {
+                        out.push(name.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The builtin-command shape shared by `IrStmt::Exec` and the
+    /// `Call("exec"/"builtin", …)` expression form: args[0] = the command
+    /// name, args[1] = the arg-list Array. Classifies the write, if any.
+    fn classify_builtin(args: &[IrExpr], acc: &mut Acc, multi_run: bool) {
+        let [cmd, IrExpr::Array(rest)] = args else {
+            return;
+        };
+        let Some(cname) = (match cmd {
+            IrExpr::Str(s, _) => Some(s.as_str()),
+            IrExpr::Ident(s) => Some(s.as_str()),
+            _ => None,
+        }) else {
+            return;
+        };
+        if DYNAMIC_WRITE.contains(&cname) {
+            acc.dynamic = true;
+            return;
+        }
+        if STORE_WRITE.contains(&cname) {
+            let mut names = Vec::new();
+            builtin_names(rest, &mut names);
+            for n in names {
+                acc.runtime_written.insert(n);
+            }
+            return;
+        }
+        if cname == "let" {
+            // `let x=5` / `let x++` — the runtime evaluates arith strings;
+            // every bare identifier is a potential write (mirror of
+            // mark_all_idents for the exec arg shape). Conservative.
+            let mut names = Vec::new();
+            builtin_names(rest, &mut names);
+            for n in names {
+                acc.runtime_written.insert(n);
+            }
+            return;
+        }
+        if DECL_ASSIGN.contains(&cname) {
+            let mut names = Vec::new();
+            builtin_names(rest, &mut names);
+            for n in names {
+                site(acc, &n, multi_run);
+            }
+        }
+    }
+
+    fn walk_expr(e: &IrExpr, acc: &mut Acc, multi_run: bool) {
+        match e {
+            IrExpr::Arith(a) => {
+                for w in arith_written_vars(a) {
+                    acc.arith_written.insert(w);
+                }
+                walk_arith(a, acc, multi_run);
+            }
+            IrExpr::Arrow(stmts) => {
+                for s in stmts {
+                    walk_stmt(s, acc, multi_run);
+                }
+            }
+            IrExpr::Call { func, args } => {
+                if func == "setVar" {
+                    if let [IrExpr::Str(name, _), _] = args.as_slice() {
+                        site(acc, name, multi_run);
+                    }
+                }
+                if func == "exec" || func == "builtin" {
+                    classify_builtin(args, acc, multi_run);
+                }
+                for a in args {
+                    walk_expr(a, acc, multi_run);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    walk_expr(el, acc, multi_run);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, acc, multi_run);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        walk_expr(x, acc, multi_run);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. }
+            | IrExpr::Ternary { cond: lhs, then: rhs, .. } => {
+                walk_expr(lhs, acc, multi_run);
+                walk_expr(rhs, acc, multi_run);
+            }
+            IrExpr::Index { key, .. } | IrExpr::Capture { expr: key, .. } => {
+                walk_expr(key, acc, multi_run);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, acc, multi_run);
+                for a in args {
+                    walk_expr(a, acc, multi_run);
+                }
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, acc, multi_run);
+                walk_expr(default, acc, multi_run);
+            }
+            IrExpr::Range { .. }
+            | IrExpr::Int(_)
+            | IrExpr::Str(_, _)
+            | IrExpr::Var(_, _)
+            | IrExpr::Regex { .. }
+            | IrExpr::RawExpr(_)
+            | IrExpr::Bool(_)
+            | IrExpr::Json(_)
+            | IrExpr::Ident(_) => {}
+        }
+    }
+
+    fn walk_arith(a: &ArithAst, acc: &mut Acc, multi_run: bool) {
+        match a {
+            ArithAst::Num(_) | ArithAst::Var(_) => {}
+            ArithAst::Index { key, .. } => walk_arith(key, acc, multi_run),
+            ArithAst::Bin { lhs, rhs, .. } => {
+                walk_arith(lhs, acc, multi_run);
+                walk_arith(rhs, acc, multi_run);
+            }
+            ArithAst::Un { arg, .. } => walk_arith(arg, acc, multi_run),
+            ArithAst::Cond { test, then, else_, .. } => {
+                walk_arith(test, acc, multi_run);
+                walk_arith(then, acc, multi_run);
+                walk_arith(else_, acc, multi_run);
+            }
+            // writes already recorded via arith_written_vars above
+            ArithAst::Assign { rhs, .. } => walk_arith(rhs, acc, multi_run),
+            ArithAst::IncDec { .. } => {}
+        }
+    }
+
+    fn walk_stmt(st: &IrStmt, acc: &mut Acc, multi_run: bool) {
+        match st {
+            IrStmt::Assign { targets, expr } => {
+                for t in targets {
+                    if t.indices.is_empty() {
+                        site(acc, &t.var, multi_run);
+                    } else {
+                        acc.index_written.insert(t.var.clone());
+                    }
+                }
+                walk_expr(expr, acc, multi_run);
+            }
+            IrStmt::Declare { vars, .. } => {
+                for d in vars {
+                    site(acc, &d.name, multi_run);
+                }
+            }
+            IrStmt::DeclareArray { var, elements, .. } => {
+                site(acc, var, multi_run);
+                for el in elements {
+                    walk_expr(el, acc, multi_run);
+                }
+            }
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                walk_expr(cond, acc, multi_run);
+                for s in then {
+                    walk_stmt(s, acc, multi_run);
+                }
+                for (c, b) in elsifs {
+                    walk_expr(c, acc, multi_run);
+                    for s in b {
+                        walk_stmt(s, acc, multi_run);
+                    }
+                }
+                for s in else_ {
+                    walk_stmt(s, acc, multi_run);
+                }
+            }
+            // loop bodies + loop variables run per iteration
+            IrStmt::For { var, iter, body } => {
+                site(acc, var, true);
+                walk_expr(iter, acc, multi_run);
+                for s in body {
+                    walk_stmt(s, acc, true);
+                }
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr(cond, acc, multi_run);
+                for s in body {
+                    walk_stmt(s, acc, true);
+                }
+            }
+            // a function may run 0..N times — its sites are multi-run
+            IrStmt::Function { body, .. } => {
+                for s in body {
+                    walk_stmt(s, acc, true);
+                }
+            }
+            IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                for s in body {
+                    walk_stmt(s, acc, multi_run);
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                for s in inner {
+                    walk_stmt(s, acc, multi_run);
+                }
+                for r in redirects {
+                    walk_expr(&r.target, acc, multi_run);
+                }
+            }
+            IrStmt::Case { discriminant, clauses } => {
+                walk_expr(discriminant, acc, multi_run);
+                for c in clauses {
+                    for s in &c.body {
+                        walk_stmt(s, acc, multi_run);
+                    }
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for s in stage {
+                        walk_stmt(s, acc, multi_run);
+                    }
+                }
+            }
+            IrStmt::Exec { cmd, args, env, .. } => {
+                walk_expr(cmd, acc, multi_run);
+                classify_builtin(args, acc, multi_run);
+                for a in args {
+                    walk_expr(a, acc, multi_run);
+                }
+                for (_, v) in env {
+                    walk_expr(v, acc, multi_run);
+                }
+            }
+            IrStmt::Expr(e) => walk_expr(e, acc, multi_run),
+            IrStmt::Output { value, .. } => walk_expr(value, acc, multi_run),
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_expr(path, acc, multi_run);
+                walk_expr(content, acc, multi_run);
+            }
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                walk_expr(expr, acc, multi_run);
+            }
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) | IrStmt::SetChildError(e) => {
+                walk_expr(e, acc, multi_run);
+            }
+            IrStmt::Return(None) | IrStmt::Exit(None) => {}
+            IrStmt::Require(_) | IrStmt::RawText(_) => {}
+        }
+    }
+
+    let mut acc = Acc::default();
+    for s in &prog.stmts {
+        walk_stmt(s, &mut acc, false);
+    }
+    for sub in &prog.subs {
+        for s in &sub.body {
+            walk_stmt(s, &mut acc, true);
+        }
+    }
+
+    let mut names: Vec<String> = acc.sites.keys().cloned().collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|n| {
+            let is_const = acc.sites[&n] == 1
+                && !acc.multi_run.contains(&n)
+                && !acc.runtime_written.contains(&n)
+                && !acc.arith_written.contains(&n)
+                && !acc.index_written.contains(&n)
+                && !acc.dynamic;
+            (n, if is_const { VarKind::Const } else { VarKind::Var })
         })
         .collect()
 }
@@ -4585,6 +4965,9 @@ fn iter_numeric(e: &IrExpr) -> Option<bool> {
                             numeric = false;
                         }
                     }
+                    // the `seq_range_for` transform's Range item
+                    // (`for i in $(seq A B)` → `Array([Range])`)
+                    IrExpr::Range { .. } => {}
                     IrExpr::Call { func, args } if func == "brace" => match brace_numeric(args) {
                         Some(true) => {}
                         Some(false) => numeric = false,
@@ -7491,6 +7874,7 @@ fn lowered_stmts_have_signals(stmts: &[Stmt]) -> bool {
             Stmt::WhileStatement { body, .. } | Stmt::ForOfStatement { body, .. } => {
                 stmt_has_signal(body, false)
             }
+            Stmt::ForStatement { body, .. } => stmt_has_signal(body, false),
             Stmt::VariableDeclaration { declarations, .. } => declarations
                 .iter()
                 .any(|d| d.init.as_ref().map(expr_has_signal).unwrap_or(false)),
@@ -7586,6 +7970,77 @@ fn for_iter_flattenable(iter: &IrExpr) -> bool {
             _ => false,
         }),
         _ => true,
+    }
+}
+
+/// The `seq_range_for` transform's numeric-range iterable: the for-items
+/// shape `Array([Range { start, end }])` (the transform rewrites the
+/// `$(seq …)` capture item in place) or a bare `Range`. Anything else is
+/// not a native-range loop.
+fn for_range_bounds(iter: &IrExpr) -> Option<(i64, i64)> {
+    match iter {
+        IrExpr::Array(items) => match items.as_slice() {
+            [IrExpr::Range { start, end }] => Some((*start, *end)),
+            _ => None,
+        },
+        IrExpr::Range { start, end } => Some((*start, *end)),
+        _ => None,
+    }
+}
+
+/// The materialized string-item list for a range iterable — the fallback
+/// when the loop cannot take the native counter path (async region /
+/// awaits in body / signals): the for-of / *Sync / async paths need a
+/// concrete item list and the runtime has no range helper. Bounded by
+/// the transform's span cap (1M), so compilation cannot blow up.
+fn range_items_array(lo: i64, hi: i64) -> IrExpr {
+    let items: Vec<IrExpr> = (lo..=hi)
+        .map(|v| IrExpr::Str(v.to_string(), StrStyle::SingleQuoted))
+        .collect();
+    IrExpr::Array(items)
+}
+
+/// `for (let i = lo; i <= hi; i++) { body }` — the native numeric-range
+/// loop (the hand-js ideal for `for i in $(seq lo hi)`). The binding is
+/// a JS number from the init literal; the body never writes it (the
+/// transform's guarantee), so the postfix `i++` update stays exact. The
+/// `let` shadows the module `let i = 0` (numeric lift) exactly like the
+/// for-of binding.
+fn native_range_for(js_var: String, lo: i64, hi: i64, body: Vec<Stmt>) -> Stmt {
+    Stmt::ForStatement {
+        init: Box::new(Stmt::VariableDeclaration {
+            kind: "let",
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: Expr::Identifier {
+                    name: js_var.clone(),
+                },
+                init: Some(Expr::Literal {
+                    value: serde_json::Value::from(lo),
+                    raw: None,
+                regex: None,
+                }),
+            }],
+        }),
+        test: Expr::BinaryExpression {
+            operator: "<=".to_string(),
+            left: Box::new(Expr::Identifier {
+                name: js_var.clone(),
+            }),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(hi),
+                raw: None,
+            regex: None,
+            }),
+        },
+        update: Expr::UnaryExpression {
+            operator: "++".to_string(),
+            argument: Box::new(Expr::Identifier {
+                name: js_var.clone(),
+            }),
+            prefix: false,
+        },
+        body: Box::new(Stmt::BlockStatement { body }),
     }
 }
 
@@ -8062,22 +8517,37 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         }
         IrStmt::For { var, iter, body } => {
             let js_var = safe_ident(var);
+            // The `seq_range_for` transform's native-range iterable
+            // (`Array([Range{lo,hi}])` or bare `Range`): the loop lowers
+            // to a native JS `for (let i = lo; i <= hi; i++)` — no
+            // runtime call, no item list at all. The transform
+            // guarantees the loop var is never WRITTEN by the body (the
+            // one semantic gap between a word list and a counter), and
+            // the bounds are plain in-range integers.
+            let range = for_range_bounds(iter);
             let mut coercion: Option<IrStmt> = None;
             if is_lifted_num(var) {
-                // the forLoop items arrive as strings; coerce the param to
-                // a number in place (the closure param shadows the module
-                // let — a self-assign is exactly the coercion we want)
-                coercion = Some(IrStmt::Assign {
-                    targets: vec![AssignTarget {
-                        var: var.clone(),
-                        sigil: None,
-                        indices: vec![],
-                    }],
-                    expr: IrExpr::Call {
-                        func: "Number".to_string(),
-                        args: vec![IrExpr::Ident(js_var.clone())],
-                    },
-                });
+                if range.is_some() {
+                    // the native counter binding is a NUMBER from the
+                    // `let i = lo` init — no per-iteration coercion (the
+                    // for-of path's `i = Number(i)` exists only because
+                    // its items arrive as strings)
+                } else {
+                    // the forLoop items arrive as strings; coerce the param to
+                    // a number in place (the closure param shadows the module
+                    // let — a self-assign is exactly the coercion we want)
+                    coercion = Some(IrStmt::Assign {
+                        targets: vec![AssignTarget {
+                            var: var.clone(),
+                            sigil: None,
+                            indices: vec![],
+                        }],
+                        expr: IrExpr::Call {
+                            func: "Number".to_string(),
+                            args: vec![IrExpr::Ident(js_var.clone())],
+                        },
+                    });
+                }
             } else if !is_lifted(var) {
                 // store sync (non-lifted loop var)
                 coercion = Some(IrStmt::Assign {
@@ -8095,7 +8565,6 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 body_stmts.push(c.clone());
             }
             body_stmts.extend(body.clone());
-            let iter_e = expr_to_estree(iter);
             // the *Sync path emits the ORIGINAL body references — the
             // liveness pre-pass (compute_lastexit_deadness) keys by
             // statement pointer, so the loop bodies' dead-write marks must
@@ -8105,6 +8574,91 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 .chain(body.iter())
                 .filter_map(stmt_to_estree)
                 .collect();
+            // Native counter loop (the ladder's top rung for a range
+            // iterable): `for (let i = lo; i <= hi; i++)` — the
+            // hand-written ideal (PLAN §9.1 `seq 1 N → native range`).
+            // Same eligibility as the native for-of below (no await in
+            // body, not an async region, no signal sources); the
+            // transform's guarantees cover the rest (pure integer
+            // bounds, body never writes the var).
+            if let Some((lo, hi)) = range {
+                if !stmts_have_await(&body_e)
+                    && !loop_in_async_region(stmt)
+                    && !lowered_stmts_have_signals(&body_e)
+                {
+                    // Store-sync elimination — the mirror of the for-of
+                    // path below: a STORE-BACKED loop var (unliftable —
+                    // read after the loop etc.) whose body only observes
+                    // it through `sh2.getVar(var)` collapses the
+                    // per-iteration `sh2.setVar(var, i)` to ONE pre-loop
+                    // store read (the empty-range case keeps the prior
+                    // value, exactly like bash) + ONE post-loop write.
+                    let mut sync_elim: Option<Vec<Stmt>> = None;
+                    if let Some(sync) = &coercion {
+                        let is_store_sync = !is_lifted(var)
+                            && matches!(sync, IrStmt::Assign { targets, .. }
+                                if targets.len() == 1 && targets[0].var == *var);
+                        if is_store_sync && forof_sync_elim_ok(&body_e[1..], var) {
+                            let mut body2: Vec<Stmt> = vec![Stmt::ExpressionStatement {
+                                // the per-iteration store sync becomes a
+                                // native temp write (the post-loop setVar
+                                // stores the LAST value; the pre-loop read
+                                // covers the empty-range case)
+                                expression: Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(Expr::Identifier {
+                                        name: format!("__sh2_for_last_{js_var}"),
+                                    }),
+                                    right: Box::new(Expr::Identifier {
+                                        name: js_var.clone(),
+                                    }),
+                                },
+                            }];
+                            body2.extend(body_e[1..].to_vec());
+                            forof_rewrite_getvar(&mut body2, var, &js_var);
+                            let temp = format!("__sh2_for_last_{js_var}");
+                            let mut out: Vec<Stmt> = vec![Stmt::VariableDeclaration {
+                                kind: "let",
+                                declarations: vec![VariableDeclarator {
+                                    type_: "VariableDeclarator",
+                                    id: Expr::Identifier {
+                                        name: temp.clone(),
+                                    },
+                                    init: Some(sh2_call("getVar", vec![str_lit(var)])),
+                                }],
+                            }];
+                            out.push(native_range_for(
+                                js_var.clone(),
+                                lo,
+                                hi,
+                                body2,
+                            ));
+                            out.push(Stmt::ExpressionStatement {
+                                expression: sh2_call(
+                                    "setVar",
+                                    vec![str_lit(var), Expr::Identifier {
+                                        name: temp,
+                                    }],
+                                ),
+                            });
+                            sync_elim = Some(out);
+                        }
+                    }
+                    if let Some(out) = sync_elim {
+                        return Some(Stmt::BlockStatement { body: out });
+                    }
+                    return Some(native_range_for(js_var.clone(), lo, hi, body_e));
+                }
+            }
+            // the range fallback: the loop could not take the native
+            // counter path (async region / awaits / signals) — materialize
+            // the item list for the for-of / *Sync / async paths below
+            // (the runtime has no range helper). Bounded by the
+            // transform's span cap.
+            let iter_e = match range {
+                Some((lo, hi)) => expr_to_estree(&range_items_array(lo, hi)),
+                None => expr_to_estree(iter),
+            };
             // Fast path: a provably-sync loop (the BODY needs no `await`)
             // lowers to the synchronous runtime loop — identical semantics
             // (flattening, GLOB_MAGIC items, BREAK/CONTINUE/RETURN signals,
@@ -15548,6 +16102,18 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             }
         }
         IrExpr::Ident(name) => Expr::Identifier { name: name.clone() },
+        // A numeric-range iterable (`seq_range_for`'s `Array([Range])`
+        // for-items shape): the ESTree surface has no range literal, so
+        // render the materialized string list. The native ForStatement
+        // path consumes the Range BEFORE this arm (a counter loop, no
+        // array); this arm is the bounded fallback (for-of / *Sync /
+        // async paths) and any stray Range in an expression position.
+        IrExpr::Range { start, end } => {
+            let items: Vec<Option<Expr>> = (*start..=*end)
+                .map(|v| Some(str_lit(&v.to_string())))
+                .collect();
+            Expr::ArrayExpression { elements: items }
+        }
         IrExpr::Array(elems) => Expr::ArrayExpression {
             elements: elems.iter().map(|e| Some(expr_to_estree(e))).collect(),
         },
@@ -17318,6 +17884,11 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
                     })
             }
             Stmt::WhileStatement { test, body } => expr_ok(test, var) && stmt_ok(body, var),
+            Stmt::ForStatement {
+                init, test, update, body,
+            } => {
+                stmt_ok(init, var) && expr_ok(test, var) && expr_ok(update, var) && stmt_ok(body, var)
+            }
             Stmt::ForOfStatement { left, right, body } => {
                 stmt_ok(left, var) && expr_ok(right, var) && stmt_ok(body, var)
             }
@@ -17441,6 +18012,14 @@ fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
             }
             Stmt::WhileStatement { test, body } => {
                 expr_rewrite(test, var, js_var);
+                stmt_rewrite(body, var, js_var);
+            }
+            Stmt::ForStatement {
+                init, test, update, body,
+            } => {
+                stmt_rewrite(init, var, js_var);
+                expr_rewrite(test, var, js_var);
+                expr_rewrite(update, var, js_var);
                 stmt_rewrite(body, var, js_var);
             }
             Stmt::ForOfStatement { left, right, body } => {
@@ -17571,5 +18150,71 @@ mod range_analysis_tests {
             "RANGE TALLY: files={} numeric_lift_vars={} range_proven={} widths={:?} files_with_narrow={}",
             files, total_numeric, total_proven, widths, narrowed_files
         );
+    }
+}
+
+#[cfg(test)]
+mod length_analysis_tests {
+    use super::*;
+
+    #[test]
+    #[ignore] // corpus-wide tally — run on demand: cargo test -- --ignored --nocapture
+    fn corpus_length_tally() {
+        let mut total_vars = 0usize;
+        let mut total_bounded = 0usize;
+        let mut total_unbounded = 0usize;
+        let mut total_len = 0u64;
+        let mut files = 0usize;
+        let mut files_with_bounds = 0usize;
+        for entry in std::fs::read_dir("examples").unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "sh").unwrap_or(false) {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                let Ok(cmds) = crate::Parser::new(&src).parse() else { continue };
+                let prog = ast_to_ir(&cmds);
+                let lens = analyze_string_lengths(&prog);
+                files += 1;
+                total_vars += lens.len();
+                let mut file_had_bound = false;
+                for (_, l) in &lens {
+                    match l {
+                        Some(n) => {
+                            total_bounded += 1;
+                            total_len += n;
+                            file_had_bound = true;
+                        }
+                        None => total_unbounded += 1,
+                    }
+                }
+                if file_had_bound {
+                    files_with_bounds += 1;
+                }
+            }
+        }
+        eprintln!(
+            "LENGTH TALLY: files={} vars={} bounded={} unbounded={} total_len={} files_with_bounds={}",
+            files, total_vars, total_bounded, total_unbounded, total_len, files_with_bounds
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    #[test]
+    fn probe_ir_forms() {
+        for src in [
+            "i=0\nwhile [ $i -lt 100 ]; do i=$((i+1)); done\n",
+            "i=0\nwhile (( i < 100 )); do i=$((i+1)); done\n",
+            "i=0\nuntil [ $i -ge 100 ]; do i=$((i+1)); done\n",
+            "for i in 1 2 3; do echo $i; done\n",
+        ] {
+            let cmds = crate::Parser::new(src).parse().expect("parse");
+            let prog = ast_to_ir(&cmds);
+            eprintln!("=== {src:?} ===");
+            for s in &prog.stmts {
+                eprintln!("{:?}", s);
+            }
+        }
     }
 }
