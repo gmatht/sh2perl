@@ -766,7 +766,29 @@ exit $main_exit_code;
                 Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
             }
         }
-        "--shir-in-perl" => {
+                "--shir-in-python" => {
+            if args.len() < 3 { println!("Error: --shir-in-python requires input"); return; }
+            let input = &args[2];
+            let content = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e); std::process::exit(1);
+                }
+                Ok(s)
+            } else {
+                fs::read_to_string(input)
+            };
+            let content = match content {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+            };
+            print!("{}", debashl::python_backend::shir_to_python(&prog));
+        }
+"--shir-in-perl" => {
             if args.len() < 3 { println!("Error: --shir-in-perl requires input"); return; }
             let input = &args[2];
             let content = if input == "-" {
