@@ -743,20 +743,11 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             }
         }
         IrStmt::Expr(e) => {
-            // plan improvement #5: a bare expression statement is a no-op
-            // in Perl (expressions don't have side effects in statement
-            // position). Render as a comment so the source is still
-            // traceable; if the expression is a Call (sh2.*), it's
-            // actually a shell exec whose side effects matter — but the
-            // sh2 backend isn't wired here (see sh2runtime). For the
-            // shIR→Perl path, Exprs that are real execs should have been
-            // lowered to Output/Exec by the optimizer; bare Expr means
-            // a value was discarded, which is a no-op in Perl.
-            // the C frontend's break/continue (IrStmt::Expr(Call("break")))
-            // are the shell's control signals — Perl's native loop
-            // controls (last/next)
-            if let IrExpr::Call { func, args } = e {
-                match func.as_str() {
+            // A bare expression statement: shell commands arrive as
+            // Call{exec/test/pipeline/redirect/…} or as `&&`/`||` chains of
+            // those (BinOp) — lower them all to shell-out via bash -c.
+            match e {
+                IrExpr::Call { func, .. } => match func.as_str() {
                     "break" => {
                         emit_indent(out, indent);
                         out.push_str("last;\n");
@@ -814,8 +805,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         }
                     }
                     other => {
-                        // Non-Call expressions (e.g. a bare `&&`/`||` chain of
-                        // execs) and unknown sh2.* calls.
+                        // Unknown sh2.* calls in statement position.
                         if let Some(cmd) = expr_to_cmd(e) {
                             emit_indent(out, indent);
                             out.push_str(&format!(
@@ -829,6 +819,24 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 other
                             ));
                         }
+                    }
+                },
+                // Non-Call expressions: bare `&&`/`||` chains of execs,
+                // redirects, pipelines — run the reconstructed shell command.
+                other_expr => {
+                    if let Some(s) = cd_chain_to_perl(other_expr) {
+                        emit_indent(out, indent);
+                        out.push_str(&s);
+                        out.push('\n');
+                    } else if let Some(cmd) = expr_to_cmd(other_expr) {
+                        emit_indent(out, indent);
+                        out.push_str(&format!(
+                            "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+                            safe_perl_q_string(&cmd)
+                        ));
+                    } else {
+                        emit_indent(out, indent);
+                        out.push_str("die \"debashc: shIR expression not yet supported by the Perl backend\\n\";\n");
                     }
                 }
             }
@@ -1374,7 +1382,12 @@ fn render_word(e: &IrExpr) -> String {
     match e {
         IrExpr::Str(s, style) => {
             // Reuse the Str rendering from ir_expr_to_perl by constructing it.
-            render_str_literal(s, style)
+            if let Some(pat) = s.strip_prefix("\u{1}SH2GLOB\u{1}") {
+                // Shell glob word — expand via Perl's glob().
+                format!("glob('{}')", pat.replace('\'', "\\\\'"))
+            } else {
+                render_str_literal(s, style)
+            }
         }
         IrExpr::Call { func, args } => match func.as_str() {
             "getVar" => args
@@ -1393,11 +1406,12 @@ fn render_word(e: &IrExpr) -> String {
                 .unwrap_or_else(|| "0".to_string()),
             "brace" => render_brace_word(args),
             "capture" | "captureWords" => {
-                // Command substitution in word position: capture stdout and
-                // split on IFS whitespace (bash word-splitting semantics).
+                // Command substitution in unquoted word position: capture
+                // stdout, then split on IFS whitespace (bash word-splitting
+                // semantics). The join keeps it a single string for print.
                 let cap = args.first().and_then(arrow_to_cmd);
                 match cap {
-                    Some(cmd) => format!("split(/\\s+/, {})", cmd_str_to_open_perl(&cmd)),
+                    Some(cmd) => format!("join(' ', split(/\\s+/, {}))", cmd_str_to_open_perl(&cmd)),
                     None => "''".to_string(),
                 }
             }
@@ -1472,27 +1486,180 @@ fn render_param(args: &[IrExpr]) -> String {
 
 /// Build a bash command string from an exec's (cmd, words) for shell-out.
 fn build_shell_cmd(cmd: &str, words: &[&IrExpr]) -> String {
-    let bash_quote = |s: &str| -> String { format!("'{}'", s.replace('\'', "'\\\\''")) };
-    let mut parts: Vec<String> = vec![bash_quote(cmd)];
+    let mut parts: Vec<String> = vec![bash_quote_word(cmd)];
     for w in words {
-        let w: &IrExpr = w;
-        match w {
-            IrExpr::Str(s, _) => parts.push(bash_quote(s)),
-            _ => {
-                let wstr = render_word(w);
-                // A Perl string literal or a plain scalar: embed safely.
-                if wstr.starts_with('\'') || wstr.starts_with('"') || wstr.starts_with('q') {
-                    parts.push(wstr);
-                } else {
-                    parts.push(format!(
-                        "\"{}\"",
-                        wstr.replace("\"", "\\\"").replace('$', "\\$").replace('@', "\\@")
-                    ));
+        parts.push(bash_word_for(w));
+    }
+    parts.join(" ")
+}
+
+/// `cd` must affect the Perl process (chdir), so chains starting with it
+/// render natively: `cd D || exit N` → `chdir(D) or exit N;` and
+/// `cd D && cmd` → `chdir(D) or die;` + shell-out of the tail.
+fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
+    if let IrExpr::BinOp { lhs, op, rhs } = expr {
+        if let IrExpr::Call { func, args } = lhs.as_ref() {
+            if func == "exec" {
+                if let Some((cmd, words)) = exec_call_parts(args) {
+                    if cmd == "cd" {
+                        let dir = words
+                            .first()
+                            .map(|w| render_word(w))
+                            .unwrap_or_else(|| "$ENV{HOME}".to_string());
+                        return match op {
+                            BinOpKind::Or => {
+                                let code = if let IrExpr::Call { func: f, args: a2 } = rhs.as_ref() {
+                                    if f == "exit" {
+                                        a2.first()
+                                            .map(|w| render_word(w))
+                                            .unwrap_or_else(|| "1".to_string())
+                                    } else {
+                                        "1".to_string()
+                                    }
+                                } else {
+                                    "1".to_string()
+                                };
+                                Some(format!("chdir({}) or exit {};", dir, code))
+                            }
+                            BinOpKind::And => {
+                                let tail = expr_to_cmd(rhs);
+                                match tail {
+                                    Some(t) => Some(format!(
+                                        "chdir({}) or die \"cd: $!\\n\"; system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;",
+                                        dir,
+                                        safe_perl_q_string(&t)
+                                    )),
+                                    None => Some(format!("chdir({}) or die \"cd: $!\\n\";", dir)),
+                                }
+                            }
+                            _ => None,
+                        };
+                    }
                 }
             }
         }
     }
-    parts.join(" ")
+    None
+}
+
+/// A word as bash syntax: literals shell-quoted, captures as `$(…)`
+/// (bash evaluates nested command substitution), interpolated words rebuilt
+/// as bash double-quoted `"…$var…"`, vars double-quoted, braces as `{…}`.
+fn bash_word_for(w: &IrExpr) -> String {
+    match w {
+        IrExpr::Str(s, _) => {
+            if let Some(pat) = s.strip_prefix("\u{1}SH2GLOB\u{1}") {
+                // Shell glob — emit unquoted so bash -c expands it.
+                pat.to_string()
+            } else {
+                bash_quote_word(s)
+            }
+        }
+        IrExpr::Interpolate(parts) => {
+            let mut s = String::from("\"");
+            for p in parts {
+                match p {
+                    InterpPart::Lit(t) => {
+                        for ch in t.chars() {
+                            match ch {
+                                '"' => s.push_str("\\\""),
+                                '$' => s.push_str("\\$"),
+                                '`' => s.push_str("\\`"),
+                                c => s.push(c),
+                            }
+                        }
+                    }
+                    InterpPart::Expr(e) => {
+                        if let IrExpr::Call { func, args } = e.as_ref() {
+                            if func == "getVar" {
+                                if let Some(n) = args.first().and_then(call_arg_str) {
+                                    s.push_str(&format!("${}", n));
+                                    continue;
+                                }
+                            }
+                            if func == "capture" || func == "captureWords" {
+                                if let Some(cmd) = args.first().and_then(arrow_to_cmd) {
+                                    s.push_str(&format!("$({})", cmd));
+                                    continue;
+                                }
+                            }
+                        }
+                        s.push_str(&render_word(e));
+                    }
+                }
+            }
+            s.push('"');
+            s
+        }
+        IrExpr::Call { func, args } if func == "capture" || func == "captureWords" => {
+            match args.first().and_then(arrow_to_cmd) {
+                Some(cmd) => format!("$({})", cmd),
+                None => "''".to_string(),
+            }
+        }
+        IrExpr::Call { func, args } if func == "brace" => bash_brace_syntax(args),
+        _ => {
+            let wstr = render_word(w);
+            // A Perl string literal or a plain scalar: embed safely.
+            if wstr.starts_with('\'') || wstr.starts_with('"') || wstr.starts_with('q') {
+                wstr
+            } else {
+                format!(
+                    "\"{}\"",
+                    wstr.replace("\"", "\\\"").replace('$', "\\$").replace('@', "\\@")
+                )
+            }
+        }
+    }
+}
+
+/// Rebuild bash brace syntax from a parsed `brace` Call:
+/// prefix + {range/list}{range/list}… + suffix (bash expands it).
+fn bash_brace_syntax(args: &[IrExpr]) -> String {
+    let prefix = args.first().and_then(call_arg_str).unwrap_or_default();
+    let suffix = args.get(3).and_then(call_arg_str).unwrap_or_default();
+    let v = match brace_json_arg(args) {
+        Some(v) => v,
+        None => return format!("'{}{}'", prefix, suffix),
+    };
+    let mut out = prefix;
+    if let Some(groups) = v.as_array() {
+        for g in groups {
+            let items = match g.as_array() {
+                Some(i) => i,
+                None => continue,
+            };
+            out.push('{');
+            let mut first = true;
+            for it in items {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if let Some(s) = it.as_str() {
+                    out.push_str(s);
+                } else if let Some(range_arr) = it.get("range").and_then(|r| r.as_array()) {
+                    let a = range_arr.get(0).and_then(|x| x.as_str()).unwrap_or("");
+                    let b = range_arr.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                    let step = range_arr.get(2).and_then(|x| x.as_str()).unwrap_or("");
+                    out.push_str(a);
+                    out.push_str("..");
+                    out.push_str(b);
+                    if !step.is_empty() {
+                        out.push_str("..");
+                        out.push_str(step);
+                    }
+                }
+            }
+            out.push('}');
+        }
+    }
+    out.push_str(&suffix);
+    out
+}
+
+fn bash_quote_word(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\\\''"))
 }
 
 /// The modern IR packs all of a command's word arguments into a single
@@ -1514,78 +1681,126 @@ fn brace_json_arg(args: &[IrExpr]) -> Option<&serde_json::Value> {
     })
 }
 
-/// A single numeric range: Json `[[{"range":["A","B",null,null]}]]`.
-fn brace_range(v: &serde_json::Value) -> Option<(i64, i64)> {
-    let groups = v.as_array()?;
-    if groups.len() != 1 {
-        return None;
-    }
-    let items = groups[0].as_array()?;
-    if items.len() != 1 {
-        return None;
-    }
-    let r = items[0].get("range")?.as_array()?;
-    let a = r.get(0)?.as_str()?.parse::<i64>().ok()?;
-    let b = r.get(1)?.as_str()?.parse::<i64>().ok()?;
-    Some((a, b))
-}
-
-/// Flatten a brace group (first alternative group) to its items, expanding
-/// numeric ranges (capped at 1024 elements).
-fn brace_items(v: &serde_json::Value) -> Vec<String> {
+/// Expand one range spec (numeric or single-char) to its items, honoring
+/// the step and zero-padding width of the start/end strings. Capped at
+/// 1024 items.
+fn expand_range(start: &str, end: &str, step: i64) -> Vec<String> {
     let mut out = Vec::new();
-    let groups = match v.as_array() {
-        Some(g) => g,
-        None => return out,
-    };
-    for g in groups {
-        let items = match g.as_array() {
-            Some(i) => i,
-            None => continue,
-        };
-        for it in items {
-            if let Some(s) = it.as_str() {
-                out.push(s.to_string());
-            } else if let Some(arr) = it.get("range").and_then(|r| r.as_array()) {
-                if let (Some(a), Some(b)) = (
-                    arr.get(0).and_then(|x| x.as_str()),
-                    arr.get(1).and_then(|x| x.as_str()),
-                ) {
-                    if let (Ok(ai), Ok(bi)) = (a.parse::<i64>(), b.parse::<i64>()) {
-                        let step = arr.get(2).and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
-                        if step != 0 && (bi - ai) / step.abs() < 1024 {
-                            let mut n = ai;
-                            while (n <= bi && step > 0) || (n >= bi && step < 0) {
-                                out.push(n.to_string());
-                                n += step;
-                            }
-                        }
-                    }
-                }
-            }
+    if step == 0 {
+        return out;
+    }
+    // Numeric range (zero-padded only when the START has a leading zero).
+    if let (Ok(ai), Ok(bi)) = (start.parse::<i64>(), end.parse::<i64>()) {
+        let pad = start.starts_with('0');
+        let width = if pad { start.len().max(end.len()) } else { 1 };
+        if (bi - ai) / step.abs() >= 1024 {
+            return out;
         }
-        if !out.is_empty() {
-            break; // first non-empty group wins
+        let mut n = ai;
+        while (n <= bi && step > 0) || (n >= bi && step < 0) {
+            if pad && n >= 0 {
+                out.push(format!("{:0width$}", n, width = width));
+            } else {
+                out.push(n.to_string());
+            }
+            n += step;
+        }
+        return out;
+    }
+    // Single-character range (a..c, a..z..3).
+    if let (Some(ac), Some(bc)) = (start.chars().next(), end.chars().next()) {
+        if start.chars().count() == 1 && end.chars().count() == 1 {
+            let (ai, bi) = (ac as i64, bc as i64);
+            if (bi - ai) / step.abs() >= 1024 {
+                return out;
+            }
+            let mut n = ai;
+            while (n <= bi && step > 0) || (n >= bi && step < 0) {
+                out.push(char::from_u32(n as u32).unwrap_or('?').to_string());
+                n += step;
+            }
         }
     }
     out
 }
 
-/// Render a `brace` Call in word position: the expanded items joined by
-/// spaces (echo {a,b,c} → a b c). Numeric ranges expand up to 256 items;
-/// larger ones approximate with the A..B literal.
-fn render_brace_word(args: &[IrExpr]) -> String {
+/// Expand the brace groups Json to one item-list per group (each range
+/// entry expanded).
+fn brace_groups(v: &serde_json::Value) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None => return groups,
+    };
+    for g in arr {
+        let items = match g.as_array() {
+            Some(i) => i,
+            None => continue,
+        };
+        let mut expanded = Vec::new();
+        for it in items {
+            if let Some(s) = it.as_str() {
+                expanded.push(s.to_string());
+            } else if let Some(range_arr) = it.get("range").and_then(|r| r.as_array()) {
+                let a = range_arr.get(0).and_then(|x| x.as_str()).unwrap_or("");
+                let b = range_arr.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                let step = range_arr
+                    .get(2)
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(1);
+                expanded.extend(expand_range(a, b, step));
+            }
+        }
+        if !expanded.is_empty() {
+            groups.push(expanded);
+        }
+    }
+    groups
+}
+
+/// Full brace expansion: prefix + cross-product(groups) + suffix.
+fn brace_expand(args: &[IrExpr]) -> Vec<String> {
+    let prefix = args.first().and_then(call_arg_str).unwrap_or_default();
+    let suffix = args.get(3).and_then(call_arg_str).unwrap_or_default();
     let v = match brace_json_arg(args) {
         Some(v) => v,
-        None => return "''".to_string(),
+        None => return Vec::new(),
     };
-    let items = brace_items(v);
+    let groups = brace_groups(v);
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    // Cross-product of the groups.
+    let mut stack: Vec<String> = vec![prefix];
+    for group in &groups {
+        let mut next = Vec::new();
+        for acc in &stack {
+            for item in group {
+                let mut s = acc.clone();
+                s.push_str(item);
+                next.push(s);
+                if next.len() > 4096 {
+                    break;
+                }
+            }
+        }
+        stack = next;
+    }
+    for mut s in stack {
+        s.push_str(&suffix);
+        out.push(s);
+    }
+    out
+}
+
+/// Render a `brace` Call in word position: the expanded items joined by
+/// spaces (echo {a,b,c} → a b c).
+fn render_brace_word(args: &[IrExpr]) -> String {
+    let items = brace_expand(args);
     if items.is_empty() {
         return "''".to_string();
-    }
-    if items.len() > 256 {
-        // Approximate a huge range with the numeric span.
-        return format!("'{}..{}'", items[0], items[items.len() - 1]);
     }
     let quoted: Vec<String> = items
         .iter()
@@ -1594,17 +1809,31 @@ fn render_brace_word(args: &[IrExpr]) -> String {
     format!("join(' ', {})", quoted.join(", "))
 }
 
-/// Render a `brace` Call as a for-iterable: {1..5} → 1..5; {a,b,c} →
-/// ('a','b','c') (single-quoted).
+/// Render a `brace` Call as a for-iterable: {1..5} → 1..5; {a..c} →
+/// ('a'..'c'); {a,b,c} → ('a','b','c').
 fn render_brace_iter(args: &[IrExpr]) -> String {
     let v = match brace_json_arg(args) {
         Some(v) => v,
         None => return "()".to_string(),
     };
-    if let Some((a, b)) = brace_range(v) {
-        return format!("{}..{}", a, b);
+    // Single numeric range → 1..5; single char range → ('a'..'c').
+    let groups = brace_groups(v);
+    if groups.len() == 1 && groups[0].len() == 1 {
+        if let Some(range_arr) = v.as_array().and_then(|a| a[0].as_array()).and_then(|g| g[0].get("range")).and_then(|r| r.as_array()) {
+            let a = range_arr.get(0).and_then(|x| x.as_str()).unwrap_or("");
+            let b = range_arr.get(1).and_then(|x| x.as_str()).unwrap_or("");
+            let step = range_arr.get(2).and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
+            if step == 1 {
+                if a.parse::<i64>().is_ok() && b.parse::<i64>().is_ok() {
+                    return format!("{}..{}", a.parse::<i64>().unwrap(), b.parse::<i64>().unwrap());
+                }
+                if a.chars().count() == 1 && b.chars().count() == 1 {
+                    return format!("('{}'..'{}')", a, b);
+                }
+            }
+        }
     }
-    let items = brace_items(v);
+    let items = brace_expand(args);
     if items.is_empty() {
         return "()".to_string();
     }
@@ -1638,6 +1867,7 @@ fn expr_to_cmd(e: &IrExpr) -> Option<String> {
                 Some(build_shell_cmd(&cmd, &words))
             }
             "pipeline" => pipeline_call_to_cmd(e),
+            "redirect" => redirect_call_to_cmd(e),
             _ => None,
         },
         IrExpr::BinOp { lhs, op, rhs } => {
@@ -2049,8 +2279,15 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
     let parts: Vec<String> = args.iter().map(|w| render_word(w)).collect();
     let nl = if newline { ", \"\\n\"" } else { "" };
     if parts.len() == 1 {
-        emit_indent(out, indent);
-        out.push_str(&format!("print({}{});\n", parts[0], nl));
+        // A single glob word is a LIST in Perl — wrap in join(' ', …) so
+        // the expansion space-joins like bash (echo file_*.txt).
+        if parts[0].starts_with("glob(") {
+            emit_indent(out, indent);
+            out.push_str(&format!("print(join(' ', {}){});\n", parts[0], nl));
+        } else {
+            emit_indent(out, indent);
+            out.push_str(&format!("print({}{});\n", parts[0], nl));
+        }
     } else {
         // Unquoted word-splitting drops empty words (bash IFS semantics);
         // `grep { defined && length }` filters those out and avoids undef
@@ -2925,9 +3162,12 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     .unwrap_or_else(|| "0".to_string()),
                 "brace" => render_brace_word(args),
                 "capture" | "captureWords" => {
+                    // Expression/interpolated context (e.g. inside a
+                    // double-quoted word): the raw chomped value, NOT a
+                    // split (split in scalar context yields a field count).
                     let cap = args.first().and_then(arrow_to_cmd);
                     match cap {
-                        Some(cmd) => format!("split(/\\s+/, {})", cmd_str_to_open_perl(&cmd)),
+                        Some(cmd) => cmd_str_to_open_perl(&cmd),
                         None => "''".to_string(),
                     }
                 }
