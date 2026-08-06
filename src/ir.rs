@@ -758,7 +758,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     .patterns
                     .iter()
                     .filter(|p| p.as_str() != "*")
-                    .map(|p| glob_to_regex(p))
+                    .map(|p| glob_to_regex(p.trim_matches('"').trim_matches('\'')))
                     .collect();
                 let is_first = i == 0 && !any_emitted;
                 if has_default && i == clauses.len() - 1 {
@@ -914,7 +914,8 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         // Call to a shell function defined in this program
                         // (rewritten by shir_to_perl): a Perl sub call.
                         let name = args.first().and_then(call_arg_str).unwrap_or_default();
-                        let rest: Vec<String> = args[1..].iter().map(render_word).collect();
+                        let words = exec_word_args(args);
+                        let rest: Vec<String> = words.iter().map(|w| render_word(w)).collect();
                         emit_indent(out, indent);
                         out.push_str(&format!(
                             "{}({}); $main_exit_code = $CHILD_ERROR = 0;\n",
@@ -2699,6 +2700,35 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 .unwrap_or_else(|| "0".to_string());
             emit_indent(out, indent);
             out.push_str(&format!("exit {};\n", code));
+        }
+        "local" => {
+            // bash `local NAME=VALUE` — function-scoped: a fresh `my`
+            // inside the sub (shadows the hoisted lexical for the call).
+            for w in &words {
+                if let Some(word_str) = call_arg_str(w) {
+                    if let Some(eq) = word_str.split_once('=') {
+                        // The value may be a positional ref ($1 → $ARGV[0])
+                        // or an interpolating literal.
+                        let val = eq.1.trim();
+                        let rendered = if let Some(n) = val.strip_prefix('$') {
+                            if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                                var_read(n)
+                            } else {
+                                render_word(&IrExpr::Str(val.to_string(), StrStyle::DoubleQuoted))
+                            }
+                        } else {
+                            render_word(&IrExpr::Str(val.to_string(), StrStyle::DoubleQuoted))
+                        };
+                        emit_indent(out, indent);
+                        out.push_str(&format!("my ${} = {};\n", eq.0, rendered));
+                    } else {
+                        emit_indent(out, indent);
+                        out.push_str(&format!("my ${};\n", word_str));
+                    }
+                }
+            }
+            emit_indent(out, indent);
+            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
         }
         "read" => {
             if let Some(n) = words.first().and_then(|w| call_arg_str(w)) {
