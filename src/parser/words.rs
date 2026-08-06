@@ -324,7 +324,50 @@ fn strip_outer_quotes(text: &str) -> String {
     }
 }
 
+/// CRLF line endings (Windows-style scripts): bash treats `\r` as a
+/// LITERAL word character — a CR at the end of a line JOINS the last word
+/// (`echo "hello world"\r\n` prints `hello world\r`); it is not a line
+/// terminator. The lexer emits a CarriageReturn token that the parser
+/// otherwise treats as a line separator; when one directly follows a word
+/// (no whitespace between), append its text to the word so the emitted
+/// string matches bash byte-for-byte (crlf-line-endings.sh,
+/// parse-crlf-shebang.sh). A CR after whitespace/comments or in other
+/// positions keeps its line-separator treatment.
+fn append_adjacent_cr(lexer: &mut Lexer, mut word: Word) -> Result<Word, ParserError> {
+    if !matches!(lexer.peek(), Some(Token::CarriageReturn)) {
+        return Ok(word);
+    }
+    // The CR is adjacent iff it starts exactly where the word's last real
+    // token ended (walk back over any inline whitespace/comments the word
+    // parser consumed after the word).
+    let mut i = lexer.current;
+    while i > 0 {
+        match lexer.tokens.get(i - 1).map(|(t, _, _)| t) {
+            Some(Token::Space | Token::Tab | Token::Comment) => i -= 1,
+            _ => break,
+        }
+    }
+    let adjacent = i > 0 && lexer.tokens[i - 1].2 == lexer.tokens[lexer.current].1;
+    if !adjacent {
+        return Ok(word);
+    }
+    let text = lexer.get_string_text()?; // consume the CR token ("\r")
+    match &mut word {
+        Word::Literal(s, _) => s.push_str(&text),
+        Word::StringInterpolation(interp, _) => {
+            interp.parts.push(StringPart::Literal(text));
+        }
+        _ => {}
+    }
+    Ok(word)
+}
+
 pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    let w = parse_word_inner(lexer)?;
+    append_adjacent_cr(lexer, w)
+}
+
+fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Handle backtick command substitution first
     if matches!(lexer.peek(), Some(Token::BacktickChar)) {
         if crate::debug::is_debug_enabled() {
@@ -1133,6 +1176,11 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
 /// Parse a word without skipping newlines at the end.
 /// This is used specifically for argument parsing where we want to preserve newlines.
 pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    let w = parse_word_no_newline_skip_inner(lexer)?;
+    append_adjacent_cr(lexer, w)
+}
+
+fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
     if let Some(word) = parse_at_prefixed_word(lexer) {
         return Ok(word);
     }

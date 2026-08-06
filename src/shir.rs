@@ -3886,6 +3886,14 @@ fn exec_call_ir(
 /// glob chars matches bash for every example.
 const GLOB_MAGIC: &str = "\u{1}SH2GLOB\u{1}";
 
+/// Marker the runtime's `sh2.arith` returns when the arithmetic evaluation
+/// errors (`$(( $1 * 100 ))` with an unset positional — bash aborts the
+/// WHOLE expansion, skipping the command with status 1, and keeps the
+/// script running). Mirrors the runtime's ARITH_BAD_MAGIC constant
+/// (harness/sh2-namespace.mjs); the exec/builtin arg flatteners skip the
+/// command on it, and the native echo guard below suppresses the write.
+const ARITH_BAD_MAGIC: &str = "\u{1}SH2ARITH\u{1}";
+
 /// Marker prefix the runtime recognizes on exec args carrying a process
 /// substitution (`<(...)`); the runtime materializes the suffix into a
 /// temp file path at exec time (see estree.rs transform_process_substitution
@@ -5046,12 +5054,22 @@ fn pure_template_part(interp: &StringInterpolation) -> Option<IrExpr> {
         // `${arr[@]}` often arrives as a ParameterExpansion with the
         // ArraySlice operator (offset "@", no length) instead of a bare
         // ArraySlice part — same whole-word rule: bare param (array),
-        // no join.
+        // no join. The positional slice `"${@:off:len}"` is the same
+        // word-list expansion (one word per positional; an empty slice
+        // yields ZERO words — `set -- "$1" "$t" "${@:3}"` with no args
+        // sets TWO positionals) — bare param for name "@" (the runtime
+        // returns the array and exec/echo flatteners splice it);
+        // `"${*:…}"` stays the part_ir join (one space-joined word).
         StringPart::ParameterExpansion(pe)
-            if matches!(
-                pe.operator,
-                ParameterExpansionOperator::ArraySlice(ref off, None) if off == "@"
-            ) =>
+            if (pe.variable == "@"
+                && matches!(
+                    pe.operator,
+                    ParameterExpansionOperator::ArraySlice(..)
+                ))
+                || matches!(
+                    pe.operator,
+                    ParameterExpansionOperator::ArraySlice(ref off, None) if off == "@"
+                ) =>
         {
             param_ir(pe)
         }
@@ -10945,14 +10963,14 @@ fn exec_arg_is_array_valued(e: &IrExpr) -> bool {
             ),
             "param" => {
                 matches!(args.first().and_then(static_str), Some(op) if op == "slice")
-                    && matches!(
-                        args.get(2).and_then(static_str),
-                        Some(a) if a == "@" || a == "*"
-                    )
-                    && !matches!(
-                        args.get(1).and_then(static_str),
-                        Some(n) if n.starts_with('#')
-                    )
+                    && (matches!(args.get(1).and_then(static_str), Some(n) if n == "@")
+                        || (matches!(
+                            args.get(2).and_then(static_str),
+                            Some(a) if a == "@" || a == "*"
+                        ) && !matches!(
+                            args.get(1).and_then(static_str),
+                            Some(n) if n.starts_with('#')
+                        )))
             }
             _ => false,
         },
@@ -13517,6 +13535,138 @@ fn printf_write_expr(value: Expr) -> Expr {
     }
 }
 
+/// The write-argument guard for a native echo whose value is a bare
+/// `$((...))` word: bash ABORTS the whole command (nothing printed, no
+/// newline, status 1) when the arithmetic expansion errors, so the
+/// `String(sh2.arith(src))`-shaped write value is rewritten to
+/// `(sh2._g = sh2.arith(src), sh2._g === ARITH_BAD ? "" :
+/// String(sh2._g) + "\n")` — the error marker suppresses the write
+/// (parse-dollar-in-arithmetic.sh: `echo $(($1 * 100 + $2))` with unset
+/// positionals). The runtime exec path skips the command on the same
+/// marker (see the exec flattener's BADSUB/ARITH check).
+fn guard_arith_echo_write(write: Expr) -> Expr {
+    // The write is `process.stdout.write(VALUE)`; VALUE is
+    // `String(sh2.arith(src))` or `String(sh2.arith(src)) + "\n"` (the
+    // `echo -n` form has no `\n`). Unwrap both wrappers to find the bare
+    // arith call.
+    let Expr::CallExpression {
+        callee,
+        arguments,
+        optional,
+    } = &write
+    else {
+        return write;
+    };
+    if !matches!(&**callee, Expr::MemberExpression { object, property, .. }
+        if matches!(&**object, Expr::MemberExpression { object: o2, property: p2, .. }
+            if matches!(&**o2, Expr::Identifier { name } if name == "process")
+                && matches!(&**p2, Expr::Identifier { name } if name == "stdout"))
+            && matches!(&**property, Expr::Identifier { name } if name == "write"))
+    {
+        return write;
+    }
+    let [value] = arguments.as_slice() else {
+        return write;
+    };
+    // unwrap a trailing `+ "\n"` so the core shape is the
+    // `String(sh2.arith(src))` call itself.
+    let core = match value {
+        Expr::BinaryExpression {
+            operator,
+            left,
+            right,
+            ..
+        } if operator == "+" => match (&**left, &**right) {
+            (_, Expr::Literal { value: serde_json::Value::String(s), .. }) if s == "\n" => left,
+            (Expr::Literal { value: serde_json::Value::String(s), .. }, _) if s == "\n" => right,
+            _ => return write,
+        },
+        _ => value,
+    };
+    let Expr::CallExpression {
+        callee: sc,
+        arguments: sargs,
+        ..
+    } = core
+    else {
+        return write;
+    };
+    if !matches!(&**sc, Expr::Identifier { name } if name == "String") {
+        return write;
+    }
+    let [Expr::CallExpression {
+        callee: ac,
+        arguments: aargs,
+        optional: aopt,
+    }] = sargs.as_slice()
+    else {
+        return write;
+    };
+    if !matches!(&**ac, Expr::MemberExpression { object, property, .. }
+        if matches!(&**object, Expr::Identifier { name } if name == "sh2")
+            && matches!(&**property, Expr::Identifier { name } if name == "arith"))
+    {
+        return write;
+    }
+    let arith_call = Expr::CallExpression {
+        callee: ac.clone(),
+        arguments: aargs.clone(),
+        optional: *aopt,
+    };
+    let scratch = sh2_member("_g");
+    // `String(sh2._g) + "\n"` — the success value (the same shape with
+    // the arith call replaced by the scratch read).
+    let ok_value = {
+        let mut ok = value.clone();
+        fn replace_arith(e: &mut Expr) {
+            match e {
+                Expr::CallExpression { callee, arguments, .. } => {
+                    if let Expr::MemberExpression { object, property, .. } = &**callee {
+                        if matches!(&**object, Expr::Identifier { name } if name == "sh2")
+                            && matches!(&**property, Expr::Identifier { name } if name == "arith")
+                        {
+                            *e = sh2_member("_g");
+                            return;
+                        }
+                    }
+                    for a in arguments {
+                        replace_arith(a);
+                    }
+                }
+                Expr::BinaryExpression { left, right, .. } => {
+                    replace_arith(left);
+                    replace_arith(right);
+                }
+                _ => {}
+            }
+        }
+        replace_arith(&mut ok);
+        ok
+    };
+    let guarded = Expr::ConditionalExpression {
+        test: Box::new(Expr::BinaryExpression {
+            operator: "===".to_string(),
+            left: Box::new(scratch.clone()),
+            right: Box::new(str_lit(ARITH_BAD_MAGIC)),
+        }),
+        consequent: Box::new(str_lit("")),
+        alternate: Box::new(ok_value),
+    };
+    let seq = seq(vec![
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(scratch),
+            right: Box::new(arith_call),
+        },
+        guarded,
+    ]);
+    Expr::CallExpression {
+        callee: callee.clone(),
+        arguments: vec![seq],
+        optional: *optional,
+    }
+}
+
 fn try_native_echo(args: &[IrExpr]) -> Option<Expr> {
     let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args else {
         return None; // env-carrying 3-arg form — the env is command-scoped
@@ -13528,7 +13678,10 @@ fn try_native_echo(args: &[IrExpr]) -> Option<Expr> {
         return None;
     }
     let (joined, no_newline, _) = echo_join_args(echo_args)?;
-    let write = printf_write_expr(echo_text(joined, no_newline));
+    let write = guard_arith_echo_write(printf_write_expr(echo_text(
+        joined,
+        no_newline,
+    )));
     // (process.stdout.write(text), sh2.lastExit = 0, true)
     Some(seq(vec![
         write,
@@ -13563,7 +13716,10 @@ fn try_native_echo_dead(args: &[IrExpr]) -> Option<Expr> {
         return None;
     }
     let (joined, no_newline, _) = echo_join_args(echo_args)?;
-    Some(printf_write_expr(echo_text(joined, no_newline)))
+    Some(guard_arith_echo_write(printf_write_expr(echo_text(
+        joined,
+        no_newline,
+    ))))
 }
 
 /// `$(echo EXPR | bc)` — a native bc evaluation (SH2_BC_NATIVE, default
@@ -16819,7 +16975,19 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                         vec![int_lit(start), int_lit(start + l)],
                     )
                 };
-                return Some(method(sl, "join", vec![str_lit(" ")]));
+                // `"${@:off:len}"` expands to SEPARATE words (one per
+                // positional — bash arg-count semantics: an empty slice
+                // yields ZERO words, e.g. `set -- "$1" "$t" "${@:3}"`
+                // with no args must set TWO positionals, not three). The
+                // `@` form is therefore ARRAY-valued: the exec/echo/
+                // builtin arg flatteners splice the elements (each is
+                // already a final string). `"${*:…}"` stays the joined
+                // scalar (bash: one space-joined word, like `"$*"`).
+                return if name == "@" {
+                    Some(sl)
+                } else {
+                    Some(method(sl, "join", vec![str_lit(" ")]))
+                };
             }
         // A plain-name slice may be an ARRAY: `${arr[@]:o:l}` parses with
         // the BARE name (the `[@]` is dropped by the parser), and the
@@ -18126,13 +18294,14 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                     if op == "slice"
                                         && (name.ends_with("[@]") || name.ends_with("[*]")
                                             || (name.starts_with('!')
-                                                && !name.contains('*')))));
+                                                && !name.contains('*'))
+                                            || name == "@")));
                     let always_string = matches!(v, IrExpr::Call { func: f, args: a }
                         if f == "param"
                             && matches!(a.as_slice(),
                                 [IrExpr::Str(op, _), IrExpr::Str(name, _), ..]
                                 if op == "slice"
-                                    && (name.starts_with('#') || name == "@" || name == "*")));
+                                    && (name.starts_with('#') || name == "*")));
                     if always_array {
                         return Expr::CallExpression {
                             callee: Box::new(Expr::MemberExpression {
