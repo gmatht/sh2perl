@@ -250,38 +250,81 @@ impl Parser {
                 }
             }
         } else {
-            match self.lexer.peek() {
-                Some(Token::Comment) => {
-                    // Comments should be handled at the top level
-                    return Err(ParserError::InvalidSyntax(
-                        "Unexpected comment in command parsing".to_string(),
-                    ));
+            // A bash KEYWORD immediately followed by `=` is a plain variable
+            // ASSIGNMENT, not a keyword construct: `exec=/usr/sbin/dkms`,
+            // `export=foo`, `if=1` (bash treats keywords as keywords only
+            // when they stand ALONE as a word — `exec = x` with whitespace
+            // is the exec builtin). Rewrite the keyword token to an
+            // Identifier (its span text — the variable name — is
+            // unchanged) so the standalone-assignment path handles the
+            // rest identically.
+            if Self::is_assignment_operator(self.lexer.peek_n(1).cloned())
+                && matches!(
+                    self.lexer.peek(),
+                    Some(
+                        Token::If
+                            | Token::Case
+                            | Token::While
+                            | Token::Until
+                            | Token::For
+                            | Token::Function
+                            | Token::Break
+                            | Token::Continue
+                            | Token::Return
+                            | Token::Shopt
+                            | Token::Set
+                            | Token::Unset
+                            | Token::Export
+                            | Token::Readonly
+                            | Token::Declare
+                            | Token::Typeset
+                            | Token::Local
+                            | Token::Shift
+                            | Token::Eval
+                            | Token::Exec
+                            | Token::Source
+                            | Token::Trap
+                            | Token::Wait
+                            | Token::Exit
+                    )
+            ) {
+                if let Some((tok, _, _)) = self.lexer.tokens.get_mut(self.lexer.current) {
+                    *tok = Token::Identifier;
                 }
-                Some(Token::If) => parse_if_statement(self)?,
-                Some(Token::Case) => parse_case_statement(self)?,
-                Some(Token::While) => parse_while_loop(self)?,
-                Some(Token::Until) => parse_until_loop(self)?,
-                Some(Token::For) => parse_for_loop(self)?,
-                Some(Token::Function) => parse_function(self)?,
-                Some(Token::Break) => parse_break_statement(self)?,
-                Some(Token::Continue) => parse_continue_statement(self)?,
-                Some(Token::Return) => parse_return_statement(self)?,
-                Some(Token::Shopt) => self.parse_shopt_command()?,
-                // Handle builtin commands
-                Some(Token::Set)
-                | Some(Token::Unset)
-                | Some(Token::Export)
-                | Some(Token::Readonly)
-                | Some(Token::Declare)
-                | Some(Token::Typeset)
-                | Some(Token::Local)
-                | Some(Token::Shift)
-                | Some(Token::Eval)
-                | Some(Token::Exec)
-                | Some(Token::Source)
-                | Some(Token::Trap)
-                | Some(Token::Wait)
-                | Some(Token::Exit) => self.parse_pipeline()?,
+                self.parse_standalone_assignment()?
+            } else {
+                match self.lexer.peek() {
+                    Some(Token::Comment) => {
+                        // Comments should be handled at the top level
+                        return Err(ParserError::InvalidSyntax(
+                            "Unexpected comment in command parsing".to_string(),
+                        ));
+                    }
+                    Some(Token::If) => parse_if_statement(self)?,
+                    Some(Token::Case) => parse_case_statement(self)?,
+                    Some(Token::While) => parse_while_loop(self)?,
+                    Some(Token::Until) => parse_until_loop(self)?,
+                    Some(Token::For) => parse_for_loop(self)?,
+                    Some(Token::Function) => parse_function(self)?,
+                    Some(Token::Break) => parse_break_statement(self)?,
+                    Some(Token::Continue) => parse_continue_statement(self)?,
+                    Some(Token::Return) => parse_return_statement(self)?,
+                    Some(Token::Shopt) => self.parse_shopt_command()?,
+                    // Handle builtin commands
+                    Some(Token::Set)
+                    | Some(Token::Unset)
+                    | Some(Token::Export)
+                    | Some(Token::Readonly)
+                    | Some(Token::Declare)
+                    | Some(Token::Typeset)
+                    | Some(Token::Local)
+                    | Some(Token::Shift)
+                    | Some(Token::Eval)
+                    | Some(Token::Exec)
+                    | Some(Token::Source)
+                    | Some(Token::Trap)
+                    | Some(Token::Wait)
+                    | Some(Token::Exit) => self.parse_pipeline()?,
                 // Handle redirects at the beginning of a command (e.g., process substitution)
                 Some(Token::RedirectIn)
                 | Some(Token::RedirectOut)
@@ -399,6 +442,7 @@ impl Parser {
                     }));
                 }
                 _ => self.parse_pipeline()?,
+            }
             }
         };
 
