@@ -1816,13 +1816,21 @@ mod tests {
 
     #[test]
     fn unterminated_param_expansion_drops_command() {
-        // `echo "${var:?unset"` (missing closing `}`) is a bash parse error:
-        // the lexer artifact word must never print. The command lowers to
-        // nothing (BlankLine) — an empty program, matching bash's abort.
-        let json = to_json("echo \"${var:?unset\"");
-        assert!(!json.contains("unset"));
-        assert!(!json.contains("\"name\":\"exec\""));
-        assert!(!json.contains("\"name\":\"unsupported\""));
+        // `echo "${var:?unset"` (missing closing `}`) is a bash parse error
+        // (exit 2, nothing runs) — the parser now REJECTS the unterminated
+        // expansion outright (the old literal-`${` artifact + drop-the-
+        // command transform silently exited 0; the CLI's parse-error
+        // fallback reproduces bash's verdict). The artifact detection stays
+        // for other producers (heredoc re-parses), but the canonical parse
+        // must fail.
+        let err = crate::Parser::new("echo \"${var:?unset\"")
+            .parse()
+            .expect_err("unterminated `${` must be a parse error");
+        assert!(
+            format!("{}", err).contains("unterminated"),
+            "unexpected error: {}",
+            err
+        );
         // Legit single-quoted `${x}` text (closing brace present) survives.
         let json2 = to_json("echo '${x}'");
         assert!(json2.contains("${x}"));

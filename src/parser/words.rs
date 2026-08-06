@@ -3359,9 +3359,15 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         parts.push(StringPart::Literal(format!("${{{}}}", expansion_content)));
                     }
                 } else {
-                    // Unmatched braces, treat as literal
-                    parts.push(StringPart::Literal("${".to_string()));
-                    i = expansion_start;
+                    // Unmatched braces: bash rejects unterminated `${`
+                    // at parse time (exit 2) — a real syntax error, not a
+                    // literal (parse-parameter-expansion-eof.sh: the old
+                    // literal fallback silently executed the broken word,
+                    // bash=2 vs estree=0). The CLI's parse-error fallback
+                    // reproduces bash's verdict.
+                    return Err(ParserError::InvalidSyntax(
+                        "unterminated `${` in double-quoted string".to_string(),
+                    ));
                 }
             } else {
                 // Simple variable reference like $var or a literal $ followed by a non-variable char
@@ -3513,8 +3519,13 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         parts.push(StringPart::Literal(format!("${{{}}}", expansion_content)));
                     }
                 } else {
-                    parts.push(StringPart::Literal("${".to_string()));
-                    i = expansion_start;
+                    // Unmatched braces: bash rejects unterminated `${`
+                    // at parse time (exit 2) — a real syntax error, not a
+                    // literal (see the identical arm in
+                    // parse_string_interpolation).
+                    return Err(ParserError::InvalidSyntax(
+                        "unterminated `${` in double-quoted string".to_string(),
+                    ));
                 }
             } else {
                 // Simple $var or special var or literal $
