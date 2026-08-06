@@ -1843,6 +1843,26 @@ mod tests {
     }
 
     #[test]
+    fn env_assignment_with_redirect_keeps_env_on_command() {
+        // frontends-ifs: `IFS=, read a b c <<< "1,2,3"` — the env vars
+        // must scope the actual command (a redirect-wrapped simple
+        // command), NOT split into a sibling `true` no-op (the old
+        // behavior left read without the env — the read fell back to
+        // whitespace IFS).
+        let json = to_json("IFS=, read a b c <<< \"1,2,3\"");
+        // the redirect wraps the env-carrying read (the env stays on the
+        // command; the no-op `true` split is gone)
+        assert!(json.contains("\"name\":\"redirect\""));
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(json.contains("\"value\":\"read\""));
+        assert!(json.contains("\"key\":\"IFS\""));
+        assert!(json.contains("\"value\":\",\""));
+        // the env must NOT land on a separate `true` command
+        assert!(!json.contains("\"value\":\"true\""));
+        assert!(!json.contains("\"name\":\"unsupported\""));
+    }
+
+    #[test]
     fn local_scope_shadows_outer_binding() {
         // fish-sh-go local-scope request: `local v=1` inside a function
         // must NOT leak into the outer v (the runtime's flat store model
