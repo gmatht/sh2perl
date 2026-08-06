@@ -548,7 +548,19 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
 
     // Imports (`use` statements).
     // Auto-derive `use feature 'say'` if any Output { newline: true } exists.
+    let modern_ir = prog.imports.is_empty();
     let mut imports = prog.imports.clone();
+    if modern_ir {
+        // Modern-IR program (`--shir` → `--shir-in-perl`): the JSON contract
+        // carries no import list, so add the standard preamble the emitted
+        // Perl expects (mirrors the Generator's preamble).
+        imports.extend([
+            "Carp".to_string(),
+            "English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME)"
+                .to_string(),
+            "IPC::Open3".to_string(),
+        ]);
+    }
     if prog_uses_say(&stmts) {
         let needs_say = !imports.iter().any(|i| i.contains("feature"));
         if needs_say {
@@ -572,6 +584,42 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
 
     // Top-level variable declarations from usage analysis
     // (emitted by generator as Declare stmts, handled below)
+
+    // Modern-IR preamble: the status-trackers the emitted statements use.
+    if modern_ir {
+        out.push_str("my $main_exit_code = 0;\n");
+        out.push_str("our $CHILD_ERROR = 0;\n");
+        // Snapshot the positional-arg count BEFORE any $ARGV[n] read (the
+        // magic @ARGV extends on indexed reads, corrupting scalar(@ARGV)).
+        out.push_str("my $__argc = @ARGV;\n");
+        // Hoisted declarations for assigned variables (use strict).
+        let mut vars = Vec::new();
+        collect_assigned_vars(&stmts, &mut vars);
+        let mut read_vars = Vec::new();
+        collect_read_vars_stmts(&stmts, &mut read_vars);
+        for (n, s) in read_vars {
+            if !vars.iter().any(|(vn, _)| vn == &n) {
+                vars.push((n, s));
+            }
+        }
+        for (name, sigil) in &vars {
+            let assigned = collect_assigned_vars_contains(&stmts, name);
+            match sigil {
+                Sigil::Scalar => {
+                    // Read-only vars initialize to '' (bash unset = empty,
+                    // and Perl would warn on undef in string concat).
+                    if assigned {
+                        out.push_str(&format!("my ${};\n", name));
+                    } else {
+                        out.push_str(&format!("my ${} = '';\n", name));
+                    }
+                }
+                Sigil::Array => out.push_str(&format!("my @{};\n", name)),
+                Sigil::Hash => out.push_str(&format!("my %{};\n", name)),
+            }
+        }
+        out.push('\n');
+    }
 
     // Top-level statements
     for (idx, stmt) in stmts.iter().enumerate() {
@@ -602,7 +650,8 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     // Exit — only if $main_exit_code might be non-zero (i.e. if any
     // statement references it).  For scripts that never touch it,
     // omit the exit so Perl's default exit(0) applies.
-    let has_main_exit = stmts.iter().any(|s| stmt_refers_to_main_exit(s))
+    let has_main_exit = modern_ir
+        || stmts.iter().any(|s| stmt_refers_to_main_exit(s))
         || prog.subs.iter().any(|sub| sub.body.iter().any(|s| stmt_refers_to_main_exit(s)));
     if has_main_exit {
         out.push_str("exit $main_exit_code;\n");
@@ -676,7 +725,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             // the C frontend's break/continue (IrStmt::Expr(Call("break")))
             // are the shell's control signals — Perl's native loop
             // controls (last/next)
-            if let IrExpr::Call { func, .. } = e {
+            if let IrExpr::Call { func, args } = e {
                 match func.as_str() {
                     "break" => {
                         emit_indent(out, indent);
@@ -688,10 +737,40 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         out.push_str("next;\n");
                         return;
                     }
-                    _ => {}
+                    "exec" => {
+                        emit_exec_call(out, e, indent);
+                    }
+                    "test" => {
+                        // Bare `[ cond ]` as a statement: the exit status is the
+                        // condition's truth.
+                        let cond = ir_expr_to_perl(e);
+                        emit_indent(out, indent);
+                        out.push_str(&format!("$main_exit_code = $CHILD_ERROR = ({}) ? 0 : 1;\n", cond));
+                    }
+                    "pipeline" => {
+                        // Side-effect pipeline: rebuild the shell command string
+                        // and run it via bash -c (matches bash stdout by running
+                        // the same tools).
+                        if let Some(cmd) = pipeline_call_to_cmd(e) {
+                            emit_indent(out, indent);
+                            out.push_str(&format!(
+                                "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+                                safe_perl_q_string(&cmd)
+                            ));
+                        } else {
+                            emit_indent(out, indent);
+                            out.push_str("die \"debashc: shIR pipeline not yet supported by the Perl backend\\n\";\n");
+                        }
+                    }
+                    other => {
+                        emit_indent(out, indent);
+                        out.push_str(&format!(
+                            "die \"debashc: sh2.* call `{}` not yet supported by the shIR Perl backend\\n\";\n",
+                            other
+                        ));
+                    }
                 }
             }
-            let _ = e;
         }
 
         IrStmt::Output { value, newline, target } => {
@@ -750,6 +829,16 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 } else {
                     format!("${}", var)
                 };
+                if let IrExpr::Call { func, .. } = expr {
+                    if func == "capture" {
+                        // Modern-IR command substitution: Assign{var, capture(…)}
+                        // — rebuild the shell command and capture its stdout.
+                        if let Some(cmd) = capture_call_to_cmd(expr) {
+                            emit_capture_assign(out, indent, &lhs, &cmd);
+                            return;
+                        }
+                    }
+                }
                 if let IrExpr::Capture { native: false, .. } = expr {
                     // Extract the inner expression string for qx{...}
                     if let IrExpr::Capture { expr: inner_expr, .. } = expr {
@@ -876,7 +965,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         IrStmt::For { var, iter, body } => {
-            let iter_str = ir_expr_to_perl(iter);
+            let iter_str = word_iter_to_perl(iter);
             emit_indent(out, indent);
             out.push_str(&format!("for my ${} ({}) {{\n", var, iter_str));
             for s in body {
@@ -1074,6 +1163,1075 @@ pub(crate) fn emit_sub(out: &mut String, sub: &IrSub) {
     out.push_str("}\n");
 }
 
+// ── Modern-IR (sh2.* call) lowering ──────────────────────────────────
+//
+// `ast_to_ir` emits shell commands as neutral `Call{func:"exec"}` nodes with
+// string/array words, tests as `Call{func:"test"}` on a flat string, and
+// captures/pipelines as closures. These lowerings port the Generator's Perl
+// idioms (echo → print, `${name}` reads, q{}/interpolation, int() arith)
+// onto the IR side so `--shir → --shir-in-perl` produces runnable,
+// bash-matching Perl. Constructs with no Perl lowering yet render a `die`
+// with an actionable message instead of a panic.
+
+/// Extract a plain string from a word-shaped expression (Str / Var / Ident).
+fn call_arg_str(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Var(name, _) => Some(name.clone()),
+        IrExpr::Ident(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Render a variable read: getVar("x") / Var("x") → `$x` / `$ENV{x}`;
+/// bash positional params ($1 → $ARGV[0]) and specials ($#, $?, $@).
+fn var_read(name: &str) -> String {
+    if is_env_style_var_name(name) {
+        return format!("$ENV{{{}}}", name);
+    }
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+        // bash positional parameter: $1 → $ARGV[0]
+        return match name.parse::<usize>() {
+            Ok(0) => "$0".to_string(),
+            Ok(n) => format!("$ARGV[{}]", n - 1),
+            Err(_) => format!("${}", name),
+        };
+    }
+    match name {
+        "#" => "$__argc".to_string(),
+        "?" => "$CHILD_ERROR".to_string(),
+        "@" | "*" => "@ARGV".to_string(),
+        "$" => "$$".to_string(),
+        _ if !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+        {
+            format!("${}", name)
+        }
+        _ => format!("${{{}}}", name),
+    }
+}
+
+/// Render a bash glob pattern as a Perl regex fragment (the subset the
+/// corpus's `${x#…}`/`${x%…}`/`${x/…/…}` idioms use).
+fn glob_to_regex(pat: &str) -> String {
+    let mut out = String::new();
+    let mut chars = pat.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push_str("."),
+            '\\' => {
+                if let Some(&d) = chars.peek() {
+                    out.push('\\');
+                    out.push(d);
+                    chars.next();
+                } else {
+                    out.push_str("\\\\");
+                }
+            }
+            '.' | '(' | ')' | '+' | '|' | '^' | '$' | '{' | '}' | '[' | ']' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render `ArithAst` as a Perl numeric expression (bash integer semantics;
+/// int() wrapping happens at the IrExpr::Arith arm).
+fn arith_ast_to_perl(ast: &ArithAst) -> String {
+    match ast {
+        ArithAst::Num(n) => n.to_string(),
+        ArithAst::Var(name) => var_read(name),
+        ArithAst::Index { var, key } => {
+            format!("${{{}}}[{}]", var, arith_ast_to_perl(key))
+        }
+        ArithAst::Bin { op, lhs, rhs } => {
+            let l = arith_ast_to_perl(lhs);
+            let r = arith_ast_to_perl(rhs);
+            match op.as_str() {
+                "&&" | "||" | "**" => format!("({} {} {})", l, op, r),
+                // bash `/` truncates toward zero; wrap the dividend so
+                // int() lands on the quotient (int(a / b) == trunc).
+                "/" => format!("int({} / {})", l, r),
+                "%" => format!("int({}) % {}", l, r),
+                _ => format!("({} {} {})", l, op, r),
+            }
+        }
+        ArithAst::Un { op, arg } => {
+            let a = arith_ast_to_perl(arg);
+            match op.as_str() {
+                "!" => format!("!({})", a),
+                "~" => format!("~({})", a),
+                "-" => format!("-({})", a),
+                "+" => a,
+                _ => format!("({}{})", op, a),
+            }
+        }
+        ArithAst::Cond { test, then, else_ } => format!(
+            "({} ? {} : {})",
+            arith_ast_to_perl(test),
+            arith_ast_to_perl(then),
+            arith_ast_to_perl(else_)
+        ),
+        ArithAst::Assign { var, op, rhs } => format!(
+            "{}{}{}",
+            var_read(var),
+            op,
+            arith_ast_to_perl(rhs)
+        ),
+        ArithAst::IncDec { var, delta, prefix } => {
+            let v = var_read(var);
+            let d = if *delta < 0 { "-1" } else { "+1" };
+            if *prefix {
+                format!("({} {}= 1)", v, if *delta < 0 { "-" } else { "+" })
+            } else {
+                let _ = d;
+                format!("({} {}= 1)", v, if *delta < 0 { "-" } else { "+" })
+            }
+        }
+    }
+}
+
+/// Render a shell word (an exec arg) as a Perl expression.
+/// A word is a Str literal, an Interpolate (concat chain), a getVar/split/
+/// param/arith call, or an Array (bash joins array elements with a space
+/// only when there are several — handled by the echo/command join, so here
+/// a multi-element Array renders as its own join).
+fn render_word(e: &IrExpr) -> String {
+    match e {
+        IrExpr::Str(s, style) => {
+            // Reuse the Str rendering from ir_expr_to_perl by constructing it.
+            render_str_literal(s, style)
+        }
+        IrExpr::Call { func, args } => match func.as_str() {
+            "getVar" => args
+                .first()
+                .and_then(call_arg_str)
+                .map(|n| var_read(&n))
+                .unwrap_or_else(|| "''".to_string()),
+            "split" => args
+                .first()
+                .map(render_word)
+                .unwrap_or_else(|| "''".to_string()),
+            "param" => render_param(args),
+            "arith" => args
+                .first()
+                .map(|a| format!("int({})", render_word(a)))
+                .unwrap_or_else(|| "0".to_string()),
+            _ => ir_expr_to_perl(e),
+        },
+        IrExpr::Interpolate(_) | IrExpr::Var(_, _) | IrExpr::Arith(_)
+        | IrExpr::Capture { .. } | IrExpr::Index { .. }
+        | IrExpr::BinOp { .. } | IrExpr::Ternary { .. }
+        | IrExpr::DefinedOr { .. } | IrExpr::MethodCall { .. } => ir_expr_to_perl(e),
+        IrExpr::Array(elements) => {
+            let parts: Vec<String> = elements.iter().map(render_word).collect();
+            if parts.is_empty() {
+                "''".to_string()
+            } else if parts.len() == 1 {
+                parts[0].clone()
+            } else {
+                format!("join(' ', {})", parts.join(", "))
+            }
+        }
+        _ => ir_expr_to_perl(e),
+    }
+}
+
+/// `${var…}` parameter expansion (Call param): op, var, value/pattern...
+fn render_param(args: &[IrExpr]) -> String {
+    let op = args.first().and_then(call_arg_str).unwrap_or_default();
+    let name = args.get(1).and_then(call_arg_str);
+    let var = name.map(|n| var_read(&n)).unwrap_or_else(|| "''".to_string());
+    let val = args.get(2).map(render_word).unwrap_or_else(|| "''".to_string());
+    let repl = args.get(3).map(render_word).unwrap_or_else(|| "''".to_string());
+    match op.as_str() {
+        "" => var,
+        "-" => format!("(defined({}) ? {} : {})", var, var, val),
+        ":-" => format!(
+            "((defined({v}) && length({v})) ? {v} : {d})",
+            v = var,
+            d = val
+        ),
+        "=" | ":=" => format!(
+            "((defined({v}) && length({v})) ? {v} : ({v} = {d}))",
+            v = var,
+            d = val
+        ),
+        // Prefix removal: # shortest, ## longest. The `:` forms (only when
+        // non-empty) are approximated by the plain forms.
+        "#" | "#:" => {
+            let re = glob_to_regex(val.trim_start_matches('\\'));
+            format!("(({} =~ s/^{}?//r))", var, re)
+        }
+        "##" | "##:" => {
+            let re = glob_to_regex(val.trim_start_matches('\\'));
+            format!("(({} =~ s/^{}//r))", var, re)
+        }
+        "%" | "%:" => {
+            let re = glob_to_regex(val.trim_start_matches('\\'));
+            format!("(({} =~ s/{}$//r))", var, re)
+        }
+        "%%" | "%%:" => {
+            let re = glob_to_regex(val.trim_start_matches('\\'));
+            format!("(({} =~ s/{}.*$//r))", var, re)
+        }
+        // Substitution: / first, // all.
+        "/" => format!("(({} =~ s/{}/{}/r))", var, glob_to_regex(&val), repl.trim_matches('\\')),
+        "//" => format!("(({} =~ s/{}/{}/gr))", var, glob_to_regex(&val), repl.trim_matches('\\')),
+        _ => {
+            // Unknown op — best-effort: return the var (parameter expansions
+            // default to the value when the op is unrecognized).
+            var
+        }
+    }
+}
+
+/// Build a bash command string from an exec's (cmd, words) for shell-out.
+fn build_shell_cmd(cmd: &str, words: &[&IrExpr]) -> String {
+    let bash_quote = |s: &str| -> String { format!("'{}'", s.replace('\'', "'\\\\''")) };
+    let mut parts: Vec<String> = vec![bash_quote(cmd)];
+    for w in words {
+        let w: &IrExpr = w;
+        match w {
+            IrExpr::Str(s, _) => parts.push(bash_quote(s)),
+            _ => {
+                let wstr = render_word(w);
+                // A Perl string literal or a plain scalar: embed safely.
+                if wstr.starts_with('\'') || wstr.starts_with('"') || wstr.starts_with('q') {
+                    parts.push(wstr);
+                } else {
+                    parts.push(format!(
+                        "\"{}\"",
+                        wstr.replace("\"", "\\\"").replace('$', "\\$").replace('@', "\\@")
+                    ));
+                }
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+/// The modern IR packs all of a command's word arguments into a single
+/// `Array` element: exec(cmd, Array([w1, w2, …])). Flatten to the word list.
+fn exec_word_args(args: &[IrExpr]) -> Vec<&IrExpr> {
+    if args.len() == 2 {
+        if let IrExpr::Array(elems) = &args[1] {
+            return elems.iter().collect();
+        }
+    }
+    args[1..].iter().collect()
+}
+
+/// Extract (cmd, words) from an `exec` Call's args (arg0 = command name;
+/// the remaining args are the flattened word list — see exec_word_args).
+fn exec_call_parts(args: &[IrExpr]) -> Option<(String, Vec<&IrExpr>)> {
+    let cmd = call_arg_str(args.first()?)?;
+    Some((cmd, exec_word_args(args)))
+}
+
+/// Emit `LHS = do { open('bash','-c',CMD) ... }` capture (chomps trailing NL).
+fn emit_capture_assign(out: &mut String, indent: usize, lhs: &str, cmd: &str) {
+    emit_indent(out, indent);
+    out.push_str(&format!("{} = {};\n", lhs, cmd_str_to_open_perl(cmd)));
+}
+
+/// Rebuild a shell command string from a `pipeline` Call:
+/// pipeline([Arrow([Expr(exec)]), Arrow([Expr(exec)]), …]) → "a | b".
+fn arrow_to_cmd(a: &IrExpr) -> Option<String> {
+    if let IrExpr::Arrow(stmts) = a {
+        for s in stmts {
+            if let IrStmt::Expr(inner) = s {
+                if let IrExpr::Call { func, .. } = inner {
+                    match func.as_str() {
+                        "exec" => {
+                            if let IrExpr::Call { args, .. } = inner {
+                                let (cmd, words) = exec_call_parts(args)?;
+                                return Some(build_shell_cmd(&cmd, &words));
+                            }
+                        }
+                        "pipeline" => return pipeline_call_to_cmd(inner),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn pipeline_call_to_cmd(call: &IrExpr) -> Option<String> {
+    if let IrExpr::Call { func, args } = call {
+        if func == "pipeline" {
+            // Stages arrive as pipeline([Arrow, Arrow, …]) or
+            // pipeline([Array([Arrow, Arrow, …])]).
+            let mut stage_exprs: Vec<&IrExpr> = Vec::new();
+            for a in args {
+                if let IrExpr::Array(elems) = a {
+                    stage_exprs.extend(elems.iter());
+                } else {
+                    stage_exprs.push(a);
+                }
+            }
+            let stages: Vec<String> = stage_exprs.iter().filter_map(|a| arrow_to_cmd(a)).collect();
+            if stages.is_empty() {
+                return None;
+            }
+            return Some(stages.join(" | "));
+        }
+    }
+    None
+}
+
+/// Rebuild the shell command string from a `capture` Call (command
+/// substitution `$(…)` / backticks) whose closure body is an exec/pipeline.
+fn capture_call_to_cmd(call: &IrExpr) -> Option<String> {
+    if let IrExpr::Call { func, args } = call {
+        if func == "capture" {
+            for a in args {
+                if let Some(cmd) = arrow_to_cmd(a) {
+                    return Some(cmd);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Render a `for` iterable: `Array([…])` → Perl list; `Range` → `a..b`;
+/// `split(x)` → `split /\s+/, x` (bash IFS word splitting); a single
+/// `capture` element → iterate the captured words.
+fn word_iter_to_perl(iter: &IrExpr) -> String {
+    match iter {
+        IrExpr::Call { func, args } if func == "split" => {
+            let inner = args.first().map(render_word).unwrap_or_default();
+            format!("split /\\s+/, {}", inner)
+        }
+        IrExpr::Array(elems) if elems.len() == 1 => {
+            if let IrExpr::Call { func, .. } = &elems[0] {
+                if func == "capture" {
+                    if let Some(cmd) = capture_call_to_cmd(&elems[0]) {
+                        return format!("split /\\s+/, {}", cmd_str_to_open_perl(&cmd));
+                    }
+                }
+            }
+            ir_expr_to_perl(iter)
+        }
+        _ => ir_expr_to_perl(iter),
+    }
+}
+
+
+/// Lower a modern-IR `exec` Call in statement position.
+fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
+    let (cmd, words) = match call {
+        IrExpr::Call { args, .. } => match exec_call_parts(args) {
+            Some(p) => p,
+            None => {
+                // Dynamic / unparseable command — shell out via bash -c.
+                let full = args
+                    .iter()
+                    .map(render_word)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                emit_indent(out, indent);
+                out.push_str(&format!(
+                    "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+                    safe_perl_q_string(&full)
+                ));
+                return;
+            }
+        },
+        _ => return,
+    };
+    match cmd.as_str() {
+        "echo" => emit_echo(out, &words, indent),
+        "printf" => {
+            if words.is_empty() {
+                emit_indent(out, indent);
+                out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+                return;
+            }
+            // The format word: keep backslashes intact — Perl's printf
+            // interprets \n/\t in the double-quoted format.
+            let fmt = match &words[0] {
+                IrExpr::Str(s, _) => {
+                    let mut f = String::from("\"");
+                    for ch in s.chars() {
+                        match ch {
+                            '"' => f.push_str("\\\""),
+                            '$' => f.push_str("\\$"),
+                            '@' => f.push_str("\\@"),
+                            c => f.push(c),
+                        }
+                    }
+                    f.push('"');
+                    f
+                }
+                _ => render_word(words[0]),
+            };
+            let rest: Vec<String> = words[1..].iter().map(|w| render_word(w)).collect();
+            emit_indent(out, indent);
+            if rest.is_empty() {
+                out.push_str(&format!("printf({});\n", fmt));
+            } else {
+                out.push_str(&format!("printf({}, {});\n", fmt, rest.join(", ")));
+            }
+            emit_indent(out, indent);
+            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+        }
+        "cd" => {
+            let dir = words
+                .first()
+                .map(|w| render_word(w))
+                .unwrap_or_else(|| "$ENV{HOME}".to_string());
+            emit_indent(out, indent);
+            out.push_str(&format!(
+                "chdir({}) or die \"cd: $!\\n\"; $main_exit_code = $CHILD_ERROR = 0;\n",
+                dir
+            ));
+        }
+        "export" => {
+            for w in &words {
+                if let Some(word_str) = call_arg_str(w) {
+                    if let Some(eq) = word_str.split_once('=') {
+                        emit_indent(out, indent);
+                        out.push_str(&format!(
+                            "$ENV{{{}}} = {};\n",
+                            eq.0,
+                            render_word(&IrExpr::Str(eq.1.to_string(), StrStyle::DoubleQuoted))
+                        ));
+                    } else {
+                        emit_indent(out, indent);
+                        out.push_str(&format!("$ENV{{{}}} = $ENV{{{}}};\n", word_str, word_str));
+                    }
+                }
+            }
+            emit_indent(out, indent);
+            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+        }
+        "pwd" => {
+            emit_indent(out, indent);
+            out.push_str("print qx{pwd};\n");
+            emit_indent(out, indent);
+            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+        }
+        "true" | ":" => {
+            emit_indent(out, indent);
+            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+        }
+        "false" => {
+            emit_indent(out, indent);
+            out.push_str("$main_exit_code = $CHILD_ERROR = 1;\n");
+        }
+        "shift" => {
+            emit_indent(out, indent);
+            out.push_str("shift @ARGV;\n");
+            emit_indent(out, indent);
+            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+        }
+        "exit" => {
+            let code = words
+                .first()
+                .map(|w| render_word(w))
+                .unwrap_or_else(|| "0".to_string());
+            emit_indent(out, indent);
+            out.push_str(&format!("exit {};\n", code));
+        }
+        "read" => {
+            if let Some(n) = words.first().and_then(|w| call_arg_str(w)) {
+                emit_indent(out, indent);
+                out.push_str(&format!(
+                    "chomp(my $__line = <STDIN>); ${} = $__line;\n",
+                    n
+                ));
+            }
+            emit_indent(out, indent);
+            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+        }
+        "sleep" => {
+            let t = words
+                .first()
+                .map(|w| render_word(w))
+                .unwrap_or_else(|| "1".to_string());
+            emit_indent(out, indent);
+            out.push_str(&format!("sleep({}); $main_exit_code = $CHILD_ERROR = 0;\n", t));
+        }
+        _ => {
+            // External command — shell out (matches bash stdout by running
+            // the same tool; the Generator's in-Perl emulations are not
+            // needed for the IR path).
+            let full = build_shell_cmd(&cmd, &words);
+            emit_indent(out, indent);
+            out.push_str(&format!(
+                "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+                safe_perl_q_string(&full)
+            ));
+        }
+    }
+}
+
+/// `echo` lowering — join args with single spaces, newline unless `-n`.
+fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
+    let mut args = words;
+    let mut newline = true;
+    if let Some(first) = args.first() {
+        if let Some(s) = call_arg_str(first) {
+            if s == "-n" {
+                newline = false;
+                args = &args[1..];
+            }
+        }
+    }
+    let ok = |out: &mut String| out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+    if args.is_empty() {
+        emit_indent(out, indent);
+        if newline {
+            out.push_str("print \"\\n\";\n");
+        }
+        emit_indent(out, indent);
+        ok(out);
+        return;
+    }
+    let all_literal = args.iter().all(|a| matches!(a, IrExpr::Str(_, _)));
+    if all_literal {
+        let joined: String = args
+            .iter()
+            .map(|a| call_arg_str(a).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut s = String::from("\"");
+        for ch in joined.chars() {
+            match ch {
+                '"' => s.push_str("\\\""),
+                '\\' => s.push_str("\\\\"),
+                '$' => s.push_str("\\$"),
+                '@' => s.push_str("\\@"),
+                '\n' => s.push_str("\\n"),
+                _ => s.push(ch),
+            }
+        }
+        if newline {
+            s.push_str("\\n");
+        }
+        s.push('"');
+        emit_indent(out, indent);
+        out.push_str(&format!("print {};\n", s));
+        emit_indent(out, indent);
+        ok(out);
+        return;
+    }
+    let parts: Vec<String> = args.iter().map(|w| render_word(w)).collect();
+    let nl = if newline { ", \"\\n\"" } else { "" };
+    if parts.len() == 1 {
+        emit_indent(out, indent);
+        out.push_str(&format!("print({}{});\n", parts[0], nl));
+    } else {
+        // Unquoted word-splitting drops empty words (bash IFS semantics);
+        // `grep { defined && length }` filters those out and avoids undef
+        // warnings on unset positional params.
+        let has_split = args.iter().any(|w| matches!(w, IrExpr::Call { func, .. } if func == "split"));
+        if has_split {
+            emit_indent(out, indent);
+            out.push_str(&format!(
+                "print(join(' ', grep {{ defined($_) && length($_) }} {}){});\n",
+                parts.join(", "),
+                nl
+            ));
+        } else {
+            emit_indent(out, indent);
+            out.push_str(&format!(
+                "print(join(' ', {}){});\n",
+                parts.join(", "),
+                nl
+            ));
+        }
+    }
+    emit_indent(out, indent);
+    ok(out);
+}
+
+/// Collect variables assigned by `Assign` stmts (recursively) so the
+/// modern-IR preamble can hoist `my` declarations (Perl `use strict`
+/// requires them; the Generator's usage analysis does the same). Vars
+/// declared via `Declare`/`DeclareArray` are excluded (they emit their own
+/// `my`/`local`).
+fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, .. } => {
+                for t in targets {
+                    if !is_env_style_var_name(&t.var)
+                        && !out.iter().any(|(n, _)| n == &t.var)
+                    {
+                        out.push((t.var.clone(), t.sigil.unwrap_or(Sigil::Scalar)));
+                    }
+                }
+            }
+            IrStmt::Declare { vars, .. } => {
+                for d in vars {
+                    out.retain(|(n, _)| n != &d.name);
+                }
+            }
+            IrStmt::DeclareArray { var, .. } => {
+                out.retain(|(n, _)| n != var);
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_assigned_vars(then, out);
+                for (_, b) in elsifs {
+                    collect_assigned_vars(b, out);
+                }
+                collect_assigned_vars(else_, out);
+            }
+            IrStmt::For { body, .. }
+            | IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body) => collect_assigned_vars(body, out),
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_assigned_vars(&c.body, out);
+                }
+            }
+            IrStmt::Function { body, .. } => collect_assigned_vars(body, out),
+            IrStmt::Expr(IrExpr::Arrow(body)) => collect_assigned_vars(body, out),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_assigned_vars(st, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A var name that needs a hoisted `my` declaration: not an env-style
+/// name (→ $ENV), not a positional param (→ $ARGV), not a bash special.
+fn var_is_declarable(name: &str) -> bool {
+    !is_env_style_var_name(name)
+        && !name.is_empty()
+        && !name.chars().all(|c| c.is_ascii_digit())
+        && !matches!(name, "#" | "?" | "@" | "*" | "$" | "!" | "0")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Collect vars READ via getVar/param/Var (recursively) so the preamble can
+/// declare them too — `use strict` fails on any undeclared read, and bash
+/// reads of unset vars yield empty strings (a `my $x;` matches that).
+fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
+    match e {
+        IrExpr::Call { func, args } => {
+            if func == "getVar" || func == "param" {
+                let idx = if func == "param" { 1 } else { 0 };
+                if let Some(name) = args.get(idx).and_then(call_arg_str) {
+                    if var_is_declarable(&name)
+                        && !out.iter().any(|(n, _)| n == &name)
+                    {
+                        out.push((name, Sigil::Scalar));
+                    }
+                }
+            }
+            for a in args {
+                collect_read_vars_expr(a, out);
+            }
+        }
+        IrExpr::Var(name, sigil) => {
+            if var_is_declarable(name) && !out.iter().any(|(n, _)| n == name) {
+                out.push((name.clone(), sigil.unwrap_or(Sigil::Scalar)));
+            }
+        }
+        IrExpr::Array(elems) => {
+            for e in elems {
+                collect_read_vars_expr(e, out);
+            }
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(ee) = p {
+                    collect_read_vars_expr(ee, out);
+                }
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_read_vars_expr(lhs, out);
+            collect_read_vars_expr(rhs, out);
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            collect_read_vars_expr(cond, out);
+            collect_read_vars_expr(then, out);
+            collect_read_vars_expr(else_, out);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            collect_read_vars_expr(expr, out);
+            collect_read_vars_expr(default, out);
+        }
+        IrExpr::Index { key, .. } => collect_read_vars_expr(key, out),
+        IrExpr::Capture { expr, .. } => collect_read_vars_expr(expr, out),
+        IrExpr::Arith(ast) => collect_read_vars_arith(ast, out),
+        IrExpr::MethodCall { obj, args, .. } => {
+            collect_read_vars_expr(obj, out);
+            for a in args {
+                collect_read_vars_expr(a, out);
+            }
+        }
+        IrExpr::Object(fields) => {
+            for (_, v) in fields {
+                collect_read_vars_expr(v, out);
+            }
+        }
+        IrExpr::Arrow(stmts) => collect_read_vars_stmts(stmts, out),
+        _ => {}
+    }
+}
+
+fn collect_read_vars_arith(ast: &ArithAst, out: &mut Vec<(String, Sigil)>) {
+    match ast {
+        ArithAst::Var(name) => {
+            if var_is_declarable(name) && !out.iter().any(|(n, _)| n == name) {
+                out.push((name.clone(), Sigil::Scalar));
+            }
+        }
+        ArithAst::Index { var, key } => {
+            if var_is_declarable(var) && !out.iter().any(|(n, _)| n == var) {
+                out.push((var.clone(), Sigil::Scalar));
+            }
+            collect_read_vars_arith(key, out);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            collect_read_vars_arith(lhs, out);
+            collect_read_vars_arith(rhs, out);
+        }
+        ArithAst::Un { arg, .. } => collect_read_vars_arith(arg, out),
+        ArithAst::Cond { test, then, else_ } => {
+            collect_read_vars_arith(test, out);
+            collect_read_vars_arith(then, out);
+            collect_read_vars_arith(else_, out);
+        }
+        ArithAst::Assign { var, rhs, .. } => {
+            if var_is_declarable(var) && !out.iter().any(|(n, _)| n == var) {
+                out.push((var.clone(), Sigil::Scalar));
+            }
+            collect_read_vars_arith(rhs, out);
+        }
+        ArithAst::IncDec { var, .. } => {
+            if var_is_declarable(var) && !out.iter().any(|(n, _)| n == var) {
+                out.push((var.clone(), Sigil::Scalar));
+            }
+        }
+        ArithAst::Num(_) => {}
+    }
+}
+
+fn collect_read_vars_stmts(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
+    for s in stmts {
+        match s {
+            IrStmt::Expr(e) | IrStmt::Assign { expr: e, .. } => collect_read_vars_expr(e, out),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                collect_read_vars_expr(cond, out);
+                collect_read_vars_stmts(then, out);
+                for (c, b) in elsifs {
+                    collect_read_vars_expr(c, out);
+                    collect_read_vars_stmts(b, out);
+                }
+                collect_read_vars_stmts(else_, out);
+            }
+            IrStmt::For { iter, body, .. } => {
+                collect_read_vars_expr(iter, out);
+                collect_read_vars_stmts(body, out);
+            }
+            IrStmt::While { cond, body } => {
+                collect_read_vars_expr(cond, out);
+                collect_read_vars_stmts(body, out);
+            }
+            IrStmt::DoWhile { body, cond, .. } => {
+                collect_read_vars_expr(cond, out);
+                collect_read_vars_stmts(body, out);
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                collect_read_vars_expr(discriminant, out);
+                for c in clauses {
+                    collect_read_vars_stmts(&c.body, out);
+                }
+            }
+            IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Block(body) => collect_read_vars_stmts(body, out),
+            IrStmt::Declare { init, .. } => {
+                if let Some(i) = init {
+                    collect_read_vars_expr(i, out);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for el in elements {
+                    collect_read_vars_expr(el, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_read_vars_stmts(st, out);
+                }
+            }
+            IrStmt::Output { value, .. } | IrStmt::WriteFile { path: value, .. } => {
+                let _ = value;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True if `name` is assigned by any `Assign` stmt (recursively).
+fn collect_assigned_vars_contains(stmts: &[IrStmt], name: &str) -> bool {
+    let mut found = Vec::new();
+    collect_assigned_vars(stmts, &mut found);
+    found.iter().any(|(n, _)| n == name)
+}
+
+/// Render a test-expression string (the text inside `[ … ]` / `[[ … ]]`,
+/// as flattened by ast_to_ir) as a Perl boolean expression.
+fn render_test_expr(s: &str) -> String {
+    let toks = tokenize_test(s);
+    let mut i = 0;
+    let expr = parse_test_or(&toks, &mut i);
+    if expr.is_empty() { "0".to_string() } else { expr }
+}
+
+/// Tokenize a test string: whitespace-separated, double-quoted runs kept
+/// together (with the quotes stripped but `$var` left for interpolation).
+fn tokenize_test(s: &str) -> Vec<String> {
+    let mut toks = Vec::new();
+    let mut cur = String::new();
+    let mut in_dq = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                if in_dq {
+                    in_dq = false;
+                    toks.push(std::mem::take(&mut cur));
+                } else {
+                    in_dq = true;
+                }
+            }
+            c if c.is_whitespace() && !in_dq => {
+                if !cur.is_empty() {
+                    toks.push(std::mem::take(&mut cur));
+                }
+            }
+            '\\' if in_dq => {
+                if let Some(&d) = chars.peek() {
+                    cur.push(d);
+                    chars.next();
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        toks.push(cur);
+    }
+    toks
+}
+
+fn test_peek<'a>(toks: &'a [String], i: usize) -> Option<&'a str> {
+    toks.get(i).map(|s| s.as_str())
+}
+
+fn test_next<'a>(toks: &'a [String], i: &mut usize) -> Option<&'a str> {
+    let t = test_peek(toks, *i);
+    if t.is_some() {
+        *i += 1;
+    }
+    t
+}
+
+fn parse_test_or(toks: &[String], i: &mut usize) -> String {
+    let mut lhs = parse_test_and(toks, i);
+    loop {
+        match test_peek(toks, *i) {
+            Some("||") | Some("-o") => {
+                *i += 1;
+                let rhs = parse_test_and(toks, i);
+                lhs = format!("({} || {})", lhs, rhs);
+            }
+            _ => break,
+        }
+    }
+    lhs
+}
+
+fn parse_test_and(toks: &[String], i: &mut usize) -> String {
+    let mut lhs = parse_test_not(toks, i);
+    loop {
+        match test_peek(toks, *i) {
+            Some("&&") | Some("-a") => {
+                *i += 1;
+                let rhs = parse_test_not(toks, i);
+                lhs = format!("({} && {})", lhs, rhs);
+            }
+            _ => break,
+        }
+    }
+    lhs
+}
+
+fn parse_test_not(toks: &[String], i: &mut usize) -> String {
+    if test_peek(toks, *i) == Some("!") {
+        *i += 1;
+        format!("!({})", parse_test_not(toks, i))
+    } else {
+        parse_test_primary(toks, i)
+    }
+}
+
+fn parse_test_primary(toks: &[String], i: &mut usize) -> String {
+    match test_peek(toks, *i) {
+        Some("(") => {
+            *i += 1;
+            let inner = parse_test_or(toks, i);
+            if test_peek(toks, *i) == Some(")") {
+                *i += 1;
+            }
+            format!("({})", inner)
+        }
+        Some("true") | Some(":") => {
+            *i += 1;
+            "1".to_string()
+        }
+        Some("false") => {
+            *i += 1;
+            "0".to_string()
+        }
+        Some(op) if is_file_test_op(op) => {
+            *i += 1;
+            let operand = test_next(toks, i).unwrap_or("''");
+            let o = render_test_operand(operand);
+            match op {
+                "-z" => format!("!length({})", o),
+                "-n" => format!("length({})", o),
+                _ => format!("{} {}", op, o),
+            }
+        }
+        _ => {
+            let lhs = test_next(toks, i).unwrap_or("''");
+            match test_peek(toks, *i) {
+                Some(op) if is_compare_op(op) => {
+                    *i += 1;
+                    let rhs = test_next(toks, i).unwrap_or("''");
+                    let perl_op = perl_compare_op(op);
+                    let l = render_test_operand(lhs);
+                    let r = render_test_operand(rhs);
+                    format!("{} {} {}", l, perl_op, r)
+                }
+                _ => {
+                    // bare operand: truthiness = non-empty string
+                    let l = render_test_operand(lhs);
+                    format!("length({})", l)
+                }
+            }
+        }
+    }
+}
+
+fn is_file_test_op(op: &str) -> bool {
+    matches!(op, "-f" | "-d" | "-e" | "-r" | "-w" | "-x" | "-s" | "-z" | "-n")
+}
+
+fn is_compare_op(op: &str) -> bool {
+    matches!(
+        op,
+        "=" | "==" | "!=" | "<" | ">" | "<=" | ">=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
+    )
+}
+
+fn perl_compare_op(op: &str) -> &'static str {
+    match op {
+        "=" | "==" => "eq",
+        "!=" => "ne",
+        "-eq" => "==",
+        "-ne" => "!=",
+        "-lt" => "<",
+        "-le" => "<=",
+        "-gt" => ">",
+        "-ge" => ">=",
+        "<" => "<",
+        ">" => ">",
+        "<=" => "<=",
+        ">=" => ">=",
+        _ => "==",
+    }
+}
+
+/// Render a test operand: `$var`-only tokens become bare `${name}` reads
+/// (Generator idiom); literals become Perl literals.
+fn render_test_operand(tok: &str) -> String {
+    if tok.starts_with('$') && tok.len() > 1 {
+        let name = &tok[1..];
+        if name.starts_with('{') && name.ends_with('}') {
+            var_read(&name[1..name.len() - 1])
+        } else {
+            var_read(name)
+        }
+    } else if tok.is_empty() {
+        "''".to_string()
+    } else if tok.chars().all(|c| c.is_ascii_digit()) {
+        format!("'{}'", tok)
+    } else if tok.contains('$') {
+        // Literal with an embedded variable — double-quote for interpolation.
+        let mut s = String::from("\"");
+        for ch in tok.chars() {
+            match ch {
+                '"' => s.push_str("\\\""),
+                '\\' => s.push_str("\\\\"),
+                _ => s.push(ch),
+            }
+        }
+        s.push('"');
+        s
+    } else {
+        format!("'{}'", tok.replace('\'', "\\\\'"))
+    }
+}
+
+/// Render a Str literal (shared by ir_expr_to_perl and render_word).
+fn render_str_literal(s: &str, style: &StrStyle) -> String {
+    match style {
+        StrStyle::SingleQuoted => format!("'{}'", s.replace('\'', "\\\\'"))
+            .replace("\\'\'", "\\'\\\\'\\'"),
+        StrStyle::DoubleQuoted | StrStyle::Heredoc => {
+            let mut escaped = String::from("\"");
+            for ch in s.chars() {
+                match ch {
+                    '"' => escaped.push_str("\\\""),
+                    '\\' => escaped.push_str("\\\\"),
+                    '$' if matches!(style, StrStyle::DoubleQuoted) => escaped.push_str("\\$"),
+                    '@' if matches!(style, StrStyle::DoubleQuoted) => escaped.push_str("\\@"),
+                    '\n' => escaped.push_str("\\n"),
+                    '\t' => escaped.push_str("\\t"),
+                    '\r' => escaped.push_str("\\r"),
+                    c => escaped.push(c),
+                }
+            }
+            escaped.push('"');
+            escaped
+        }
+        StrStyle::Command => format!("`{}`", s),
+    }
+}
+
+/// Lower a modern-IR `test` Call (cond position) to a Perl boolean.
+fn render_test_call(args: &[IrExpr]) -> String {
+    if let Some(s) = args.first().and_then(call_arg_str) {
+        render_test_expr(&s)
+    } else {
+        "0".to_string()
+    }
+}
+
 // ── Expression emitter ───────────────────────────────────────────────
 
 pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
@@ -1192,13 +2350,42 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         }
 
         IrExpr::RawExpr(text) => text.clone(),
-        IrExpr::Arrow(_) => unreachable!("ESTree-path-only Arrow reached the Perl renderer"),
-        IrExpr::Array(_) => unreachable!("ESTree-path-only Array reached the Perl renderer"),
-        IrExpr::Arith(_) => unreachable!("ESTree-path-only Arith reached the Perl renderer"),
-        IrExpr::Bool(_) => unreachable!("ESTree-path-only Bool reached the Perl renderer"),
-        IrExpr::Json(_) => unreachable!("ESTree-path-only Json reached the Perl renderer"),
-        IrExpr::Ident(_) => unreachable!("ESTree-path-only Ident reached the Perl renderer"),
-        IrExpr::Object(_) => unreachable!("ESTree-path-only Object reached the Perl renderer"),
+        IrExpr::Arrow(stmts) => {
+            // Delayed block (closure) — render as a Perl anonymous sub. The
+            // capture/pipeline lowerings rebuild a shell command string from
+            // the inner exec before falling back to this.
+            let mut body = String::new();
+            for s in stmts {
+                emit_stmt(&mut body, s, 1);
+            }
+            format!("sub {{ {}\n}}", body.trim_end_matches('\n'))
+        }
+        IrExpr::Array(elements) => {
+            // General expression position: parenthesized list (for-iter,
+            // list contexts). Exec-word position uses render_word instead.
+            if elements.is_empty() {
+                "()".to_string()
+            } else {
+                format!(
+                    "({})",
+                    elements.iter().map(render_word).collect::<Vec<_>>().join(", ")
+                )
+            }
+        }
+        IrExpr::Arith(ast) => format!("int({})", arith_ast_to_perl(ast)),
+        IrExpr::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+        IrExpr::Json(v) => {
+            let s = v.to_string();
+            format!("'{}'", s.replace('\'', "\\\\'"))
+        }
+        IrExpr::Ident(name) => var_read(name),
+        IrExpr::Object(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(k, v)| format!("{} => {}", k, ir_expr_to_perl(v)))
+                .collect();
+            format!("{{ {} }}", parts.join(", "))
+        }
 
         IrExpr::Int(n) => {
             if n.abs() < 1000 {
@@ -1349,17 +2536,40 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         }
 
         IrExpr::Call { func, args } => {
-            let a = args.iter().map(|a| ir_expr_to_perl(a)).collect::<Vec<_>>().join(", ");
-            // Special-case `chomp` with a single scalar argument to produce
-            // the idiomatic `chomp $var;` (without parentheses).
-            if func == "chomp" && args.len() == 1 {
-                format!("chomp {}", a)
-            // Special-case `join` to produce the idiomatic `join $sep, @list`
-            // (without parentheses) — the function-call parens add noise here.
-            } else if func == "join" && args.len() >= 2 {
-                format!("join {}", a)
-            } else {
-                format!("{}({})", func, a)
+            // Modern-IR (sh2.* namespace) calls: lower the common word-level
+            // funcs to Perl idioms; everything else falls back to the generic
+            // `func(args)` form (valid only for plain Perl helper calls like
+            // chomp/join emitted by the Generator-side IR).
+            match func.as_str() {
+                "getVar" => args
+                    .first()
+                    .and_then(call_arg_str)
+                    .map(|n| var_read(&n))
+                    .unwrap_or_else(|| "''".to_string()),
+                "split" => args
+                    .first()
+                    .map(render_word)
+                    .unwrap_or_else(|| "''".to_string()),
+                "param" => render_param(args),
+                "test" => render_test_call(args),
+                _ => {
+                    let a = args
+                        .iter()
+                        .map(|a| ir_expr_to_perl(a))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    // Special-case `chomp` with a single scalar argument to produce
+                    // the idiomatic `chomp $var;` (without parentheses).
+                    if func == "chomp" && args.len() == 1 {
+                        format!("chomp {}", a)
+                    // Special-case `join` to produce the idiomatic `join $sep, @list`
+                    // (without parentheses) — the function-call parens add noise here.
+                    } else if func == "join" && args.len() >= 2 {
+                        format!("join {}", a)
+                    } else {
+                        format!("{}({})", func, a)
+                    }
+                }
             }
         }
 

@@ -6509,6 +6509,26 @@ fn assume_local_scope() -> bool {
     std::env::var("SH2_ASSUME_LOCAL_SCOPE").map_or(true, |v| v != "0")
 }
 
+/// SH2_ASSUME_TMPDIR=0 — keep the runtime `$(mktemp -d)` path (the
+/// capture + sync builtin + blocking mkdirSync).
+///
+/// Documented assumption (default ON): the corpus never prints or
+/// compares the temp-dir path — every site is `d=$(mktemp -d); cd "$d"`,
+/// the path is only used as a directory — so the native
+/// `sh2.fs.mkdtemp` path (node's six random chars appended to the
+/// template-minus-X-run prefix) is interchangeable with the runtime
+/// mktemp's (GNU's replace-the-X-run + custom alphanumeric charset):
+/// same path structure, same uniqueness, same exit-status protocol
+/// (0 + path, or 1 + "" on failure). Second half: TMPDIR is unset in
+/// the harness, so the runtime's default template (os.tmpdir()) resolves
+/// to `/tmp/...` — the hardcoded `/tmp` prefix matches exactly; a TMPDIR
+/// override would move the directory's LOCATION only, which the corpus
+/// cannot observe (and the runtime's own random value is already
+/// non-deterministic, so no test can depend on the exact path).
+fn mktemp_native_enabled() -> bool {
+    std::env::var("SH2_ASSUME_TMPDIR").map_or(true, |v| v != "0")
+}
+
 /// The native lowering of a PURE-VALUE declaration whose names are ALL
 /// lifted (see [`pure_value_declare`]): `(name = value, ...,
 /// sh2.lastExit = 0, true)`. Numeric-lifted names get the i64 literal
@@ -10807,7 +10827,15 @@ fn read_file_promise(path: Expr, encoding: Option<&'static str>, ok: i64, err: i
     if let Some(enc) = encoding {
         args.push(str_lit(enc));
     }
-    let base = sh2_fs_call("readFile", args);
+    fs_promise_status(sh2_fs_call("readFile", args), ok, err)
+}
+
+/// Chain the runtime's exit-status recording onto an arbitrary
+/// `sh2.fs.<name>` promise: `.then(r => (sh2.lastExit = ok, r)).catch(e
+/// => (sh2.lastExit = err, ""))` — the value the runtime's exec path
+/// would capture for the command, INCLUDING its exit status (`$?` reads
+/// lastExit after the cmdsub).
+fn fs_promise_status(base: Expr, ok: i64, err: i64) -> Expr {
     let status = |exit: i64| Expr::AssignmentExpression {
         operator: "=".to_string(),
         left: Box::new(sh2_member("lastExit")),
@@ -10874,6 +10902,73 @@ fn is_plain_path_arg(e: &IrExpr) -> Option<String> {
         return None;
     }
     Some(sv.clone())
+}
+
+/// `$(mktemp -d)` — a unique temp DIRECTORY (the capture's only statement
+/// is the sync mktemp builtin with `-d`): the value is the created
+/// directory path (the capture strips the builtin's trailing newline). A
+/// native `await sh2.fs.mkdtemp(prefix)` creates the same unique dir — no
+/// fd swap, no blocking mkdirSync, no builtin dispatch (node appends six
+/// random chars to the prefix; GNU mktemp replaces the trailing X-run —
+/// same structure, same uniqueness; the exact random value is
+/// unobservable, see [`mktemp_native_enabled`]). The `.then/.catch`
+/// records the exit status the runtime mktemp would (0 + the path on
+/// success; 1 + "" on failure — a rejected mkdtemp). Only the exact
+/// `["-d"]` / `["-d", template]` shapes lift (template static with a
+/// trailing run of ≥3 X's — the builtin's error for shorter runs is
+/// observable via the exit status); every other flag shape (file
+/// mktemp, `-u`, `-t`, `--suffix`) stays on the runtime builtin.
+fn native_capture_mktemp_dir(e: &IrExpr) -> Option<Expr> {
+    if !mktemp_native_enabled() {
+        return None;
+    }
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if func != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(cargs)] = args.as_slice() else {
+        return None;
+    };
+    if name != "mktemp" {
+        return None;
+    }
+    let mut is_dir = false;
+    let mut template: Option<&str> = None;
+    for a in cargs {
+        match a {
+            IrExpr::Str(sv, _) if sv == "-d" => is_dir = true,
+            IrExpr::Str(sv, _) if sv.starts_with('-') => return None, // other flags
+            IrExpr::Str(sv, _) => {
+                if template.is_some() {
+                    return None; // more than one positional
+                }
+                template = Some(sv);
+            }
+            _ => return None,
+        }
+    }
+    if !is_dir {
+        return None;
+    }
+    let tpl = template.unwrap_or("/tmp/tmp.XXXXXXXXXX");
+    if tpl.contains(GLOB_MAGIC)
+        || tpl.contains(PS_MAGIC)
+        || tpl.chars().any(|c| (0xF800..=0xF8FF).contains(&(c as u32)))
+    {
+        return None;
+    }
+    let xrun = tpl.len() - tpl.trim_end_matches('X').len();
+    if xrun < 3 {
+        return None; // GNU mktemp errors on <3 trailing X's
+    }
+    let prefix = &tpl[..tpl.len() - xrun];
+    Some(await_expr(fs_promise_status(
+        sh2_fs_call("mkdtemp", vec![str_lit(prefix)]),
+        0,
+        1,
+    )))
 }
 
 /// `$(cat f...)` / `$(cat < f)` — the capture's value is the files'
@@ -17887,6 +17982,19 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
                             if let Some(transform) = try_native_tr_pipeline(pipe) {
                                 return trim_capture(transform);
+                            }
+                        }
+                    }
+                }
+                // `$(mktemp -d)` — the capture's only statement is the
+                // sync mktemp builtin with -d: the value is the created
+                // unique temp directory (see `native_capture_mktemp_dir`)
+                // — no fd swap, no blocking mkdirSync, no dispatch.
+                if !program_defines_function("mktemp") {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(inner)] = stmts.as_slice() {
+                            if let Some(value) = native_capture_mktemp_dir(inner) {
+                                return value;
                             }
                         }
                     }
