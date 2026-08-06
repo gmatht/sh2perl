@@ -684,7 +684,6 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
 
         // Neutral ESTree-path-only nodes — the Perl generator never emits them.
         IrStmt::Case { .. }
-        | IrStmt::Redirect { .. }
         | IrStmt::Function { .. }
         | IrStmt::Subshell(_)
         | IrStmt::Background(_) => {
@@ -694,13 +693,44 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             emit_indent(out, indent);
             out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (");
             out.push_str(match stmt {
-                IrStmt::Redirect { .. } => "redirect",
                 IrStmt::Function { .. } => "function definition",
                 IrStmt::Subshell(_) => "subshell",
                 IrStmt::Background(_) => "background",
                 _ => "other",
             });
             out.push_str(")\\n\";\n");
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            // Rebuild the shell command with shell redirection syntax and
+            // run it via bash -c — stdout matches bash exactly (redirects
+            // are shell-level semantics).
+            match stmts_to_shell_cmd(inner) {
+                Some(mut cmd) => {
+                    let mut ok = true;
+                    for r in redirects {
+                        let fd = r.fd.unwrap_or(1);
+                        let target = call_arg_str(&r.target).unwrap_or_default();
+                        if !append_redirect_frag(&mut cmd, fd as i64, &r.mode, &target) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        emit_indent(out, indent);
+                        out.push_str(&format!(
+                            "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+                            safe_perl_q_string(&cmd)
+                        ));
+                    } else {
+                        emit_indent(out, indent);
+                        out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (redirect mode)\\n\";\n");
+                    }
+                }
+                None => {
+                    emit_indent(out, indent);
+                    out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (redirect)\\n\";\n");
+                }
+            }
         }
         IrStmt::Block(stmts) => {
             // plan improvement #5: render a block as a flat sequence of
@@ -762,12 +792,43 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             out.push_str("die \"debashc: shIR pipeline not yet supported by the Perl backend\\n\";\n");
                         }
                     }
-                    other => {
+                    "caseMatch" | "define" | "subshell" | "background" => {
                         emit_indent(out, indent);
                         out.push_str(&format!(
                             "die \"debashc: sh2.* call `{}` not yet supported by the shIR Perl backend\\n\";\n",
-                            other
+                            func
                         ));
+                    }
+                    "redirect" => {
+                        // Statement-position redirect: run the command with its
+                        // redirects via bash -c (redirects are shell-level).
+                        if let Some(cmd) = redirect_call_to_cmd(e) {
+                            emit_indent(out, indent);
+                            out.push_str(&format!(
+                                "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+                                safe_perl_q_string(&cmd)
+                            ));
+                        } else {
+                            emit_indent(out, indent);
+                            out.push_str("die \"debashc: shIR redirect not yet supported by the Perl backend\\n\";\n");
+                        }
+                    }
+                    other => {
+                        // Non-Call expressions (e.g. a bare `&&`/`||` chain of
+                        // execs) and unknown sh2.* calls.
+                        if let Some(cmd) = expr_to_cmd(e) {
+                            emit_indent(out, indent);
+                            out.push_str(&format!(
+                                "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+                                safe_perl_q_string(&cmd)
+                            ));
+                        } else {
+                            emit_indent(out, indent);
+                            out.push_str(&format!(
+                                "die \"debashc: sh2.* call `{}` not yet supported by the shIR Perl backend\\n\";\n",
+                                other
+                            ));
+                        }
                     }
                 }
             }
@@ -830,6 +891,15 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     format!("${}", var)
                 };
                 if let IrExpr::Call { func, .. } = expr {
+                    if func == "setArray" {
+                        // Array assignment: arr=(a b c) → @arr = ('a','b','c');
+                        if let IrExpr::Call { args, .. } = expr {
+                            let items: Vec<String> = args.iter().map(render_word).collect();
+                            emit_indent(out, indent);
+                            out.push_str(&format!("@{} = ({});\n", var, items.join(", ")));
+                            return;
+                        }
+                    }
                     if func == "capture" {
                         // Modern-IR command substitution: Assign{var, capture(…)}
                         // — rebuild the shell command and capture its stdout.
@@ -1321,6 +1391,16 @@ fn render_word(e: &IrExpr) -> String {
                 .first()
                 .map(|a| format!("int({})", render_word(a)))
                 .unwrap_or_else(|| "0".to_string()),
+            "brace" => render_brace_word(args),
+            "capture" | "captureWords" => {
+                // Command substitution in word position: capture stdout and
+                // split on IFS whitespace (bash word-splitting semantics).
+                let cap = args.first().and_then(arrow_to_cmd);
+                match cap {
+                    Some(cmd) => format!("split(/\\s+/, {})", cmd_str_to_open_perl(&cmd)),
+                    None => "''".to_string(),
+                }
+            }
             _ => ir_expr_to_perl(e),
         },
         IrExpr::Interpolate(_) | IrExpr::Var(_, _) | IrExpr::Arith(_)
@@ -1426,6 +1506,115 @@ fn exec_word_args(args: &[IrExpr]) -> Vec<&IrExpr> {
     args[1..].iter().collect()
 }
 
+/// Extract the brace-expansion Json (arg 1) from a `brace` Call.
+fn brace_json_arg(args: &[IrExpr]) -> Option<&serde_json::Value> {
+    args.iter().find_map(|a| match a {
+        IrExpr::Json(v) => Some(v),
+        _ => None,
+    })
+}
+
+/// A single numeric range: Json `[[{"range":["A","B",null,null]}]]`.
+fn brace_range(v: &serde_json::Value) -> Option<(i64, i64)> {
+    let groups = v.as_array()?;
+    if groups.len() != 1 {
+        return None;
+    }
+    let items = groups[0].as_array()?;
+    if items.len() != 1 {
+        return None;
+    }
+    let r = items[0].get("range")?.as_array()?;
+    let a = r.get(0)?.as_str()?.parse::<i64>().ok()?;
+    let b = r.get(1)?.as_str()?.parse::<i64>().ok()?;
+    Some((a, b))
+}
+
+/// Flatten a brace group (first alternative group) to its items, expanding
+/// numeric ranges (capped at 1024 elements).
+fn brace_items(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let groups = match v.as_array() {
+        Some(g) => g,
+        None => return out,
+    };
+    for g in groups {
+        let items = match g.as_array() {
+            Some(i) => i,
+            None => continue,
+        };
+        for it in items {
+            if let Some(s) = it.as_str() {
+                out.push(s.to_string());
+            } else if let Some(arr) = it.get("range").and_then(|r| r.as_array()) {
+                if let (Some(a), Some(b)) = (
+                    arr.get(0).and_then(|x| x.as_str()),
+                    arr.get(1).and_then(|x| x.as_str()),
+                ) {
+                    if let (Ok(ai), Ok(bi)) = (a.parse::<i64>(), b.parse::<i64>()) {
+                        let step = arr.get(2).and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
+                        if step != 0 && (bi - ai) / step.abs() < 1024 {
+                            let mut n = ai;
+                            while (n <= bi && step > 0) || (n >= bi && step < 0) {
+                                out.push(n.to_string());
+                                n += step;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !out.is_empty() {
+            break; // first non-empty group wins
+        }
+    }
+    out
+}
+
+/// Render a `brace` Call in word position: the expanded items joined by
+/// spaces (echo {a,b,c} → a b c). Numeric ranges expand up to 256 items;
+/// larger ones approximate with the A..B literal.
+fn render_brace_word(args: &[IrExpr]) -> String {
+    let v = match brace_json_arg(args) {
+        Some(v) => v,
+        None => return "''".to_string(),
+    };
+    let items = brace_items(v);
+    if items.is_empty() {
+        return "''".to_string();
+    }
+    if items.len() > 256 {
+        // Approximate a huge range with the numeric span.
+        return format!("'{}..{}'", items[0], items[items.len() - 1]);
+    }
+    let quoted: Vec<String> = items
+        .iter()
+        .map(|s| format!("'{}'", s.replace('\'', "\\\\'")))
+        .collect();
+    format!("join(' ', {})", quoted.join(", "))
+}
+
+/// Render a `brace` Call as a for-iterable: {1..5} → 1..5; {a,b,c} →
+/// ('a','b','c') (single-quoted).
+fn render_brace_iter(args: &[IrExpr]) -> String {
+    let v = match brace_json_arg(args) {
+        Some(v) => v,
+        None => return "()".to_string(),
+    };
+    if let Some((a, b)) = brace_range(v) {
+        return format!("{}..{}", a, b);
+    }
+    let items = brace_items(v);
+    if items.is_empty() {
+        return "()".to_string();
+    }
+    let quoted: Vec<String> = items
+        .iter()
+        .map(|s| format!("'{}'", s.replace('\'', "\\\\'")))
+        .collect();
+    format!("({})", quoted.join(", "))
+}
+
 /// Extract (cmd, words) from an `exec` Call's args (arg0 = command name;
 /// the remaining args are the flattened word list — see exec_word_args).
 fn exec_call_parts(args: &[IrExpr]) -> Option<(String, Vec<&IrExpr>)> {
@@ -1439,28 +1628,148 @@ fn emit_capture_assign(out: &mut String, indent: usize, lhs: &str, cmd: &str) {
     out.push_str(&format!("{} = {};\n", lhs, cmd_str_to_open_perl(cmd)));
 }
 
-/// Rebuild a shell command string from a `pipeline` Call:
-/// pipeline([Arrow([Expr(exec)]), Arrow([Expr(exec)]), …]) → "a | b".
-fn arrow_to_cmd(a: &IrExpr) -> Option<String> {
-    if let IrExpr::Arrow(stmts) = a {
-        for s in stmts {
-            if let IrStmt::Expr(inner) = s {
-                if let IrExpr::Call { func, .. } = inner {
-                    match func.as_str() {
-                        "exec" => {
-                            if let IrExpr::Call { args, .. } = inner {
-                                let (cmd, words) = exec_call_parts(args)?;
-                                return Some(build_shell_cmd(&cmd, &words));
+/// Rebuild the shell command string for an expression: a `Call exec`,
+/// a `pipeline` Call, or a `&&`/`||` chain of those (bash control operators).
+fn expr_to_cmd(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Call { func, args } => match func.as_str() {
+            "exec" => {
+                let (cmd, words) = exec_call_parts(args)?;
+                Some(build_shell_cmd(&cmd, &words))
+            }
+            "pipeline" => pipeline_call_to_cmd(e),
+            _ => None,
+        },
+        IrExpr::BinOp { lhs, op, rhs } => {
+            let opstr = match op {
+                BinOpKind::And => " && ",
+                BinOpKind::Or => " || ",
+                _ => return None,
+            };
+            Some(format!("{}{}{}", expr_to_cmd(lhs)?, opstr, expr_to_cmd(rhs)?))
+        }
+        _ => None,
+    }
+}
+
+/// Read the (fd, mode, target) of one redirect spec Object.
+fn redirect_spec_fields(e: &IrExpr) -> Option<(i64, String, String)> {
+    if let IrExpr::Object(fields) = e {
+        let mut fd: i64 = 1;
+        let mut mode = String::new();
+        let mut target = String::new();
+        for (k, v) in fields {
+            match k.as_str() {
+                "fd" => {
+                    if let IrExpr::Int(n) = v {
+                        fd = *n;
+                    }
+                }
+                "mode" => mode = call_arg_str(v).unwrap_or_default(),
+                "target" => target = call_arg_str(v).unwrap_or_default(),
+                _ => {}
+            }
+        }
+        Some((fd, mode, target))
+    } else {
+        None
+    }
+}
+
+/// Append one redirect's shell syntax (` > t`, ` 2>> t`, ` 2>&1`, …) to cmd.
+fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> bool {
+    let op = match mode {
+        "w" => ">",
+        "a" => ">>",
+        "r" => "<",
+        _ => return false,
+    };
+    // fd N → target &M means N>&M (fd dup).
+    if let Some(m) = target.strip_prefix('&') {
+        cmd.push_str(&format!(" {}>{}&{}", fd, op.trim_start_matches('<'), m));
+        return true;
+    }
+    let quoted = format!("'{}'", target.replace('\'', "'\\\\''"));
+    let frag = match fd {
+        0 => format!(" < {}", quoted),
+        1 => format!(" > {}", quoted),
+        n => format!(" {}> {}", n, quoted),
+    };
+    cmd.push_str(&frag);
+    true
+}
+
+/// Rebuild a shell command string from a `redirect` Call (a command plus
+/// fd redirect specs) — used in condition and statement positions.
+fn redirect_call_to_cmd(call: &IrExpr) -> Option<String> {
+    if let IrExpr::Call { func, args } = call {
+        if func == "redirect" {
+            let mut cmd = args.first().and_then(arrow_to_cmd)?;
+            for spec in args.iter().skip(1) {
+                let specs: Vec<&IrExpr> = match spec {
+                    IrExpr::Array(elems) => elems.iter().collect(),
+                    other => vec![other],
+                };
+                for s in specs {
+                    if let Some((fd, mode, target)) = redirect_spec_fields(s) {
+                        append_redirect_frag(&mut cmd, fd, &mode, &target);
+                    }
+                }
+            }
+            return Some(cmd);
+        }
+    }
+    None
+}
+
+/// Rebuild a shell command string from a `block` Call: multiple statements
+/// run in sequence (`;`-joined) — used in condition position.
+fn block_call_to_cmd(call: &IrExpr) -> Option<String> {
+    if let IrExpr::Call { func, args } = call {
+        if func == "block" {
+            for a in args {
+                if let IrExpr::Arrow(stmts) = a {
+                    let cmds: Vec<String> = stmts
+                        .iter()
+                        .filter_map(|s| {
+                            if let IrStmt::Expr(inner) = s {
+                                expr_to_cmd(inner)
+                            } else {
+                                None
                             }
-                        }
-                        "pipeline" => return pipeline_call_to_cmd(inner),
-                        _ => {}
+                        })
+                        .collect();
+                    if !cmds.is_empty() {
+                        return Some(cmds.join("; "));
                     }
                 }
             }
         }
     }
     None
+}
+
+/// Find the shell command string inside a block of stmts (exec, pipeline,
+/// or `&&`/`||` chain) — shared by Arrow bodies and Redirect inners.
+fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
+    for s in stmts {
+        if let IrStmt::Expr(inner) = s {
+            if let Some(cmd) = expr_to_cmd(inner) {
+                return Some(cmd);
+            }
+        }
+    }
+    None
+}
+
+/// Rebuild a shell command string from a `pipeline` Call:
+/// pipeline([Arrow([Expr(exec)]), Arrow([Expr(exec)]), …]) → "a | b".
+fn arrow_to_cmd(a: &IrExpr) -> Option<String> {
+    if let IrExpr::Arrow(stmts) = a {
+        stmts_to_shell_cmd(stmts)
+    } else {
+        None
+    }
 }
 
 fn pipeline_call_to_cmd(call: &IrExpr) -> Option<String> {
@@ -1512,14 +1821,21 @@ fn word_iter_to_perl(iter: &IrExpr) -> String {
         }
         IrExpr::Array(elems) if elems.len() == 1 => {
             if let IrExpr::Call { func, .. } = &elems[0] {
-                if func == "capture" {
+                if func == "capture" || func == "captureWords" {
                     if let Some(cmd) = capture_call_to_cmd(&elems[0]) {
                         return format!("split /\\s+/, {}", cmd_str_to_open_perl(&cmd));
+                    }
+                }
+                if func == "brace" {
+                    if let IrExpr::Call { args, .. } = &elems[0] {
+                        return render_brace_iter(args);
                     }
                 }
             }
             ir_expr_to_perl(iter)
         }
+        IrExpr::Array(_) => ir_expr_to_perl(iter),
+        IrExpr::Call { func, args } if func == "brace" => render_brace_iter(args),
         _ => ir_expr_to_perl(iter),
     }
 }
@@ -1616,6 +1932,12 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         "pwd" => {
             emit_indent(out, indent);
             out.push_str("print qx{pwd};\n");
+            emit_indent(out, indent);
+            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+        }
+        "shopt" | "set" => {
+            // Shell-option toggles — no runtime effect for the supported
+            // subset (the corpus's shopt -s/-u lines gate extglob etc.).
             emit_indent(out, indent);
             out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
         }
@@ -1835,6 +2157,13 @@ fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
                     }
                 }
             }
+            if func == "test" {
+                // Test conditions arrive as a flat string ("$y -lt 10")
+                // with $vars inside — collect them for declarations.
+                if let Some(s) = args.first().and_then(call_arg_str) {
+                    collect_vars_from_test_string(&s, out);
+                }
+            }
             for a in args {
                 collect_read_vars_expr(a, out);
             }
@@ -1989,6 +2318,47 @@ fn collect_assigned_vars_contains(stmts: &[IrStmt], name: &str) -> bool {
     let mut found = Vec::new();
     collect_assigned_vars(stmts, &mut found);
     found.iter().any(|(n, _)| n == name)
+}
+
+/// Scan a test-condition string for `$var` / `${var}` / `${#var}` reads
+/// (for hoisted declarations — the vars are text inside the flat string).
+fn collect_vars_from_test_string(s: &str, out: &mut Vec<(String, Sigil)>) {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' {
+            let mut j = i + 1;
+            if j < chars.len() && chars[j] == '{' {
+                let mut k = j + 1;
+                if k < chars.len() && chars[k] == '#' {
+                    k += 1;
+                }
+                let start = k;
+                while k < chars.len() && (chars[k].is_ascii_alphanumeric() || chars[k] == '_') {
+                    k += 1;
+                }
+                let name: String = chars[start..k].iter().collect();
+                if var_is_declarable(&name) && !out.iter().any(|(n, _)| n == &name) {
+                    out.push((name, Sigil::Scalar));
+                }
+                i = k;
+            } else {
+                let start = j;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                if j > start {
+                    let name: String = chars[start..j].iter().collect();
+                    if var_is_declarable(&name) && !out.iter().any(|(n, _)| n == &name) {
+                        out.push((name, Sigil::Scalar));
+                    }
+                }
+                i = j;
+            }
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Render a test-expression string (the text inside `[ … ]` / `[[ … ]]`,
@@ -2536,10 +2906,8 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         }
 
         IrExpr::Call { func, args } => {
-            // Modern-IR (sh2.* namespace) calls: lower the common word-level
-            // funcs to Perl idioms; everything else falls back to the generic
-            // `func(args)` form (valid only for plain Perl helper calls like
-            // chomp/join emitted by the Generator-side IR).
+            // Word-level funcs (shared with render_word): getVar, split,
+            // param, arith, brace, capture/captureWords, listVar.
             match func.as_str() {
                 "getVar" => args
                     .first()
@@ -2551,6 +2919,65 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     .map(render_word)
                     .unwrap_or_else(|| "''".to_string()),
                 "param" => render_param(args),
+                "arith" => args
+                    .first()
+                    .map(|a| format!("int({})", render_word(a)))
+                    .unwrap_or_else(|| "0".to_string()),
+                "brace" => render_brace_word(args),
+                "capture" | "captureWords" => {
+                    let cap = args.first().and_then(arrow_to_cmd);
+                    match cap {
+                        Some(cmd) => format!("split(/\\s+/, {})", cmd_str_to_open_perl(&cmd)),
+                        None => "''".to_string(),
+                    }
+                }
+                "listVar" | "getArray" | "arrayItems" => args
+                    .first()
+                    .and_then(call_arg_str)
+                    .map(|n| format!("@{}", n))
+                    .unwrap_or_else(|| "()".to_string()),
+                "redirect" => {
+                    // Redirect used as a condition: run the command with its
+                    // redirects via bash -c and test its exit status.
+                    match redirect_call_to_cmd(expr) {
+                        Some(cmd) => format!(
+                            "(system('bash', '-c', {}) == 0)",
+                            safe_perl_q_string(&cmd)
+                        ),
+                        None => "0".to_string(),
+                    }
+                }
+                "block" => {
+                    // Multi-command block in condition position (e.g. a while
+                    // cond with several statements): run them joined by `;`.
+                    match block_call_to_cmd(expr) {
+                        Some(cmd) => format!(
+                            "(system('bash', '-c', {}) == 0)",
+                            safe_perl_q_string(&cmd)
+                        ),
+                        None => "0".to_string(),
+                    }
+                }
+                "arrayIndex" => {
+                    let name = args.first().and_then(call_arg_str).unwrap_or_default();
+                    let idx = args.get(1).and_then(call_arg_str).unwrap_or_default();
+                    if idx == "@" || idx == "*" {
+                        format!("@{}", name)
+                    } else {
+                        format!("${}[{}]", name, idx)
+                    }
+                }
+                "arrayLen" => args
+                    .first()
+                    .and_then(call_arg_str)
+                    .map(|n| format!("scalar(@{})", n))
+                    .unwrap_or_else(|| "0".to_string()),
+                "setArray" => {
+                    // Array assignment in expression position (rare) — the
+                    // elements as a parenthesized list.
+                    let items: Vec<String> = args.iter().map(render_word).collect();
+                    format!("({})", items.join(", "))
+                }
                 "test" => render_test_call(args),
                 _ => {
                     let a = args
