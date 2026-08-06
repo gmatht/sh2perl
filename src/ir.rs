@@ -616,6 +616,7 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         // tracks success; the pipeline machinery accumulates stdout).
         out.push_str("my $ls_success = 0;\n");
         out.push_str("my $output = '';\n");
+        out.push_str("my $__nocasematch = 0;\n");
         // Hoisted declarations for assigned variables (use strict).
         let mut vars = Vec::new();
         collect_assigned_vars(&stmts, &mut vars);
@@ -930,10 +931,23 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         ));
                     }
                     "shopt" => {
-                        // Shell-option toggle (shopt -s/-u …) — no runtime
-                        // effect for the supported subset.
-                        emit_indent(out, indent);
-                        out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+                        // Shell-option toggle — nocasematch affects [[ == ]]
+                        // string comparisons (tracked at runtime).
+                        let on = args
+                            .get(1)
+                            .map(|a| matches!(a, IrExpr::Bool(true)))
+                            .unwrap_or(false);
+                        let opt = args.first().and_then(call_arg_str).unwrap_or_default();
+                        if opt == "nocasematch" || opt == "-s" && args.get(1).and_then(call_arg_str).as_deref() == Some("nocasematch") {
+                            emit_indent(out, indent);
+                            out.push_str(&format!(
+                                "$__nocasematch = {}; $main_exit_code = $CHILD_ERROR = 0;\n",
+                                if on { 1 } else { 0 }
+                            ));
+                        } else {
+                            emit_indent(out, indent);
+                            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+                        }
                     }
                     "redirect" => {
                         // Statement-position redirect: run the command with its
@@ -3216,6 +3230,15 @@ fn flat_operand(s: &str) -> String {
     }
 }
 
+/// String equality with nocasematch runtime tracking.
+fn nocase_str_eq(lhs: &str, rhs: &str) -> String {
+    format!(
+        "(($__nocasematch) ? lc({l}) eq lc({r}) : {l} eq {r})",
+        l = lhs,
+        r = rhs
+    )
+}
+
 /// Render a flattened `[[ ]]` test: lhs OP rhs where OP is `==`, `=~`,
 /// `!=` or `=`. Glob and extglob patterns become regex matches.
 fn render_flat_test(s: &str) -> Option<String> {
@@ -3231,7 +3254,8 @@ fn render_flat_test(s: &str) -> Option<String> {
                 }
                 "ne" => {
                     // != : string inequality (glob patterns rare here)
-                    return Some(format!("(!({} eq {}))", lhs, flat_operand(rhs)));
+                    let l = flat_operand(rhs);
+                    return Some(format!("(!({}))", nocase_str_eq(&lhs, &l)));
                 }
                 _ => {
                     // == or = : glob pattern (contains */?/[/!( ) or literal.
@@ -3249,7 +3273,7 @@ fn render_flat_test(s: &str) -> Option<String> {
                         let re = glob_to_regex(rhs.trim_matches('"').trim_matches('\''));
                         return Some(format!("({} =~ /^{}$/)", lhs, re));
                     }
-                    return Some(format!("({} eq {})", lhs, flat_operand(rhs)));
+                    return Some(nocase_str_eq(&lhs, &flat_operand(rhs)));
                 }
             }
         }
