@@ -1726,6 +1726,7 @@ pub fn ast_to_ir_raw(commands: &[Command]) -> IrProgram {
 pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
     const CAP: u64 = 1024; // a false bound from an unbounded loop is worse than none
     const ITER_LIMIT: usize = 1024;
+    const MAX_DEPTH: u32 = 512; // an over-deep AST -> conservative unbounded (None)
     use crate::ir::{InterpPart, IrExpr, IrStmt};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1819,7 +1820,10 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
     let mut lens: BTreeMap<String, Option<u64>> =
         names.iter().map(|n| (n.clone(), Some(0))).collect();
 
-    fn expr_len(e: &IrExpr, lens: &BTreeMap<String, Option<u64>>, cap: u64) -> Option<u64> {
+    fn expr_len(e: &IrExpr, lens: &BTreeMap<String, Option<u64>>, cap: u64, depth: u32) -> Option<u64> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
         match e {
             IrExpr::Str(sv, _) => Some(sv.len() as u64),
             IrExpr::Int(_) => Some(20), // the max digit count
@@ -1829,7 +1833,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                 for p in parts {
                     let l = match p {
                         InterpPart::Lit(s) => s.len() as u64,
-                        InterpPart::Expr(e) => expr_len(e, lens, cap)?,
+                        InterpPart::Expr(e) => expr_len(e, lens, cap, depth + 1)?,
                     };
                     total = total.saturating_add(l);
                     if total > cap {
@@ -1846,7 +1850,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                 // when that is a bounded echo; everything else is
                 // unbounded (the user's design: e.g. the primes'
                 // `$(echo "sqrt($n)" | bc)` -> 40).
-                capture_bound(expr, lens, cap)
+                capture_bound(expr, lens, cap, depth + 1)
             }
             IrExpr::Call { func, args } if func == "getVar" => match args.first() {
                 Some(IrExpr::Str(n, _)) => lens.get(n).copied().flatten(),
@@ -1856,7 +1860,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
             // bound comes from the CAPTURED command (bc/wc/hash fixed
             // widths, the filters <= the input, grep -q/-c options)
             IrExpr::Call { func, args } if func == "capture" => match args.first() {
-                Some(body) => capture_bound(body, lens, cap),
+                Some(body) => capture_bound(body, lens, cap, depth + 1),
                 _ => None,
             },
             // BinOps ARE bounded: `a . b` (Concat) = max(a)+max(b); the
@@ -1864,8 +1868,8 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
             // logicals yield 0/1 (1 char).
             IrExpr::BinOp { op, lhs, rhs } => match op {
                 BinOpKind::Concat => {
-                    let l = expr_len(lhs, lens, cap)?;
-                    let r = expr_len(rhs, lens, cap)?;
+                    let l = expr_len(lhs, lens, cap, depth + 1)?;
+                    let r = expr_len(rhs, lens, cap, depth + 1)?;
                     Some(l.saturating_add(r))
                 }
                 BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Gt
@@ -1972,7 +1976,11 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
         e: &IrExpr,
         lens: &BTreeMap<String, Option<u64>>,
         cap: u64,
+        depth: u32,
     ) -> Option<u64> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
         let stages: Vec<&IrExpr> = capture_stages(e);
         // the LAST stage's command name
         let last = stages.last()?;
@@ -2042,11 +2050,11 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                         IrExpr::Array(items) => {
                             let mut t = 0u64;
                             for it in items.iter() {
-                                t = t.saturating_add(expr_len(it, lens, cap)?);
+                                t = t.saturating_add(expr_len(it, lens, cap, depth + 1)?);
                             }
                             t
                         }
-                        other => expr_len(other, lens, cap)?,
+                        other => expr_len(other, lens, cap, depth + 1)?,
                     };
                     total = total.saturating_add(l).saturating_add(1);
                 }
@@ -2056,12 +2064,22 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                     Some(total)
                 }
             }
-            // the filters: output <= input — the FIRST stage's bound
+            // the filters: output <= input — the FIRST stage's bound.
+            // A SINGLE-stage filter (the command call IS the only stage,
+            // e.g. `$(basename $(pwd))`) must NOT recurse into itself —
+            // capture_stages returns [e], so recursing on stages.first()
+            // was INFINITE recursion (core-requests/c-20260806-102527.md
+            // stack overflow on 000__04a). Its input is the captured
+            // stream, not a pipeline stage -> conservative unbounded.
             "grep" | "sed" | "tr" | "head" | "tail" | "sort" | "uniq"
             | "cut" | "cat" | "paste" | "rev" | "join" | "basename"
             | "dirname" | "comm" => {
-                let first = stages.first()?;
-                capture_bound(first, lens, cap)
+                if stages.len() <= 1 {
+                    None
+                } else {
+                    let first = stages.first()?;
+                    capture_bound(first, lens, cap, depth + 1)
+                }
             }
             _ => None,
         }
@@ -2074,7 +2092,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
             if cur.is_none() {
                 continue;
             }
-            let l = expr_len(rhs, &lens, CAP);
+            let l = expr_len(rhs, &lens, CAP, 0);
             let new = match l {
                 Some(v) if v > CAP => None,
                 Some(v) => Some(v.max(cur.unwrap_or(0))),
