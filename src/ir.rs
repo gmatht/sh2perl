@@ -1177,8 +1177,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
 
         IrStmt::For { var, iter, body } => {
             let iter_str = word_iter_to_perl(iter);
+            // Perl's `for $i` restores the pre-loop value after the loop, but
+            // bash leaves the last value — iterate a fresh temp and assign
+            // the real var each round.
+            let tmp = format!("__{}", var);
             emit_indent(out, indent);
-            out.push_str(&format!("for my ${} ({}) {{\n", var, iter_str));
+            out.push_str(&format!("for my ${} ({}) {{\n", tmp, iter_str));
+            emit_indent(out, indent + 1);
+            out.push_str(&format!("${} = ${};\n", var, tmp));
             for s in body {
                 emit_stmt(out, s, indent + 1);
             }
@@ -1616,22 +1622,32 @@ fn render_param(args: &[IrExpr]) -> String {
         ),
         // Prefix removal: # shortest, ## longest. The `:` forms (only when
         // non-empty) are approximated by the plain forms.
-        "#" | "#:" => {
-            let re = glob_to_regex(val.trim_start_matches('\\'));
-            format!("(({} =~ s/^{}?//r))", var, re)
+        // Prefix removal: # shortest, ## longest (approximated by the
+        // greedy form — the corpus idioms are ##*/ and %/* which are exact).
+        "#" | "#:" | "##" | "##:" => {
+            let pat = args.get(2).and_then(call_arg_str).unwrap_or_default();
+            let re = glob_to_regex(&pat);
+            format!("(({} =~ s:^{}::r))", var, re)
         }
-        "##" | "##:" => {
-            let re = glob_to_regex(val.trim_start_matches('\\'));
-            format!("(({} =~ s/^{}//r))", var, re)
+        // Suffix removal: % shortest, %% longest. The `%.*` extension
+        // idiom strips the last extension (shortest) / from the first dot
+        // (longest); other patterns remove a plain greedy suffix.
+        "%" | "%:" | "%%" | "%%:" => {
+            let pat = args.get(2).and_then(call_arg_str).unwrap_or_default();
+            if pat == ".*" {
+                if op == "%%" || op == "%%:" {
+                    format!("(({} =~ s:\\.*$::r))", var)
+                } else {
+                    format!("(({} =~ s:\\.[^.]*$::r))", var)
+                }
+            } else {
+                let re = glob_to_regex(&pat);
+                format!("(({} =~ s:{}[^/]*$::r))", var, re)
+            }
         }
-        "%" | "%:" => {
-            let re = glob_to_regex(val.trim_start_matches('\\'));
-            format!("(({} =~ s/{}$//r))", var, re)
-        }
-        "%%" | "%%:" => {
-            let re = glob_to_regex(val.trim_start_matches('\\'));
-            format!("(({} =~ s/{}.*$//r))", var, re)
-        }
+        // Named idioms the IR maps: ##*/ → basename, %/* → dirname.
+        "basename" => format!("(({} =~ s:^.*/::r))", var),
+        "dirname" => format!("(({} =~ s:/[^/]*$::r))", var),
         // Case modification: ^^/,, = all, ^/, = first char.
         "^^" => format!("uc({})", var),
         ",," => format!("lc({})", var),
@@ -1652,7 +1668,12 @@ fn render_param(args: &[IrExpr]) -> String {
         }
         // Substitution: / first, // all.
         "/" => format!("(({} =~ s/{}/{}/r))", var, glob_to_regex(&val), repl.trim_matches('\\')),
-        "//" => format!("(({} =~ s/{}/{}/gr))", var, glob_to_regex(&val), repl.trim_matches('\\')),
+        "//" | "/" => {
+            let pat = args.get(2).and_then(call_arg_str).unwrap_or_default();
+            let rep = args.get(3).and_then(call_arg_str).unwrap_or_default();
+            let g = if op == "//" { "g" } else { "" };
+            format!("(({} =~ s/{}/{}/{g}r))", var, glob_to_regex(&pat), rep.trim_matches('\\'))
+        }
         // Array slice: ${arr[@]:off:len} → @arr[off..off+len-1] (0-based;
         // the shIR contract normalizes subscripts).
         "slice" => {
@@ -1745,7 +1766,9 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
 }
 
 /// `test-cond ||/&& control` chains render natively: `[ x = y ] || continue`
-/// → `(cond) || next;` (bash control-flow operators on a test result).
+/// → `(cond) || next;` (bash control-flow operators on a test result), and
+/// `[[ flat ]] && cmd` → `if (cond) { cmd; }` (flattened `[[ ]]` tests can't
+/// be reconstructed as spaced `[ … ]` bash syntax).
 fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
     if let IrExpr::BinOp { lhs, op, rhs } = e {
         if let IrExpr::Call { func: f, .. } = lhs.as_ref() {
@@ -1773,6 +1796,23 @@ fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
                         }
                         _ => {}
                     }
+                }
+                // test && cmd / test || cmd — native if-guard around the
+                // shell-out (the flattened test can't round-trip to bash).
+                if let Some(cmd) = expr_to_cmd(rhs) {
+                    return match op {
+                        BinOpKind::And => Some(format!(
+                            "if ({c}) {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
+                            c = cond,
+                            q = safe_perl_q_string(&cmd)
+                        )),
+                        BinOpKind::Or => Some(format!(
+                            "if (!({c})) {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
+                            c = cond,
+                            q = safe_perl_q_string(&cmd)
+                        )),
+                        _ => None,
+                    };
                 }
             }
         }
@@ -2145,9 +2185,14 @@ fn expr_to_cmd(e: &IrExpr) -> Option<String> {
             }
             "pipeline" => pipeline_call_to_cmd(e),
             "redirect" => redirect_call_to_cmd(e),
-            // A test in command position reconstructs as bash `[ … ]`.
+            // A test in command position reconstructs as bash `[ … ]` — but
+            // only when the text is genuinely spaced (`-f x`); flattened
+            // `[[ ]]`/`[ ]` forms (no-space `==`/`=~`/`=`) can't round-trip.
             "test" => {
                 let text = args.first().and_then(call_arg_str)?;
+                if text.contains('=') || text.contains('~') {
+                    return None;
+                }
                 Some(format!("[ {} ]", text))
             }
             _ => None,
@@ -3022,10 +3067,100 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
 /// Render a test-expression string (the text inside `[ … ]` / `[[ … ]]`,
 /// as flattened by ast_to_ir) as a Perl boolean expression.
 fn render_test_expr(s: &str) -> String {
+    // `[[ ]]` tests flatten to no-space forms ("$s==*.txt", "$s=~^re$",
+    // "$f1==!(*.min).js") that the spaced tokenizer can't parse.
+    if s.contains("==") || s.contains("=~") || s.contains("!=") || s.contains("=" ) {
+        if let Some(r) = render_flat_test(s) {
+            return r;
+        }
+    }
     let toks = tokenize_test(s);
     let mut i = 0;
     let expr = parse_test_or(&toks, &mut i);
     if expr.is_empty() { "0".to_string() } else { expr }
+}
+
+/// A `[[ ]]`-flavored operand: strip quotes, `$var` → read, else literal.
+fn flat_operand(s: &str) -> String {
+    let t = s.trim().trim_matches('"').trim_matches('\'');
+    if let Some(name) = t.strip_prefix('$') {
+        if name.starts_with('{') && name.ends_with('}') {
+            var_read(&name[1..name.len() - 1])
+        } else {
+            var_read(name)
+        }
+    } else if t.is_empty() {
+        "''".to_string()
+    } else if t.contains('$') {
+        // Interpolating literal — keep as a double-quoted string.
+        format!("\"{}\"", t)
+    } else {
+        format!("'{}'", t.replace('\'', "\\\\'"))
+    }
+}
+
+/// Render a flattened `[[ ]]` test: lhs OP rhs where OP is `==`, `=~`,
+/// `!=` or `=`. Glob and extglob patterns become regex matches.
+fn render_flat_test(s: &str) -> Option<String> {
+    for (op, kind) in [("==", "eq"), ("=~", "re"), ("!=", "ne"), ("=", "eq")] {
+        if let Some(pos) = s.find(op) {
+            let lhs = flat_operand(&s[..pos]);
+            let rhs = &s[pos + op.len()..];
+            match kind {
+                "re" => {
+                    // [[ $s =~ regex ]] → $s =~ /regex/
+                    let re = rhs.trim_matches('"').trim_matches('\'');
+                    return Some(format!("({} =~ /{}/)", lhs, re));
+                }
+                "ne" => {
+                    // != : string inequality (glob patterns rare here)
+                    return Some(format!("(!({} eq {}))", lhs, flat_operand(rhs)));
+                }
+                _ => {
+                    // == or = : glob pattern (contains */?/[/!( ) or literal.
+                    let has_glob = rhs.contains('*') || rhs.contains('?')
+                        || rhs.contains('[') || rhs.contains("!(");
+                    if rhs.contains("!(") {
+                        // Extglob `!(P).S` — the compound is a full boolean
+                        // expression (lhs embedded); return it directly.
+                        if let Some(re) = glob_or_extglob_to_regex(&lhs, rhs) {
+                            return Some(re);
+                        }
+                    }
+                    if has_glob {
+                        // Normal glob → anchored regex match.
+                        let re = glob_to_regex(rhs.trim_matches('"').trim_matches('\''));
+                        return Some(format!("({} =~ /^{}$/)", lhs, re));
+                    }
+                    return Some(format!("({} eq {})", lhs, flat_operand(rhs)));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// glob → anchored regex; `!(P).S` extglob → the corpus idiom as a
+/// compound: ends-with-S and not P+S.
+fn glob_or_extglob_to_regex(lhs: &str, pat: &str) -> Option<String> {
+    let pat = pat.trim_matches('"').trim_matches('\'');
+    if let Some(open) = pat.find("!(") {
+        if let Some(close_rel) = pat[open + 2..].find(')') {
+            let close = open + 2 + close_rel;
+            let inner = &pat[open + 2..close];
+            let suffix = &pat[close + 1..];
+            let re_inner = glob_to_regex(inner);
+            let re_suffix = glob_to_regex(suffix);
+            // (x =~ /S$/) && (x !~ /P S$/)
+            return Some(format!(
+                "(({l}) =~ /{rs}$/) && (({l}) !~ /{ri}{rs}$/)",
+                l = lhs,
+                rs = re_suffix,
+                ri = re_inner
+            ));
+        }
+    }
+    Some(format!("^({})$", glob_to_regex(pat)))
 }
 
 /// Tokenize a test string: whitespace-separated, double-quoted runs kept
