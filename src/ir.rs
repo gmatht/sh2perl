@@ -2311,6 +2311,16 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
             cmd.push_str("_SH2DOC_");
             return true;
         }
+        // Process substitution (core-request perl-shir-20260806-1930):
+        // the target carries the inner command text; bash expands it.
+        "process-in" => {
+            cmd.push_str(&format!(" <({})", target));
+            return true;
+        }
+        "process-out" => {
+            cmd.push_str(&format!(" >({})", target));
+            return true;
+        }
         _ => {}
     }
     let op = match mode {
