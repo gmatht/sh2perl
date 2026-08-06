@@ -1,14 +1,19 @@
 #!/bin/bash
-
-# Pipeline examples
+# Pipeline examples (hermetic: runs in its own mktemp scratch, never the
+# shared CWD — the old ls/find/file.txt read the harness's cwd)
+d=$(mktemp -d)
+cd "$d" || exit 1
+printf 'apple\napple\n' > file.txt
+printf 'hello.txt\n' > note.txt
+printf 'function f() { echo hi; }\n' > s.sh
 ls | grep "\.txt$" | wc -l
 echo
 cat file.txt | sort | uniq -c | sort -nr
 echo
-find . -name "*.sh" | xargs grep -l "function"  | tr -d "\\\\/"
+find . -name "*.sh" | xargs grep -l "function" | tr -d "\\\\/"
 echo
-# This pipeline will use line-by-line processing:
 cat file.txt | tr 'a' 'b' | grep 'hello'
 echo
-# This pipeline will fall back to buffered processing:
 cat file.txt | sort | grep 'hello'
+cd /
+rm -rf "$d"
