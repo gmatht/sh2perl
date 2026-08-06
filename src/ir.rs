@@ -612,6 +612,10 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         // Snapshot the positional-arg count BEFORE any $ARGV[n] read (the
         // magic @ARGV extends on indexed reads, corrupting scalar(@ARGV)).
         out.push_str("my $__argc = @ARGV;\n");
+        // Preamble vars the Generator's per-command emulations expect (ls
+        // tracks success; the pipeline machinery accumulates stdout).
+        out.push_str("my $ls_success = 0;\n");
+        out.push_str("my $output = '';\n");
         // Hoisted declarations for assigned variables (use strict).
         let mut vars = Vec::new();
         collect_assigned_vars(&stmts, &mut vars);
@@ -997,11 +1001,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             // two-statement clean form instead of embedding a do-block.
             if targets.len() == 1 && targets[0].indices.is_empty() {
                 let var = &targets[0].var;
-                let lhs = if is_env_style_var_name(var) {
-                    format!("$ENV{{{}}}", var)
-                } else {
-                    format!("${}", var)
-                };
+                let lhs = perl_lhs_for(var);
                 if let IrExpr::Call { func, .. } = expr {
                     if func == "setArray" {
                         // Array assignment: arr=(a b c) → @arr = ('a','b','c');
@@ -1066,11 +1066,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             } else {
                 let lhs = targets
                     .iter()
-                    .map(|t| if is_env_style_var_name(&t.var) {
-                        format!("$ENV{{{}}}", t.var)
-                    } else {
-                        format!("${}", t.var)
-                    })
+                    .map(|t| perl_lhs_for(&t.var))
                     .collect::<Vec<_>>()
                     .join(", ");
                 emit_indent(out, indent);
@@ -1365,6 +1361,32 @@ fn call_arg_str(e: &IrExpr) -> Option<String> {
     }
 }
 
+/// Split a possibly-indexed var name ("matrix[0,0]") into base + optional
+/// comma-key. Bash pseudo-multidimensional arrays bake the subscript into
+/// the name at the parser level (Assign targets with `indices: []`).
+fn split_indexed_var(name: &str) -> (&str, Option<&str>) {
+    if let Some(open) = name.find('[') {
+        if name.ends_with(']') {
+            return (&name[..open], Some(&name[open + 1..name.len() - 1]));
+        }
+    }
+    (name, None)
+}
+
+/// The Perl lhs for a (possibly indexed) var name: `matrix[0,0]` →
+/// `$matrix{"0,0"}` (a hash key — bash's fake-multidim), plain names →
+/// `$name` / `$ENV{name}`.
+fn perl_lhs_for(var: &str) -> String {
+    if is_env_style_var_name(var) {
+        return format!("$ENV{{{}}}", var);
+    }
+    let (base, idx) = split_indexed_var(var);
+    match idx {
+        Some(i) => format!("${{{}}}{{\"{}\"}}", base, i.replace('\"', "\\\"")),
+        None => format!("${}", base),
+    }
+}
+
 /// Render a variable read: getVar("x") / Var("x") → `$x` / `$ENV{x}`;
 /// bash positional params ($1 → $ARGV[0]) and specials ($#, $?, $@).
 fn var_read(name: &str) -> String {
@@ -1542,8 +1564,8 @@ fn render_word(e: &IrExpr) -> String {
 /// `${var…}` parameter expansion (Call param): op, var, value/pattern...
 fn render_param(args: &[IrExpr]) -> String {
     let op = args.first().and_then(call_arg_str).unwrap_or_default();
-    let name = args.get(1).and_then(call_arg_str);
-    let var = name.map(|n| var_read(&n)).unwrap_or_else(|| "''".to_string());
+    let name = args.get(1).and_then(call_arg_str).unwrap_or_default();
+    let var = if name.is_empty() { "''".to_string() } else { var_read(&name) };
     let val = args.get(2).map(render_word).unwrap_or_else(|| "''".to_string());
     let repl = args.get(3).map(render_word).unwrap_or_else(|| "''".to_string());
     match op.as_str() {
@@ -1580,6 +1602,31 @@ fn render_param(args: &[IrExpr]) -> String {
         // Substitution: / first, // all.
         "/" => format!("(({} =~ s/{}/{}/r))", var, glob_to_regex(&val), repl.trim_matches('\\')),
         "//" => format!("(({} =~ s/{}/{}/gr))", var, glob_to_regex(&val), repl.trim_matches('\\')),
+        // Array slice: ${arr[@]:off:len} → @arr[off..off+len-1] (0-based;
+        // the shIR contract normalizes subscripts).
+        "slice" => {
+            let off = args
+                .get(2)
+                .and_then(call_arg_str)
+                .unwrap_or_else(|| "0".to_string())
+                .parse::<i64>()
+                .unwrap_or(0);
+            let end = match args.get(3).and_then(call_arg_str) {
+                Some(l) if !l.is_empty() => {
+                    let len = l.parse::<i64>().unwrap_or(0);
+                    if len <= 0 {
+                        return "()".to_string();
+                    }
+                    off + len - 1
+                }
+                _ => i64::MAX, // unbounded → to the last element
+            };
+            if end == i64::MAX {
+                format!("@{}[{}..$#{}]", name, off, name)
+            } else {
+                format!("@{}[{}..{}]", name, off, end)
+            }
+        }
         _ => {
             // Unknown op — best-effort: return the var (parameter expansions
             // default to the value when the op is unrecognized).
@@ -1764,6 +1811,29 @@ fn bash_brace_syntax(args: &[IrExpr]) -> String {
 
 fn bash_quote_word(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\\\''"))
+}
+
+/// Reuse the AST Generator's per-command in-Perl emulations for an external
+/// command: reconstruct the shell text from IR words, re-parse it into a
+/// `SimpleCommand`, and run the Generator's dispatcher (ls/wc/sed/… become
+/// native Perl, no bash dependency). Returns None when the command isn't
+/// emulatable (caller falls back to `bash -c` shell-out).
+fn generator_emulate_command(cmd: &str, words: &[&IrExpr]) -> Option<String> {
+    let shell_text = build_shell_cmd(cmd, words);
+    let parsed = crate::Parser::new(&shell_text).parse().ok()?;
+    let simple = parsed.into_iter().find_map(|c| match c {
+        crate::ast::Command::Simple(sc) => Some(sc),
+        _ => None,
+    })?;
+    let mut gen = crate::generator::Generator::new();
+    let perl = crate::generator::commands::simple_commands::generate_simple_command_impl(
+        &mut gen, &simple,
+    );
+    if perl.trim().is_empty() {
+        None
+    } else {
+        Some(perl)
+    }
 }
 
 /// The modern IR packs all of a command's word arguments into a single
@@ -2317,15 +2387,23 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             out.push_str(&format!("sleep({}); $main_exit_code = $CHILD_ERROR = 0;\n", t));
         }
         _ => {
-            // External command — shell out (matches bash stdout by running
-            // the same tool; the Generator's in-Perl emulations are not
-            // needed for the IR path).
-            let full = build_shell_cmd(&cmd, &words);
-            emit_indent(out, indent);
-            out.push_str(&format!(
-                "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-                safe_perl_q_string(&full)
-            ));
+            // External command — first try the AST Generator's in-Perl
+            // emulation (ls/wc/sed/… native, no bash dependency); fall back
+            // to bash -c shell-out when there is no emulation.
+            if let Some(perl) = generator_emulate_command(&cmd, &words) {
+                for line in perl.lines() {
+                    emit_indent(out, indent);
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            } else {
+                let full = build_shell_cmd(&cmd, &words);
+                emit_indent(out, indent);
+                out.push_str(&format!(
+                    "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+                    safe_perl_q_string(&full)
+                ));
+            }
         }
     }
 }
@@ -2500,10 +2578,18 @@ fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
             if func == "getVar" || func == "param" {
                 let idx = if func == "param" { 1 } else { 0 };
                 if let Some(name) = args.get(idx).and_then(call_arg_str) {
+                    // param "slice" (${arr[@]:o:l}) reads an ARRAY.
+                    let sigil = if func == "param"
+                        && args.first().and_then(call_arg_str).as_deref() == Some("slice")
+                    {
+                        Sigil::Array
+                    } else {
+                        Sigil::Scalar
+                    };
                     if var_is_declarable(&name)
                         && !out.iter().any(|(n, _)| n == &name)
                     {
-                        out.push((name, Sigil::Scalar));
+                        out.push((name, sigil));
                     }
                 }
             }
@@ -3424,6 +3510,10 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // the idiomatic `chomp $var;` (without parentheses).
                     if func == "chomp" && args.len() == 1 {
                         format!("chomp {}", a)
+                    // `join` needs a separator — a single argument (e.g. an
+                    // array-slice param) gets the space join.
+                    } else if func == "join" && args.len() == 1 {
+                        format!("join(' ', {})", a)
                     // Special-case `join` to produce the idiomatic `join $sep, @list`
                     // (without parentheses) — the function-call parens add noise here.
                     } else if func == "join" && args.len() >= 2 {
