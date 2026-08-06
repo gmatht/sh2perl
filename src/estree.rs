@@ -1417,7 +1417,11 @@ mod tests {
         assert!(!json3.contains("unsupported"));
         let json4 = to_json("x=$(date)");
         assert!(json4.contains("\"type\":\"AssignmentExpression\""));
-        assert!(json4.contains("\"name\":\"capture\""));
+        // `$(date)` lifts to the native value twin of the sync builtin
+        // (sh2.date — no capture machinery, no spawn); a genuinely
+        // external capture keeps the await sh2.capture call.
+        assert!(json4.contains("\"name\":\"date\""));
+        assert!(!json4.contains("\"name\":\"capture\""));
         assert!(!json4.contains("\"name\":\"setVar\""));
     }
 
@@ -1465,12 +1469,19 @@ mod tests {
     #[test]
     fn command_substitution_uses_await_capture() {
         // Unquoted $(...) word-splits: captureWords returns an arg array.
+        // `$(date)` keeps captureWords (bash word-splits the date output)
+        // but the inner spawn is gone — the sync builtin twin runs inside.
         let json = to_json("echo $(date)");
-        assert!(json.contains("\"type\":\"AwaitExpression\""));
         assert!(json.contains("\"name\":\"captureWords\""));
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(json.contains("\"value\":\"date\""));
         assert!(!json.contains("unsupported"));
-        // Quoted "$(...)" stays a plain template capture (no word splitting).
-        let json2 = to_json("echo \"$(date)\"");
+        // a non-liftable command substitution keeps the await capture
+        // machinery: captureWords for unquoted, capture for quoted.
+        let json3 = to_json("echo $(ls)");
+        assert!(json3.contains("\"type\":\"AwaitExpression\""));
+        assert!(json3.contains("\"name\":\"captureWords\""));
+        let json2 = to_json("echo \"$(ls)\"");
         assert!(json2.contains("\"name\":\"capture\""));
         assert!(!json2.contains("captureWords"));
     }
