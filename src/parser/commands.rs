@@ -144,9 +144,29 @@ impl Parser {
                         self.lexer.next();
                         break;
                     }
-                    Some(Token::DoubleSemicolon) | Some(Token::ParenClose) => {
+                    Some(Token::DoubleSemicolon) => {
                         commands.truncate(line_start);
                         self.lexer.next();
+                        return Ok(commands);
+                    }
+                    Some(Token::ParenClose) => {
+                        // A stray `)` after a command (outside any
+                        // subshell — the subshell body loop pre-checks
+                        // ParenClose): bash runs the commands BEFORE it,
+                        // then aborts with a syntax error (exit 2). Recover
+                        // the `)` as a literal command — the ESTree
+                        // runner's stray-`)` path (exit 2) then matches
+                        // bash; the Perl renderer's handling is
+                        // best-effort.
+                        self.lexer.next();
+                        commands.push(Command::Simple(SimpleCommand {
+                            name: Word::literal(")".to_string()),
+                            args: vec![],
+                            redirects: vec![],
+                            env_vars: BTreeMap::new(),
+                            stdout_used: true,
+                            stderr_used: true,
+                        }));
                         return Ok(commands);
                     }
                     Some(Token::Background) => {
@@ -404,6 +424,24 @@ impl Parser {
                     let cmd = self.parse_pipeline()?;
                     Command::Not(Box::new(cmd))
                 }
+                Some(Token::ParenClose) => {
+                    // A stray `)` outside any subshell (the subshell body
+                    // loop pre-checks ParenClose, so reaching here is always
+                    // a bash syntax error: bash executes everything BEFORE
+                    // it, then aborts with exit 2). Recover it as a literal
+                    // `)` command — the ESTree runner's stray-`)` path
+                    // (exit 2) then matches bash; the Perl renderer's
+                    // handling is best-effort.
+                    self.lexer.next();
+                    Command::Simple(SimpleCommand {
+                        name: Word::literal(")".to_string()),
+                        args: vec![],
+                        redirects: vec![],
+                        env_vars: BTreeMap::new(),
+                        stdout_used: true,
+                        stderr_used: true,
+                    })
+                }
                 Some(Token::Semicolon) | Some(Token::DoubleSemicolon) => {
                     // Skip semicolon/double-semicolon and continue parsing
                     self.lexer.next();
@@ -466,7 +504,6 @@ impl Parser {
     fn parse_command_redirects(&mut self, mut command: Command) -> Result<Command, ParserError> {
         // Check if there are redirects following the command
         let mut redirects = Vec::new();
-        let mut had_heredoc = false;
 
         // Parse redirects until we hit a command separator or other non-redirect token.
         // Skip inline whitespace between redirects so sequences like `cmd <(a) <(b)`
@@ -496,61 +533,22 @@ impl Parser {
                 | Token::RedirectOutClobber
                 | Token::RedirectAll
                 | Token::RedirectAllAppend => {
-                    let is_heredoc = matches!(token, Token::Heredoc | Token::HeredocTabs);
                     redirects.push(parse_redirect(&mut self.lexer)?);
-                    if is_heredoc {
-                        had_heredoc = true;
-                    }
                     self.lexer.skip_inline_whitespace_and_comments();
                 }
                 _ => break,
             }
         }
 
-        // Handle dangling || / && after a heredoc.
-        // In bash, `cat >file <<EOF ||` (with nothing after || on the same line)
-        // is valid M-bM-^@M-^T the operator is silently ignored.  Detect this by checking
-        // whether the rest of the line (after the operator) contains only whitespace.
-        if had_heredoc {
-            if let Some(Token::And) | Some(Token::Or) = self.lexer.peek() {
-                if let Some((start, _)) = self.lexer.get_span() {
-                    let input_bytes = self.lexer.input.as_bytes();
-                    let mut pos = start;
-                    // Scan from the operator position to the end of the line.
-                    while pos < input_bytes.len() && input_bytes[pos] != b'\n' {
-                        match input_bytes[pos] {
-                            b'|' | b'&' | b' ' | b'\t' => {
-                                pos += 1;
-                            }
-                            _ => break,
-                        }
-                    }
-                    // If we reached the newline (or end of input) without finding
-                    // a non-whitespace, non-operator character, this is a dangling
-                    // operator.  Consume it.
-                    if (pos < input_bytes.len() && input_bytes[pos] == b'\n')
-                        || pos >= input_bytes.len()
-                    {
-                        // Dangling operator M-bM-^@M-^T consume it and the following newline.
-                        self.lexer.next(); // consume the operator
-                        // Consume trailing whitespace/newlines
-                        while let Some(tok) = self.lexer.peek() {
-                            match tok {
-                                Token::Space | Token::Tab | Token::Newline
-                                | Token::CarriageReturn | Token::Comment => {
-                                    self.lexer.next();
-                                }
-                                _ => break,
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         // After parsing redirects, collect any additional arguments on the same line.
         // bash allows redirects between arguments (e.g. `grep >/dev/null pattern file`).
         // Only process SimpleCommand and break on keywords that start new statements.
+        // NOTE: a `||`/`&&` after a heredoc header is a normal list
+        // continuation in bash (verified: `cat <<EOF ||` + body + terminator
+        // + `cmd` parses as `cat || cmd` — the right side comes from the
+        // line after the terminator; parse-heredoc-or-dangling.sh). The
+        // operator token survives the heredoc body re-sync, so it flows to
+        // parse_pipeline_from_command below — no special handling here.
         if let Command::Simple(ref mut simple_cmd) = command {
             loop {
                 self.lexer.skip_inline_whitespace_and_comments();

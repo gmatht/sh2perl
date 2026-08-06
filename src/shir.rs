@@ -411,20 +411,20 @@ fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMa
 /// consumes the statement's value) — under errexit NO write is droppable
 /// and the pass returns empty.
 ///
-/// The PROGRAM-FINAL status is NOT observable in the ESTree backend: the
-/// runner's exit code is 0 unless the `exit` builtin fired (it reads
-/// lastExit itself and is scanned as a reader), `_finish()` never reads
-/// lastExit, EXIT trap handlers run under REAL bash via spawnSync (they
-/// see bash's own status, not sh2.lastExit), and the corpus harness
-/// compares stdout only. So the program-level `end_live` is FALSE — the
-/// final statement's write is dead unless a later statement reads it.
+/// The PROGRAM-FINAL status IS observable in the ESTree backend: the
+/// runner's `sh2._finish()` exits with `sh2.lastExit` (bash's exit code =
+/// the last command's status; the corpus gate compares exit codes), so the
+/// program-level `end_live` is TRUE — the final statement's write is live.
+/// EXIT trap handlers run under REAL bash via spawnSync (they see bash's
+/// own status, not sh2.lastExit), which is why `_finish` captures the code
+/// BEFORE running the traps.
 fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, bool> {
     let mut dead = HashMap::new();
     if errexit {
         return dead;
     }
     let mut live: HashSet<usize> = HashSet::new();
-    walk_lastexit_liveness(&prog.stmts, false, &mut live);
+    walk_lastexit_liveness(&prog.stmts, true, &mut live);
     mark_lastexit_dead(&prog.stmts, &live, &mut dead);
     dead
 }
@@ -4726,6 +4726,7 @@ fn param_ir(pe: &ParameterExpansion) -> IrExpr {
         ParameterExpansionOperator::DefaultValue(d) => (":-".into(), vec![st(d)]),
         ParameterExpansionOperator::AssignDefault(d) => (":=".into(), vec![st(d)]),
         ParameterExpansionOperator::ErrorIfUnset(e) => (":?".into(), vec![st(e)]),
+        ParameterExpansionOperator::BadSubstitution => ("badsub".into(), vec![]),
         ParameterExpansionOperator::Basename => ("basename".into(), vec![]),
         ParameterExpansionOperator::Dirname => ("dirname".into(), vec![]),
         ParameterExpansionOperator::ArraySlice(off, len) => (
@@ -7991,13 +7992,14 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let mut loop_status_dead = HashMap::new();
     if !errexit {
         let mut live: HashSet<usize> = HashSet::new();
-        // Program-final `end_live` is FALSE — see compute_lastexit_deadness:
-        // nothing in the ESTree backend observes the final statement's
-        // status (the runner exits 0, `_finish` never reads lastExit, EXIT
-        // traps run under real bash). A trailing loop's per-iteration
-        // `__sh2_loop_last = sh2.lastExit` tracking is therefore dead
-        // weight — the native while lowers to a bare `while (cond) { body }`.
-        walk_lastexit_liveness(&prog.stmts, false, &mut live);
+        // Program-final `end_live` is TRUE — see
+        // compute_lastexit_deadness: the runner's `sh2._finish()` exits
+        // with `sh2.lastExit` (bash's exit code = the last command's
+        // status; the corpus gate compares exit codes), so a trailing
+        // loop's final status IS observable and its `__sh2_loop_last`
+        // tracking must stay live (the tracked native while records the
+        // body's last status, matching bash's loop-status rule).
+        walk_lastexit_liveness(&prog.stmts, true, &mut live);
         for st in &prog.stmts {
             mark_loop_status_deadness(st, &live, &mut loop_status_dead);
         }
@@ -8711,6 +8713,29 @@ fn try_native_case(
         };
         alt = Some(Box::new(stmt));
     }
+    // bash: a case with NO matching pattern has status 0 (the subject's
+    // own evaluation status must NOT leak: `case "$(cmd-not-found)" in
+    // foo) ;; esac` → the cmdsub's 127 is discarded). The innermost if's
+    // empty else (the no-match path) synthesizes the explicit write,
+    // mirroring the IrStmt::If empty-else lowering.
+    let mut chain = alt.take().expect("at least one clause");
+    if let Stmt::IfStatement { alternate, .. } = chain.as_mut() {
+        if alternate.is_none() {
+            *alternate = Some(Box::new(Stmt::BlockStatement {
+                body: vec![Stmt::ExpressionStatement {
+                    expression: Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(sh2_member("lastExit")),
+                        right: Box::new(Expr::Literal {
+                            value: serde_json::Value::from(0),
+                            raw: None,
+                            regex: None,
+                        }),
+                    },
+                }],
+            }));
+        }
+    }
     Some(Stmt::BlockStatement {
         body: std::iter::once(Stmt::VariableDeclaration {
             kind: "const",
@@ -8724,7 +8749,7 @@ fn try_native_case(
         })
         .chain(value_decl)
         .chain(glob_decls)
-        .chain(std::iter::once(*alt.expect("at least one clause")))
+        .chain(std::iter::once(*chain))
         .collect(),
     })
 }
@@ -9817,8 +9842,11 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         if errexit && is_top_level_stmt() {
                             // the top-level guard's exact semantics: a
                             // failing loop aborts the script when `set -e`
-                            // is on (`if (sh2.errexit && sh2.lastExit !== 0)
-                            // process.exit(0);`)
+                            // is on, with the LOOP's status (bash's
+                            // errexit exit code = the failing command's
+                            // status; the gate compares exit codes).
+                            // (`if (sh2.errexit && sh2.lastExit !== 0)
+                            // process.exit(sh2.lastExit);`)
                             tracked.push(Stmt::IfStatement {
                                 test: Expr::LogicalExpression {
                                     operator: "&&".to_string(),
@@ -9835,7 +9863,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                                 },
                                 consequent: Box::new(Stmt::BlockStatement {
                                     body: vec![Stmt::ExpressionStatement {
-                                        expression: process_exit_zero(),
+                                        expression: process_exit(sh2_member("lastExit")),
                                     }],
                                 }),
                                 alternate: None,
@@ -10551,12 +10579,56 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         })
                 })
                 .collect();
-            Stmt::SwitchStatement {
-                discriminant: sh2_call(
-                    "caseMatch",
-                    vec![expr_to_estree(discriminant), array(patterns)],
-                ),
-                cases,
+            // bash: the case's exit status is the matched body's last
+            // command status, or 0 when NO pattern matched — the subject's
+            // own evaluation status (`$(cmd-not-found)` → 127) must NOT
+            // leak into the case's status. caseMatch returns the matched
+            // pattern (a string) or undefined; evaluate it ONCE into the
+            // `_m` scratch (it may embed an awaited capture), switch on
+            // the scratch, and zero lastExit on the no-match path. The
+            // scratch read after the switch is safe: a nested case's write
+            // can only falsify the no-match check when the outer body ran
+            // a no-match inner case — which already zeroed lastExit.
+            Stmt::BlockStatement {
+                body: vec![
+                    Stmt::ExpressionStatement {
+                        expression: Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(sh2_member("_m")),
+                            right: Box::new(sh2_call(
+                                "caseMatch",
+                                vec![expr_to_estree(discriminant), array(patterns)],
+                            )),
+                        },
+                    },
+                    Stmt::SwitchStatement {
+                        discriminant: sh2_member("_m"),
+                        cases,
+                    },
+                    Stmt::IfStatement {
+                        test: Expr::BinaryExpression {
+                            operator: "===".to_string(),
+                            left: Box::new(sh2_member("_m")),
+                            right: Box::new(Expr::Identifier {
+                                name: "undefined".to_string(),
+                            }),
+                        },
+                        consequent: Box::new(Stmt::BlockStatement {
+                            body: vec![Stmt::ExpressionStatement {
+                                expression: Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(sh2_member("lastExit")),
+                                    right: Box::new(Expr::Literal {
+                                        value: serde_json::Value::from(0),
+                                        raw: None,
+                                        regex: None,
+                                    }),
+                                },
+                            }],
+                        }),
+                        alternate: None,
+                    },
+                ],
             }
         }
         IrStmt::Return(opt) => Stmt::ReturnStatement {
@@ -12327,7 +12399,26 @@ fn ir_expr_needs_runtime(e: &IrExpr) -> bool {
             // echo would print the marker text instead.
             if func == "param" {
                 if let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args.as_slice() {
-                    if op == "slice" && name.starts_with('!') && name.contains('*') {
+                    if (op == "slice" && name.starts_with('!') && name.contains('*'))
+                        || op == "badsub"
+                    {
+                        return true;
+                    }
+                }
+            }
+            // arrayIndex — the runner returns ARITH_BAD_MAGIC when the
+            // subscript arithmetic fails to EVALUATE (`${arr[(2*$i)-1]}`
+            // with $i unset → "syntax error in expression" → bash skips
+            // the whole command, status 1; the magic cannot be statically
+            // predicted — it depends on runtime var values). getVar with a
+            // `name[key]` name has the identical runtime path. A native
+            // echo would print the marker through String(); the runtime
+            // dispatch's flattener checks it.
+            if matches!(func.as_str(), "arrayIndex" | "getVar") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if func == "arrayIndex"
+                        || (n.contains('[') && n.contains(']'))
+                    {
                         return true;
                     }
                 }
@@ -18974,14 +19065,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                 }
             }
-            // `exit N` — the runtime builtin ignores the code and terminates
-            // the process cleanly (the corpus gate compares stdout only; a
-            // nonzero exit would read as a runtime error, see sh2-namespace.mjs
-            // `builtins.exit`). A native `process.exit(0)` is byte-identical;
-            // the argument exprs are sequenced first so their side effects
-            // (`exit $((i++))`) evaluate exactly as they would in the
-            // dispatch. Any caller-visible state is irrelevant — the process
-            // is gone either way.
+            // `exit N` — bash exits with N (mod 256); `exit` with the
+            // previous status (`$?`). The corpus gate compares the
+            // program's exit code against bash's, so the code must be
+            // REAL — a deliberate 0 reads as an exit-code mismatch. The
+            // argument exprs are evaluated ONCE as the process.exit
+            // argument (`exit $((i++))` side effects behave exactly as in
+            // the runtime dispatch); Number() coerces string args ("1" →
+            // 1). Any caller-visible state is irrelevant — the process is
+            // gone either way.
             if func == "exec" {
                 if let [IrExpr::Str(name, _), IrExpr::Array(_)] = args.as_slice() {
                     if name == "exit" {
@@ -18994,11 +19086,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                 _ => None,
                             })
                             .unwrap_or_default();
-                        exprs.push(process_exit_zero());
-                        if exprs.len() == 1 {
-                            return exprs.pop().unwrap();
-                        }
-                        return seq(exprs);
+                        let code = match exprs.as_slice() {
+                            [] => sh2_member("lastExit"),
+                            [first, ..] => Expr::CallExpression {
+                                callee: Box::new(Expr::Identifier {
+                                    name: "Number".to_string(),
+                                }),
+                                arguments: vec![first.clone()],
+                                optional: false,
+                            },
+                        };
+                        return process_exit(code);
                     }
                 }
             }
@@ -19496,10 +19594,12 @@ fn bool_lit(b: bool) -> Expr {
     }
 }
 
-/// `process.exit(0)` — the runtime's clean-termination convention (the
-/// corpus gate compares stdout only; a nonzero exit would read as a
-/// runtime error). Shared by the native `exit` and `guard` lowerings.
-fn process_exit_zero() -> Expr {
+/// `process.exit(code)` — the runtime's clean-termination convention. The
+/// corpus gate compares the program's exit code against bash's
+/// (fail-estree: "exit code (bash=N estree=M)"), so the code must be
+/// REAL — the exit builtin, errexit guards and the program-final status
+/// (sh2._finish) all exit with the status bash would.
+fn process_exit(code: Expr) -> Expr {
     Expr::CallExpression {
         callee: Box::new(Expr::MemberExpression {
             object: Box::new(Expr::Identifier {
@@ -19511,29 +19611,41 @@ fn process_exit_zero() -> Expr {
             computed: false,
             optional: false,
         }),
-        arguments: vec![Expr::Literal {
-            value: serde_json::Value::from(0),
-            raw: None,
-        regex: None,
-        }],
+        arguments: vec![code],
         optional: false,
     }
 }
 
+/// `process.exit(0)` — shared by the native `exit`-with-no-status and
+/// guard lowerings when the status is provably zero.
+fn process_exit_zero() -> Expr {
+    process_exit(Expr::Literal {
+        value: serde_json::Value::from(0),
+        raw: None,
+        regex: None,
+    })
+}
+
 /// `sh2.guard(v)` — the runtime helper's exact semantics
-/// (`if (this.errexit && !v) process.exit(0); return v;`) as a native
-/// expression: `(sh2._g = v, sh2.errexit && !sh2._g ? process.exit(0) :
-/// sh2._g)`. The wrapped value must be evaluated EXACTLY ONCE (it is
-/// usually an awaited command run), so the runtime object's `_g` field is
-/// a single-use scratch — the assignment and its reads are one
-/// synchronous sequence, and JS is single-threaded, so a nested guard's
-/// scratch use can never interleave with an outer one.
+/// (`if (this.errexit && !v) process.exit(<failing status>); return v;`)
+/// as a native expression: `(sh2._g = v, sh2.errexit && !sh2._g ?
+/// process.exit(…) : sh2._g)`. The wrapped value must be evaluated
+/// EXACTLY ONCE (it is usually an awaited command run), so the runtime
+/// object's `_g` field is a single-use scratch — the assignment and its
+/// reads are one synchronous sequence, and JS is single-threaded, so a
+/// nested guard's scratch use can never interleave with an outer one.
+///
+/// Exit code: bash `set -e` aborts with the FAILING command's status. A
+/// runtime call (exec/builtin/test/…) records it in `sh2.lastExit` before
+/// returning; a native expression has no recorded status, and its status
+/// is exactly `v ? 0 : 1` (a native test/comparison failing under errexit
+/// exits 1 in bash).
 fn guard_native(v: Expr) -> Expr {
     let tmp = sh2_member("_g");
     let store = Expr::AssignmentExpression {
         operator: "=".to_string(),
         left: Box::new(tmp.clone()),
-        right: Box::new(v),
+        right: Box::new(v.clone()),
     };
     let check = Expr::LogicalExpression {
         operator: "&&".to_string(),
@@ -19544,11 +19656,28 @@ fn guard_native(v: Expr) -> Expr {
             prefix: true,
         }),
     };
+    // unwrap a top-level await: the wrapped statement is usually
+    // `await sh2.exec(...)` — the status lives in lastExit.
+    let records_status = match &v {
+        Expr::AwaitExpression { argument, .. } => sets_last_exit(argument),
+        _ => sets_last_exit(&v),
+    };
+    let exit_code = if records_status {
+        sh2_member("lastExit")
+    } else {
+        // native expression: status = v ? 0 : 1 (the guard fires when
+        // v is falsy → always 1)
+        Expr::Literal {
+            value: serde_json::Value::from(1),
+            raw: None,
+            regex: None,
+        }
+    };
     seq(vec![
         store,
         Expr::ConditionalExpression {
             test: Box::new(check),
-            consequent: Box::new(process_exit_zero()),
+            consequent: Box::new(process_exit(exit_code)),
             alternate: Box::new(tmp.clone()),
         },
     ])

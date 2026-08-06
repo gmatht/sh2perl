@@ -228,6 +228,13 @@ pub fn generate_parameter_expansion_impl(
                 r, r, r, error
             )
         }
+        ParameterExpansionOperator::BadSubstitution => {
+            // `${arr[1]>2}` — bash rejects the expansion ("bad
+            // substitution", skips the command); the Perl generator has
+            // no skip mechanism, so render the raw variable reference
+            // (best-effort; the corpus file is a bash-error probe).
+            parameter_var_scalar_ref(generator, &pe.variable)
+        }
         ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
             // ${var%suffix} - remove shortest suffix
             // To get shortest (rightmost) suffix, use the reverse trick:
