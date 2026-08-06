@@ -819,6 +819,50 @@ pub fn generate_cstyle_for_loop_impl(
     output
 }
 
+/// `for i in $(seq A B)` — a single UNQUOTED command substitution of
+/// `seq` with plain integer literal args (1-arg `seq LAST` starts at 1,
+/// GNU semantics): the native Perl range `for my $i (A..B)`, mirroring
+/// the `{1..5}` brace-expansion path. Anything doubtful keeps the
+/// word-list path (correct, just unoptimized): flags, floats, leading
+/// zeros (GNU pads `01 02 …`), 3-arg step forms, redirects/env.
+fn for_seq_range(items: &[Word]) -> Option<(i64, i64)> {
+    let [Word::CommandSubstitution(cmd, _)] = items else {
+        return None;
+    };
+    let Command::Simple(sc) = cmd.as_ref() else {
+        return None;
+    };
+    if !matches!(&sc.name, Word::Literal(n, _) if n == "seq") {
+        return None;
+    }
+    if !sc.redirects.is_empty() || !sc.env_vars.is_empty() {
+        return None;
+    }
+    let ints: Vec<i64> = sc
+        .args
+        .iter()
+        .map(|a| match a {
+            Word::Literal(s, _) => {
+                // leading zero → GNU pads the output (`01 02 …`); a Perl
+                // integer range would print plain numbers — keep the
+                // word path (byte-identical output matters)
+                if (s.len() > 1 && s.starts_with('0'))
+                    || (s.starts_with('-') && s.len() > 2 && s.starts_with("-0"))
+                {
+                    return None;
+                }
+                s.parse::<i64>().ok()
+            }
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    match ints.as_slice() {
+        [last] => Some((1, *last)),
+        [first, last] => Some((*first, *last)),
+        _ => None,
+    }
+}
+
 pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> String {
     let mut output = String::new();
 
@@ -855,17 +899,47 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
     // Generate for loop using IR nodes for simple cases, falling back to
     // string formatting for complex cases.
     //
-    // Check if this is a simple numeric range for loop (e.g. `for i in {1..5}`).
+    // Check if this is a simple numeric range for loop (`for i in {1..5}`
+    // or `for i in $(seq A B)` with integer literal args).
     // If so, emit an `IrStmt::For` with `IrExpr::Range` so the IR backend
     // controls formatting (clean spacing, no magic-number constants, etc.).
     //
     // For complex cases (string lists, brace expansions with prefixes/suffixes,
     // array variables, etc.) we fall back to the existing string-based approach.
-    let is_simple_range = for_loop.items.len() == 1
-        && matches!(&for_loop.items[0], Word::BraceExpansion(e, _) if e.items.len() == 1 && matches!(&e.items[0], BraceItem::Range(_)) && e.prefix.is_none() && e.suffix.is_none());
+    let is_simple_range = (for_loop.items.len() == 1
+        && matches!(&for_loop.items[0], Word::BraceExpansion(e, _) if e.items.len() == 1 && matches!(&e.items[0], BraceItem::Range(_)) && e.prefix.is_none() && e.suffix.is_none()))
+        || for_seq_range(&for_loop.items).is_some();
 
     if is_simple_range {
+        // `for i in $(seq A B)` with plain integer args: the bounds come
+        // from the seq command substitution (1-arg `seq LAST` starts at 1,
+        // GNU semantics).
+        let seq_bounds = for_seq_range(&for_loop.items);
         // Build IrStmt::For with IrExpr::Range, then format via stmt_to_perl.
+        if let Some((start_num, end_num)) = seq_bounds {
+            // Build the body as RawText.  The body generator still
+            // produces string output; it uses generator.indent_level
+            // for indentation, so bump it first.
+            generator.indent_level += 1;
+            let body_str = generator.generate_block_commands(&for_loop.body);
+            generator.indent_level -= 1;
+
+            let ir_for = crate::ir::IrStmt::For {
+                var: for_loop.variable.clone(),
+                iter: crate::ir::IrExpr::Range { start: start_num, end: end_num },
+                body: vec![crate::ir::IrStmt::RawText(body_str)],
+            };
+            output.push_str(&crate::ir::stmt_to_perl(&ir_for, generator.indent_level));
+
+            // Post-loop persistence: if the variable is used after the loop,
+            // assign it the final value (shell-compatibility).
+            if generator.function_level_vars.contains(&for_loop.variable) {
+                output.push_str(&generator.indent());
+                output.push_str(&format!("${} = {};\n", for_loop.variable, end_num));
+            }
+
+            return output;
+        }
         if let Word::BraceExpansion(expansion, _) = &for_loop.items[0] {
             if let BraceItem::Range(range) = &expansion.items[0] {
                 if let (Ok(start_num), Ok(end_num)) =
@@ -1104,6 +1178,17 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                 } else {
                     all_items.push(generator.word_to_perl(word));
                 }
+            }
+            Word::CommandSubstitution(_, _) => {
+                // Unquoted `$(cmd)`: bash word-splits the output (IFS
+                // whitespace, trailing newlines already stripped) into
+                // the iteration list. `word_to_perl` returns the SCALAR
+                // output — a one-element list would iterate ONCE over the
+                // whole joined string (the `seq` fast path above is the
+                // native-range form; everything else lands here). Split
+                // so the loop iterates per word, like bash.
+                let w = generator.word_to_perl(word);
+                all_items.push(format!("split /\\s+/, {}", w));
             }
             _ => all_items.push(generator.word_to_perl(word)),
         }

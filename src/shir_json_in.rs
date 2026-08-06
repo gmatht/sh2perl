@@ -712,6 +712,43 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// The const-markup round-trips: `--shir` attaches the verdicts
+    /// (LIMIT const, i/sum var), the reader ingests them, and re-serializing
+    /// is byte-identical.
+    /// The seq_range_for transform's BARE `Range` For.iterable (PLAN §5.6)
+    /// round-trips: `--shir` emits `{"type":"Range",start,end}` as the
+    /// For.iter, the reader ingests it, and re-serializing is byte-identical
+    /// (every backend matches the bare Range arm of its For handler).
+    #[test]
+    fn seq_range_for_bare_range_roundtrip() {
+        let json = round_trip("for i in $(seq 1 10000); do echo $i; done");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let iter = &v["stmts"][0]["iter"];
+        assert_eq!(iter["type"], "Range", "bare Range iterable, got: {iter}");
+        assert_eq!(iter["start"], 1);
+        assert_eq!(iter["end"], 10000);
+        // and the deserialized program re-serializes byte-identically
+        // (round_trip already did the full loop; assert the shape survived)
+        assert!(iter.get("elements").is_none(), "no Array wrapper around the Range: {iter}");
+    }
+
+    #[test]
+    fn var_const_roundtrip() {
+        let json = round_trip("LIMIT=10\nsum=0\nfor i in 1 2; do sum=$((sum+i)); done\necho $LIMIT $sum");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let vc = v.get("var_const").and_then(|x| x.as_array());
+        assert!(vc.is_some(), "var_const missing from serialized ShIR: {json}");
+        let vc = vc.unwrap();
+        assert_eq!(vc.len(), 3, "expected LIMIT/i/sum verdicts, got {vc:?}");
+        let names: Vec<&str> = vc.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["LIMIT", "i", "sum"], "sorted by name");
+        let kinds: Vec<&str> = vc.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["Const", "Var", "Var"]);
+        // unknown kind rejected
+        let bad = json.replace("\"Var\"", "\"Maybe\"");
+        assert!(shir_json_to_ir(&bad).is_err());
+    }
+
     #[test]
     fn contract_version_required() {
         let mut prog = IrProgram { imports: vec![], requires: vec![],

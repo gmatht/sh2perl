@@ -1064,6 +1064,26 @@ mod tests {
     }
 
     #[test]
+    fn if_empty_else_lastexit_dropped_when_unread() {
+        // `if c; then ...; fi` with NO else synthesizes a false-path
+        // `sh2.lastExit = 0` (bash: false cond + no else → $? = 0). The
+        // Plan 4 liveness now marks it dead when nothing reads the if's
+        // status — the if lowers to a plain `if (c) { ... }`, no else.
+        let json = to_json("if false; then echo yes; fi");
+        assert!(json.contains("\"type\":\"IfStatement\""));
+        assert!(json.contains("\"alternate\":null"), "dead status write → no else");
+        assert!(!json.contains("unsupported"));
+        // a READER keeps the write: `; echo $?` observes the false-path 0
+        let json2 = to_json("if false; then echo yes; fi; echo $?");
+        assert!(json2.contains("\"alternate\":{\"type\""), "read status → else kept");
+        assert!(!json2.contains("unsupported"));
+        // a later WRITER shadows the if's status → the write is dead again
+        let json3 = to_json("if false; then echo yes; fi; false; echo $?");
+        assert!(json3.contains("\"alternate\":null"), "shadowed by `false` → no else");
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
     fn echo_lowers_to_builtin_call() {
         // `echo` with literal args at the default stdout sink → a NATIVE
         // `process.stdout.write` sequence (no dispatch at all); echo args
@@ -1081,6 +1101,39 @@ mod tests {
         let json2 = to_json("echo *.txt");
         assert!(json2.contains("\"name\":\"builtin\""));
         assert!(!json2.contains("\"name\":\"write\""));
+    }
+
+    #[test]
+    fn echo_single_arg_skips_the_join() {
+        // `echo "$i"` — one QUOTED non-literal arg: `[String(i)].join(" ")` is
+        // exactly `String(i)` (a one-element join never inserts the
+        // separator), so the emitter emits the bare value — no array /
+        // join machinery. An UNQUOTED `echo $i` is a field-split arg (the
+        // A1 split marker) and legitimately takes the flat/join path (the
+        // shortcut would comma-join a multi-word value).
+        let json = to_json("i=42; echo \"$i\"");
+        assert!(json.contains("\"name\":\"String\""));
+        assert!(!json.contains("\"name\":\"join\""), "single arg: no join");
+        assert!(!json.contains("\"type\":\"ArrayExpression\""), "single arg: no array");
+        assert!(!json.contains("unsupported"));
+        // unquoted: the split arg keeps the flat/join path
+        let json_unq = to_json("i=42; echo $i");
+        assert!(json_unq.contains("\"name\":\"join\""));
+        // two args keep the word-join
+        let json2 = to_json("i=42; echo $i $i");
+        assert!(json2.contains("\"name\":\"join\""));
+        assert!(json2.contains("\"type\":\"ArrayExpression\""));
+        assert!(!json2.contains("unsupported"));
+        // an ARRAY-VALUED single arg (unquoted `$(...)` captureWords — the
+        // runtime splices its words) must still splice + join — it is not
+        // a scalar; a capture ASSIGNED to a var is a scalar string
+        let json3 = to_json("echo $(echo 1 2 3)");
+        assert!(json3.contains("\"name\":\"join\""));
+        assert!(json3.contains("\"name\":\"flat\""));
+        assert!(!json3.contains("unsupported"));
+        let json4 = to_json("x=$(echo 1 2 3); echo \"$x\"");
+        assert!(!json4.contains("\"name\":\"join\""), "capture-assigned var is a scalar");
+        assert!(!json4.contains("unsupported"));
     }
 
     #[test]
@@ -1382,10 +1435,13 @@ mod tests {
         assert!(!json.contains("\"name\":\"getVar\""));
         assert!(!json.contains("unsupported"));
         // a CAPTURE source lifts to a native binding; a read/write-builtin
-        // var (read/declare/local/export...) stays a store read
+        // var (read/declare/local/export...) stays a store read. The echo
+        // has ONE interpolated arg — the single-arg collapse emits the
+        // bare template, no join.
         let json2 = to_json("name=$(echo world)\necho \"Hello $name\"");
         assert!(!json2.contains("\"name\":\"getVar\""));
-        assert!(json2.contains("\"name\":\"join\""));
+        assert!(!json2.contains("\"name\":\"join\""), "single interpolated arg: no join");
+        assert!(json2.contains("\"type\":\"TemplateLiteral\""));
         assert!(!json2.contains("unsupported"));
         let json3 = to_json("read name\necho \"Hello $name\"");
         assert!(json3.contains("\"name\":\"getVar\""));
