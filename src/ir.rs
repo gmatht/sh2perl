@@ -703,7 +703,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         // Neutral ESTree-path-only nodes — the Perl generator never emits them.
-        IrStmt::Case { .. } | IrStmt::Subshell(_) | IrStmt::Background(_) => {
+        IrStmt::Subshell(_) | IrStmt::Background(_) => {
             // plan improvement #5 (partial): these ESTree-path-only stmts
             // still lack a Perl renderer. Emit a clear runtime error so
             // the failure is actionable, not a panic.
@@ -715,6 +715,38 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 _ => "other",
             });
             out.push_str(")\\n\";\n");
+        }
+        IrStmt::Case { discriminant, clauses } => {
+            // case $x in pat1) …;; pat2) …;; *) …;; esac → if/elsif chain on
+            // regex-translated glob patterns (bash case is anchored glob
+            // matching on the value).
+            let d = ir_expr_to_perl(discriminant);
+            let mut any_emitted = false;
+            for (i, clause) in clauses.iter().enumerate() {
+                let has_default = clause.patterns.iter().any(|p| p == "*");
+                let patterns: Vec<String> = clause
+                    .patterns
+                    .iter()
+                    .filter(|p| p.as_str() != "*")
+                    .map(|p| glob_to_regex(p))
+                    .collect();
+                let kw = if i == 0 && !any_emitted { "if" } else { "elsif" };
+                if has_default && i == clauses.len() - 1 {
+                    // `*)` final clause — render as else.
+                    emit_indent(out, indent);
+                    out.push_str("} else {\n");
+                } else {
+                    let re = format!("^(?:{})$", patterns.join("|"));
+                    emit_indent(out, indent);
+                    out.push_str(&format!("{} ({} =~ /{}/) {{\n", kw, d, re));
+                }
+                for s in &clause.body {
+                    emit_stmt(out, s, indent + 1);
+                }
+                any_emitted = true;
+            }
+            emit_indent(out, indent);
+            out.push_str("}\n");
         }
         IrStmt::Function { name, body } => {
             // Shell function → Perl sub. `local @ARGV = @_` maps the bash
@@ -832,6 +864,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             "die \"debashc: sh2.* call `{}` not yet supported by the shIR Perl backend\\n\";\n",
                             func
                         ));
+                    }
+                    "shopt" => {
+                        // Shell-option toggle (shopt -s/-u …) — no runtime
+                        // effect for the supported subset.
+                        emit_indent(out, indent);
+                        out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
                     }
                     "redirect" => {
                         // Statement-position redirect: run the command with its
