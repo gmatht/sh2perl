@@ -2134,6 +2134,28 @@ impl Parser {
                     }
                     Ok(Command::Simple(simple_cmd))
                 }
+                // A redirect-wrapped simple command (`VAR=x read a <<< t` —
+                // the redirect wraps the simple command): merge the env
+                // into the INNER simple command — the env must scope the
+                // actual command, not a sibling no-op (`VAR=x cmd <<< t`
+                // with the env on a separate `true` leaves cmd without
+                // the env — the IFS=, read failing case).
+                Command::Redirect(redir) if matches!(&*redir.command, Command::Simple(_)) => {
+                    let mut inner = match *redir.command {
+                        Command::Simple(mut sc) => {
+                            for (key, value) in env_vars {
+                                sc.env_vars.insert(key, value);
+                            }
+                            Command::Simple(sc)
+                        }
+                        _ => unreachable!("command Simple checked"),
+                    };
+                    // keep the redirect's own structure
+                    Ok(Command::Redirect(RedirectCommand {
+                        command: Box::new(inner),
+                        redirects: redir.redirects,
+                    }))
+                }
                 _ => {
                     // For non-simple commands, wrap in a block with environment variables
                     let mut env_cmd_vars = BTreeMap::new();
