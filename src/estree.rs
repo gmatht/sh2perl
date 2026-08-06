@@ -186,6 +186,15 @@ pub enum Expr {
     SequenceExpression {
         expressions: Vec<Expr>,
     },
+    // `new Promise(r => setTimeout(() => r(true), ms))` — the native
+    // sleep lowering (src/shir.rs try_native_sleep): the exec spawn
+    // collapses to a plain async timer. The executor arrow resolves
+    // `true` (the statement's value feeds the errexit guard, which needs
+    // truthiness like every exec statement's value).
+    NewExpression {
+        callee: Box<Expr>,
+        arguments: Vec<Expr>,
+    },
 }
 
 /// Arrow function body: an expression (`x => expr`) or a block
@@ -1212,6 +1221,94 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn sleep_lowers_to_native_timer() {
+        // `sleep 1` — the exec spawn collapses to a native async timer
+        // `(await new Promise(r => setTimeout(() => r(true), 1000)), …)`:
+        // no exec dispatch, no subprocess. A fractional literal folds to
+        // ms too (`sleep 0.1` → 100); a dynamic arg becomes
+        // `Number(<value>) * 1000` (the runtime's arg flattener turns the
+        // unquoted-expansion split array into one arg for a single-word
+        // value).
+        let json = to_json("sleep 1");
+        assert!(json.contains("\"type\":\"NewExpression\""));
+        assert!(json.contains("setTimeout"));
+        assert!(json.contains("1000"));
+        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(!json.contains("unsupported"));
+        let json2 = to_json("sleep 0.1");
+        assert!(json2.contains("100"), "fractional seconds fold to ms");
+        assert!(!json2.contains("\"name\":\"exec\""));
+        let json3 = to_json("sleep $n");
+        assert!(json3.contains("Number"));
+        assert!(!json3.contains("\"name\":\"exec\""));
+        // a command named sleep with extra args keeps the runtime (bash
+        // would error — the spawn path reports it)
+        let json4 = to_json("sleep 1 2");
+        assert!(json4.contains("\"name\":\"exec\""));
+        // the env-carrying form keeps the runtime (command-scoped env)
+        let json5 = to_json("TZ=UTC sleep 1");
+        assert!(json5.contains("\"name\":\"exec\""));
+    }
+
+    #[test]
+    fn yes_head_capture_lifts_to_native_repeat() {
+        // `$(yes Hello | head -3)` — the infinite-producer capture: yes
+        // prints `Hello\n` forever, head takes the first 3 lines — the
+        // captured value is exactly `(Hello + "\n").repeat(3)` with the
+        // capture strips: no pipeline, no capture arrow, no spawns.
+        let json = to_json("x=$(yes Hello | head -3)");
+        assert!(json.contains("\"name\":\"repeat\""));
+        assert!(json.contains("Hello"));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"capture\""));
+        assert!(!json.contains("\"name\":\"yes\""));
+        assert!(!json.contains("unsupported"));
+        // `head -n 3` / `head -n3` forms lift too; a dynamic head count
+        // keeps the runtime pipeline.
+        let json2 = to_json("x=$(yes Hi | head -n 3)");
+        assert!(json2.contains("\"name\":\"repeat\""));
+        let json3 = to_json("x=$(yes Hi | head -n $n)");
+        assert!(json3.contains("\"name\":\"pipeline\""));
+        assert!(!json3.contains("\"name\":\"repeat\""));
+    }
+
+    #[test]
+    fn ls_lowers_to_sync_builtin_and_hostname_capture_is_native() {
+        // `ls` is a native sync builtin (the GNU-faithful listing): the
+        // exec dispatch lowers to the sync twin — no spawn.
+        let json = to_json("ls -A");
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(!json.contains("unsupported"));
+        // `$(hostname)` — the value-returning runtime twin (like uname/
+        // date/readlink): no capture machinery, no spawn.
+        let json2 = to_json("h=$(hostname)");
+        assert!(json2.contains("\"name\":\"hostname\""));
+        assert!(!json2.contains("\"name\":\"capture\""));
+        assert!(!json2.contains("\"name\":\"exec\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn substitute_all_uses_replace_all_for_dollar_free_replacement() {
+        // `${x//p/r}` with a literal pattern — the runtime's literal fast
+        // path is split/join; a `$`-free replacement lowers one step
+        // further to String.replaceAll (single-pass, same literal
+        // semantics). A `$`-bearing replacement keeps split/join (JS
+        // replaceAll would treat `$&`/`$1` as substitution sequences).
+        let json = to_json("echo \"${x//o/0}\"");
+        assert!(json.contains("\"name\":\"replaceAll\""));
+        assert!(!json.contains("unsupported"));
+        // a `$`-bearing replacement keeps the RUNTIME param call (JS
+        // replaceAll would treat `$&`/`$1` as substitution sequences, and
+        // the positional default is not fully liftable anyway)
+        let json2 = to_json(r#"echo "${x//o/$1}""#);
+        assert!(json2.contains("\"name\":\"param\""));
+        assert!(!json2.contains("\"name\":\"replaceAll\""));
+    }
+
+    #[test]
     fn and_or_chain_store_var_tests_lower_native() {
         // `[[ "$a" == "x" ]] && [[ "$b" == "y" ]]` — the chain links
         // branch on lastExit, so each test records its status natively
@@ -1640,9 +1737,16 @@ mod tests {
         let json2 = to_json("FOO=bar grep x");
         assert!(json2.contains("\"name\":\"builtin\""));
         assert!(json2.contains("FOO"));
+        // `ls` is a native sync builtin too (the GNU-faithful native
+        // listing — no spawn), so the env-carrying form lowers to the
+        // sync twin as well; a genuinely external name (cp) keeps the
+        // async exec call.
         let json3 = to_json("FOO=bar ls x");
-        assert!(json3.contains("\"name\":\"exec\""));
+        assert!(json3.contains("\"name\":\"builtin\""));
         assert!(json3.contains("FOO"));
+        let json4 = to_json("FOO=bar cp x y");
+        assert!(json4.contains("\"name\":\"exec\""));
+        assert!(json4.contains("FOO"));
     }
 
     #[test]
