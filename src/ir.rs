@@ -545,10 +545,30 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
 
     // Run optimization passes before emitting.
     let stmts = optimize_stmts(&prog.stmts);
+    let modern_ir = prog.imports.is_empty();
+
+    // Function calls: exec(foo, …) where foo is a defined shell function
+    // must become a Perl sub call (bash -c would not know it). Rewrite the
+    // stmts first; the emitter renders the marker as a sub call.
+    let stmts = if modern_ir {
+        let fns: std::collections::HashSet<String> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                IrStmt::Function { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        if fns.is_empty() {
+            stmts
+        } else {
+            rewrite_fn_calls(&stmts, &fns)
+        }
+    } else {
+        stmts
+    };
 
     // Imports (`use` statements).
     // Auto-derive `use feature 'say'` if any Output { newline: true } exists.
-    let modern_ir = prog.imports.is_empty();
     let mut imports = prog.imports.clone();
     if modern_ir {
         // Modern-IR program (`--shir` → `--shir-in-perl`): the JSON contract
@@ -683,22 +703,33 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         // Neutral ESTree-path-only nodes — the Perl generator never emits them.
-        IrStmt::Case { .. }
-        | IrStmt::Function { .. }
-        | IrStmt::Subshell(_)
-        | IrStmt::Background(_) => {
+        IrStmt::Case { .. } | IrStmt::Subshell(_) | IrStmt::Background(_) => {
             // plan improvement #5 (partial): these ESTree-path-only stmts
             // still lack a Perl renderer. Emit a clear runtime error so
             // the failure is actionable, not a panic.
             emit_indent(out, indent);
             out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (");
             out.push_str(match stmt {
-                IrStmt::Function { .. } => "function definition",
                 IrStmt::Subshell(_) => "subshell",
                 IrStmt::Background(_) => "background",
                 _ => "other",
             });
             out.push_str(")\\n\";\n");
+        }
+        IrStmt::Function { name, body } => {
+            // Shell function → Perl sub. `local @ARGV = @_` maps the bash
+            // positional params ($1 → $ARGV[0]) onto the function's args;
+            // the body's statements render inline (bash functions share the
+            // global scope; Perl subs see the hoisted lexical vars).
+            emit_indent(out, indent);
+            out.push_str(&format!("sub {} {{\n", name));
+            emit_indent(out, indent + 1);
+            out.push_str("local @ARGV = @_;\n");
+            for s in body {
+                emit_stmt(out, s, indent + 1);
+            }
+            emit_indent(out, indent);
+            out.push_str("}\n");
         }
         IrStmt::Redirect { inner, redirects } => {
             // Rebuild the shell command with shell redirection syntax and
@@ -747,7 +778,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             // Call{exec/test/pipeline/redirect/…} or as `&&`/`||` chains of
             // those (BinOp) — lower them all to shell-out via bash -c.
             match e {
-                IrExpr::Call { func, .. } => match func.as_str() {
+                IrExpr::Call { func, args } => match func.as_str() {
                     "break" => {
                         emit_indent(out, indent);
                         out.push_str("last;\n");
@@ -760,6 +791,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     }
                     "exec" => {
                         emit_exec_call(out, e, indent);
+                    }
+                    "$fn_call" => {
+                        // Call to a shell function defined in this program
+                        // (rewritten by shir_to_perl): a Perl sub call.
+                        let name = args.first().and_then(call_arg_str).unwrap_or_default();
+                        let rest: Vec<String> = args[1..].iter().map(render_word).collect();
+                        emit_indent(out, indent);
+                        out.push_str(&format!(
+                            "{}({}); $main_exit_code = $CHILD_ERROR = 0;\n",
+                            name,
+                            rest.join(", ")
+                        ));
                     }
                     "test" => {
                         // Bare `[ cond ]` as a statement: the exit status is the
@@ -2321,12 +2364,21 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
 fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, .. } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
-                    if !is_env_style_var_name(&t.var)
-                        && !out.iter().any(|(n, _)| n == &t.var)
-                    {
-                        out.push((t.var.clone(), t.sigil.unwrap_or(Sigil::Scalar)));
+                    if is_env_style_var_name(&t.var) {
+                        continue;
+                    }
+                    // setArray RHS → the target is an array even if the sigil
+                    // annotation is absent.
+                    let is_array_rhs = matches!(expr, IrExpr::Call { func, .. } if func == "setArray");
+                    let sigil = if is_array_rhs {
+                        Sigil::Array
+                    } else {
+                        t.sigil.unwrap_or(Sigil::Scalar)
+                    };
+                    if !out.iter().any(|(n, _)| n == &t.var) {
+                        out.push((t.var.clone(), sigil));
                     }
                 }
             }
@@ -2391,6 +2443,20 @@ fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
                         && !out.iter().any(|(n, _)| n == &name)
                     {
                         out.push((name, Sigil::Scalar));
+                    }
+                }
+            }
+            // Array reads (${arr[@]}, ${#arr[@]}, arr[i], $(arr…)) declare
+            // as @name.
+            if matches!(
+                func.as_str(),
+                "listVar" | "getArray" | "arrayItems" | "arrayLen" | "arrayIndex"
+            ) {
+                if let Some(name) = args.first().and_then(call_arg_str) {
+                    if var_is_declarable(&name)
+                        && !out.iter().any(|(n, _)| n == &name)
+                    {
+                        out.push((name, Sigil::Array));
                     }
                 }
             }
@@ -2596,6 +2662,74 @@ fn collect_vars_from_test_string(s: &str, out: &mut Vec<(String, Sigil)>) {
             i += 1;
         }
     }
+}
+
+/// Rewrite `exec(foo, …)` calls to the `$fn_call` marker when `foo` is a
+/// function defined in the program (recursively into compound bodies).
+fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -> Vec<IrStmt> {
+    stmts
+        .iter()
+        .map(|s| match s {
+            IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+                if let Some(name) = args.first().and_then(call_arg_str) {
+                    if fns.contains(&name) {
+                        return IrStmt::Expr(IrExpr::Call {
+                            func: "$fn_call".to_string(),
+                            args: args.clone(),
+                        });
+                    }
+                }
+                s.clone()
+            }
+            IrStmt::If { cond, then, elsifs, else_ } => IrStmt::If {
+                cond: cond.clone(),
+                then: rewrite_fn_calls(then, fns),
+                elsifs: elsifs
+                    .iter()
+                    .map(|(c, b)| (c.clone(), rewrite_fn_calls(b, fns)))
+                    .collect(),
+                else_: rewrite_fn_calls(else_, fns),
+            },
+            IrStmt::While { cond, body } => IrStmt::While {
+                cond: cond.clone(),
+                body: rewrite_fn_calls(body, fns),
+            },
+            IrStmt::DoWhile { body, cond, until } => IrStmt::DoWhile {
+                body: rewrite_fn_calls(body, fns),
+                cond: cond.clone(),
+                until: *until,
+            },
+            IrStmt::For { var, iter, body } => IrStmt::For {
+                var: var.clone(),
+                iter: iter.clone(),
+                body: rewrite_fn_calls(body, fns),
+            },
+            IrStmt::Case { discriminant, clauses } => IrStmt::Case {
+                discriminant: discriminant.clone(),
+                clauses: clauses
+                    .iter()
+                    .map(|c| IrCaseClause {
+                        patterns: c.patterns.clone(),
+                        body: rewrite_fn_calls(&c.body, fns),
+                    })
+                    .collect(),
+            },
+            IrStmt::Function { name, body } => IrStmt::Function {
+                name: name.clone(),
+                body: rewrite_fn_calls(body, fns),
+            },
+            IrStmt::Subshell(body) => IrStmt::Subshell(rewrite_fn_calls(body, fns)),
+            IrStmt::Background(body) => IrStmt::Background(rewrite_fn_calls(body, fns)),
+            IrStmt::Block(body) => IrStmt::Block(rewrite_fn_calls(body, fns)),
+            IrStmt::Pipeline { stages, last_output, capture, cmd_str } => IrStmt::Pipeline {
+                stages: stages.iter().map(|st| rewrite_fn_calls(st, fns)).collect(),
+                last_output: last_output.clone(),
+                capture: capture.clone(),
+                cmd_str: cmd_str.clone(),
+            },
+            other => other.clone(),
+        })
+        .collect()
 }
 
 /// Render a test-expression string (the text inside `[ … ]` / `[[ … ]]`,
