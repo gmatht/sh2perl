@@ -673,11 +673,12 @@ fn mark_loop_status_deadness(st: &IrStmt, live: &HashSet<usize>, dead: &mut Hash
 /// expansion, identical builtin function, minus the async exec machinery
 /// (the whileLoopSync pattern — same semantics, no per-call promises).
 pub(crate) const SYNC_BUILTINS: &[&str] = &[
-    ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue", "cut", "declare",
-    "dirname", "echo", "eval", "exit", "export", "false", "grep", "head", "let", "local",
-    "mapfile", "mktemp", "printf", "pwd", "read", "readarray", "readonly", "return", "seq",
-    "sed", "set", "shift", "sort", "source", "stat", "tail", "test", "touch", "tr", "trap",
-    "true", "type", "typeset", "uniq", "unset", "wc",
+    ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue", "cut", "date",
+    "declare", "dirname", "echo", "eval", "exit", "export", "false", "grep", "head", "let",
+    "local", "mapfile", "mktemp", "printf", "pwd", "read", "readarray", "readlink",
+    "readonly", "return", "seq", "sed", "set", "shift", "sort", "source", "stat", "tail",
+    "test", "touch", "tr", "trap", "true", "type", "typeset", "uname", "uniq", "unset",
+    "wc",
 ];
 /// Names of every function the program defines (IrStmt::Function), set per
 /// compilation by `shir_to_estree` under COMPILE_LOCK. A script-defined
@@ -7541,6 +7542,16 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                             // a subshell/background write is COPY-local in
                             // bash — a lifted module var would be clobbered
                             excluded.insert(t.var.clone());
+                        } else if t.var.contains('[') {
+                            // Baked subscript write (`arr[$i]=v`, `map[$k]=v`):
+                            // the runtime resolves the subscript from the
+                            // STORE (setVar's name regex + normAssocKey /
+                            // evalArith) — mark every `$var` ref inside the
+                            // name store-read (assoc-arrays request: a
+                            // LIFTED native binding would be invisible to
+                            // the store and the write would land on a stale
+                            // index/key).
+                            mark_string_refs(&t.var, string_ctx);
                         }
                     } else {
                         excluded.insert(t.var.clone());
@@ -11954,6 +11965,14 @@ fn native_capture_path(cmd: &str, cmd_args: &[IrExpr]) -> Option<Expr> {
             }
             sh2_member("cwd")
         }
+        // `$(uname -s)` / `$(date +%Y%m)` / `$(readlink -f X)` — the
+        // value-returning runtime twins of the sync builtins (native
+        // platform/clock/fs — no spawn). Any flag/operand shape the
+        // builtin handles lifts; the twin returns the capture-stripped
+        // string (lastExit is set 0 — a failing readlink yields "" with
+        // the same output, the status is not observable here; the runtime
+        // capture path keeps full status fidelity for non-lifted forms).
+        "uname" | "date" | "readlink" => sh2_call(cmd, cmd_args.iter().map(expr_to_estree).collect()),
         _ => return None,
     };
     Some(seq(vec![
@@ -12190,7 +12209,7 @@ fn try_native_capture_value(stmts: &[IrStmt]) -> Option<Expr> {
                 match name.as_str() {
                     "cat" => native_capture_cat(cmd_args, None),
                     "sort" => native_capture_sort(cmd_args, None),
-                    "dirname" | "basename" | "pwd" => {
+                    "dirname" | "basename" | "pwd" | "uname" | "date" | "readlink" => {
                         native_capture_path(name, cmd_args)
                     }
                     _ => None,
@@ -17442,6 +17461,12 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                     if t.indices.is_empty() {
                         if in_copy {
                             excluded.insert(t.var.clone());
+                        } else if t.var.contains('[') {
+                            // Baked subscript write (see the numeric-lift
+                            // twin): the runtime resolves the subscript
+                            // from the STORE — mark its `$var` refs
+                            // store-read so a lifted binding never desyncs.
+                            mark_string_refs(&t.var, string_ctx);
                         }
                     } else {
                         excluded.insert(t.var.clone());
@@ -19579,6 +19604,58 @@ fn sh2_name_arg(e: &Expr) -> Option<&str> {
     None
 }
 
+/// Does a baked subscript name (`map[$k]`, `arr[$i+1]`) reference `var`
+/// in its subscript text? The runtime resolves such refs from the STORE.
+fn subscript_refs_var(name: &str, var: &str) -> bool {
+    let Some(open) = name.find('[') else { return false };
+    let Some(close) = name.rfind(']') else { return false };
+    if close <= open {
+        return false;
+    }
+    let sub = &name[open + 1..close];
+    let mut i = 0;
+    let bytes = sub.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let rest = &sub[i + 1..];
+        let name_len = if rest.starts_with('{') {
+            let r2 = &rest[1..];
+            let n = r2
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
+            if n > 0 && n < r2.len() && r2.as_bytes()[n] == b'}' {
+                n + 2 // ${var}
+            } else {
+                0
+            }
+        } else {
+            rest.chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count()
+        };
+        if name_len > 0 {
+            let v = if rest.starts_with('{') {
+                &rest[1..name_len - 1]
+            } else {
+                &rest[..name_len]
+            };
+            if v == var {
+                return true;
+            }
+        }
+        i += 1 + name_len;
+    }
+    false
+}
+
 /// Native-ForOf store-sync elimination — eligibility scan over the loop
 /// body (minus the sync statement itself). The optimization replaces the
 /// per-iteration `sh2.setVar(var, i)` store sync + the body's
@@ -19613,7 +19690,14 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
                     },
                     Some("setVar") | Some("setArray") | Some("setArrayAppend")
                     | Some("assign") => match sh2_name_arg(e) {
-                        Some(n) => n != var,
+                        // a literal-name setVar is fine UNLESS the name is a
+                        // baked subscript whose text references `var` — the
+                        // runtime resolves the subscript from the STORE
+                        // (setVar's name regex + normAssocKey/evalArith),
+                        // so a per-iteration store sync of `var` must stay
+                        // (assoc-arrays: `map[$k]=v` / `arr[$i]=v` in a
+                        // native for-of loop).
+                        Some(n) => n != var && !(n.contains('[') && subscript_refs_var(n, var)),
                         None => false,
                     },
                     Some(_) => false, // any other sh2 call disqualifies

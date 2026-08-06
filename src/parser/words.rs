@@ -3199,11 +3199,17 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         continue;
                     }
                     match content[i..].chars().next() {
-                        Some('"') if dq_depth == 0 => {
-                            // Toggle double-quote depth.
+                        Some('"') if dq_depth == 0 && !sq_depth => {
+                            // Toggle double-quote depth. A `"` inside a
+                            // single-quoted string within $() is LITERAL
+                            // (bash: `awk '{ print $1 }' | sed 's/"//g'`
+                            // inside a DQS) — it must not toggle dq_depth,
+                            // or the closing `'` would be misread and the
+                            // `)` would never close the substitution
+                            // (parse-gaps: multiple-awk-in-dqs.sh).
                             dq_depth = 1;
                         }
-                        Some('"') => {
+                        Some('"') if !sq_depth => {
                             dq_depth = 0;
                         }
                         Some('\'') if dq_depth == 0 => {
