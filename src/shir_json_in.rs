@@ -302,9 +302,28 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
             IrStmt::Pipeline { stages, last_output, capture, cmd_str }
         }
         "Return" => {
-            let value = match o.get("value") {
-                None | Some(Value::Null) => None,
-                Some(x) => Some(expr_from(x, &format!("{where_}.value"))?),
+            // Multi-value form (core request c-multi-return 20260806):
+            // `{"type":"Return","values":[e1, e2, ...]}` — the shell
+            // value-return channel can carry several values (one echoed
+            // line each); the IR represents the list as an Array value
+            // (the emitter renders a native JS `return [e1, e2]`, the
+            // caller destructures). `value` (single) stays valid and the
+            // serializer keeps emitting the Array round-trip.
+            let value = if let Some(vs) = o.get("values") {
+                if let Some(arr) = vs.as_array() {
+                    let mut exprs = Vec::new();
+                    for (i, x) in arr.iter().enumerate() {
+                        exprs.push(expr_from(x, &format!("{where_}.values[{i}]"))?);
+                    }
+                    Some(IrExpr::Array(exprs))
+                } else {
+                    return Err(format!("{where_}: Return.values must be an array"));
+                }
+            } else {
+                match o.get("value") {
+                    None | Some(Value::Null) => None,
+                    Some(x) => Some(expr_from(x, &format!("{where_}.value"))?),
+                }
             };
             IrStmt::Return(value)
         }

@@ -1412,6 +1412,7 @@ pub fn convert_test_args_to_expression_impl(
             failglob: false,
             globstar: false,
             nullglob: false,
+            double: false,
         },
     }
 }
