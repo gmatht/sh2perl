@@ -1496,11 +1496,18 @@ fn var_read(name: &str) -> String {
 /// Render a bash glob pattern as a Perl regex fragment (the subset the
 /// corpus's `${x#…}`/`${x%…}`/`${x/…/…}` idioms use).
 fn glob_to_regex(pat: &str) -> String {
+    glob_to_regex_greedy(pat, true)
+}
+
+/// `*` → `.*` when greedy, `.*?` when non-greedy (bash #/%% shortest vs
+/// ##/%% longest prefix/suffix removal).
+fn glob_to_regex_greedy(pat: &str, greedy: bool) -> String {
+    let star = if greedy { ".*" } else { ".*?" };
     let mut out = String::new();
     let mut chars = pat.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '*' => out.push_str(".*"),
+            '*' => out.push_str(star),
             '?' => out.push_str("."),
             '\\' => {
                 if let Some(&d) = chars.peek() {
@@ -1677,12 +1684,13 @@ fn render_param(args: &[IrExpr]) -> String {
         // greedy form — the corpus idioms are ##*/ and %/* which are exact).
         "#" | "#:" | "##" | "##:" => {
             let pat = args.get(2).and_then(call_arg_str).unwrap_or_default();
-            let re = glob_to_regex(&pat);
+            let greedy = matches!(op.as_str(), "##" | "##:");
+            let re = glob_to_regex_greedy(&pat, greedy);
             format!("(({} =~ s:^{}::r))", var, re)
         }
         // Suffix removal: % shortest, %% longest. The `%.*` extension
         // idiom strips the last extension (shortest) / from the first dot
-        // (longest); other patterns remove a plain greedy suffix.
+        // (longest); other patterns remove a greedy suffix.
         "%" | "%:" | "%%" | "%%:" => {
             let pat = args.get(2).and_then(call_arg_str).unwrap_or_default();
             if pat == ".*" {
@@ -1692,8 +1700,9 @@ fn render_param(args: &[IrExpr]) -> String {
                     format!("(({} =~ s:\\.[^.]*$::r))", var)
                 }
             } else {
-                let re = glob_to_regex(&pat);
-                format!("(({} =~ s:{}[^/]*$::r))", var, re)
+                let greedy = matches!(op.as_str(), "%%" | "%%:");
+                let re = glob_to_regex_greedy(&pat, greedy);
+                format!("(({} =~ s:{}$::r))", var, re)
             }
         }
         // Named idioms the IR maps: ##*/ → basename, %/* → dirname.
