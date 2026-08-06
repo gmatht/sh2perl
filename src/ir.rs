@@ -734,15 +734,23 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     .filter(|p| p.as_str() != "*")
                     .map(|p| glob_to_regex(p))
                     .collect();
-                let kw = if i == 0 && !any_emitted { "if" } else { "elsif" };
+                let is_first = i == 0 && !any_emitted;
                 if has_default && i == clauses.len() - 1 {
                     // `*)` final clause — render as else.
                     emit_indent(out, indent);
-                    out.push_str("} else {\n");
+                    if is_first {
+                        out.push_str(&format!("if ({} =~ /^.*$/) {{\n", d));
+                    } else {
+                        out.push_str("} else {\n");
+                    }
                 } else {
                     let re = format!("^(?:{})$", patterns.join("|"));
                     emit_indent(out, indent);
-                    out.push_str(&format!("{} ({} =~ /{}/) {{\n", kw, d, re));
+                    if is_first {
+                        out.push_str(&format!("if ({} =~ /{}/) {{\n", d, re));
+                    } else {
+                        out.push_str(&format!("}} elsif ({} =~ /{}/) {{\n", d, re));
+                    }
                 }
                 for s in &clause.body {
                     emit_stmt(out, s, indent + 1);
@@ -1609,12 +1617,24 @@ fn render_param(args: &[IrExpr]) -> String {
     let repl = args.get(3).map(render_word).unwrap_or_else(|| "''".to_string());
     match op.as_str() {
         "" => var,
-        "-" => format!("(defined({}) ? {} : {})", var, var, val),
-        ":-" => format!(
-            "((defined({v}) && length({v})) ? {v} : {d})",
-            v = var,
-            d = val
-        ),
+        "-" => {
+            if var.starts_with('@') {
+                format!("({} ? {} : {})", var, var, val)
+            } else {
+                format!("(defined({}) ? {} : {})", var, var, val)
+            }
+        }
+        ":-" => {
+            if var.starts_with('@') {
+                format!("({} ? {} : {})", var, var, val)
+            } else {
+                format!(
+                    "((defined({v}) && length({v})) ? {v} : {d})",
+                    v = var,
+                    d = val
+                )
+            }
+        }
         "=" | ":=" => format!(
             "((defined({v}) && length({v})) ? {v} : ({v} = {d}))",
             v = var,
@@ -2687,13 +2707,16 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
                     // setArray RHS → the target is an array even if the sigil
                     // annotation is absent.
                     let is_array_rhs = matches!(expr, IrExpr::Call { func, .. } if func == "setArray");
+                    let (base, idx) = split_indexed_var(&t.var);
                     let sigil = if is_array_rhs {
                         Sigil::Array
+                    } else if idx.is_some() {
+                        Sigil::Hash
                     } else {
                         t.sigil.unwrap_or(Sigil::Scalar)
                     };
-                    if !out.iter().any(|(n, _)| n == &t.var) {
-                        out.push((t.var.clone(), sigil));
+                    if !out.iter().any(|(n, _)| n == base) {
+                        out.push((base.to_string(), sigil));
                     }
                 }
             }
@@ -3067,11 +3090,15 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
 /// Render a test-expression string (the text inside `[ … ]` / `[[ … ]]`,
 /// as flattened by ast_to_ir) as a Perl boolean expression.
 fn render_test_expr(s: &str) -> String {
-    // `[[ ]]` tests flatten to no-space forms ("$s==*.txt", "$s=~^re$",
-    // "$f1==!(*.min).js") that the spaced tokenizer can't parse.
-    if s.contains("==") || s.contains("=~") || s.contains("!=") || s.contains("=" ) {
-        if let Some(r) = render_flat_test(s) {
-            return r;
+    // `[[ ]]` tests flatten to NO-WHITESPACE forms ("$s==*.txt",
+    // "$s=~^re$", "$f1==!(*.min).js", ""$y"="5"") that the spaced
+    // tokenizer can't parse. Spaced strings (with -gt/-a/etc.) keep the
+    // tokenizer even if they contain a bare `=`.
+    if !s.chars().any(|c| c.is_whitespace()) {
+        if s.contains("==") || s.contains("=~") || s.contains("!=") || s.contains('=') {
+            if let Some(r) = render_flat_test(s) {
+                return r;
+            }
         }
     }
     let toks = tokenize_test(s);
@@ -3184,6 +3211,27 @@ fn tokenize_test(s: &str) -> Vec<String> {
                 if !cur.is_empty() {
                     toks.push(std::mem::take(&mut cur));
                 }
+            }
+            '=' if !in_dq => {
+                // Flattened "[ a = b ]" loses the spaces around `=` — split
+                // it out as its own token (handles `a=b`, `a==b`, `a!=b`).
+                if !cur.is_empty() {
+                    toks.push(std::mem::take(&mut cur));
+                }
+                let mut op = String::from("=");
+                if chars.peek() == Some(&'=') {
+                    op.push('=');
+                    chars.next();
+                }
+                toks.push(op);
+            }
+            '!' if !in_dq && chars.peek() == Some(&'=') => {
+                // `!=` — possibly right after a quoted token ("$a"!="b").
+                if !cur.is_empty() {
+                    toks.push(std::mem::take(&mut cur));
+                }
+                toks.push("!=".to_string());
+                chars.next();
             }
             '\\' if in_dq => {
                 if let Some(&d) = chars.peek() {
@@ -3332,6 +3380,13 @@ fn perl_compare_op(op: &str) -> &'static str {
 /// Render a test operand: `$var`-only tokens become bare `${name}` reads
 /// (Generator idiom); literals become Perl literals.
 fn render_test_operand(tok: &str) -> String {
+    // $name[idx] / ${name[idx]} array element inside a test.
+    if tok.starts_with('$') && tok.contains('[') && tok.contains(']') {
+        let inner = tok.trim_start_matches("${").trim_start_matches('$').trim_end_matches('}');
+        if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '[' || c == ']' || c == '$' || c == '.' || c == ' ' || c == '-') {
+            return format!("${}", inner);
+        }
+    }
     if tok.starts_with('$') && tok.len() > 1 {
         let name = &tok[1..];
         if name.starts_with('{') && name.ends_with('}') {
@@ -3759,6 +3814,9 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     let idx = args.get(1).and_then(call_arg_str).unwrap_or_default();
                     if idx == "@" || idx == "*" {
                         format!("@{}", name)
+                    } else if idx.contains(',') {
+                        // Bash pseudo-multidim subscript → hash key.
+                        format!("${{{}}}{{\"{}\"}}", name, idx.replace('\"', "\\\""))
                     } else {
                         format!("${}[{}]", name, idx)
                     }
