@@ -1066,7 +1066,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     if func == "setArray" {
                         // Array assignment: arr=(a b c) → @arr = ('a','b','c');
                         if let IrExpr::Call { args, .. } = expr {
-                            let items: Vec<String> = args.iter().map(render_word).collect();
+                            // args[0] is the array NAME — the elements follow
+                            // (either a single Array arg or individual words).
+                            let elems: Vec<&IrExpr> = if args.len() >= 2 {
+                                if let IrExpr::Array(elems) = &args[1] {
+                                    elems.iter().collect()
+                                } else {
+                                    args[1..].iter().collect()
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            let items: Vec<String> = elems.iter().map(|e| render_word(*e)).collect();
                             emit_indent(out, indent);
                             out.push_str(&format!("@{} = ({});\n", var, items.join(", ")));
                             return;
@@ -3980,8 +3991,17 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     .unwrap_or_else(|| "0".to_string()),
                 "setArray" => {
                     // Array assignment in expression position (rare) — the
-                    // elements as a parenthesized list.
-                    let items: Vec<String> = args.iter().map(render_word).collect();
+                    // elements as a parenthesized list (skip the name arg).
+                    let elems: Vec<&IrExpr> = if args.len() >= 2 {
+                        if let IrExpr::Array(elems) = &args[1] {
+                            elems.iter().collect()
+                        } else {
+                            args[1..].iter().collect()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let items: Vec<String> = elems.iter().map(|e| render_word(*e)).collect();
                     format!("({})", items.join(", "))
                 }
                 "test" => render_test_call(args),
