@@ -815,11 +815,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         cmd.push_str(&delim);
                     }
                     if ok {
-                        emit_indent(out, indent);
-                        out.push_str(&format!(
-                            "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-                            safe_perl_q_string(&cmd)
-                        ));
+                        emit_shell_cmd(out, indent, &cmd);
                     } else {
                         emit_indent(out, indent);
                         out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (redirect mode)\\n\";\n");
@@ -913,11 +909,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         // and run it via bash -c (matches bash stdout by running
                         // the same tools).
                         if let Some(cmd) = pipeline_call_to_cmd(e) {
-                            emit_indent(out, indent);
-                            out.push_str(&format!(
-                                "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-                                safe_perl_q_string(&cmd)
-                            ));
+                            emit_shell_cmd(out, indent, &cmd);
                         } else {
                             emit_indent(out, indent);
                             out.push_str("die \"debashc: shIR pipeline not yet supported by the Perl backend\\n\";\n");
@@ -953,11 +945,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         // Statement-position redirect: run the command with its
                         // redirects via bash -c (redirects are shell-level).
                         if let Some(cmd) = redirect_call_to_cmd(e) {
-                            emit_indent(out, indent);
-                            out.push_str(&format!(
-                                "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-                                safe_perl_q_string(&cmd)
-                            ));
+                            emit_shell_cmd(out, indent, &cmd);
                         } else {
                             emit_indent(out, indent);
                             out.push_str("die \"debashc: shIR redirect not yet supported by the Perl backend\\n\";\n");
@@ -966,11 +954,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     other => {
                         // Unknown sh2.* calls in statement position.
                         if let Some(cmd) = expr_to_cmd(e) {
-                            emit_indent(out, indent);
-                            out.push_str(&format!(
-                                "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-                                safe_perl_q_string(&cmd)
-                            ));
+                            emit_shell_cmd(out, indent, &cmd);
                         } else {
                             emit_indent(out, indent);
                             out.push_str(&format!(
@@ -992,11 +976,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         out.push_str(&s);
                         out.push('\n');
                     } else if let Some(cmd) = expr_to_cmd(other_expr) {
-                        emit_indent(out, indent);
-                        out.push_str(&format!(
-                            "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-                            safe_perl_q_string(&cmd)
-                        ));
+                        emit_shell_cmd(out, indent, &cmd);
                     } else {
                         emit_indent(out, indent);
                         out.push_str("die \"debashc: shIR expression not yet supported by the Perl backend\\n\";\n");
@@ -1782,9 +1762,10 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
                                 let tail = expr_to_cmd(rhs);
                                 match tail {
                                     Some(t) => Some(format!(
-                                        "chdir({}) or die \"cd: $!\\n\"; system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;",
-                                        dir,
-                                        safe_perl_q_string(&t)
+                                        "{x}chdir({dir}) or die \"cd: $!\\n\"; system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8;",
+                                        x = var_exports_str(&t),
+                                        dir = dir,
+                                        q = safe_perl_q_string(&t)
                                     )),
                                     None => Some(format!("chdir({}) or die \"cd: $!\\n\";", dir)),
                                 }
@@ -1854,7 +1835,8 @@ fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
                 if ltail.is_none() {
                     if let (Some(t), Some(els)) = (expr_to_cmd(then_cmd), expr_to_cmd(rhs)) {
                         return Some(format!(
-                            "if ({c}) {{ system('bash', '-c', {q1}); $main_exit_code = $CHILD_ERROR = $? >> 8; }} else {{ system('bash', '-c', {q2}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
+                            "{x}if ({c}) {{ system('bash', '-c', {q1}); $main_exit_code = $CHILD_ERROR = $? >> 8; }} else {{ system('bash', '-c', {q2}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
+                            x = format!("{}{}", var_exports_str(&t), var_exports_str(&els)),
                             c = cond,
                             q1 = safe_perl_q_string(&t),
                             q2 = safe_perl_q_string(&els)
@@ -1908,7 +1890,8 @@ fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
                 cond.clone()
             };
             return Some(format!(
-                "if ({c}) {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
+                "{x}if ({c}) {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
+                x = var_exports_str(&cmd),
                 c = c,
                 q = safe_perl_q_string(&cmd)
             ));
@@ -2053,6 +2036,44 @@ const EMULATED_COMMANDS: &[&str] = &[
     "touch", "basename", "dirname", "pwd", "date", "hostname", "paste",
     "tee", "which", "yes",
 ];
+
+/// `$ENV{name} = $name;` for every `$name` referenced in a shell command
+/// text — bash children read Perl vars via the environment (otherwise
+/// `"$longline"` in the command is unset in the child).
+fn var_exports_str(cmd: &str) -> String {
+    let re = regex::Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)").unwrap();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = String::new();
+    for cap in re.captures_iter(cmd) {
+        let name = cap[1].to_string();
+        if name == "ENV" {
+            continue;
+        }
+        if name.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+            continue; // real env vars (HOME, PATH...) — already in the child
+        }
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        out.push_str(&format!("$ENV{{{}}} = ${};\n", name, name));
+    }
+    out
+}
+
+/// `$ENV{name} = $name;` lines + the bash -c system call + status tracking.
+fn emit_shell_cmd(out: &mut String, indent: usize, cmd: &str) {
+    let exports = var_exports_str(cmd);
+    for line in exports.lines() {
+        emit_indent(out, indent);
+        out.push_str(line);
+        out.push('\n');
+    }
+    emit_indent(out, indent);
+    out.push_str(&format!(
+        "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+        safe_perl_q_string(cmd)
+    ));
+}
 
 /// Reuse the AST Generator's per-command in-Perl emulations for an external
 /// command: reconstruct the shell text from IR words, re-parse it into a
@@ -2537,11 +2558,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                     .map(render_word)
                     .collect::<Vec<_>>()
                     .join(" ");
-                emit_indent(out, indent);
-                out.push_str(&format!(
-                    "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-                    safe_perl_q_string(&full)
-                ));
+                emit_shell_cmd(out, indent, &full);
                 return;
             }
         },
@@ -2683,11 +2700,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 }
             }
             let full = build_shell_cmd(&cmd, &words);
-            emit_indent(out, indent);
-            out.push_str(&format!(
-                "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-                safe_perl_q_string(&full)
-            ));
+            emit_shell_cmd(out, indent, &full);
         }
     }
 }
