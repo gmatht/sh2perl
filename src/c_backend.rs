@@ -33,7 +33,35 @@ use std::collections::{BTreeSet, HashMap};
 
 enum Part {
     Lit(String),
-    Arg(String, bool),
+    /// Arg(cexpr, spec) — the printf specifier for the operand,
+    /// precomputed at construction where the IrExpr is in scope.
+    Arg(String, NumSpec),
+}
+
+/// How to print a printf/snprintf argument.
+///
+/// `Num(spec, cast)`: the operand is numeric. `spec` matches the
+/// operand's PROVEN width (`%u`/`%d`/`%lld` for u32/i32/i64) and `cast`
+/// says whether a `(long long)` wrap is still required. The pair is
+/// always consistent: cast == true implies spec == "%lld" (the cast pins
+/// the vararg type to long long), and cast == false implies the operand's
+/// C type is provably exactly the spec's expected type.
+/// `Str`: non-numeric — `%s` + a `(char*)` cast (stub calls return
+/// `long long`; printf("%s", long long) is UB).
+#[derive(Debug)]
+enum NumSpec {
+    Num(&'static str, bool),
+    Str,
+}
+
+impl PartialEq for NumSpec {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (NumSpec::Num(a, ca), NumSpec::Num(b, cb)) => a == b && ca == cb,
+            (NumSpec::Str, NumSpec::Str) => true,
+            _ => false,
+        }
+    }
 }
 
 /// C width from the core's range analysis (`range_width_name`): an
@@ -55,6 +83,18 @@ impl Width {
             Width::U32 => "unsigned int",
             Width::I32 => "int",
             Width::I64 => "long long",
+        }
+    }
+
+    /// printf-family format for the width's C type. The format matches
+    /// the DECLARED type exactly, so a cast is only needed when the
+    /// operand's actual C type can't be proven to be it (see
+    /// [`Render::expr_type_matches`] / [`Render::num_spec`]).
+    fn format(self) -> &'static str {
+        match self {
+            Width::U32 => "%u",
+            Width::I32 => "%d",
+            Width::I64 => "%lld",
         }
     }
 
@@ -591,13 +631,26 @@ impl Render {
                         // snprintf truncates, so this is headroom, not
                         // correctness; the range analysis proves the value
                         // fits (its width is what we sized against).
-                        let cap = width_buf_len(self.expr_width(needle));
+                        let width = self.expr_width(needle);
+                        let cap = width_buf_len(width);
                         self.emit(&format!("char {t}[{cap}];"));
                         let e = self.expr(needle);
-                        // (long long) cast: the operand may be a narrowed
-                        // u32/i32 var; the cast canonicalizes the vararg
-                        // type to match %lld regardless of width
-                        self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", (long long)({e}));"));
+                        // format by the PROVEN width; the (long long) cast
+                        // only when the operand's C type can't be proven to
+                        // match the specifier (a var read or arith over
+                        // vars at that width is provable — `%u`/`%d` need
+                        // no cast; literals/stubs keep the %lld pair)
+                        let NumSpec::Num(spec, cast) = self.num_spec(needle) else {
+                            unreachable!("numeric needle → numeric spec")
+                        };
+                        let arg = if cast {
+                            format!("(long long)({e})")
+                        } else {
+                            e
+                        };
+                        self.emit(&format!(
+                            "snprintf({t}, sizeof {t}, \"{spec}\", {arg});"
+                        ));
                         t
                     } else {
                         self.expr(needle)
@@ -710,42 +763,62 @@ impl Render {
     fn parts_of(&mut self, e: &IrExpr) -> Vec<Part> {
         match e {
             IrExpr::Str(s, _) => vec![Part::Lit(s.clone())],
-            IrExpr::Int(i) => vec![Part::Arg(i.to_string(), true)],
+            IrExpr::Int(i) => vec![Part::Arg(i.to_string(), self.num_spec(e))],
             IrExpr::Var(name, _) => {
-                vec![Part::Arg(self.c_ident(name), self.is_num(name))]
+                if self.is_num(name) {
+                    vec![Part::Arg(self.c_ident(name), self.num_spec(e))]
+                } else {
+                    vec![Part::Arg(self.c_ident(name), NumSpec::Str)]
+                }
             }
-            IrExpr::Ident(name) => vec![Part::Arg(self.c_ident(name), false)],
+            IrExpr::Ident(name) => vec![Part::Arg(self.c_ident(name), NumSpec::Str)],
             IrExpr::Interpolate(parts) => {
                 let mut out = Vec::new();
                 for p in parts {
                     match p {
                         InterpPart::Lit(s) => out.push(Part::Lit(s.clone())),
                         InterpPart::Expr(x) => {
-                            out.push(Part::Arg(self.expr(x), self.expr_is_num(x)))
+                            let spec = if self.expr_is_num(x) {
+                                self.num_spec(x)
+                            } else {
+                                NumSpec::Str
+                            };
+                            out.push(Part::Arg(self.expr(x), spec))
                         }
                     }
                 }
                 out
             }
-            IrExpr::Arith(a) => vec![Part::Arg(self.arith(a), true)],
-            IrExpr::BinOp { .. } => vec![Part::Arg(self.expr(e), true)],
+            IrExpr::Arith(a) => vec![Part::Arg(self.arith(a), self.num_spec(e))],
+            IrExpr::BinOp { .. } => vec![Part::Arg(self.expr(e), self.num_spec(e))],
             IrExpr::Call { func, args } => {
                 let args = args.clone();
                 // getVar("x") → ident if x is typed, else stub
                 if func == "getVar" {
                     if let Some(IrExpr::Str(name, _)) = args.first() {
                         if self.var_types.contains_key(name) {
-                            return vec![Part::Arg(self.c_ident(name), self.is_num(name))];
+                            let spec = if self.is_num(name) {
+                                self.num_spec(e)
+                            } else {
+                                NumSpec::Str
+                            };
+                            return vec![Part::Arg(self.c_ident(name), spec)];
                         }
                     }
-                    return vec![Part::Arg(self.call(func, &args), false)];
+                    return vec![Part::Arg(self.call(func, &args), NumSpec::Str)];
                 }
-                // other calls: render the call expression; default to non-num
-                vec![Part::Arg(self.call(func, &args), self.expr_is_num(e))]
+                // other calls: render the call expression; numeric iff the
+                // expression is numeric (stubs return long long → %lld+cast)
+                let spec = if self.expr_is_num(e) {
+                    self.num_spec(e)
+                } else {
+                    NumSpec::Str
+                };
+                vec![Part::Arg(self.call(func, &args), spec)]
             }
             other => {
                 self.mark_todo(&format!("echo arg {:?}", other));
-                vec![Part::Arg("0".into(), true)]
+                vec![Part::Arg("0".into(), NumSpec::Num("%lld", true))]
             }
         }
     }
@@ -768,17 +841,25 @@ impl Render {
         for p in parts {
             match p {
                 Part::Lit(t) => fmt.push_str(&t),
-                Part::Arg(v, is_num) => {
-                    if is_num {
-                        fmt.push_str("%lld");
-                        cargs.push(format!("(long long)({v})"));
-                    } else {
+                Part::Arg(v, spec) => match spec {
+                    // numeric: the spec already matches the operand's
+                    // proven width — cast only when the type is unproven
+                    // (num_spec's invariant: cast ⟺ spec == "%lld")
+                    NumSpec::Num(spec, cast) => {
+                        fmt.push_str(spec);
+                        if cast {
+                            cargs.push(format!("(long long)({v})"));
+                        } else {
+                            cargs.push(v);
+                        }
+                    }
+                    NumSpec::Str => {
                         fmt.push_str("%s");
                         // cast: the arg may be a stub call returning
                         // long long — printf("%s", long long) is UB.
                         cargs.push(format!("(char*)({v})"));
                     }
-                }
+                },
             }
         }
         if cargs.is_empty() {
@@ -1076,7 +1157,70 @@ impl Render {
                     None => Width::I64,
                 }
             }
+            // `$y` read of a typed var renders as the declared ident —
+            // its width is the var's declared width, not the I64 fallback
+            // (without this, `echo $i` would keep the %lld cast)
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match args.first() {
+                    Some(IrExpr::Str(name, _)) if self.var_types.contains_key(name) => {
+                        self.width_of_var(name)
+                    }
+                    _ => Width::I64,
+                }
+            }
             _ => Width::I64,
+        }
+    }
+
+    /// The printf spec for a numeric operand: format by the PROVEN width,
+    /// cast only when the operand's C type can't be proven to match.
+    ///
+    /// Invariant: cast == true ⟺ spec == "%lld". When the type is known
+    /// (a var read / arith over vars at that width), the spec matches the
+    /// actual C type — `%u` on an `unsigned int`, `%d` on an `int`,
+    /// `%lld` on a `long long` — and no cast is emitted. When it is not
+    /// (int literals, stub calls, unproven arith), the `(long long)` cast
+    /// pins the vararg type to match `%lld` — the pair is always
+    /// consistent, so a casted operand never meets a `%u`/`%d`.
+    fn num_spec(&self, e: &IrExpr) -> NumSpec {
+        let w = self.expr_width(e);
+        if self.expr_type_matches(e, w) {
+            NumSpec::Num(w.format(), false)
+        } else {
+            NumSpec::Num("%lld", true)
+        }
+    }
+
+    /// Can the rendered C expression of `e` be proven to have exactly the
+    /// C type of width `w` — so the width's printf format matches without
+    /// a cast? True for a read of a variable declared at `w` (Var/Ident,
+    /// or getVar of a typed var, which renders as the declared ident), and
+    /// for arithmetic whose variable leaves are all at `w` (C's usual
+    /// arithmetic conversions keep the result at the leaf type; int
+    /// literals convert up). Everything else — int literals, stubs,
+    /// BinOp — is conservative (cast kept).
+    fn expr_type_matches(&self, e: &IrExpr, w: Width) -> bool {
+        match e {
+            IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+                // the var must be genuinely numeric (a string var's width
+                // defaults to I64 but its C type is `char*` — never match)
+                self.is_num(name) && self.width_of_var(name) == w
+            }
+            IrExpr::Arith(a) => {
+                let mut has_var = false;
+                arith_leaves_at_width(a, self, w, &mut has_var)
+                    // a pure-Num arith renders as `int` — only matches I32
+                    && (has_var || w == Width::I32)
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                // `$y` read of a typed var renders as the declared ident
+                matches!(
+                    args.first(),
+                    Some(IrExpr::Str(name, _))
+                        if self.is_num(name) && self.width_of_var(name) == w
+                )
+            }
+            _ => false,
         }
     }
 
@@ -1479,6 +1623,47 @@ fn is_ident(s: &str) -> bool {
 ///   i32 `"-2147483648"`       → 11 + 1 = 12
 ///   i64 `"-9223372036854775808"` → 20 + 1 = 21 (u64's 20 digits too,
 ///      so 21 is the universal 64-bit bound)
+/// All variable leaves of an arith tree must be declared at width `w`
+/// (the rendered C expression then has `w`'s C type: `unsigned int ×
+/// unsigned int → unsigned int`, `int × int → int`, `long long × long
+/// long → long long`, and an `int` literal operand converts up). `has_var`
+/// records whether any Var/Assign/IncDec leaf was seen (a pure-Num tree
+/// renders as `int`, which only matches I32). Index leaves are stubbed to
+/// `0` (`int`) — unprovable, returns false.
+fn arith_leaves_at_width(a: &ArithAst, r: &Render, w: Width, has_var: &mut bool) -> bool {
+    match a {
+        ArithAst::Num(_) => true,
+        ArithAst::Var(name) => {
+            *has_var = true;
+            // genuinely numeric (a string var's width default I64 must not
+            // match; its rendered type is `char*`)
+            r.is_num(name) && r.width_of_var(name) == w
+        }
+        ArithAst::Index { .. } => false,
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_leaves_at_width(lhs, r, w, has_var)
+                && arith_leaves_at_width(rhs, r, w, has_var)
+        }
+        ArithAst::Un { arg, .. } => arith_leaves_at_width(arg, r, w, has_var),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => {
+            arith_leaves_at_width(test, r, w, has_var)
+                && arith_leaves_at_width(then, r, w, has_var)
+                && arith_leaves_at_width(else_, r, w, has_var)
+        }
+        ArithAst::Assign { var, rhs, .. } => {
+            *has_var = true;
+            r.is_num(var) && r.width_of_var(var) == w
+                && arith_leaves_at_width(rhs, r, w, has_var)
+        }
+        ArithAst::IncDec { var, .. } => {
+            *has_var = true;
+            r.is_num(var) && r.width_of_var(var) == w
+        }
+    }
+}
+
 fn width_buf_len(w: Width) -> usize {
     match w {
         Width::U32 => 11,
@@ -1847,5 +2032,105 @@ fn arith_vars(a: &ArithAst, out: &mut Vec<String>) {
         ArithAst::Assign { rhs, .. } => arith_vars(rhs, out),
         ArithAst::IncDec { var, .. } => out.push(var.clone()),
         ArithAst::Num(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A renderer with `name` declared as an Int var at width `w` (both
+    /// the range the width analysis derives from, and the width itself —
+    /// the shir_to_c flow's invariant).
+    fn int_render(name: &str, lo: i64, hi: i64, w: Width) -> Render {
+        let mut r = Render::default();
+        r.var_types.insert(name.to_string(), IrType::Int);
+        r.var_ranges.insert(name.to_string(), (lo, hi));
+        r.var_widths.insert(name.to_string(), w);
+        r
+    }
+
+    #[test]
+    fn width_format_matches_c_type() {
+        // the format must read exactly what the width's C type declares
+        assert_eq!(Width::U32.format(), "%u");
+        assert_eq!(Width::I32.format(), "%d");
+        assert_eq!(Width::I64.format(), "%lld");
+        assert_eq!(Width::U32.c_type(), "unsigned int");
+        assert_eq!(Width::I32.c_type(), "int");
+        assert_eq!(Width::I64.c_type(), "long long");
+    }
+
+    #[test]
+    fn typed_var_reads_drop_the_cast() {
+        // `echo $i` where i is proven u32 → `printf("%u\n", i)` — no cast
+        // (the format matches the declared `unsigned int` exactly)
+        for (name, lo, hi, w, fmt) in [
+            ("i", 1, 10000, Width::U32, "%u"),
+            ("x", -100, -100, Width::I32, "%d"),
+            ("n", 1_000_000_000_000, 1_000_000_000_000, Width::I64, "%lld"),
+        ] {
+            let r = int_render(name, lo, hi, w);
+            let e = IrExpr::Var(name.to_string(), None);
+            assert_eq!(r.num_spec(&e), NumSpec::Num(fmt, false), "{name}");
+        }
+    }
+
+    #[test]
+    fn getvar_of_typed_var_matches_var() {
+        // `$y` reads arrive as getVar("y"); the read renders as the
+        // declared ident, so it gets the same cast-free spec
+        let r = int_render("i", 1, 10000, Width::U32);
+        let e = IrExpr::Call {
+            func: "getVar".to_string(),
+            args: vec![IrExpr::Str("i".to_string(), crate::ir::StrStyle::DoubleQuoted)],
+        };
+        assert_eq!(r.num_spec(&e), NumSpec::Num("%u", false));
+    }
+
+    #[test]
+    fn arith_over_same_width_leaves_drops_the_cast() {
+        // `$((i * i))` — every var leaf at u32 → `snprintf(..., "%u",
+        // (i * i))` — the usual arithmetic conversions keep `unsigned int`
+        let r = int_render("i", 1, 10000, Width::U32);
+        let e = IrExpr::Arith(Box::new(ArithAst::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(ArithAst::Var("i".to_string())),
+            rhs: Box::new(ArithAst::Var("i".to_string())),
+        }));
+        assert_eq!(r.num_spec(&e), NumSpec::Num("%u", false));
+    }
+
+    #[test]
+    fn mixed_width_arith_keeps_the_cast() {
+        // a long long leaf in the tree → the result type is long long,
+        // not the u32 the range might suggest → %lld + cast (the safe pair)
+        let mut r = int_render("i", 1, 10000, Width::U32);
+        r.var_types.insert("n".to_string(), IrType::Int);
+        r.var_ranges.insert("n".to_string(), (1_000_000_000_000, 1_000_000_000_000));
+        r.var_widths.insert("n".to_string(), Width::I64);
+        let e = IrExpr::Arith(Box::new(ArithAst::Bin {
+            op: "*".to_string(),
+            lhs: Box::new(ArithAst::Var("i".to_string())),
+            rhs: Box::new(ArithAst::Var("n".to_string())),
+        }));
+        assert_eq!(r.num_spec(&e), NumSpec::Num("%lld", true));
+    }
+
+    #[test]
+    fn string_var_and_literal_keep_the_cast() {
+        // a Str var's width DEFAULTS to I64 but its C type is `char*` —
+        // never type-matched; an int literal renders as `int` — never
+        // long long. Both keep the %lld + (long long) pair.
+        let mut r = Render::default();
+        r.var_types.insert("s".to_string(), IrType::Str);
+        assert_eq!(
+            r.num_spec(&IrExpr::Var("s".to_string(), None)),
+            NumSpec::Num("%lld", true)
+        );
+        assert_eq!(
+            r.num_spec(&IrExpr::Int(42)),
+            NumSpec::Num("%lld", true)
+        );
     }
 }
