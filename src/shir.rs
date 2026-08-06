@@ -10504,7 +10504,8 @@ fn echo_arg_to_estree(a: &IrExpr) -> Option<Expr> {
             // String() wrap would comma-join the array).
             if matches!(
                 other,
-                IrExpr::Call { func, .. } if func == "captureWords" || func == "listVar"
+                IrExpr::Call { func, .. }
+                    if func == "captureWords" || func == "listVar" || func == "split"
             ) {
                 return Some(expr_to_estree(other));
             }
@@ -10583,7 +10584,8 @@ fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
                 flag_done = true;
                 if matches!(
                     other,
-                    IrExpr::Call { func, .. } if func == "captureWords" || func == "listVar"
+                    IrExpr::Call { func, .. }
+                        if func == "captureWords" || func == "listVar" || func == "split"
                 ) {
                     // array-valued arg — the runtime's flattener splices the
                     // elements; mirror it with `.flat()` before the join
@@ -12772,7 +12774,7 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
         for a in rest {
             match a {
                 IrExpr::Call { func, .. }
-                    if func == "captureWords" || func == "listVar" =>
+                    if func == "captureWords" || func == "listVar" || func == "split" =>
                 {
                     return None;
                 }
