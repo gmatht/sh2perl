@@ -1785,56 +1785,94 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
     None
 }
 
-/// `test-cond ||/&& control` chains render natively: `[ x = y ] || continue`
-/// → `(cond) || next;` (bash control-flow operators on a test result), and
-/// `[[ flat ]] && cmd` → `if (cond) { cmd; }` (flattened `[[ ]]` tests can't
-/// be reconstructed as spaced `[ … ]` bash syntax).
-fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
-    if let IrExpr::BinOp { lhs, op, rhs } = e {
-        if let IrExpr::Call { func: f, .. } = lhs.as_ref() {
-            if f == "test" {
-                let cond = ir_expr_to_perl(lhs);
-                if let IrExpr::Call { func: rf, args: ra } = rhs.as_ref() {
-                    match (op, rf.as_str()) {
-                        (BinOpKind::Or, "continue") => return Some(format!("({}) || next;", cond)),
-                        (BinOpKind::Or, "break") => return Some(format!("({}) || last;", cond)),
-                        (BinOpKind::And, "continue") => return Some(format!("({}) && next;", cond)),
-                        (BinOpKind::And, "break") => return Some(format!("({}) && last;", cond)),
-                        (BinOpKind::Or, "exit") => {
-                            let code = ra
-                                .first()
-                                .map(render_word)
-                                .unwrap_or_else(|| "1".to_string());
-                            return Some(format!("({}) || exit {};", cond, code));
+/// Split a test-chain: returns (cond-string, tail) where tail is the first
+/// non-test node after the leading tests. Handles left-assoc chains
+/// (t1 && t2 && cmd) and mixed ops.
+fn split_test_tail(e: &IrExpr) -> Option<(String, Option<&IrExpr>)> {
+    match e {
+        IrExpr::Call { func, .. } if func == "test" => Some((ir_expr_to_perl(e), None)),
+        IrExpr::BinOp { lhs, op, rhs }
+            if matches!(op, BinOpKind::And | BinOpKind::Or) =>
+        {
+            let (lcond, ltail) = split_test_tail(lhs)?;
+            let joiner = if matches!(op, BinOpKind::And) {
+                " && "
+            } else {
+                " || "
+            };
+            match (ltail, rhs.as_ref()) {
+                // lhs ended in a test (no inner tail): rhs continues the
+                // chain (another test) or is the tail.
+                (None, r) => {
+                    if let IrExpr::Call { func, .. } = r {
+                        if func == "test" {
+                            let (rcond, rtail) = split_test_tail(r)?;
+                            Some((
+                                format!("({}){}({})", lcond, joiner, rcond),
+                                rtail,
+                            ))
+                        } else {
+                            Some((lcond, Some(r)))
                         }
-                        (BinOpKind::And, "exit") => {
-                            let code = ra
-                                .first()
-                                .map(render_word)
-                                .unwrap_or_else(|| "1".to_string());
-                            return Some(format!("({}) && exit {};", cond, code));
-                        }
-                        _ => {}
+                    } else {
+                        Some((lcond, Some(r)))
                     }
                 }
-                // test && cmd / test || cmd — native if-guard around the
-                // shell-out (the flattened test can't round-trip to bash).
-                if let Some(cmd) = expr_to_cmd(rhs) {
-                    return match op {
-                        BinOpKind::And => Some(format!(
-                            "if ({c}) {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
+                // lhs had an inner tail (t && cmd1) — the outer rhs is the
+                // else-branch for the if/else caller.
+                (Some(_), r) => Some((lcond, Some(r))),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `test-cond ||/&& control` chains render natively: `[ x = y ] || continue`
+/// → `(cond) || next;`, `[[ flat ]] && cmd` → `if (cond) { cmd; }`, and
+/// `(t && c1) || c2` → if/else. Flattened `[[ ]]` tests can't be
+/// reconstructed as spaced `[ … ]` bash syntax, so these lower in Perl.
+fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
+    // (test [&&/|| test]* [&& then]) || else → if/else
+    if let IrExpr::BinOp { lhs, op: BinOpKind::Or, rhs } = e {
+        if let IrExpr::BinOp { lhs: l2, op: BinOpKind::And, rhs: then_cmd } = lhs.as_ref() {
+            if let Some((cond, ltail)) = split_test_tail(l2) {
+                if ltail.is_none() {
+                    if let (Some(t), Some(els)) = (expr_to_cmd(then_cmd), expr_to_cmd(rhs)) {
+                        return Some(format!(
+                            "if ({c}) {{ system('bash', '-c', {q1}); $main_exit_code = $CHILD_ERROR = $? >> 8; }} else {{ system('bash', '-c', {q2}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
                             c = cond,
-                            q = safe_perl_q_string(&cmd)
-                        )),
-                        BinOpKind::Or => Some(format!(
-                            "if (!({c})) {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
-                            c = cond,
-                            q = safe_perl_q_string(&cmd)
-                        )),
-                        _ => None,
-                    };
+                            q1 = safe_perl_q_string(&t),
+                            q2 = safe_perl_q_string(&els)
+                        ));
+                    }
                 }
             }
+        }
+    }
+    let (cond, tail) = split_test_tail(e)?;
+    // Control-flow tail: continue/break/exit.
+    if let Some(tail_expr) = tail {
+        if let IrExpr::Call { func, args } = tail_expr {
+            match func.as_str() {
+                "continue" => return Some(format!("({}) || next;", cond)),
+                "break" => return Some(format!("({}) || last;", cond)),
+                "exit" => {
+                    let code = args
+                        .first()
+                        .map(render_word)
+                        .unwrap_or_else(|| "1".to_string());
+                    return Some(format!("({}) || exit {};", cond, code));
+                }
+                _ => {}
+            }
+        }
+        // Command tail: if-guard around the shell-out.
+        if let Some(cmd) = expr_to_cmd(tail_expr) {
+            return Some(format!(
+                "if ({c}) {{ system('bash', '-c', {q}); $main_exit_code = $CHILD_ERROR = $? >> 8; }}",
+                c = cond,
+                q = safe_perl_q_string(&cmd)
+            ));
         }
     }
     None
@@ -3111,11 +3149,27 @@ fn render_test_expr(s: &str) -> String {
 /// A `[[ ]]`-flavored operand: strip quotes, `$var` → read, else literal.
 fn flat_operand(s: &str) -> String {
     let t = s.trim().trim_matches('"').trim_matches('\'');
+    if t == "~" {
+        return "$ENV{HOME}".to_string();
+    }
+    if let Some(rest) = t.strip_prefix("~/") {
+        if !rest.is_empty() {
+            return format!("\"$ENV{{HOME}}/{}\"", rest.replace('\"', "\\\""));
+        }
+    }
     if let Some(name) = t.strip_prefix('$') {
-        if name.starts_with('{') && name.ends_with('}') {
-            var_read(&name[1..name.len() - 1])
+        let clean = name.starts_with('{') && name.ends_with('}');
+        let bare = &name[if clean { 1 } else { 0 }..name.len() - if clean { 1 } else { 0 }];
+        if !bare.is_empty() && bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            var_read(bare)
         } else {
-            var_read(name)
+            // $HOME/xxx — an interpolating literal: keep it double-quoted
+            // with env-style vars rewritten to $ENV{…} (Perl would demand
+            // a declaration for bare $HOME).
+            let interp = t.replace('\"', "\\\"");
+            let re = regex::Regex::new(r"\$(\w+)").unwrap();
+            let rewritten = re.replace_all(&interp, "$$ENV{$1}");
+            format!("\"{}\"", rewritten)
         }
     } else if t.is_empty() {
         "''".to_string()
