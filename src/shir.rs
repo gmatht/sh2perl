@@ -5736,7 +5736,11 @@ fn arith_var_read(name: &str) -> Expr {
             name: name.to_string(),
         };
     }
-    let read = if is_lifted_str(name) {
+    // A local-lifted name (per-function `let` binding, see
+    // [`local_lift_analysis`]) holds the STRING the decl assigned — the
+    // same Number()||0 coercion as string-lifted names; the runtime store
+    // would never see the local (the leak the lift fixes).
+    let read = if is_lifted_str(name) || is_local_lifted(name) {
         Expr::Identifier {
             name: name.to_string(),
         }
@@ -5847,6 +5851,28 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 "*=" => bin("*", cur, rhs_e.clone()),
                 _ => unreachable!("parse_arith only emits = += -= *="),
             };
+            // A local-lifted (string) binding: the native `let` shadow must
+            // receive the write (the store would never see it) — `v =
+            // String(new)` keeps the binding's string invariant, the
+            // read-back is the expression's value (bash arith semantics).
+            if is_local_lifted(var) {
+                return seq(vec![
+                    Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(Expr::Identifier {
+                            name: var.clone(),
+                        }),
+                        right: Box::new(Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "String".to_string(),
+                            }),
+                            arguments: vec![new_val],
+                            optional: false,
+                        }),
+                    },
+                    arith_var_read(var),
+                ]);
+            }
             seq(vec![
                 sh2_call(
                     "setVar",
@@ -5900,6 +5926,26 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                     right: Box::new(int1()),
                 }
             };
+            // local-lifted (string) binding: native update + read-back
+            // (mirror of the Assign branch above).
+            if is_local_lifted(var) {
+                return seq(vec![
+                    Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(Expr::Identifier {
+                            name: var.clone(),
+                        }),
+                        right: Box::new(Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "String".to_string(),
+                            }),
+                            arguments: vec![new_val],
+                            optional: false,
+                        }),
+                    },
+                    value,
+                ]);
+            }
             seq(vec![
                 sh2_call(
                     "setVar",
@@ -6718,29 +6764,98 @@ fn pure_value_declare(args: &[IrExpr]) -> Option<Vec<(String, String)>> {
     if !matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") {
         return None;
     }
+    // The word may arrive as a plain Str (`local v=1`) or as an
+    // ALL-LITERAL Interpolate (`local v="abc"` / `local v=""` — the
+    // parser wraps quoted strings in an interpolation; a literal-only
+    // interpolation IS the plain string, expandWord is an identity).
+    // Any Expr part (`$var`, captures) disqualifies — dynamic values
+    // stay on the runtime builtin.
+    fn word_text(e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Str(s, _) => Some(s.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                Some(
+                    parts
+                        .iter()
+                        .map(|p| match p {
+                            InterpPart::Lit(s) => s.clone(),
+                            _ => unreachable!("all-Lit checked"),
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+    fn value_ok(value: &str) -> bool {
+        value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | ',' | '+' | '-')
+        })
+    }
     let mut out = Vec::new();
-    for a in cargs {
-        let IrExpr::Str(sv, _) = a else { return None; };
+    let mut i = 0;
+    while i < cargs.len() {
+        let Some(sv) = word_text(&cargs[i]) else {
+            return None;
+        };
         if sv.starts_with('-') || sv.starts_with('+') {
             return None;
         }
-        // `mergeAssignArgs` merges `name=` followed by a bare word — the
-        // pure form has one `name=value` word per arg.
+        // `local v="..."` parses as TWO elements (`v=` + the quoted
+        // literal); `mergeAssignArgs` merges them at runtime — mirror the
+        // merge here. A bare word without `=` is a plain (no-value) decl —
+        // not a pure-value pair.
+        if let Some(rest) = sv.strip_suffix('=') {
+            if plain_ident(rest) {
+                if let Some(next) = cargs.get(i + 1).and_then(word_text) {
+                    if !next.starts_with('-') && !next.contains('=') && value_ok(&next) {
+                        out.push((rest.to_string(), next));
+                        i += 2;
+                        continue;
+                    }
+                }
+                return None; // `name=` with a non-literal value
+            }
+        }
         let (name, value) = sv.split_once('=')?;
         if !plain_ident(name) {
             return None;
         }
-        if !value.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | ',' | '+' | '-')
-        }) {
+        if !value_ok(value) {
             return None;
         }
         out.push((name.to_string(), value.to_string()));
+        i += 1;
     }
     if out.is_empty() {
         return None;
     }
     Some(out)
+}
+
+/// The literal text of a pure-value init expression (Str / Int /
+/// all-Lit Interpolate) — None for anything dynamic.
+fn literal_decl_value(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Int(i) => Some(i.to_string()),
+        IrExpr::Interpolate(parts)
+            if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+        {
+            Some(
+                parts
+                    .iter()
+                    .map(|p| match p {
+                        InterpPart::Lit(s) => s.clone(),
+                        _ => unreachable!("all-Lit checked"),
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
 }
 
 /// SH2_ASSUME_LOCAL_SCOPE=0 — turn off the pure-value `local`/`declare`/
@@ -6809,6 +6924,89 @@ fn try_native_declare_stmt(args: &[IrExpr]) -> Option<Expr> {
     });
     exprs.push(bool_lit(true));
     Some(seq(exprs))
+}
+
+/// Per-function `local` native lift (fish-sh-go local-scope requests) —
+/// the STATEMENT-position twin of [`try_native_declare_stmt`] for names
+/// in the CURRENT function's lift set (see [`local_lift_analysis`]): the
+/// FIRST decl of each name in the body emits a native `let NAME = value`
+/// (the block-scope shadow the runtime's flat store model lacks — the
+/// module-write path leaks the local out of the function), later decls
+/// plain assignments. Returns the statements (a `let` + assignment
+/// sequence), or None to keep the runtime builtin. The trailing
+/// `(sh2.lastExit = 0, true)` mirrors the builtin's status/truthiness
+/// (the runtime local always exits 0). Numeric-lifted names get the i64
+/// literal (the module model's invariant — reads/arith stay native
+/// numbers); all other lifted names hold the STRING (bash's value model
+/// — `local v=01; echo $v` must print "01").
+fn try_native_local_decl_stmt(args: &[IrExpr]) -> Option<Vec<Stmt>> {
+    let pairs = pure_value_declare(args)?;
+    if !pairs.iter().all(|(n, _)| is_local_lifted(n)) {
+        return None;
+    }
+    let nums: HashSet<String> = LIFTED_NUMERIC
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_default();
+    let mut decls: Vec<VariableDeclarator> = Vec::new();
+    let mut assigns: Vec<Stmt> = Vec::new();
+    let value_lit = |name: &str, value: &str| {
+        if nums.contains(name) {
+            Expr::Literal {
+                value: serde_json::Value::from(value.trim().parse::<i64>().unwrap_or(0)),
+                raw: None,
+            regex: None,
+            }
+        } else {
+            str_lit(value)
+        }
+    };
+    let mut out: Vec<Stmt> = Vec::new();
+    {
+        let mut stack = FUNCTION_STACK.lock().unwrap();
+        let (_, seen) = stack.last_mut()?;
+        for (name, value) in pairs {
+            if seen.contains(&name) {
+                assigns.push(Stmt::ExpressionStatement {
+                    expression: Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(Expr::Identifier { name: name.clone() }),
+                        right: Box::new(value_lit(&name, &value)),
+                    },
+                });
+            } else {
+                seen.insert(name.clone());
+                decls.push(VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: Expr::Identifier { name: name.clone() },
+                    init: Some(value_lit(&name, &value)),
+                });
+            }
+        }
+    }
+    if !decls.is_empty() {
+        out.push(Stmt::VariableDeclaration {
+            declarations: decls,
+            kind: "let",
+        });
+    }
+    out.extend(assigns);
+    out.push(Stmt::ExpressionStatement {
+        expression: seq(vec![
+            Expr::AssignmentExpression {
+                operator: "=".to_string(),
+                left: Box::new(sh2_member("lastExit")),
+                right: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                regex: None,
+                }),
+            },
+            bool_lit(true),
+        ]),
+    });
+    Some(out)
 }
 
 /// `eval "NAME=VALUE NAME=VALUE..."` with STATIC args: the runtime builtin
@@ -7596,9 +7794,19 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 }
                 walk_expr(expr, excluded, string_ctx, in_copy);
             }
-            IrStmt::Declare { vars, .. } => {
-                for v in vars {
-                    excluded.insert(v.name.clone());
+            IrStmt::Declare { vars, init, local } => {
+                // A PURE-VALUE `Declare { local: true }` is not a store
+                // write (the emit rewrites it to the native binding write
+                // path — mirror of the exec pure_value_declare skip): no
+                // exclusion marks. Other Declare forms (plain, dynamic
+                // init) stay store-bound.
+                let pure_local = *local
+                    && vars.len() == 1
+                    && init.as_ref().and_then(literal_decl_value).is_some();
+                if !pure_local {
+                    for v in vars {
+                        excluded.insert(v.name.clone());
+                    }
                 }
             }
             IrStmt::DeclareArray { var, .. } => {
@@ -7949,6 +8157,14 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     collect_program_functions(&prog.stmts, &mut functions);
     *LIFTED_NUMERIC.lock().unwrap() = Some(num);
     *LIFTED_STRING.lock().unwrap() = Some(str);
+    // Per-function `local` native lift (fish-sh-go local-scope requests):
+    // computed after the lift/scan statics (it consults nothing of them,
+    // but the emission reads it alongside) and before the main emission.
+    // FUNCTION_STACK is cleared too — the push/pop discipline inside the
+    // Function arm keeps it balanced, but a stale frame from an earlier
+    // compile would poison every later read.
+    *LOCAL_LIFT.lock().unwrap() = Some(local_lift_analysis(prog));
+    FUNCTION_STACK.lock().unwrap().clear();
     *CASE_NOCASE.lock().unwrap() = Some(nocase);
     *MAY_ERREXIT.lock().unwrap() = Some(errexit);
     *PROGRAM_PERSIST_FD1.lock().unwrap() = Some(persist_fd1);
@@ -9607,6 +9823,30 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }
                 }
             }
+            // Per-function `local` native lift: a statement-position
+            // pure-value decl whose names are all local-lifted emits the
+            // `let` block (first decl) / assignments (later) — see
+            // try_native_local_decl_stmt. Must run before expr_to_estree
+            // (whose exec arm would emit the module-write form — the
+            // leak). The `true && local v=1` expression-position form
+            // never reaches this arm (the BinOp lowers via expr_to_estree
+            // directly; the analysis keeps such names store-bound).
+            if let IrExpr::Call { func, args } = e {
+                if func == "exec" {
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        if matches!(name.as_str(), "local" | "declare" | "typeset" | "readonly")
+                        {
+                            if let Some(stmts) = try_native_local_decl_stmt(args) {
+                                return Some(if stmts.len() == 1 {
+                                    stmts.into_iter().next().unwrap()
+                                } else {
+                                    Stmt::BlockStatement { body: stmts }
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             Stmt::ExpressionStatement {
                 expression: expr_to_estree(e),
             }
@@ -10411,6 +10651,17 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             }
         }
         IrStmt::Function { name, body } => {
+            // Per-function `local` native lift (see [`local_lift_analysis`]):
+            // push the function's frame so the body's `local` decls lower
+            // to native `let` bindings (first decl) / assignments (later),
+            // and the body's reads/writes resolve to the local binding
+            // (is_lifted consults the stack top). Popped right after the
+            // body arrow lowers — module-level and other functions' refs
+            // never see the lift.
+            FUNCTION_STACK
+                .lock()
+                .unwrap()
+                .push((name.clone(), HashSet::new()));
             // `sh2.define(name, fn)` is a thin wrapper over the runtime's
             // function map (`this.functions.set(name, fn); return true;`) —
             // a direct state write + `true`, no dispatch. The arrow arg is
@@ -10440,6 +10691,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             } else {
                 arrow_sink(vec![], IrExpr::Arrow(body.clone()))
             };
+            FUNCTION_STACK.lock().unwrap().pop();
             let binding = fn_call_is_direct(name).then(|| {
                 direct_binding_name(name).expect("direct set is binding-valid")
             });
@@ -10649,6 +10901,21 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // the runtime dispatch.
             if env.is_empty() && redirects.is_empty() {
                 if let IrExpr::Str(name, _) = cmd {
+                    // Per-function `local` lift FIRST: a local-lifted name's
+                    // first decl must emit the native `let` (the module
+                    // path below would write the module binding — the
+                    // leak the local scope must fix). Later decls fall
+                    // through to the assignment path via try_native_local_decl_stmt's
+                    // seen-set.
+                    if matches!(name.as_str(), "local" | "declare" | "typeset" | "readonly") {
+                        if let Some(stmts) = try_native_local_decl_stmt(args) {
+                            return Some(if stmts.len() == 1 {
+                                stmts.into_iter().next().unwrap()
+                            } else {
+                                Stmt::BlockStatement { body: stmts }
+                            });
+                        }
+                    }
                     if let Some(native) = try_native_declare_stmt(args) {
                         return Some(Stmt::ExpressionStatement { expression: native });
                     }
@@ -10758,6 +11025,129 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 } else {
                     call
                 },
+            }
+        }
+        IrStmt::Declare { vars, init, local } => {
+            // The A1 contract's declarative declaration (the C frontend's
+            // `int x;` / a frontend `local x=1`). The shell model has no
+            // declaration — the init IS the assignment. The `local: true`
+            // form (a frontend `local`) reuses the exec-local lowering:
+            // a pure-literal init takes the per-function local lift's
+            // `let`/assignment path (first decl → native `let` — the
+            // scope shadow), then the module-lift assignment, then the
+            // runtime builtin (flat store write) for dynamic inits.
+            if *local && vars.len() == 1 {
+                let name = vars[0].name.clone();
+                let mk_args = |v: String| {
+                    vec![
+                        IrExpr::Str("local".into(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str(
+                            format!("{}={}", name, v),
+                            StrStyle::DoubleQuoted,
+                        )]),
+                    ]
+                };
+                if let Some(init) = init {
+                    if let Some(v) = literal_decl_value(init) {
+                        let args = mk_args(v);
+                        if let Some(stmts) = try_native_local_decl_stmt(&args) {
+                            return Some(if stmts.len() == 1 {
+                                stmts.into_iter().next().unwrap()
+                            } else {
+                                Stmt::BlockStatement { body: stmts }
+                            });
+                        }
+                        if let Some(native) = try_native_declare_stmt(&args) {
+                            return Some(Stmt::ExpressionStatement {
+                                expression: native,
+                            });
+                        }
+                    }
+                    // dynamic init: runtime builtin (the runtime's flat
+                    // store model), the value rendered in
+                    let word = Expr::BinaryExpression {
+                        operator: "+".to_string(),
+                        left: Box::new(str_lit(&format!("{}=", name))),
+                        right: Box::new(Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "String".to_string(),
+                            }),
+                            arguments: vec![expr_to_estree(init)],
+                            optional: false,
+                        }),
+                    };
+                    Stmt::ExpressionStatement {
+                        expression: seq(vec![
+                            sh2_call(
+                                "builtin",
+                                vec![str_lit("local"), array(vec![word])],
+                            ),
+                            Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(sh2_member("lastExit")),
+                                right: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(0),
+                                    raw: None,
+                                regex: None,
+                                }),
+                            },
+                            bool_lit(true),
+                        ]),
+                    }
+                } else {
+                    // `local v` (no value): the runtime builtin sets "".
+                    Stmt::ExpressionStatement {
+                        expression: sh2_call(
+                            "builtin",
+                            vec![str_lit("local"), array(vec![str_lit(&name)])],
+                        ),
+                    }
+                }
+            } else if let Some(init) = init {
+                // plain declaration with an init: the assignment
+                // (native when lifted — the analysis guarantees the
+                // source kind — else the store write)
+                let v = vars[0].name.clone();
+                if is_lifted(&v) {
+                    Stmt::ExpressionStatement {
+                        expression: Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(Expr::Identifier { name: v }),
+                            right: Box::new(expr_to_estree(init)),
+                        },
+                    }
+                } else {
+                    Stmt::ExpressionStatement {
+                        expression: seq(vec![
+                            sh2_call(
+                                "setVar",
+                                vec![str_lit(&v), Expr::CallExpression {
+                                    callee: Box::new(Expr::Identifier {
+                                        name: "String".to_string(),
+                                    }),
+                                    arguments: vec![expr_to_estree(init)],
+                                    optional: false,
+                                }],
+                            ),
+                            Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(sh2_member("lastExit")),
+                                right: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(0),
+                                    raw: None,
+                                regex: None,
+                                }),
+                            },
+                            bool_lit(true),
+                        ]),
+                    }
+                }
+            } else {
+                // declaration without init: a no-op in the shell model
+                // (bash `declare v` merely marks the attribute)
+                Stmt::ExpressionStatement {
+                    expression: bool_lit(true),
+                }
             }
         }
         other => unreachable!("Perl-only IR statement reached the ESTree renderer: {other:?}"),
@@ -17450,362 +17840,194 @@ fn file_test_check(f: char, s: Expr) -> Option<Expr> {
 /// string-lifted var) — never arithmetic, capture, or a write-builtin — and
 /// it is not already numeric-lifted. String reads inside arithmetic still
 /// work via `(Number(x) || 0)` on the native binding.
-fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<String> {
-    let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
-    let mut excluded: HashSet<String> = HashSet::new();
-    let mut string_ctx: HashSet<String> = HashSet::new();
-
-    fn is_ident(s: &str) -> bool {
-        let mut cs = s.chars();
-        match cs.next() {
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
-            }
-            _ => false,
+fn lift_is_ident(s: &str) -> bool {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
         }
+        _ => false,
     }
-    fn mark_string_refs(s: &str, out: &mut HashSet<String>) {
-        // Same precise store-read scan as the numeric-lift twin (the two
-        // walkers must agree): `$refs` outside `$(...)`, bare identifiers
-        // inside `$((...))`. See mark_store_refs.
-        mark_store_refs(s, out);
-    }
-    // `let`/`eval`/`(( ))` args are ARITHMETIC EXPRESSIONS — every bare
-    // identifier is a variable the runtime touches (unlike plain string
-    // words, which mark_store_refs correctly ignores).
-    fn mark_all_idents(s: &str, out: &mut HashSet<String>) {
-        let bytes = s.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let c = bytes[i] as char;
-            if (c.is_ascii_alphabetic() || c == '_')
-                && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-            {
-                let start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                let w = &s[start..i];
-                if is_ident(w) {
-                    out.insert(w.to_string());
-                }
-            } else {
+}
+fn lift_mark_string_refs(s: &str, out: &mut HashSet<String>) {
+    // Same precise store-read scan as the numeric-lift twin (the two
+    // walkers must agree): `$refs` outside `$(...)`, bare identifiers
+    // inside `$((...))`. See mark_store_refs.
+    mark_store_refs(s, out);
+}
+// `let`/`eval`/`(( ))` args are ARITHMETIC EXPRESSIONS — every bare
+// identifier is a variable the runtime touches (unlike plain string
+// words, which mark_store_refs correctly ignores).
+fn lift_mark_all_idents(s: &str, out: &mut HashSet<String>) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if (c.is_ascii_alphabetic() || c == '_')
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
+            let w = &s[start..i];
+            if lift_is_ident(w) {
+                out.insert(w.to_string());
+            }
+        } else {
+            i += 1;
         }
     }
-    fn mark_all_idents_args(e: &IrExpr, out: &mut HashSet<String>) {
-        match e {
-            IrExpr::Str(ss, _) => mark_all_idents(ss, out),
-            IrExpr::Array(elems) => {
-                for el in elems {
-                    mark_all_idents_args(el, out);
-                }
+}
+fn lift_mark_all_idents_args(e: &IrExpr, out: &mut HashSet<String>) {
+    match e {
+        IrExpr::Str(ss, _) => lift_mark_all_idents(ss, out),
+        IrExpr::Array(elems) => {
+            for el in elems {
+                lift_mark_all_idents_args(el, out);
             }
-            IrExpr::Object(props) => {
-                for (_, v) in props {
-                    mark_all_idents_args(v, out);
-                }
-            }
-            _ => {}
         }
-    }
-    fn mark_str_args(e: &IrExpr, string_ctx: &mut HashSet<String>) {
-        match e {
-            IrExpr::Str(ss, _) => mark_string_refs(ss, string_ctx),
-            IrExpr::Array(elems) => {
-                for el in elems {
-                    mark_str_args(el, string_ctx);
-                }
+        IrExpr::Object(props) => {
+            for (_, v) in props {
+                lift_mark_all_idents_args(v, out);
             }
-            IrExpr::Object(props) => {
-                for (_, v) in props {
-                    mark_str_args(v, string_ctx);
-                }
-            }
-            _ => {}
         }
+        _ => {}
     }
-    fn mark_write_builtin_vars(e: &IrExpr, excluded: &mut HashSet<String>) {
-        match e {
-            IrExpr::Array(elems) => {
-                for el in elems {
-                    mark_write_builtin_vars(el, excluded);
-                }
+}
+fn lift_mark_str_args(e: &IrExpr, string_ctx: &mut HashSet<String>) {
+    match e {
+        IrExpr::Str(ss, _) => lift_mark_string_refs(ss, string_ctx),
+        IrExpr::Array(elems) => {
+            for el in elems {
+                lift_mark_str_args(el, string_ctx);
             }
-            IrExpr::Str(sv, _) => {
-                let v = sv.split('=').next().unwrap_or("");
-                if is_ident(v) {
-                    excluded.insert(v.to_string());
-                }
-            }
-            _ => {}
         }
+        IrExpr::Object(props) => {
+            for (_, v) in props {
+                lift_mark_str_args(v, string_ctx);
+            }
+        }
+        _ => {}
     }
-    fn walk_expr(
-        e: &IrExpr,
-        excluded: &mut HashSet<String>,
-        string_ctx: &mut HashSet<String>,
-        in_copy: bool,
-    ) {
-        match e {
-            IrExpr::Call { func, args } => {
-                // `test` / `setArray` / `setArrayAppend` strings are
-                // excluded: the renderer injects lifted values into them,
-                // so a lifted var may appear inside them.
-                let let_args_native = func == "exec" && arith_let_args_native(args);
-                if func != "getVar" && func != "test" && func != "setArray" && func != "setArrayAppend"
-                    && !let_args_native
-                {
-                    for (i, a) in args.iter().enumerate() {
-                        // `sh2.param`'s NAME arg (index 1) is a direct store
-                        // lookup, never a $ref scan — and for a lifted name
-                        // the emitter inlines the value (native string ops
-                        // or the trailing value-override arg), so it must
-                        // NOT be marked store-bound. The extras keep their
-                        // marks (the runtime still expandWord's/evalArith's
-                        // them against the store). Names that are NOT plain
-                        // identifiers (`map[$k]` — the runtime expands the
-                        // subscript via normAssocKey/expandWord; `@`/`*`/
-                        // `#x`/`!x` forms) keep their marks.
-                        if func == "param" && i == 1 {
-                            if let IrExpr::Str(n, _) = a {
-                                let plain = !n.contains('$')
-                                    && !n.contains('[')
-                                    && !n.contains('@')
-                                    && !n.contains('*')
-                                    && !n.starts_with('#')
-                                    && !n.starts_with('!');
-                                if plain {
-                                    continue;
-                                }
-                            }
-                        }
-                        mark_str_args(a, string_ctx);
-                    }
-                }
-                // a native `((i++))` / `let` inside a subshell/background
-                // writes a COPY in bash — a lifted module binding would be
-                // clobbered by the arrow (mirror of the numeric-lift
-                // twin's exclusion), so mark the written vars excluded.
-                if in_copy && let_args_native {
-                    if let [IrExpr::Str(_cn, _), IrExpr::Array(cargs)] = args.as_slice() {
-                        for a in cargs {
-                            if let IrExpr::Str(sv, _) = a {
-                                if let Some(ast) = parse_arith_native(sv) {
-                                    for w in arith_written_vars(&ast) {
-                                        excluded.insert(w.clone());
-                                    }
-                                }
+}
+fn lift_mark_write_builtin_vars(e: &IrExpr, excluded: &mut HashSet<String>) {
+    match e {
+        IrExpr::Array(elems) => {
+            for el in elems {
+                lift_mark_write_builtin_vars(el, excluded);
+            }
+        }
+        IrExpr::Str(sv, _) => {
+            let v = sv.split('=').next().unwrap_or("");
+            if lift_is_ident(v) {
+                excluded.insert(v.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+fn lift_walk_expr(
+    e: &IrExpr,
+    excluded: &mut HashSet<String>,
+    string_ctx: &mut HashSet<String>,
+    in_copy: bool,
+) {
+    match e {
+        IrExpr::Call { func, args } => {
+            // `test` / `setArray` / `setArrayAppend` strings are
+            // excluded: the renderer injects lifted values into them,
+            // so a lifted var may appear inside them.
+            let let_args_native = func == "exec" && arith_let_args_native(args);
+            if func != "getVar" && func != "test" && func != "setArray" && func != "setArrayAppend"
+                && !let_args_native
+            {
+                for (i, a) in args.iter().enumerate() {
+                    // `sh2.param`'s NAME arg (index 1) is a direct store
+                    // lookup, never a $ref scan — and for a lifted name
+                    // the emitter inlines the value (native string ops
+                    // or the trailing value-override arg), so it must
+                    // NOT be marked store-bound. The extras keep their
+                    // marks (the runtime still expandWord's/evalArith's
+                    // them against the store). Names that are NOT plain
+                    // identifiers (`map[$k]` — the runtime expands the
+                    // subscript via normAssocKey/expandWord; `@`/`*`/
+                    // `#x`/`!x` forms) keep their marks.
+                    if func == "param" && i == 1 {
+                        if let IrExpr::Str(n, _) = a {
+                            let plain = !n.contains('$')
+                                && !n.contains('[')
+                                && !n.contains('@')
+                                && !n.contains('*')
+                                && !n.starts_with('#')
+                                && !n.starts_with('!');
+                            if plain {
+                                continue;
                             }
                         }
                     }
+                    lift_mark_str_args(a, string_ctx);
                 }
-                // `${x:=d}` WRITES the variable. The native lowering updates
-                // the JS binding via an assignment expression — but a
-                // default that cannot be fully inlined (a `$` ref to a
-                // store-bound var) or a subshell/background write (copy
-                // semantics: bash writes a COPY; a module binding would be
-                // clobbered) must keep the name store-bound so the runtime
-                // setVar path stays consistent.
-                if func == "param" {
-                    if let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args.as_slice() {
-                        if op == ":=" {
-                            let store_default = matches!(
-                                args.get(2),
-                                Some(IrExpr::Str(d, _)) if d.contains('$')
-                            );
-                            if store_default || in_copy {
-                                string_ctx.insert(name.clone());
-                            }
-                        }
-                    }
-                }
-                if func == "exec" || func == "builtin" {
-                    // `builtin` is the sync-builtin-dispatch callee (M8) —
-                    // same write-builtin semantics as exec-lowered builtins
-                    if let Some(IrExpr::Str(cname, _)) = args.first() {
-                        if matches!(
-                            cname.as_str(),
-                            "read" | "declare" | "typeset" | "local" | "export" | "readonly"
-                                | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source"
-                                | "."
-                        ) {
-                            // A natively-lowered `let` (try_native_let — the
-                            // runtime never sees the args) and a VALIDATED
-                            // `-i` declaration (int_declare_names — the
-                            // declare writes nothing and references
-                            // nothing) are not store writes: skip the marks
-                            // for the WHOLE call. (The old per-name skip
-                            // was defeated by the exec arg shape — the
-                            // names live inside the Array wrapper at
-                            // args[1], so only the bare Str args matched,
-                            // while the `-i` flag's letters still marked
-                            // the name store-bound via mark_all_idents.)
-                            let native_let = cname == "let" && let_args_native;
-                            let intdecl = if cname == "let" { Vec::new() } else {
-                                int_declare_names(args).unwrap_or_default()
-                            };
-                            // a PURE-VALUE `local x=1` declaration is not a store write (the
-                            // emit rewrites it to a native binding write — see pure_value_declare):
-                            // skip its marks too, unless the call sits in a subshell/background
-                            // (COPY semantics — the name must stay store-bound there, mirror of
-                            // the Assign-target exclusion).
-                            let pure_decl = !in_copy && pure_value_declare(args).is_some();
-                            if !(native_let || !intdecl.is_empty() || pure_decl) {
-
-                                for a in &args[1..] {
-                                    mark_write_builtin_vars(a, excluded);
-                                    // `let`/`(( ))`/`eval` args are
-                                    // EXPRESSIONS ("i++") — mark EVERY
-                                    // identifier they touch so a lifted
-                                    // native binding never desyncs from
-                                    // the runtime's store write
-                                    mark_all_idents_args(a, string_ctx);
+            }
+            // a native `((i++))` / `let` inside a subshell/background
+            // writes a COPY in bash — a lifted module binding would be
+            // clobbered by the arrow (mirror of the numeric-lift
+            // twin's exclusion), so mark the written vars excluded.
+            if in_copy && let_args_native {
+                if let [IrExpr::Str(_cn, _), IrExpr::Array(cargs)] = args.as_slice() {
+                    for a in cargs {
+                        if let IrExpr::Str(sv, _) = a {
+                            if let Some(ast) = parse_arith_native(sv) {
+                                for w in arith_written_vars(&ast) {
+                                    excluded.insert(w.clone());
                                 }
                             }
                         }
                     }
                 }
-                if matches!(
-                    func.as_str(),
-                    "arrayIndex" | "arrayLen" | "arrayItems" | "arraySlice" | "setArray"
-                        | "setArrayAppend"
-                ) {
-                    if let Some(IrExpr::Str(name, _)) = args.first() {
-                        excluded.insert(name.clone());
-                    }
-                }
-                for a in args {
-                    walk_expr(a, excluded, string_ctx, in_copy);
-                }
             }
-            IrExpr::Arrow(stmts) => {
-                for st in stmts {
-                    walk_stmt(st, excluded, string_ctx, in_copy);
-                }
-            }
-            IrExpr::Index { key, .. } => walk_expr(key, excluded, string_ctx, in_copy),
-            IrExpr::BinOp { lhs, rhs, .. } => {
-                walk_expr(lhs, excluded, string_ctx, in_copy);
-                walk_expr(rhs, excluded, string_ctx, in_copy);
-            }
-            IrExpr::MethodCall { obj, args, .. } => {
-                walk_expr(obj, excluded, string_ctx, in_copy);
-                for a in args {
-                    walk_expr(a, excluded, string_ctx, in_copy);
-                }
-            }
-            IrExpr::Ternary { cond, then, else_, .. } => {
-                walk_expr(cond, excluded, string_ctx, in_copy);
-                walk_expr(then, excluded, string_ctx, in_copy);
-                walk_expr(else_, excluded, string_ctx, in_copy);
-            }
-            IrExpr::DefinedOr { expr, default } => {
-                walk_expr(expr, excluded, string_ctx, in_copy);
-                walk_expr(default, excluded, string_ctx, in_copy);
-            }
-            IrExpr::Interpolate(parts) => {
-                for p in parts {
-                    if let InterpPart::Expr(inner) = p {
-                        walk_expr(inner, excluded, string_ctx, in_copy);
-                    }
-                }
-            }
-            IrExpr::Capture { expr, .. } => walk_expr(expr, excluded, string_ctx, in_copy),
-            IrExpr::Array(elems) => {
-                for el in elems {
-                    walk_expr(el, excluded, string_ctx, in_copy);
-                }
-            }
-            IrExpr::Object(props) => {
-                for (_, v) in props {
-                    walk_expr(v, excluded, string_ctx, in_copy);
-                }
-            }
-            _ => {}
-        }
-    }
-    fn walk_stmt(
-        st: &IrStmt,
-        excluded: &mut HashSet<String>,
-        string_ctx: &mut HashSet<String>,
-        in_copy: bool,
-    ) {
-        match st {
-            IrStmt::Assign { targets, expr } => {
-                for t in targets {
-                    if t.indices.is_empty() {
-                        if in_copy {
-                            excluded.insert(t.var.clone());
-                        } else if t.var.contains('[') {
-                            // Baked subscript write (see the numeric-lift
-                            // twin): the runtime resolves the subscript
-                            // from the STORE — mark its `$var` refs
-                            // store-read so a lifted binding never desyncs.
-                            mark_string_refs(&t.var, string_ctx);
+            // `${x:=d}` WRITES the variable. The native lowering updates
+            // the JS binding via an assignment expression — but a
+            // default that cannot be fully inlined (a `$` ref to a
+            // store-bound var) or a subshell/background write (copy
+            // semantics: bash writes a COPY; a module binding would be
+            // clobbered) must keep the name store-bound so the runtime
+            // setVar path stays consistent.
+            if func == "param" {
+                if let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args.as_slice() {
+                    if op == ":=" {
+                        let store_default = matches!(
+                            args.get(2),
+                            Some(IrExpr::Str(d, _)) if d.contains('$')
+                        );
+                        if store_default || in_copy {
+                            string_ctx.insert(name.clone());
                         }
-                    } else {
-                        excluded.insert(t.var.clone());
-                    }
-                }
-                walk_expr(expr, excluded, string_ctx, in_copy);
-            }
-            IrStmt::Declare { vars, .. } => {
-                for v in vars {
-                    excluded.insert(v.name.clone());
-                }
-            }
-            IrStmt::DeclareArray { var, .. } => {
-                excluded.insert(var.clone());
-            }
-            IrStmt::For { var, iter, body } => {
-                // NOTE: the loop var is NOT excluded here — the loop
-                // iteration is its assignment source (see collect_for_iters
-                // + the fixpoint); external references are removed by
-                // drop_externally_referenced_loop_vars afterwards.
-                walk_expr(iter, excluded, string_ctx, in_copy);
-                for b in body {
-                    walk_stmt(b, excluded, string_ctx, in_copy);
-                }
-            }
-            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
-                walk_expr(cond, excluded, string_ctx, in_copy);
-                for b in body {
-                    walk_stmt(b, excluded, string_ctx, in_copy);
-                }
-            }
-            IrStmt::If { cond, then, elsifs, else_ } => {
-                walk_expr(cond, excluded, string_ctx, in_copy);
-                for b in then.iter().chain(else_) {
-                    walk_stmt(b, excluded, string_ctx, in_copy);
-                }
-                for (_, b) in elsifs {
-                    for stm in b {
-                        walk_stmt(stm, excluded, string_ctx, in_copy);
                     }
                 }
             }
-            IrStmt::Exec { cmd, args, capture, env, .. } => {
-                if let Some(c) = capture {
-                    excluded.insert(c.clone());
-                }
-                for (v, _) in env {
-                    excluded.insert(v.clone());
-                }
-                if let IrExpr::Str(cname, _) = cmd {
+            if func == "exec" || func == "builtin" {
+                // `builtin` is the sync-builtin-dispatch callee (M8) —
+                // same write-builtin semantics as exec-lowered builtins
+                if let Some(IrExpr::Str(cname, _)) = args.first() {
                     if matches!(
                         cname.as_str(),
                         "read" | "declare" | "typeset" | "local" | "export" | "readonly"
-                            | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source" | "."
+                            | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source"
+                            | "."
                     ) {
-                        // natively-lowered `let` args (try_native_let) and
-                        // a VALIDATED `-i` declaration (int_declare_names)
-                        // are not store writes — skip their marks for the
-                        // WHOLE call (mirror of the expression-position
-                        // block; the old per-name skip was defeated by the
-                        // Array wrapper + flag letters — see above).
-                        let native_let = cname == "let" && arith_let_args_native(args);
+                        // A natively-lowered `let` (try_native_let — the
+                        // runtime never sees the args) and a VALIDATED
+                        // `-i` declaration (int_declare_names — the
+                        // declare writes nothing and references
+                        // nothing) are not store writes: skip the marks
+                        // for the WHOLE call. (The old per-name skip
+                        // was defeated by the exec arg shape — the
+                        // names live inside the Array wrapper at
+                        // args[1], so only the bare Str args matched,
+                        // while the `-i` flag's letters still marked
+                        // the name store-bound via mark_all_idents.)
+                        let native_let = cname == "let" && let_args_native;
                         let intdecl = if cname == "let" { Vec::new() } else {
                             int_declare_names(args).unwrap_or_default()
                         };
@@ -17817,84 +18039,653 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                         let pure_decl = !in_copy && pure_value_declare(args).is_some();
                         if !(native_let || !intdecl.is_empty() || pure_decl) {
 
-                            for a in args {
-                                mark_write_builtin_vars(a, excluded);
-                                // `let`/`(( ))`/`eval` args are ARITHMETIC
-                                // EXPRESSIONS — mark EVERY identifier they
-                                // touch so a lifted native binding never
-                                // desyncs from a runtime store write
-                                mark_all_idents_args(a, string_ctx);
+                            for a in &args[1..] {
+                                lift_mark_write_builtin_vars(a, excluded);
+                                // `let`/`(( ))`/`eval` args are
+                                // EXPRESSIONS ("i++") — mark EVERY
+                                // identifier they touch so a lifted
+                                // native binding never desyncs from
+                                // the runtime's store write
+                                lift_mark_all_idents_args(a, string_ctx);
                             }
                         }
                     }
                 }
-                walk_expr(cmd, excluded, string_ctx, in_copy);
-                for a in args {
-                    walk_expr(a, excluded, string_ctx, in_copy);
+            }
+            if matches!(
+                func.as_str(),
+                "arrayIndex" | "arrayLen" | "arrayItems" | "arraySlice" | "setArray"
+                    | "setArrayAppend"
+            ) {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    excluded.insert(name.clone());
                 }
             }
-            IrStmt::Pipeline { stages, capture, .. } => {
-                if let Some(c) = capture {
-                    excluded.insert(c.clone());
+            for a in args {
+                lift_walk_expr(a, excluded, string_ctx, in_copy);
+            }
+        }
+        IrExpr::Arrow(stmts) => {
+            for st in stmts {
+                lift_walk_stmt(st, excluded, string_ctx, in_copy);
+            }
+        }
+        IrExpr::Index { key, .. } => lift_walk_expr(key, excluded, string_ctx, in_copy),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            lift_walk_expr(lhs, excluded, string_ctx, in_copy);
+            lift_walk_expr(rhs, excluded, string_ctx, in_copy);
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            lift_walk_expr(obj, excluded, string_ctx, in_copy);
+            for a in args {
+                lift_walk_expr(a, excluded, string_ctx, in_copy);
+            }
+        }
+        IrExpr::Ternary { cond, then, else_, .. } => {
+            lift_walk_expr(cond, excluded, string_ctx, in_copy);
+            lift_walk_expr(then, excluded, string_ctx, in_copy);
+            lift_walk_expr(else_, excluded, string_ctx, in_copy);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            lift_walk_expr(expr, excluded, string_ctx, in_copy);
+            lift_walk_expr(default, excluded, string_ctx, in_copy);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(inner) = p {
+                    lift_walk_expr(inner, excluded, string_ctx, in_copy);
                 }
-                for stage in stages {
-                    for b in stage {
-                        walk_stmt(b, excluded, string_ctx, in_copy);
+            }
+        }
+        IrExpr::Capture { expr, .. } => lift_walk_expr(expr, excluded, string_ctx, in_copy),
+        IrExpr::Array(elems) => {
+            for el in elems {
+                lift_walk_expr(el, excluded, string_ctx, in_copy);
+            }
+        }
+        IrExpr::Object(props) => {
+            for (_, v) in props {
+                lift_walk_expr(v, excluded, string_ctx, in_copy);
+            }
+        }
+        _ => {}
+    }
+}
+fn lift_walk_stmt(
+    st: &IrStmt,
+    excluded: &mut HashSet<String>,
+    string_ctx: &mut HashSet<String>,
+    in_copy: bool,
+) {
+    match st {
+        IrStmt::Assign { targets, expr } => {
+            for t in targets {
+                if t.indices.is_empty() {
+                    if in_copy {
+                        excluded.insert(t.var.clone());
+                    } else if t.var.contains('[') {
+                        // Baked subscript write (see the numeric-lift
+                        // twin): the runtime resolves the subscript
+                        // from the STORE — mark its `$var` refs
+                        // store-read so a lifted binding never desyncs.
+                        lift_mark_string_refs(&t.var, string_ctx);
                     }
+                } else {
+                    excluded.insert(t.var.clone());
                 }
             }
-            IrStmt::Function { body, .. } | IrStmt::Block(body) => {
-                for b in body {
-                    walk_stmt(b, excluded, string_ctx, in_copy);
+            lift_walk_expr(expr, excluded, string_ctx, in_copy);
+        }
+        IrStmt::Declare { vars, init, local } => {
+            // A PURE-VALUE `Declare { local: true }` is not a store
+            // write (the emit rewrites it to the native binding write
+            // path — mirror of the exec pure_value_declare skip): no
+            // exclusion marks. Other Declare forms (plain, dynamic
+            // init) stay store-bound.
+            let pure_local = *local
+                && vars.len() == 1
+                && init.as_ref().and_then(literal_decl_value).is_some();
+            if !pure_local {
+                for v in vars {
+                    excluded.insert(v.name.clone());
                 }
             }
-            IrStmt::Subshell(body) | IrStmt::Background(body) => {
-                for b in body {
-                    walk_stmt(b, excluded, string_ctx, true);
+        }
+        IrStmt::DeclareArray { var, .. } => {
+            excluded.insert(var.clone());
+        }
+        IrStmt::For { var, iter, body } => {
+            // NOTE: the loop var is NOT excluded here — the loop
+            // iteration is its assignment source (see collect_for_iters
+            // + the fixpoint); external references are removed by
+            // drop_externally_referenced_loop_vars afterwards.
+            lift_walk_expr(iter, excluded, string_ctx, in_copy);
+            for b in body {
+                lift_walk_stmt(b, excluded, string_ctx, in_copy);
+            }
+        }
+        IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+            lift_walk_expr(cond, excluded, string_ctx, in_copy);
+            for b in body {
+                lift_walk_stmt(b, excluded, string_ctx, in_copy);
+            }
+        }
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            lift_walk_expr(cond, excluded, string_ctx, in_copy);
+            for b in then.iter().chain(else_) {
+                lift_walk_stmt(b, excluded, string_ctx, in_copy);
+            }
+            for (_, b) in elsifs {
+                for stm in b {
+                    lift_walk_stmt(stm, excluded, string_ctx, in_copy);
                 }
             }
-            IrStmt::Redirect { inner, redirects } => {
-                for b in inner {
-                    walk_stmt(b, excluded, string_ctx, in_copy);
-                }
-                for r in redirects {
-                    walk_expr(&r.target, excluded, string_ctx, in_copy);
-                    if r.interpolate {
-                        if let IrExpr::Str(body, _) = &r.target {
-                            mark_string_refs(body, string_ctx);
+        }
+        IrStmt::Exec { cmd, args, capture, env, .. } => {
+            if let Some(c) = capture {
+                excluded.insert(c.clone());
+            }
+            for (v, _) in env {
+                excluded.insert(v.clone());
+            }
+            if let IrExpr::Str(cname, _) = cmd {
+                if matches!(
+                    cname.as_str(),
+                    "read" | "declare" | "typeset" | "local" | "export" | "readonly"
+                        | "unset" | "mapfile" | "readarray" | "let" | "eval" | "source" | "."
+                ) {
+                    // natively-lowered `let` args (try_native_let) and
+                    // a VALIDATED `-i` declaration (int_declare_names)
+                    // are not store writes — skip their marks for the
+                    // WHOLE call (mirror of the expression-position
+                    // block; the old per-name skip was defeated by the
+                    // Array wrapper + flag letters — see above).
+                    let native_let = cname == "let" && arith_let_args_native(args);
+                    let intdecl = if cname == "let" { Vec::new() } else {
+                        int_declare_names(args).unwrap_or_default()
+                    };
+                    // a PURE-VALUE `local x=1` declaration is not a store write (the
+                    // emit rewrites it to a native binding write — see pure_value_declare):
+                    // skip its marks too, unless the call sits in a subshell/background
+                    // (COPY semantics — the name must stay store-bound there, mirror of
+                    // the Assign-target exclusion).
+                    let pure_decl = !in_copy && pure_value_declare(args).is_some();
+                    if !(native_let || !intdecl.is_empty() || pure_decl) {
+
+                        for a in args {
+                            lift_mark_write_builtin_vars(a, excluded);
+                            // `let`/`(( ))`/`eval` args are ARITHMETIC
+                            // EXPRESSIONS — mark EVERY identifier they
+                            // touch so a lifted native binding never
+                            // desyncs from a runtime store write
+                            lift_mark_all_idents_args(a, string_ctx);
                         }
                     }
                 }
             }
-            IrStmt::Case { discriminant, clauses } => {
-                walk_expr(discriminant, excluded, string_ctx, in_copy);
-                for c in clauses {
-                    for p in &c.patterns {
-                        mark_string_refs(p, string_ctx);
-                    }
-                    for b in &c.body {
-                        walk_stmt(b, excluded, string_ctx, in_copy);
+            lift_walk_expr(cmd, excluded, string_ctx, in_copy);
+            for a in args {
+                lift_walk_expr(a, excluded, string_ctx, in_copy);
+            }
+        }
+        IrStmt::Pipeline { stages, capture, .. } => {
+            if let Some(c) = capture {
+                excluded.insert(c.clone());
+            }
+            for stage in stages {
+                for b in stage {
+                    lift_walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+            }
+        }
+        IrStmt::Function { body, .. } | IrStmt::Block(body) => {
+            for b in body {
+                lift_walk_stmt(b, excluded, string_ctx, in_copy);
+            }
+        }
+        IrStmt::Subshell(body) | IrStmt::Background(body) => {
+            for b in body {
+                lift_walk_stmt(b, excluded, string_ctx, true);
+            }
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            for b in inner {
+                lift_walk_stmt(b, excluded, string_ctx, in_copy);
+            }
+            for r in redirects {
+                lift_walk_expr(&r.target, excluded, string_ctx, in_copy);
+                if r.interpolate {
+                    if let IrExpr::Str(body, _) = &r.target {
+                        lift_mark_string_refs(body, string_ctx);
                     }
                 }
             }
-            IrStmt::Expr(e) => walk_expr(e, excluded, string_ctx, in_copy),
-            IrStmt::Output { value, .. } => walk_expr(value, excluded, string_ctx, in_copy),
-            IrStmt::WriteFile { path, content, .. } => {
-                walk_expr(path, excluded, string_ctx, in_copy);
-                walk_expr(content, excluded, string_ctx, in_copy);
+        }
+        IrStmt::Case { discriminant, clauses } => {
+            lift_walk_expr(discriminant, excluded, string_ctx, in_copy);
+            for c in clauses {
+                for p in &c.patterns {
+                    lift_mark_string_refs(p, string_ctx);
+                }
+                for b in &c.body {
+                    lift_walk_stmt(b, excluded, string_ctx, in_copy);
+                }
             }
-            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => {
-                walk_expr(e, excluded, string_ctx, in_copy)
+        }
+        IrStmt::Expr(e) => lift_walk_expr(e, excluded, string_ctx, in_copy),
+        IrStmt::Output { value, .. } => lift_walk_expr(value, excluded, string_ctx, in_copy),
+        IrStmt::WriteFile { path, content, .. } => {
+            lift_walk_expr(path, excluded, string_ctx, in_copy);
+            lift_walk_expr(content, excluded, string_ctx, in_copy);
+        }
+        IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => {
+            lift_walk_expr(e, excluded, string_ctx, in_copy)
+        }
+        IrStmt::SetChildError(e) => lift_walk_expr(e, excluded, string_ctx, in_copy),
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+            lift_walk_expr(expr, excluded, string_ctx, in_copy)
+        }
+        _ => {}
+    }
+}
+
+
+
+// ── Per-function `local` native lift (fish-sh-go local-scope requests) ──
+
+/// Does an `IrStmt::Exec` (statement position) declare `name` with a
+/// PURE-VALUE `local`/`declare`/`typeset`/`readonly` call?
+fn lift_stmt_is_pure_decl(st: &IrStmt, name: &str) -> bool {
+    // The declarative contract form: `Declare { local: true }` with a
+    // literal init.
+    if let IrStmt::Declare {
+        vars,
+        init,
+        local: true,
+    } = st
+    {
+        return vars.len() == 1
+            && vars[0].name == name
+            && init.as_ref().and_then(literal_decl_value).is_some();
+    }
+    // Both IR shapes carry the call's args compatible with
+    // pure_value_declare: the frontend `IrStmt::Exec { cmd, args }` and
+    // the corpus `IrStmt::Expr(Call exec [Str(cname), Array(args)])`.
+    let args: &[IrExpr] = match st {
+        IrStmt::Exec { cmd, args, .. } => {
+            if let IrExpr::Str(cname, _) = cmd {
+                if matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") {
+                    args
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
             }
-            IrStmt::SetChildError(e) => walk_expr(e, excluded, string_ctx, in_copy),
-            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
-                walk_expr(expr, excluded, string_ctx, in_copy)
+        }
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+            if let Some(IrExpr::Str(cname, _)) = args.first() {
+                if matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") {
+                    args
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
             }
-            _ => {}
+        }
+        _ => return false,
+    };
+    pure_value_declare(args)
+        .map(|pairs| pairs.iter().any(|(n, _)| n == name))
+        .unwrap_or(false)
+}
+
+/// Does `name` appear anywhere in the arithmetic AST (reads, writes,
+/// index keys)?
+fn lift_arith_mentions(a: &ArithAst, name: &str) -> bool {
+    match a {
+        ArithAst::Num(_) => false,
+        ArithAst::Var(v) => v == name,
+        ArithAst::Index { var, key } => var == name || lift_arith_mentions(key, name),
+        ArithAst::Bin { lhs, rhs, .. } => {
+            lift_arith_mentions(lhs, name) || lift_arith_mentions(rhs, name)
+        }
+        ArithAst::Un { arg, .. } => lift_arith_mentions(arg, name),
+        ArithAst::Cond { test, then, else_ } => {
+            lift_arith_mentions(test, name)
+                || lift_arith_mentions(then, name)
+                || lift_arith_mentions(else_, name)
+        }
+        ArithAst::Assign { var, rhs, .. } => var == name || lift_arith_mentions(rhs, name),
+        ArithAst::IncDec { var, .. } => var == name,
+    }
+}
+
+/// Does the expression mention `name` anywhere — a `$name` ref inside a
+/// runtime string (mark_store_refs semantics), a Var/getVar/array-name
+/// arg, or a nested expression?
+fn lift_expr_mentions(e: &IrExpr, name: &str) -> bool {
+    match e {
+        IrExpr::Var(n, _) => n == name,
+        IrExpr::Call { func, args } => {
+            // literal name-arg reads/writes (getVar/param/setVar/array forms)
+            if matches!(
+                func.as_str(),
+                "getVar" | "setVar" | "listVar" | "param" | "arrayIndex" | "arrayLen"
+                    | "arrayItems" | "arraySlice" | "setArray" | "setArrayAppend"
+            ) {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if n == name {
+                        return true;
+                    }
+                }
+            }
+            // `$name` refs the runtime resolves from the STORE in any
+            // runtime-call string arg
+            let mut refs = HashSet::new();
+            lift_mark_str_args(e, &mut refs);
+            if refs.contains(name) {
+                return true;
+            }
+            args.iter().any(|a| lift_expr_mentions(a, name))
+        }
+        IrExpr::Str(s, _) => {
+            let mut refs = HashSet::new();
+            lift_mark_string_refs(s, &mut refs);
+            refs.contains(name)
+        }
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            InterpPart::Lit(s) => {
+                let mut refs = HashSet::new();
+                lift_mark_string_refs(s, &mut refs);
+                refs.contains(name)
+            }
+            InterpPart::Expr(inner) => lift_expr_mentions(inner, name),
+        }),
+        IrExpr::Arith(a) => lift_arith_mentions(a, name),
+        IrExpr::Arrow(stmts) => stmts.iter().any(|s| lift_stmt_mentions(s, name)),
+        IrExpr::Array(elems) => elems.iter().any(|el| lift_expr_mentions(el, name)),
+        IrExpr::Object(props) => props.iter().any(|(_, v)| lift_expr_mentions(v, name)),
+        IrExpr::Index { key, .. } => lift_expr_mentions(key, name),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            lift_expr_mentions(lhs, name) || lift_expr_mentions(rhs, name)
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            lift_expr_mentions(obj, name) || args.iter().any(|a| lift_expr_mentions(a, name))
+        }
+        IrExpr::Ternary { cond, then, else_, .. } => {
+            lift_expr_mentions(cond, name)
+                || lift_expr_mentions(then, name)
+                || lift_expr_mentions(else_, name)
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            lift_expr_mentions(expr, name) || lift_expr_mentions(default, name)
+        }
+        IrExpr::Capture { expr, .. } => lift_expr_mentions(expr, name),
+        _ => false,
+    }
+}
+
+/// Does the statement mention `name` anywhere (reads, writes, runtime
+/// strings)? `descend_fns`: whether nested `IrStmt::Function` bodies
+/// count — false for the nested-function exclusion scan (bash has no
+/// closures: a nested function reads the GLOBAL, and a lifted local
+/// binding would shadow it for module-lifted names).
+fn lift_stmt_mentions_deep(st: &IrStmt, name: &str, descend_fns: bool) -> bool {
+    match st {
+        IrStmt::Assign { targets, expr } => {
+            targets.iter().any(|t| t.var == name) || lift_expr_mentions(expr, name)
+        }
+        IrStmt::Exec { cmd, args, capture, env, .. } => {
+            if capture.as_deref() == Some(name) {
+                return true;
+            }
+            if env.iter().any(|(v, _)| v == name) {
+                return true;
+            }
+            lift_expr_mentions(cmd, name) || args.iter().any(|a| lift_expr_mentions(a, name))
+        }
+        IrStmt::Expr(e) => lift_expr_mentions(e, name),
+        IrStmt::If { cond, then, elsifs, else_ } => {
+            lift_expr_mentions(cond, name)
+                || then
+                    .iter()
+                    .chain(else_)
+                    .any(|b| lift_stmt_mentions_deep(b, name, descend_fns))
+                || elsifs.iter().any(|(_, b)| {
+                    b.iter()
+                        .any(|s| lift_stmt_mentions_deep(s, name, descend_fns))
+                })
+        }
+        IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+            lift_expr_mentions(cond, name)
+                || body
+                    .iter()
+                    .any(|b| lift_stmt_mentions_deep(b, name, descend_fns))
+        }
+        IrStmt::For { var, iter, body } => {
+            var == name
+                || lift_expr_mentions(iter, name)
+                || body
+                    .iter()
+                    .any(|b| lift_stmt_mentions_deep(b, name, descend_fns))
+        }
+        IrStmt::Function { name: fname, body } => {
+            fname == name
+                || (descend_fns
+                    && body
+                        .iter()
+                        .any(|b| lift_stmt_mentions_deep(b, name, descend_fns)))
+        }
+        IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => body
+            .iter()
+            .any(|b| lift_stmt_mentions_deep(b, name, descend_fns)),
+        IrStmt::Pipeline { stages, capture, .. } => {
+            capture.as_deref() == Some(name)
+                || stages
+                    .iter()
+                    .any(|s| s.iter().any(|b| lift_stmt_mentions_deep(b, name, descend_fns)))
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            inner
+                .iter()
+                .any(|b| lift_stmt_mentions_deep(b, name, descend_fns))
+                || redirects.iter().any(|r| lift_expr_mentions(&r.target, name))
+        }
+        IrStmt::Case { discriminant, clauses } => {
+            lift_expr_mentions(discriminant, name)
+                || clauses.iter().any(|c| {
+                    c.body
+                        .iter()
+                        .any(|b| lift_stmt_mentions_deep(b, name, descend_fns))
+                        || c.patterns.iter().any(|p| {
+                            let mut refs = HashSet::new();
+                            lift_mark_string_refs(p, &mut refs);
+                            refs.contains(name)
+                        })
+                })
+        }
+        IrStmt::Declare { vars, .. } => vars.iter().any(|v| v.name == name),
+        IrStmt::DeclareArray { var, .. } => var == name,
+        IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => lift_expr_mentions(e, name),
+        IrStmt::Output { value, .. } => lift_expr_mentions(value, name),
+        IrStmt::WriteFile { path, content, .. } => {
+            lift_expr_mentions(path, name) || lift_expr_mentions(content, name)
+        }
+        IrStmt::SetChildError(e) => lift_expr_mentions(e, name),
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => lift_expr_mentions(expr, name),
+        _ => false,
+    }
+}
+
+fn lift_stmt_mentions(st: &IrStmt, name: &str) -> bool {
+    lift_stmt_mentions_deep(st, name, true)
+}
+
+/// Names the runtime/OS machinery reads from the store or the environment
+/// implicitly (subprocess env inheritance, IFS-driven splitting/joins,
+/// cd state): a lifted native binding would hide a `local` shadow from
+/// them. Conservative denylist — corpus functions never local-declare
+/// these (the corpus is the oracle).
+const LOCAL_ENV_OBSERVABLE: &[&str] = &[
+    "IFS", "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "PWD", "OLDPWD", "USER", "LOGNAME",
+    "LANG", "LC_ALL", "LC_CTYPE", "LANGUAGE", "TERM", "SHELL", "EDITOR", "VISUAL",
+    "CDPATH", "ENV", "BASH_ENV", "PS1", "PS2", "PS3", "PS4", "TZ", "HOSTNAME", "MAIL",
+    "LINES", "COLUMNS", "HISTSIZE", "HISTFILE", "PROMPT_COMMAND",
+];
+
+/// Per-function `local`-variable native lift (the fish-sh-go local-scope
+/// requests): function name → the set of names whose PURE-VALUE
+/// `local`/`declare`/`typeset`/`readonly` declarations in the body lower
+/// to a native `let` binding (first decl) / assignment (later decls)
+/// INSIDE the function's define arrow — the block-scope shadow the
+/// runtime's flat store model lacks (`builtins.local` is a plain store
+/// write with no scope stack; the old native path wrote the MODULE
+/// binding, leaking the local out of the function).
+///
+/// Safety (all conservative — any doubt disqualifies):
+/// 1. The FIRST mention of the name in the function body (preorder) must
+///    be the first pure-value decl, in EXEC (statement) position at the
+///    function-body TOP LEVEL — the `let` must be emitted where it can
+///    execute before any read/write (JS TDZ: a read before the `let`
+///    would throw; bash would read the outer value) and where its block
+///    scope covers the whole body (a decl inside an if-branch/loop-body
+///    arrow would not escape its JS block).
+/// 2. The shared lift walker (the string-lift analysis' excluded /
+///    string_ctx sets, run per function body): no runtime-store read of
+///    the name (`$v` in runtime-call strings — tests, arith, eval,
+///    heredocs, `declare -p`), no store write (read/unset/export/eval/
+///    setArray/subshell-copy...), no baked-subscript or array-name use.
+/// 3. No mention inside a NESTED function body (bash has no closures — a
+///    nested function reads the global; for a module-lifted name the JS
+///    closure would wrongly resolve to the local binding).
+/// 4. Not in LOCAL_ENV_OBSERVABLE (subprocess env / IFS / cwd machinery).
+/// 5. The SH2_ASSUME_LOCAL_SCOPE documented assumption (default ON, see
+///    `assume_local_scope`): the local's scope is never observed across
+///    recursive/interleaved calls between re-inits — the runtime model
+///    the existing pure-value-decl path already relies on.
+fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
+    if !assume_local_scope() {
+        return HashMap::new();
+    }
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+    for stmt in &prog.stmts {
+        if let IrStmt::Function { name, body } = stmt {
+            // 1. candidate names: pure-value decls anywhere in the body
+            let mut candidates: HashSet<String> = HashSet::new();
+            for b in body {
+                let args: Option<&[IrExpr]> = match b {
+                    IrStmt::Declare {
+                        vars,
+                        init,
+                        local: true,
+                    } => {
+                        if vars.len() == 1 && init.as_ref().and_then(literal_decl_value).is_some()
+                        {
+                            Some(&[])
+                        } else {
+                            None
+                        }
+                    }
+                    IrStmt::Exec { cmd, args, .. } => match cmd {
+                        IrExpr::Str(cname, _)
+                            if matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") =>
+                        {
+                            Some(args)
+                        }
+                        _ => None,
+                    },
+                    IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+                        match args.first() {
+                            Some(IrExpr::Str(cname, _))
+                                if matches!(
+                                    cname.as_str(),
+                                    "local" | "declare" | "typeset" | "readonly"
+                                ) =>
+                            {
+                                Some(args)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match b {
+                    IrStmt::Declare { vars, .. } if args.is_some() => {
+                        candidates.insert(vars[0].name.clone());
+                    }
+                    _ => {
+                        if let Some(a) = args {
+                            if let Some(pairs) = pure_value_declare(a) {
+                                for (n, _) in pairs {
+                                    candidates.insert(n);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // 2. walker exclusion sets (per function body)
+            let mut excluded: HashSet<String> = HashSet::new();
+            let mut string_ctx: HashSet<String> = HashSet::new();
+            for b in body {
+                lift_walk_stmt(b, &mut excluded, &mut string_ctx, false);
+            }
+            let mut lift: HashSet<String> = HashSet::new();
+            'cand: for c in candidates.iter() {
+                if LOCAL_ENV_OBSERVABLE.contains(&c.as_str()) {
+                    continue;
+                }
+                if excluded.contains(c) || string_ctx.contains(c) {
+                    continue;
+                }
+                // 3. first mention must be the first decl, at top level
+                let mut seen_decl = false;
+                for b in body {
+                    if seen_decl {
+                        break;
+                    }
+                    if lift_stmt_is_pure_decl(b, &c) {
+                        seen_decl = true;
+                        continue;
+                    }
+                    if lift_stmt_mentions_deep(b, &c, true) {
+                        continue 'cand;
+                    }
+                }
+                if !seen_decl {
+                    continue;
+                }
+                // 4. no mention inside nested function bodies
+                for b in body {
+                    if let IrStmt::Function { body: fbody, .. } = b {
+                        if fbody
+                            .iter()
+                            .any(|s| lift_stmt_mentions_deep(s, &c, true))
+                        {
+                            continue 'cand;
+                        }
+                    }
+                }
+                lift.insert(c.clone());
+            }
+            let lift_done = !lift.is_empty();
+            if lift_done {
+                out.insert(name.clone(), lift.clone());
+            }
         }
     }
+    out
+}
+
+fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<String> {
+    let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
+    let mut excluded: HashSet<String> = HashSet::new();
+    let mut string_ctx: HashSet<String> = HashSet::new();
+
     for st in &prog.stmts {
-        walk_stmt(st, &mut excluded, &mut string_ctx, false);
+        lift_walk_stmt(st, &mut excluded, &mut string_ctx, false);
     }
 
     fn collect_assigns(st: &IrStmt, assigns: &mut HashMap<String, Vec<IrExpr>>) {
@@ -19354,9 +20145,69 @@ fn arrow_body_async(params: Vec<Expr>, body: IrExpr, r#async: bool) -> Expr {
     out
 }
 
+/// Is the statement a statement-position pure-value `local`/`declare`/
+/// `typeset`/`readonly` exec (either IR shape)? Shape-only check — does
+/// NOT consume the per-function decl seen-set (see
+/// [`try_native_local_decl_stmt`] — it must be called exactly once per
+/// statement).
+fn stmt_is_local_decl(stmt: &IrStmt) -> bool {
+    let args: Option<&[IrExpr]> = match stmt {
+        IrStmt::Exec { cmd, args, .. } => match cmd {
+            IrExpr::Str(cname, _) if matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") => {
+                Some(args)
+            }
+            _ => None,
+        },
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+            match args.first() {
+                Some(IrExpr::Str(cname, _))
+                    if matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") =>
+                {
+                    Some(args)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    args.is_some_and(|a| pure_value_declare(a).is_some())
+}
+
+/// Is this a [`try_native_local_decl_stmt`] block (a `let` first + the
+/// trailing `(sh2.lastExit = 0, true)` status sequence)? The arrow-body
+/// collector SPLICES such blocks into the enclosing body — a `let`
+/// inside a nested JS block would not scope over the rest of the
+/// function body (the local must be function-scoped, like bash).
+fn local_decl_block(b: &[Stmt]) -> bool {
+    matches!(
+        b.first(),
+        Some(Stmt::VariableDeclaration { kind, .. }) if *kind == "let"
+    ) && b.len() > 1
+        && matches!(
+            b.last(),
+            Some(Stmt::ExpressionStatement { expression })
+                if matches!(
+                    expression,
+                    Expr::SequenceExpression { expressions }
+                        if matches!(
+                            expressions.last(),
+                            Some(Expr::Literal { value, .. })
+                                if value == &serde_json::Value::Bool(true)
+                        )
+                )
+        )
+}
+
 fn arrow_body_async_inner(params: Vec<Expr>, body: IrExpr, r#async: bool) -> Expr {
     match &body {
-        IrExpr::Arrow(stmts) if stmts.len() == 1 && matches!(stmts[0], IrStmt::Expr(_)) => {
+        // A single expression statement lowers to an expression arrow —
+        // EXCEPT a statement-position local decl: its `let` needs the
+        // statement form (the block path below).
+        IrExpr::Arrow(stmts)
+            if stmts.len() == 1
+                && matches!(stmts[0], IrStmt::Expr(_))
+                && !stmt_is_local_decl(&stmts[0]) =>
+        {
             let inner = match &stmts[0] {
                 IrStmt::Expr(e) => expr_to_estree(e),
                 _ => unreachable!(),
@@ -19368,14 +20219,25 @@ fn arrow_body_async_inner(params: Vec<Expr>, body: IrExpr, r#async: bool) -> Exp
                 r#async,
             }
         }
-        IrExpr::Arrow(stmts) => Expr::ArrowFunctionExpression {
-            params,
-            body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
-                body: stmts.iter().filter_map(stmt_to_estree).collect(),
-            })),
-            expression: false,
-            r#async,
-        },
+        IrExpr::Arrow(stmts) => {
+            let mut body_stmts: Vec<Stmt> = Vec::new();
+            for s in stmts {
+                match stmt_to_estree(s) {
+                    Some(Stmt::BlockStatement { body: b }) if local_decl_block(&b) => {
+                        // splice the local-decl `let` into THIS scope
+                        body_stmts.extend(b);
+                    }
+                    Some(s) => body_stmts.push(s),
+                    None => {}
+                }
+            }
+            Expr::ArrowFunctionExpression {
+                params,
+                body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body: body_stmts })),
+                expression: false,
+                r#async,
+            }
+        }
         other => Expr::ArrowFunctionExpression {
             params,
             body: ArrowBody::Expr(Box::new(expr_to_estree(other))),
