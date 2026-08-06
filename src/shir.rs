@@ -1494,9 +1494,16 @@ fn estree_reads_positional(e: &Expr) -> bool {
                 if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2") {
                     if let Expr::Identifier { name } = property.as_ref() {
                         match name.as_str() {
-                            "getVar" | "param" => {
-                                // the name slot: getVar(name) / param(op, name, ...)
-                                let slot = if name == "getVar" { 0 } else { 1 };
+                            "getVar" | "param" | "listVar" => {
+                                // the name slot: getVar(name) / listVar(name)
+                                // / param(op, name, ...). listVar("@"/"*") —
+                                // the `"$@"` whole-word array form (core
+                                // request array-flatten-positional-20260806)
+                                // — reads the CURRENT positionals, exactly
+                                // like getVar("@") — a direct call would
+                                // see the caller's positionals, not the
+                                // function's.
+                                let slot = if name == "param" { 1 } else { 0 };
                                 if let Some(Expr::Literal { value, .. }) =
                                     arguments.get(slot)
                                 {
@@ -4024,7 +4031,7 @@ fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
             "setArray",
             vec![
                 st(name),
-                IrExpr::Array(elements.iter().map(|e| st(e)).collect()),
+                IrExpr::Array(elements.iter().map(array_element_ir).collect()),
                 IrExpr::Bool(assoc),
             ],
         ),
@@ -4044,6 +4051,34 @@ fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
     }
 }
 
+/// One array-literal element (`arr=(...)`) to IR. Elements field-split like
+/// exec args, NOT like assignment RHS values (core request
+/// posix-sh-go-20260806-174619): an UNQUOTED `$x` element carries the A1
+/// `split` marker (bash word-splits it; the runner's setArray splices the
+/// resulting array — harness step 6), quoted `"$x"` stays a single-element
+/// Interpolate (no split), `$@`/`$*` expand to the positional list, and
+/// literals keep quote-removal WITHOUT the GLOB_MAGIC tag (the runtime's
+/// setArray stores literal text — a magic marker would leak into the value;
+/// bash globbing of unquoted literal elements is a known gap, unchanged
+/// from the raw-text path).
+fn array_element_ir(w: &Word) -> IrExpr {
+    match w {
+        Word::Literal(s, _) => st(&shell_quote_removal(s)),
+        Word::Variable(name, _, _) if name != "@" && name != "*" => {
+            call("split", vec![call("getVar", vec![st(name)])])
+        }
+        // `arr=($@)` / `arr=($*)` — each positional is one element (the
+        // runner's setArray splices the listVar array; bash field-splits
+        // each positional too, but that is a corner case the raw-text
+        // path never handled either)
+        Word::Variable(name, _, _) => call("listVar", vec![st(name)]),
+        // quoted `"$@"` → listVar via the whole-word interpolation path;
+        // quoted `"$x"` stays an Interpolate (single element); unquoted
+        // `$x` → the split arm above
+        _ => word_ir(w),
+    }
+}
+
 /// `name op value` — the RHS expression for a statement-level assignment
 /// (`IrStmt::Assign` wraps it in `sh2.setVar`). Compound operators lower to
 /// `sh2.assign` (which sets the variable itself), array `+=` to
@@ -4052,11 +4087,11 @@ fn assignment_value_ir(a: &Assignment) -> IrExpr {
     match &a.value {
         Word::Array(name, elements, _) if a.operator == AssignmentOperator::PlusAssign => call(
             "setArrayAppend",
-            vec![st(name), IrExpr::Array(elements.iter().map(|e| st(e)).collect())],
+            vec![st(name), IrExpr::Array(elements.iter().map(array_element_ir).collect())],
         ),
         Word::Array(name, elements, _) => call(
             "setArray",
-            vec![st(name), IrExpr::Array(elements.iter().map(|e| st(e)).collect())],
+            vec![st(name), IrExpr::Array(elements.iter().map(array_element_ir).collect())],
         ),
         _ if a.operator == AssignmentOperator::Assign => word_ir_quoted(&a.value),
         _ => call(
@@ -4077,11 +4112,11 @@ fn assignment_expr_ir(a: &Assignment) -> IrExpr {
     match &a.value {
         Word::Array(name, elements, _) if a.operator == AssignmentOperator::PlusAssign => call(
             "setArrayAppend",
-            vec![st(name), IrExpr::Array(elements.iter().map(|e| st(e)).collect())],
+            vec![st(name), IrExpr::Array(elements.iter().map(array_element_ir).collect())],
         ),
         Word::Array(name, elements, _) => call(
             "setArray",
-            vec![st(name), IrExpr::Array(elements.iter().map(|e| st(e)).collect())],
+            vec![st(name), IrExpr::Array(elements.iter().map(array_element_ir).collect())],
         ),
         _ => call(
             "assign",
@@ -4102,6 +4137,88 @@ fn assign_op_str(op: &AssignmentOperator) -> &'static str {
         AssignmentOperator::StarAssign => "*=",
         AssignmentOperator::SlashAssign => "/=",
         AssignmentOperator::PercentAssign => "%=",
+    }
+}
+
+/// Reconstruct a process-substitution inner command (`<(cmd)`) as shell
+/// text — the perl renderer appends it to its `bash -c` command line, so
+/// it only needs to be text bash can parse (core request
+/// perl-shir-20260806-1930). Covers the corpus shapes: simple commands
+/// with literal/expansion args and `|` pipelines; anything else falls
+/// back to the word-level Display (never panics).
+pub(crate) fn command_to_shell_text(cmd: &Command) -> String {
+    match cmd {
+        Command::Simple(sc) => {
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(word_shell_text(&sc.name));
+            for a in &sc.args {
+                parts.push(word_shell_text(a));
+            }
+            for (k, v) in &sc.env_vars {
+                parts.push(format!("{k}={}", word_shell_text(v)));
+            }
+            for r in &sc.redirects {
+                parts.push(redirect_shell_text(r));
+            }
+            parts.join(" ")
+        }
+        Command::BuiltinCommand(bc) => {
+            let mut parts: Vec<String> = vec![bc.name.clone()];
+            for a in &bc.args {
+                parts.push(word_shell_text(a));
+            }
+            for r in &bc.redirects {
+                parts.push(redirect_shell_text(r));
+            }
+            parts.join(" ")
+        }
+        Command::Pipeline(p) => {
+            let stages: Vec<String> = p
+                .commands
+                .iter()
+                .map(command_to_shell_text)
+                .collect();
+            stages.join(" | ")
+        }
+        Command::While(w) => {
+            // `head <(while true; do echo .; sleep 1; done)` — the 096
+            // corpus shape; bash -c parses the reconstructed text.
+            let cond = command_to_shell_text(&w.condition);
+            let body: Vec<String> = w
+                .body
+                .commands
+                .iter()
+                .map(command_to_shell_text)
+                .collect();
+            format!("while {cond}; do {}; done", body.join("; "))
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+/// Word → shell text for process-substitution reconstruction. Quoted
+/// words need their quotes back for bash to parse correctly; the corpus
+/// inner commands are simple enough that the Display form (which keeps
+/// literal text and `$var` forms) is adequate.
+fn word_shell_text(w: &Word) -> String {
+    match w {
+        Word::Literal(s, _) => s.clone(),
+        _ => w.to_string(),
+    }
+}
+
+fn redirect_shell_text(r: &Redirect) -> String {
+    match &r.operator {
+        RedirectOperator::Input => format!("< {}", word_shell_text(&r.target)),
+        RedirectOperator::Output => format!("> {}", word_shell_text(&r.target)),
+        RedirectOperator::Append => format!(">> {}", word_shell_text(&r.target)),
+        RedirectOperator::ProcessSubstitutionInput(c) => {
+            format!("<({})", command_to_shell_text(c))
+        }
+        RedirectOperator::ProcessSubstitutionOutput(c) => {
+            format!(">({})", command_to_shell_text(c))
+        }
+        _ => String::new(),
     }
 }
 
@@ -4126,8 +4243,15 @@ fn redirect_to_ir(r: &Redirect) -> IrRedirect {
         RedirectOperator::StderrOutput => ("w", 2),
         RedirectOperator::StderrAppend => ("a", 2),
         RedirectOperator::StderrInput => ("r", 2),
-        RedirectOperator::ProcessSubstitutionInput(_) => ("unsupported", 0),
-        RedirectOperator::ProcessSubstitutionOutput(_) => ("unsupported", 0),
+        // Process substitution (core request perl-shir-20260806-1930):
+        // preserve the inner command instead of dropping it. The target
+        // carries the reconstructed shell text; the perl renderer appends
+        // ` <(cmd)` / ` >(cmd)` to its bash -c line (append_redirect_frag),
+        // and bash expands it natively. The estree path never sees these
+        // modes — estree.rs transform_cmd materializes process
+        // substitution into temp-file paths BEFORE ast_to_ir.
+        RedirectOperator::ProcessSubstitutionInput(cmd) => ("process-in", 0),
+        RedirectOperator::ProcessSubstitutionOutput(cmd) => ("process-out", 1),
     };
     let is_dup = digit_target
         && matches!(
@@ -4152,6 +4276,14 @@ fn redirect_to_ir(r: &Redirect) -> IrRedirect {
         match &r.operator {
             RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => {
                 st(r.heredoc_body.as_deref().unwrap_or(""))
+            }
+            // core request perl-shir-20260806-1930: the inner command text
+            // (bash expands process substitution natively in the perl
+            // renderer's bash -c shell-out; the estree path materializes
+            // temp files before ast_to_ir, so it never sees these modes)
+            RedirectOperator::ProcessSubstitutionInput(cmd)
+            | RedirectOperator::ProcessSubstitutionOutput(cmd) => {
+                st(&command_to_shell_text(cmd))
             }
             _ => word_ir(&r.target),
         }
@@ -4886,7 +5018,44 @@ fn brace_expand(
 }
 
 fn pure_template_part(interp: &StringInterpolation) -> Option<IrExpr> {
-    pure_part(interp).map(part_ir)
+    pure_part(interp).map(|p| match p {
+        // Whole-word quoted `"$@"`: bash expands it to SEPARATE args (one
+        // per positional). part_ir's getVar("@") would join to a single
+        // scalar — the runtime's exec/builtin arg flattener splices the
+        // listVar array instead (core request array-flatten-positional-2026
+        // 0806; the same decision for_item_ir makes for for-items). `"$*"`
+        // stays the joined getVar (bash: one arg, space-joined).
+        StringPart::Variable(name) if name == "@" => call("listVar", vec![st(name)]),
+        // Whole-word quoted `${arr[@]}`: bash expands it to SEPARATE args
+        // too. part_ir wraps ArraySlice in sh2.join (correct inside
+        // MULTI-part templates, where bash joins with spaces) — for a
+        // whole-word interpolation the array must survive so the runtime's
+        // flattener splices it. Only the no-offset `@` form (a-arg "@"):
+        // `${arr[*]}` stays joined (one arg), and `${arr[@]:off:len}` keeps
+        // today's join (the A1 cannot distinguish its [@] vs [*] forms).
+        StringPart::ArraySlice(name, offset, length) if offset == "@" => call(
+            "param",
+            vec![
+                st("slice"),
+                st(name),
+                st(offset),
+                st(length.as_deref().unwrap_or("")),
+            ],
+        ),
+        // `${arr[@]}` often arrives as a ParameterExpansion with the
+        // ArraySlice operator (offset "@", no length) instead of a bare
+        // ArraySlice part — same whole-word rule: bare param (array),
+        // no join.
+        StringPart::ParameterExpansion(pe)
+            if matches!(
+                pe.operator,
+                ParameterExpansionOperator::ArraySlice(ref off, None) if off == "@"
+            ) =>
+        {
+            param_ir(pe)
+        }
+        other => part_ir(other),
+    })
 }
 
 /// The single non-literal part of a one-part interpolation (if any).
@@ -5954,6 +6123,16 @@ fn is_reserved_var(name: &str) -> bool {
             | "GROUPS" | "OPTIND" | "OPTARG" | "REPLY" | "PIPESTATUS" | "FUNCNAME"
             | "BASH_SOURCE" | "BASH_LINENO" | "BASH_ARGV" | "BASH_ARGC"
     )
+}
+
+/// Deterministic iteration order for the HashSet-backed lift/function
+/// statics: the A1->ESTree emission must be byte-stable across processes
+/// (core request fish-sh-go-20260806-181309 — HashSet iteration order
+/// flips per process and hash seed).
+fn sorted_set(s: &Mutex<Option<HashSet<String>>>) -> Vec<String> {
+    let mut names: Vec<String> = s.lock().unwrap().as_ref().unwrap().iter().cloned().collect();
+    names.sort();
+    names
 }
 
 /// JS reserved words — a lifted variable becomes a native binding, and
@@ -7690,6 +7869,22 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
 
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    // StoreToNative (core request shir-passes-store-to-native-20260806):
+    // convert provably store-only `setVar("v", e)` Expr-stmts to Assign
+    // stmts on a clone, so the native lift below fires (a native `x = v`
+    // write instead of a runtime sh2.setVar store round-trip). The
+    // transform is the shared shir_passes pass; the analyses below run
+    // on the TRANSFORMED program so the lift verdicts see the same shape
+    // the emitter will emit. The corpus's own ast_to_ir path emits
+    // IrStmt::Assign directly (never Expr(setVar)), so this is a no-op
+    // for it — it serves frontend-emitted A1 (c-sh-go / go-sh / ...).
+    let mut store_to_native = prog.clone();
+    {
+        use crate::shir_passes::Transform as _;
+        crate::shir_passes::transform::StoreToNative
+            .run(&mut store_to_native, &crate::shir_passes::PassContext::default());
+    }
+    let prog = &store_to_native;
     let (num, str) = analyze_loop_var_refs(
         prog,
         &numeric_lift_vars(prog),
@@ -7763,8 +7958,13 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     *LOOP_STATUS_DEAD.lock().unwrap() = Some(loop_status_dead);
     let mut body: Vec<Stmt> = Vec::new();
     // `let x = 0` (numeric) / `let x = ""` (string) at program top. bash
-    // reads an unset var as 0 in arithmetic and "" as a string.
-    for name in LIFTED_NUMERIC.lock().unwrap().as_ref().unwrap().iter() {
+    // reads an unset var as 0 in arithmetic and "" as a string. The
+    // declarations are emitted in SORTED name order (core request
+    // fish-sh-go-20260806-181309): the lift sets are HashSets, and raw
+    // iteration order flips per process — byte-stable A1->ESTree output
+    // requires a deterministic order (JS let decls are order-independent,
+    // so sorting is behavior-neutral).
+    for name in sorted_set(&LIFTED_NUMERIC) {
         body.push(Stmt::VariableDeclaration {
             kind: "let",
             declarations: vec![VariableDeclarator {
@@ -7778,7 +7978,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
             }],
         });
     }
-    for name in LIFTED_STRING.lock().unwrap().as_ref().unwrap().iter() {
+    for name in sorted_set(&LIFTED_STRING) {
         body.push(Stmt::VariableDeclaration {
             kind: "let",
             declarations: vec![VariableDeclarator {
@@ -7805,7 +8005,12 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // plain variable declaration — no runtime calls added to the metric
     // (the callUndefined fallback arrow would add one call site per
     // direct function for identical behavior).
-    for name in direct_fns.iter() {
+    // Sorted iteration (core request fish-sh-go-20260806-181309): the
+    // direct-fn set is HashSet-backed; deterministic declaration order
+    // keeps A1->ESTree output byte-stable across processes.
+    let mut direct_sorted: Vec<&String> = direct_fns.iter().collect();
+    direct_sorted.sort();
+    for name in direct_sorted {
         let binding = direct_binding_name(name).expect("direct set is binding-valid");
         body.push(Stmt::VariableDeclaration {
             kind: "let",
@@ -10709,6 +10914,41 @@ fn tr_decode_escapes(s: &str) -> Option<String> {
 /// arrays keep the runtime's `a.map(String)` comma-join via the String()
 /// wrap; everything else is String()-coerced. Returns None if any element
 /// carries glob magic (the runtime would expand it).
+/// Array-valued runtime call in EXEC-ARG position: the arg flattener must
+/// SPLICE its elements (bash arg-count semantics — printf cycles one line
+/// per element, `"${arr[@]}"`/`"$@"` supply one arg each), never
+/// String()-wrap them (a template literal or String() wrap would comma-join
+/// the array). Mirrors the runner's arrayItems/arrayIndex/listVar/
+/// captureWords/split contracts (core request
+/// array-flatten-positional-20260806). `param("slice", …)` returns an
+/// array only for the whole-array forms (`${arr[@]}` / `${arr[*]}` /
+/// `${!map[@]}` — a-arg "@"/"*"); `${#arr[@]}` (name "#arr") is the
+/// scalar length, and `${@:off:len}` joins to a scalar string.
+fn exec_arg_is_array_valued(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } => match func.as_str() {
+            "captureWords" | "listVar" | "split" => true,
+            "arrayIndex" => matches!(
+                args.get(1).and_then(static_str),
+                Some(k) if k == "@" || k == "*"
+            ),
+            "param" => {
+                matches!(args.first().and_then(static_str), Some(op) if op == "slice")
+                    && matches!(
+                        args.get(2).and_then(static_str),
+                        Some(a) if a == "@" || a == "*"
+                    )
+                    && !matches!(
+                        args.get(1).and_then(static_str),
+                        Some(n) if n.starts_with('#')
+                    )
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn echo_arg_to_estree(a: &IrExpr) -> Option<Expr> {
     match a {
         IrExpr::Str(sv, _) if sv.starts_with(GLOB_MAGIC) => None,
@@ -10741,16 +10981,13 @@ fn echo_arg_to_estree(a: &IrExpr) -> Option<Expr> {
             })
         }
         other => {
-            // array-valued args (UNQUOTED `$(...)` / `$@` — the runtime's
-            // captureWords/listVar return arrays): keep the call bare — the
-            // builtin's arg flattener splices the elements into the arg
-            // list, and the join builder applies `.flat()` first (a
-            // String() wrap would comma-join the array).
-            if matches!(
-                other,
-                IrExpr::Call { func, .. }
-                    if func == "captureWords" || func == "listVar" || func == "split"
-            ) {
+            // array-valued args (`$(...)` / `$@` / `${arr[@]}` — the
+            // runtime's captureWords/listVar/param-slice/arrayIndex return
+            // arrays): keep the call bare — the builtin's arg flattener
+            // splices the elements into the arg list, and the join builder
+            // applies `.flat()` first (a String() wrap would comma-join the
+            // array).
+            if exec_arg_is_array_valued(other) {
                 return Some(expr_to_estree(other));
             }
             let e = expr_to_estree(other);
@@ -10826,11 +11063,7 @@ fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
             }
             other => {
                 flag_done = true;
-                if matches!(
-                    other,
-                    IrExpr::Call { func, .. }
-                        if func == "captureWords" || func == "listVar" || func == "split"
-                ) {
+                if exec_arg_is_array_valued(other) {
                     // array-valued arg — the runtime's flattener splices the
                     // elements; mirror it with `.flat()` before the join
                     flat = true;
@@ -13092,9 +13325,12 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
         let mut arg_exprs: Vec<Expr> = Vec::new();
         for a in rest {
             match a {
-                IrExpr::Call { func, .. }
-                    if func == "captureWords" || func == "listVar" || func == "split" =>
-                {
+                // array-valued args (captureWords/listVar/split/
+                // `${arr[@]}` param-slice/arrayIndex) expand the arg count
+                // at runtime — bail to the general exec path, whose arg
+                // flattener splices them (bash: one printf line per
+                // element)
+                other if exec_arg_is_array_valued(other) => {
                     return None;
                 }
                 IrExpr::Array(_) => return None,

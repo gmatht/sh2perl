@@ -144,6 +144,16 @@ pub enum StringPart {
     CommandSubstitution(Box<crate::ast::Command>),
 }
 
+/// Space-joined Display of a Word list (Word::Array elements render as
+/// `name=(a b c)`).
+pub fn word_list_text(elements: &[Word]) -> String {
+    elements
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Represents a word in the shell language (literal, variable, expansion, etc.)
 /// This is the AST version - pure syntax without analysis information
 /// The Option<()> field is reserved for future MIR annotations
@@ -152,7 +162,7 @@ pub enum Word {
     Literal(String, Option<()>),
     Variable(String, bool, Option<()>), // variable_name, is_mutable, annotations
     ParameterExpansion(ParameterExpansion, Option<()>),
-    Array(String, Vec<String>, Option<()>), // array_name, elements, annotations
+    Array(String, Vec<Word>, Option<()>), // array_name, elements, annotations
     MapAccess(String, String, Option<()>),  // map_name, key, annotations
     MapKeys(String, Option<()>),            // !map[@] -> get keys of associative array, annotations
     MapLength(String, Option<()>),          // #arr[@] -> get length of array, annotations
@@ -173,7 +183,7 @@ impl std::fmt::Display for Word {
                 // produces correct shell syntax (e.g., ${0##*/} not ${0}##*/).
                 write!(f, "{}", pe)
             },
-            Word::Array(name, elements, _) => write!(f, "{}=({})", name, elements.join(" ")),
+            Word::Array(name, elements, _) => write!(f, "{}=({})", name, word_list_text(elements)),
             Word::MapAccess(map_name, key, _) => write!(f, "{}[{}]", map_name, key),
             Word::MapKeys(map_name, _) => write!(f, "!{}[@]", map_name),
             Word::MapLength(map_name, _) => write!(f, "#{}[@]", map_name),
@@ -366,7 +376,7 @@ impl Word {
     }
 
     /// Create an array word
-    pub fn array(name: String, elements: Vec<String>) -> Self {
+    pub fn array(name: String, elements: Vec<Word>) -> Self {
         Word::Array(name, elements, None)
     }
 
@@ -454,7 +464,7 @@ impl Word {
                     }
                 }
             },
-            Word::Array(name, elements, _) => format!("{}=({})", name, elements.join(" ")),
+            Word::Array(name, elements, _) => format!("{}=({})", name, word_list_text(elements)),
             Word::MapAccess(map_name, key, _) => format!("{}[{}]", map_name, key),
             Word::MapKeys(map_name, _) => format!("!{}[@]", map_name),
             Word::MapLength(map_name, _) => format!("#{}[@]", map_name),

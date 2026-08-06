@@ -79,16 +79,25 @@ impl ParserUtilities for Lexer {
                     self.next();
                 }
                 Some(Token::ArithmeticEvalClose) => {
-                    // )) closes two levels of paren depth
-                    // (ArithmeticEvalClose has priority over ParenClose via logos)
-                    depth -= 2;
-                    if depth > 0 {
+                    // `))` closes two levels of paren depth
+                    // (ArithmeticEvalClose has priority over ParenClose via logos).
+                    // When depth == 1 the FIRST `)` closes THIS $(...); the
+                    // second belongs to an ENCLOSING context — the classic
+                    // shape is a cmdsub as the last element of an array
+                    // literal (`arr=($(cmd))` — the lexer merges the cmdsub's
+                    // `)` with the array's `)` into one token). Pushing
+                    // anything (the old code pushed "))") corrupted the
+                    // captured text and broke the re-parse. The enclosing
+                    // parser detects the swallowed closer via the last-token
+                    // check in parse_array_elements.
+                    if depth >= 3 {
+                        depth -= 2;
                         content.push_str("))");
-                    } else if depth == 0 {
+                    } else if depth == 2 {
+                        depth = 0;
                         content.push(')'); // one ) is inside, one closes
                     } else {
-                        // depth went negative — we overshot; emit all ) needed
-                        content.push_str("))");
+                        // depth == 1: first ) closes us, second is outside
                         depth = 0;
                     }
                     self.next();

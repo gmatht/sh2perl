@@ -1199,7 +1199,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                         if !generator.declared_locals.contains(name) {
                             let elements_perl: Vec<String> = elements
                                 .iter()
-                                .map(|e| generator.array_element_to_perl(e))
+                                .map(|e| generator.array_element_word_to_perl(e))
                                 .collect();
                             output.push_str(&generator.indent());
                             if is_assoc {
@@ -1368,10 +1368,11 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             let elements_perl: Vec<String> = elements
                                 .iter()
                                 .map(|e| {
-                                    if e == "\"$@\"" || e == "$@" {
+                                    let es = e.to_string();
+                                    if es == "\"$@\"" || es == "$@" {
                                         "@_".to_string()
                                     } else {
-                                        format!("'{}'", e.replace("'", "\\'"))
+                                        format!("'{}'", es.replace("'", "\\'"))
                                     }
                                 })
                                 .collect();
