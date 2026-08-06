@@ -1699,6 +1699,16 @@ fn render_param(args: &[IrExpr]) -> String {
                 } else {
                     format!("(({} =~ s:\\.[^.]*$::r))", var)
                 }
+            } else if pat.len() == 2 && pat.ends_with('*') {
+                // C* pattern: % removes from the LAST C, %% from the FIRST
+                // ("hello world" %o* → "hello w", %%o* → "hell").
+                let c = &pat[..1];
+                let re = if matches!(op.as_str(), "%%" | "%%:") {
+                    format!("{}.*", c)
+                } else {
+                    format!("{}[^{}]*", c, c)
+                };
+                format!("(({} =~ s:{}$::r))", var, re)
             } else {
                 let greedy = matches!(op.as_str(), "%%" | "%%:");
                 let re = glob_to_regex_greedy(&pat, greedy);
