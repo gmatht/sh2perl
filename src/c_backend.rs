@@ -28,7 +28,7 @@
 //! inference" gap PLAN.md v2 flagged (the numeric width side is now
 //! covered by the range analysis; the string side stays open).
 
-use crate::ir::{ArithAst, IrExpr, IrProgram, IrStmt, IrType, InterpPart};
+use crate::ir::{ArithAst, IrExpr, IrProgram, IrStmt, IrType, InterpPart, VarKind};
 use std::collections::{BTreeSet, HashMap};
 
 enum Part {
@@ -88,10 +88,27 @@ pub struct Render {
     /// var name -> conservative [lo, hi] (analyze_var_ranges + the
     /// Range/seq for-iter seeds the analysis doesn't track).
     var_ranges: HashMap<String, (i64, i64)>,
+    /// var name -> const/var verdict (the const-markup analysis): `Const`
+    /// vars with a single literal top-level assignment render as C
+    /// `const` declarations initialized from that literal, and the
+    /// assignment statement is dropped.
+    const_vars: HashMap<String, VarKind>,
+    /// name -> the single top-level `Assign` RHS of a `Const` var (the
+    /// hoisted `const` declaration's initializer).
+    const_rhs: HashMap<String, IrExpr>,
+    /// names already emitted as `const` (the matching Assign stmt is
+    /// skipped at emission time).
+    const_lifted: BTreeSet<String>,
     /// var name -> effective C width: the widest of the var's own range
     /// and every arith-expr result range mentioning it (a var's width
     /// must cover its arithmetic results, not just its own values).
     var_widths: HashMap<String, Width>,
+    /// shell function names defined in the program (Function stmts) —
+    /// calls to these render as `name();` instead of a sh2.* stub.
+    functions: BTreeSet<String>,
+    /// the definitions themselves (name, body) — emitted in the
+    /// preamble (BEFORE main: C has no nested function definitions).
+    fn_defs: Vec<(String, Vec<IrStmt>)>,
     /// distinct sh2.* callee names that need stubs
     sh2_calls: BTreeSet<String>,
     need_upper: bool,
@@ -114,6 +131,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // JSON path; the library path must run the same ones.
     prog.var_types = crate::shir::analyze_var_types(&prog);
     prog.var_lengths = crate::shir::analyze_string_lengths(&prog);
+    prog.var_const = crate::shir::analyze_var_const(&prog);
     // Range analysis (M8 spike): conservative [lo, hi] per assigned var,
     // + the Range/seq for-iter seeds the analysis doesn't track (loop
     // vars are excluded from its assign set).
@@ -126,6 +144,8 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.var_lengths = prog.var_lengths.iter().cloned().collect();
+    r.const_vars = prog.var_const.iter().cloned().collect();
+    r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
     r.var_ranges = ranges;
     r.var_widths = widths;
     r.program(&prog);
@@ -348,6 +368,145 @@ impl Render {
         format!("sh2_{name}()")
     }
 
+    /// A sh2.*-free no-op call: `exec ":"` / `exec "true"` (and the
+    /// always-false `exec "false"`). Setup/cleanup wrappers in the
+    /// shellbench runners are exactly these — skipping them (instead of
+    /// a sh2_exec stub) is what makes the loop body render natively.
+    fn noop_value(&self, func: &str, args: &[IrExpr]) -> Option<&'static str> {
+        if func == "exec" {
+            if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                return match cmd.as_str() {
+                    ":" | "true" => Some("1"),
+                    "false" => Some("0"),
+                    // declaration builtins — the hoist already declares
+                    // the vars (`local x` / `typeset x` / `declare x`
+                    // with no initializer are pure declarations).
+                    "local" | "declare" | "typeset" | "export" | "readonly" => Some("1"),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    fn noop_value_call(&self, e: &IrExpr) -> bool {
+        matches!(
+            e,
+            IrExpr::Call { func, args } if self.noop_value(func, args).is_some()
+        )
+    }
+
+    /// Render `var`'s declaration (Int -> the narrowed width, bounded Str
+    /// -> the fixed buffer, else char*). Shared by the main hoist and the
+    /// per-function hoists.
+    fn emit_var_decl(&mut self, v: &str) {
+        let name = self.c_ident(v);
+        // const-markup lift: a Const var whose single top-level
+        // assignment is a literal renders as a const declaration
+        // initialized from that literal; the Assign stmt is dropped
+        // (see the Assign arm). Only literal RHSs are lifted — a
+        // non-literal init would need a runtime write (and possibly a
+        // var reference declared later in the hoist order).
+        if let Some(rhs) = self.const_rhs.get(v).cloned() {
+            // numeric vars need a numeric initializer: the Str RHS parses
+            // as an integer (that is exactly the numeric lift's criterion)
+            let init = if self.is_num(v) {
+                match &rhs {
+                    IrExpr::Int(i) => Some(i.to_string()),
+                    IrExpr::Str(s, _) => s.trim().parse::<i64>().ok().map(|n| n.to_string()),
+                    _ => None,
+                }
+            } else {
+                self.literal_init(&rhs)
+            };
+            if let Some(init) = init {
+                self.const_lifted.insert(v.to_string());
+                if self.is_num(v) {
+                    self.emit(&format!("const {} {name} = {init};", self.width_of_var(v).c_type()));
+                } else if let Some(b) = self.buf_bound(v) {
+                    self.emit(&format!("const char {name}[{}] = {init};", b + 1));
+                } else {
+                    self.emit(&format!("const char* {name} = {init};"));
+                }
+                return;
+            }
+        }
+        if self.is_num(v) {
+            self.emit(&format!("{} {name} = 0;", self.width_of_var(v).c_type()));
+        } else if let Some(b) = self.buf_bound(v) {
+            // the fixed-buffer transform: the var_lengths analysis
+            // proves len(v) <= b, so the buffer is b+1 bytes
+            self.emit(&format!("char {name}[{}] = \"\";", b + 1));
+        } else {
+            self.emit(&format!("char* {name} = NULL;"));
+        }
+    }
+
+    /// Render an expression as a C compile-time constant initializer, or
+    /// None when it isn't one (var refs, calls, captures, interpolation
+    /// with expression parts). Ints and string literals (incl. pure-
+    /// literal interpolations) qualify.
+    fn literal_init(&mut self, e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Int(i) => Some(i.to_string()),
+            IrExpr::Str(s, _) => Some(Self::cstr(s)),
+            IrExpr::Interpolate(parts) => {
+                let mut s = String::new();
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(l) => s.push_str(l),
+                        InterpPart::Expr(_) => return None,
+                    }
+                }
+                Some(Self::cstr(&s))
+            }
+            _ => None,
+        }
+    }
+
+    /// Emit the DEBUG-ONLY length invariants (assert, NDEBUG-out) for the
+    /// bounded vars among `vars` — at function boundaries.
+    fn emit_bound_asserts(&mut self, vars: &BTreeSet<String>) {
+        for v in vars {
+            if let Some(b) = self.buf_bound(v) {
+                let name = self.c_ident(v);
+                self.emit(&format!("assert(strlen({name}) <= {b});"));
+            }
+        }
+    }
+
+    /// Emit one shell function as `static void NAME(void) { ... }`
+    /// (preamble position — C has no nested function definitions).
+    /// No-op wrappers (setup()/cleanup() with `:` bodies) are skipped.
+    fn emit_function(&mut self, name: &str, body: &[IrStmt]) {
+        if body.iter().all(|s| {
+            matches!(s, IrStmt::Expr(e) if self.noop_value_call(e))
+        }) {
+            return;
+        }
+        let fname = self.c_ident(name);
+        self.emit(&format!("static void {fname}(void) {{"));
+        self.depth += 1;
+        // per-function hoist: vars ASSIGNED inside the function are
+        // declared locally (a var only READ is the caller's — main's
+        // hoist owns it; redeclaring would shadow it and break sharing).
+        let mut fvars: BTreeSet<String> = BTreeSet::new();
+        collect_assigned_vars(body, &mut fvars);
+        for n in &fvars {
+            self.emit_var_decl(n);
+        }
+        if !fvars.is_empty() {
+            self.emit("");
+            self.emit_bound_asserts(&fvars);
+            self.emit("");
+        }
+        for st in body {
+            self.stmt(st);
+        }
+        self.depth -= 1;
+        self.emit("}");
+    }
+
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
             // exec("echo", [args...]) → native printf (the draft's echo path)
@@ -369,6 +528,16 @@ impl Render {
                     }
                     if cmd == "printf" {
                         return self.sh2_stub("builtin", args, "builtin printf");
+                    }
+                    // `:` / `true` / `false` — no-op builtins (setup()/
+                    // cleanup() wrappers, `while true` conditions).
+                    if let Some(v) = self.noop_value("exec", args) {
+                        return v.to_string();
+                    }
+                    // a defined shell function's call (the Expr
+                    // stmt arm appends the ';')
+                    if self.functions.contains(cmd) {
+                        return format!("{}()", self.c_ident(cmd));
                     }
                 }
                 self.sh2_stub("exec", args, "exec")
@@ -430,7 +599,9 @@ impl Render {
                 }
                 self.sh2_stub("test", args, "test")
             }
-            // everything else → compile-able sh2.* stub
+            // everything else → a defined shell function's call, or a
+            // compile-able sh2.* stub
+            _ if self.functions.contains(func) => format!("{}();", self.c_ident(func)),
             _ => self.sh2_stub(func, args, func),
         }
     }
@@ -581,6 +752,13 @@ impl Render {
                 };
                 if !t.indices.is_empty() {
                     self.mark_todo("array-index assign");
+                    return;
+                }
+                // const-markup lift: the declaration already carries the
+                // literal initializer (emit_var_decl) — the assignment
+                // statement is redundant (the verdict guarantees this is
+                // the var's only write).
+                if self.const_lifted.contains(&t.var) {
                     return;
                 }
                 let name = self.c_ident(&t.var);
@@ -788,6 +966,36 @@ impl Render {
                     self.emit("}");
                 }
             }
+            IrStmt::While { cond, body } => {
+                // the cond is an IrExpr (the ShIR's `[ ... ]` is a
+                // Call("test") -> test_render, `while true` -> "1")
+                let c = self.expr(cond);
+                self.emit(&format!("while ({c}) {{"));
+                self.depth += 1;
+                for s in body {
+                    self.stmt(s);
+                }
+                self.depth -= 1;
+                self.emit("}");
+            }
+            IrStmt::DoWhile { body, cond, until } => {
+                let c = self.expr(cond);
+                self.emit("do {");
+                self.depth += 1;
+                for s in body {
+                    self.stmt(s);
+                }
+                self.depth -= 1;
+                if *until {
+                    self.emit(&format!("}} while (!({c}));"));
+                } else {
+                    self.emit(&format!("}} while ({c});"));
+                }
+            }
+            IrStmt::Function { .. } => {
+                // definitions are emitted in the preamble (before main);
+                // calls arrive as exec("<name>") and render `name();`.
+            }
             other => self.mark_todo(&format!("stmt {:?}", other)),
         }
     }
@@ -844,14 +1052,37 @@ impl Render {
         // Pass 1: collect declared vars (assign targets, declare lists,
         // Var reads) so declarations can be hoisted before use. Also
         // collect for-loop variables so we can exclude them from the
-        // top-level pre-declaration (they are declared inside the loop).
+        // top-level pre-declaration (they are declared inside the loop),
+        // and the shell function names (their calls render `name();`).
         let mut vars: BTreeSet<String> = BTreeSet::new();
         let mut for_vars: BTreeSet<String> = BTreeSet::new();
         collect_vars_full(&prog.stmts, &mut vars, &mut for_vars);
+        for s in &prog.stmts {
+            if let IrStmt::Function { name, body } = s {
+                self.functions.insert(name.clone());
+                self.fn_defs.push((name.clone(), body.clone()));
+            }
+        }
+        // vars that appear ONLY inside function bodies (var_types covers
+        // them too, but they must NOT be hoisted into main — the
+        // function declares its own copy).
+        let mut fn_only: BTreeSet<String> = BTreeSet::new();
+        for (_, body) in &self.fn_defs {
+            let mut fv = BTreeSet::new();
+            collect_vars(body, &mut fv);
+            for v in &fv {
+                if !vars.contains(v) {
+                    fn_only.insert(v.clone());
+                }
+            }
+        }
         for (n, _) in &prog.var_types {
             vars.insert(n.clone());
         }
         for v in &for_vars {
+            vars.remove(v);
+        }
+        for v in &fn_only {
             vars.remove(v);
         }
 
@@ -860,28 +1091,14 @@ impl Render {
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 1;
         for v in &vars {
-            let name = self.c_ident(v);
-            if self.is_num(v) {
-                self.emit(&format!("{} {name} = 0;", self.width_of_var(v).c_type()));
-            } else if let Some(b) = self.buf_bound(v) {
-                // the fixed-buffer transform: the var_lengths analysis
-                // proves len(v) <= b, so the buffer is b+1 bytes
-                self.emit(&format!("char {name}[{}] = \"\";", b + 1));
-            } else {
-                self.emit(&format!("char* {name} = NULL;"));
-            }
+            self.emit_var_decl(v);
         }
         if !vars.is_empty() {
             self.emit("");
             // DEBUG-ONLY length invariants at the function boundary
             // (assert() compiles out under NDEBUG): every bounded var
             // must still fit its analysis bound.
-            for v in &vars {
-                if let Some(b) = self.buf_bound(v) {
-                    let name = self.c_ident(v);
-                    self.emit(&format!("assert(strlen({name}) <= {b});"));
-                }
-            }
+            self.emit_bound_asserts(&vars);
             self.emit("");
         }
         for s in &prog.stmts {
@@ -899,6 +1116,19 @@ impl Render {
         self.emit("#include <math.h>");
         self.emit("#include <assert.h>"); // debug-only length asserts (NDEBUG compiles out)
         self.emit("");
+        // shell functions rendered FIRST (into a side buffer) so the
+        // sh2.* stub set is complete before the stubs are emitted —
+        // definition-before-use: a function body calling a stub must
+        // see its definition (an implicit declaration then the real
+        // definition is a conflicting-types error).
+        let fn_defs = std::mem::take(&mut self.fn_defs);
+        let mut fn_out = Vec::new();
+        let saved_out = std::mem::replace(&mut self.out, Vec::new());
+        for (name, body) in &fn_defs {
+            self.emit_function(name, body);
+        }
+        fn_out = std::mem::replace(&mut self.out, saved_out);
+        self.fn_defs = fn_defs;
         if !self.sh2_calls.is_empty() {
             self.emit("/* sh2.* runtime stubs — TODO: implement (harness/sh2-namespace.json) */");
             let names: Vec<String> = self.sh2_calls.iter().cloned().collect();
@@ -909,6 +1139,10 @@ impl Render {
                 self.emit("  return 0;");
                 self.emit("}");
             }
+            self.emit("");
+        }
+        self.out.extend(fn_out.iter().cloned());
+        if !fn_out.is_empty() {
             self.emit("");
         }
         self.emit("int main(void) {");
@@ -924,6 +1158,28 @@ impl Render {
 /// declare lists, Var reads).
 fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     collect_vars_full(stmts, out, &mut BTreeSet::new());
+}
+
+/// For every `Const`-verdict var: the single TOP-LEVEL `Assign` targeting
+/// it (straight-line, no indices). The const markup alone allows
+/// conditional single sites; the C backend lifts only the unconditional
+/// top-level ones (a hoisted initializer must always run). The verdict
+/// guarantees at most one site, so the first match is the only one.
+fn const_assign_rhs(stmts: &[IrStmt], const_vars: &HashMap<String, VarKind>) -> HashMap<String, IrExpr> {
+    let mut out = HashMap::new();
+    for s in stmts {
+        if let IrStmt::Assign { targets, expr } = s {
+            for t in targets {
+                if t.indices.is_empty()
+                    && const_vars.get(&t.var) == Some(&VarKind::Const)
+                    && !out.contains_key(&t.var)
+                {
+                    out.insert(t.var.clone(), expr.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Like `collect_vars`, but also returns the set of for-loop variables
@@ -972,9 +1228,69 @@ fn collect_vars_full(
                 collect_vars_expr(iter, out);
                 collect_vars_full(body, out, for_vars);
             }
+            // loop bodies assign/read vars — hoist them (they are
+            // ordinary top-level vars, unlike for-loop counters).
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                collect_vars(body, out)
+            }
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => collect_vars(b, out),
             _ => {}
         }
+    }
+}
+
+/// Collect vars ASSIGNED in a statement list (Assign/Declare targets,
+/// arith x=/x++/x--), not mere reads — the per-function hoist declares
+/// exactly these (a read-only var is the caller's).
+fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr } => {
+                for t in targets {
+                    out.insert(t.var.clone());
+                }
+                collect_assigned_expr(expr, out);
+            }
+            IrStmt::Declare { vars, init, .. } => {
+                for d in vars {
+                    out.insert(d.name.clone());
+                }
+                if let Some(e) = init {
+                    collect_assigned_expr(e, out);
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_assigned_vars(then, out);
+                for (_, b) in elsifs {
+                    collect_assigned_vars(b, out);
+                }
+                collect_assigned_vars(else_, out);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => collect_assigned_vars(body, out),
+            IrStmt::Expr(e) => collect_assigned_expr(e, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_assigned_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+    match e {
+        IrExpr::Arith(a) => collect_assigned_arith(a, out),
+        _ => {}
+    }
+}
+
+fn collect_assigned_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
+    match a {
+        ArithAst::Assign { var, .. } | ArithAst::IncDec { var, .. } => {
+            out.insert(var.clone());
+        }
+        _ => {}
     }
 }
 
