@@ -1632,6 +1632,24 @@ fn render_param(args: &[IrExpr]) -> String {
             let re = glob_to_regex(val.trim_start_matches('\\'));
             format!("(({} =~ s/{}.*$//r))", var, re)
         }
+        // Case modification: ^^/,, = all, ^/, = first char.
+        "^^" => format!("uc({})", var),
+        ",," => format!("lc({})", var),
+        "^" => format!("ucfirst({})", var),
+        "," => format!("lcfirst({})", var),
+        // Substring: ${var:off:len} → substr($var, off, len).
+        ":" => {
+            let off = args
+                .get(2)
+                .and_then(call_arg_str)
+                .unwrap_or_else(|| "0".to_string());
+            let len = args.get(3).and_then(call_arg_str).unwrap_or_default();
+            if len.is_empty() {
+                format!("substr({}, {})", var, off)
+            } else {
+                format!("substr({}, {}, {})", var, off, len)
+            }
+        }
         // Substitution: / first, // all.
         "/" => format!("(({} =~ s/{}/{}/r))", var, glob_to_regex(&val), repl.trim_matches('\\')),
         "//" => format!("(({} =~ s/{}/{}/gr))", var, glob_to_regex(&val), repl.trim_matches('\\')),
@@ -2170,8 +2188,27 @@ fn redirect_spec_fields(e: &IrExpr) -> Option<(i64, String, String)> {
     }
 }
 
-/// Append one redirect's shell syntax (` > t`, ` 2>> t`, ` 2>&1`, …) to cmd.
+/// Append one redirect's shell syntax (` > t`, ` 2>> t`, ` 2>&1`, ` <<< s`,
+/// ` <<DELIM\nbody\nDELIM`) to cmd. Returns false for unknown modes.
 fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> bool {
+    match mode {
+        "herestring" => {
+            cmd.push_str(&format!(" <<< '{}'", target.replace('\'', "'\\\\''")));
+            return true;
+        }
+        "heredoc" => {
+            let body = target;
+            cmd.push_str(" <<'_SH2DOC_'");
+            cmd.push('\n');
+            cmd.push_str(body);
+            if !body.ends_with('\n') {
+                cmd.push('\n');
+            }
+            cmd.push_str("_SH2DOC_");
+            return true;
+        }
+        _ => {}
+    }
     let op = match mode {
         "w" => ">",
         "a" => ">>",
@@ -2630,8 +2667,17 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
                 }
                 collect_assigned_vars(else_, out);
             }
-            IrStmt::For { body, .. }
-            | IrStmt::While { body, .. }
+            IrStmt::For { var, body, .. } => {
+                // The loop var is read after the loop (bash keeps the last
+                // value) — declare it so `for $var` aliases a lexical.
+                if !is_env_style_var_name(var)
+                    && !out.iter().any(|(n, _)| n == var)
+                {
+                    out.push((var.clone(), Sigil::Scalar));
+                }
+                collect_assigned_vars(body, out);
+            }
+            IrStmt::While { body, .. }
             | IrStmt::DoWhile { body, .. }
             | IrStmt::Subshell(body)
             | IrStmt::Background(body)
