@@ -46,7 +46,6 @@ pub struct Render {
     sh2_calls: BTreeSet<String>,
     need_upper: bool,
     need_lower: bool,
-    need_includes: bool,
     need_slice: bool,
     /// named-temp counter for statement-level snprintf buffers
     /// (`char _sN[64]; snprintf(_sN, ...)` before the enclosing stmt)
@@ -325,14 +324,12 @@ impl Render {
                 self.sh2_stub("getVar", args, "getVar")
             }
             // contains(needle, pattern) — PureCpu (the grep -q / case *P*)
-            // lift). strstr is exact-substring; identical for literal
-            // patterns. An Int-typed needle is stringified with a named
-            // temp + snprintf at statement level (snprintf returns int,
-            // so it cannot stand in an expression; the temp lines are
-            // emitted right before the enclosing statement).
+            // lift). The core only emits contains for provably-literal
+            // patterns, so strstr is exact-substring == the semantic.
+            // Inlined directly — no wrapper (static tiny fns are inlined
+            // at -O anyway; `inline` is an ODR/header mechanism).
             "contains" => {
                 if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
-                    self.need_includes = true;
                     let needle_c = if self.expr_is_num(needle) {
                         let t = format!("_s{}", self.temp_seq);
                         self.temp_seq += 1;
@@ -343,8 +340,10 @@ impl Render {
                     } else {
                         self.expr(needle)
                     };
+                    // no (char*) casts: arrays/literals decay to const
+                    // char* implicitly
                     return format!(
-                        "c_includes((char*)({needle_c}), (char*)({}))",
+                        "strstr({needle_c}, {}) != NULL",
                         self.expr(pattern)
                     );
                 }
@@ -885,9 +884,6 @@ impl Render {
         self.emit("#include <math.h>");
         self.emit("#include <assert.h>"); // debug-only length asserts (NDEBUG compiles out)
         self.emit("");
-        if self.need_includes {
-            self.emit("static int c_includes(const char* s, const char* p) { return strstr(s, p) != NULL; }");
-        }
         if !self.sh2_calls.is_empty() {
             self.emit("/* sh2.* runtime stubs — TODO: implement (harness/sh2-namespace.json) */");
             let names: Vec<String> = self.sh2_calls.iter().cloned().collect();
