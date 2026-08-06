@@ -817,8 +817,37 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     }
                 }
                 None => {
-                    emit_indent(out, indent);
-                    out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (redirect)\\n\";\n");
+                    // The inner isn't a single command (e.g. a while-loop or
+                    // block with a redirect) — run the inner statements with
+                    // Perl's STDOUT redirected to the target file (select).
+                    // print-based output (echo, emulated commands) follows;
+                    // bash -c shell-outs inside leak to the real STDOUT
+                    // (accepted divergence for this fallback).
+                    let first_redirect = redirects.first();
+                    match first_redirect {
+                        Some(r) if matches!(r.mode.as_str(), "w" | "a" | "r+") => {
+                            let target = call_arg_str(&r.target).unwrap_or_default();
+                            let mode = if r.mode == "a" { "'>>'" } else { "'>'" };
+                            emit_indent(out, indent);
+                            out.push_str(&format!(
+                                "open my $__redir_fh, {}, {} or die \"Cannot write to {}: $!\\n\";\n",
+                                mode,
+                                render_word(&r.target),
+                                target
+                            ));
+                            emit_indent(out, indent);
+                            out.push_str("my $__saved_out = select($__redir_fh);\n");
+                            for s in inner {
+                                emit_stmt(out, s, indent);
+                            }
+                            emit_indent(out, indent);
+                            out.push_str("select($__saved_out); close $__redir_fh;\n");
+                        }
+                        _ => {
+                            emit_indent(out, indent);
+                            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (redirect)\\n\";\n");
+                        }
+                    }
                 }
             }
         }
@@ -933,6 +962,10 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // redirects, pipelines — run the reconstructed shell command.
                 other_expr => {
                     if let Some(s) = cd_chain_to_perl(other_expr) {
+                        emit_indent(out, indent);
+                        out.push_str(&s);
+                        out.push('\n');
+                    } else if let Some(s) = control_chain_to_perl(other_expr) {
                         emit_indent(out, indent);
                         out.push_str(&s);
                         out.push('\n');
@@ -1693,6 +1726,42 @@ fn cd_chain_to_perl(expr: &IrExpr) -> Option<String> {
     None
 }
 
+/// `test-cond ||/&& control` chains render natively: `[ x = y ] || continue`
+/// → `(cond) || next;` (bash control-flow operators on a test result).
+fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
+    if let IrExpr::BinOp { lhs, op, rhs } = e {
+        if let IrExpr::Call { func: f, .. } = lhs.as_ref() {
+            if f == "test" {
+                let cond = ir_expr_to_perl(lhs);
+                if let IrExpr::Call { func: rf, args: ra } = rhs.as_ref() {
+                    match (op, rf.as_str()) {
+                        (BinOpKind::Or, "continue") => return Some(format!("({}) || next;", cond)),
+                        (BinOpKind::Or, "break") => return Some(format!("({}) || last;", cond)),
+                        (BinOpKind::And, "continue") => return Some(format!("({}) && next;", cond)),
+                        (BinOpKind::And, "break") => return Some(format!("({}) && last;", cond)),
+                        (BinOpKind::Or, "exit") => {
+                            let code = ra
+                                .first()
+                                .map(render_word)
+                                .unwrap_or_else(|| "1".to_string());
+                            return Some(format!("({}) || exit {};", cond, code));
+                        }
+                        (BinOpKind::And, "exit") => {
+                            let code = ra
+                                .first()
+                                .map(render_word)
+                                .unwrap_or_else(|| "1".to_string());
+                            return Some(format!("({}) && exit {};", cond, code));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// A word as bash syntax: literals shell-quoted, captures as `$(…)`
 /// (bash evaluates nested command substitution), interpolated words rebuilt
 /// as bash double-quoted `"…$var…"`, vars double-quoted, braces as `{…}`.
@@ -2058,6 +2127,11 @@ fn expr_to_cmd(e: &IrExpr) -> Option<String> {
             }
             "pipeline" => pipeline_call_to_cmd(e),
             "redirect" => redirect_call_to_cmd(e),
+            // A test in command position reconstructs as bash `[ … ]`.
+            "test" => {
+                let text = args.first().and_then(call_arg_str)?;
+                Some(format!("[ {} ]", text))
+            }
             _ => None,
         },
         IrExpr::BinOp { lhs, op, rhs } => {
