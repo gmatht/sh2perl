@@ -5884,7 +5884,7 @@ fn iter_numeric(e: &IrExpr) -> Option<bool> {
                         }
                     }
                     // the `seq_range_for` transform's Range item
-                    // (`for i in $(seq A B)` → `Array([Range])`)
+                    // (`for i in $(seq A B)` → `Range`)
                     IrExpr::Range { .. } => {}
                     IrExpr::Call { func, args } if func == "brace" => match brace_numeric(args) {
                         Some(true) => {}
@@ -8893,10 +8893,10 @@ fn for_iter_flattenable(iter: &IrExpr) -> bool {
     }
 }
 
-/// The `seq_range_for` transform's numeric-range iterable: the for-items
-/// shape `Array([Range { start, end }])` (the transform rewrites the
-/// `$(seq …)` capture item in place) or a bare `Range`. Anything else is
-/// not a native-range loop.
+/// The `seq_range_for` transform's numeric-range iterable: the For.iter
+/// shape `Range { start, end }` (the transform rewrites the `$(seq …)`
+/// capture item to a bare Range — PLAN §5.6) or a bare `Range`. Anything
+/// else is not a native-range loop.
 fn for_range_bounds(iter: &IrExpr) -> Option<(i64, i64)> {
     match iter {
         IrExpr::Array(items) => match items.as_slice() {
@@ -9447,13 +9447,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         }
         IrStmt::For { var, iter, body } => {
             let js_var = safe_ident(var);
-            // The `seq_range_for` transform's native-range iterable
-            // (`Array([Range{lo,hi}])` or bare `Range`): the loop lowers
-            // to a native JS `for (let i = lo; i <= hi; i++)` — no
-            // runtime call, no item list at all. The transform
-            // guarantees the loop var is never WRITTEN by the body (the
-            // one semantic gap between a word list and a counter), and
-            // the bounds are plain in-range integers.
+            // The `seq_range_for` transform's native-range iterable (a
+            // bare `Range{lo,hi}`): the loop lowers to a native JS
+            // `for (let i = lo; i <= hi; i++)` — no runtime call, no item
+            // list at all. The transform guarantees the loop var is never
+            // WRITTEN by the body (the one semantic gap between a word
+            // list and a counter), and the bounds are plain in-range
+            // integers.
             let range = for_range_bounds(iter);
             let mut coercion: Option<IrStmt> = None;
             if is_lifted_num(var) {
@@ -16182,6 +16182,11 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
 /// `await sh2.fs.lstat(P).then(s => <check>, () => false)` — one async
 /// non-blocking fs call, no test-string parse, no dispatch.
 ///
+/// `-r`/`-w`/`-x` are the exception: bash tests access(2) with
+/// R_OK/W_OK/X_OK (effective-uid permission, following symlinks), so they
+/// lower to `await sh2.fs.access(P, N).then(() => true, () => false)` —
+/// the async twin of the runtime's fs.accessSync flag resolution.
+///
 /// Operand shapes: a literal path (quoted or bare, `$`-free, no
 /// whitespace/quotes/backslashes inside), a `$name`/`${name}` read
 /// (lifted binding → bare identifier, special var → field read, store var
@@ -16215,38 +16220,87 @@ fn try_native_file_test(s: &str) -> Option<Expr> {
         return None; // extra tokens after the operand → a compound/other shape
     }
     let path = file_test_operand(operand)?;
-    let check = file_test_check(f, Expr::Identifier {
-        name: "s".to_string(),
-    })?;
-    let lstat = sh2_fs_call("lstat", vec![path]);
-    let then = Expr::CallExpression {
-        callee: Box::new(Expr::MemberExpression {
-            object: Box::new(lstat),
-            property: Box::new(Expr::Identifier {
-                name: "then".to_string(),
+    let chain = if matches!(f, 'r' | 'w' | 'x') {
+        // `-r`/`-w`/`-x` — bash tests access(2) with R_OK/W_OK/X_OK (the
+        // real effective-uid permission, following symlinks), NOT raw mode
+        // bits: a root-owned `crw-------` device is unreadable by a
+        // non-root user even though the owner-read bit is set
+        // (tty-cmdsub.sh). The runtime's evalUnary resolves these flags the
+        // same way (fs.accessSync); this chain is its async twin:
+        // `await sh2.fs.access(P, 4).then(() => true, () => false)`.
+        let want = match f {
+            'r' => 4, // fs.constants.R_OK
+            'w' => 2, // fs.constants.W_OK
+            _ => 1,   // fs.constants.X_OK
+        };
+        let access = sh2_fs_call("access", vec![
+            path,
+            Expr::Literal {
+                value: serde_json::Value::from(want),
+                raw: None,
+                regex: None,
+            },
+        ]);
+        let then = Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(access),
+                property: Box::new(Expr::Identifier {
+                    name: "then".to_string(),
+                }),
+                computed: false,
+                optional: false,
             }),
-            computed: false,
+            arguments: vec![
+                Expr::ArrowFunctionExpression {
+                    params: vec![],
+                    body: ArrowBody::Expr(Box::new(bool_lit(true))),
+                    expression: true,
+                    r#async: false,
+                },
+                Expr::ArrowFunctionExpression {
+                    params: vec![],
+                    body: ArrowBody::Expr(Box::new(bool_lit(false))),
+                    expression: true,
+                    r#async: false,
+                },
+            ],
             optional: false,
-        }),
-        arguments: vec![
-            Expr::ArrowFunctionExpression {
-                params: vec![Expr::Identifier {
-                    name: "s".to_string(),
-                }],
-                body: ArrowBody::Expr(Box::new(check)),
-                expression: true,
-                r#async: false,
-            },
-            Expr::ArrowFunctionExpression {
-                params: vec![],
-                body: ArrowBody::Expr(Box::new(bool_lit(false))),
-                expression: true,
-                r#async: false,
-            },
-        ],
-        optional: false,
+        };
+        await_expr(then)
+    } else {
+        let check = file_test_check(f, Expr::Identifier {
+            name: "s".to_string(),
+        })?;
+        let lstat = sh2_fs_call("lstat", vec![path]);
+        let then = Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(lstat),
+                property: Box::new(Expr::Identifier {
+                    name: "then".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![
+                Expr::ArrowFunctionExpression {
+                    params: vec![Expr::Identifier {
+                        name: "s".to_string(),
+                    }],
+                    body: ArrowBody::Expr(Box::new(check)),
+                    expression: true,
+                    r#async: false,
+                },
+                Expr::ArrowFunctionExpression {
+                    params: vec![],
+                    body: ArrowBody::Expr(Box::new(bool_lit(false))),
+                    expression: true,
+                    r#async: false,
+                },
+            ],
+            optional: false,
+        };
+        await_expr(then)
     };
-    let chain = await_expr(then);
     if negate {
         Some(Expr::UnaryExpression {
             operator: "!".to_string(),
@@ -17037,8 +17091,8 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             }
         }
         IrExpr::Ident(name) => Expr::Identifier { name: name.clone() },
-        // A numeric-range iterable (`seq_range_for`'s `Array([Range])`
-        // for-items shape): the ESTree surface has no range literal, so
+        // A numeric-range iterable (`seq_range_for`'s bare `Range`
+        // For.iter shape): the ESTree surface has no range literal, so
         // render the materialized string list. The native ForStatement
         // path consumes the Range BEFORE this arm (a counter loop, no
         // array); this arm is the bounded fallback (for-of / *Sync /

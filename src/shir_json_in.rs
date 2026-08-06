@@ -715,6 +715,23 @@ mod tests {
     /// The const-markup round-trips: `--shir` attaches the verdicts
     /// (LIMIT const, i/sum var), the reader ingests them, and re-serializing
     /// is byte-identical.
+    /// The seq_range_for transform's BARE `Range` For.iterable (PLAN §5.6)
+    /// round-trips: `--shir` emits `{"type":"Range",start,end}` as the
+    /// For.iter, the reader ingests it, and re-serializing is byte-identical
+    /// (every backend matches the bare Range arm of its For handler).
+    #[test]
+    fn seq_range_for_bare_range_roundtrip() {
+        let json = round_trip("for i in $(seq 1 10000); do echo $i; done");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let iter = &v["stmts"][0]["iter"];
+        assert_eq!(iter["type"], "Range", "bare Range iterable, got: {iter}");
+        assert_eq!(iter["start"], 1);
+        assert_eq!(iter["end"], 10000);
+        // and the deserialized program re-serializes byte-identically
+        // (round_trip already did the full loop; assert the shape survived)
+        assert!(iter.get("elements").is_none(), "no Array wrapper around the Range: {iter}");
+    }
+
     #[test]
     fn var_const_roundtrip() {
         let json = round_trip("LIMIT=10\nsum=0\nfor i in 1 2; do sum=$((sum+i)); done\necho $LIMIT $sum");
