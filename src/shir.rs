@@ -3999,6 +3999,18 @@ fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
                 IrExpr::Bool(assoc),
             ],
         ),
+        // UNQUOTED pure expansion in exec-arg position (`echo $y`,
+        // `set -- $y`): bash field-splits it on IFS into separate args. A
+        // bare Word::Variable is unquoted by construction — quoted `"$y"`
+        // is a StringInterpolation and assignment forms (`x=$y`, `PATH=$y`)
+        // merge into interpolations too, so neither is split (assignment
+        // context never field-splits). The runtime flattens the split's
+        // array into separate args (the A1 `split` marker, same contract
+        // as for_item_ir). `$@`/`$*` keep the bare read (the runtime's
+        // positional-join semantics, see the exec name handling).
+        Word::Variable(name, _, _) if name != "@" && name != "*" => {
+            call("split", vec![call("getVar", vec![st(name)])])
+        }
         _ => word_ir(w),
     }
 }
@@ -4969,6 +4981,17 @@ fn part_ir(part: &StringPart) -> IrExpr {
 fn for_item_ir(w: &Word) -> IrExpr {
     match w {
         Word::Variable(name, _, _) if name == "@" || name == "*" => call("listVar", vec![st(name)]),
+        // UNQUOTED `for w in $y`: bash field-splits the expansion on IFS and
+        // iterates per FIELD (`y="hello world"` → two iterations). A bare
+        // Word::Variable is unquoted BY CONSTRUCTION — a quoted `"$y"`
+        // parses as a StringInterpolation (next arm) and keeps the bare
+        // getVar — so the `split` marker carries the quoted/unquoted
+        // distinction the A1 contract previously dropped (core request
+        // posix-sh-go-20260806-152225; its failing gate case t04_params.sh
+        // is exactly this shape). The estree lowering renders split(x) as a
+        // native whitespace field-split; `$@`/`$*` keep listVar above (the
+        // runtime's per-positional flatten, never IFS-split).
+        Word::Variable(name, _, _) => call("split", vec![call("getVar", vec![st(name)])]),
         Word::StringInterpolation(interp, _) => {
             if let Some(part) = pure_part(interp) {
                 // Un-joined: `for x in "${!map[@]}"` iterates each element.
@@ -17272,6 +17295,74 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     if let Some(native) = native_special_var(name) {
                         return native;
                     }
+                }
+            }
+            // `sh2.split(v)` — the field-split marker on UNQUOTED expansions
+            // (for-iters `for w in $y`, exec args `set -- $y`): bash splits
+            // on default-IFS whitespace and DROPS empty fields (an empty/
+            // unset variable → zero fields → zero iterations/args). The
+            // runtime's own pattern (captureWords, exec's name split) is
+            // `s.split(/\s+/).filter(w => w.length > 0)` — emit it NATIVE,
+            // no dispatch. `String(v)` guards lifted numeric bindings.
+            if func == "split" {
+                if let [v] = args.as_slice() {
+                    let ve = expr_to_estree(v);
+                    if expr_has_await(&ve) {
+                        return sh2_call("split", vec![ve]);
+                    }
+                    return Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::CallExpression {
+                                callee: Box::new(Expr::MemberExpression {
+                                    object: Box::new(Expr::CallExpression {
+                                        callee: Box::new(Expr::Identifier {
+                                            name: "String".to_string(),
+                                        }),
+                                        arguments: vec![ve],
+                                        optional: false,
+                                    }),
+                                    property: Box::new(Expr::Identifier {
+                                        name: "split".to_string(),
+                                    }),
+                                    computed: false,
+                                    optional: false,
+                                }),
+                                arguments: vec![regex_lit(r"\s+")],
+                                optional: false,
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "filter".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        arguments: vec![Expr::ArrowFunctionExpression {
+                            params: vec![Expr::Identifier {
+                                name: "w".to_string(),
+                            }],
+                            body: ArrowBody::Expr(Box::new(Expr::BinaryExpression {
+                                operator: ">".to_string(),
+                                left: Box::new(Expr::MemberExpression {
+                                    object: Box::new(Expr::Identifier {
+                                        name: "w".to_string(),
+                                    }),
+                                    property: Box::new(Expr::Identifier {
+                                        name: "length".to_string(),
+                                    }),
+                                    computed: false,
+                                    optional: false,
+                                }),
+                                right: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(0),
+                                    raw: None,
+                                regex: None,
+                                }),
+                            })),
+                            expression: true,
+                            r#async: false,
+                        }],
+                        optional: false,
+                    };
                 }
             }
             // `echo X | grep PAT` lowers to a `contains` call — the runtime
