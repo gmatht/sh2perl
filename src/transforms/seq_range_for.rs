@@ -70,7 +70,13 @@ fn transform_stmt(st: &mut IrStmt) -> bool {
             }
             if let Some((start, end)) = seq_range_bounds(iter) {
                 if !stmts_write_var(body, var) {
-                    *iter = IrExpr::Array(vec![IrExpr::Range { start, end }]);
+                    // A BARE Range — the shIR contract's numeric-range
+                    // For.iterable shape (see PLAN §5.6): every backend
+                    // matches the `Range` arm of its For handler directly
+                    // (the C backend consumes both forms; the ESTree
+                    // emitter's `for_range_bounds` accepts bare Range and
+                    // lowers it to the native JS counter loop).
+                    *iter = IrExpr::Range { start, end };
                     changed = true;
                 }
             }
@@ -410,13 +416,11 @@ mod tests {
         assert!(transform_stmt(&mut st));
         match st {
             IrStmt::For { iter, .. } => match iter {
-                IrExpr::Array(items) => match items.as_slice() {
-                    [IrExpr::Range { start, end }] => {
-                        assert_eq!((*start, *end), (1, 10000))
-                    }
-                    _ => panic!("expected Range item"),
-                },
-                _ => panic!("expected Array iterable"),
+                // the contract shape: a BARE Range For.iterable (PLAN §5.6)
+                IrExpr::Range { start, end } => {
+                    assert_eq!((start, end), (1, 10000))
+                }
+                _ => panic!("expected bare Range iterable"),
             },
             _ => panic!("expected For"),
         }
@@ -427,9 +431,8 @@ mod tests {
         let mut st = seq_for(&["10"], vec![]);
         assert!(transform_stmt(&mut st));
         let IrStmt::For { iter, .. } = st else { panic!() };
-        let IrExpr::Array(items) = iter else { panic!() };
-        let IrExpr::Range { start, end } = &items[0] else { panic!() };
-        assert_eq!((*start, *end), (1, 10));
+        let IrExpr::Range { start, end } = iter else { panic!() };
+        assert_eq!((start, end), (1, 10));
     }
 
     #[test]
@@ -439,9 +442,8 @@ mod tests {
         let mut st = seq_for(&["5", "1"], vec![]);
         assert!(transform_stmt(&mut st));
         let IrStmt::For { iter, .. } = st else { panic!() };
-        let IrExpr::Array(items) = iter else { panic!() };
-        let IrExpr::Range { start, end } = &items[0] else { panic!() };
-        assert_eq!((*start, *end), (5, 1));
+        let IrExpr::Range { start, end } = iter else { panic!() };
+        assert_eq!((start, end), (5, 1));
     }
 
     #[test]
