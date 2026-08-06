@@ -674,11 +674,11 @@ fn mark_loop_status_deadness(st: &IrStmt, live: &HashSet<usize>, dead: &mut Hash
 /// (the whileLoopSync pattern — same semantics, no per-call promises).
 pub(crate) const SYNC_BUILTINS: &[&str] = &[
     ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue", "cut", "date",
-    "declare", "dirname", "echo", "eval", "exit", "export", "false", "grep", "head", "let",
-    "local", "mapfile", "mktemp", "printf", "pwd", "read", "readarray", "readlink",
-    "readonly", "return", "seq", "sed", "set", "shift", "sort", "source", "stat", "tail",
-    "test", "touch", "tr", "trap", "true", "type", "typeset", "uname", "uniq", "unset",
-    "wc",
+    "declare", "dirname", "echo", "eval", "exit", "export", "false", "grep", "head",
+    "hostname", "let", "local", "ls", "mapfile", "mktemp", "printf", "pwd", "read",
+    "readarray", "readlink", "readonly", "return", "seq", "sed", "set", "shift", "sort",
+    "source", "stat", "tail", "test", "touch", "tr", "trap", "true", "type", "typeset",
+    "uname", "uniq", "unset", "wc", "which",
 ];
 /// Names of every function the program defines (IrStmt::Function), set per
 /// compilation by `shir_to_estree` under COMPILE_LOCK. A script-defined
@@ -1592,6 +1592,9 @@ fn estree_reads_positional(e: &Expr) -> bool {
         Expr::UnaryExpression { argument, .. } => estree_reads_positional(argument),
         Expr::SequenceExpression { expressions } => {
             expressions.iter().any(estree_reads_positional)
+        }
+        Expr::NewExpression { callee, arguments } => {
+            estree_reads_positional(callee) || arguments.iter().any(estree_reads_positional)
         }
     }
 }
@@ -11127,6 +11130,23 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }
                 }
             }
+            // `sleep N` — the exec spawn collapses to a native async
+            // timer (see try_native_sleep): no subprocess, no dispatch.
+            // Redirect/env forms keep the runtime (the redirect wrapper
+            // around the statement is an IrStmt::Redirect — its inner Exec
+            // still hits this arm, so the fd plumbing stays vacuous for a
+            // write-free native sleep and the wrapper can stay).
+            if env.is_empty() {
+                if let IrExpr::Str(name, _) = cmd {
+                    if let [IrExpr::Array(a)] = args.as_slice() {
+                        if let Some(native) = try_native_sleep(name, a) {
+                            return Some(Stmt::ExpressionStatement {
+                                expression: native,
+                            });
+                        }
+                    }
+                }
+            }
             // `f args...` — a call to a PROVABLY-SYNC script-defined
             // function (see `fn_call_sync_set`): the sync runtime twin of
             // the exec function-dispatch path (sh2-namespace.mjs `fnCall`)
@@ -12641,14 +12661,17 @@ fn native_capture_path(cmd: &str, cmd_args: &[IrExpr]) -> Option<Expr> {
             }
             sh2_member("cwd")
         }
-        // `$(uname -s)` / `$(date +%Y%m)` / `$(readlink -f X)` — the
-        // value-returning runtime twins of the sync builtins (native
-        // platform/clock/fs — no spawn). Any flag/operand shape the
-        // builtin handles lifts; the twin returns the capture-stripped
-        // string (lastExit is set 0 — a failing readlink yields "" with
-        // the same output, the status is not observable here; the runtime
-        // capture path keeps full status fidelity for non-lifted forms).
-        "uname" | "date" | "readlink" => sh2_call(cmd, cmd_args.iter().map(expr_to_estree).collect()),
+        // `$(uname -s)` / `$(date +%Y%m)` / `$(readlink -f X)` /
+        // `$(hostname)` — the value-returning runtime twins of the sync
+        // builtins (native platform/clock/fs — no spawn). Any flag/operand
+        // shape the builtin handles lifts; the twin returns the
+        // capture-stripped string (lastExit is set 0 — a failing readlink
+        // yields "" with the same output, the status is not observable
+        // here; the runtime capture path keeps full status fidelity for
+        // non-lifted forms).
+        "uname" | "date" | "readlink" | "hostname" => {
+            sh2_call(cmd, cmd_args.iter().map(expr_to_estree).collect())
+        }
         _ => return None,
     };
     Some(seq(vec![
@@ -12885,7 +12908,8 @@ fn try_native_capture_value(stmts: &[IrStmt]) -> Option<Expr> {
                 match name.as_str() {
                     "cat" => native_capture_cat(cmd_args, None),
                     "sort" => native_capture_sort(cmd_args, None),
-                    "dirname" | "basename" | "pwd" | "uname" | "date" | "readlink" => {
+                    "dirname" | "basename" | "pwd" | "uname" | "date" | "readlink"
+                    | "hostname" => {
                         native_capture_path(name, cmd_args)
                     }
                     _ => None,
@@ -14344,6 +14368,106 @@ fn guard_arith_echo_write(write: Expr) -> Expr {
     }
 }
 
+/// `sleep N` — the exec spawn collapses to a native async timer:
+/// `(await new Promise(r => setTimeout(() => r(true), ms)), sh2.lastExit = 0, true)`.
+/// A literal arg folds to a compile-time ms literal (integer AND fractional
+/// seconds); a dynamic arg (a getVar, or the `sh2.split` of an unquoted
+/// expansion) becomes `Number(<value>) * 1000` — the runtime's arg
+/// flattener turns the split array into one arg for a single-word value
+/// (the corpus sleep args are single words: `sleep 1`, `sleep 0.1`, …).
+/// No spawn, no dispatch; the promise resolves `true` (the statement's
+/// value feeds the errexit guard, which needs truthiness like every exec
+/// statement's value) and the status write mirrors the runtime builtin
+/// (exit 0 on success).
+fn try_native_sleep(name: &str, a: &[IrExpr]) -> Option<Expr> {
+    if name != "sleep" || a.len() != 1 {
+        return None;
+    }
+    let ms: Expr = match &a[0] {
+        IrExpr::Str(sv, _) => {
+            let secs: f64 = sv.trim().parse().ok()?;
+            Expr::Literal {
+                value: serde_json::Value::from(secs * 1000.0),
+                raw: None,
+                regex: None,
+            }
+        }
+        IrExpr::Call { func, args: a } if func == "split" => match a.as_slice() {
+            [x] => sleep_ms_expr(x),
+            _ => return None,
+        },
+        other => sleep_ms_expr(other),
+    };
+    let promise = Expr::NewExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "Promise".to_string(),
+        }),
+        arguments: vec![Expr::ArrowFunctionExpression {
+            params: vec![Expr::Identifier {
+                name: "r".to_string(),
+            }],
+            body: ArrowBody::Expr(Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "setTimeout".to_string(),
+                }),
+                arguments: vec![
+                    Expr::ArrowFunctionExpression {
+                        params: vec![],
+                        body: ArrowBody::Expr(Box::new(Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "r".to_string(),
+                            }),
+                            arguments: vec![bool_lit(true)],
+                            optional: false,
+                        })),
+                        expression: true,
+                        r#async: false,
+                    },
+                    ms,
+                ],
+                optional: false,
+            })),
+            expression: true,
+            r#async: false,
+        }],
+    };
+    // (await new Promise(...), sh2.lastExit = 0, true)
+    Some(seq(vec![
+        await_expr(promise),
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        },
+        bool_lit(true),
+    ]))
+}
+
+/// `Number(<value>) * 1000` — the dynamic-arg ms expression for the
+/// native sleep lowering (bash vars are strings; Number() mirrors the
+/// runtime's coercion and a fractional "0.1" works too).
+fn sleep_ms_expr(x: &IrExpr) -> Expr {
+    Expr::BinaryExpression {
+        operator: "*".to_string(),
+        left: Box::new(Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "Number".to_string(),
+            }),
+            arguments: vec![expr_to_estree(x)],
+            optional: false,
+        }),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(1000),
+            raw: None,
+        regex: None,
+        }),
+    }
+}
+
 fn try_native_echo(args: &[IrExpr]) -> Option<Expr> {
     let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args else {
         return None; // env-carrying 3-arg form — the env is command-scoped
@@ -14397,6 +14521,110 @@ fn try_native_echo_dead(args: &[IrExpr]) -> Option<Expr> {
         joined,
         no_newline,
     ))))
+}
+
+/// `$(yes LIT | head -N)` — the infinite-producer capture: bash runs
+/// `yes` forever, `head -N` takes the first N lines, yes dies on the
+/// pipe close (SIGPIPE) — the captured value is exactly `LIT + "\n"`
+/// repeated N times, a compile-time string expression with ZERO runtime
+/// surface. The head arg is `-N`, `-n N` or `-nN` with a literal
+/// positive count; yes must have exactly one literal arg (no flags — a
+/// flag would print its text like any other word, but the corpus shapes
+/// are single-word; the no-arg `yes` → "y" form and dynamic args keep
+/// the spawn).
+fn native_capture_yes_head(pipe: &IrExpr) -> Option<Expr> {
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() != 2 {
+        return None;
+    }
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return None;
+    };
+    // stage 1: exec/builtin "yes" with exactly one literal arg
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return None;
+    };
+    if !matches!(f1.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name1, _), IrExpr::Array(yes_args)] = a1.as_slice() else {
+        return None;
+    };
+    if name1 != "yes" {
+        return None;
+    }
+    if yes_args.iter().any(ir_expr_needs_runtime) {
+        return None;
+    }
+    // stage 2: builtin/exec "head" with a literal positive count
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
+        return None;
+    };
+    if !matches!(f2.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name2, _), IrExpr::Array(head_args)] = a2.as_slice() else {
+        return None;
+    };
+    if name2 != "head" {
+        return None;
+    }
+    // the word: a plain Str, or an ALL-LITERAL Interpolate (the quoted
+    // "Hello" form — expandWord joins the parts to the same text)
+    let lit: &str = match &yes_args[0] {
+        IrExpr::Str(sv, _) => sv,
+        IrExpr::Interpolate(parts)
+            if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+        {
+            let mut s = String::new();
+            for p in parts {
+                if let InterpPart::Lit(t) = p {
+                    s.push_str(t);
+                }
+            }
+            // a dynamic (non-literal) part was excluded above — the
+            // literal-only join is the plain text; leak the owned string
+            return native_capture_yes_head_text(&s, head_args);
+        }
+        _ => return None, // flags / dynamic args / no-arg "y" — keep the spawn
+    };
+    native_capture_yes_head_text(lit, head_args)
+}
+
+/// The repeat expression for a literal yes word + head arg list (see
+/// [`native_capture_yes_head`] for the head-count grammar).
+fn native_capture_yes_head_text(lit: &str, head_args: &[IrExpr]) -> Option<Expr> {
+    let n: usize = match head_args {
+        [IrExpr::Str(flag, _)] if flag.len() > 1 && flag.starts_with('-') => {
+            flag[1..].parse().ok()?
+        }
+        [IrExpr::Str(flag, _), IrExpr::Str(c, _)] if flag == "-n" => c.parse().ok()?,
+        [IrExpr::Str(flag, _)] if flag.len() > 2 && flag.starts_with("-n") => {
+            flag[2..].parse().ok()?
+        }
+        _ => return None,
+    };
+    if n == 0 {
+        return None; // head -0 prints nothing — keep the runtime (no corpus shape)
+    }
+    // (LIT + "\n").repeat(N)
+    Some(method_call(
+        Expr::BinaryExpression {
+            operator: "+".to_string(),
+            left: Box::new(str_lit(lit)),
+            right: Box::new(str_lit("\n")),
+        },
+        "repeat",
+        vec![int_lit_expr(n as i64)],
+    ))
 }
 
 /// `$(echo EXPR | bc)` — a native bc evaluation (SH2_BC_NATIVE, default
@@ -17556,10 +17784,14 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
             }
             }
         }
-        // ${x//p/r} — replace ALL occurrences (split/join; the runtime's
-        // literal fast path is exactly this). Empty pattern must stay on
-        // the runtime (split("") splits chars; bash treats it as a
-        // no-op).
+        // ${x//p/r} — replace ALL occurrences. The runtime's literal fast
+        // path is `split(p).join(r)`; a literal `p` with a `$`-free `r`
+        // lowers one step further to `replaceAll(p, r)` — same literal
+        // semantics (JS replaceAll's `$&`/`$1` substitution sequences
+        // cannot fire without a `$` in the replacement; `\` is literal in
+        // both), single-pass instead of array-allocate + join. Empty
+        // pattern must stay on the runtime (split("") splits chars; bash
+        // treats it as a no-op).
         "//" => {
             let [_, _, IrExpr::Str(p, _), IrExpr::Str(r, _)] = args else {
                 return None;
@@ -17568,10 +17800,17 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                 return None;
             }
             let rep = fully_lifted_template(r)?;
+            if r.contains('$') {
+                return Some(method(
+                    method(val(), "split", vec![str_lit(p)]),
+                    "join",
+                    vec![rep],
+                ));
+            }
             Some(method(
-                method(val(), "split", vec![str_lit(p)]),
-                "join",
-                vec![rep],
+                val(),
+                "replaceAll",
+                vec![str_lit(p), rep],
             ))
         }
         // ${x:-d} — default when empty. `${x:=d}` also WRITES the
@@ -19965,6 +20204,22 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         }
                     }
                 }
+                // `$(yes LIT | head -N)` — the yes|head capture: the
+                // infinite-producer pipeline is exactly `LIT + "\n"`
+                // repeated N times (head takes the first N lines, yes
+                // dies on the pipe close) — a native string repeat, no
+                // spawns, no pipeline machinery (see
+                // `native_capture_yes_head`). trimCapture applies the
+                // capture's NUL + trailing-newline strips.
+                if !program_defines_function("yes") && !program_defines_function("head") {
+                    if let [IrExpr::Arrow(stmts)] = args.as_slice() {
+                        if let [IrStmt::Expr(pipe)] = stmts.as_slice() {
+                            if let Some(value) = native_capture_yes_head(pipe) {
+                                return trim_capture(value);
+                            }
+                        }
+                    }
+                }
                 // `$(cat f)` / `$(sort f)` / `$(wc -l < f)` /
                 // `$(dirname x)` / `$(basename x)` / `$(pwd)` — the
                 // pure-capture family: the value is a native expression
@@ -20027,6 +20282,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     && !PROGRAM_PERSIST_FD1.lock().unwrap().unwrap_or(true)
                 {
                     if let Some(native) = try_native_echo(args) {
+                        return native;
+                    }
+                }
+            }
+            // `sleep N` — the exec spawn collapses to a native async
+            // timer (see try_native_sleep): no subprocess, no dispatch.
+            // Env-carrying forms keep the runtime (the env is
+            // command-scoped).
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), IrExpr::Array(a)] = args.as_slice() {
+                    if let Some(native) = try_native_sleep(name, a) {
                         return native;
                     }
                 }
@@ -20640,6 +20906,12 @@ fn expr_sh2_call_count(e: &Expr) -> usize {
             Expr::UnaryExpression { argument, .. } => walk(argument, n),
             Expr::SequenceExpression { expressions } => {
                 for a in expressions {
+                    walk(a, n);
+                }
+            }
+            Expr::NewExpression { callee, arguments } => {
+                walk(callee, n);
+                for a in arguments {
                     walk(a, n);
                 }
             }
