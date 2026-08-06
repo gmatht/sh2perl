@@ -1131,7 +1131,7 @@ mod tests {
         assert!(json3.contains("\"name\":\"join\""));
         assert!(json3.contains("\"name\":\"flat\""));
         assert!(!json3.contains("unsupported"));
-        let json4 = to_json("x=$(echo 1 2 3); echo $x");
+        let json4 = to_json("x=$(echo 1 2 3); echo \"$x\"");
         assert!(!json4.contains("\"name\":\"join\""), "capture-assigned var is a scalar");
         assert!(!json4.contains("unsupported"));
     }
