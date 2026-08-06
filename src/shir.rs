@@ -1754,7 +1754,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
         stmts: &'a [IrStmt],
         assigns: &mut Vec<(String, &'a IrExpr, Option<u64>)>,
         trip: Option<u64>,
-        ranges: &HashMap<String, (i64, i64)>,
+        ranges: &HashMap<String, (i128, i128)>,
     ) {
         for st in stmts {
             match st {
@@ -1859,14 +1859,14 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
     /// sound under-estimate of the entry lo — over-estimates the trip),
     /// step from the body's provable +k writes. None = unbounded.
     fn trip_from_bound(
-        bound: Option<(String, Cmp, i64)>,
+        bound: Option<(String, Cmp, i128)>,
         body: &[IrStmt],
-        ranges: &HashMap<String, (i64, i64)>,
+        ranges: &HashMap<String, (i128, i128)>,
     ) -> Option<u64> {
         let (v, c, n) = bound?;
         let (blo, bhi) = ranges.get(&v).copied()?;
         let (mn, _) = body_step_bounds(body, &v)?;
-        while_iterations(c, n, blo, bhi, mn)
+        while_iterations(c, n, blo, bhi, mn as i128)
     }
 
     /// Multiply the enclosing trip by a loop's trip (cap the product).
@@ -2903,8 +2903,8 @@ pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> 
 // fixpoint) → None (Any). Returns var -> (lo, hi) for provably-integer
 // vars.
 
-pub fn analyze_var_ranges(prog: &IrProgram) -> HashMap<String, (i64, i64)> {
-    let mut state: HashMap<String, Option<(i64, i64)>> = HashMap::new();
+pub fn analyze_var_ranges(prog: &IrProgram) -> HashMap<String, (i128, i128)> {
+    let mut state: HashMap<String, Option<(i128, i128)>> = HashMap::new();
     for s in &prog.stmts {
         walk_stmt_ranges(s, &mut state);
     }
@@ -2915,17 +2915,35 @@ pub fn analyze_var_ranges(prog: &IrProgram) -> HashMap<String, (i64, i64)> {
 }
 
 /// Width a [lo, hi] range maps to (target type table — C/Rust/GLSL).
-pub fn range_width_name(lo: i64, hi: i64) -> &'static str {
-    if lo >= 0 && hi <= u32::MAX as i64 {
+/// u64 fires only past signed-64 — a range only a C-frontend unsigned
+/// integer can produce (bash's arithmetic never leaves i64).
+pub fn range_width_name(lo: i128, hi: i128) -> &'static str {
+    if lo >= 0 && hi <= u32::MAX as i128 {
         "u32"
-    } else if lo >= i32::MIN as i64 && hi <= i32::MAX as i64 {
+    } else if lo >= i32::MIN as i128 && hi <= i32::MAX as i128 {
         "i32"
+    } else if lo >= 0 && hi > i64::MAX as i128 {
+        "u64"
     } else {
         "i64"
     }
 }
 
-type Range = Option<(i64, i64)>;
+type Range = Option<(i128, i128)>;
+
+/// The FRONTEND's integer arithmetic domain, not the storage width:
+/// bash is signed-64-bit wrapped, so a provable range never leaves
+/// [i64::MIN, i64::MAX] — an op/literal that can cross it is top (None).
+/// The C frontend's unsigned types widen this per variable once
+/// `var_types` carries width + signedness (frontend-c-core-needs.md);
+/// the i128 storage already represents the full u64 domain.
+const INT_DOMAIN: (i128, i128) = (i64::MIN as i128, i64::MAX as i128);
+
+/// A range is representable in the frontend's integer domain only when
+/// every value fits — a result that can leave it is top (None).
+fn in_domain(r: (i128, i128)) -> bool {
+    r.0 >= INT_DOMAIN.0 && r.1 <= INT_DOMAIN.1
+}
 
 fn join(a: Range, b: Range) -> Range {
     match (a, b) {
@@ -2964,11 +2982,11 @@ fn cmp_flip(c: Cmp) -> Cmp {
 
 /// Apply a `while var cmp n` entry invariant to a range (cap the side the
 /// comparison pins; None when the range is impossible).
-fn cap_by_cmp(r: (i64, i64), c: Cmp, n: i64) -> Range {
+fn cap_by_cmp(r: (i128, i128), c: Cmp, n: i128) -> Range {
     let (lo, hi) = r;
     match c {
         Cmp::Lt => {
-            if n == i64::MIN {
+            if n == i64::MIN as i128 {
                 return None;
             }
             let hi2 = hi.min(n - 1);
@@ -2987,7 +3005,7 @@ fn cap_by_cmp(r: (i64, i64), c: Cmp, n: i64) -> Range {
             }
         }
         Cmp::Gt => {
-            if n == i64::MAX {
+            if n == i64::MAX as i128 {
                 return None;
             }
             let lo2 = lo.max(n + 1);
@@ -3020,7 +3038,7 @@ fn cap_by_cmp(r: (i64, i64), c: Cmp, n: i64) -> Range {
 /// `let "i < 100"`), or the `until` negation. `(var, cmp, n)` = "the loop
 /// continues while `var cmp n`". String compares (`[[ ]]`), grep-lifted
 /// conds, file tests — None (no numeric bound).
-fn cond_bound(cond: &IrExpr) -> Option<(String, Cmp, i64)> {
+fn cond_bound(cond: &IrExpr) -> Option<(String, Cmp, i128)> {
     match cond {
         IrExpr::Call { func, args } if func == "test" => match args.as_slice() {
             [IrExpr::Str(text, _)] => test_text_bound(text),
@@ -3049,14 +3067,14 @@ fn cond_bound(cond: &IrExpr) -> Option<(String, Cmp, i64)> {
 /// `[ $i -lt 100 ]` / `[ 100 -gt $i ]` — single-bracket NUMERIC tests
 /// only (`-lt/-le/-gt/-ge/-eq`); `<`/`>` are string compares and are NOT
 /// trusted as numeric bounds.
-fn test_text_bound(text: &str) -> Option<(String, Cmp, i64)> {
+fn test_text_bound(text: &str) -> Option<(String, Cmp, i128)> {
     let parts: Vec<&str> = text.split_whitespace().collect();
     if parts.len() != 3 {
         return None;
     }
     let var =
         |s: &str| s.strip_prefix('$').filter(|n| !n.is_empty()).map(str::to_string);
-    let num = |s: &str| s.parse::<i64>().ok();
+    let num = |s: &str| s.parse::<i128>().ok();
     let cmp = |s: &str| match s {
         "-lt" => Some(Cmp::Lt),
         "-le" => Some(Cmp::Le),
@@ -3076,7 +3094,7 @@ fn test_text_bound(text: &str) -> Option<(String, Cmp, i64)> {
 }
 
 /// `let "i < 100"` — numeric arithmetic comparisons only.
-fn arith_text_bound(text: &str) -> Option<(String, Cmp, i64)> {
+fn arith_text_bound(text: &str) -> Option<(String, Cmp, i128)> {
     let parts: Vec<&str> = text.split_whitespace().collect();
     if parts.len() != 3 {
         return None;
@@ -3088,7 +3106,7 @@ fn arith_text_bound(text: &str) -> Option<(String, Cmp, i64)> {
             None
         }
     };
-    let num = |s: &str| s.parse::<i64>().ok();
+    let num = |s: &str| s.parse::<i128>().ok();
     let cmp = |s: &str| match s {
         "<" => Some(Cmp::Lt),
         "<=" => Some(Cmp::Le),
@@ -3112,8 +3130,8 @@ fn arith_text_bound(text: &str) -> Option<(String, Cmp, i64)> {
 fn for_iter_range(iter: &IrExpr) -> Range {
     match iter {
         IrExpr::Array(items) => {
-            let mut lo = i64::MAX;
-            let mut hi = i64::MIN;
+            let mut lo = i128::MAX;
+            let mut hi = i128::MIN;
             for it in items {
                 match ir_range(it, &HashMap::new()) {
                     Some((l, h)) => {
@@ -3129,7 +3147,11 @@ fn for_iter_range(iter: &IrExpr) -> Range {
                 None // empty item list — the loop never runs
             }
         }
-        IrExpr::Range { start, end } => Some(((*start).min(*end), (*start).max(*end))),
+        // the Range node is a frontend-constructed bounded iterable
+        IrExpr::Range { start, end } => {
+            let (s, e) = (*start as i128, *end as i128);
+            Some((s.min(e), s.max(e)))
+        }
         _ => None,
     }
 }
@@ -3170,7 +3192,7 @@ fn plus_step(expr: &IrExpr, v: &str) -> Option<i64> {
         IrExpr::Call { func, args } if func == "assign" => match args.as_slice() {
             [IrExpr::Str(n, _), IrExpr::Str(op, _), e] if n == v && op == "+=" => {
                 match ir_range(e, &HashMap::new()) {
-                    Some((lo, hi)) if lo >= 1 && hi >= lo => Some(lo),
+                    Some((lo, hi)) if lo >= 1 && hi >= lo => i64::try_from(lo).ok(),
                     _ => None,
                 }
             }
@@ -3228,11 +3250,7 @@ fn body_step_bounds(stmts: &[IrStmt], v: &str) -> Option<(i64, i64)> {
 /// Iterations of `while v cmp n` when v starts inside [blo, bhi] and the
 /// body moves it by ≥ step per iteration (monotone). Sound over-approx
 /// (i128 math avoids overflow).
-fn while_iterations(cmp: Cmp, n: i64, blo: i64, bhi: i64, step: i64) -> Option<u64> {
-    let n = n as i128;
-    let blo = blo as i128;
-    let bhi = bhi as i128;
-    let step = step as i128;
+fn while_iterations(cmp: Cmp, n: i128, blo: i128, bhi: i128, step: i128) -> Option<u64> {
     let iters = match cmp {
         Cmp::Lt => {
             if n <= blo {
@@ -3285,7 +3303,7 @@ fn loop_fixpoint(
     state: &mut HashMap<String, Range>,
     body: &[IrStmt],
     skip_var: Option<&str>,
-    bound: Option<(String, Cmp, i64)>,
+    bound: Option<(String, Cmp, i128)>,
 ) {
     let pre = state.clone();
     let mut carried: HashSet<String> = HashSet::new();
@@ -3310,7 +3328,7 @@ fn loop_fixpoint(
     // a provable counter with a known entry lower bound.
     let trip: Option<u64> = match (&cond_var, cond_pre) {
         (Some(v), Some((blo, bhi))) => match body_step_bounds(body, v) {
-            Some((mn, _)) => while_iterations(cmp, n, blo, bhi, mn),
+            Some((mn, _)) => while_iterations(cmp, n, blo, bhi, mn as i128),
             None => None,
         },
         _ => None,
@@ -3334,11 +3352,12 @@ fn loop_fixpoint(
             let before = ls.get(v).copied().flatten();
             let after = ns.get(v).copied().flatten();
             let mut joined = join(after, before);
-            // widening: a bound that moved outward becomes ±i64 (bash
-            // arithmetic is 64-bit wrapped — sound and terminating)
+            // widening: a bound that moved outward becomes the frontend
+            // integer domain's extreme (bash: ±i64 — sound, since values
+            // past it wrap; terminating)
             if let (Some((blo, bhi)), Some((jlo, jhi))) = (before, joined) {
-                let wlo = if jlo < blo { i64::MIN } else { jlo };
-                let whi = if jhi > bhi { i64::MAX } else { jhi };
+                let wlo = if jlo < blo { INT_DOMAIN.0 } else { jlo };
+                let whi = if jhi > bhi { INT_DOMAIN.1 } else { jhi };
                 joined = Some((wlo, whi));
             }
             // entry invariant: while v cmp n → cap the entry range
@@ -3355,16 +3374,16 @@ fn loop_fixpoint(
                         .get(v)
                         .copied()
                         .flatten()
-                        .map_or(i64::MIN, |r| r.0);
+                        .map_or(INT_DOMAIN.0, |r| r.0);
                     let hi0 = pre
                         .get(v)
                         .copied()
                         .flatten()
-                        .map_or(i64::MAX, |r| r.1);
+                        .map_or(INT_DOMAIN.1, |r| r.1);
                     // increasing counter: v ≤ pre_lo + trip·step
-                    let cap_hi = lo0.saturating_add(t as i64);
+                    let cap_hi = lo0.saturating_add(t as i128);
                     // decreasing counter: v ≥ pre_hi − trip·step
-                    let cap_lo = hi0.saturating_sub(t as i64);
+                    let cap_lo = hi0.saturating_sub(t as i128);
                     joined = Some((r.0.max(cap_lo), r.1.min(cap_hi)));
                 }
             }
@@ -3550,11 +3569,16 @@ fn collect_assigned(s: &IrStmt, out: &mut HashSet<String>) {
 
 fn ir_range(e: &IrExpr, state: &HashMap<String, Range>) -> Range {
     match e {
-        IrExpr::Int(i) => Some((*i, *i)),
-        // bash vars are strings; a literal that parses as an integer is
-        // provably that value (matches the numeric lift's "sources that
-        // parse as integers").
-        IrExpr::Str(sv, _) => sv.trim().parse::<i64>().ok().map(|n| (n, n)),
+        IrExpr::Int(i) => Some((*i as i128, *i as i128)),
+        // variables are strings; a literal that parses as an integer in
+        // the frontend's domain is provably that value (matches the
+        // numeric lift's "sources that parse as integers").
+        IrExpr::Str(sv, _) => sv
+            .trim()
+            .parse::<i128>()
+            .ok()
+            .map(|n| (n, n))
+            .filter(|&r| in_domain(r)),
         IrExpr::Var(n, _) => state.get(n).copied().flatten(),
         IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
             [IrExpr::Str(n, _)] => state.get(n).copied().flatten(),
@@ -3565,10 +3589,11 @@ fn ir_range(e: &IrExpr, state: &HashMap<String, Range>) -> Range {
         IrExpr::Call { func, args } if func == "assign" => match args.as_slice() {
             [IrExpr::Str(n, _), IrExpr::Str(op, _), e] if op == "+=" => {
                 let k = ir_range(e, state)?;
-                match state.get(n).copied().flatten() {
+                let shifted = match state.get(n).copied().flatten() {
                     Some((lo, hi)) => Some((lo.checked_add(k.0)?, hi.checked_add(k.1)?)),
                     None => Some(k),
-                }
+                };
+                shifted.filter(|&r| in_domain(r))
             }
             [IrExpr::Str(_, _), IrExpr::Str(op, _), e] if op == "=" => ir_range(e, state),
             _ => None,
@@ -3580,12 +3605,14 @@ fn ir_range(e: &IrExpr, state: &HashMap<String, Range>) -> Range {
 
 fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
     match a {
-        ArithAst::Num(i) => Some((*i, *i)),
+        ArithAst::Num(i) => Some((*i as i128, *i as i128)),
         ArithAst::Var(n) => state.get(n).copied().flatten(),
         ArithAst::Bin { op, lhs, rhs } => {
             let (l, r) = (arith_range(lhs, state)?, arith_range(rhs, state)?);
             let (l0, l1, r0, r1) = (l.0, l.1, r.0, r.1);
-            match op.as_str() {
+            // the interval of the op, provably within the frontend's
+            // integer domain; a result that can leave it (wrap) is top
+            let res = match op.as_str() {
                 "+" => Some((l0.checked_add(r0)?, l1.checked_add(r1)?)),
                 "-" => Some((l0.checked_sub(r1)?, l1.checked_sub(r0)?)),
                 "*" => {
@@ -3611,15 +3638,17 @@ fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
                     Some((*qs.iter().min()?, *qs.iter().max()?))
                 }
                 _ => None, // % , ^, ... conservative
-            }
+            };
+            res.filter(|&r| in_domain(r))
         }
         ArithAst::Un { op, arg } => {
             let (lo, hi) = arith_range(arg, state)?;
-            match op.as_str() {
+            let res = match op.as_str() {
                 "-" => Some((-hi, -lo)),
                 "+" => Some((lo, hi)),
                 _ => None,
-            }
+            };
+            res.filter(|&r| in_domain(r))
         }
         _ => None, // Index / Cond / Assign / IncDec — step 2
     }
@@ -19041,7 +19070,7 @@ mod const_analysis_tests {
 mod range_analysis_tests {
     use super::*;
 
-    fn ranges_of(src: &str) -> HashMap<String, (i64, i64)> {
+    fn ranges_of(src: &str) -> HashMap<String, (i128, i128)> {
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = ast_to_ir(&cmds);
         analyze_var_ranges(&prog)
@@ -19058,7 +19087,12 @@ mod range_analysis_tests {
         assert_eq!(range_width_name(1, 1), "u32");
         assert_eq!(range_width_name(-5, -5), "i32");
         assert_eq!(range_width_name(0, 4_000_000_000), "u32");
+        // fits signed-64 but not u32 → i64 (bash/C-signed domain)
         assert_eq!(range_width_name(0, 10_000_000_000), "i64");
+        // beyond signed-64 → u64 (only a C-frontend unsigned integer can
+        // produce this; bash arithmetic never leaves i64)
+        assert_eq!(range_width_name(0, u64::MAX as i128), "u64");
+        assert_eq!(range_width_name(i64::MAX as i128, i64::MAX as i128), "i64");
     }
 
     #[test]
@@ -19126,6 +19160,7 @@ mod range_analysis_tests {
         let mut widths: HashMap<&'static str, usize> = HashMap::new();
         widths.insert("u32", 0);
         widths.insert("i32", 0);
+        widths.insert("u64", 0);
         widths.insert("i64", 0);
         let mut total_proven = 0usize;
         let mut total_numeric = 0usize;
