@@ -11,6 +11,15 @@
 //! compile-able `sh2.*` stub or a `/* TODO(unsupported) */` marker, so
 //! the draft always compiles.
 //!
+//! Also consumes the core's conservative string-length analysis
+//! (`IrProgram.var_lengths`, fbedac4): a Str var with a known bound N
+//! gets a FIXED buffer `char v[N+1]` (the fixed-buffer transform the
+//! analysis was built for), with DEBUG-ONLY length asserts (`assert()`,
+//! compiled out under NDEBUG) at the function boundary and BEFORE every
+//! copy into the buffer — the write that would overflow is UB, and the
+//! assert is the debug-mode tripwire; under NDEBUG `strncpy` truncates.
+//! Unbounded (None) vars stay `char*`.
+//!
 //! The naive string/number coercion here is exactly the "C needs type
 //! inference" gap PLAN.md v2 flagged; the design doc surfaces it as the
 //! next work item.
@@ -29,6 +38,10 @@ pub struct Render {
     depth: usize,
     /// var name -> type verdict (A2); missing = Any (runtime store)
     var_types: HashMap<String, IrType>,
+    /// var name -> conservative max string length (fbedac4's
+    /// analyze_string_lengths); None = unbounded. Only vars in the
+    /// analysis' assign set appear.
+    var_lengths: HashMap<String, Option<u64>>,
     /// distinct sh2.* callee names that need stubs
     sh2_calls: BTreeSet<String>,
     need_upper: bool,
@@ -38,14 +51,20 @@ pub struct Render {
     todo: usize,
 }
 
+/// Bounded Str vars get a fixed buffer of bound+1 bytes; unbounded or
+/// over-cap vars stay `char*`. Aligned with the analysis' own CAP.
+const FIXED_BUF_CAP: u64 = 1024;
+
 /// Render an `IrProgram` to C source (main() body).
 pub fn shir_to_c(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
-    // A2: the type verdicts are computed at serialization time in the JSON
-    // path; the library path must run the same analysis.
+    // A2 + var_lengths: the analyses run at serialization time in the
+    // JSON path; the library path must run the same ones.
     prog.var_types = crate::shir::analyze_var_types(&prog);
+    prog.var_lengths = crate::shir::analyze_string_lengths(&prog);
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
+    r.var_lengths = prog.var_lengths.iter().cloned().collect();
     r.program(&prog);
     r.out.join("\n")
 }
@@ -103,6 +122,42 @@ impl Render {
         self.var_types.get(name).copied() == Some(IrType::Int)
     }
 
+    /// The fixed-buffer bound for a Str var (Some(N) -> `char v[N+1]`),
+    /// or None (stay `char*`). INT vars are excluded — the length
+    /// analysis also bounds numeric RHS (`i=$((i+1))` -> 20), and
+    /// `strlen`/`strncpy` on a `long long` is itself UB.
+    fn buf_bound(&self, name: &str) -> Option<u64> {
+        if self.is_num(name) {
+            return None;
+        }
+        self.var_lengths
+            .get(name)
+            .copied()
+            .flatten()
+            .filter(|&b| b <= FIXED_BUF_CAP)
+    }
+
+    /// `name = rhs` into a fixed buffer of size b+1: the DEBUG-ONLY
+    /// length assert fires BEFORE the copy (the UB-triggering write);
+    /// NDEBUG compiles it out and strncpy truncates (null-terminated).
+    /// Non-string RHS exprs (the "0" placeholder for unlowered
+    /// Interpolate etc.) lower to the empty string — copying a bogus
+    /// pointer would itself be UB.
+    fn emit_guarded_copy(&mut self, name: &str, b: u64, rhs: &str) {
+        let rhs_c = format!("(char*)({rhs})");
+        let stringy = rhs.starts_with('"')
+            || rhs.starts_with("(char*)")
+            || rhs.starts_with("sh2_")
+            || is_ident(rhs);
+        if stringy {
+            self.emit(&format!("assert(strlen({rhs_c}) <= {b});"));
+            self.emit(&format!("strncpy({name}, {rhs_c}, {b} + 1);"));
+            self.emit(&format!("{name}[{b}] = '\\0';"));
+        } else {
+            self.emit(&format!("{name}[0] = '\\0';"));
+        }
+    }
+
     // ── expressions ──────────────────────────────────────────────────
 
     fn expr(&mut self, e: &IrExpr) -> String {
@@ -143,10 +198,28 @@ impl Render {
                 format!("({l} {c_op} {r})")
             }
             IrExpr::Arith(a) => self.arith(a),
-            IrExpr::Interpolate(_) => {
-                // interpolation only lowers via echo parts_of; standalone → TODO
-                self.mark_todo("Interpolate expr");
-                "0".into()
+            IrExpr::Interpolate(parts) => {
+                // a pure-literal interpolation lowers to the concatenated
+                // string literal; parts with vars stay TODO (no runtime
+                // store in this draft — the "0" placeholder is caught by
+                // emit_guarded_copy's non-string path, never copied).
+                let mut lit = String::new();
+                let mut all_lit = true;
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(t) => lit.push_str(t),
+                        InterpPart::Expr(_) => {
+                            all_lit = false;
+                            break;
+                        }
+                    }
+                }
+                if all_lit {
+                    Self::cstr(&lit)
+                } else {
+                    self.mark_todo("Interpolate expr");
+                    "0".into()
+                }
             }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|e| self.expr(e)).collect();
@@ -287,15 +360,28 @@ impl Render {
     }
 
     /// A test operand: `"$y"`/`$y`/`y` (typed var) → ident; number →
-    /// literal; otherwise a quoted string.
-    fn test_value(&self, t: &str) -> String {
-        let t = t.trim().trim_matches('"').strip_prefix('$').unwrap_or(t.trim().trim_matches('"'));
-        if self.var_types.contains_key(t) {
-            self.c_ident(t)
-        } else if let Ok(n) = t.parse::<i64>() {
+    /// literal; a plain quoted string → the literal. Anything else
+    /// (unresolved `$name`, positional `$#`/`$1`, compounds) → a sh2.*
+    /// stub — NEVER a bare string: `$#` used to render `"#"`, and
+    /// `("#" < 2)` is a pointer-vs-int comparison (UB — 900_if2echo
+    /// silently skipped its if-body).
+    fn test_value(&mut self, t: &str) -> String {
+        let raw = t.trim();
+        let dequoted = raw.trim_matches('"');
+        let stripped = dequoted.strip_prefix('$').unwrap_or(dequoted);
+        if self.var_types.contains_key(stripped) {
+            self.c_ident(stripped)
+        } else if let Ok(n) = stripped.parse::<i64>() {
             n.to_string()
+        } else if dequoted.starts_with('$')
+            || !stripped
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            // unresolved $-name / positional / compound operand
+            self.sh2_stub("test", &[], "test operand")
         } else {
-            Self::cstr(t)
+            Self::cstr(stripped)
         }
     }
 
@@ -367,7 +453,9 @@ impl Render {
                         cargs.push(format!("(long long)({v})"));
                     } else {
                         fmt.push_str("%s");
-                        cargs.push(format!("({v})"));
+                        // cast: the arg may be a stub call returning
+                        // long long — printf("%s", long long) is UB.
+                        cargs.push(format!("(char*)({v})"));
                     }
                 }
             }
@@ -397,6 +485,14 @@ impl Render {
                     return;
                 }
                 let name = self.c_ident(&t.var);
+                if let Some(b) = self.buf_bound(&t.var) {
+                    // a bounded string var: the debug-only length assert
+                    // fires BEFORE the write that would overflow the
+                    // fixed buffer (see emit_guarded_copy).
+                    let rhs = self.expr(expr);
+                    self.emit_guarded_copy(&name, b, &rhs);
+                    return;
+                }
                 let is_num = self.is_num(&t.var);
                 let rhs = if is_num {
                     self.expr_as_num(expr)
@@ -419,6 +515,11 @@ impl Render {
                     if self.is_num(&d.name) {
                         let v = init_expr.clone().unwrap_or_else(|| "0".into());
                         self.emit(&format!("long long {name} = {v};"));
+                    } else if let Some(b) = self.buf_bound(&d.name) {
+                        self.emit(&format!("char {name}[{}] = \"\";", b + 1));
+                        if let Some(v) = init_expr.clone() {
+                            self.emit_guarded_copy(&name, b, &v);
+                        }
                     } else {
                         let v = init_expr.clone().unwrap_or_else(|| "NULL".into());
                         self.emit(&format!("char* {name} = {v};"));
@@ -595,11 +696,25 @@ impl Render {
             let name = self.c_ident(v);
             if self.is_num(v) {
                 self.emit(&format!("long long {name} = 0;"));
+            } else if let Some(b) = self.buf_bound(v) {
+                // the fixed-buffer transform: the var_lengths analysis
+                // proves len(v) <= b, so the buffer is b+1 bytes
+                self.emit(&format!("char {name}[{}] = \"\";", b + 1));
             } else {
                 self.emit(&format!("char* {name} = NULL;"));
             }
         }
         if !vars.is_empty() {
+            self.emit("");
+            // DEBUG-ONLY length invariants at the function boundary
+            // (assert() compiles out under NDEBUG): every bounded var
+            // must still fit its analysis bound.
+            for v in &vars {
+                if let Some(b) = self.buf_bound(v) {
+                    let name = self.c_ident(v);
+                    self.emit(&format!("assert(strlen({name}) <= {b});"));
+                }
+            }
             self.emit("");
         }
         for s in &prog.stmts {
@@ -615,6 +730,7 @@ impl Render {
         self.emit("#include <stdlib.h>");
         self.emit("#include <string.h>");
         self.emit("#include <math.h>");
+        self.emit("#include <assert.h>"); // debug-only length asserts (NDEBUG compiles out)
         self.emit("");
         if !self.sh2_calls.is_empty() {
             self.emit("/* sh2.* runtime stubs — TODO: implement (harness/sh2-namespace.json) */");
@@ -743,4 +859,13 @@ fn collect_vars_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
         }
         _ => {}
     }
+}
+
+/// A plain C identifier (a mangled var name or a string-literal-less
+/// expression is NOT — used to decide whether an RHS is a string value
+/// that may be length-asserted before a guarded copy).
+fn is_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().next().unwrap().is_ascii_alphabetic()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
