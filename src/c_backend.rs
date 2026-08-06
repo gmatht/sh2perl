@@ -269,7 +269,10 @@ impl Render {
                     crate::ir::BinOpKind::Ge => ">=",
                     crate::ir::BinOpKind::And => "&&",
                     crate::ir::BinOpKind::Or => "||",
-                    crate::ir::BinOpKind::Not => "!",
+                    // `!` is UNARY — the ShIR duplicates the operand
+                    // (until loops: BinOp{Not, test, test}), so render
+                    // the negation of the lhs and ignore the rhs copy.
+                    crate::ir::BinOpKind::Not => return format!("(!({l}))"),
                     crate::ir::BinOpKind::Pow => {
                         return format!("pow({l},{r})");
                     }
@@ -352,10 +355,19 @@ impl Render {
                 self.arith(then),
                 self.arith(else_)
             ),
-            ArithAst::Assign { .. } | ArithAst::IncDec { .. } => {
-                // runtime setVar semantics (x+=, x++) — sh2.arith stub
-                self.sh2_calls.insert("arith".into());
-                format!("sh2_arith()")
+            ArithAst::Assign { var, op, rhs } => {
+                // `x op= rhs` — native (the zero-divisor /%= cases are
+                // kept on the runtime by the core, so op is safe here)
+                format!("{} {op}= {}", self.c_ident(var), self.arith(rhs))
+            }
+            ArithAst::IncDec { var, delta, prefix } => {
+                // `++x` / `x++` / `--x` / `x--` (delta ±1)
+                let name = self.c_ident(var);
+                if *prefix {
+                    format!("{}{}", if *delta >= 0 { "++" } else { "--" }, name)
+                } else {
+                    format!("{}{}", name, if *delta >= 0 { "++" } else { "--" })
+                }
             }
         }
     }
@@ -477,13 +489,10 @@ impl Render {
 
     /// Emit one shell function as `static void NAME(void) { ... }`
     /// (preamble position — C has no nested function definitions).
-    /// No-op wrappers (setup()/cleanup() with `:` bodies) are skipped.
+    /// Always emitted: a `:`-body function may be CALLED (shellbench
+    /// func:func wraps the call in @begin/@end) — dropping the
+    /// definition would make the call an undefined symbol.
     fn emit_function(&mut self, name: &str, body: &[IrStmt]) {
-        if body.iter().all(|s| {
-            matches!(s, IrStmt::Expr(e) if self.noop_value_call(e))
-        }) {
-            return;
-        }
         let fname = self.c_ident(name);
         self.emit(&format!("static void {fname}(void) {{"));
         self.depth += 1;
@@ -533,6 +542,19 @@ impl Render {
                     // cleanup() wrappers, `while true` conditions).
                     if let Some(v) = self.noop_value("exec", args) {
                         return v.to_string();
+                    }
+                    // `let "i++"` / `let "x+=1"` — the ((...)) builtin's
+                    // string form (the core emits it when the var is
+                    // typeset -i / let-declared). Parse the common shapes.
+                    if cmd == "let" {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if let Some(IrExpr::Str(expr, _)) = items.first() {
+                                if let Some(c) = self.let_render(expr) {
+                                    return c;
+                                }
+                            }
+                        }
+                        return self.sh2_stub("let", args, "let");
                     }
                     // a defined shell function's call (the Expr
                     // stmt arm appends the ';')
@@ -604,6 +626,35 @@ impl Render {
             _ if self.functions.contains(func) => format!("{}();", self.c_ident(func)),
             _ => self.sh2_stub(func, args, func),
         }
+    }
+
+    /// `let` — the ((...)) builtin arrives as a STRING ("i++", "x+=1").
+    /// Parse the common single-assignment shapes natively; anything
+    /// else → None (the caller stubs). No trailing ';' — the Expr
+    /// stmt arm appends it.
+    fn let_render(&self, s: &str) -> Option<String> {
+        let s = s.trim();
+        if let Some(rest) = s.strip_suffix("++") {
+            let n = rest.trim();
+            if is_ident(n) {
+                return Some(format!("{}++", self.c_ident(n)));
+            }
+        }
+        if let Some(rest) = s.strip_suffix("--") {
+            let n = rest.trim();
+            if is_ident(n) {
+                return Some(format!("{}--", self.c_ident(n)));
+            }
+        }
+        for op in ["+=", "-=", "*=", "/=", "%="] {
+            if let Some((l, r)) = s.split_once(op) {
+                let l = l.trim();
+                if is_ident(l) && r.trim().parse::<i64>().is_ok() {
+                    return Some(format!("{} {op} {}", self.c_ident(l), r.trim()));
+                }
+            }
+        }
+        None
     }
 
     /// Mini `[ ... ]` evaluator for the common patterns; None → stub.
@@ -1057,12 +1108,9 @@ impl Render {
         let mut vars: BTreeSet<String> = BTreeSet::new();
         let mut for_vars: BTreeSet<String> = BTreeSet::new();
         collect_vars_full(&prog.stmts, &mut vars, &mut for_vars);
-        for s in &prog.stmts {
-            if let IrStmt::Function { name, body } = s {
-                self.functions.insert(name.clone());
-                self.fn_defs.push((name.clone(), body.clone()));
-            }
-        }
+        // collect function definitions at ANY depth (a function may be
+        // defined inside a block/loop — the shellbench eval benches do).
+        collect_fn_defs(&prog.stmts, &mut self.functions, &mut self.fn_defs);
         // vars that appear ONLY inside function bodies (var_types covers
         // them too, but they must NOT be hoisted into main — the
         // function declares its own copy).
@@ -1158,6 +1206,36 @@ impl Render {
 /// declare lists, Var reads).
 fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     collect_vars_full(stmts, out, &mut BTreeSet::new());
+}
+
+/// Collect Function definitions at any depth (names + bodies).
+fn collect_fn_defs(
+    stmts: &[IrStmt],
+    names: &mut BTreeSet<String>,
+    defs: &mut Vec<(String, Vec<IrStmt>)>,
+) {
+    for s in stmts {
+        match s {
+            IrStmt::Function { name, body } => {
+                names.insert(name.clone());
+                defs.push((name.clone(), body.clone()));
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_fn_defs(then, names, defs);
+                for (_, b) in elsifs {
+                    collect_fn_defs(b, names, defs);
+                }
+                collect_fn_defs(else_, names, defs);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => collect_fn_defs(body, names, defs),
+            _ => {}
+        }
+    }
 }
 
 /// For every `Const`-verdict var: the single TOP-LEVEL `Assign` targeting
@@ -1316,12 +1394,53 @@ fn collect_vars_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                 collect_vars_expr(i, out);
             }
         }
+        IrExpr::Call { func, args } if func == "exec" => {
+            // `let "i++"` hides its var inside a STRING arg — the hoist
+            // must see it or the loop var is undeclared in C.
+            if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                if cmd == "let" {
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        if let Some(IrExpr::Str(expr, _)) = items.first() {
+                            if let Some(n) = let_var_name(expr) {
+                                out.insert(n);
+                            }
+                        }
+                    }
+                }
+            }
+            for a in args {
+                collect_vars_expr(a, out);
+            }
+        }
         IrExpr::Call { args, .. } => {
             for a in args {
                 collect_vars_expr(a, out);
             }
         }
         _ => {}
+    }
+}
+
+/// The variable a `let` string operates on ("i++", "++i", "x+=1").
+fn let_var_name(s: &str) -> Option<String> {
+    let s = s.trim();
+    let s = s
+        .strip_prefix("++")
+        .or_else(|| s.strip_prefix("--"))
+        .unwrap_or(s)
+        .trim();
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end > 0 {
+        Some(s[..end].to_string())
+    } else {
+        None
     }
 }
 
