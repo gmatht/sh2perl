@@ -10,6 +10,9 @@
 //!     (builtin vs external classification, conservative).
 //!   - const-markup: `var_const` — conservative const/var verdicts per
 //!     assigned variable (`Const` | `Var`; the C backend emits `const`).
+//!   - lifetime: `var_lifetimes` — per-variable live spans (first/last
+//!     access positions) + the escape bit (the C backend's per-point
+//!     buffer sizing and copy-vs-move input).
 //! Deterministic: same input → byte-identical JSON.
 //!
 //! Usage: `debashc file --shir foo.sh` (or `debashc --shir <input>`).
@@ -33,6 +36,9 @@ pub fn shir_to_shir_json(prog: &IrProgram) -> String {
     }
     if prog.var_const.is_empty() {
         prog.var_const = crate::shir::analyze_var_const(&prog);
+    }
+    if prog.var_lifetimes.is_empty() {
+        prog.var_lifetimes = crate::shir_passes::lifetime::analyze_var_lifetimes(&prog);
     }
     program_json(&prog, CONTRACT_VERSION).to_string()
 }
@@ -61,6 +67,7 @@ fn program_json(p: &IrProgram, contract_version: u32) -> Value {
         "stmt_lines": p.stmt_lines.iter().map(|(i, l)| json!({"stmt": i, "line": l})).collect::<Vec<_>>(),
         "var_lengths": p.var_lengths.iter().map(|(n, l)| json!({"name": n, "max_len": l})).collect::<Vec<_>>(),
         "var_const": p.var_const.iter().map(|(n, k)| json!({"name": n, "kind": k})).collect::<Vec<_>>(),
+        "var_lifetimes": p.var_lifetimes.iter().map(|(n, l)| json!({"name": n, "first": l.first, "last": l.last, "escapes": l.escapes})).collect::<Vec<_>>(),
         "subs": p.subs.iter().map(sub_json).collect::<Vec<_>>(),
         "stmts": p.stmts.iter().map(stmt_json).collect::<Vec<_>>(),
     })
