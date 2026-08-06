@@ -1843,6 +1843,26 @@ mod tests {
     }
 
     #[test]
+    fn local_scope_shadows_outer_binding() {
+        // fish-sh-go local-scope request: `local v=1` inside a function
+        // must NOT leak into the outer v (the runtime's flat store model
+        // leaks; the per-function local lift emits a native `let` inside
+        // the define arrow). The emitted function body must contain a
+        // `let v` (block-scope shadow), and the module binding must NOT
+        // be the write target of the decl.
+        let json = to_json("f() { local v=1; echo \"inner=$v\"; }; v=2; f; echo \"outer=$v\"");
+        assert!(json.contains("\"kind\":\"let\""));
+        assert!(json.contains("\"name\":\"v\""));
+        // the first decl inside the arrow is a `let v = 1` VariableDeclaration
+        assert!(json.contains("\"type\":\"VariableDeclaration\""));
+        // local-lifted arith: `local i=3; ((i++))` writes the native
+        // binding, not the store (no setVar for the incdec)
+        let json2 = to_json("g() { local i=3; ((i++)); echo \"i=$i\"; }; g");
+        assert!(!json2.contains("\"name\":\"setVar\""));
+        assert!(json2.contains("\"name\":\"i\""));
+    }
+
+    #[test]
     fn process_substitution_lowers_without_unsupported() {
         // <(cmd) as an argument position: the redirect becomes a here-string
         // (captured producer stdout) and a materialized-path argument is
