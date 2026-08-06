@@ -1813,6 +1813,22 @@ fn bash_quote_word(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\\\''"))
 }
 
+/// Commands whose Generator emulations are verified bash-correct in
+/// STANDALONE use (no pipeline/$input_data machinery, no file-arg gaps,
+/// error paths included). Everything else falls back to `bash -c`
+/// shell-out. Verified empirically per command+arg-shape: seq, ls, wc,
+/// cat, tail, grep, tr, mkdir, rm, touch, basename, dirname, pwd, date,
+/// hostname, paste, tee, which, yes. Excluded: sort/uniq/sed/cut/comm/
+/// strings/gzip/awk (need the pipeline \$input_data), head (reads STDIN
+/// even with a file arg), cp/mv (croak on missing source where bash
+/// errors and continues), sha256sum/diff/find (output format), rmdir
+/// (failure exit code).
+const EMULATED_COMMANDS: &[&str] = &[
+    "seq", "ls", "wc", "cat", "tail", "grep", "tr", "mkdir", "rm",
+    "touch", "basename", "dirname", "pwd", "date", "hostname", "paste",
+    "tee", "which", "yes",
+];
+
 /// Reuse the AST Generator's per-command in-Perl emulations for an external
 /// command: reconstruct the shell text from IR words, re-parse it into a
 /// `SimpleCommand`, and run the Generator's dispatcher (ls/wc/sed/… become
@@ -2388,22 +2404,26 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         }
         _ => {
             // External command — first try the AST Generator's in-Perl
-            // emulation (ls/wc/sed/… native, no bash dependency); fall back
-            // to bash -c shell-out when there is no emulation.
-            if let Some(perl) = generator_emulate_command(&cmd, &words) {
-                for line in perl.lines() {
-                    emit_indent(out, indent);
-                    out.push_str(line);
-                    out.push('\n');
+            // emulation (verified-safe commands only: native Perl, no bash
+            // dependency); fall back to bash -c shell-out otherwise.
+            if EMULATED_COMMANDS.contains(&cmd.as_str())
+                && std::env::var("DEBASHC_IR_NO_EMUL").is_err()
+            {
+                if let Some(perl) = generator_emulate_command(&cmd, &words) {
+                    for line in perl.lines() {
+                        emit_indent(out, indent);
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    return;
                 }
-            } else {
-                let full = build_shell_cmd(&cmd, &words);
-                emit_indent(out, indent);
-                out.push_str(&format!(
-                    "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
-                    safe_perl_q_string(&full)
-                ));
             }
+            let full = build_shell_cmd(&cmd, &words);
+            emit_indent(out, indent);
+            out.push_str(&format!(
+                "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+                safe_perl_q_string(&full)
+            ));
         }
     }
 }
