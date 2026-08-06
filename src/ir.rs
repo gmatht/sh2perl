@@ -709,12 +709,37 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
 
         // Neutral ESTree-path-only nodes — the Perl generator never emits them.
         IrStmt::Subshell(body) => {
-            // ( cmd ) — copy semantics. Perl has no fork-scope by default,
-            // so a subshell renders as its statements in place (stdout is
-            // identical; variable isolation is approximated — the corpus's
-            // subshells are output-only in the common case).
+            // ( cmd ) — copy semantics: assignments inside do NOT leak. Save
+            // the vars the body assigns, run it, restore them (Perl `local`
+            // can't apply to the hoisted `my` lexicals).
+            let mut assigned = Vec::new();
+            collect_assigned_vars(body, &mut assigned);
+            let mut saves = Vec::new();
+            for (name, sigil) in &assigned {
+                if is_env_style_var_name(name) {
+                    continue;
+                }
+                let save = format!("__save_{}", name);
+                emit_indent(out, indent);
+                let var = match sigil {
+                    Sigil::Scalar => format!("${}", name),
+                    Sigil::Array => format!("@{}", name),
+                    Sigil::Hash => format!("%{}", name),
+                };
+                out.push_str(&format!("my ${} = {};\n", save, var));
+                saves.push((name.clone(), save, sigil.clone()));
+            }
             for s in body {
                 emit_stmt(out, s, indent);
+            }
+            for (name, save, sigil) in saves {
+                emit_indent(out, indent);
+                let var = match sigil {
+                    Sigil::Scalar => format!("${}", name),
+                    Sigil::Array => format!("@{}", name),
+                    Sigil::Hash => format!("%{}", name),
+                };
+                out.push_str(&format!("{} = ${};\n", var, save));
             }
         }
         IrStmt::Background(_) => {
