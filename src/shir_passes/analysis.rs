@@ -54,6 +54,29 @@ impl super::Analysis for LocalLift {
     fn run(&self, _prog: &IrProgram, _ctx: &mut PassContext) {}
 }
 
+/// Const/var verdicts per assigned variable — the const-markup analysis.
+/// `Const` = exactly one static assignment site that executes at most
+/// once (outside loops/function bodies) and is never written by the
+/// runtime store, native arith, an array-element write, or a dynamic
+/// write (`eval`/`source`). The verdicts populate `ctx.const_vars`;
+/// [`crate::shir_passes::transform::ConstMarkup`] attaches them to
+/// `IrProgram.var_const` so every backend (and the ShIR JSON contract)
+/// carries the markup. The implementation is the real one — it delegates
+/// to `shir::analyze_var_const`, the canonical pass shared with the
+/// `--shir` serialization path.
+pub struct ConstVar;
+
+impl super::Analysis for ConstVar {
+    fn name(&self) -> &'static str {
+        "const_var"
+    }
+    fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
+        ctx.const_vars = crate::shir::analyze_var_const(prog)
+            .into_iter()
+            .collect();
+    }
+}
+
 /// `set -e` (errexit) may be enabled somewhere in the program.
 /// Stage 0: default `false` (safe — the guard wrapper is an identity
 /// when errexit is off, so the only cost of `false` is a missed
@@ -169,6 +192,8 @@ impl super::Analysis for LoopStatusDeadness {
 mod tests {
     use super::*;
     use crate::ir::IrProgram;
+    // bring the `run` method into scope for direct `ConstVar.run(..)` calls
+    use crate::shir_passes::Analysis as _;
 
     fn empty_prog() -> IrProgram {
         IrProgram {
@@ -177,6 +202,9 @@ mod tests {
             stmts: vec![],
             subs: vec![],
             var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
         }
     }
 
@@ -186,6 +214,7 @@ mod tests {
             Box::new(NumericLift),
             Box::new(StringLift),
             Box::new(LocalLift),
+            Box::new(ConstVar),
             Box::new(ErrexitMayEnable),
             Box::new(NocaseMayEnable),
             Box::new(PersistFd1),
@@ -216,6 +245,7 @@ mod tests {
             Box::new(NumericLift),
             Box::new(StringLift),
             Box::new(LocalLift),
+            Box::new(ConstVar),
             Box::new(ErrexitMayEnable),
             Box::new(NocaseMayEnable),
             Box::new(PersistFd1),
@@ -234,6 +264,7 @@ mod tests {
         assert!(ctx.lifted_numeric.is_empty());
         assert!(ctx.lifted_string.is_empty());
         assert!(ctx.lifted_local.is_empty());
+        assert!(ctx.const_vars.is_empty());
         assert!(!ctx.may_errexit);
         assert!(!ctx.case_nocase);
         assert!(!ctx.persist_fd1);
@@ -243,5 +274,66 @@ mod tests {
         assert!(ctx.lastexit_dead.is_empty());
         assert!(ctx.loop_status_dead.is_empty());
         assert!(ctx.async_region_loops.is_empty());
+    }
+
+    #[test]
+    fn const_var_analysis_populates_verdicts() {
+        use crate::ir::{IrExpr, IrStmt, StrStyle};
+        // `x=5` once, straight-line → Const; `y` reassigned → Var;
+        // `z` written by a loop body → Var (multi-run site).
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "x".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Int(5),
+                },
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "y".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Int(1),
+                },
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "y".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Int(2),
+                },
+                IrStmt::While {
+                    cond: IrExpr::Call {
+                        func: "test".to_string(),
+                        args: vec![IrExpr::Str("true".to_string(), StrStyle::SingleQuoted)],
+                    },
+                    body: vec![IrStmt::Assign {
+                        targets: vec![crate::ir::AssignTarget {
+                            var: "z".to_string(),
+                            sigil: None,
+                            indices: vec![],
+                        }],
+                        expr: IrExpr::Int(0),
+                    }],
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+        };
+        let mut ctx = PassContext::default();
+        ConstVar.run(&prog, &mut ctx);
+        assert_eq!(ctx.const_vars.get("x"), Some(&crate::ir::VarKind::Const));
+        assert_eq!(ctx.const_vars.get("y"), Some(&crate::ir::VarKind::Var));
+        assert_eq!(ctx.const_vars.get("z"), Some(&crate::ir::VarKind::Var));
     }
 }
