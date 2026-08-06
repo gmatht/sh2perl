@@ -6,11 +6,12 @@ pub mod parser;
 pub mod ir;
 pub mod debug;
 pub mod estree;
+pub mod cfront;
 pub mod shir;
+pub mod transforms;
 pub mod shir_json;
 pub mod c_backend; // worktree-local: C backend renderer (branch backend/c)
 pub mod shir_json_in;
-pub mod shir_passes;
 pub mod bc;
 pub mod generator;
 pub mod mir_simple;

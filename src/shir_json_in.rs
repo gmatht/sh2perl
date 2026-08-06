@@ -50,7 +50,37 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
     let var_types = var_types_from(obj.get("var_types"), "Program.var_types")?;
     let subs = subs_from(obj.get("subs"), "Program.subs")?;
     let stmts = stmts_from(obj.get("stmts"), "Program.stmts")?;
-    Ok(IrProgram { imports, requires, stmts, subs, var_types })
+    let stmt_lines = match obj.get("stmt_lines") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| {
+                let s = v.get("stmt")?.as_u64()? as usize;
+                let l = v.get("line")?.as_u64()? as usize;
+                Some((s, l))
+            })
+            .collect(),
+        _ => vec![],
+    };
+    let var_lengths = match obj.get("var_lengths") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| {
+                let n = v.get("name")?.as_str()?.to_string();
+                let l = v.get("max_len").and_then(|x| x.as_u64());
+                Some((n, l))
+            })
+            .collect(),
+        _ => vec![],
+    };
+    Ok(IrProgram {
+        imports,
+        requires,
+        stmts,
+        subs,
+        var_types,
+        stmt_lines,
+        var_lengths,
+    })
 }
 
 fn subs_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrSub>, String> {
@@ -632,7 +662,7 @@ mod tests {
     #[test]
     fn contract_version_required() {
         let mut prog = IrProgram { imports: vec![], requires: vec![],
-            stmts: vec![], subs: vec![], var_types: vec![] };
+            stmts: vec![], subs: vec![], var_types: vec![], stmt_lines: vec![] };
         let json = shir_to_shir_json(&prog);
         // valid
         assert!(shir_json_to_ir(&json).is_ok());
