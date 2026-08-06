@@ -35,6 +35,16 @@ static CASE_NOCASE: Mutex<Option<bool>> = Mutex::new(None);
 /// value-consuming positions (if/while/until conds, `!`, ternary) get the
 /// native lowering.
 static AND_OR_DEPTH: Mutex<usize> = Mutex::new(0);
+/// Native arith div/mod poison depth: >0 while lowering a `$((...))`
+/// expression that contains a NaN-COERCING operator (bitwise `|`/`&`/`^`/
+/// shifts, `**`, comparisons, `&&`/`||`, `!`, ternaries — JS converts NaN
+/// to 0/false/true where bash would abort the WHOLE expansion). A zero
+/// divisor in such an expression must keep the runtime `idiv`/`imod`
+/// THROW (the only mechanism that aborts mid-expression); poison-free
+/// expressions (div/mod results only flow through `+ - * / %` and unary
+/// +/- into the arithEval boundary) can go fully native — NaN reaches
+/// the wrapper and converts to the bash empty result.
+static ARITH_POISON_DEPTH: Mutex<usize> = Mutex::new(0);
 /// Native-echo emission depth: >0 while lowering inside a construct whose
 /// runtime stdout sink differs from the module's stdout — `redirect` /
 /// `pipeline` / `capture` / `captureWords` calls (the runtime swaps
@@ -5527,6 +5537,50 @@ fn arith_var_read(name: &str) -> Expr {
 }
 
 /// Render the arithmetic AST as native JS expressions.
+/// Does the arith AST contain a NaN-COERCING operator anywhere? Bitwise
+/// ops (`|` `&` `^` shifts) coerce NaN to 0, `**` to 1 (exponent 0),
+/// comparisons to false, `&&`/`||`/`!`/ternary-conds to truthiness —
+/// where bash would abort the whole expansion on a zero divisor. Only
+/// `+ - * / %` and unary +/- propagate NaN faithfully.
+fn arith_has_poison(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Bin { op, lhs, rhs } => {
+            matches!(
+                op.as_str(),
+                "|" | "&" | "^" | "<<" | ">>" | ">>>" | "**" | "<" | "<=" | ">"
+                    | ">=" | "==" | "!=" | "&&" | "||"
+            ) || arith_has_poison(lhs)
+                || arith_has_poison(rhs)
+        }
+        ArithAst::Un { op, arg } => op == "!" || arith_has_poison(arg),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => {
+            arith_has_poison(test) || arith_has_poison(then) || arith_has_poison(else_)
+        }
+        _ => false,
+    }
+}
+
+/// Top-level arith lowering with the poison-depth bookkeeping: the
+/// div/mod arms (see [`arith_to_estree`]) consult [`ARITH_POISON_DEPTH`]
+/// to decide native-vs-throw, but an arm only sees its LOCAL subtree —
+/// whether a NaN result would later be coerced depends on ANCESTORS.
+/// Every external entry point (the Arith expr arm, test operands, lifted
+/// assignments, `let`/`(( ))` statements, array keys) lowers the WHOLE
+/// expression through this wrapper so the depth reflects the root's
+/// poison-ness for every nested div/mod.
+fn arith_to_estree_wrapped(a: &ArithAst) -> Expr {
+    if arith_has_poison(a) {
+        *ARITH_POISON_DEPTH.lock().unwrap() += 1;
+        let out = arith_to_estree(a);
+        *ARITH_POISON_DEPTH.lock().unwrap() -= 1;
+        out
+    } else {
+        arith_to_estree(a)
+    }
+}
+
 fn arith_to_estree(a: &ArithAst) -> Expr {
     match a {
         ArithAst::Num(v) => Expr::Literal {
@@ -5643,7 +5697,7 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 callee: Box::new(Expr::Identifier {
                     name: "Number".to_string(),
                 }),
-                arguments: vec![sh2_call("arrayIndex", vec![str_lit(var), arith_to_estree(key)])],
+                arguments: vec![sh2_call("arrayIndex", vec![str_lit(var), arith_to_estree_wrapped(key)])],
                 optional: false,
             }),
             right: Box::new(Expr::Literal {
@@ -5697,13 +5751,54 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                         }
                     }
                 } else if *op == "/" {
-                    // zero divisor must abort the whole expansion, and
-                    // JS bitwise ops would silently absorb a NaN — so throw
-                    // from the runtime helper (caught by arithEval).
-                    sh2_call("idiv", vec![arith_to_estree(lhs), r])
+                    // zero divisor must abort the whole expansion. The
+                    // native form (SH2_ASSUME_ARITH_NATIVE, default ON —
+                    // see [`arith_native_enabled`]) emits `Math.trunc`:
+                    // a zero divisor yields NaN/Infinity, which the
+                    // arithEval wrapper (or the test-cond false-ness)
+                    // converts to the bash abort — no per-evaluation
+                    // runtime dispatch. Suppressed inside POISONED
+                    // expressions (a NaN-coercing ancestor — see
+                    // [`arith_has_poison`]): JS would absorb the NaN
+                    // (bitwise → 0, `**` → 1, comparison → false) where
+                    // bash aborts the whole expansion, so those keep the
+                    // throwing helper. =0 restores the helper everywhere.
+                    if !arith_native_enabled() || *ARITH_POISON_DEPTH.lock().unwrap() > 0 {
+                        sh2_call("idiv", vec![arith_to_estree(lhs), r])
+                    } else {
+                        Expr::CallExpression {
+                            callee: Box::new(Expr::MemberExpression {
+                                object: Box::new(Expr::Identifier {
+                                    name: "Math".to_string(),
+                                }),
+                                property: Box::new(Expr::Identifier {
+                                    name: "trunc".to_string(),
+                                }),
+                                computed: false,
+                                optional: false,
+                            }),
+                            arguments: vec![Expr::BinaryExpression {
+                                operator: "/".to_string(),
+                                left: Box::new(arith_to_estree(lhs)),
+                                right: Box::new(r),
+                            }],
+                            optional: false,
+                        }
+                    }
                 } else {
-                    // modulo by zero aborts the expansion too (bash "division by 0")
-                    sh2_call("imod", vec![arith_to_estree(lhs), r])
+                    // modulo by zero aborts the expansion too (bash
+                    // "division by 0"); the native `%` yields NaN on a
+                    // zero divisor — same abort channels + poison
+                    // suppression as the division arm above.
+                    if !arith_native_enabled() || *ARITH_POISON_DEPTH.lock().unwrap() > 0 {
+                        sh2_call("imod", vec![arith_to_estree(lhs), r])
+                    } else {
+                        Expr::BinaryExpression {
+                            operator: "%".to_string(),
+                            left: Box::new(arith_to_estree(lhs)),
+                            right: Box::new(r),
+                        }
+                    }
                 }
             } else if *op == "&&" || *op == "||" {
                 // bash yields 0/1; JS logicals yield one of the operands
@@ -6662,6 +6757,35 @@ fn assume_cfor() -> bool {
 /// EXACTLY); scripts that can must set SH2_BC_NATIVE=0.
 fn bc_native_enabled() -> bool {
     std::env::var("SH2_BC_NATIVE").map_or(true, |v| v != "0")
+}
+
+/// SH2_ASSUME_ARITH_NATIVE=0 — turn off the native `$((...))` div/mod
+/// lowering (the `Math.trunc` / `%` emission replaces the runtime
+/// `sh2.idiv`/`sh2.imod` calls for non-provable divisors).
+///
+/// Documented assumption (default ON): bash arithmetic is 64-bit integer;
+/// a division/modulo by ZERO is an arithmetic ERROR — the whole expansion
+/// aborts to the empty string (assignment/test positions make the command
+/// fail). JS doubles have no error: `a / 0` is Infinity/NaN and `a % 0` is
+/// NaN. The native lowering leans on the two positions' existing abort
+/// channels instead of a runtime throw:
+///   - inside the `arithEval` wrapper (every expansion-position `$((...))`
+///     with div/mod), a non-finite result converts to '' — bash's exact
+///     empty expansion;
+///   - inside a numeric TEST operand (`[ $((n % d)) -eq 0 ]`), NaN makes
+///     the comparison false — bash's exact error→command-fails→false —
+///     EXCEPT a `-ne` comparison, which would invert (NaN !== x → true);
+///   - a LIFTED-var assignment (`i=$((i/2))`) would poison the binding
+///     with NaN where bash keeps the old value — also only reachable via
+///     an actual zero divisor.
+/// The corpus cannot reach a zero divisor (every corpus div/mod divisor
+/// is a literal or a loop counter >= 1); the old runtime behavior in the
+/// test-cond positions was an UNCAUGHT throw → script crash, strictly
+/// less faithful than NaN→false. Scripts that can observe a zero divisor
+/// must set SH2_ASSUME_ARITH_NATIVE=0 (the runtime idiv/imod throw is
+/// restored).
+fn arith_native_enabled() -> bool {
+    std::env::var("SH2_ASSUME_ARITH_NATIVE").map_or(true, |v| v != "0")
 }
 
 /// SH2_BC_NATIVE=exact — the `sqrt($var)` runtime path uses the wasm bc
@@ -9173,7 +9297,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 // native JS write — the analysis guarantees the source kind
                 let right = match expr {
                     // numeric-lifted source
-                    IrExpr::Arith(a) => arith_to_estree(a),
+                    IrExpr::Arith(a) => arith_to_estree_wrapped(a),
                     IrExpr::Int(i) => Expr::Literal {
                         value: serde_json::Value::from(*i),
                         raw: None,
@@ -11706,7 +11830,7 @@ fn try_native_let(args: &[IrExpr]) -> Option<Expr> {
             for arg in a {
                 match arg {
                     IrExpr::Str(sv, _) => match parse_arith_native(sv) {
-                        Some(ast) => vals.push((arith_to_estree(&ast), arith_has_write(&ast))),
+                        Some(ast) => vals.push((arith_to_estree_wrapped(&ast), arith_has_write(&ast))),
                         None => {
                             parseable = false;
                             break;
@@ -11788,7 +11912,7 @@ fn try_native_let_dead(args: &[IrExpr]) -> Option<Expr> {
             for arg in a {
                 match arg {
                     IrExpr::Str(sv, _) => match parse_arith_native(sv) {
-                        Some(ast) => vals.push(arith_to_estree(&ast)),
+                        Some(ast) => vals.push(arith_to_estree_wrapped(&ast)),
                         None => return None,
                     },
                     _ => return None,
@@ -15195,7 +15319,7 @@ fn try_native_test(s: &str) -> Option<Expr> {
                 if let Some(inner) = e.strip_prefix("$((").and_then(|x| x.strip_suffix("))"))
                 {
                     let a = parse_arith(inner)?;
-                    return Some((arith_to_estree(&a), false));
+                    return Some((arith_to_estree_wrapped(&a), false));
                 }
                 let bare = e.strip_prefix('$').unwrap_or(e);
                 if is_lifted(bare) {
@@ -18188,7 +18312,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         }
         IrExpr::Arrow(stmts) => arrow(vec![], IrExpr::Arrow(stmts.clone())),
         IrExpr::Arith(a) => {
-            let inner = arith_to_estree(a);
+            let inner = arith_to_estree_wrapped(a);
             // `$(( ... ))` whose expression contains NO `/` or `%` cannot
             // throw (the only runtime abort a native arith can express is
             // the idiv/imod zero-divisor throw — everything else is a
