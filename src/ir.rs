@@ -1937,6 +1937,26 @@ fn control_chain_to_perl(e: &IrExpr) -> Option<String> {
     None
 }
 
+/// Convert a bash arithmetic text ("value % 2 == 0") to Perl by prefixing
+/// bare identifiers with `$` (the let / (( )) condition form).
+fn arith_text_to_perl(text: &str) -> String {
+    let re = regex::Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b").unwrap();
+    let skipped = [
+        "if", "else", "for", "while", "do", "and", "or", "not", "xor", "sub",
+        "my", "local", "our", "defined", "undef", "int", "length", "scalar",
+        "eq", "ne", "lt", "gt", "le", "ge", "cmp",
+    ];
+    re.replace_all(text, |caps: &regex::Captures| {
+        let w = &caps[1];
+        if skipped.contains(&w) {
+            w.to_string()
+        } else {
+            format!("${}", w)
+        }
+    })
+    .to_string()
+}
+
 /// A word as bash syntax: literals shell-quoted, captures as `$(…)`
 /// (bash evaluates nested command substitution), interpolated words rebuilt
 /// as bash double-quoted `"…$var…"`, vars double-quoted, braces as `{…}`.
@@ -2704,28 +2724,46 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         "local" => {
             // bash `local NAME=VALUE` — function-scoped: a fresh `my`
             // inside the sub (shadows the hoisted lexical for the call).
-            for w in &words {
-                if let Some(word_str) = call_arg_str(w) {
-                    if let Some(eq) = word_str.split_once('=') {
-                        // The value may be a positional ref ($1 → $ARGV[0])
-                        // or an interpolating literal.
-                        let val = eq.1.trim();
-                        let rendered = if let Some(n) = val.strip_prefix('$') {
-                            if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                                var_read(n)
-                            } else {
-                                render_word(&IrExpr::Str(val.to_string(), StrStyle::DoubleQuoted))
-                            }
-                        } else {
-                            render_word(&IrExpr::Str(val.to_string(), StrStyle::DoubleQuoted))
-                        };
+            // The parser may split the assignment: `data_type=` + `$1`
+            // (two words) — join them.
+            let mut i = 0;
+            while i < words.len() {
+                let Some(word_str) = call_arg_str(words[i]) else {
+                    i += 1;
+                    continue;
+                };
+                if let Some(eq) = word_str.split_once('=') {
+                    let mut val = eq.1.to_string();
+                    if eq.1.is_empty() && i + 1 < words.len() {
+                        // value is the next word — render it structurally
+                        // (a getVar(1) word → $ARGV[0]).
+                        let next = render_word(words[i + 1]);
                         emit_indent(out, indent);
-                        out.push_str(&format!("my ${} = {};\n", eq.0, rendered));
-                    } else {
-                        emit_indent(out, indent);
-                        out.push_str(&format!("my ${};\n", word_str));
+                        out.push_str(&format!("my ${} = {};\n", eq.0, next));
+                        i += 1;
+                        i += 1;
+                        continue;
                     }
+                    // The value may be a positional ref ($1 → $ARGV[0])
+                    // or an interpolating literal. Strip source quotes
+                    // ("$1" arrives with them).
+                    let val_trim = val.trim().trim_matches('"').trim_matches('\'');
+                    let rendered = if let Some(n) = val_trim.strip_prefix('$') {
+                        if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            var_read(n)
+                        } else {
+                            render_word(&IrExpr::Str(val_trim.to_string(), StrStyle::DoubleQuoted))
+                        }
+                    } else {
+                        render_word(&IrExpr::Str(val_trim.to_string(), StrStyle::DoubleQuoted))
+                    };
+                    emit_indent(out, indent);
+                    out.push_str(&format!("my ${} = {};\n", eq.0, rendered));
+                } else {
+                    emit_indent(out, indent);
+                    out.push_str(&format!("my ${};\n", word_str));
                 }
+                i += 1;
             }
             emit_indent(out, indent);
             out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
@@ -4035,6 +4073,15 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     format!("({})", items.join(", "))
                 }
                 "test" => render_test_call(args),
+                // (( arith )) as a condition — the `let` builtin form.
+                "exec" if args.first().and_then(call_arg_str).as_deref() == Some("let") => {
+                    let words = exec_word_args(args);
+                    let text = words
+                        .first()
+                        .and_then(|w| call_arg_str(w))
+                        .unwrap_or_default();
+                    format!("({})", arith_text_to_perl(&text))
+                }
                 _ => {
                     let a = args
                         .iter()
