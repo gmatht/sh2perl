@@ -1064,6 +1064,26 @@ mod tests {
     }
 
     #[test]
+    fn if_empty_else_lastexit_dropped_when_unread() {
+        // `if c; then ...; fi` with NO else synthesizes a false-path
+        // `sh2.lastExit = 0` (bash: false cond + no else → $? = 0). The
+        // Plan 4 liveness now marks it dead when nothing reads the if's
+        // status — the if lowers to a plain `if (c) { ... }`, no else.
+        let json = to_json("if false; then echo yes; fi");
+        assert!(json.contains("\"type\":\"IfStatement\""));
+        assert!(json.contains("\"alternate\":null"), "dead status write → no else");
+        assert!(!json.contains("unsupported"));
+        // a READER keeps the write: `; echo $?` observes the false-path 0
+        let json2 = to_json("if false; then echo yes; fi; echo $?");
+        assert!(json2.contains("\"alternate\":{\"type\""), "read status → else kept");
+        assert!(!json2.contains("unsupported"));
+        // a later WRITER shadows the if's status → the write is dead again
+        let json3 = to_json("if false; then echo yes; fi; false; echo $?");
+        assert!(json3.contains("\"alternate\":null"), "shadowed by `false` → no else");
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
     fn echo_lowers_to_builtin_call() {
         // `echo` with literal args at the default stdout sink → a NATIVE
         // `process.stdout.write` sequence (no dispatch at all); echo args

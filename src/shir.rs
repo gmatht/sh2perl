@@ -341,6 +341,20 @@ fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMa
         if is_native_echo_stmt(stmt) && !live.contains(&(stmt as *const IrStmt as usize)) {
             dead.insert(stmt as *const IrStmt as usize, true);
         }
+        // Plan 4 for if-statements: an `if c; then ...; fi` with NO else
+        // synthesizes `sh2.lastExit = 0` on the false path (bash: a false
+        // condition with no else leaves `$?` = 0). When the if's status is
+        // unread (its pointer is not in the live set — the backward scan
+        // already treats the If as a writer, `ir_stmt_writes_lastexit`),
+        // that write is dead and the if-lowering drops the else entirely.
+        // Only EMPTY-else ifs synthesize the write (a non-empty else
+        // carries its own status through its statements — no marking
+        // needed).
+        if let IrStmt::If { else_, .. } = stmt {
+            if else_.is_empty() && !live.contains(&(stmt as *const IrStmt as usize)) {
+                dead.insert(stmt as *const IrStmt as usize, true);
+            }
+        }
         match stmt {
             IrStmt::While { body, .. }
             | IrStmt::For { body, .. }
@@ -7521,10 +7535,12 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // lift/scan statics (the emission reads them) and before the main
     // emission.
     *NATIVE_ECHO_FNS.lock().unwrap() = Some(native_echo_fn_set(prog, &functions));
-    // Plan 4 — lastExit-write liveness: which `(( ))` statements' status
-    // writes are unread (empty under a possible `set -e`). Runs before the
-    // emission (the IR tree is immutable here — the *Sync loop bodies are
-    // emitted from the ORIGINAL references, so the pointer keys hold).
+    // Plan 4 — lastExit-write liveness: which `(( ))`/echo statements' status
+    // writes are unread, and which empty-else ifs' synthesized false-path
+    // `sh2.lastExit = 0` is droppable (empty under a possible `set -e`).
+    // Runs before the emission (the IR tree is immutable here — the *Sync
+    // loop bodies are emitted from the ORIGINAL references, so the pointer
+    // keys hold).
     *LASTEXIT_DEAD.lock().unwrap() = Some(compute_lastexit_deadness(prog, errexit));
     // Native-loop passes: (a) which loops may be capture producers (they
     // keep the runtime loop — a native loop would lose the producer bound),
@@ -9211,23 +9227,33 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 body: then.iter().filter_map(stmt_to_estree).collect(),
             });
             let alternate: Option<Box<Stmt>> = if else_.is_empty() {
-                // bash: `if c; then ...; fi` with a false condition and no
-                // else leaves `$?` = 0. The runtime tracks lastExit through
-                // calls only, so the false path must set it explicitly — a
-                // native field write (`sh2.lastExit = 0`), no dispatch.
-                Some(Box::new(Stmt::BlockStatement {
-                    body: vec![Stmt::ExpressionStatement {
-                        expression: Expr::AssignmentExpression {
-                            operator: "=".to_string(),
-                            left: Box::new(sh2_member("lastExit")),
-                            right: Box::new(Expr::Literal {
-                                value: serde_json::Value::from(0),
-                                raw: None,
-                            regex: None,
-                            }),
-                        },
-                    }],
-                }))
+                if lastexit_write_is_dead(stmt) {
+                    // Plan 4: the if's status write is provably unread
+                    // (no `$?` reader before the next writer; the runner
+                    // never consumes the program-final status; empty under
+                    // a possible `set -e` — the guard consumes it) — the
+                    // synthesized false-path `sh2.lastExit = 0` is dead
+                    // weight. Emit a plain `if (c) { ... }`, no else.
+                    None
+                } else {
+                    // bash: `if c; then ...; fi` with a false condition and no
+                    // else leaves `$?` = 0. The runtime tracks lastExit through
+                    // calls only, so the false path must set it explicitly — a
+                    // native field write (`sh2.lastExit = 0`), no dispatch.
+                    Some(Box::new(Stmt::BlockStatement {
+                        body: vec![Stmt::ExpressionStatement {
+                            expression: Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(sh2_member("lastExit")),
+                                right: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(0),
+                                    raw: None,
+                                regex: None,
+                                }),
+                            },
+                        }],
+                    }))
+                }
             } else {
                 Some(match else_.as_slice() {
                     [IrStmt::If { .. }] => Box::new(
