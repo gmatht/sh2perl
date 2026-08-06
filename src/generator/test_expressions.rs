@@ -1318,7 +1318,9 @@ pub fn convert_test_args_to_expression_impl(
             }
             Word::Array(_, elements, _) => {
                 // Handle array arguments
-                let array_expr = format!("@{{{}}}", elements.join(", "));
+                let joined: Vec<String> =
+                    elements.iter().map(|e| e.to_string()).collect();
+                let array_expr = format!("@{{{}}}", joined.join(", "));
                 expr_parts.push(array_expr);
             }
             Word::StringInterpolation(interp, _) => {

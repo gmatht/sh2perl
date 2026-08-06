@@ -151,6 +151,150 @@ pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String 
     }
 }
 
+/// The single non-empty part of a StringInterpolation (if exactly one
+/// non-literal-or-empty part exists).
+fn single_nonempty_part(interp: &crate::ast::StringInterpolation) -> Option<&crate::ast_words::StringPart> {
+    let mut found: Option<&crate::ast_words::StringPart> = None;
+    for p in &interp.parts {
+        match p {
+            crate::ast_words::StringPart::Literal(s) if s.is_empty() => {}
+            other => {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(other);
+            }
+        }
+    }
+    found
+}
+
+/// Word-aware twin of [`try_extract_sort_herestring_var`]: the array
+/// element `$(sort <<<"${config[*]}")` now parses as a real
+/// CommandSubstitution word — detect the `sort` + herestring shape
+/// directly instead of re-parsing reconstructed text.
+fn try_extract_sort_herestring_word(cmd: &crate::ast::Command) -> Option<String> {
+    let crate::ast::Command::Simple(sc) = cmd else {
+        return None;
+    };
+    if !sc.args.is_empty() {
+        return None;
+    }
+    let Word::Literal(name, _) = &sc.name else {
+        return None;
+    };
+    if name != "sort" {
+        return None;
+    }
+    if sc.redirects.len() != 1 {
+        return None;
+    }
+    let r = &sc.redirects[0];
+    if !matches!(
+        r.operator,
+        crate::ast::RedirectOperator::HereString
+    ) {
+        return None;
+    }
+    // the target: `"${config[*]}"` — a single-part interpolation of a
+    // ParameterExpansion `${name[*]}` / `${name[@]}`
+    let Word::StringInterpolation(interp, _) = &r.target else {
+        return None;
+    };
+    if interp.parts.len() != 1 {
+        return None;
+    }
+    match &interp.parts[0] {
+        crate::ast_words::StringPart::ParameterExpansion(pe) => {
+            match &pe.operator {
+                crate::ast::ParameterExpansionOperator::ArraySlice(off, None) => {
+                    if off == "*" || off == "@" {
+                        return Some(pe.variable.clone());
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Word::Array element → Perl (core request posix-sh-go-20260806-174619 —
+/// array elements are now real Words). LITERAL elements render
+/// byte-identically to the raw-text path; richer words dispatch to the
+/// word-level generators (`"$@"` → @_ — one element per positional,
+/// `$(...)` → the capture generator, `${arr[@]:off:len}` → a Perl array
+/// slice, `${x}` → parameter expansion).
+pub fn array_element_word_to_perl_impl(generator: &mut Generator, w: &Word) -> String {
+    match w {
+        Word::Literal(s, _) => array_element_to_perl_impl(generator, s),
+        Word::Variable(name, _, _) if name == "@" || name == "*" => "@_".to_string(),
+        Word::StringInterpolation(interp, _) => {
+            // single-part `"$@"` / `"$*"` — one element per positional
+            let mut var: Option<&str> = None;
+            let mut pos_only = true;
+            for p in &interp.parts {
+                match p {
+                    crate::ast_words::StringPart::Literal(s) if s.is_empty() => {}
+                    crate::ast_words::StringPart::Variable(name) if var.is_none() => {
+                        var = Some(name)
+                    }
+                    _ => {
+                        pos_only = false;
+                        break;
+                    }
+                }
+            }
+            if pos_only && matches!(var, Some("@") | Some("*")) {
+                return "@_".to_string();
+            }
+            // single-part `"${...}"` — dispatch like a bare
+            // ParameterExpansion (the raw-text path parsed `${numbers[@]:3:4}`
+            // into @numbers[3..6]; word_to_perl would add a join wrapper)
+            if let Some(part) = single_nonempty_part(interp) {
+                if let crate::ast_words::StringPart::ParameterExpansion(pe) = part {
+                    return array_element_word_to_perl_impl(
+                        generator,
+                        &Word::ParameterExpansion(pe.clone(), None),
+                    );
+                }
+            }
+            generator.word_to_perl(w)
+        }
+        Word::CommandSubstitution(cmd, _) => {
+            // `$(sort <<<"${var[*]}")` → native `(sort @var)` /
+            // `(sort values %var)` (assoc-aware)
+            if let Some(var_name) = try_extract_sort_herestring_word(cmd) {
+                if generator.associative_arrays.contains(&var_name) {
+                    return format!("(sort values %{})", var_name);
+                }
+                return format!("(sort @{})", var_name);
+            }
+            generator.word_to_perl(w)
+        }
+        Word::ParameterExpansion(pe, _) => match &pe.operator {
+            crate::ast::ParameterExpansionOperator::ArraySlice(offset, length) => {
+                if offset == "@" {
+                    format!("@{}", pe.variable)
+                } else {
+                    let start = offset.trim();
+                    if let Some(len_str) = length {
+                        let len = len_str.trim().parse::<i32>().unwrap_or(0);
+                        let start_num = start.parse::<i32>().unwrap_or(0);
+                        let end = if len > 0 { start_num + len - 1 } else { start_num };
+                        format!("@{}[{}..{}]", pe.variable, start, end)
+                    } else {
+                        format!("@{}[{}..$#{}]", pe.variable, start, pe.variable)
+                    }
+                }
+            }
+            _ => generator.generate_parameter_expansion(pe),
+        },
+        _ => generator.word_to_perl(w),
+    }
+}
+
 /// If `inner` (the text inside `$(…)`) matches `sort <<<"${var[*]}"` or
 /// `sort <<<"${var[@]}"`, return the variable name.  Otherwise return None.
 fn try_extract_sort_herestring_var(inner: &str) -> Option<&str> {

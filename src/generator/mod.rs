@@ -744,7 +744,7 @@ impl Generator {
                 .map(|s| {
                     // Use array_element_to_perl which handles ${...} patterns
                     // (like ${numbers[@]:3:4} -> @numbers[3..6])
-                    self.array_element_to_perl(s)
+                    self.array_element_word_to_perl(s)
                 })
                 .collect();
             match assignment.operator {
@@ -1082,6 +1082,14 @@ impl Generator {
     /// handling `${...}` expansions like `${numbers[@]:3:4}` -> `@numbers[3..6]`.
     pub fn array_element_to_perl(&mut self, s: &str) -> String {
         utils::array_element_to_perl_impl(self, s)
+    }
+
+    /// Word::Array element → Perl (core request posix-sh-go-20260806-174619:
+    /// array elements are now real Words). Literal elements render
+    /// byte-identically to the raw-text path; richer words dispatch to the
+    /// word-level generators.
+    pub fn array_element_word_to_perl(&mut self, w: &Word) -> String {
+        utils::array_element_word_to_perl_impl(self, w)
     }
 
     pub fn perl_string_literal(&mut self, word: &Word) -> String {

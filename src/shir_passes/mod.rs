@@ -123,6 +123,7 @@ impl Pipeline {
                 Box::new(transform::ConstantFold),
                 Box::new(transform::DeadAssignmentElim),
                 Box::new(transform::ImportMinimize),
+                Box::new(transform::StoreToNative),
                 Box::new(transform::ConstMarkup),
             ],
         }

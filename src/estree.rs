@@ -1364,11 +1364,17 @@ mod tests {
         // the loop var read AFTER the loop stays store-backed — the
         // store-sync elimination emits a pre-loop getVar into a temp, the
         // per-iteration temp write, and a post-loop setVar of the LAST
-        // value (bash leaves $i = 10000)
+        // value (bash leaves $i = 10000). Since the store-to-native
+        // transform (core request shir-passes-store-to-native-20260806)
+        // the post-loop sync is a NATIVE write `i = __sh2_for_last_i` —
+        // the lifted binding IS the post-loop read target, so the store
+        // round-trip is pure overhead (the runtime would read the same
+        // binding back).
         let json = to_json("for i in $(seq 1 3); do echo $i; done; echo $i");
         assert!(json.contains("\"type\":\"ForStatement\""));
         assert!(json.contains("\"name\":\"__sh2_for_last_i\""));
-        assert!(json.contains("\"name\":\"setVar\""));
+        assert!(json.contains("\"type\":\"AssignmentExpression\""));
+        assert!(!json.contains("\"name\":\"setVar\""));
         assert!(!json.contains("\"name\":\"captureWords\""));
         assert!(!json.contains("unsupported"));
     }

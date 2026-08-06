@@ -50,15 +50,29 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             // Handle array assignment like arr=(one two three)
             let elements_perl: Vec<String> = elements.iter()
                 .map(|s| {
+                    // Parameter-expansion elements (`${numbers[@]:3:4}`) dispatch
+                    // to the word-level generator — the Display form is lossy for
+                    // the slice shape (core request posix-sh-go-20260806-174619).
+                    if matches!(s, Word::ParameterExpansion(..)) {
+                        return generator.array_element_word_to_perl(s);
+                    }
+                    // Backtick elements parse as CommandSubstitution words —
+                    // reconstruct the `cmd` text for the legacy handling below.
+                    let raw = match s {
+                        Word::CommandSubstitution(cmd, _) => {
+                            format!("`{}`", crate::shir::command_to_shell_text(cmd))
+                        }
+                        _ => s.to_string(),
+                    };
                     // Check if this element is a ${...} parameter expansion (e.g. ${numbers[@]:3:4})
-                    if s.starts_with("${") && s.ends_with('}') {
-                        return generator.array_element_to_perl(s);
+                    if raw.starts_with("${") && raw.ends_with('}') {
+                        return generator.array_element_to_perl(&raw);
                     }
                     // Check if this element contains backticks (command substitution)
-                    if s.contains('`') {
+                    if raw.contains('`') {
                         // Extract the command from backticks and convert to native Perl
-                        if s.starts_with('`') && s.ends_with('`') {
-                            let cmd_text = &s[1..s.len()-1]; // Remove backticks
+                        if raw.starts_with('`') && raw.ends_with('`') {
+                            let cmd_text = &raw[1..raw.len()-1]; // Remove backticks
                             // For now, handle common cases like `ls -1 examples/*.sh 2>/dev/null`
                             if cmd_text.starts_with("ls ") {
                                 // Convert ls command to native Perl glob
@@ -155,11 +169,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             }
                         } else {
                             // Element contains backticks but not at start/end - treat as literal
-                            format!("\"{}\"", generator.escape_perl_string(s))
+                            format!("\"{}\"", generator.escape_perl_string(&raw))
                         }
                     } else {
                         // Normal string element
-                        format!("\"{}\"", generator.escape_perl_string(s))
+                        format!("\"{}\"", generator.escape_perl_string(&raw))
                     }
                 })
                 .collect();
@@ -702,10 +716,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             let elements_perl: Vec<String> = elements
                                 .iter()
                                 .map(|e| {
-                                    if e == "\"$@\"" || e == "$@" {
+                                    let es = e.to_string();
+                                    if es == "\"$@\"" || es == "$@" {
                                         "@_".to_string()
                                     } else {
-                                        format!("'{}'", e.replace("'", "\\'"))
+                                        format!("'{}'", es.replace("'", "\\'"))
                                     }
                                 })
                                 .collect();
@@ -2749,12 +2764,13 @@ fn env_var_refs_var(value: &Word, var_name: &str) -> bool {
         Word::Array(_, elements, _) => {
             // Check if any element in the array references var_name
             for element in elements {
-                if element == var_name || element.contains(var_name) {
+                let es = element.to_string();
+                if es == var_name || es.contains(var_name) {
                     return true;
                 }
                 // Check for ${var_name} patterns in the element
-                if element.starts_with("${") && element.ends_with('}')
-                    && element[2..element.len()-1].contains(var_name)
+                if es.starts_with("${") && es.ends_with('}')
+                    && es[2..es.len()-1].contains(var_name)
                 {
                     return true;
                 }
