@@ -1575,6 +1575,14 @@ fn estree_stmt_reads_positional(s: &Stmt) -> bool {
         Stmt::WhileStatement { test, body } => {
             estree_reads_positional(test) || estree_stmt_reads_positional(body)
         }
+        Stmt::ForStatement {
+            init, test, update, body,
+        } => {
+            estree_stmt_reads_positional(init)
+                || estree_reads_positional(test)
+                || estree_reads_positional(update)
+                || estree_stmt_reads_positional(body)
+        }
         Stmt::ForOfStatement {
             left,
             right,
@@ -4585,6 +4593,9 @@ fn iter_numeric(e: &IrExpr) -> Option<bool> {
                             numeric = false;
                         }
                     }
+                    // the `seq_range_for` transform's Range item
+                    // (`for i in $(seq A B)` → `Array([Range])`)
+                    IrExpr::Range { .. } => {}
                     IrExpr::Call { func, args } if func == "brace" => match brace_numeric(args) {
                         Some(true) => {}
                         Some(false) => numeric = false,
@@ -7491,6 +7502,7 @@ fn lowered_stmts_have_signals(stmts: &[Stmt]) -> bool {
             Stmt::WhileStatement { body, .. } | Stmt::ForOfStatement { body, .. } => {
                 stmt_has_signal(body, false)
             }
+            Stmt::ForStatement { body, .. } => stmt_has_signal(body, false),
             Stmt::VariableDeclaration { declarations, .. } => declarations
                 .iter()
                 .any(|d| d.init.as_ref().map(expr_has_signal).unwrap_or(false)),
@@ -7586,6 +7598,77 @@ fn for_iter_flattenable(iter: &IrExpr) -> bool {
             _ => false,
         }),
         _ => true,
+    }
+}
+
+/// The `seq_range_for` transform's numeric-range iterable: the for-items
+/// shape `Array([Range { start, end }])` (the transform rewrites the
+/// `$(seq …)` capture item in place) or a bare `Range`. Anything else is
+/// not a native-range loop.
+fn for_range_bounds(iter: &IrExpr) -> Option<(i64, i64)> {
+    match iter {
+        IrExpr::Array(items) => match items.as_slice() {
+            [IrExpr::Range { start, end }] => Some((*start, *end)),
+            _ => None,
+        },
+        IrExpr::Range { start, end } => Some((*start, *end)),
+        _ => None,
+    }
+}
+
+/// The materialized string-item list for a range iterable — the fallback
+/// when the loop cannot take the native counter path (async region /
+/// awaits in body / signals): the for-of / *Sync / async paths need a
+/// concrete item list and the runtime has no range helper. Bounded by
+/// the transform's span cap (1M), so compilation cannot blow up.
+fn range_items_array(lo: i64, hi: i64) -> IrExpr {
+    let items: Vec<IrExpr> = (lo..=hi)
+        .map(|v| IrExpr::Str(v.to_string(), StrStyle::SingleQuoted))
+        .collect();
+    IrExpr::Array(items)
+}
+
+/// `for (let i = lo; i <= hi; i++) { body }` — the native numeric-range
+/// loop (the hand-js ideal for `for i in $(seq lo hi)`). The binding is
+/// a JS number from the init literal; the body never writes it (the
+/// transform's guarantee), so the postfix `i++` update stays exact. The
+/// `let` shadows the module `let i = 0` (numeric lift) exactly like the
+/// for-of binding.
+fn native_range_for(js_var: String, lo: i64, hi: i64, body: Vec<Stmt>) -> Stmt {
+    Stmt::ForStatement {
+        init: Box::new(Stmt::VariableDeclaration {
+            kind: "let",
+            declarations: vec![VariableDeclarator {
+                type_: "VariableDeclarator",
+                id: Expr::Identifier {
+                    name: js_var.clone(),
+                },
+                init: Some(Expr::Literal {
+                    value: serde_json::Value::from(lo),
+                    raw: None,
+                regex: None,
+                }),
+            }],
+        }),
+        test: Expr::BinaryExpression {
+            operator: "<=".to_string(),
+            left: Box::new(Expr::Identifier {
+                name: js_var.clone(),
+            }),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(hi),
+                raw: None,
+            regex: None,
+            }),
+        },
+        update: Expr::UnaryExpression {
+            operator: "++".to_string(),
+            argument: Box::new(Expr::Identifier {
+                name: js_var.clone(),
+            }),
+            prefix: false,
+        },
+        body: Box::new(Stmt::BlockStatement { body }),
     }
 }
 
@@ -8062,22 +8145,37 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         }
         IrStmt::For { var, iter, body } => {
             let js_var = safe_ident(var);
+            // The `seq_range_for` transform's native-range iterable
+            // (`Array([Range{lo,hi}])` or bare `Range`): the loop lowers
+            // to a native JS `for (let i = lo; i <= hi; i++)` — no
+            // runtime call, no item list at all. The transform
+            // guarantees the loop var is never WRITTEN by the body (the
+            // one semantic gap between a word list and a counter), and
+            // the bounds are plain in-range integers.
+            let range = for_range_bounds(iter);
             let mut coercion: Option<IrStmt> = None;
             if is_lifted_num(var) {
-                // the forLoop items arrive as strings; coerce the param to
-                // a number in place (the closure param shadows the module
-                // let — a self-assign is exactly the coercion we want)
-                coercion = Some(IrStmt::Assign {
-                    targets: vec![AssignTarget {
-                        var: var.clone(),
-                        sigil: None,
-                        indices: vec![],
-                    }],
-                    expr: IrExpr::Call {
-                        func: "Number".to_string(),
-                        args: vec![IrExpr::Ident(js_var.clone())],
-                    },
-                });
+                if range.is_some() {
+                    // the native counter binding is a NUMBER from the
+                    // `let i = lo` init — no per-iteration coercion (the
+                    // for-of path's `i = Number(i)` exists only because
+                    // its items arrive as strings)
+                } else {
+                    // the forLoop items arrive as strings; coerce the param to
+                    // a number in place (the closure param shadows the module
+                    // let — a self-assign is exactly the coercion we want)
+                    coercion = Some(IrStmt::Assign {
+                        targets: vec![AssignTarget {
+                            var: var.clone(),
+                            sigil: None,
+                            indices: vec![],
+                        }],
+                        expr: IrExpr::Call {
+                            func: "Number".to_string(),
+                            args: vec![IrExpr::Ident(js_var.clone())],
+                        },
+                    });
+                }
             } else if !is_lifted(var) {
                 // store sync (non-lifted loop var)
                 coercion = Some(IrStmt::Assign {
@@ -8095,7 +8193,6 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 body_stmts.push(c.clone());
             }
             body_stmts.extend(body.clone());
-            let iter_e = expr_to_estree(iter);
             // the *Sync path emits the ORIGINAL body references — the
             // liveness pre-pass (compute_lastexit_deadness) keys by
             // statement pointer, so the loop bodies' dead-write marks must
@@ -8105,6 +8202,91 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 .chain(body.iter())
                 .filter_map(stmt_to_estree)
                 .collect();
+            // Native counter loop (the ladder's top rung for a range
+            // iterable): `for (let i = lo; i <= hi; i++)` — the
+            // hand-written ideal (PLAN §9.1 `seq 1 N → native range`).
+            // Same eligibility as the native for-of below (no await in
+            // body, not an async region, no signal sources); the
+            // transform's guarantees cover the rest (pure integer
+            // bounds, body never writes the var).
+            if let Some((lo, hi)) = range {
+                if !stmts_have_await(&body_e)
+                    && !loop_in_async_region(stmt)
+                    && !lowered_stmts_have_signals(&body_e)
+                {
+                    // Store-sync elimination — the mirror of the for-of
+                    // path below: a STORE-BACKED loop var (unliftable —
+                    // read after the loop etc.) whose body only observes
+                    // it through `sh2.getVar(var)` collapses the
+                    // per-iteration `sh2.setVar(var, i)` to ONE pre-loop
+                    // store read (the empty-range case keeps the prior
+                    // value, exactly like bash) + ONE post-loop write.
+                    let mut sync_elim: Option<Vec<Stmt>> = None;
+                    if let Some(sync) = &coercion {
+                        let is_store_sync = !is_lifted(var)
+                            && matches!(sync, IrStmt::Assign { targets, .. }
+                                if targets.len() == 1 && targets[0].var == *var);
+                        if is_store_sync && forof_sync_elim_ok(&body_e[1..], var) {
+                            let mut body2: Vec<Stmt> = vec![Stmt::ExpressionStatement {
+                                // the per-iteration store sync becomes a
+                                // native temp write (the post-loop setVar
+                                // stores the LAST value; the pre-loop read
+                                // covers the empty-range case)
+                                expression: Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(Expr::Identifier {
+                                        name: format!("__sh2_for_last_{js_var}"),
+                                    }),
+                                    right: Box::new(Expr::Identifier {
+                                        name: js_var.clone(),
+                                    }),
+                                },
+                            }];
+                            body2.extend(body_e[1..].to_vec());
+                            forof_rewrite_getvar(&mut body2, var, &js_var);
+                            let temp = format!("__sh2_for_last_{js_var}");
+                            let mut out: Vec<Stmt> = vec![Stmt::VariableDeclaration {
+                                kind: "let",
+                                declarations: vec![VariableDeclarator {
+                                    type_: "VariableDeclarator",
+                                    id: Expr::Identifier {
+                                        name: temp.clone(),
+                                    },
+                                    init: Some(sh2_call("getVar", vec![str_lit(var)])),
+                                }],
+                            }];
+                            out.push(native_range_for(
+                                js_var.clone(),
+                                lo,
+                                hi,
+                                body2,
+                            ));
+                            out.push(Stmt::ExpressionStatement {
+                                expression: sh2_call(
+                                    "setVar",
+                                    vec![str_lit(var), Expr::Identifier {
+                                        name: temp,
+                                    }],
+                                ),
+                            });
+                            sync_elim = Some(out);
+                        }
+                    }
+                    if let Some(out) = sync_elim {
+                        return Some(Stmt::BlockStatement { body: out });
+                    }
+                    return Some(native_range_for(js_var.clone(), lo, hi, body_e));
+                }
+            }
+            // the range fallback: the loop could not take the native
+            // counter path (async region / awaits / signals) — materialize
+            // the item list for the for-of / *Sync / async paths below
+            // (the runtime has no range helper). Bounded by the
+            // transform's span cap.
+            let iter_e = match range {
+                Some((lo, hi)) => expr_to_estree(&range_items_array(lo, hi)),
+                None => expr_to_estree(iter),
+            };
             // Fast path: a provably-sync loop (the BODY needs no `await`)
             // lowers to the synchronous runtime loop — identical semantics
             // (flattening, GLOB_MAGIC items, BREAK/CONTINUE/RETURN signals,
@@ -15548,6 +15730,18 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             }
         }
         IrExpr::Ident(name) => Expr::Identifier { name: name.clone() },
+        // A numeric-range iterable (`seq_range_for`'s `Array([Range])`
+        // for-items shape): the ESTree surface has no range literal, so
+        // render the materialized string list. The native ForStatement
+        // path consumes the Range BEFORE this arm (a counter loop, no
+        // array); this arm is the bounded fallback (for-of / *Sync /
+        // async paths) and any stray Range in an expression position.
+        IrExpr::Range { start, end } => {
+            let items: Vec<Option<Expr>> = (*start..=*end)
+                .map(|v| Some(str_lit(&v.to_string())))
+                .collect();
+            Expr::ArrayExpression { elements: items }
+        }
         IrExpr::Array(elems) => Expr::ArrayExpression {
             elements: elems.iter().map(|e| Some(expr_to_estree(e))).collect(),
         },
@@ -17318,6 +17512,11 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
                     })
             }
             Stmt::WhileStatement { test, body } => expr_ok(test, var) && stmt_ok(body, var),
+            Stmt::ForStatement {
+                init, test, update, body,
+            } => {
+                stmt_ok(init, var) && expr_ok(test, var) && expr_ok(update, var) && stmt_ok(body, var)
+            }
             Stmt::ForOfStatement { left, right, body } => {
                 stmt_ok(left, var) && expr_ok(right, var) && stmt_ok(body, var)
             }
@@ -17441,6 +17640,14 @@ fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
             }
             Stmt::WhileStatement { test, body } => {
                 expr_rewrite(test, var, js_var);
+                stmt_rewrite(body, var, js_var);
+            }
+            Stmt::ForStatement {
+                init, test, update, body,
+            } => {
+                stmt_rewrite(init, var, js_var);
+                expr_rewrite(test, var, js_var);
+                expr_rewrite(update, var, js_var);
                 stmt_rewrite(body, var, js_var);
             }
             Stmt::ForOfStatement { left, right, body } => {
