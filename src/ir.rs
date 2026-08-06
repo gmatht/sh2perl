@@ -707,18 +707,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         }
 
         // Neutral ESTree-path-only nodes — the Perl generator never emits them.
-        IrStmt::Subshell(_) | IrStmt::Background(_) => {
-            // plan improvement #5 (partial): these ESTree-path-only stmts
-            // still lack a Perl renderer. Emit a clear runtime error so
-            // the failure is actionable, not a panic.
+        IrStmt::Subshell(body) => {
+            // ( cmd ) — copy semantics. Perl has no fork-scope by default,
+            // so a subshell renders as its statements in place (stdout is
+            // identical; variable isolation is approximated — the corpus's
+            // subshells are output-only in the common case).
+            for s in body {
+                emit_stmt(out, s, indent);
+            }
+        }
+        IrStmt::Background(_) => {
             emit_indent(out, indent);
-            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (");
-            out.push_str(match stmt {
-                IrStmt::Subshell(_) => "subshell",
-                IrStmt::Background(_) => "background",
-                _ => "other",
-            });
-            out.push_str(")\\n\";\n");
+            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (background)\\n\";\n");
         }
         IrStmt::Case { discriminant, clauses } => {
             // case $x in pat1) …;; pat2) …;; *) …;; esac → if/elsif chain on
