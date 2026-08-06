@@ -1902,10 +1902,11 @@ fn bash_word_for(w: &IrExpr) -> String {
             if wstr.starts_with('\'') || wstr.starts_with('"') || wstr.starts_with('q') {
                 wstr
             } else {
-                format!(
-                    "\"{}\"",
-                    wstr.replace("\"", "\\\"").replace('$', "\\$").replace('@', "\\@")
-                )
+                // A variable word — double-quote it for bash and let bash
+                // expand the $ (this text is inside a q{} literal, so Perl
+                // does not interpolate it; literal $ in single-quoted words
+                // above is already protected).
+                format!("\"{}\"", wstr.replace('\"', "\\\""))
             }
         }
     }
