@@ -18,6 +18,128 @@ use crate::ir::{ArithAst, BinOpKind, InterpPart, IrExpr, IrProgram, IrRedirect, 
 const GLOB_MAGIC: &str = "\u{1}SH2GLOB\u{1}";
 const PS_MAGIC: &str = "\u{1}SH2PS\u{1}";
 
+/// Does the program use whole-array expansions (`"${arr[@]}"`, `${!arr[@]}`,
+/// `${arr[*]}`)? They need the `_arr_expand`/`_arr_keys` prologue helpers
+/// (the per-element vars + counter lowering).
+fn needs_arr_helper(prog: &IrProgram) -> bool {
+    fn expr_uses_arr(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => {
+                let f = func.as_str();
+                if f == "arrayItems" {
+                    return true;
+                }
+                if f == "arrayIndex" {
+                    if let Some(IrExpr::Str(k, _)) = args.get(1) {
+                        if k == "@" || k == "*" {
+                            return true;
+                        }
+                    }
+                }
+                if f == "param" {
+                    let op = args
+                        .first()
+                        .and_then(|a| match a {
+                            IrExpr::Str(s, _) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    let name = args
+                        .get(1)
+                        .and_then(|a| match a {
+                            IrExpr::Str(s, _) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    if name.ends_with("[@]") || name.ends_with("[*]") {
+                        return true;
+                    }
+                    if op == "slice" {
+                        let off = args
+                            .get(2)
+                            .and_then(|a| match a {
+                                IrExpr::Str(s, _) => Some(s.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or("");
+                        if (off == "@" || off == "*") && !name.starts_with('#') {
+                            return true;
+                        }
+                    }
+                }
+                if f == "join" {
+                    if let Some(inner) = args.first() {
+                        if expr_uses_arr(inner) {
+                            return true;
+                        }
+                    }
+                }
+                args.iter().any(expr_uses_arr)
+            }
+            IrExpr::Array(es) => es.iter().any(expr_uses_arr),
+            IrExpr::Object(es) => es.iter().any(|(_, v)| expr_uses_arr(v)),
+            IrExpr::Interpolate(parts) => parts
+                .iter()
+                .any(|p| matches!(p, InterpPart::Expr(x) if expr_uses_arr(x))),
+            _ => false,
+        }
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            let hit = match st {
+                IrStmt::Expr(e) => expr_uses_arr(e),
+                IrStmt::Assign { expr, .. } => expr_uses_arr(expr),
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    expr_uses_arr(cond)
+                        || walk(then)
+                        || walk(else_)
+                        || elsifs.iter().any(|(c, b)| expr_uses_arr(c) || walk(b))
+                }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    expr_uses_arr(cond) || walk(body)
+                }
+                IrStmt::For { iter, body, .. } => expr_uses_arr(iter) || walk(body),
+                IrStmt::Case { discriminant, clauses, .. } => {
+                    expr_uses_arr(discriminant)
+                        || clauses.iter().any(|c| walk(&c.body))
+                }
+                IrStmt::Function { body, .. } => walk(body),
+                IrStmt::Redirect { inner, redirects } => {
+                    walk(inner) || redirects.iter().any(|r| expr_uses_arr(&r.target))
+                }
+                IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                    walk(body)
+                }
+                IrStmt::Exec {
+                    cmd,
+                    args,
+                    redirects,
+                    env,
+                    ..
+                } => {
+                    expr_uses_arr(cmd)
+                        || args.iter().any(expr_uses_arr)
+                        || redirects.iter().any(expr_uses_arr)
+                        || env.iter().any(|(_, v)| expr_uses_arr(v))
+                }
+                IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| walk(s)),
+                IrStmt::Output { value, .. } | IrStmt::Return(Some(value)) | IrStmt::Exit(Some(value)) | IrStmt::Die { expr: value, .. } | IrStmt::Warn { expr: value, .. } => expr_uses_arr(value),
+                IrStmt::Declare { init, .. } => init.as_ref().map(expr_uses_arr).unwrap_or(false),
+                IrStmt::DeclareArray { elements, .. } => elements.iter().any(expr_uses_arr),
+                IrStmt::WriteFile { path, content, .. } => {
+                    expr_uses_arr(path) || expr_uses_arr(content)
+                }
+                IrStmt::Return(None) | IrStmt::Exit(None) | IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => false,
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+    walk(&prog.stmts) || prog.subs.iter().any(|s| walk(&s.body))
+}
+
 /// Render a ShIR program to `sh` source. `Err` on a construct outside the
 /// renderable subset (the gate reports it as a FAIL).
 pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
@@ -32,6 +154,34 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
         out.push_str("    if command -v ggrep >/dev/null 2>&1; then ggrep -P -- \"$p\" \"$@\"; return; fi\n");
         out.push_str("    perl -ne 'BEGIN{$p=shift @ARGV} print if /$p/' \"$p\" \"$@\"\n");
         out.push_str("}\n\n");
+    }
+    if needs_arr_helper(prog) {
+        out.push_str(
+            r#"
+# whole-array expansion helpers (the per-element vars + len counter)
+_arr_expand() {
+    _i=0
+    _n=$(eval echo "\${$1_len}")
+    _n=${_n:-0}
+    while [ "$_i" -lt "$_n" ]; do
+        eval "printf '%s' \"\${$1_$_i}\""
+        [ "$_i" -lt "$((_n - 1))" ] && printf ' '
+        _i=$((_i + 1))
+    done
+    printf '\n'
+}
+_arr_keys() {
+    _i=0
+    _n=$(eval echo "\${$1_len}")
+    _n=${_n:-0}
+    while [ "$_i" -lt "$_n" ]; do
+        printf '%s\n' "$_i"
+        _i=$((_i + 1))
+    done
+}
+
+"#,
+        );
     }
     for st in &prog.stmts {
         stmt_to_sh(st, 0, &mut out)?;
@@ -206,7 +356,10 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             Ok(())
         }
         IrStmt::Redirect { inner, redirects } => {
-            let suffix = redirects_to_sh(redirects)?;
+            // process substitutions lower to pipes / temp files (POSIX has
+            // no `<(cmd)`); the remaining redirects render as suffixes
+            let (ps_ins, plain) = partition_procsub(redirects);
+            let suffix = redirects_to_sh(&plain)?;
             let mut line = if inner.len() == 1 {
                 if let IrStmt::Expr(e) = &inner[0] {
                     cmd_to_sh(e)?
@@ -217,7 +370,10 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 // compound inner: inline it, then the redirects apply to the group
                 stmts_inline(inner)?
             };
-            line = herestring_wrap(redirects, line)?;
+            line = herestring_wrap(&plain, line)?;
+            if !ps_ins.is_empty() {
+                line = lower_procsub_stmt(&ps_ins, &line)?;
+            }
             indent(out, d);
             out.push_str(&line);
             out.push_str(&suffix);
@@ -538,14 +694,25 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             }
             "redirect" => {
                 let inner = arrow_to_sh(args)?;
-                let specs = redirect_specs(args, 1)?;
-                // the call-form specs are Objects — build IrRedirects for the wrap
                 let redirs = match args.get(1) {
                     Some(x) => redirect_objs(x)?,
                     None => vec![],
                 };
-                let inner = herestring_wrap(&redirs, inner)?;
-                Ok(format!("{inner}{specs}"))
+                let (ps_ins, plain) = partition_procsub(&redirs);
+                // process substitutions lower in place; the remaining
+                // specs render as ordinary redirect suffixes
+                let specs = {
+                    let mut out = String::new();
+                    for r in &plain {
+                        out.push_str(&redirect_to_sh(r)?);
+                    }
+                    out
+                };
+                let mut line = herestring_wrap(&plain, inner)?;
+                if !ps_ins.is_empty() {
+                    line = lower_procsub_inline(&ps_ins, &line)?;
+                }
+                Ok(format!("{line}{specs}"))
             }
             "subshell" => Ok(format!("( {} )", arrow_to_sh(args)?)),
             "block" => {
@@ -673,16 +840,27 @@ fn gnu_only_flag(cmd: &str, flag: &str) -> bool {
 
 // Does the program need the grep_p PCRE polyfill prologue?
 fn needs_grep_p(stmts: &[IrStmt]) -> bool {
-    fn in_call(c: &IrExpr) -> bool {
-        if let IrExpr::Call { func, args } = c {
+    // Recursive: pipelines (and cmdsubs) nest the stage execs inside the
+    // Call args — the scan must descend, not just look at the top exec.
+    fn has_grep_p(e: &IrExpr) -> bool {
+        if std::env::var_os("SHDBG_GREPP").is_some() {
+            eprintln!("scan: {:?}", e);
+        }
+        if let IrExpr::Call { func, args } = e {
             if func == "exec" && args.len() >= 1 {
                 if let IrExpr::Str(cn, _) = &args[0] {
                     if cn == "grep" {
-                        let mut i = 1;
-                        while i + 1 < args.len() {
-                            if let IrExpr::Str(fl, _) = &args[i] {
-                                if (fl == "-P" || fl == "--perl-regexp") && i + 1 < args.len() {
-                                    if let IrExpr::Str(pat, _) = &args[i + 1] {
+                        // the exec args live in the Array at args[1] (the
+                        // same de-nesting cmd_to_sh's render path does)
+                        let words = match args.get(1) {
+                            Some(IrExpr::Array(items)) => items.as_slice(),
+                            _ => &[],
+                        };
+                        let mut i = 0;
+                        while i + 1 < words.len() {
+                            if let IrExpr::Str(fl, _) = &words[i] {
+                                if (fl == "-P" || fl == "--perl-regexp") {
+                                    if let IrExpr::Str(pat, _) = &words[i + 1] {
                                         if !ere_safe(pat) {
                                             return true;
                                         }
@@ -694,25 +872,30 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
                     }
                 }
             }
+            return args.iter().any(has_grep_p);
         }
-        false
+        match e {
+            IrExpr::Array(es) => es.iter().any(has_grep_p),
+            IrExpr::Object(es) => es.iter().any(|(_, v)| has_grep_p(v)),
+            _ => false,
+        }
     }
     fn walk(sts: &[IrStmt]) -> bool {
         for st in sts {
             match st {
                 IrStmt::Expr(e) => {
-                    if in_call(e) {
+                    if has_grep_p(e) {
                         return true;
                     }
                 }
                 IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
-                    if in_call(cond) || walk(body) {
+                    if has_grep_p(cond) || walk(body) {
                         return true;
                     }
                 }
                 IrStmt::If { cond, then, elsifs, else_, .. } => {
-                    if in_call(cond) || walk(then) || walk(else_)
-                        || elsifs.iter().any(|(c, b)| in_call(c) || walk(b))
+                    if has_grep_p(cond) || walk(then) || walk(else_)
+                        || elsifs.iter().any(|(c, b)| has_grep_p(c) || walk(b))
                     {
                         return true;
                     }
@@ -723,7 +906,7 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
                     }
                 }
                 IrStmt::For { iter, body, .. } => {
-                    if in_call(iter) || walk(body) {
+                    if has_grep_p(iter) || walk(body) {
                         return true;
                     }
                 }
@@ -856,13 +1039,42 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
         return Ok(out);
     }
     // `local`/`export`/`readonly` with bash-only type flags: drop the flags
-    // (`local -i x=5` -> `local x=5`), keep the builtin.
+    // (`local -i x=5` -> `local x=5`), keep the builtin. Assignment words
+    // (`local n=$1`) must stay UNQUOTED — dash's local does not re-expand
+    // a `'n=$1'` argument (the value would be the literal `$1`).
     if matches!(cmd_name, Some("local" | "export" | "readonly")) {
         let mut words: Vec<String> = Vec::new();
         for a in args {
             match a {
                 IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {}
-                other => words.push(word_to_sh(other)?),
+                IrExpr::Str(s, _) => {
+                    if let Some(eq) = s.find('=') {
+                        let name = &s[..eq];
+                        let val = &s[eq + 1..];
+                        let needs_quote = val.contains(|c: char| {
+                            c.is_whitespace() || matches!(c, '*' | '?' | '[' | ']' | '$' | '`')
+                        });
+                        if needs_quote {
+                            words.push(format!("{name}=\"{val}\""));
+                        } else {
+                            words.push(format!("{name}={val}"));
+                        }
+                    } else if s.is_empty() {
+                        // `local x=` arrives as ["x=", Interpolate("")] —
+                        // the empty word is the empty VALUE; the `name=`
+                        // form already covers it (dash: `local ''` is an error)
+                        continue;
+                    } else {
+                        words.push(str_word(s));
+                    }
+                }
+                other => {
+                    let w = word_to_sh(other)?;
+                    if w.is_empty() || w == "''" || w == "\"\"" {
+                        continue;
+                    }
+                    words.push(w);
+                }
             }
         }
         if words.is_empty() {
@@ -970,6 +1182,84 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
             return Err("sed -i without a literal file — the temp-file lowering needs one".into());
         }
     }
+    // `mapfile`/`readarray` are bash-only builtins (dash has neither).
+    // Lines land in the per-element vars + a len counter:
+    //   mapfile -t lines < input  ->
+    //     lines_len=0; while IFS= read -r _map_line; do
+    //       eval "lines_$lines_len=$_map_line"; lines_len=$((lines_len+1)); done
+    if matches!(cmd_name, Some("mapfile" | "readarray")) {
+        let mut name = "MAPFILE".to_string();
+        let mut flags: Vec<String> = Vec::new();
+        for a in args {
+            match a {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => flags.push(s.clone()),
+                other => {
+                    let w = word_to_sh(other)?;
+                    if !w.starts_with('$') && w != "-" {
+                        name = w;
+                    }
+                }
+            }
+        }
+        // `-t` strips the delimiter — IFS= read -r already does; any
+        // other option changes the read semantics (refuse loudly)
+        for f in &flags {
+            if f != "-t" {
+                return Err(format!(
+                    "mapfile flag {f} is not POSIX-lowered — refusing (only -t is emulated)"
+                ));
+            }
+        }
+        return Ok(format!(
+            "{name}_len=0; while IFS= read -r _map_line; do eval \"{name}_${{{name}_len}}=\\$_map_line\"; {name}_len=$(({name}_len + 1)); done"
+        ));
+    }
+    // `read -a arr` — bash-only array read (dash rejects -a). Split the
+    // line on IFS into the per-element vars + len counter.
+    if cmd_name == Some("read") {
+        if let Some(pidx) = args
+            .iter()
+            .position(|a| matches!(a, IrExpr::Str(s, _) if s == "-a"))
+        {
+            let name = args
+                .get(pidx + 1)
+                .and_then(|a| match a {
+                    IrExpr::Str(s, _) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "READ_A".into());
+            let mut words: Vec<String> = Vec::new();
+            for (i, a) in args.iter().enumerate() {
+                if i == pidx || i == pidx + 1 {
+                    continue;
+                }
+                words.push(word_to_sh(a)?);
+            }
+            let opts = words.join(" ");
+            return Ok(format!(
+                "read {opts} _read_line && {{ {name}_len=0; for _w in $_read_line; do eval \"{name}_${{{name}_len}}=\\$_w\"; {name}_len=$(({name}_len + 1)); done; }}"
+            ));
+        }
+    }
+    // `let` is a bash-only builtin (dash rejects it). A `let EXPR` is an
+    // arithmetic condition (rc 0 iff the value is nonzero); the portable
+    // `[ "$((EXPR))" -ne 0 ]` keeps both the rc semantics and the
+    // side effects (`let counter++` increments — dash's $(( )) supports
+    // C post-increment).
+    if cmd_name == Some("let") {
+        let mut parts = Vec::new();
+        for a in args {
+            let e = match a {
+                IrExpr::Str(s, _) => s.clone(),
+                other => word_to_sh(other)?,
+            };
+            parts.push(format!("[ \"$(({e}))\" -ne 0 ]"));
+        }
+        if parts.is_empty() {
+            return Ok(":".into());
+        }
+        return Ok(parts.join("; "));
+    }
     out.push_str(&word_to_sh(cmd)?);
     for w in args {
         out.push(' ');
@@ -986,6 +1276,169 @@ fn redirects_to_sh(redirects: &[IrRedirect]) -> Result<String, String> {
         out.push_str(&redirect_to_sh(r)?);
     }
     Ok(out)
+}
+
+/// Split redirects into process substitutions (in order) and the rest.
+fn partition_procsub(redirs: &[IrRedirect]) -> (Vec<IrRedirect>, Vec<IrRedirect>) {
+    let mut ps = Vec::new();
+    let mut plain = Vec::new();
+    for r in redirs {
+        if r.mode == "process-in" || r.mode == "process-out" {
+            ps.push(r.clone());
+        } else {
+            plain.push(r.clone());
+        }
+    }
+    (ps, plain)
+}
+
+/// The inner command text of a process-substitution redirect. The target
+/// is already shell syntax (the core reconstructed it); a Debug-string
+/// leak (064_01-style core gap) refuses loudly. bash-only `echo -e`
+/// producers (dash's echo has no flags) render as printf.
+fn proc_target(r: &IrRedirect) -> Result<String, String> {
+    let s = match &r.target {
+        IrExpr::Str(s, _) if s.starts_with("Redirect(") => Err(format!(
+            "process-substitution target leaked a Debug string — core lowering gap: {s:?}"
+        )),
+        IrExpr::Str(s, _) => Ok(s.clone()),
+        other => word_to_sh(other),
+    }?;
+    Ok(shim_producer(&s))
+}
+
+/// dash-compat shims for the core's bash-centric producer text:
+///  * `echo -e "a\nc"` -> `printf '%b\n' "a\nc"` (dash's echo prints
+///    the -e flag literally)
+///  * `printf a\nb\n` -> `printf 'a\nb\n'` (dash interprets \n in an
+///    UNQUOTED format arg only as literal backslash-n; bash does)
+fn shim_producer(s: &str) -> String {
+    let s = if s.contains("echo -e ") || s.contains("echo -E ") {
+        s.replacen("echo -e ", "printf '%b\\n' ", 1)
+            .replacen("echo -E ", "printf '%s\\n' ", 1)
+    } else {
+        s.to_string()
+    };
+    let mut out = String::new();
+    let mut rest = s.as_str();
+    loop {
+        match rest.find("printf ") {
+            Some(i) => {
+                out.push_str(&rest[..i + 7]);
+                rest = &rest[i + 7..];
+                // already-quoted format (`printf '%b\n'`) — pass through
+                if let Some(stripped) = rest.strip_prefix('\'') {
+                    if let Some(end) = stripped.find('\'') {
+                        out.push('\'');
+                        out.push_str(&stripped[..=end]);
+                        rest = &stripped[end + 1..];
+                        continue;
+                    }
+                }
+                let end = rest
+                    .find(|c: char| c == ' ' || c == '\'')
+                    .unwrap_or(rest.len());
+                let w = &rest[..end];
+                if !w.is_empty() && w.contains('\\') {
+                    out.push('\'');
+                    out.push_str(w);
+                    out.push('\'');
+                } else {
+                    out.push_str(w);
+                }
+                if end < rest.len() {
+                    out.push(' ');
+                    rest = &rest[end + 1..];
+                } else {
+                    return out;
+                }
+            }
+            None => {
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+}
+
+/// Statement-level process-substitution lowering (multi-line form):
+///  * ONE process-in  -> `head <(x)`-style partial readers get the
+///    streaming pipe (an infinite producer is stopped by SIGPIPE when
+///    the reader closes, exactly like bash's /dev/fd pipe); everything
+///    else gets a temp file + stdin redirect — a pipe would run the
+///    command in a SUBSHELL and lose its state (mapfile/while-read
+///    accumulate vars the script uses afterwards).
+///  * ONE process-out -> `cmd > tmp; consumer < tmp`
+///  * TWO+ process-in -> per-substitution temp files, appended to the
+///    command as trailing args (`comm -12 <(a) <(b)` -> `comm -12 "$t1"
+///    "$t2"` — the IR keeps only the redirect list, and the corpus's
+///    multi-process-substitution commands are all trailing-arg uses).
+/// The producer runs with stderr discarded — bash feeds it the /dev/fd
+/// pipe (stdout only) and the gate compares stdout against `bash 2>/dev/null`.
+fn lower_procsub_stmt(ps: &[IrRedirect], cmd: &str) -> Result<String, String> {
+    if ps.len() == 1 {
+        let r = &ps[0];
+        if r.mode == "process-in" {
+            let producer = proc_target(r)?;
+            if cmd.starts_with("head ") || cmd == "head" {
+                return Ok(format!("{{ {producer}; }} 2>/dev/null | {cmd}"));
+            }
+            return Ok(format!(
+                "_ps_t=$(mktemp)\n{{ {producer}; }} 2>/dev/null > \"$_ps_t\"\n{cmd} < \"$_ps_t\"\nrm -f \"$_ps_t\""
+            ));
+        }
+        // process-out: the target CONSUMES the command's output
+        return Ok(format!(
+            "_ps_t=$(mktemp)\n{cmd} > \"$_ps_t\"\n{{ {}; }} < \"$_ps_t\"\nrm -f \"$_ps_t\"",
+            proc_target(r)?
+        ));
+    }
+    let mut pre = String::new();
+    let mut args = String::new();
+    for (i, r) in ps.iter().enumerate() {
+        let t = format!("_ps_t{}", i + 1);
+        let producer = proc_target(r)?;
+        if r.mode == "process-in" {
+            pre.push_str(&format!("{t}=$(mktemp)\n{{ {producer}; }} 2>/dev/null > \"${t}\"\n"));
+            args.push_str(&format!(" \"${t}\""));
+        } else {
+            pre.push_str(&format!("{t}=$(mktemp)\n"));
+            pre.push_str(&format!("{{ {producer}; }} < \"${t}\"\n"));
+        }
+    }
+    let mut names = Vec::new();
+    for (i, _) in ps.iter().enumerate() {
+        names.push(format!("\"$_ps_t{}\"", i + 1));
+    }
+    Ok(format!("{pre}{cmd}{args}\nrm -f {}", names.join(" ")))
+}
+
+/// Inline (expression-context) process-substitution lowering: the
+/// `{ ...; }` group form with the status preserved via `rc=$?` and a
+/// final `[ "$rc" -eq 0 ]` (the group's status mirrors the command's:
+/// set -e stays suppressed inside and the caller's `|| echo` still sees
+/// the command's true status).
+fn lower_procsub_inline(ps: &[IrRedirect], cmd: &str) -> Result<String, String> {
+    let mut pre = String::new();
+    let mut post = String::new();
+    let mut args = String::new();
+    let mut names = Vec::new();
+    for (i, r) in ps.iter().enumerate() {
+        let t = format!("_ps_t{}", i + 1);
+        names.push(format!("\"${t}\""));
+        let producer = proc_target(r)?;
+        if r.mode == "process-in" {
+            pre.push_str(&format!("{t}=$(mktemp); {{ {producer}; }} 2>/dev/null > \"${t}\"; "));
+            args.push_str(&format!(" \"${t}\""));
+        } else {
+            pre.push_str(&format!("{t}=$(mktemp); "));
+            post.push_str(&format!("{{ {producer}; }} < \"${t}\"; "));
+        }
+    }
+    Ok(format!(
+        "{{ {pre}{cmd}{args}; rc=$?; {post}rm -f {}; [ \"$rc\" -eq 0 ]; }}",
+        names.join(" ")
+    ))
 }
 
 /// `cmd <<<word` (dash: "redirection unexpected") → `printf '%s\n' word | cmd`
@@ -1008,7 +1461,7 @@ fn redirect_to_sh(r: &IrRedirect) -> Result<String, String> {
         "a" => ">>",
         "r" => "<",
         "r+" => "<>",
-        "herestring" => "", // wrapped as a printf pipe by herestring_wrap
+        "herestring" => return Ok(String::new()), // wrapped as a printf pipe by herestring_wrap
         "heredoc" | "heredoc-tabs" => {
             // The heredoc BODY is carried in the target string.
             let body = match &r.target {
@@ -1134,7 +1587,22 @@ fn word_to_sh(e: &IrExpr) -> Result<String, String> {
 
 fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
     match func {
-        "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?, false)),
+        // A bare getVar in a word position is the QUOTED expansion (the
+        // core wraps deliberate word-splitting in split()): `"$x"`. The
+        // quote matters — bash `printf '%s' "$x"` passes the value as
+        // ONE word, the unquoted form re-splits it (heredoc-apostrophe.sh
+        // truncates at the first space without it).
+        "getVar" => Ok(format!("\"{}\"", var_ref_to_sh(&raw_arg(args, 0)?, false))),
+        // the core's word-splitting node: an UNQUOTED `$var` expands and
+        // word-splits natively in POSIX sh — render the inner expansion
+        // bare (no quotes).
+        "split" => match arg(args, 0)? {
+            IrExpr::Call { func, args } if func == "getVar" => {
+                Ok(var_ref_to_sh(&raw_arg(args, 0)?, false))
+            }
+            IrExpr::Call { func, args } if func == "param" => param_to_sh(args, false),
+            other => word_to_sh(other),
+        },
         "param" => param_to_sh(args, false),
         "listVar" => {
             let n = raw_arg(args, 0)?;
@@ -1143,18 +1611,18 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
         "arrayIndex" => {
             let name = raw_arg(args, 0)?;
             // POSIX has no arrays — the per-element lowering (`arr[i]` ->
-            // `${arr_i}`). Literal indices lower inline; @/* (the whole
-            // array) and dynamic indices need the runtime count / indirect
-            // expansion — refuse for now (a leak is worse than a refusal).
+            // `${arr_i}`). Literal indices lower inline (quoted — the
+            // element is one word); @/* (the whole array) and dynamic
+            // indices need the runtime count / indirect expansion.
             match arg(args, 1)? {
-                IrExpr::Str(k, _) if k == "@" || k == "*" => Err(
-                    "array @/* expansion is not POSIX-portable without the element count — refusing".into(),
-                ),
-                IrExpr::Str(k, _) => Ok(format!("${{{name}_{k}}}")),
+                IrExpr::Str(k, _) if k == "@" || k == "*" => {
+                    Ok(format!("$(_arr_expand {name})"))
+                }
+                IrExpr::Str(k, _) => Ok(format!("\"${{{name}_{k}}}\"")),
                 _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
             }
         }
-        "arrayItems" => Err("array key iteration is not POSIX-portable — refusing".into()),
+        "arrayItems" => Ok(format!("$(_arr_keys {})", raw_arg(args, 0)?)),
         "arrayLen" => Ok(format!("${{{}}}_len", raw_arg(args, 0)?)),
         "capture" | "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
         "arith" => Ok(format!("$(({}))", raw_arg(args, 0)?)),
@@ -1235,14 +1703,14 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
         "" => {
             // the baked-name form: `arr[1]` (an element read -> ${arr_1}),
             // `#arr` (length -> ${arr_len}), `arr[@]`/`arr[*]` (the whole
-            // array -> needs the element count, refuse for now)
+            // array -> the per-element counter helper). A bare `param("",
+            // name)` is the QUOTED `"${x}"` expansion (the core wraps
+            // unquoted `$x` in split()) — keep it one word.
             if let Some((an, idx)) = name.strip_suffix(']').and_then(|n| n.split_once('[')) {
                 if idx == "@" || idx == "*" {
-                    return Err(
-                        "array @/* expansion needs the element count — not POSIX-lowered yet".into(),
-                    );
+                    return Ok(format!("$(_arr_expand {an})"));
                 }
-                return Ok(format!("${{{an}_{idx}}}"));
+                return Ok(format!("\"${{{an}_{idx}}}\""));
             }
             if let Some(an) = name.strip_prefix('#') {
                 return Ok(format!("${{{an}_len}}"));
@@ -1251,7 +1719,9 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                 // `"${x[@]}"` — array elements joined
                 Ok(var_ref_to_sh(&name, true))
             } else {
-                Ok(format!("${{{name}}}"))
+                // special params (`?`, `1`, `@`, ...) keep the `$name`
+                // form inside the quotes (`"$?"` — `${?}` is invalid)
+                Ok(format!("\"{}\"", var_ref_to_sh(&name, false)))
             }
         }
         "len" => {
@@ -1289,6 +1759,11 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                     return Ok(format!("$(shift {sh}; printf '%s' \"$*\")"));
                 }
                 return Ok(format!("${{{name}:{off}}}"));
+            }
+            // `${arr[@]}` / `${arr[*]}` — the whole array: the per-element
+            // counter helper (arrays have no POSIX form)
+            if off == "@" || off == "*" {
+                return Ok(format!("$(_arr_expand {name})"));
             }
             let offn: i64 = off.trim().parse().unwrap_or(-1);
             let lenn: i64 = len.trim().parse().unwrap_or(-1);
@@ -1388,10 +1863,10 @@ fn join_to_sh(inner: &IrExpr, quoted: bool) -> Result<String, String> {
             let name = raw_arg(args, 0)?;
             let key = raw_arg(args, 1)?;
             if key == "@" || key == "*" {
-                var_ref_to_sh(&name, true)
-            } else {
-                format!("${{{name}[{key}]}}")
+                // the whole array — the helper's expansion IS the list
+                return Ok(format!("$(_arr_expand {name})"));
             }
+            format!("${{{name}[{key}]}}")
         }
         IrExpr::Call { func, args } if func == "arrayItems" => {
             format!("${{!{}[@]}}", raw_arg(args, 0)?)
@@ -1401,7 +1876,12 @@ fn join_to_sh(inner: &IrExpr, quoted: bool) -> Result<String, String> {
         }
         _ => word_to_sh(inner)?,
     };
-    Ok(if quoted { format!("\"{s}\"") } else { s })
+    // array expansions are already word lists — never re-quote them
+    if s.starts_with("$(_arr_expand") || s.starts_with("$(_arr_keys") {
+        Ok(s)
+    } else {
+        Ok(if quoted { format!("\"{s}\"") } else { s })
+    }
 }
 
 fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
@@ -1446,12 +1926,16 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
                 let n = raw_arg(args, 0)?;
                 Ok(if n == "*" { "$*".into() } else { "$@".into() })
             }
-            "arrayIndex" => Ok(format!(
-                "${{{}{}}}",
-                raw_arg(args, 0)?,
-                raw_arg(args, 1)?
-            )),
-            "arrayItems" => Ok(format!("${{!{}[@]}}", raw_arg(args, 0)?)),
+            "arrayIndex" => {
+                let name = raw_arg(args, 0)?;
+                let key = raw_arg(args, 1)?;
+                if key == "@" || key == "*" {
+                    Ok(format!("$(_arr_expand {name})"))
+                } else {
+                    Ok(format!("${{{name}_{key}}}"))
+                }
+            }
+            "arrayItems" => Ok(format!("$(_arr_keys {})", raw_arg(args, 0)?)),
             "arrayLen" => Ok(format!("${{#{}[@]}}", raw_arg(args, 0)?)),
             "capture" | "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
             "arith" => Ok(format!("$(({}))", raw_arg(args, 0)?)),
