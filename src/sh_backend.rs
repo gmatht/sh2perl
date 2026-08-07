@@ -11,12 +11,166 @@
 //! REAL shell syntax (no stubs).
 
 use crate::ir::{ArithAst, BinOpKind, InterpPart, IrExpr, IrProgram, IrRedirect, IrStmt, StrStyle};
+use std::collections::HashSet;
+
+lazy_static::lazy_static! {
+    /// Array base names seen in the program (setArray/arrayLen/arrayIndex/
+    /// slice usages) — the per-element lowering keys off these.
+    static ref ARRAY_NAMES: std::sync::Mutex<HashSet<String>> = Default::default();
+}
 
 /// Marker prefixes the core's lowering tags unquoted glob / process-
 /// substitution words with (see shir.rs). The native shell performs both
 /// natively, so the renderer strips the markers and emits the raw text.
 const GLOB_MAGIC: &str = "\u{1}SH2GLOB\u{1}";
 const PS_MAGIC: &str = "\u{1}SH2PS\u{1}";
+
+/// Collect the array base names used anywhere in the program — the
+/// per-element lowering keys the slice/len arms off these (the A1's
+/// var_lengths field is not carried into IrProgram by the shared core).
+fn array_names(prog: &IrProgram) -> HashSet<String> {
+    let mut names = HashSet::new();
+    fn expr_names(e: &IrExpr, names: &mut HashSet<String>) {
+        match e {
+            IrExpr::Call { func, args } => {
+                let f = func.as_str();
+                if matches!(
+                    f,
+                    "setArray" | "setArrayAppend" | "arrayItems" | "arrayLen"
+                ) {
+                    if let Ok(s) = raw_arg(args, 0) {
+                        names.insert(s);
+                    }
+                }
+                if f == "arrayIndex" {
+                    if let Ok(s) = raw_arg(args, 0) {
+                        names.insert(s);
+                    }
+                }
+                if f == "param" {
+                    let name = args
+                        .get(1)
+                        .and_then(|a| match a {
+                            IrExpr::Str(s, _) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    // `${arr[@]}`-family baked names
+                    if name.ends_with("[@]") || name.ends_with("[*]") {
+                        if let Some(base) = name
+                            .strip_suffix("[@]")
+                            .or_else(|| name.strip_suffix("[*]"))
+                        {
+                            names.insert(base.to_string());
+                        }
+                    }
+                }
+                for a in args {
+                    expr_names(a, names);
+                }
+            }
+            IrExpr::Array(es) => {
+                for e in es {
+                    expr_names(e, names);
+                }
+            }
+            IrExpr::Object(es) => {
+                for (_, v) in es {
+                    expr_names(v, names);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        expr_names(x, names);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk(sts: &[IrStmt], names: &mut HashSet<String>) {
+        for st in sts {
+            match st {
+                IrStmt::Expr(e) => expr_names(e, names),
+                IrStmt::Assign { expr, .. } => expr_names(expr, names),
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    expr_names(cond, names);
+                    walk(then, names);
+                    walk(else_, names);
+                    for (c, b) in elsifs {
+                        expr_names(c, names);
+                        walk(b, names);
+                    }
+                }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    expr_names(cond, names);
+                    walk(body, names);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    expr_names(iter, names);
+                    walk(body, names);
+                }
+                IrStmt::Case { discriminant, clauses, .. } => {
+                    expr_names(discriminant, names);
+                    for c in clauses {
+                        walk(&c.body, names);
+                    }
+                }
+                IrStmt::Function { body, .. } => walk(body, names),
+                IrStmt::Redirect { inner, redirects } => {
+                    walk(inner, names);
+                    for r in redirects {
+                        expr_names(&r.target, names);
+                    }
+                }
+                IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                    walk(body, names);
+                }
+                IrStmt::Exec {
+                    cmd, args, redirects, env, ..
+                } => {
+                    expr_names(cmd, names);
+                    for a in args {
+                        expr_names(a, names);
+                    }
+                    for r in redirects {
+                        expr_names(r, names);
+                    }
+                    for (_, v) in env {
+                        expr_names(v, names);
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for s in stages {
+                        walk(s, names);
+                    }
+                }
+                IrStmt::Output { value, .. } | IrStmt::Return(Some(value)) | IrStmt::Exit(Some(value)) | IrStmt::Die { expr: value, .. } | IrStmt::Warn { expr: value, .. } => expr_names(value, names),
+                IrStmt::Declare { init, .. } => {
+                    if let Some(i) = init {
+                        expr_names(i, names);
+                    }
+                }
+                IrStmt::DeclareArray { elements, .. } => {
+                    for e in elements {
+                        expr_names(e, names);
+                    }
+                }
+                IrStmt::WriteFile { path, content, .. } => {
+                    expr_names(path, names);
+                    expr_names(content, names);
+                }
+                IrStmt::Return(None) | IrStmt::Exit(None) | IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => {}
+            }
+        }
+    }
+    walk(&prog.stmts, &mut names);
+    for sub in &prog.subs {
+        walk(&sub.body, &mut names);
+    }
+    names
+}
 
 /// Does the program use whole-array expansions (`"${arr[@]}"`, `${!arr[@]}`,
 /// `${arr[*]}`)? They need the `_arr_expand`/`_arr_keys` prologue helpers
@@ -62,7 +216,12 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                                 _ => None,
                             })
                             .unwrap_or("");
-                        if (off == "@" || off == "*") && !name.starts_with('#') {
+                        if !name.starts_with('#')
+                            && (off == "@"
+                                || off == "*"
+                                || (off.parse::<i64>().is_ok()
+                                    && ARRAY_NAMES.lock().unwrap().contains(name)))
+                        {
                             return true;
                         }
                     }
@@ -143,6 +302,9 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
 /// Render a ShIR program to `sh` source. `Err` on a construct outside the
 /// renderable subset (the gate reports it as a FAIL).
 pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
+    // collect the array base names (the A1's var_lengths is not carried
+    // into IrProgram — the shared core; usage is a sound proxy)
+    *ARRAY_NAMES.lock().unwrap() = array_names(prog);
     let mut out = String::new();
     out.push_str("#!/bin/sh\n");
     if needs_grep_p(&prog.stmts) {
@@ -178,6 +340,19 @@ _arr_keys() {
         printf '%s\n' "$_i"
         _i=$((_i + 1))
     done
+}
+_arr_slice() {
+    # $1=name $2=off $3=len — elements off..off+len-1, space-joined
+    _i=$(( $2 ))
+    _end=$(eval echo "\${$1_len}")
+    _end=${_end:-0}
+    _lim=$(( $2 + ${3:-1000000} ))
+    while [ "$_i" -lt "$_lim" ] && [ "$_i" -lt "$_end" ]; do
+        eval "printf '%s' \"\${$1_$_i}\""
+        _i=$((_i + 1))
+        [ "$_i" -lt "$_lim" ] && [ "$_i" -lt "$_end" ] && printf ' '
+    done
+    printf '\n'
 }
 
 "#,
@@ -577,6 +752,62 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
         if i > 0 {
             out.push(' ');
         }
+        let rhs = assign_rhs_to_sh(expr)?;
+        // baked element targets (`arr[1]=x` — the A1 folds the subscript
+        // into the var name)
+        if let Some((base, idx)) = t.var.strip_suffix(']').and_then(|v| v.split_once('[')) {
+            if idx.chars().all(|c| c.is_ascii_digit())
+                || (!idx.contains(['$', '(', ')', '`', ';', '&', '|', ' '])
+                    && !idx.is_empty())
+            {
+                out.push_str(&format!("{base}_{idx}={rhs}"));
+            } else {
+                out.push_str(&format!("{base}[{idx}]={rhs}"));
+            }
+            continue;
+        }
+        if t.indices.is_empty() {
+            out.push_str(&t.var);
+            out.push('=');
+            out.push_str(&rhs);
+            continue;
+        }
+        // `arr[i]=x` — the per-element lowering writes `arr_i=x`; a
+        // dynamic subscript (arith / $var) needs an eval to build the
+        // element name at runtime
+        if t.indices.len() == 1 {
+            let idx = &t.indices[0];
+            if let IrExpr::Str(k, _) = idx {
+                if k.chars().all(|c| c.is_ascii_digit()) {
+                    out.push_str(&t.var);
+                    out.push('_');
+                    out.push_str(k);
+                    out.push('=');
+                    out.push_str(&rhs);
+                    continue;
+                }
+                if !k.chars().any(|c| c.is_whitespace())
+                    && !k.contains(['$', '(', ')', '"', '\'', '`', ';', '&', '|'])
+                {
+                    out.push_str(&t.var);
+                    out.push('_');
+                    out.push_str(k);
+                    out.push('=');
+                    out.push_str(&rhs);
+                    continue;
+                }
+            }
+            let k = word_to_sh(idx)?;
+            // dynamic: eval "arr_$idx=$rhs" — the rhs expands at eval
+            // time (its $vars are live then)
+            let r = rhs.replace('\\', "\\\\").replace('"', "\\\"");
+            return Ok(format!(
+                "eval \"{}_{}={}\"",
+                t.var,
+                k.trim_matches('"'),
+                r
+            ));
+        }
         out.push_str(&t.var);
         for idx in &t.indices {
             out.push('[');
@@ -584,9 +815,45 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
             out.push(']');
         }
         out.push('=');
-        out.push_str(&assign_rhs_to_sh(expr)?);
+        out.push_str(&rhs);
     }
     Ok(out)
+}
+
+
+/// `arr=(a b c)` / `arr+=(x)` — the per-element lowering. Elements with
+/// runtime expansions (`arr=($x)`) word-split at runtime (bash counts the
+/// SPLIT words); appends need eval (dash cannot parse an expanded
+/// assignment NAME like `arr_$i=x`).
+fn set_array_to_sh(name: &str, items: &str, append: bool) -> String {
+    if items.is_empty() {
+        return format!("{name}_len=0");
+    }
+    if items.contains('$') && !append {
+        return format!(
+            "{name}_len=0; for _w in {items}; do eval \"{name}_${{{name}_len}}=\\\"\\$_w\\\"\"; {name}_len=$(({name}_len + 1)); done"
+        );
+    }
+    let mut parts = Vec::new();
+    if append {
+        for it in items.split(' ') {
+            let esc = it
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('$', "\\$")
+                .replace('`', "\\`");
+            parts.push(format!(
+                "eval \"{name}_${{{name}_len}}=\\\"{esc}\\\"\""
+            ));
+            parts.push(format!("{name}_len=$(({name}_len + 1))"));
+        }
+    } else {
+        for (i, it) in items.split(' ').enumerate() {
+            parts.push(format!("{name}_{i}={it}"));
+        }
+        parts.push(format!("{name}_len={}", items.split(' ').count()));
+    }
+    parts.join("; ")
 }
 
 fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
@@ -607,26 +874,11 @@ fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
             "arith" => Ok(format!("$(({}))", raw_arg(args, 0)?)),
             "setArray" => {
                 let name = raw_arg(args, 0)?;
-                let items = array_items(args, 1)?;
-                if items.is_empty() {
-                    return Ok(format!("{name}_len=0"));
-                }
-                let mut parts = Vec::new();
-                for (i, it) in items.split(' ').enumerate() {
-                    parts.push(format!("{name}_{i}={it}"));
-                }
-                parts.push(format!("{name}_len={}", items.split(' ').count()));
-                Ok(parts.join("; "))
+                Ok(set_array_to_sh(&name, &array_items(args, 1)?, false))
             }
             "setArrayAppend" => {
                 let name = raw_arg(args, 0)?;
-                let items = array_items(args, 1)?;
-                let mut parts = Vec::new();
-                for it in items.split(' ') {
-                    parts.push(format!("{name}_${{{name}_len}}={it}"));
-                    parts.push(format!("{name}_len=$(({name}_len + 1))"));
-                }
-                Ok(parts.join("; "))
+                Ok(set_array_to_sh(&name, &array_items(args, 1)?, true))
             }
             "assign" => {
                 let name = raw_arg(args, 0)?;
@@ -678,7 +930,7 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                         "printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"
                     ))
                 } else {
-                    Ok(format!("[ {t} ]"))
+                    Ok(format!("[ {} ]", space_test_eq(t)))
                 }
             }
             "pipeline" => {
@@ -755,26 +1007,11 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             }
             "setArray" => {
                 let name = raw_arg(args, 0)?;
-                let items = array_items(args, 1)?;
-                if items.is_empty() {
-                    return Ok(format!("{name}_len=0"));
-                }
-                let mut parts = Vec::new();
-                for (i, it) in items.split(' ').enumerate() {
-                    parts.push(format!("{name}_{i}={it}"));
-                }
-                parts.push(format!("{name}_len={}", items.split(' ').count()));
-                Ok(parts.join("; "))
+                Ok(set_array_to_sh(&name, &array_items(args, 1)?, false))
             }
             "setArrayAppend" => {
                 let name = raw_arg(args, 0)?;
-                let items = array_items(args, 1)?;
-                let mut parts = Vec::new();
-                for it in items.split(' ') {
-                    parts.push(format!("{name}_${{{name}_len}}={it}"));
-                    parts.push(format!("{name}_len=$(({name}_len + 1))"));
-                }
-                Ok(parts.join("; "))
+                Ok(set_array_to_sh(&name, &array_items(args, 1)?, true))
             }
             "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?, false)),
             "capture" | "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
@@ -1632,27 +1869,12 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
             // POSIX has no arrays — the per-element lowering:
             //   arr=(a b c) -> arr_0=a; arr_1=b; arr_2=c; arr_len=3
             let name = raw_arg(args, 0)?;
-            let items = array_items(args, 1)?;
-            if items.is_empty() {
-                return Ok(format!("{name}_len=0"));
-            }
-            let mut parts = Vec::new();
-            for (i, it) in items.split(' ').enumerate() {
-                parts.push(format!("{name}_{i}={it}"));
-            }
-            parts.push(format!("{name}_len={}", items.split(' ').count()));
-            Ok(parts.join("; "))
+            Ok(set_array_to_sh(&name, &array_items(args, 1)?, false))
         }
         "setArrayAppend" => {
             //   arr+=(x) -> arr_$arr_len=x; arr_len=$((arr_len+1))
             let name = raw_arg(args, 0)?;
-            let items = array_items(args, 1)?;
-            let mut parts = Vec::new();
-            for it in items.split(' ') {
-                parts.push(format!("{name}_${{{name}_len}}={it}"));
-                parts.push(format!("{name}_len=$(({name}_len + 1))"));
-            }
-            Ok(parts.join("; "))
+            Ok(set_array_to_sh(&name, &array_items(args, 1)?, true))
         }
         "assign" => {
             let name = raw_arg(args, 0)?;
@@ -1765,6 +1987,14 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             if off == "@" || off == "*" {
                 return Ok(format!("$(_arr_expand {name})"));
             }
+            // a numeric-offset slice on a KNOWN array (`${arr[@]:1:2}`
+            // lowers as a slice with the bare base name): element-wise
+            // via the counter; unknown names stay scalar (cut on chars)
+            if !name.starts_with('#') && name != "@" && name != "*"
+                && ARRAY_NAMES.lock().unwrap().contains(name.as_str())
+            {
+                return Ok(format!("$(_arr_slice {name} {off} {len})"));
+            }
             let offn: i64 = off.trim().parse().unwrap_or(-1);
             let lenn: i64 = len.trim().parse().unwrap_or(-1);
             if offn >= 0 && (lenn >= 0 || len.is_empty()) {
@@ -1818,6 +2048,13 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
         }
         ":-" | ":=" | ":?" => {
             let default = raw_arg(args, 2)?;
+            // `${arr:-d}` — bash's array form reads ELEMENT 0 when the
+            // array is non-empty (the per-element vars have no scalar)
+            if ARRAY_NAMES.lock().unwrap().contains(name.as_str()) {
+                return Ok(format!(
+                    "$([ \"${{{name}_len:-0}}\" -gt 0 ] && eval \"printf '%s' \\\"\\${{{name}_0}}\\\"\" || printf '%s' {default})"
+                ));
+            }
             Ok(format!("${{{name}{op}{default}}}"))
         }
         "basename" => Ok(format!("${{{name}##*/}}")),
@@ -1950,6 +2187,48 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Str(s, _) => Ok(s.clone()),
         other => Err(format!("interp expr not renderable: {other:?}")),
     }
+}
+
+/// The core's test lowering strips the spaces around comparison
+/// operators (`[ "$X" = "1" ]` arrives as `"$X"="1"` — dash would read
+/// the whole thing as ONE word). Re-insert the spaces around `=` outside
+/// quoted regions.
+fn space_test_eq(t: &str) -> String {
+    let mut out = String::new();
+    let mut in_dq = false;
+    let mut in_sq = false;
+    let chars: Vec<char> = t.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '"' => {
+                in_dq = !in_dq;
+                out.push(c);
+            }
+            '\'' => {
+                in_sq = !in_sq;
+                out.push(c);
+            }
+            _ if in_dq || in_sq => out.push(c),
+            '=' => {
+                let prev = chars[..i].iter().rev().find(|p| !p.is_whitespace()).copied();
+                let next = chars[i + 1..].iter().find(|n| !n.is_whitespace()).copied();
+                let prev_ok = prev.map(|p| !matches!(p, '=' | '!' | '<' | '>')).unwrap_or(false);
+                let next_ok = next.map(|n| !matches!(n, '=')).unwrap_or(false);
+                if prev_ok && next_ok {
+                    out.push(' ');
+                    out.push(c);
+                    out.push(' ');
+                } else {
+                    out.push(c);
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Split `lhs OP rhs` from a `[[ ]]` raw test (the parser strips spaces
