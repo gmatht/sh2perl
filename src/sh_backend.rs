@@ -23,6 +23,16 @@ const PS_MAGIC: &str = "\u{1}SH2PS\u{1}";
 pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
     let mut out = String::new();
     out.push_str("#!/bin/sh\n");
+    if needs_grep_p(&prog.stmts) {
+        out.push_str("\n");
+        out.push_str("# portable PCRE grep: GNU grep -P, macOS gnu-grep, or perl\n");
+        out.push_str("grep_p() {\n");
+        out.push_str("    p=\"$1\"; shift\n");
+        out.push_str("    if grep -P -- \"$p\" \"$@\" 2>/dev/null; then return; fi\n");
+        out.push_str("    if command -v ggrep >/dev/null 2>&1; then ggrep -P -- \"$p\" \"$@\"; return; fi\n");
+        out.push_str("    perl -ne 'BEGIN{$p=shift @ARGV} print if /$p/' \"$p\" \"$@\"\n");
+        out.push_str("}\n\n");
+    }
     for st in &prog.stmts {
         stmt_to_sh(st, 0, &mut out)?;
     }
@@ -398,6 +408,14 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
 /// `var=value` for a statement-level assignment. Handles the sh2.* RHS
 /// forms (capture, pipeline, arith, setArray, assign) natively.
 fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<String, String> {
+    // `arr=(a b c)` — the A1 is Assign{var: arr, expr: setArray(...)}. The
+    // setArray lowering IS the assignment (`arr_0=a; arr_1=b; ...`) — the
+    // `name=` prefix would corrupt it into `arr=arr_0=a`.
+    if let IrExpr::Call { func, .. } = expr {
+        if func == "setArray" || func == "setArrayAppend" {
+            return cmd_to_sh(expr);
+        }
+    }
     let mut out = String::new();
     for (i, t) in targets.iter().enumerate() {
         if i > 0 {
@@ -431,13 +449,28 @@ fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
                 Ok(format!("$({line})"))
             }
             "arith" => Ok(format!("$(({}))", raw_arg(args, 0)?)),
-            "setArray" => Err(
-                "array literals are not POSIX-portable (no arrays in POSIX sh) — refusing".into(),
-            ),
+            "setArray" => {
+                let name = raw_arg(args, 0)?;
+                let items = array_items(args, 1)?;
+                if items.is_empty() {
+                    return Ok(format!("{name}_len=0"));
+                }
+                let mut parts = Vec::new();
+                for (i, it) in items.split(' ').enumerate() {
+                    parts.push(format!("{name}_{i}={it}"));
+                }
+                parts.push(format!("{name}_len={}", items.split(' ').count()));
+                Ok(parts.join("; "))
+            }
             "setArrayAppend" => {
                 let name = raw_arg(args, 0)?;
                 let items = array_items(args, 1)?;
-                Ok(format!("{name}+=({items})"))
+                let mut parts = Vec::new();
+                for it in items.split(' ') {
+                    parts.push(format!("{name}_${{{name}_len}}={it}"));
+                    parts.push(format!("{name}_len=$(({name}_len + 1))"));
+                }
+                Ok(parts.join("; "))
             }
             "assign" => {
                 let name = raw_arg(args, 0)?;
@@ -553,13 +586,28 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 let value = word_to_sh(arg(args, 2)?)?;
                 Ok(format!("{name}{op}{value}"))
             }
-            "setArray" => Err(
-                "array literals are not POSIX-portable (no arrays in POSIX sh) — refusing".into(),
-            ),
+            "setArray" => {
+                let name = raw_arg(args, 0)?;
+                let items = array_items(args, 1)?;
+                if items.is_empty() {
+                    return Ok(format!("{name}_len=0"));
+                }
+                let mut parts = Vec::new();
+                for (i, it) in items.split(' ').enumerate() {
+                    parts.push(format!("{name}_{i}={it}"));
+                }
+                parts.push(format!("{name}_len={}", items.split(' ').count()));
+                Ok(parts.join("; "))
+            }
             "setArrayAppend" => {
                 let name = raw_arg(args, 0)?;
                 let items = array_items(args, 1)?;
-                Ok(format!("{name}+=({items})"))
+                let mut parts = Vec::new();
+                for it in items.split(' ') {
+                    parts.push(format!("{name}_${{{name}_len}}={it}"));
+                    parts.push(format!("{name}_len=$(({name}_len + 1))"));
+                }
+                Ok(parts.join("; "))
             }
             "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?, false)),
             "capture" | "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
@@ -600,17 +648,91 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
     }
 }
 
+// A PCRE pattern that is also valid ERE (no lookarounds, backrefs, or
+// \d/\w/\s/\b shorthand) can lower `grep -P` to `grep -E` inline.
+fn ere_safe(p: &str) -> bool {
+    for t in ["(?", "\\d", "\\w", "\\s", "\\b", "\\D", "\\W", "\\S", "\\1", "\\2", "\\3", "\\4"] {
+        if p.contains(t) {
+            return false;
+        }
+    }
+    true
+}
+
 // GNU-only flags with no POSIX/BSD equivalent: a pass-through is a
 // portability LEAK (the output must run on macOS/BSD sh) — refuse loudly.
 fn gnu_only_flag(cmd: &str, flag: &str) -> bool {
     match cmd {
-        "grep" => matches!(flag, "-P" | "--perl-regexp"),
-        "sed" => matches!(flag, "-i" | "--in-place"),
+        // grep -P and sed -i are LOWERED (grep_p polyfill / temp-file pattern)
         "head" => matches!(flag, "-z" | "--zero-terminated"),
         "find" => matches!(flag, "-printf"),
         "sort" => matches!(flag, "-V" | "--version-sort"),
         _ => false,
     }
+}
+
+// Does the program need the grep_p PCRE polyfill prologue?
+fn needs_grep_p(stmts: &[IrStmt]) -> bool {
+    fn in_call(c: &IrExpr) -> bool {
+        if let IrExpr::Call { func, args } = c {
+            if func == "exec" && args.len() >= 1 {
+                if let IrExpr::Str(cn, _) = &args[0] {
+                    if cn == "grep" {
+                        let mut i = 1;
+                        while i + 1 < args.len() {
+                            if let IrExpr::Str(fl, _) = &args[i] {
+                                if (fl == "-P" || fl == "--perl-regexp") && i + 1 < args.len() {
+                                    if let IrExpr::Str(pat, _) = &args[i + 1] {
+                                        if !ere_safe(pat) {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            match st {
+                IrStmt::Expr(e) => {
+                    if in_call(e) {
+                        return true;
+                    }
+                }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    if in_call(cond) || walk(body) {
+                        return true;
+                    }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    if in_call(cond) || walk(then) || walk(else_)
+                        || elsifs.iter().any(|(c, b)| in_call(c) || walk(b))
+                    {
+                        return true;
+                    }
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    if in_call(iter) || walk(body) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
 }
 
 fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)]>) -> Result<String, String> {
@@ -805,6 +927,49 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
             }
         }
     }
+    // `grep -P PAT` — PCRE. ERE-safe patterns lower to `grep -E` inline;
+    // anything else uses the grep_p polyfill (emitted in the prologue):
+    // GNU grep -P, macOS gnu-grep, or perl. A pass-through would leak.
+    if cmd_name == Some("grep") && env.is_none() {
+        if let Some(pidx) = args.iter().position(|a| matches!(a, IrExpr::Str(s, _) if s == "-P" || s == "--perl-regexp")) {
+            let use_e = matches!(args.get(pidx + 1), Some(IrExpr::Str(p, _)) if ere_safe(p));
+            let mut words: Vec<String> = Vec::new();
+            words.push(if use_e { "grep -E".into() } else { "grep_p".into() });
+            for (i, a) in args.iter().enumerate() {
+                if i == pidx {
+                    continue; // drop the -P flag
+                }
+                words.push(word_to_sh(a)?);
+            }
+            return Ok(words.join(" "));
+        }
+    }
+    // `sed -i [SUFFIX] EXPR FILE` — GNU in-place. The portable temp-file
+    // pattern: sed EXPR FILE > FILE.tmp && mv FILE.tmp FILE (mv is
+    // same-dir, so no cross-filesystem rename issue).
+    if cmd_name == Some("sed") && env.is_none() {
+        let in_place = args.iter().position(|a| matches!(
+            a,
+            IrExpr::Str(s, _) if s == "-i" || s == "--in-place" || (s.starts_with("-i") && s.len() > 2)
+        ));
+        if let Some(pidx) = in_place {
+            let mut words: Vec<String> = vec!["sed".into()];
+            for (i, a) in args.iter().enumerate() {
+                if i == pidx {
+                    continue; // drop -i (and any attached suffix)
+                }
+                words.push(word_to_sh(a)?);
+            }
+            let file = args.iter().rev().find_map(|a| match a {
+                IrExpr::Str(s, _) => Some(s.clone()),
+                _ => None,
+            });
+            if let Some(f) = file {
+                return Ok(format!("{} > {f}.tmp && mv {f}.tmp {f}", words.join(" ")));
+            }
+            return Err("sed -i without a literal file — the temp-file lowering needs one".into());
+        }
+    }
     out.push_str(&word_to_sh(cmd)?);
     for w in args {
         out.push(' ');
@@ -975,23 +1140,52 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
             let n = raw_arg(args, 0)?;
             Ok(if n == "*" { "\"$*\"".into() } else { "\"$@\"".into() })
         }
-        "arrayIndex" => Ok(format!(
-            "${{{}{}}}",
-            raw_arg(args, 0)?,
-            word_to_sh(arg(args, 1)?)?
-        )),
-        "arrayItems" => Ok(format!("${{!{}[@]}}", raw_arg(args, 0)?)),
-        "arrayLen" => Ok(format!("${{#{}[@]}}", raw_arg(args, 0)?)),
+        "arrayIndex" => {
+            let name = raw_arg(args, 0)?;
+            // POSIX has no arrays — the per-element lowering (`arr[i]` ->
+            // `${arr_i}`). Literal indices lower inline; @/* (the whole
+            // array) and dynamic indices need the runtime count / indirect
+            // expansion — refuse for now (a leak is worse than a refusal).
+            match arg(args, 1)? {
+                IrExpr::Str(k, _) if k == "@" || k == "*" => Err(
+                    "array @/* expansion is not POSIX-portable without the element count — refusing".into(),
+                ),
+                IrExpr::Str(k, _) => Ok(format!("${{{name}_{k}}}")),
+                _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
+            }
+        }
+        "arrayItems" => Err("array key iteration is not POSIX-portable — refusing".into()),
+        "arrayLen" => Ok(format!("${{{}}}_len", raw_arg(args, 0)?)),
         "capture" | "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
         "arith" => Ok(format!("$(({}))", raw_arg(args, 0)?)),
         "brace" => brace_to_sh(args),
         "join" => join_to_sh(arg(args, 0)?, false),
-        "setArray" => Err(
-            "array literals are not POSIX-portable (no arrays in POSIX sh) — refusing".into(),
-        ),
-        "setArrayAppend" => Err(
-            "array append is not POSIX-portable (no arrays in POSIX sh) — refusing".into(),
-        ),
+        "setArray" => {
+            // POSIX has no arrays — the per-element lowering:
+            //   arr=(a b c) -> arr_0=a; arr_1=b; arr_2=c; arr_len=3
+            let name = raw_arg(args, 0)?;
+            let items = array_items(args, 1)?;
+            if items.is_empty() {
+                return Ok(format!("{name}_len=0"));
+            }
+            let mut parts = Vec::new();
+            for (i, it) in items.split(' ').enumerate() {
+                parts.push(format!("{name}_{i}={it}"));
+            }
+            parts.push(format!("{name}_len={}", items.split(' ').count()));
+            Ok(parts.join("; "))
+        }
+        "setArrayAppend" => {
+            //   arr+=(x) -> arr_$arr_len=x; arr_len=$((arr_len+1))
+            let name = raw_arg(args, 0)?;
+            let items = array_items(args, 1)?;
+            let mut parts = Vec::new();
+            for it in items.split(' ') {
+                parts.push(format!("{name}_${{{name}_len}}={it}"));
+                parts.push(format!("{name}_len=$(({name}_len + 1))"));
+            }
+            Ok(parts.join("; "))
+        }
         "assign" => {
             let name = raw_arg(args, 0)?;
             let op = raw_arg(args, 1)?;
@@ -1039,6 +1233,20 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
     let name = raw_arg(args, 1)?;
     match op.as_str() {
         "" => {
+            // the baked-name form: `arr[1]` (an element read -> ${arr_1}),
+            // `#arr` (length -> ${arr_len}), `arr[@]`/`arr[*]` (the whole
+            // array -> needs the element count, refuse for now)
+            if let Some((an, idx)) = name.strip_suffix(']').and_then(|n| n.split_once('[')) {
+                if idx == "@" || idx == "*" {
+                    return Err(
+                        "array @/* expansion needs the element count — not POSIX-lowered yet".into(),
+                    );
+                }
+                return Ok(format!("${{{an}_{idx}}}"));
+            }
+            if let Some(an) = name.strip_prefix('#') {
+                return Ok(format!("${{{an}_len}}"));
+            }
             if list {
                 // `"${x[@]}"` — array elements joined
                 Ok(var_ref_to_sh(&name, true))
@@ -1046,8 +1254,21 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                 Ok(format!("${{{name}}}"))
             }
         }
-        "len" => Ok(format!("${{#{name}}}")),
+        "len" => {
+            // `len` on an array (`${#arr[@]}`) -> the counter; on a scalar
+            // (`${#s}`) -> the portable `$#{s}`
+            if let Some(an) = name.strip_suffix("[@]") {
+                Ok(format!("${{{an}_len}}"))
+            } else {
+                Ok(format!("${{#{name}}}"))
+            }
+        }
         "slice" => {
+            // `${#arr[@]}` arrives as slice with a `#name` target — the
+            // per-element length counter
+            if let Some(an) = name.strip_prefix('#') {
+                return Ok(format!("${{{an}_len}}"));
+            }
             let off = raw_arg(args, 2)?;
             let len = args
                 .get(3)
