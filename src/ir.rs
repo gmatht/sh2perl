@@ -47,11 +47,77 @@ pub enum Sigil {
 //   Any  -> runtime store (mixed/unknown typing; shell vars are strings)
 // Populated by `shir::analyze_var_types`; serialized in the ShIR JSON
 // (ask A1). Existing backends ignore it (additive only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrType {
     Int,
     Str,
     Any,
+    /// IEEE-754 bit width (32 = float, 64 = double). Serialized as
+    /// `{"kind": "Float", "width": 64}` so the width survives the A1
+    /// round-trip; the unit variants stay plain strings (byte-identical
+    /// to the old derive output). Additive: backends that ignore the
+    /// annotation are unaffected.
+    Float(u8),
+}
+
+impl serde::Serialize for IrType {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            IrType::Int => s.serialize_unit_variant("IrType", 0, "Int"),
+            IrType::Str => s.serialize_unit_variant("IrType", 1, "Str"),
+            IrType::Any => s.serialize_unit_variant("IrType", 2, "Any"),
+            IrType::Float(w) => {
+                use serde::ser::SerializeStruct;
+                let mut st = s.serialize_struct("IrType", 2)?;
+                st.serialize_field("kind", "Float")?;
+                st.serialize_field("width", w)?;
+                st.end()
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for IrType {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = IrType;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an IrType (\"Int\"/\"Str\"/\"Any\" or {\"kind\":\"Float\",\"width\":N})")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<IrType, E> {
+                match v {
+                    "Int" => Ok(IrType::Int),
+                    "Str" => Ok(IrType::Str),
+                    "Any" => Ok(IrType::Any),
+                    other => Err(E::custom(format!("unknown IrType {other:?}"))),
+                }
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<IrType, A::Error> {
+                let mut kind: Option<String> = None;
+                let mut width: Option<u8> = None;
+                while let Some(k) = map.next_key::<String>()? {
+                    match k.as_str() {
+                        "kind" => kind = Some(map.next_value()?),
+                        "width" => width = Some(map.next_value()?),
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                match (kind.as_deref(), width) {
+                    (Some("Float"), Some(w)) => Ok(IrType::Float(w)),
+                    _ => Err(serde::de::Error::custom(
+                        "expected {\"kind\":\"Float\",\"width\":N}",
+                    )),
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 // ── Const/var annotations (the const-markup transform) ──────────────────
