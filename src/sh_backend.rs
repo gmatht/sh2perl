@@ -1401,13 +1401,34 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
     // a `'n=$1'` argument (the value would be the literal `$1`).
     if matches!(cmd_name, Some("local" | "export" | "readonly")) {
         let mut words: Vec<String> = Vec::new();
-        for a in args {
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
             match a {
                 IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {}
                 IrExpr::Str(s, _) => {
                     if let Some(eq) = s.find('=') {
                         let name = &s[..eq];
                         let val = &s[eq + 1..];
+                        if val.is_empty() && i + 1 < args.len() {
+                            // `local msg= "hello"` — the VALUE is the next
+                            // word (the core splits `local msg="hello"`
+                            // into ["msg=", "hello"])
+                            if let Some(next) = args.get(i + 1) {
+                                let is_flag = matches!(next, IrExpr::Str(x, _)
+                                    if x.starts_with('-') && x.len() > 1);
+                                if !is_flag {
+                                    let nv = word_to_sh(next)?;
+                                    if nv.is_empty() || nv == "''" || nv == "\"\"" {
+                                        words.push(name.to_string());
+                                    } else {
+                                        words.push(format!("{name}={nv}"));
+                                    }
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                        }
                         let needs_quote = val.contains(|c: char| {
                             c.is_whitespace() || matches!(c, '*' | '?' | '[' | ']' | '$' | '`')
                         });
@@ -1420,6 +1441,7 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
                         // `local x=` arrives as ["x=", Interpolate("")] —
                         // the empty word is the empty VALUE; the `name=`
                         // form already covers it (dash: `local ''` is an error)
+                        i += 1;
                         continue;
                     } else {
                         words.push(str_word(s));
@@ -1428,11 +1450,13 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
                 other => {
                     let w = word_to_sh(other)?;
                     if w.is_empty() || w == "''" || w == "\"\"" {
+                        i += 1;
                         continue;
                     }
                     words.push(w);
                 }
             }
+            i += 1;
         }
         if words.is_empty() {
             out.push_str(cmd_name.unwrap());
@@ -2276,10 +2300,18 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
         }
         return Ok(str_word(&s));
     }
-    let mut out = String::from("\"");
+    // emit adjacent quoted segments: close the quote after an Expr so a
+    // following literal cannot extend the variable name (`"$x"world` —
+    // `"$xworld"` would expand the var xworld)
+    let mut out = String::new();
+    let mut open = false;
     for p in parts {
         match p {
             InterpPart::Lit(t) => {
+                if !open {
+                    out.push('"');
+                    open = true;
+                }
                 for c in t.chars() {
                     match c {
                         '"' => out.push_str("\\\""),
@@ -2290,10 +2322,18 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
                     }
                 }
             }
-            InterpPart::Expr(x) => out.push_str(&interp_expr_to_sh(x)?),
+            InterpPart::Expr(x) => {
+                if open {
+                    out.push('"');
+                    open = false;
+                }
+                out.push_str(&interp_expr_to_sh(x)?);
+            }
         }
     }
-    out.push('"');
+    if open {
+        out.push('"');
+    }
     Ok(out)
 }
 
