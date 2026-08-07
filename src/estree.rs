@@ -1212,9 +1212,9 @@ mod tests {
     #[test]
     fn cut_dynamic_args_not_lifted() {
         // a dynamic cut arg (a variable position list) keeps the runtime
-        // pipeline + builtin
+        // pipeline + builtin — the sync twin (both stages are sync)
         let json = to_json("x=$(echo a:b:c | cut -d: -f$n)");
-        assert!(json.contains("\"name\":\"pipeline\""));
+        assert!(json.contains("\"name\":\"pipelineSync\""));
         assert!(!json.contains("\"name\":\"slice\""));
         assert!(!json.contains("\"name\":\"filter\""));
         assert!(!json.contains("unsupported"));
@@ -1393,14 +1393,22 @@ mod tests {
         let json2 = to_json("for i in a b c; do echo $i; done");
         assert!(json2.contains("\"type\":\"ForOfStatement\""));
         assert!(!json2.contains("\"name\":\"forLoopBatch\""));
-        // a batch_ok loop with an AWAITING body (a capture assign inside)
-        // never takes the batch path — the sync bodyFn cannot await
+        // a batch_ok loop whose body's capture is now SYNC (the *Sync
+        // family: `$(ls)` is a sync builtin → captureSync, no await) has
+        // an await-free body → the loop lifts to the NATIVE for-of (the
+        // best rung) — the old "awaiting body" premise only holds for
+        // genuinely async captures (spawns)
         let json3 = to_json("for i in 1 2 3; do x=$(ls); done");
         assert!(!json3.contains("\"name\":\"forLoopBatch\""));
         assert!(!json3.contains("\"name\":\"forLoopSync\""));
-        assert!(!json3.contains("\"type\":\"ForOfStatement\""));
-        assert!(json3.contains("\"name\":\"forLoop\""));
+        assert!(json3.contains("\"type\":\"ForOfStatement\""));
+        assert!(json3.contains("\"name\":\"captureSync\""));
+        assert!(!json3.contains("\"name\":\"forLoop\""));
         assert!(!json3.contains("unsupported"));
+        // a genuinely async capture (a spawn) keeps the async forLoop
+        let json5 = to_json("for i in 1 2 3; do x=$(awk '{print $1}'); done");
+        assert!(json5.contains("\"type\":\"AwaitExpression\""));
+        assert!(json5.contains("\"name\":\"forLoop\""));
     }
 
     #[test]
@@ -1435,18 +1443,19 @@ mod tests {
 
     #[test]
     fn seq_range_for_conservative_cases() {
-        // 3-arg step forms (`seq A S B`) keep the runtime path
+        // 3-arg step forms (`seq A S B`) keep the runtime path — the
+        // capture is sync now (seq is a sync builtin → captureWordsSync)
         let json = to_json("for i in $(seq 1 2 10); do echo $i; done");
-        assert!(json.contains("\"name\":\"captureWords\""));
+        assert!(json.contains("\"name\":\"captureWordsSync\""));
         assert!(!json.contains("\"type\":\"ForStatement\""));
         // leading-zero args (`seq 01 10` — GNU pads, bash arith is octal)
         let json2 = to_json("for i in $(seq 01 10); do echo $i; done");
-        assert!(json2.contains("\"name\":\"captureWords\""));
+        assert!(json2.contains("\"name\":\"captureWordsSync\""));
         assert!(!json2.contains("\"type\":\"ForStatement\""));
         // a body WRITE to the loop var keeps word-list semantics (a
         // counter's i++ would read the body-written value)
         let json3 = to_json("for i in $(seq 1 3); do i=99; echo $i; done");
-        assert!(json3.contains("\"name\":\"captureWords\""));
+        assert!(json3.contains("\"name\":\"captureWordsSync\""));
         assert!(!json3.contains("\"type\":\"ForStatement\""));
         // a nested loop binding the SAME var keeps the OUTER on the word
         // path (bash clobbers i in the body; a counter's i++ would read
@@ -1455,7 +1464,7 @@ mod tests {
         let json4 = to_json(
             "for i in $(seq 1 2); do for i in $(seq 10 12); do echo $i; done; done",
         );
-        assert!(json4.contains("\"name\":\"captureWords\""), "outer keeps the word list");
+        assert!(json4.contains("\"name\":\"captureWordsSync\""), "outer keeps the word list");
         assert!(json4.contains("\"type\":\"ForOfStatement\""), "outer is a word loop");
         assert!(json4.contains("\"type\":\"ForStatement\""), "inner is a counter loop");
     }
@@ -1561,29 +1570,44 @@ mod tests {
 
     #[test]
     fn pipeline_lowers_to_pipeline_call() {
+        // `ls | grep foo` — every stage is a SYNC builtin (native ls, the
+        // sync grep builtin), so the await-free pipeline dispatches to the
+        // sync twin pipelineSync — identical fd0/fd1 stage swaps minus the
+        // per-stage promise (the *Sync family, see src/shir.rs
+        // SYNC_TWIN_CALLS).
         let json = to_json("ls | grep foo");
-        assert!(json.contains("\"name\":\"pipeline\""));
+        assert!(json.contains("\"name\":\"pipelineSync\""));
         assert!(json.contains("\"type\":\"ArrowFunctionExpression\""));
         assert!(!json.contains("unsupported"));
+        // an exec stage (a spawn) keeps the async pipeline
+        let json2 = to_json("ls | awk '{print $1}'");
+        assert!(json2.contains("\"name\":\"pipeline\""));
+        assert!(json2.contains("\"type\":\"AwaitExpression\""));
     }
 
     #[test]
     fn command_substitution_uses_await_capture() {
         // Unquoted $(...) word-splits: captureWords returns an arg array.
-        // `$(date)` keeps captureWords (bash word-splits the date output)
-        // but the inner spawn is gone — the sync builtin twin runs inside.
+        // `$(date)` — the captured command is a SYNC builtin, so the
+        // await-free body dispatches to the sync twin captureWordsSync
+        // (the inner spawn is already gone — the sync builtin twin runs
+        // inside either way).
         let json = to_json("echo $(date)");
-        assert!(json.contains("\"name\":\"captureWords\""));
+        assert!(json.contains("\"name\":\"captureWordsSync\""));
         assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("\"value\":\"date\""));
         assert!(!json.contains("unsupported"));
-        // a non-liftable command substitution keeps the await capture
-        // machinery: captureWords for unquoted, capture for quoted.
+        // `$(ls)` is sync-builtin too (native ls) → captureSync, no await
         let json3 = to_json("echo $(ls)");
-        assert!(json3.contains("\"type\":\"AwaitExpression\""));
-        assert!(json3.contains("\"name\":\"captureWords\""));
+        assert!(!json3.contains("\"type\":\"AwaitExpression\""));
+        assert!(json3.contains("\"name\":\"captureWordsSync\""));
+        // a genuinely async captured command (a spawn) keeps the async
+        // capture machinery: captureWords for unquoted, capture for quoted.
+        let json4 = to_json("echo $(awk '{print $1}')");
+        assert!(json4.contains("\"type\":\"AwaitExpression\""));
+        assert!(json4.contains("\"name\":\"captureWords\""));
         let json2 = to_json("echo \"$(ls)\"");
-        assert!(json2.contains("\"name\":\"capture\""));
+        assert!(json2.contains("\"name\":\"captureSync\""));
         assert!(!json2.contains("captureWords"));
     }
 
@@ -1666,9 +1690,12 @@ mod tests {
         assert!(!json.contains("\"name\":\"redirect\""));
         assert!(!json.contains("\"name\":\"builtin\""));
         assert!(!json.contains("unsupported"));
-        // non-echo bodies keep the runtime redirect
+        // non-echo bodies keep the runtime redirect — `ls` is a sync
+        // builtin, so the await-free redirect dispatches to the sync twin
+        // redirectSync (the *Sync family; the async `redirect` only when a
+        // body/target awaits)
         let json2 = to_json("ls > out.txt");
-        assert!(json2.contains("\"name\":\"redirect\""));
+        assert!(json2.contains("\"name\":\"redirectSync\""));
         // Property keys serialize as {key: Identifier{name}, value: Literal}.
         assert!(json2.contains("\"name\":\"mode\""));
         assert!(json2.contains("\"value\":\"w\""));
@@ -1709,9 +1736,16 @@ mod tests {
 
     #[test]
     fn subshell_lowers_to_subshell_call() {
+        // `(echo hi)` — the body is a sync builtin, so the await-free
+        // subshell dispatches to the sync twin subshellSync (identical
+        // state copy/restore minus the per-call promise).
         let json = to_json("(echo hi)");
-        assert!(json.contains("\"name\":\"subshell\""));
+        assert!(json.contains("\"name\":\"subshellSync\""));
         assert!(!json.contains("unsupported"));
+        // a spawn inside keeps the async subshell
+        let json2 = to_json("(awk '{print $1}')");
+        assert!(json2.contains("\"name\":\"subshell\""));
+        assert!(json2.contains("\"type\":\"AwaitExpression\""));
     }
 
     #[test]
@@ -1955,8 +1989,10 @@ mod tests {
         // whitespace IFS).
         let json = to_json("IFS=, read a b c <<< \"1,2,3\"");
         // the redirect wraps the env-carrying read (the env stays on the
-        // command; the no-op `true` split is gone)
-        assert!(json.contains("\"name\":\"redirect\""));
+        // command; the no-op `true` split is gone) — the await-free body
+        // + literal herestring target dispatch to the sync twin
+        // redirectSync
+        assert!(json.contains("\"name\":\"redirectSync\""));
         assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("\"value\":\"read\""));
         // the env object's property key is an Identifier (prop() renders
@@ -2011,7 +2047,9 @@ mod tests {
         let json2 = to_json("mapfile -t lines < <(printf 'x\\ny\\n')");
         assert!(!json2.contains("\"name\":\"unsupported\""));
         assert!(!json2.contains("\"value\":\"unsupported\""));
-        assert!(json2.contains("\"name\":\"redirect\""));
+        // the producer + mapfile body are both sync builtins → the
+        // await-free redirect dispatches to the sync twin redirectSync
+        assert!(json2.contains("\"name\":\"redirectSync\""));
         assert!(json2.contains("\"name\":\"builtin\""));
     }
 }

@@ -20418,7 +20418,29 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                             out.push(expr_to_estree(stage));
                         }
                         if changed {
-                            return sh2_call("pipeline", vec![array(out)]);
+                            // The pipeline call must be SELF-CONTAINED (awaited
+                            // or the *Sync twin): the old bare un-awaited
+                            // `sh2.pipeline(...)` relied on the enclosing
+                            // async arrow's implicit promise-flattening, which
+                            // the *Sync twins broke (a dangling pipeline's
+                            // late fd-table restore clobbered a LATER capture's
+                            // buffer — `tee_result=$(echo x | tee f)` followed
+                            // by `perl_result=$(perl ...)` read the tee's
+                            // leftover buffer). Await-free stages → the sync
+                            // twin (arrows flipped); any remaining await → the
+                            // awaited async form (the statement arm's re-await
+                            // is a harmless identity).
+                            let call = sh2_call("pipeline", vec![array(out.clone())]);
+                            return if expr_has_await(&call) {
+                                await_expr(call)
+                            } else {
+                                sh2_call(
+                                    "pipelineSync",
+                                    vec![array(
+                                        out.into_iter().map(sync_arrow_flip_deep).collect(),
+                                    )],
+                                )
+                            };
                         }
                     }
                 }
