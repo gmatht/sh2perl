@@ -10024,8 +10024,27 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }
                 }
             }
+            // A bare `sh2.pipeline(...)` STATEMENT (no &&/||/guard
+            // context) must be AWAITED: the runtime pipeline is async and
+            // mutates the shared fd table (stage fd0/fd1 swaps), and its
+            // deferred finally restores the whole object — an un-awaited
+            // call overlaps the NEXT statement's async window (capture/
+            // redirect/subshell save+restore the same object, so the late
+            // restores clobber each other — a `$(...)` capture after a
+            // pipeline could read fdTargets[1] as the restored stdout
+            // instead of its capture buffer). Subshell/redirect/exec
+            // statements already await (`is_async_call`); the pipeline
+            // statement joins them — the runtime's sequential fd model.
+            // Expression-position pipelines (&&/||/if operands) are
+            // already awaited at their own emission site (see
+            // expr_to_estree's async-call await).
+            let lowered = expr_to_estree(e);
             Stmt::ExpressionStatement {
-                expression: expr_to_estree(e),
+                expression: if sh2_callee_name(&lowered) == Some("pipeline") {
+                    await_expr(lowered)
+                } else {
+                    lowered
+                },
             }
         }
         IrStmt::Assign { targets, expr } => {
@@ -15860,6 +15879,71 @@ fn try_native_echo_grep(pipe: &IrExpr) -> Option<(Expr, Vec<Expr>)> {
     Some((text, argv))
 }
 
+/// `echo ARGS` as a NON-LAST pipeline stage whose args are all
+/// compile-time static: the exact text the echo builtin would write into
+/// the pipe — the `echo_join_args` join plus the trailing newline
+/// (unless `-n`) — for the pipeline string-stage collapse (see the
+/// `func == "pipeline"` arm in `expr_to_estree`). The stage shape is the
+/// sync-builtin arrow `Arrow([Expr(exec/builtin("echo", [... ]))])`.
+/// Static means the arg text cannot depend on anything evaluated between
+/// pipeline-CALL time (where the string expression computes) and
+/// stage-RUN time (where the arrow would run): literals, all-literal
+/// interpolations and literal arrays (brace expansions) only — no
+/// `$var`/`$(...)`/`$((...))` reads, no glob/PS/badsub magic (see
+/// [`ir_expr_compile_time`]).
+fn try_echo_stage_text(stage: &IrExpr) -> Option<Expr> {
+    let IrExpr::Arrow(stmts) = stage else {
+        return None;
+    };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stmts.as_slice() else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args.as_slice() else {
+        return None;
+    };
+    if name != "echo" {
+        return None;
+    }
+    if echo_args.iter().any(|a| !ir_expr_compile_time(a)) {
+        return None;
+    }
+    let (joined, no_newline, _) = echo_join_args(echo_args)?;
+    Some(if no_newline {
+        joined
+    } else {
+        Expr::BinaryExpression {
+            operator: "+".to_string(),
+            left: Box::new(joined),
+            right: Box::new(str_lit("\n")),
+        }
+    })
+}
+
+/// Is the expression's value fully determined at compile time — literals,
+/// all-literal quoted words, and literal arrays (brace expansions)? The
+/// pipeline string-stage collapse evaluates the stage text at
+/// pipeline-CALL time, so a dynamic read (`$var`, `$(...)`, glob/badsub
+/// magic) could in principle differ from the stage-run value (earlier
+/// stages run in between for non-first stages) — only compile-time text
+/// is sound. GLOB_MAGIC / PS_MAGIC / raw-byte markers are runtime
+/// transforms, never compile-time.
+fn ir_expr_compile_time(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Str(s, _) => {
+            !s.contains(GLOB_MAGIC)
+                && !s.contains(PS_MAGIC)
+                && !s.chars().any(|c| (0xF800..=0xF8FF).contains(&(c as u32)))
+        }
+        IrExpr::Interpolate(parts) => parts.iter().all(|p| matches!(p, InterpPart::Lit(_))),
+        IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_) => true,
+        IrExpr::Array(elems) => elems.iter().all(ir_expr_compile_time),
+        _ => false,
+    }
+}
+
 /// The static text of an IR expression: a plain `Str` or a quoted word
 /// with no expansions (an all-literal Interpolate — `"hello"` arrives as
 /// Interpolate, not Str). Used by the grep-argv validator to accept both.
@@ -17535,6 +17619,69 @@ fn try_native_compound_test(s: &str) -> Option<Expr> {
 /// the lifted var's value is inlined instead of read from the store, which
 /// it is no longer in). Handles `$name`, `${name}`, and bare names inside
 /// `$(( ... ))` arith regions. Returns None when nothing is injected.
+/// Split a `${...}` parameter-expansion inner (`p##*/`, `x:-def`, `s:2:3`,
+/// `x//a/b`) into (name, op, a, b) — the subset the runtime's `sh2.param`
+/// switch implements, for the lifted-value override form (see
+/// `test_str_to_estree`). The name must be a plain identifier; the op must
+/// be a supported one; anything else (bad substitution, `${#x}` length,
+/// nested defaults with an inner `}`) returns None and the caller keeps
+/// the text literal (the runtime's own tokenizer/expandWord handles
+/// store-backed names). Order matters: `##` before `#`, `%%` before `%`,
+/// `^^`/`,,` before the single-char cases.
+fn split_test_param(inner: &str) -> Option<(String, String, String, String)> {
+    let bytes = inner.as_bytes();
+    let mut k = 0usize;
+    while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+        k += 1;
+    }
+    if k == 0 {
+        return None;
+    }
+    let name = inner[..k].to_string();
+    let rest = &inner[k..];
+    if rest.is_empty() {
+        return None; // plain `${name}` — the caller's is_lifted path handles it
+    }
+    let (op, a, b) = if let Some(r) = rest.strip_prefix("##") {
+        ("##", r.to_string(), String::new())
+    } else if let Some(r) = rest.strip_prefix('#') {
+        ("#", r.to_string(), String::new())
+    } else if let Some(r) = rest.strip_prefix("%%") {
+        ("%%", r.to_string(), String::new())
+    } else if let Some(r) = rest.strip_prefix('%') {
+        ("%", r.to_string(), String::new())
+    } else if rest.starts_with("^^") {
+        ("^^", String::new(), String::new())
+    } else if rest.starts_with(",,") {
+        (",,", String::new(), String::new())
+    } else if rest.starts_with('^') {
+        ("^", String::new(), String::new())
+    } else if let Some(r) = rest.strip_prefix("//") {
+        let sl = r.find('/')?;
+        ("//", r[..sl].to_string(), r[sl + 1..].to_string())
+    } else if let Some(r) = rest.strip_prefix('/') {
+        let sl = r.find('/')?;
+        ("/", r[..sl].to_string(), r[sl + 1..].to_string())
+    } else if let Some(r) = rest.strip_prefix(":-") {
+        (":-", r.to_string(), String::new())
+    } else if let Some(r) = rest.strip_prefix(":=") {
+        (":=", r.to_string(), String::new())
+    } else if let Some(r) = rest.strip_prefix(":?") {
+        (":?", r.to_string(), String::new())
+    } else if let Some(r) = rest.strip_prefix(':') {
+        // `${s:off:len}` slice
+        let sl = r.find(':').unwrap_or(r.len());
+        (
+            "slice",
+            r[..sl].to_string(),
+            r[sl..].strip_prefix(':').unwrap_or("").to_string(),
+        )
+    } else {
+        return None;
+    };
+    Some((name, op.to_string(), a, b))
+}
+
 fn test_str_to_estree(s: &str) -> Option<Expr> {
     let bytes = s.as_bytes();
     let mut quasis: Vec<String> = Vec::new();
@@ -17592,12 +17739,40 @@ fn test_str_to_estree(s: &str) -> Option<Expr> {
         }
         if bytes[i] == b'$' && i + 1 < n && bytes[i + 1] == b'{' {
             if let Some(close) = s[i + 2..].find('}') {
-                let name = &s[i + 2..i + 2 + close];
+                let inner = &s[i + 2..i + 2 + close];
                 let end = i + 2 + close + 1;
-                if is_lifted(name) {
+                if is_lifted(inner) {
                     quasis.push(std::mem::take(&mut lit));
-                    exprs.push(Expr::Identifier { name: name.to_string() });
+                    exprs.push(Expr::Identifier { name: inner.to_string() });
                     changed = true;
+                } else if let Some((name, op, a, b)) = split_test_param(inner) {
+                    // `${name op args}` on a LIFTED variable: the runtime
+                    // would read the STORE by string name — a lifted
+                    // binding is not there — so inject the value as the
+                    // trailing override argument (see the param arm in
+                    // expr_to_estree): `sh2.param(op, name, a, b, value)`
+                    // runs the exact runtime op over the inlined binding.
+                    // STORE-BACKED names stay literal text — the runtime's
+                    // own tokenizer expands them (its `${...}` pm regex
+                    // handles the split-at-space missing-brace shapes).
+                    if is_lifted(&name) {
+                        quasis.push(std::mem::take(&mut lit));
+                        exprs.push(sh2_call(
+                            "param",
+                            vec![
+                                str_lit(&op),
+                                str_lit(&name),
+                                str_lit(&a),
+                                str_lit(&b),
+                                Expr::Identifier {
+                                    name: name.clone(),
+                                },
+                            ],
+                        ));
+                        changed = true;
+                    } else {
+                        lit.push_str(&s[i..end]);
+                    }
                 } else {
                     lit.push_str(&s[i..end]);
                 }
@@ -20121,6 +20296,53 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                 bool_lit(false),
                             ],
                         );
+                    }
+                }
+                // `echo ARGS | ...` — a NON-LAST pipeline stage whose args
+                // are all compile-time static (see [`try_echo_stage_text`]):
+                // the exact bytes the echo builtin would write into the pipe
+                // are the `echo_join_args` join (+ the trailing newline
+                // unless `-n`), so the stage becomes a plain STRING
+                // expression in the stage array and the runtime's pipeline
+                // skips the builtin dispatch + fd juggling for it (see
+                // harness sh2-namespace.mjs `pipeline`: a non-function
+                // stage IS the produced text). The `(sh2.lastExit = 0,
+                // text)` sequence preserves echo's status — a later stage's
+                // `$?` read observes exactly what the arrow form records.
+                // Soundness: compile-time args produce the same text at
+                // pipeline-CALL time as the arrow would at stage-RUN time
+                // (earlier stages' side effects cannot skew a value that
+                // does not read anything). Script-defined `echo` functions
+                // shadow the builtin → keep the arrow (the runtime
+                // dispatches to the function).
+                if !program_defines_function("echo") {
+                    if let [IrExpr::Array(stages)] = args.as_slice() {
+                        let mut out: Vec<Expr> = Vec::with_capacity(stages.len());
+                        let mut changed = false;
+                        for (i, stage) in stages.iter().enumerate() {
+                            if i + 1 < stages.len() {
+                                if let Some(text) = try_echo_stage_text(stage) {
+                                    out.push(seq(vec![
+                                        Expr::AssignmentExpression {
+                                            operator: "=".to_string(),
+                                            left: Box::new(sh2_member("lastExit")),
+                                            right: Box::new(Expr::Literal {
+                                                value: serde_json::Value::from(0),
+                                                raw: None,
+                                                regex: None,
+                                            }),
+                                        },
+                                        text,
+                                    ]));
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                            out.push(expr_to_estree(stage));
+                        }
+                        if changed {
+                            return sh2_call("pipeline", vec![array(out)]);
+                        }
                     }
                 }
             }
