@@ -1739,12 +1739,12 @@ mod tests {
         assert!(json2.contains("FOO"));
         // `ls` is a native sync builtin too (the GNU-faithful native
         // listing — no spawn), so the env-carrying form lowers to the
-        // sync twin as well; a genuinely external name (cp) keeps the
+        // sync twin as well; a genuinely external name (awk) keeps the
         // async exec call.
         let json3 = to_json("FOO=bar ls x");
         assert!(json3.contains("\"name\":\"builtin\""));
         assert!(json3.contains("FOO"));
-        let json4 = to_json("FOO=bar cp x y");
+        let json4 = to_json("FOO=bar awk x");
         assert!(json4.contains("\"name\":\"exec\""));
         assert!(json4.contains("FOO"));
     }
@@ -2000,7 +2000,11 @@ mod tests {
         assert!(!json.contains("\"name\":\"unsupported\""));
         assert!(!json.contains("\"value\":\"unsupported\""));
         assert!(!json.contains("\"name\":\"trimCapture\""));
-        assert!(json.contains("\"name\":\"exec\""));
+        // diff is a native sync builtin now (the GNU-faithful gnuDiff —
+        // no spawn), so the producer-capture form lowers to the sync
+        // builtin dispatch; an external name (awk) keeps the async exec.
+        let jsona = to_json("awk <(echo a) <(echo b)");
+        assert!(jsona.contains("\"name\":\"exec\""));
         // mapfile is stdin-only: no appended path argument, still no gate leak
         // (the producer's capture is lowered as a here-string fd-0 redirect
         // feeding the sync mapfile builtin — no async capture machinery).

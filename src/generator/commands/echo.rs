@@ -57,6 +57,21 @@ pub fn generate_echo_command(
                             "?" => "$CHILD_ERROR".to_string(),
                             "!" => "''".to_string(),
                             "-" => "''".to_string(),
+                            // `$0` is argv0 (the script name), NOT a positional
+                            // param — and $1/$2/… map to @ARGV (top level) or
+                            // @_ (inside a function), like word_to_perl does.
+                            // (Bare `$0`/`$1` in echo used to fall through to
+                            // `$ENV{0}`/`$ENV{1}`, which are never set.)
+                            _ if var.chars().all(|c| c.is_ascii_digit()) => {
+                                let idx = var.parse::<usize>().unwrap_or(0);
+                                if idx == 0 {
+                                    "$0".to_string()
+                                } else if generator.fn_nesting_depth > 0 {
+                                    format!("$_[{}]", idx - 1)
+                                } else {
+                                    format!("$ARGV[{}]", idx - 1)
+                                }
+                            }
                             _ => {
                                 if generator.declared_locals.contains(var)
                                     || generator.function_level_vars.contains(var)
@@ -79,6 +94,19 @@ pub fn generate_echo_command(
                                     "?" => "$CHILD_ERROR".to_string(),
                                     "!" => "''".to_string(),
                                     "-" => "''".to_string(),
+                                    // Same argv0/positional treatment as the
+                                    // Word::Variable arm above (quoted `"$0"`
+                                    // used to render as $ENV{0}).
+                                    _ if var.chars().all(|c| c.is_ascii_digit()) => {
+                                        let idx = var.parse::<usize>().unwrap_or(0);
+                                        if idx == 0 {
+                                            "$0".to_string()
+                                        } else if generator.fn_nesting_depth > 0 {
+                                            format!("$_[{}]", idx - 1)
+                                        } else {
+                                            format!("$ARGV[{}]", idx - 1)
+                                        }
+                                    }
                                     _ => {
                                         if generator.declared_locals.contains(var)
                                             || generator.function_level_vars.contains(var)
@@ -190,6 +218,19 @@ pub fn generate_echo_command(
                                                 "?" => result.push_str("$CHILD_ERROR"),
                                                 "!" => result.push_str(""),
                                                 "-" => result.push_str(""),
+                                                // Same argv0/positional treatment
+                                                // as the other arms (multi-part
+                                                // interp with -e).
+                                                _ if var.chars().all(|c| c.is_ascii_digit()) => {
+                                                    let idx = var.parse::<usize>().unwrap_or(0);
+                                                    if idx == 0 {
+                                                        result.push_str("$0");
+                                                    } else if generator.fn_nesting_depth > 0 {
+                                                        result.push_str(&format!("$_[{}]", idx - 1));
+                                                    } else {
+                                                        result.push_str(&format!("$ARGV[{}]", idx - 1));
+                                                    }
+                                                }
                                                 _ => {
                                                     if generator.declared_locals.contains(var)
                                                         || generator.function_level_vars.contains(var)
