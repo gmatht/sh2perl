@@ -1128,6 +1128,16 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                         Ok(format!(
                             "case \"{lhs}\" in *{rest}) case \"{lhs}\" in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
                         ))
+                    } else if let Some(inner) = rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')')) {
+                        // extglob list match: `@(a|b)` == `a|b`
+                        Ok(format!(
+                            "case \"{lhs}\" in {inner}) : ;; *) false ;; esac"
+                        ))
+                    } else if let Some(inner) = rhs.strip_prefix("?(").and_then(|r| r.strip_suffix(')')) {
+                        // optional: `?(a|b)` matches empty or a|b
+                        Ok(format!(
+                            "case \"{lhs}\" in |{inner}) : ;; *) false ;; esac"
+                        ))
                     } else if *NOCASEMATCH.lock().unwrap() {
                         Ok(format!(
                             "case \"{lhs}\" in {}) : ;; *) false ;; esac",
@@ -1653,6 +1663,34 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
                     _ => {}
                 }
             }
+            // plain `echo ARGS` — dash's echo INTERPRETS backslashes,
+            // bash's does not: with a backslash-y arg the printf form
+            // (same as -E) keeps the bytes verbatim
+            let mut words = Vec::new();
+            for a in args {
+                words.push(word_to_sh(a)?);
+            }
+            let joined = words.join(" ");
+            // dash's echo INTERPRETS backslashes, bash's does not — the
+            // printf form keeps the bytes verbatim for any arg whose
+            // RUNTIME value can contain backslashes (quoted vars,
+            // cmdsubs) or that already shows a literal one. `$@`/`$*`
+            // list args are excluded (the %s count is unknowable).
+            // all-quoted args only: printf with several args prints
+            // separate LINES, while `echo $(ls)` joins the split words
+            // with a space — an unquoted expansion keeps the bare echo
+            let needs_printf = !words.is_empty()
+                && words.iter().all(|w| {
+                    w.contains('\\') || (w.starts_with('"') && !w.contains("$@") && !w.contains("$*"))
+                });
+            if needs_printf {
+                let fmt = words
+                    .iter()
+                    .map(|_| "%s")
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                return Ok(format!("printf '{fmt}\\n' {joined}"));
+            }
         }
     }
     // `grep -P PAT` — PCRE. ERE-safe patterns lower to `grep -E` inline;
@@ -2131,7 +2169,9 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
         // the quote is the safe default). Array/list forms stay bare.
         "param" => {
             let s = param_to_sh(args, false)?;
-            if s.starts_with("$(_arr_") || s.starts_with("$(shift") {
+            // the "" arm already returns a quoted segment — never
+            // re-wrap (`""$x""` would field-split the value)
+            if s.starts_with('"') || s.starts_with("$(_arr_") || s.starts_with("$(shift") {
                 Ok(s)
             } else {
                 Ok(format!("\"{s}\"", ))
@@ -2452,11 +2492,13 @@ fn join_to_sh(inner: &IrExpr, quoted: bool) -> Result<String, String> {
         }
         _ => word_to_sh(inner)?,
     };
-    // array expansions are already word lists — never re-quote them
+    // array expansions are already word lists, and param renders are
+    // already quoted — never re-quote them (`""$x""` would leave an
+    // UNQUOTED segment and field-split the value)
     if s.starts_with("$(_arr_expand") || s.starts_with("$(_arr_keys") {
         Ok(s)
     } else {
-        Ok(if quoted { format!("\"{s}\"") } else { s })
+        Ok(if quoted && !s.starts_with('"') { format!("\"{s}\"") } else { s })
     }
 }
 
@@ -2471,12 +2513,14 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
         }
         return Ok(str_word(&s));
     }
-    // emit adjacent quoted segments: close the quote after an Expr so a
-    // following literal cannot extend the variable name (`"$x"world` —
-    // `"$xworld"` would expand the var xworld)
+    // emit adjacent quoted segments: an Expr closes the quote ONLY when
+    // the next part is a literal that could extend the variable name
+    // (`"$x"world` — `"$xworld"` would expand the var xworld). A trailing
+    // Expr stays INSIDE the quotes (`"brace_expand: $result"`).
     let mut out = String::new();
     let mut open = false;
-    for p in parts {
+    let mut it = parts.iter().peekable();
+    while let Some(p) = it.next() {
         match p {
             InterpPart::Lit(t) => {
                 if !open {
@@ -2494,7 +2538,15 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
                 }
             }
             InterpPart::Expr(x) => {
-                if open {
+                let need_break = matches!(
+                    it.peek(),
+                    Some(InterpPart::Lit(n)) if n
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                        .unwrap_or(false)
+                );
+                if open && need_break {
                     out.push('"');
                     open = false;
                 }
