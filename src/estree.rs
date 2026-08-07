@@ -316,11 +316,9 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
         Stmt::BreakStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
             expression: sh2_call("break", vec![]),
         },
-        Stmt::ContinueStatement { label } if in_arrow && !in_switch => {
-            Stmt::ExpressionStatement {
-                expression: sh2_call("continue", vec![]),
-            }
-        }
+        Stmt::ContinueStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
+            expression: sh2_call("continue", vec![]),
+        },
         Stmt::ReturnStatement { argument } if !in_arrow || !in_func => {
             let mut args = vec![];
             if let Some(a) = argument {
@@ -346,15 +344,13 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
         } => Stmt::IfStatement {
             test: fix_expr(test, in_arrow, in_func),
             consequent: Box::new(
-                fix_stmt(*consequent, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
-                    body: vec![],
-                }),
+                fix_stmt(*consequent, in_arrow, in_func, false)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
             alternate: alternate.map(|a| {
                 Box::new(
-                    fix_stmt(*a, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
-                        body: vec![],
-                    }),
+                    fix_stmt(*a, in_arrow, in_func, false)
+                        .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )
             }),
         },
@@ -379,22 +375,16 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
         Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
             test: fix_expr(test, in_arrow, in_func),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
-                    body: vec![],
-                }),
+                fix_stmt(*body, in_arrow, in_func, false)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
-        Stmt::ForOfStatement {
-            left,
-            right,
-            body,
-        } => Stmt::ForOfStatement {
+        Stmt::ForOfStatement { left, right, body } => Stmt::ForOfStatement {
             left,
             right: fix_expr(right, in_arrow, in_func),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
-                    body: vec![],
-                }),
+                fix_stmt(*body, in_arrow, in_func, false)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
         Stmt::ForStatement {
@@ -404,22 +394,17 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
             body,
         } => Stmt::ForStatement {
             init: Box::new(
-                fix_stmt(*init, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
-                    body: vec![],
-                }),
+                fix_stmt(*init, in_arrow, in_func, false)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
             test: fix_expr(test, in_arrow, in_func),
             update: fix_expr(update, in_arrow, in_func),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
-                    body: vec![],
-                }),
+                fix_stmt(*body, in_arrow, in_func, false)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
-        Stmt::VariableDeclaration {
-            declarations,
-            kind,
-        } => Stmt::VariableDeclaration {
+        Stmt::VariableDeclaration { declarations, kind } => Stmt::VariableDeclaration {
             declarations: declarations
                 .into_iter()
                 .map(|d| VariableDeclarator {
@@ -481,11 +466,12 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
         } => Expr::ArrowFunctionExpression {
             params,
             body: match body {
-                ArrowBody::Expr(inner) => ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func))),
+                ArrowBody::Expr(inner) => {
+                    ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func)))
+                }
                 ArrowBody::Block(b) => ArrowBody::Block(Box::new(
-                    fix_stmt(*b, true, in_func, false).unwrap_or(Stmt::BlockStatement {
-                        body: vec![],
-                    }),
+                    fix_stmt(*b, true, in_func, false)
+                        .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )),
             },
             expression,
@@ -518,7 +504,10 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             raw,
             regex,
         },
-        Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
+        Expr::TemplateLiteral {
+            quasis,
+            expressions,
+        } => Expr::TemplateLiteral {
             quasis: quasis
                 .into_iter()
                 .map(|q| TemplateElement {
@@ -605,7 +594,12 @@ const PS_MAGIC: &str = "\u{1}SH2PS\u{1}";
 fn stdin_only_command(name: Option<&str>) -> bool {
     matches!(
         name,
-        Some("mapfile") | Some("readarray") | Some("head") | Some("tail") | Some("cat") | Some("wc")
+        Some("mapfile")
+            | Some("readarray")
+            | Some("head")
+            | Some("tail")
+            | Some("cat")
+            | Some("wc")
     )
 }
 
@@ -670,14 +664,8 @@ fn transform_cmd(cmd: &Command) -> Command {
             p.commands = p.commands.iter().map(transform_cmd).collect();
             Command::Pipeline(p)
         }
-        Command::And(l, r) => Command::And(
-            Box::new(transform_cmd(l)),
-            Box::new(transform_cmd(r)),
-        ),
-        Command::Or(l, r) => Command::Or(
-            Box::new(transform_cmd(l)),
-            Box::new(transform_cmd(r)),
-        ),
+        Command::And(l, r) => Command::And(Box::new(transform_cmd(l)), Box::new(transform_cmd(r))),
+        Command::Or(l, r) => Command::Or(Box::new(transform_cmd(l)), Box::new(transform_cmd(r))),
         Command::Not(c) => Command::Not(Box::new(transform_cmd(c))),
         Command::Background(c) => Command::Background(Box::new(transform_cmd(c))),
         Command::Subshell(c) => Command::Subshell(Box::new(transform_cmd(c))),
@@ -685,9 +673,7 @@ fn transform_cmd(cmd: &Command) -> Command {
             let mut i = i.clone();
             i.condition = Box::new(transform_cmd(&i.condition));
             i.then_branch = Box::new(transform_cmd(&i.then_branch));
-            i.else_branch = i
-                .else_branch
-                .map(|b| Box::new(transform_cmd(&b)));
+            i.else_branch = i.else_branch.map(|b| Box::new(transform_cmd(&b)));
             Command::If(i)
         }
         Command::Case(c) => {
@@ -744,7 +730,10 @@ fn transform_cmd(cmd: &Command) -> Command {
 fn is_unterminated_param_literal(w: &Word) -> bool {
     let joined = match w {
         Word::StringInterpolation(interp, _)
-            if interp.parts.iter().all(|p| matches!(p, StringPart::Literal(_))) =>
+            if interp
+                .parts
+                .iter()
+                .all(|p| matches!(p, StringPart::Literal(_))) =>
         {
             interp
                 .parts
@@ -1084,15 +1073,24 @@ mod tests {
         // codes), so a program-final if KEEPS its false-path write.
         let json = to_json("if false; then echo yes; fi");
         assert!(json.contains("\"type\":\"IfStatement\""));
-        assert!(json.contains("\"alternate\":{\"type\""), "program-final status read → else kept");
+        assert!(
+            json.contains("\"alternate\":{\"type\""),
+            "program-final status read → else kept"
+        );
         assert!(!json.contains("unsupported"));
         // a READER keeps the write: `; echo $?` observes the false-path 0
         let json2 = to_json("if false; then echo yes; fi; echo $?");
-        assert!(json2.contains("\"alternate\":{\"type\""), "read status → else kept");
+        assert!(
+            json2.contains("\"alternate\":{\"type\""),
+            "read status → else kept"
+        );
         assert!(!json2.contains("unsupported"));
         // a later WRITER shadows the if's status → the write is dead again
         let json3 = to_json("if false; then echo yes; fi; false; echo $?");
-        assert!(json3.contains("\"alternate\":null"), "shadowed by `false` → no else");
+        assert!(
+            json3.contains("\"alternate\":null"),
+            "shadowed by `false` → no else"
+        );
         assert!(!json3.contains("unsupported"));
     }
 
@@ -1127,7 +1125,10 @@ mod tests {
         let json = to_json("i=42; echo \"$i\"");
         assert!(json.contains("\"name\":\"String\""));
         assert!(!json.contains("\"name\":\"join\""), "single arg: no join");
-        assert!(!json.contains("\"type\":\"ArrayExpression\""), "single arg: no array");
+        assert!(
+            !json.contains("\"type\":\"ArrayExpression\""),
+            "single arg: no array"
+        );
         assert!(!json.contains("unsupported"));
         // unquoted: the split arg keeps the flat/join path
         let json_unq = to_json("i=42; echo $i");
@@ -1145,8 +1146,66 @@ mod tests {
         assert!(json3.contains("\"name\":\"flat\""));
         assert!(!json3.contains("unsupported"));
         let json4 = to_json("x=$(echo 1 2 3); echo \"$x\"");
-        assert!(!json4.contains("\"name\":\"join\""), "capture-assigned var is a scalar");
+        assert!(
+            !json4.contains("\"name\":\"join\""),
+            "capture-assigned var is a scalar"
+        );
         assert!(!json4.contains("unsupported"));
+    }
+
+    #[test]
+    fn join_of_string_slice_chain_is_identity() {
+        // `${name:0:4}` — the param-slice lowering emits
+        // `String(name).slice(0, 4)` and the interpolation joins it. The
+        // join of a provably-STRING value is identity (the runtime join is
+        // `Array.isArray(v) ? v.join(" ") : String(v)`), so the runtime
+        // call must disappear even when the chain carries call args
+        // (`String(name).slice(0, 4)` is a CallExpression whose callee is
+        // the `.slice` member — the old root-only scan missed it and left
+        // 5 corpus sites on the runtime join).
+        let json = to_json("n=hello; echo \"${n:0:4}\"");
+        assert!(json.contains("\"name\":\"slice\""));
+        assert!(!json.contains("\"name\":\"join\""), "no runtime join");
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn set_double_dash_assigns_positionals_natively() {
+        // `set -- a b c d` — the `--` marker ends the option list: the
+        // remaining args are the POSITIONALS. The flag path must not
+        // swallow them (its `try_native_set_flags` treats `--` as a flag
+        // with no letters and would emit only `(lastExit = 0, true)` —
+        // the positional write lost — parse-at-slice.sh printed ""
+        // instead of "c d").
+        let json = to_json("set -- a b c d; echo \"${@:3}\"");
+        assert!(json.contains("\"property\":{\"type\":\"Identifier\",\"name\":\"positional\"")
+            || json.contains("\"name\":\"positional\""));
+        assert!(
+            json.contains("\"name\":\"set\"") || json.contains("\"value\":\"a\""),
+            "the positionals a b c d are assigned"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn capture_words_single_word_wc_count_is_native() {
+        // `local size=$(wc -c < f)` — the UNQUOTED capture form: the
+        // runtime splits the capture on IFS whitespace. The wc count is
+        // provably a single word (digits), so the machinery collapses to
+        // a native readFile + byte-count inside the promise's success
+        // branch (a failed redirect yields "" — the count must not apply
+        // to the error sentinel, and an empty file must still count 0).
+        let json = to_json(
+            "f() { local size=$(wc -c < /etc/hostname); echo \"size=$size\"; }; f",
+        );
+        assert!(
+            !json.contains("\"name\":\"captureWords\""),
+            "no captureWords machinery"
+        );
+        assert!(json.contains("\"name\":\"readFile\""));
+        assert!(json.contains("\"name\":\"then\""), "the count maps inside the promise");
+        assert!(!json.contains("\"value\":\"wc\""), "no wc dispatch");
+        assert!(!json.contains("unsupported"));
     }
 
     #[test]
@@ -1155,9 +1214,7 @@ mod tests {
         // as a test) is a substring test — no echo/grep spawns, no pipeline;
         // the emitter inlines the ShIR `contains` call to a NATIVE
         // `String(h).includes(n)` (src/shir.rs expr_to_estree).
-        let json = to_json(
-            "if echo hi | grep hi > /dev/null 2> /dev/null; then echo yes; fi",
-        );
+        let json = to_json("if echo hi | grep hi > /dev/null 2> /dev/null; then echo yes; fi");
         assert!(json.contains("\"name\":\"includes\""));
         assert!(json.contains("\"name\":\"String\""));
         assert!(!json.contains("pipeline"));
@@ -1317,12 +1374,11 @@ mod tests {
         // EXACTLY ONCE, keeping the call-site count at ONE getVar vs the
         // single runtime test it replaces). No sh2.test dispatch, no
         // string tokenize/parse per evaluation.
-        let json = to_json(
-            "if [[ \"$a\" == \"x\" ]] && [[ \"$b\" == \"y\" ]]; then echo yes; fi",
-        );
+        let json = to_json("if [[ \"$a\" == \"x\" ]] && [[ \"$b\" == \"y\" ]]; then echo yes; fi");
         // the sh2.test DISPATCH is gone (a regex-literal `.test()` method
         // call has a different callee shape and may legitimately appear)
-        assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        assert!(!json
+            .contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
         assert!(json.contains("\"name\":\"getVar\""));
         assert!(json.contains("\"name\":\"_g\""));
         assert!(!json.contains("unsupported"));
@@ -1337,7 +1393,8 @@ mod tests {
         let json = to_json(
             "if [[ \"$1\" =~ ^[0-9]+$ ]] && [[ \"$2\" == \"test\" || \"$2\" == \"debug\" ]]; then echo ok; fi",
         );
-        assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        assert!(!json
+            .contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
         assert!(json.contains("\"name\":\"positional\""));
         assert!(json.contains("\"operator\":\"||\""));
         assert!(!json.contains("unsupported"));
@@ -1348,7 +1405,8 @@ mod tests {
         // `[ "$?" = "0" ]` — the `$?` sigil is a status-field read, not
         // a glob `?`: `String(sh2.lastExit) === "0"`, zero dispatches.
         let json = to_json("if [ \"$?\" = \"0\" ]; then echo zero; fi");
-        assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        assert!(!json
+            .contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
         assert!(json.contains("\"name\":\"lastExit\""));
         assert!(json.contains("\"name\":\"String\""));
         assert!(!json.contains("unsupported"));
@@ -1358,9 +1416,7 @@ mod tests {
     fn grep_with_regex_pattern_not_lifted() {
         // BRE metacharacters disqualify the lift: `grep 'a.c'` is a regex,
         // not a substring test — the pipeline must stay.
-        let json = to_json(
-            "if echo hi | grep a.c > /dev/null 2> /dev/null; then echo yes; fi",
-        );
+        let json = to_json("if echo hi | grep a.c > /dev/null 2> /dev/null; then echo yes; fi");
         assert!(!json.contains("contains"));
         assert!(json.contains("pipeline"));
     }
@@ -1436,7 +1492,10 @@ mod tests {
         assert!(json2.contains("\"type\":\"ForStatement\""));
         assert!(json2.contains("\"name\":\"includes\""));
         assert!(json2.contains("\"operator\":\"*\""));
-        assert!(!json2.contains("\"name\":\"Number\""), "no (Number(i) || 0) coercion");
+        assert!(
+            !json2.contains("\"name\":\"Number\""),
+            "no (Number(i) || 0) coercion"
+        );
         assert!(!json2.contains("\"name\":\"captureWords\""));
         assert!(!json2.contains("unsupported"));
     }
@@ -1461,12 +1520,20 @@ mod tests {
         // path (bash clobbers i in the body; a counter's i++ would read
         // the body-written value). The INNER loop — whose own body never
         // writes its var — still transforms independently.
-        let json4 = to_json(
-            "for i in $(seq 1 2); do for i in $(seq 10 12); do echo $i; done; done",
+        let json4 =
+            to_json("for i in $(seq 1 2); do for i in $(seq 10 12); do echo $i; done; done");
+        assert!(
+            json4.contains("\"name\":\"captureWordsSync\""),
+            "outer keeps the word list"
         );
-        assert!(json4.contains("\"name\":\"captureWordsSync\""), "outer keeps the word list");
-        assert!(json4.contains("\"type\":\"ForOfStatement\""), "outer is a word loop");
-        assert!(json4.contains("\"type\":\"ForStatement\""), "inner is a counter loop");
+        assert!(
+            json4.contains("\"type\":\"ForOfStatement\""),
+            "outer is a word loop"
+        );
+        assert!(
+            json4.contains("\"type\":\"ForStatement\""),
+            "inner is a counter loop"
+        );
     }
 
     #[test]
@@ -1560,7 +1627,10 @@ mod tests {
         // bare template, no join.
         let json2 = to_json("name=$(echo world)\necho \"Hello $name\"");
         assert!(!json2.contains("\"name\":\"getVar\""));
-        assert!(!json2.contains("\"name\":\"join\""), "single interpolated arg: no join");
+        assert!(
+            !json2.contains("\"name\":\"join\""),
+            "single interpolated arg: no join"
+        );
         assert!(json2.contains("\"type\":\"TemplateLiteral\""));
         assert!(!json2.contains("unsupported"));
         let json3 = to_json("read name\necho \"Hello $name\"");
@@ -1630,7 +1700,10 @@ mod tests {
         // `String(Math.floor(Math.sqrt(Number(...))))`. No spawn, no
         // pipeline/capture machinery, no async.
         let json = to_json("echo $(echo \"2+3\" | bc)");
-        assert!(json.contains("\"value\":\"5\\n\""), "static bc program folds");
+        assert!(
+            json.contains("\"value\":\"5\\n\""),
+            "static bc program folds"
+        );
         assert!(!json.contains("\"name\":\"capture\""));
         assert!(!json.contains("\"name\":\"pipeline\""));
         assert!(!json.contains("\"name\":\"exec\""));
@@ -1646,13 +1719,17 @@ mod tests {
         assert!(!json2.contains("unsupported"));
         // the general var-operand form (`$sum + $i` — the in-loop bc
         // capture): native `String(Number(sum) + Number(i))`, no spawn
-        let json3 = to_json("sum=0; for i in 1 2 3; do sum=$(echo \"$sum + $i\" | bc); done; echo $sum");
+        let json3 =
+            to_json("sum=0; for i in 1 2 3; do sum=$(echo \"$sum + $i\" | bc); done; echo $sum");
         assert!(json3.contains("\"name\":\"Number\""), "native var arith");
         assert!(json3.contains("\"operator\":\"+\""));
         assert!(!json3.contains("\"name\":\"pipeline\""));
         assert!(!json3.contains("\"name\":\"capture\""));
         assert!(!json3.contains("\"name\":\"exec\""));
-        assert!(!json3.contains("\"name\":\"forLoop\""), "the loop goes native for-of");
+        assert!(
+            !json3.contains("\"name\":\"forLoop\""),
+            "the loop goes native for-of"
+        );
         assert!(!json3.contains("unsupported"));
         // `/` lowers to Math.trunc with a zero-divisor guard (bc aborts
         // with no stdout) — the guard is a `divisor === 0` comparison
@@ -1676,8 +1753,7 @@ mod tests {
         assert!(!json.contains("\"type\":\"SwitchStatement\""));
         assert!(!json.contains("\"name\":\"caseMatch\""));
         assert!(json.contains("\"type\":\"IfStatement\""));
-        assert!(json.contains("\"name\":\"includes\"")
-            || json.contains("\"operator\":\"===\""));
+        assert!(json.contains("\"name\":\"includes\"") || json.contains("\"operator\":\"===\""));
         assert!(!json.contains("unsupported"));
     }
 
