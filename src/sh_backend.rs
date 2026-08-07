@@ -23,6 +23,10 @@ lazy_static::lazy_static! {
     /// `typeset -i` / `declare -i` integer-attribute vars — their
     /// assignments are ARITHMETIC (bash: `n=n+1` -> 43).
     static ref INT_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
+    /// Associative arrays (string-key elements / `declare -A`): their
+    /// per-element vars are KEY-named (`config_user`) — the expansion
+    /// helpers iterate the key list, not indices.
+    static ref ASSOC_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
 }
 
 /// Marker prefixes the core's lowering tags unquoted glob / process-
@@ -92,6 +96,7 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                     }
                 }
             }
+            IrExpr::Arrow(stmts) => walk(stmts, names),
             _ => {}
         }
     }
@@ -99,7 +104,21 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
         for st in sts {
             match st {
                 IrStmt::Expr(e) => expr_names(e, names),
-                IrStmt::Assign { expr, .. } => expr_names(expr, names),
+                IrStmt::Assign { expr, targets, .. } => {
+                    expr_names(expr, names);
+                    for t in targets {
+                        // element targets fold the subscript into the var
+                        if let Some((base, idx)) =
+                            t.var.strip_suffix(']').and_then(|v| v.split_once('['))
+                        {
+                            let idx = idx.trim_matches(['"', '\'']);
+                            names.insert(base.to_string());
+                            if !idx.chars().all(|c| c.is_ascii_digit()) {
+                                ASSOC_VARS.lock().unwrap().insert(base.to_string());
+                            }
+                        }
+                    }
+                }
                 IrStmt::If { cond, then, elsifs, else_, .. } => {
                     expr_names(cond, names);
                     walk(then, names);
@@ -266,6 +285,29 @@ fn has_fd_dup(prog: &IrProgram) -> bool {
     walk(&prog.stmts) || prog.subs.iter().any(|s| walk(&s.body))
 }
 
+/// The whole-array expansion helper for a name (assoc arrays iterate
+/// their key list — the per-element vars are KEY-named).
+/// `${!map[@]}` key-iteration names arrive with a `!` prefix.
+fn arr_base(name: &str) -> &str {
+    name.strip_prefix('!').unwrap_or(name)
+}
+
+fn arr_expand_call(name: &str) -> String {
+    if ASSOC_VARS.lock().unwrap().contains(name) {
+        format!("$(_arr_expand_k {name})")
+    } else {
+        format!("$(_arr_expand {name})")
+    }
+}
+
+fn arr_keys_call(name: &str) -> String {
+    if ASSOC_VARS.lock().unwrap().contains(name) {
+        format!("$(_arr_keys_k {name})")
+    } else {
+        format!("$(_arr_keys {name})")
+    }
+}
+
 /// Does the program use whole-array expansions (`"${arr[@]}"`, `${!arr[@]}`,
 /// `${arr[*]}`)? They need the `_arr_expand`/`_arr_keys` prologue helpers
 /// (the per-element vars + counter lowering).
@@ -334,6 +376,7 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
             IrExpr::Interpolate(parts) => parts
                 .iter()
                 .any(|p| matches!(p, InterpPart::Expr(x) if expr_uses_arr(x))),
+            IrExpr::Arrow(stmts) => walk(stmts),
             _ => false,
         }
     }
@@ -401,6 +444,7 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
     *ARRAY_NAMES.lock().unwrap() = array_names(prog);
     *NOCASEMATCH.lock().unwrap() = false;
     *INT_VARS.lock().unwrap() = Default::default();
+    *ASSOC_VARS.lock().unwrap() = Default::default();
     let mut out = String::new();
     out.push_str("#!/bin/sh\n");
     if !has_fd_dup(prog) {
@@ -442,6 +486,31 @@ _arr_keys() {
         printf '%s\n' "$_i"
         _i=$((_i + 1))
     done
+}
+_arr_expand_k() {
+    # assoc variant: values in key-list order ($1_keys). Joins with the
+    # FIRST char of the caller's IFS (bash's ${arr[*]} semantics — under
+    # IFS=newline each value lands on its own line); the key list itself
+    # is space-separated, so the split runs under a fixed IFS. All in a
+    # subshell: the caller's IFS is untouched.
+    ( # the first IFS char (${IFS#?} = IFS minus the first char); a
+      # cmdsub would eat a newline separator, so use pure expansion
+      _sep=${IFS%${IFS#?}}
+      IFS=' '
+      _n=0
+      for _k in $(eval echo "\${$1_keys}"); do
+          [ "$_n" -gt 0 ] && printf '%s' "$_sep"
+          eval "printf '%s' \"\${$1_$_k}\""
+          _n=$((_n + 1))
+      done
+      printf '\n' )
+}
+_arr_keys_k() {
+    # assoc variant: the key list
+    ( IFS=' '
+      for _k in $(eval echo "\${$1_keys}"); do
+          printf '%s\n' "$_k"
+      done )
 }
 _arr_slice() {
     # $1=name $2=off $3=len — elements off..off+len-1, space-joined
@@ -869,11 +938,20 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
         // baked element targets (`arr[1]=x` — the A1 folds the subscript
         // into the var name)
         if let Some((base, idx)) = t.var.strip_suffix(']').and_then(|v| v.split_once('[')) {
-            if idx.chars().all(|c| c.is_ascii_digit())
-                || (!idx.contains(['$', '(', ')', '`', ';', '&', '|', ' '])
-                    && !idx.is_empty())
-            {
+            // strip the quotes the core keeps around the subscript
+            // (`config["user"]` — a quoted subscript is still a plain key)
+            let idx = idx.trim_matches(['"', '\'']);
+            if idx.chars().all(|c| c.is_ascii_digit()) {
                 out.push_str(&format!("{base}_{idx}={rhs}"));
+            } else if !idx.contains(['$', '(', ')', '`', ';', '&', '|', ' '])
+                && !idx.is_empty()
+            {
+                // associative (string-key) element: maintain the key list
+                // (bash's ${!map[@]} keys / ${map[*]} values iterate it)
+                ASSOC_VARS.lock().unwrap().insert(base.to_string());
+                out.push_str(&format!(
+                    "{base}_{idx}={rhs}; {base}_len=$(( ${{{base}_len:-0}} + 1 )); {base}_keys=\"${{{base}_keys:-}} {idx}\""
+                ));
             } else {
                 out.push_str(&format!("{base}[{idx}]={rhs}"));
             }
@@ -1409,6 +1487,13 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
                 ints.insert(name.to_string());
             }
         }
+        if flags.iter().any(|f| f.contains('A')) {
+            let mut assoc = ASSOC_VARS.lock().unwrap();
+            for w in &words {
+                let name = w.split('=').next().unwrap_or(w.as_str());
+                assoc.insert(name.to_string());
+            }
+        }
         let prefix = if flags.iter().any(|f| f.contains('r')) {
             "readonly "
         } else if flags.iter().any(|f| f.contains('x')) {
@@ -1416,11 +1501,14 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
         } else {
             ""
         };
-        if words.is_empty() {
+        // bare names (`declare -A config`) are attribute declarations —
+        // the per-element lowering self-initializes the len counter
+        let assigns: Vec<&str> = words.iter().filter(|w| w.contains('=')).map(|w| w.as_str()).collect();
+        if assigns.is_empty() {
             out.push(':');
         } else {
             out.push_str(prefix);
-            out.push_str(&words.join(" "));
+            out.push_str(&assigns.join(" "));
         }
         return Ok(out);
     }
@@ -2054,13 +2142,20 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
             // indices need the runtime count / indirect expansion.
             match arg(args, 1)? {
                 IrExpr::Str(k, _) if k == "@" || k == "*" => {
-                    Ok(format!("$(_arr_expand {name})"))
+                    Ok(arr_expand_call(arr_base(&name)))
+                }
+                IrExpr::Str(k, _) if k.contains(['$', '(']) => {
+                    // dynamic key (`${map[$k]}`) — indirect via eval
+                    Ok(format!(
+                        "$(eval \"printf '%s' \\\"\\${{{}_{k}}}\\\"\")",
+                        arr_base(&name)
+                    ))
                 }
                 IrExpr::Str(k, _) => Ok(format!("\"${{{name}_{k}}}\"")),
                 _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
             }
         }
-        "arrayItems" => Ok(format!("$(_arr_keys {})", raw_arg(args, 0)?)),
+        "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
         "arrayLen" => Ok(format!("${{{}}}_len", raw_arg(args, 0)?)),
         "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
         "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
@@ -2132,7 +2227,17 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             // unquoted `$x` in split()) — keep it one word.
             if let Some((an, idx)) = name.strip_suffix(']').and_then(|n| n.split_once('[')) {
                 if idx == "@" || idx == "*" {
-                    return Ok(format!("$(_arr_expand {an})"));
+                    if an.starts_with('!') {
+                        return Ok(arr_keys_call(arr_base(&an)));
+                    }
+                    return Ok(arr_expand_call(arr_base(&an)));
+                }
+                if idx.contains(['$', '(']) {
+                    // dynamic key (`${map[$k]}`) — indirect via eval
+                    return Ok(format!(
+                        "$(eval \"printf '%s' \\\"\\${{{}_{idx}}}\\\"\")",
+                        arr_base(&an)
+                    ));
                 }
                 return Ok(format!("\"${{{an}_{idx}}}\""));
             }
@@ -2187,7 +2292,11 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             // `${arr[@]}` / `${arr[*]}` — the whole array: the per-element
             // counter helper (arrays have no POSIX form)
             if off == "@" || off == "*" {
-                return Ok(format!("$(_arr_expand {name})"));
+                // `${!map[@]}` — the `!` marker means KEYS, not values
+                if name.starts_with('!') {
+                    return Ok(arr_keys_call(arr_base(&name)));
+                }
+                return Ok(arr_expand_call(arr_base(&name)));
             }
             // a numeric-offset slice on a KNOWN array (`${arr[@]:1:2}`
             // lowers as a slice with the bare base name): element-wise
@@ -2303,7 +2412,7 @@ fn join_to_sh(inner: &IrExpr, quoted: bool) -> Result<String, String> {
             let key = raw_arg(args, 1)?;
             if key == "@" || key == "*" {
                 // the whole array — the helper's expansion IS the list
-                return Ok(format!("$(_arr_expand {name})"));
+                return Ok(arr_expand_call(arr_base(&name)));
             }
             format!("${{{name}[{key}]}}")
         }
@@ -2385,12 +2494,17 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
                 let name = raw_arg(args, 0)?;
                 let key = raw_arg(args, 1)?;
                 if key == "@" || key == "*" {
-                    Ok(format!("$(_arr_expand {name})"))
+                    Ok(arr_expand_call(arr_base(&name)))
+                } else if key.contains(['$', '(']) {
+                    Ok(format!(
+                        "$(eval \"printf '%s' \\\"\\${{{}_{key}}}\\\"\")",
+                        arr_base(&name)
+                    ))
                 } else {
                     Ok(format!("${{{name}_{key}}}"))
                 }
             }
-            "arrayItems" => Ok(format!("$(_arr_keys {})", raw_arg(args, 0)?)),
+            "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
             "arrayLen" => Ok(format!("${{#{}[@]}}", raw_arg(args, 0)?)),
             "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
         "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
