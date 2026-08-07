@@ -71,7 +71,6 @@ impl super::PatternLift for GrepToCase {
         "grep_to_case"
     }
     fn try_lift_stmt(&self, st: &IrStmt) -> Option<IrStmt> {
-        eprintln!("DBG_LIFT_CALLED: st={:?}", std::mem::discriminant(st));
         match st {
             // `if cond; then then_b; else else_b; fi` where `cond` is a
             // test-position grep → Case{disc=cond's input, *PAT*) then_b,
@@ -160,6 +159,7 @@ fn rhs_stmts(e: &IrExpr) -> Vec<IrStmt> {
 }
 
 fn test_grep_inner(e: &IrExpr) -> Option<(IrExpr, String, bool)> {
+    eprintln!("TGI_ENTRY");
     // The test-position grep shape. The IR carries it as either:
     //   a) `Call("pipeline", args=[Array([Arrow1, Arrow2])])` (the
     //      common `echo "$x" | grep PAT` two-stage form), or
@@ -170,13 +170,20 @@ fn test_grep_inner(e: &IrExpr) -> Option<(IrExpr, String, bool)> {
     // needs a bare `$x` discriminant).
     // 1) Two-stage: Call("pipeline", args=[Array([Arrow1, Arrow2])])
     if let IrExpr::Call { func, args } = e {
+        eprintln!("TGI_PIPELINE: func={} args.len={}", func, args.len());
         if func.as_str() == "pipeline" {
             if let Some(els) = pipeline_els(args) {
+                eprintln!("TGI_ELS: len={}", els.len());
                 if els.len() == 2 {
                     if let (IrExpr::Arrow(s1), IrExpr::Arrow(s2)) = (&els[0], &els[1]) {
+                        eprintln!("TGI_ARROWS: ok, calling extract");
                         return extract_test_grep(s1, s2);
+                    } else {
+                        eprintln!("TGI_ARROWS: NOT both arrows: 0={:?} 1={:?}", std::mem::discriminant(&els[0]), std::mem::discriminant(&els[1]));
                     }
                 }
+            } else {
+                eprintln!("TGI_PIPELINE_ELS: None");
             }
         }
         // 2) One-stage: Call("exec", args=[Arrow([Exec(grep, ...)])])
