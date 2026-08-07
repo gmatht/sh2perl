@@ -1986,6 +1986,56 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
         }
         return Ok(out);
     }
+    // `ls` (non-`-l`) output is unsorted under busybox; GNU sorts
+    // alphabetically. Append `| sort` - idempotent on already-sorted
+    // input; safe in pipelines and cmdsubs (sort then filter/head/wc
+    // is equivalent to the original GNU behavior). `ls -l` (format,
+    // not order) is a separate verbatim-output GNUism and is NOT
+    // handled here.
+    if cmd_name == Some("ls") && env.is_none() {
+        let has_l = args.iter().any(|a| matches!(a, IrExpr::Str(s, _)
+            if s == "-l" || s.starts_with("--")));
+        if !has_l {
+            out.push_str(&word_to_sh(cmd)?);
+            for w in args {
+                out.push(' ');
+                out.push_str(&word_to_sh(w)?);
+            }
+            out.push_str(" | sort");
+            return Ok(out);
+        }
+    }
+    // `tty --silent` / `tty --quiet` (GNU long options) -> `tty -s`
+    // (busybox `tty` accepts only `-s`; the long forms fail rc=2).
+    if cmd_name == Some("tty") && env.is_none()
+        && args.iter().any(|a| matches!(a, IrExpr::Str(s, _)
+            if s == "--silent" || s == "--quiet"))
+    {
+        out.push_str("tty -s");
+        for w in args {
+            if !matches!(w, IrExpr::Str(s, _) if s == "--silent" || s == "--quiet") {
+                out.push(' ');
+                out.push_str(&word_to_sh(w)?);
+            }
+        }
+        return Ok(out);
+    }
+    // `bash -c` -> `sh -c`. The chimera sandbox has no bash; `-c`
+    // invocations are the common form (e.g. `bash -c 'id -G -z'`).
+    // Non-`-c` bash uses (interactive, `--version`) are left native -
+    // those would fail in the sandbox regardless, but the corpus
+    // doesn't exercise them and a global rewrite would mask other
+    // bash-specific calls that the source genuinely requires.
+    if cmd_name == Some("bash") && env.is_none()
+        && args.iter().any(|a| matches!(a, IrExpr::Str(s, _) if s == "-c"))
+    {
+        out.push_str("sh");
+        for w in args {
+            out.push(' ');
+            out.push_str(&word_to_sh(w)?);
+        }
+        return Ok(out);
+    }
     out.push_str(&word_to_sh(cmd)?);
     for w in args {
         out.push(' ');
@@ -3239,7 +3289,16 @@ fn arith_rewrite(t: &str) -> String {
         // bare identifier -> $(_num "$name") (bash coerces non-numeric
         // values to 0, dash errors); assignment LHS stays bare (`x` in
         // `x = y` is a write target); a postfix ++/-- rewrites first
-        // (the name must stay plain there)
+        // (the name must stay plain there).
+        // A leading `$` on the identifier (e.g. `$n` in arithmetic) is
+        // the shell variable sigil - consume it so the cmdsub below
+        // is the only `$`-bearing form (avoids `$$( _num "n" )`).
+        if c == b'$' as char && i + 1 < b.len()
+            && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_')
+        {
+            i += 1;
+            continue;
+        }
         if c.is_ascii_alphabetic() || c == b'_' as char {
             let mut j = i;
             while j < b.len() && ident(b[j]) {
