@@ -159,7 +159,6 @@ fn rhs_stmts(e: &IrExpr) -> Vec<IrStmt> {
 }
 
 fn test_grep_inner(e: &IrExpr) -> Option<(IrExpr, String, bool)> {
-    eprintln!("TGI_ENTRY");
     // The test-position grep shape. The IR carries it as either:
     //   a) `Call("pipeline", args=[Array([Arrow1, Arrow2])])` (the
     //      common `echo "$x" | grep PAT` two-stage form), or
@@ -170,20 +169,15 @@ fn test_grep_inner(e: &IrExpr) -> Option<(IrExpr, String, bool)> {
     // needs a bare `$x` discriminant).
     // 1) Two-stage: Call("pipeline", args=[Array([Arrow1, Arrow2])])
     if let IrExpr::Call { func, args } = e {
-        eprintln!("TGI_PIPELINE: func={} args.len={}", func, args.len());
         if func.as_str() == "pipeline" {
             if let Some(els) = pipeline_els(args) {
-                eprintln!("TGI_ELS: len={}", els.len());
                 if els.len() == 2 {
                     if let (IrExpr::Arrow(s1), IrExpr::Arrow(s2)) = (&els[0], &els[1]) {
-                        eprintln!("TGI_ARROWS: ok, calling extract");
                         return extract_test_grep(s1, s2);
                     } else {
-                        eprintln!("TGI_ARROWS: NOT both arrows: 0={:?} 1={:?}", std::mem::discriminant(&els[0]), std::mem::discriminant(&els[1]));
                     }
                 }
             } else {
-                eprintln!("TGI_PIPELINE_ELS: None");
             }
         }
         // 2) One-stage: Call("exec", args=[Arrow([Exec(grep, ...)])])
@@ -212,22 +206,28 @@ fn extract_test_grep(producer: &[IrStmt], grepper: &[IrStmt]) -> Option<(IrExpr,
     if producer.is_empty() {
         return None; // single-stage grep (stdin) — refuse
     }
-    let (cmd, args) = match (&producer[0], &grepper[0]) {
-        (IrStmt::Expr(IrExpr::Call { func, args }), IrStmt::Expr(IrExpr::Call { func: gf, args: ga })) => {
+    // Producer args (`echo <one-arg>` / `printf '%s' <value>`) and the
+    // grep's own args (the `[flags, pattern]` array).
+    let (cmd, producer_args, grep_args) = match (&producer[0], &grepper[0]) {
+        (
+            IrStmt::Expr(IrExpr::Call { func, args: pa }),
+            IrStmt::Expr(IrExpr::Call { func: gf, args: ga }),
+        ) => {
             if *gf != "exec" { return None; }
-            (func.as_str(), args.as_slice())
+            (func.as_str(), pa.as_slice(), ga.as_slice())
         }
         _ => return None,
     };
-    // Producer: `echo <one-arg>` or `printf '%s\n' <one-arg>`.
+    // Producer: `echo <one-arg>` or `printf '%s\n' <one-arg>`. The
+    // discriminant is the value (a Var for the common `echo "$x"` shape).
     let disc_expr: IrExpr = match cmd {
         "echo" => {
-            let [_e, IrExpr::Array(els)] = args else { return None };
+            let [_e, IrExpr::Array(els)] = producer_args else { return None };
             if els.len() != 1 { return None; }
             els[0].clone()
         }
         "printf" => {
-            let [_p, IrExpr::Array(els)] = args else { return None };
+            let [_p, IrExpr::Array(els)] = producer_args else { return None };
             if els.len() != 2 { return None; };
             let fmt = interp_literal(&els[0])?;
             if !fmt_is_plain_percent_s(&fmt) { return None; }
@@ -238,15 +238,26 @@ fn extract_test_grep(producer: &[IrStmt], grepper: &[IrStmt]) -> Option<(IrExpr,
     if !matches!(&disc_expr, IrExpr::Var(_, _)) {
         return None;
     }
-    let [_g, IrExpr::Array(ga)] = args else { return None };
-    if ga.len() != 2 { return None; }
-    let flags_text = interp_literal(&ga[0])?;
+    // Consumer: `exec("grep", [..., pattern])`. The grep's positional
+    // args arrive as an Array: either [pattern] (no flags) or
+    // [flags, pattern]. Extract the pattern (always the LAST element)
+    // and the flags (the first element, if there are 2).
+    let pattern_text = match grep_args {
+        [_, IrExpr::Array(ga)] if !ga.is_empty() => {
+            let last = ga.last()?;
+            interp_literal(last)?
+        }
+        _ => return None,
+    };
+    let flags_text = match grep_args {
+        [_, IrExpr::Array(ga)] if ga.len() == 2 => interp_literal(&ga[0])?,
+        _ => String::new(),
+    };
     let (case_insensitive, _clean_flags) = classify_grep_flags(&flags_text)?;
-    let pat = interp_literal(&ga[1])?;
-    if pat.chars().any(|c| REGEX_METACHARS.contains(&c) || ANCHORS.contains(&c)) {
+    if pattern_text.chars().any(|c| REGEX_METACHARS.contains(&c) || ANCHORS.contains(&c)) {
         return None;
     }
-    Some((disc_expr, pat, case_insensitive))
+    Some((disc_expr, pattern_text, case_insensitive))
 }
 
 /// A `printf '%s\n' "$x"` is plain `%s` + literal `\n` (no precision,
