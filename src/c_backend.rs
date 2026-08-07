@@ -1003,7 +1003,7 @@ impl Render {
                         return self.num_temp("_sh_rc");
                     }
                     if name == "#" {
-                        return "(_sh_argc - 1)".into();
+                        return "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into();
                     }
                     if name == "@" || name == "*" {
                         let t = self.str_temp(4096);
@@ -2480,7 +2480,7 @@ impl Render {
             "\"\"".to_string()
         } else if name == "#" {
             self.need_sh = true;
-            "(_sh_argc - 1)".into()
+            "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into()
         } else if name == "@" || name == "*" {
             self.need_sh = true;
             let t = self.str_temp(4096);
@@ -2682,7 +2682,7 @@ impl Render {
                 }
                 if name == "#" {
                     self.need_sh = true;
-                    return "(_sh_argc - 1)".into();
+                    return "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into();
                 }
                 if name == "@" || name == "*" {
                     self.need_sh = true;
@@ -3223,7 +3223,7 @@ impl Render {
                             return vec![Part::Arg("_sh_rc".into(), NumSpec::Num("%lld", true))];
                         }
                         if name == "#" {
-                            return vec![Part::Arg("(_sh_argc - 1)".into(), NumSpec::Num("%lld", true))];
+                            return vec![Part::Arg("((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into(), NumSpec::Num("%lld", true))];
                         }
                         if name == "@" || name == "*" {
                             self.need_sh = true;
@@ -3747,6 +3747,48 @@ impl Render {
                                 .into_iter()
                                 .map(|s| IrExpr::Str(s, crate::ir::StrStyle::DoubleQuoted))
                                 .collect();
+                        }
+                    }
+                }
+                // `for a in "$@"` / `$*` — the argv loop
+                if items.len() == 1 {
+                    if let IrExpr::Call { func, args } = &items[0] {
+                        let name = match (func.as_str(), args.first()) {
+                            ("listVar" | "arrayItems", Some(IrExpr::Str(n, _))) => n.clone(),
+                            ("getVar", Some(IrExpr::Str(n, _))) => n.clone(),
+                            _ => String::new(),
+                        };
+                        if name == "@" || name == "*" {
+                            self.need_sh = true;
+                            let var_name = self.c_ident(var);
+                            if name == "*" {
+                                // `"$*"` is ONE word (the joined argv) —
+                                // bash runs the body exactly once
+                                let t = self.str_temp(4096);
+                                self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+                                self.emit(&format!("{var_name} = {t};"));
+                                self.emit("{");
+                                self.depth += 1;
+                                for s in body {
+                                    self.stmt(s);
+                                }
+                                self.depth -= 1;
+                                self.emit("}");
+                                return;
+                            }
+                            self.emit(&format!(
+                                "for (size_t _ai_{var_name} = 1; _ai_{var_name} < (size_t)_sh_argc; _ai_{var_name}++) {{"
+                            ));
+                            self.depth += 1;
+                            self.emit(&format!(
+                                "{var_name} = _sh_argv[_ai_{var_name}];"
+                            ));
+                            for s in body {
+                                self.stmt(s);
+                            }
+                            self.depth -= 1;
+                            self.emit("}");
+                            return;
                         }
                     }
                 }
@@ -4780,7 +4822,9 @@ fn collect_array_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                 "setArray" | "setArrayAppend" | "arrayIndex" | "arrayLen" | "arrayItems"
                 | "listVar" => {
                     if let Some(IrExpr::Str(n, _)) = args.first() {
-                        out.insert(n.clone());
+                        if n != "@" && n != "*" {
+                            out.insert(n.clone());
+                        }
                     }
                 }
                 "param" => {
