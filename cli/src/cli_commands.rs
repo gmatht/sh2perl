@@ -533,6 +533,41 @@ pub fn parse_file_to_estree(filename: &str) {
                     } else {
                         json
                     };
+                    // Opt-in source-name $0 semantic (`--argv0-source <name>`):
+                    // bake `sh2.argv0 = '<name>'` as the first statement so the
+                    // translated JS identifies as the ORIGINAL bash file, whatever
+                    // the executor's temp file is called. Default (flag absent) =
+                    // argv0 pass-through — the executor supplies argv0 at run time
+                    // (estree-runner --source/--name). See
+                    // harness/argv0-tests/README.md for the two semantics.
+                    let json = if let Some(name) = crate::argv0_source() {
+                        match serde_json::from_str::<serde_json::Value>(&json) {
+                            Ok(mut v) => {
+                                let assign = serde_json::json!({
+                                    "type": "ExpressionStatement",
+                                    "expression": {
+                                        "type": "AssignmentExpression",
+                                        "operator": "=",
+                                        "left": {
+                                            "type": "MemberExpression",
+                                            "object": {"type": "Identifier", "name": "sh2"},
+                                            "property": {"type": "Identifier", "name": "argv0"},
+                                            "computed": false,
+                                            "optional": false
+                                        },
+                                        "right": {"type": "Literal", "value": name}
+                                    }
+                                });
+                                if let Some(body) = v.get_mut("body").and_then(|b| b.as_array_mut()) {
+                                    body.insert(0, assign);
+                                }
+                                v.to_string()
+                            }
+                            Err(_) => json,
+                        }
+                    } else {
+                        json
+                    };
                     println!("{}", json);
                 }
                 Err(e) => eprintln!("ESTree serialization error: {}", e),
