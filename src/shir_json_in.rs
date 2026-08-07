@@ -109,11 +109,28 @@ fn var_types_from(v: Option<&Value>, where_: &str) -> Result<Vec<(String, IrType
             a.iter().enumerate().map(|(i, e)| {
                 let o = require_obj(e, &format!("{where_}[{i}]"))?;
                 let n = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();
-                let t = req_str(o, "type", &format!("{where_}[{i}]"))?;
+                let t = req(o, "type", &format!("{where_}[{i}]"))?;
                 let irt = match t {
-                    "Int" => IrType::Int,
-                    "Str" => IrType::Str,
-                    other => return Err(format!("{where_}[{i}].type: {other} not in Int/Str")),
+                    serde_json::Value::String(s) => match s.as_str() {
+                        "Int" => IrType::Int,
+                        "Str" => IrType::Str,
+                        "Any" => IrType::Any,
+                        other => return Err(format!(
+                            "{where_}[{i}].type: {other} not in Int/Str/Any"
+                        )),
+                    },
+                    serde_json::Value::Object(o) => match (
+                        o.get("kind").and_then(|k| k.as_str()),
+                        o.get("width").and_then(|w| w.as_u64()),
+                    ) {
+                        (Some("Float"), Some(w)) if w <= 255 => IrType::Float(w as u8),
+                        _ => return Err(format!(
+                            "{where_}[{i}].type: expected {{{{kind: Float, width: N}}}}"
+                        )),
+                    },
+                    _ => return Err(format!(
+                        "{where_}[{i}].type: expected a type string or Float object"
+                    )),
                 };
                 Ok((n, irt))
             }).collect()
@@ -737,6 +754,33 @@ mod tests {
         let a = round_trip("x=1; echo $x");
         let b = round_trip("x=1; echo $x");
         assert_eq!(a, b);
+    }
+
+    /// IrType::Float(32/64) round-trips through the A1 JSON: serialized
+    /// as {"kind":"Float","width":N} and re-ingested (core request
+    /// c-sh-go-20260807-114757 — the C frontend's float/double type layer).
+    #[test]
+    fn float_type_roundtrip() {
+        use crate::ir::IrType;
+        let mut prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![],
+            subs: vec![],
+            var_types: vec![("x".to_string(), IrType::Float(64))],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+        };
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json.contains("\"kind\":\"Float\""), "json: {json}");
+        let prog2 = shir_json_to_ir(&json).expect("deser");
+        assert_eq!(prog2.var_types, vec![("x".to_string(), IrType::Float(64))]);
+        // the legacy string forms still round-trip byte-identically
+        prog.var_types = vec![("y".to_string(), IrType::Int)];
+        let json2 = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json2.contains("\"type\":\"Int\""), "json: {json2}");
     }
 
     /// The const-markup round-trips: `--shir` attaches the verdicts

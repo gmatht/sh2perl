@@ -281,6 +281,8 @@ impl Parser {
         let verdict = match base.as_str() {
             "char" => crate::ir::IrType::Str,
             "void" => crate::ir::IrType::Any,
+            "float" => crate::ir::IrType::Float(32),
+            "double" => crate::ir::IrType::Float(64),
             _ => crate::ir::IrType::Int,
         };
         Ok(Some((base, verdict)))
