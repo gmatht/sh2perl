@@ -1650,6 +1650,39 @@ impl Render {
                     args: args.clone(),
                 })]);
             }
+            IrExpr::Call { func, args } if func == "redirect" => {
+                if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                    self.sh_stage(buf, stmts);
+                }
+                if let Some(IrExpr::Array(specs)) = args.get(1) {
+                    self.sh_redirect_specs(buf, specs);
+                }
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                if let Some(n) = Self::str_arg(args, 0) {
+                    let v = if self.is_num(&n) {
+                        let t = self.num_temp(&self.c_ident(&n));
+                        t
+                    } else {
+                        self.store_ref(&n)
+                    };
+                    self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
+                    self.sh_add(buf, &format!("${n}"));
+                }
+            }
+            IrExpr::BinOp { lhs, op, rhs } => {
+                let opstr = match op {
+                    crate::ir::BinOpKind::And => "&&",
+                    crate::ir::BinOpKind::Or => "||",
+                    _ => {
+                        self.mark_todo(&format!("stage cond binop {:?}", op));
+                        return;
+                    }
+                };
+                self.sh_stage_expr(buf, lhs);
+                self.sh_raw(buf, opstr);
+                self.sh_stage_expr(buf, rhs);
+            }
             _ => {
                 self.mark_todo(&format!("stage cond {:?}", e));
             }
@@ -2003,6 +2036,10 @@ impl Render {
                                 Ok(n) => self.emit(&format!("{id} = {n};")),
                                 Err(_) => self.emit(&format!("{id} = 0;")),
                             }
+                        } else if val.contains('$') {
+                            // `local n=$1` — the core keeps the source text
+                            let v = self.dollar_text_value(val).unwrap_or_else(|| "\"\"".into());
+                            self.emit(&format!("{id} = {v};"));
                         } else {
                             self.emit(&format!("{id} = {};", Self::cstr(val)));
                         }
@@ -2926,6 +2963,76 @@ impl Render {
 
     // ── arrays ───────────────────────────────────────────────────────
 
+    /// A Declare init that is literal `$`-text (`local n=$1`) — the core
+    /// keeps the source text: expand `$1`/`$name` into the live values.
+    /// Returns a char* C expression (a snprintf temp for mixed text).
+    fn dollar_text_value(&mut self, s: &str) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        let mut lit = String::new();
+        while i < chars.len() {
+            if chars[i] == '$' && i + 1 < chars.len() {
+                let mut j = i + 1;
+                while j < chars.len()
+                    && (chars[j].is_ascii_alphanumeric() || chars[j] == '_')
+                {
+                    j += 1;
+                }
+                if j > i + 1 {
+                    let name: String = chars[i + 1..j].iter().collect();
+                    if name.chars().all(|c| c.is_ascii_digit()) {
+                        if !lit.is_empty() {
+                            parts.push(Self::cstr(&lit));
+                            lit.clear();
+                        }
+                        parts.push(format!(
+                            "(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")"
+                        ));
+                        i = j;
+                        continue;
+                    }
+                    if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        if !lit.is_empty() {
+                            parts.push(Self::cstr(&lit));
+                            lit.clear();
+                        }
+                        let v = if self.is_num(&name) {
+                            let t = self.num_temp(&self.c_ident(&name));
+                            t
+                        } else {
+                            self.store_ref(&name)
+                        };
+                        parts.push(v);
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            lit.push(chars[i]);
+            i += 1;
+        }
+        if !lit.is_empty() {
+            parts.push(Self::cstr(&lit));
+        }
+        if parts.is_empty() {
+            return Some("\"\"".into());
+        }
+        if parts.len() == 1 {
+            return parts.pop();
+        }
+        let mut fmt = String::new();
+        for _ in &parts {
+            fmt.push_str("%s");
+        }
+        let t = self.str_temp(4096);
+        self.emit(&format!(
+            "snprintf({t}, sizeof {t}, \"{fmt}\", {});",
+            parts.join(", ")
+        ));
+        Some(t)
+    }
+
     /// `arr[i]=v` / `map[key]=v` — element write (literal or dynamic key).
     fn emit_array_assign(&mut self, var: &str, key: &IrExpr, val: &IrExpr) {
         self.arrays.insert(var.to_string());
@@ -3228,6 +3335,146 @@ impl Render {
 
     // ── statements ───────────────────────────────────────────────────
 
+    /// `for (( init; cond; incr ))` — the loop var is declared IN the
+    /// for-init (overriding any hoisted store decl) so its arithmetic
+    /// works natively.
+    fn emit_cstyle_for(&mut self, spec: &str, body: &[IrStmt]) {
+        let parts: Vec<&str> = spec.split(';').map(|s| s.trim()).collect();
+        let init = parts.first().copied().unwrap_or("");
+        let cond = parts.get(1).copied().unwrap_or("1");
+        let incr = parts.get(2).copied().unwrap_or("");
+        // the loop var: `i = 2` / `i=2` — the init's LHS
+        let (var, init_c) = if let Some(eq) = init.find('=') {
+            let v = init[..eq].trim().to_string();
+            let rhs = init[eq + 1..].trim().to_string();
+            if is_ident(&v) {
+                (Some(v), rhs)
+            } else {
+                (None, init.to_string())
+            }
+        } else if !init.is_empty() {
+            (None, init.to_string())
+        } else {
+            (None, String::new())
+        };
+        let prev_type = var
+            .as_ref()
+            .and_then(|v| self.var_types.get(v).copied());
+        if let Some(v) = &var {
+            self.var_types.insert(v.clone(), IrType::Int);
+            self.store.remove(v);
+        }
+        // cond: `i <= n` → C with the operand names as idents (numeric
+        // now) or atoll() for string vars
+        let cond_c = self.cstyle_cond(cond);
+        let incr_c = if incr.is_empty() {
+            String::new()
+        } else {
+            self.cstyle_incr(incr)
+        };
+        let var_name = var.as_ref().map(|v| self.c_ident(v)).unwrap_or_default();
+        if var.is_some() {
+            self.emit(&format!(
+                "for (long long {var_name} = {init_c}; {cond_c}; {incr_c}) {{"
+            ));
+        } else {
+            self.emit(&format!("for ({init_c}; {cond_c}; {incr_c}) {{"));
+        }
+        self.depth += 1;
+        for s in body {
+            self.stmt(s);
+        }
+        self.depth -= 1;
+        self.emit("}");
+        match prev_type {
+            Some(t) => {
+                if let Some(v) = &var {
+                    self.var_types.insert(v.clone(), t);
+                }
+            }
+            None => {
+                if let Some(v) = &var {
+                    self.var_types.remove(v);
+                }
+            }
+        }
+    }
+
+    /// The cstyleFor condition: split on the comparison ops, map the
+    /// operand names to C idents (or atoll() for string vars).
+    fn cstyle_cond(&mut self, c: &str) -> String {
+        let c = c.trim();
+        if c.is_empty() {
+            return "1".into();
+        }
+        for op in ["<=", ">=", "==", "!=", "<", ">"] {
+            if let Some(pos) = c.find(op) {
+                let l = c[..pos].trim();
+                let r = c[pos + op.len()..].trim();
+                let lc = self.cstyle_operand(l);
+                let rc = self.cstyle_operand(r);
+                let c_op = match op {
+                    "<=" => "<=",
+                    ">=" => ">=",
+                    "==" => "==",
+                    "!=" => "!=",
+                    "<" => "<",
+                    _ => ">",
+                };
+                return format!("({lc} {c_op} {rc})");
+            }
+        }
+        self.cstyle_operand(c)
+    }
+
+    /// A cstyleFor operand: a var name → the numeric C expr.
+    fn cstyle_operand(&mut self, name: &str) -> String {
+        let name = name.trim();
+        if name.is_empty() {
+            return "0".into();
+        }
+        if let Ok(n) = name.parse::<i64>() {
+            return n.to_string();
+        }
+        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            if self.var_types.get(name) == Some(&IrType::Int) {
+                return self.c_ident(name);
+            }
+            // a string-typed var in an arith cond — coerce
+            if self.var_types.contains_key(name) || self.store.contains(name) {
+                return format!("(long long)atoll({})", self.store_ref(name));
+            }
+            return format!("(long long)atoll({})", self.store_ref(name));
+        }
+        "0".into()
+    }
+
+    /// The cstyleFor increment: `i++` / `i--` / `i += 2`.
+    fn cstyle_incr(&mut self, s: &str) -> String {
+        let s = s.trim();
+        if s.ends_with("++") {
+            let v = s.trim_end_matches("++").trim();
+            if is_ident(v) {
+                return format!("{}++", self.c_ident(v));
+            }
+        }
+        if s.ends_with("--") {
+            let v = s.trim_end_matches("--").trim();
+            if is_ident(v) {
+                return format!("{}--", self.c_ident(v));
+            }
+        }
+        for op in ["+=", "-=", "*=", "/=", "%="] {
+            if let Some((l, r)) = s.split_once(op) {
+                let l = l.trim();
+                if is_ident(l) {
+                    return format!("{} {op} {}", self.c_ident(l), r.trim());
+                }
+            }
+        }
+        s.to_string()
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => {
@@ -3252,6 +3499,17 @@ impl Render {
                         } else {
                             self.emit(&format!("return {v};"));
                         }
+                        return;
+                    }
+                    IrExpr::Call { func, args } if func == "cstyleFor" => {
+                        // `for (( i = 2; i <= n; i++ ))` — init; cond; incr
+                        if let Some(spec) = Self::str_arg(args, 0) {
+                            if let Some(IrExpr::Arrow(body)) = args.get(1) {
+                                self.emit_cstyle_for(&spec, body);
+                                return;
+                            }
+                        }
+                        self.mark_todo("cstyleFor args");
                         return;
                     }
                     IrExpr::Call { func, args } if func == "whileLoop" => {
@@ -3355,11 +3613,27 @@ impl Render {
                 }
             }
             IrStmt::Declare { vars, init, .. } => {
-                let init_expr = init.as_ref().map(|e| self.expr(e));
+                // `local n=$1` — the core keeps the SOURCE text as the
+                // init: expand `$1`/`$name` into the live values
+                let dollar = init.as_ref().and_then(|e| match e {
+                    IrExpr::Str(s, _) if s.contains('$') => self.dollar_text_value(s),
+                    _ => None,
+                });
+                let init_expr = if dollar.is_some() {
+                    dollar
+                } else {
+                    init.as_ref().map(|e| self.expr(e))
+                };
                 for d in vars {
                     let name = self.c_ident(&d.name);
                     if self.is_num(&d.name) {
-                        let v = init_expr.clone().unwrap_or_else(|| "0".into());
+                        let v = match &init_expr {
+                            Some(v) if v.starts_with('"') || v.starts_with('(') => {
+                                format!("(long long)atoll({v})")
+                            }
+                            Some(v) => v.clone(),
+                            None => "0".into(),
+                        };
                         self.emit(&format!("{} {name} = {v};", self.width_of_var(&d.name).c_type()));
                     } else if let Some(b) = self.buf_bound(&d.name) {
                         self.emit(&format!("char {name}[{}] = \"\";", b + 1));
