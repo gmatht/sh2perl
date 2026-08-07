@@ -45,7 +45,10 @@ pub trait PatternLift: Sync {
 /// Stage 0: the walker is provided here so the trait has a default
 /// integration path. Stage 1 wires the lifts into the pipeline (after
 /// the transforms, before the renderer).
-pub fn walk_exprs<F: FnMut(&IrExpr) -> Option<IrExpr>>(_prog: &crate::ir::IrProgram, _f: F) -> usize {
+pub fn walk_exprs<F: FnMut(&IrExpr) -> Option<IrExpr>>(
+    _prog: &crate::ir::IrProgram,
+    _f: F,
+) -> usize {
     // Stage 0: not wired. The trait's default `try_lift_expr` returns
     // `None` for every lift, so a stage-0 call always returns 0.
     0

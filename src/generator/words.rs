@@ -17,10 +17,18 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
         while let Some(idx) = s[pos..].find("system") {
             let abs_idx = pos + idx;
             // Check character before "system"
-            let prev_ok = abs_idx == 0 || !s[..abs_idx].chars().last().map_or(false, |c| c.is_alphanumeric() || c == '_');
+            let prev_ok = abs_idx == 0
+                || !s[..abs_idx]
+                    .chars()
+                    .last()
+                    .map_or(false, |c| c.is_alphanumeric() || c == '_');
             // Check character after "system"
             let after_idx = abs_idx + 6;
-            let next_ok = after_idx >= s.len() || !s[after_idx..].chars().next().map_or(false, |c| c.is_alphanumeric() || c == '_');
+            let next_ok = after_idx >= s.len()
+                || !s[after_idx..]
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_alphanumeric() || c == '_');
             if prev_ok && next_ok {
                 found = true;
                 break;
@@ -33,8 +41,9 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
         crate::generator::commands::utilities::source_safe_perl_string_expr(current_string)
     } else if current_string.chars().any(|c| !c.is_ascii()) {
         // Non-ASCII characters: escape as \x{...} so PPI does not choke
-        let escaped = current_string.chars().map(|c| {
-            match c {
+        let escaped = current_string
+            .chars()
+            .map(|c| match c {
                 '"' => "\\\"".to_string(),
                 '@' => "\\@".to_string(),
                 '\\' => "\\\\".to_string(),
@@ -44,8 +53,9 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
                 '$' => "\\$".to_string(),
                 _ if c.is_ascii() => c.to_string(),
                 _ => format!("\\x{{{:04X}}}", c as u32),
-            }
-        }).collect::<Vec<_>>().join("");
+            })
+            .collect::<Vec<_>>()
+            .join("");
         format!("\"{}\"", escaped)
     } else {
         // Escape $, @, and " for Perl double-quoted strings.
@@ -57,39 +67,58 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
-                b'"' => { result.push_str("\\\""); }
+                b'"' => {
+                    result.push_str("\\\"");
+                }
                 b'\\' => {
                     // Check if this is a line continuation (backslash followed by newline).
                     // In that case, preserve both as-is — Perl also treats \<newline> as
                     // line continuation, matching shell semantics.
                     let is_line_continuation = i + 1 < bytes.len() && bytes[i + 1] == b'\n';
                     if is_line_continuation {
-                        result.push_str("\\\\");  // Keep \\ in Perl source so \n is a line continuation
+                        result.push_str("\\\\"); // Keep \\ in Perl source so \n is a line continuation
                     } else {
-                        result.push_str("\\\\");  // Escape: \\ → \\
+                        result.push_str("\\\\"); // Escape: \\ → \\
                     }
                 }
                 b'@' => {
                     // Only escape @ if NOT followed by an identifier character (letter or underscore)
                     // so that @_ and @ARGV are properly interpolated as arrays.
-                    let next = if i + 1 < bytes.len() { Some(bytes[i + 1]) } else { None };
+                    let next = if i + 1 < bytes.len() {
+                        Some(bytes[i + 1])
+                    } else {
+                        None
+                    };
                     let should_escape = match next {
                         Some(b'a'..=b'z') | Some(b'A'..=b'Z') | Some(b'_') => false,
                         _ => true,
                     };
-                    if should_escape { result.push_str("\\@"); }
-                    else { result.push('@'); }
+                    if should_escape {
+                        result.push_str("\\@");
+                    } else {
+                        result.push('@');
+                    }
                 }
                 b'$' => {
-                    let next = if i + 1 < bytes.len() { Some(bytes[i + 1]) } else { None };
+                    let next = if i + 1 < bytes.len() {
+                        Some(bytes[i + 1])
+                    } else {
+                        None
+                    };
                     let should_escape = match next {
-                        Some(b'a'..=b'z') | Some(b'A'..=b'Z') | Some(b'0'..=b'9') | Some(b'_') | Some(b'{') => false,
+                        Some(b'a'..=b'z') | Some(b'A'..=b'Z') | Some(b'0'..=b'9') | Some(b'_')
+                        | Some(b'{') => false,
                         _ => true,
                     };
-                    if should_escape { result.push_str("\\$"); }
-                    else { result.push('$'); }
+                    if should_escape {
+                        result.push_str("\\$");
+                    } else {
+                        result.push('$');
+                    }
                 }
-                c => { result.push(c as char); }
+                c => {
+                    result.push(c as char);
+                }
             }
             i += 1;
         }
@@ -451,12 +480,18 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             let here_content = redirect_cmd
                                                 .redirects
                                                 .iter()
-                                                .find(|r| matches!(r.operator, RedirectOperator::HereString))
+                                                .find(|r| {
+                                                    matches!(
+                                                        r.operator,
+                                                        RedirectOperator::HereString
+                                                    )
+                                                })
                                                 .and_then(|r| r.heredoc_body.as_ref())
                                                 .cloned()
                                                 .unwrap_or_default();
                                             let unique_id = generator.get_unique_id();
-                                            let input_data = format!("my $input_data = \"{}\";", here_content);
+                                            let input_data =
+                                                format!("my $input_data = \"{}\";", here_content);
                                             let tr_output = crate::generator::commands::tr::generate_tr_command_for_substitution(
                                                 generator, simple_cmd, "input_data", &unique_id.to_string(),
                                             );
@@ -466,12 +501,18 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             let here_content = redirect_cmd
                                                 .redirects
                                                 .iter()
-                                                .find(|r| matches!(r.operator, RedirectOperator::HereString))
+                                                .find(|r| {
+                                                    matches!(
+                                                        r.operator,
+                                                        RedirectOperator::HereString
+                                                    )
+                                                })
                                                 .and_then(|r| r.heredoc_body.as_ref())
                                                 .cloned()
                                                 .unwrap_or_default();
                                             let unique_id = generator.get_unique_id();
-                                            let input_data = format!("my $input_data = \"{}\";", here_content);
+                                            let input_data =
+                                                format!("my $input_data = \"{}\";", here_content);
                                             let grep_output = crate::generator::commands::grep::generate_grep_command(
                                                 generator, simple_cmd, &format!("${}", "input_data"), &unique_id.to_string(), false,
                                             );
@@ -520,19 +561,28 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         let bash_cmd = format!("bash -c '{}'", escaped);
                         // Use non-interpolating string so shell $var references are
                         // preserved for bash (which gets them from $ENV{var} or env).
-                        let command_lit = generator
-                            .perl_string_literal_no_interp(&Word::literal(bash_cmd));
+                        let command_lit =
+                            generator.perl_string_literal_no_interp(&Word::literal(bash_cmd));
                         crate::ir::expr_to_open_perl(&command_lit, true)
                     } else if redirect_cmd.redirects.iter().any(|r| {
-                            matches!(r.operator, RedirectOperator::Heredoc | RedirectOperator::HeredocTabs)
-                        }) {
+                        matches!(
+                            r.operator,
+                            RedirectOperator::Heredoc | RedirectOperator::HeredocTabs
+                        )
+                    }) {
                         // Heredoc inside command substitution — generate native Perl code
                         // that uses the heredoc body rather than falling through to a qx{}
                         // call (which would lose the heredoc content).
-                        let heredoc_body = redirect_cmd.redirects.iter().find_map(|r| match &r.operator {
-                            RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => r.heredoc_body.as_ref(),
-                            _ => None,
-                        });
+                        let heredoc_body =
+                            redirect_cmd
+                                .redirects
+                                .iter()
+                                .find_map(|r| match &r.operator {
+                                    RedirectOperator::Heredoc | RedirectOperator::HeredocTabs => {
+                                        r.heredoc_body.as_ref()
+                                    }
+                                    _ => None,
+                                });
                         if let Some(body) = heredoc_body {
                             if let Command::Simple(simple_cmd) = &*redirect_cmd.command {
                                 if let Word::Literal(name, _) = &simple_cmd.name {
@@ -540,7 +590,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     // (bash strips trailing newlines from command substitution)
                                     if name == "cat" && simple_cmd.args.is_empty() {
                                         let trimmed = body.trim_end_matches('\n');
-                                        generator.perl_string_literal(&Word::literal(trimmed.to_string()))
+                                        generator.perl_string_literal(&Word::literal(
+                                            trimmed.to_string(),
+                                        ))
                                     } else {
                                         // For other commands, build a shell command that
                                         // pipes the heredoc body via stdin.  We generate a
@@ -558,14 +610,17 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         // Use non-interpolating string because the heredoc
                                         // body (single-quoted delimiter <<'...') should be
                                         // treated literally by the shell — no $var expansion.
-                                        let command_lit = generator
-                                            .perl_string_literal_no_interp(&Word::literal(heredoc_snippet));
+                                        let command_lit = generator.perl_string_literal_no_interp(
+                                            &Word::literal(heredoc_snippet),
+                                        );
                                         crate::ir::expr_to_open_perl(&command_lit, true)
                                     }
                                 } else {
                                     // Non-literal command name — fall through
                                     let command_str =
-                                        crate::generator::redirects::generate_bash_command_string(cmd);
+                                        crate::generator::redirects::generate_bash_command_string(
+                                            cmd,
+                                        );
                                     // Use non-interpolating string so shell $var references
                                     // are preserved for bash.
                                     let command_lit = generator
@@ -592,13 +647,15 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 if let Word::Literal(name, _) = &simple_cmd.name {
                                     // Only handle simple input redirects (no here-strings,
                                     // process substitutions, or other complex redirects)
-                                    let all_input = redirect_cmd.redirects.iter().all(|r| {
-                                        matches!(r.operator, RedirectOperator::Input)
-                                    });
-                                    all_input && match name.as_str() {
-                                        "wc" => true,
-                                        _ => false,
-                                    }
+                                    let all_input = redirect_cmd
+                                        .redirects
+                                        .iter()
+                                        .all(|r| matches!(r.operator, RedirectOperator::Input));
+                                    all_input
+                                        && match name.as_str() {
+                                            "wc" => true,
+                                            _ => false,
+                                        }
                                 } else {
                                     false
                                 }
@@ -617,7 +674,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             let file_expr = redirect_cmd
                                                 .redirects
                                                 .iter()
-                                                .find(|r| matches!(r.operator, RedirectOperator::Input))
+                                                .find(|r| {
+                                                    matches!(r.operator, RedirectOperator::Input)
+                                                })
                                                 .map(|r| generator.perl_string_literal(&r.target))
                                                 .unwrap_or_else(|| "q{}".to_string());
 
@@ -639,18 +698,27 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                                     }
                                                 }
                                             }
-                                            if !count_lines && !count_words && !count_chars && !count_bytes {
+                                            if !count_lines
+                                                && !count_words
+                                                && !count_chars
+                                                && !count_bytes
+                                            {
                                                 count_lines = true;
                                                 count_words = true;
                                                 count_bytes = true;
                                             }
 
                                             let mut wc_code = String::from("do {\n");
-                                            wc_code.push_str(&format!("    my $wc_file = {};\n", file_expr));
+                                            wc_code.push_str(&format!(
+                                                "    my $wc_file = {};\n",
+                                                file_expr
+                                            ));
                                             wc_code.push_str("    my $wc_file_opened = 0;\n");
                                             wc_code.push_str("    my $content = do {\n");
                                             wc_code.push_str("        my $result = q{};\n");
-                                            wc_code.push_str("        if (open my $fh, '<', $wc_file) {\n");
+                                            wc_code.push_str(
+                                                "        if (open my $fh, '<', $wc_file) {\n",
+                                            );
                                             wc_code.push_str("            $wc_file_opened = 1;\n");
                                             wc_code.push_str("            local $INPUT_RECORD_SEPARATOR = undef;\n");
                                             wc_code.push_str("            $result = <$fh>;\n");
@@ -672,11 +740,15 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                                 parts.push("$wc_words".to_string());
                                             }
                                             if count_bytes {
-                                                wc_code.push_str("        my $wc_bytes = length($content);\n");
+                                                wc_code.push_str(
+                                                    "        my $wc_bytes = length($content);\n",
+                                                );
                                                 parts.push("$wc_bytes".to_string());
                                             }
                                             if count_chars {
-                                                wc_code.push_str("        my $wc_chars = length($content);\n");
+                                                wc_code.push_str(
+                                                    "        my $wc_chars = length($content);\n",
+                                                );
                                                 parts.push("$wc_chars".to_string());
                                             }
 
@@ -684,7 +756,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             // (bash strips trailing newlines from command substitution)
                                             if parts.len() > 1 {
                                                 let parts_joined = parts.join(", ");
-                                                wc_code.push_str(&format!("        my $result = join(q{{ }}, ({}));\n", parts_joined));
+                                                wc_code.push_str(&format!(
+                                                    "        my $result = join(q{{ }}, ({}));\n",
+                                                    parts_joined
+                                                ));
                                                 wc_code.push_str("        $result;\n");
                                             } else if parts.len() == 1 {
                                                 let part = &parts[0];
@@ -739,11 +814,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             perl_code
                         } else if name == "find" {
                             // Use the find command substitution handler for proper conversion
-                            let perl_code = crate::generator::commands::find::generate_find_for_substitution(
-                                generator,
-                                simple_cmd,
-                                "",
-                            );
+                            let perl_code =
+                                crate::generator::commands::find::generate_find_for_substitution(
+                                    generator, simple_cmd, "",
+                                );
 
                             // For backtick commands, we need to return the value, not print it
                             perl_code
@@ -1244,7 +1318,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 } else {
                                     let joined = args.join(" . q{ } . ");
                                     // Avoid unnecessary parens for single expressions
-                                    if joined.starts_with('"') || joined.starts_with("q{") || joined.starts_with('$') || joined.starts_with('(') {
+                                    if joined.starts_with('"')
+                                        || joined.starts_with("q{")
+                                        || joined.starts_with('$')
+                                        || joined.starts_with('(')
+                                    {
                                         joined
                                     } else {
                                         format!("({})", joined)
@@ -1415,13 +1493,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if name == "date" {
                             // Generate the date expression. It may contain `require POSIX;`
                             // which must stay inside a do-block in expression context.
-                            let date_body = crate::generator::commands::date::generate_date_expression(
-                                generator, simple_cmd,
-                            );
-                            format!(
-                                "do {{\n{}\n}}",
-                                date_body
-                            )
+                            let date_body =
+                                crate::generator::commands::date::generate_date_expression(
+                                    generator, simple_cmd,
+                                );
+                            format!("do {{\n{}\n}}", date_body)
                         } else if name == "pwd" {
                             // Special handling for pwd in command substitution
                             "do { use Cwd; $CHILD_ERROR = 0; getcwd(); }".to_string()
@@ -1741,8 +1817,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                     ));
                                 }
                             }
-                            let formatted_code = formatted_lines
-                                .join("\n");
+                            let formatted_code = formatted_lines.join("\n");
                             let indent1 = "    ".to_string();
                             let indent1_do = "        ".to_string();
                             let indent2 = "            ".to_string();
@@ -1837,23 +1912,53 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 if let Word::Literal(s, _) = arg {
                                     if s.starts_with('-') {
                                         has_flags = true;
-                                        if s.contains('a') { flag_a = true; }
-                                        if s.contains('s') { flag_s = true; }
-                                        if s.contains('n') { flag_n = true; }
-                                        if s.contains('r') { flag_r = true; }
-                                        if s.contains('v') { flag_v = true; }
-                                        if s.contains('m') { flag_m = true; }
+                                        if s.contains('a') {
+                                            flag_a = true;
+                                        }
+                                        if s.contains('s') {
+                                            flag_s = true;
+                                        }
+                                        if s.contains('n') {
+                                            flag_n = true;
+                                        }
+                                        if s.contains('r') {
+                                            flag_r = true;
+                                        }
+                                        if s.contains('v') {
+                                            flag_v = true;
+                                        }
+                                        if s.contains('m') {
+                                            flag_m = true;
+                                        }
                                     }
                                 }
                             }
-                            if !has_flags || flag_s { flag_s = true; }
-                            if flag_a { flag_s = true; flag_n = true; flag_r = true; flag_v = true; flag_m = true; }
+                            if !has_flags || flag_s {
+                                flag_s = true;
+                            }
+                            if flag_a {
+                                flag_s = true;
+                                flag_n = true;
+                                flag_r = true;
+                                flag_v = true;
+                                flag_m = true;
+                            }
                             let mut code = "do { use POSIX qw(uname); my ($__sys, $__node, $__rel, $__ver, $__mach) = POSIX::uname(); my @__parts; ".to_string();
-                            if flag_s { code.push_str("push @__parts, $__sys; "); }
-                            if flag_n { code.push_str("push @__parts, $__node; "); }
-                            if flag_r { code.push_str("push @__parts, $__rel; "); }
-                            if flag_v { code.push_str("push @__parts, $__ver; "); }
-                            if flag_m { code.push_str("push @__parts, $__mach; "); }
+                            if flag_s {
+                                code.push_str("push @__parts, $__sys; ");
+                            }
+                            if flag_n {
+                                code.push_str("push @__parts, $__node; ");
+                            }
+                            if flag_r {
+                                code.push_str("push @__parts, $__rel; ");
+                            }
+                            if flag_v {
+                                code.push_str("push @__parts, $__ver; ");
+                            }
+                            if flag_m {
+                                code.push_str("push @__parts, $__mach; ");
+                            }
                             code.push_str("join(\" \", @__parts) . \"\\n\"; }");
                             code
                         } else if name == "hostname" {
@@ -1883,7 +1988,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             // clean qx{} generation, but also try to use native Perl
                             // when possible (simple cases).
                             let cmd_str = generator.generate_command_string_for_system(cmd);
-                            let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
+                            let cmd_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                             crate::ir::expr_to_open_perl(&cmd_lit, true)
                         } else if name == "chmod" {
                             // chmod in command substitution: use Perl's native chmod
@@ -1891,7 +1997,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let mut files: Vec<String> = Vec::new();
                             for arg in &simple_cmd.args {
                                 if let Word::Literal(s, _) = arg {
-                                    if s.starts_with('-') { continue; }
+                                    if s.starts_with('-') {
+                                        continue;
+                                    }
                                 }
                                 let arg_perl = generator.word_to_perl(arg);
                                 if mode_str.is_empty() {
@@ -1905,7 +2013,8 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             } else {
                                 format!(
                                     "do {{ chmod(oct({}), ({})); $CHILD_ERROR = 0; q{{}} }};\n",
-                                    mode_str, files.join(", ")
+                                    mode_str,
+                                    files.join(", ")
                                 )
                             }
                         } else if name == "chown" {
@@ -1913,7 +2022,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let mut files: Vec<String> = Vec::new();
                             for arg in &simple_cmd.args {
                                 if let Word::Literal(s, _) = arg {
-                                    if s.starts_with('-') { continue; }
+                                    if s.starts_with('-') {
+                                        continue;
+                                    }
                                 }
                                 let arg_perl = generator.word_to_perl(arg);
                                 if owner_group.is_empty() {
@@ -1938,12 +2049,26 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let mut link_arg: Option<String> = None;
                             for arg in &simple_cmd.args {
                                 if let Word::Literal(s, _) = arg {
-                                    if s == "-s" || s == "--symbolic" { is_symbolic = true; continue; }
-                                    if s == "-f" || s == "--force" { is_force = true; continue; }
-                                    if s == "-sf" || s == "-fs" { is_symbolic = true; is_force = true; continue; }
+                                    if s == "-s" || s == "--symbolic" {
+                                        is_symbolic = true;
+                                        continue;
+                                    }
+                                    if s == "-f" || s == "--force" {
+                                        is_force = true;
+                                        continue;
+                                    }
+                                    if s == "-sf" || s == "-fs" {
+                                        is_symbolic = true;
+                                        is_force = true;
+                                        continue;
+                                    }
                                     if s.starts_with('-') && !s.starts_with("-") {
-                                        if s.contains('s') { is_symbolic = true; }
-                                        if s.contains('f') { is_force = true; }
+                                        if s.contains('s') {
+                                            is_symbolic = true;
+                                        }
+                                        if s.contains('f') {
+                                            is_force = true;
+                                        }
                                         continue;
                                     }
                                 }
@@ -1969,15 +2094,17 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                         format!("do {{ link {}, {} or warn \"link failed: $OS_ERROR\\n\"; $CHILD_ERROR = 0; q{{}} }};\n", target, link)
                                     }
                                 }
-                                _ => {
-                                    "do { $CHILD_ERROR = 1; q{} };\n".to_string()
-                                }
+                                _ => "do { $CHILD_ERROR = 1; q{} };\n".to_string(),
                             }
                         } else if name == "rmdir" {
-                            let files: Vec<String> = simple_cmd.args.iter()
+                            let files: Vec<String> = simple_cmd
+                                .args
+                                .iter()
                                 .filter_map(|arg| {
                                     if let Word::Literal(s, _) = arg {
-                                        if s.starts_with('-') { return None; }
+                                        if s.starts_with('-') {
+                                            return None;
+                                        }
                                     }
                                     Some(generator.word_to_perl(arg))
                                 })
@@ -2019,22 +2146,21 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if crate::generator::commands::builtins::is_builtin(name) {
                             // Known builtin but not yet natively handled in command substitution.
                             let cmd_str = generator.generate_command_string_for_system(cmd);
-                            let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
+                            let cmd_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                             crate::ir::expr_to_open_perl(&cmd_lit, true)
                         } else {
                             // Fall back to system command for unknown commands.
                             let cmd_str = generator.generate_command_string_for_system(cmd);
-                            let cmd_lit = generator.perl_string_literal_no_interp(
-                                &Word::literal(cmd_str),
-                            );
+                            let cmd_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                             crate::ir::expr_to_open_perl(&cmd_lit, true)
                         }
                     } else {
                         // Fall back to system command for non-literal command names.
                         let cmd_str = generator.generate_command_string_for_system(cmd);
-                        let cmd_lit = generator.perl_string_literal_no_interp(
-                            &Word::literal(cmd_str),
-                        );
+                        let cmd_lit =
+                            generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                         crate::ir::expr_to_open_perl(&cmd_lit, true)
                     }
                 }
@@ -2053,10 +2179,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     if trimmed.starts_with("do {") && trimmed.ends_with("}") {
                         trimmed.to_string()
                     } else {
-                        format!(
-                            "do {{ local $CHILD_ERROR = 0; {}; }}",
-                            pipeline_code
-                        )
+                        format!("do {{ local $CHILD_ERROR = 0; {}; }}", pipeline_code)
                     }
                 }
                 Command::And(left_cmd, right_cmd) => {
@@ -2259,8 +2382,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     // if ($CHILD_ERROR == 0) { ... } else { ... }
                     let then_raw = format!(
                         "{}my ${} = {};\n{}${} . ${};\n",
-                        "        ", right_var, right_wrapped,
-                        "        ", left_var, right_var,
+                        "        ", right_var, right_wrapped, "        ", left_var, right_var,
                     );
                     crate::ir::emit_stmt(
                         &mut do_body,
@@ -2273,13 +2395,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 op: crate::ir::BinOpKind::Eq,
                                 rhs: Box::new(crate::ir::IrExpr::Int(0)),
                             },
-                            then: vec![
-                                crate::ir::IrStmt::RawText(then_raw),
-                            ],
+                            then: vec![crate::ir::IrStmt::RawText(then_raw)],
                             elsifs: vec![],
-                            else_: vec![
-                                crate::ir::IrStmt::RawText("        q{};\n".to_string()),
-                            ],
+                            else_: vec![crate::ir::IrStmt::RawText("        q{};\n".to_string())],
                         },
                         1,
                     );
@@ -2331,7 +2449,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
             // Only skip wrapping when the result already chomps at the TOP level
             // (e.g. bash -c fallback uses `chomp $_r`).  Do NOT skip for internal
             // chomps used inside file-reading loops like `chomp $line`.
-            let has_top_chomp = result.contains("chomp $_r") || result.contains("chomp(my $_r") || result.contains("chomp(my $__r");
+            let has_top_chomp = result.contains("chomp $_r")
+                || result.contains("chomp(my $_r")
+                || result.contains("chomp(my $__r");
             if !has_top_chomp && (trimmed.starts_with("do {") || trimmed.starts_with("{")) {
                 // Already a do/block: wrap the whole thing so we can chomp its value.
                 format!("do {{ my $__cs = {}; chomp $__cs; $__cs; }}", result)
@@ -2391,15 +2511,15 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else {
                             "@ARGV".to_string()
                         }
-                    },
+                    }
                     "*" => {
                         if generator.fn_nesting_depth > 0 {
                             "@_".to_string()
                         } else {
                             "@ARGV".to_string()
                         }
-                    },
-                    "$" => "$$".to_string(),         // $$ -> $$ (process ID)
+                    }
+                    "$" => "$$".to_string(), // $$ -> $$ (process ID)
                     "?" => "$CHILD_ERROR".to_string(), // $? -> exit code
                     "!" => "''".to_string(), // $! -> empty (last background PID, not tracked)
                     "-" => "''".to_string(), // $- -> empty (shell options not tracked)
@@ -2480,7 +2600,7 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 // If the key looks like ${varname} (shell variable dereference),
                 // strip the ${ } wrapper so we use just $varname as the index.
                 let clean_key = if key.starts_with("${") && key.ends_with('}') {
-                    &key[2..key.len()-1]
+                    &key[2..key.len() - 1]
                 } else if key.starts_with('$') {
                     key
                 } else {
@@ -2593,9 +2713,13 @@ pub fn handle_brace_expansion_impl(
         // is a separate result (e.g. "1 2 3 4 5" → ["1","2","3","4","5"]).
         raw_items
             .into_iter()
-            .flat_map(|v| v.into_iter().flat_map(|s| {
-                s.split_whitespace().map(|t| t.to_string()).collect::<Vec<_>>()
-            }))
+            .flat_map(|v| {
+                v.into_iter().flat_map(|s| {
+                    s.split_whitespace()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                })
+            })
             .collect()
     } else {
         // Multiple items / cartesian product
@@ -2788,14 +2912,14 @@ pub fn convert_string_interpolation_to_perl_impl(
                         } else {
                             current_string.push_str("@ARGV");
                         }
-                    },
+                    }
                     "*" => {
                         if generator.fn_nesting_depth > 0 {
                             current_string.push_str("@_");
                         } else {
                             current_string.push_str("@ARGV");
                         }
-                    },
+                    }
                     _ => {
                         // Check if this is a shell positional parameter ($0, $1, $2, etc.)
                         if var.chars().all(|c| c.is_digit(10)) {
@@ -2964,13 +3088,14 @@ pub fn convert_string_interpolation_to_perl_impl(
                                     && !generator.associative_arrays.contains(&pe.variable);
                                 if is_scalar {
                                     // Scalar substring: ${var:offset} or ${var:offset:length}
-                                    let var_ref = if generator.declared_locals.contains(&pe.variable)
-                                        || generator.function_level_vars.contains(&pe.variable)
-                                    {
-                                        format!("${}", pe.variable)
-                                    } else {
-                                        format!("$ENV{{{}}}", pe.variable)
-                                    };
+                                    let var_ref =
+                                        if generator.declared_locals.contains(&pe.variable)
+                                            || generator.function_level_vars.contains(&pe.variable)
+                                        {
+                                            format!("${}", pe.variable)
+                                        } else {
+                                            format!("$ENV{{{}}}", pe.variable)
+                                        };
                                     let trimmed_offset = offset.trim();
                                     if let Some(length_str) = length {
                                         let trimmed_len = length_str.trim();
@@ -3071,7 +3196,8 @@ pub fn convert_string_interpolation_to_perl_impl(
                         // Apply operator transformation if present
                         let result = match &pe.operator {
                             ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
-                                let regex = super::expansions::glob_to_perl_regex_nongreedy(pattern);
+                                let regex =
+                                    super::expansions::glob_to_perl_regex_nongreedy(pattern);
                                 format!("({} =~ s/^{}//r)", expr, regex)
                             }
                             ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
@@ -3079,7 +3205,8 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 format!("({} =~ s/^{}//sr)", expr, regex)
                             }
                             ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
-                                let regex = super::expansions::glob_to_perl_regex_nongreedy(pattern);
+                                let regex =
+                                    super::expansions::glob_to_perl_regex_nongreedy(pattern);
                                 format!("({} =~ s/{}$//r)", expr, regex)
                             }
                             ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
@@ -3102,7 +3229,8 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 format!("( ( {} ) =~ s|/[^/]*$||sr )", expr)
                             }
                             ParameterExpansionOperator::DefaultValue(default) => {
-                                let default_expr = super::expansions::default_value_to_perl(generator, default);
+                                let default_expr =
+                                    super::expansions::default_value_to_perl(generator, default);
                                 format!(
                                     "(defined {} && {} ne q{{}} ? {} : {})",
                                     expr, expr, expr, default_expr
@@ -3239,14 +3367,16 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
     {
         let re_pos = regex::Regex::new(r"\$(\d+)").unwrap();
         let use_argv = generator.fn_nesting_depth == 0;
-        result = re_pos.replace_all(&result, |caps: &regex::Captures| {
-            let n: usize = caps[1].parse().unwrap_or(1);
-            if use_argv {
-                format!("$ARGV[{}]", n.saturating_sub(1))
-            } else {
-                format!("$_[{}]", n.saturating_sub(1))
-            }
-        }).to_string();
+        result = re_pos
+            .replace_all(&result, |caps: &regex::Captures| {
+                let n: usize = caps[1].parse().unwrap_or(1);
+                if use_argv {
+                    format!("$ARGV[{}]", n.saturating_sub(1))
+                } else {
+                    format!("$_[{}]", n.saturating_sub(1))
+                }
+            })
+            .to_string();
     }
 
     // Phase 0a: replace bash array-length syntax ${#var[@]} with scalar(@var)
@@ -3314,9 +3444,7 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
                 // Generate Perl code: chomp(my $r = qx{cmd}); $r
                 // Use open() with bash -c instead of qx'...' to avoid
                 // check_qx.pl violations.
-                let cmd_escaped = inner_cmd
-                    .replace("\\", "\\\\")
-                    .replace("\'", "\\\'");
+                let cmd_escaped = inner_cmd.replace("\\", "\\\\").replace("\'", "\\\'");
                 let perl_code = format!(
                     "do {{ chomp(my $_r = do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"cmd failed: $!\"; local $/; my $_r = <$__fh>; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}); $_r; }}",
                     cmd_escaped
@@ -3343,13 +3471,15 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
         let before = result.clone();
         // Match innermost ${...} (no nested ${) — i.e. ${...} with no `{` or `}` inside
         let inner_brace_re = Regex::new(r"\$\{([^{}]+)\}").unwrap();
-        result = inner_brace_re.replace_all(&result, |caps: &regex::Captures| {
-            let content = &caps[1];
-            let placeholder = format!("__PARAM_EXPAND_{}__", param_expand_replacements.len());
-            let perl = convert_param_expansion_in_arith(content, generator);
-            param_expand_replacements.push((placeholder.clone(), perl));
-            placeholder
-        }).to_string();
+        result = inner_brace_re
+            .replace_all(&result, |caps: &regex::Captures| {
+                let content = &caps[1];
+                let placeholder = format!("__PARAM_EXPAND_{}__", param_expand_replacements.len());
+                let perl = convert_param_expansion_in_arith(content, generator);
+                param_expand_replacements.push((placeholder.clone(), perl));
+                placeholder
+            })
+            .to_string();
         if result == before {
             break;
         }
@@ -3377,13 +3507,26 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
             } else if var_name.starts_with("__PARAM_EXPAND_") && var_name.ends_with("__") {
                 // Parameter expansion placeholder — leave untouched
                 var_name.to_string()
-
             } else if matches!(
                 var_name,
-                "scalar" | "length" | "keys" | "values" | "int"
-                    | "join" | "split" | "grep" | "map" | "sort"
-                    | "defined" | "undef" | "substr" | "reverse"
-                    | "pop" | "push" | "shift" | "unshift"
+                "scalar"
+                    | "length"
+                    | "keys"
+                    | "values"
+                    | "int"
+                    | "join"
+                    | "split"
+                    | "grep"
+                    | "map"
+                    | "sort"
+                    | "defined"
+                    | "undef"
+                    | "substr"
+                    | "reverse"
+                    | "pop"
+                    | "push"
+                    | "shift"
+                    | "unshift"
                     | "sprintf"
             ) {
                 // Perl builtin function — leave as-is.
@@ -3491,7 +3634,10 @@ fn convert_param_expansion_in_arith(content: &str, generator: &Generator) -> Str
             } else {
                 format!("$ENV{{{}}}", var_part)
             };
-            return format!("(defined {} && {} ne q{{}} ? {} : {})", ref_str, ref_str, ref_str, default);
+            return format!(
+                "(defined {} && {} ne q{{}} ? {} : {})",
+                ref_str, ref_str, ref_str, default
+            );
         }
         // Array access: ${array[key]:-default} where key has no ${...} (already innermost)
         if let Some(open_idx) = var_part.find('[') {
@@ -3501,10 +3647,16 @@ fn convert_param_expansion_in_arith(content: &str, generator: &Generator) -> Str
                 // Use curly braces for associative arrays, square brackets for indexed arrays
                 if generator.associative_arrays.contains(array_name) {
                     let ref_str = format!("${}{{{}}}", array_name, key);
-                    return format!("(defined {} && {} ne q{{}} ? {} : {})", ref_str, ref_str, ref_str, default);
+                    return format!(
+                        "(defined {} && {} ne q{{}} ? {} : {})",
+                        ref_str, ref_str, ref_str, default
+                    );
                 } else {
                     let ref_str = format!("${}[{}]", array_name, key);
-                    return format!("(defined {} && {} ne q{{}} ? {} : {})", ref_str, ref_str, ref_str, default);
+                    return format!(
+                        "(defined {} && {} ne q{{}} ? {} : {})",
+                        ref_str, ref_str, ref_str, default
+                    );
                 }
             }
         }
@@ -3528,8 +3680,10 @@ fn convert_param_expansion_in_arith(content: &str, generator: &Generator) -> Str
             } else {
                 format!("$ENV{{{}}}", var_part)
             };
-            return format!("(defined {} && {} ne q{{}} ? {} : do {{ {} = {}; {} }})",
-                ref_str, ref_str, ref_str, assign_ref, default, ref_str);
+            return format!(
+                "(defined {} && {} ne q{{}} ? {} : do {{ {} = {}; {} }})",
+                ref_str, ref_str, ref_str, assign_ref, default, ref_str
+            );
         }
     }
     // Handle ${var:+default} — use default if var is set and non-empty
@@ -3544,7 +3698,10 @@ fn convert_param_expansion_in_arith(content: &str, generator: &Generator) -> Str
             } else {
                 format!("$ENV{{{}}}", var_part)
             };
-            return format!("(defined {} && {} ne q{{}} ? {} : q{{}})", ref_str, ref_str, default);
+            return format!(
+                "(defined {} && {} ne q{{}} ? {} : q{{}})",
+                ref_str, ref_str, default
+            );
         }
     }
     // Handle ${var} (simple variable with braces)
@@ -3605,12 +3762,12 @@ pub fn preprocess_shell_vars_in_raw_string(generator: &Generator, raw: &str) -> 
         let var_name = &matched[1..]; // strip the $
 
         // Check if preceded by another $ (e.g. `$ENV` inside `$ENV{...}`)
-        let preceded_by_dollar = match_start > 0
-            && after_braced.as_bytes()[match_start - 1] == b'$';
+        let preceded_by_dollar =
+            match_start > 0 && after_braced.as_bytes()[match_start - 1] == b'$';
 
         // Check if followed by { (e.g. `$ENV{...}`)
-        let followed_by_brace = match_end < after_braced.len()
-            && after_braced.as_bytes()[match_end] == b'{';
+        let followed_by_brace =
+            match_end < after_braced.len() && after_braced.as_bytes()[match_end] == b'{';
 
         // Check if followed by another identifier char
         let followed_by_id_char = match_end < after_braced.len()
@@ -3618,8 +3775,7 @@ pub fn preprocess_shell_vars_in_raw_string(generator: &Generator, raw: &str) -> 
 
         let already_processed = preceded_by_dollar || followed_by_brace || followed_by_id_char;
 
-        if !already_processed
-            && !matches!(var_name, "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
+        if !already_processed && !matches!(var_name, "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
         {
             // This is a bare shell variable reference — convert it.
             let replacement = if generator.declared_locals.contains(var_name)

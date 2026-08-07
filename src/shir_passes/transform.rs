@@ -52,7 +52,12 @@ impl super::Transform for StoreToNative {
 /// Names referenced by literal-name setVar/getVar calls, and names that
 /// must stay store-bound (any non-setVar/getVar reference). A dynamic
 /// name argument marks ALL vars unsafe (it could alias any of them).
-fn analyze_store_only(prog: &IrProgram) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
+fn analyze_store_only(
+    prog: &IrProgram,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
     let mut store: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut unsafe_v: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut any_dynamic = false;
@@ -80,8 +85,16 @@ fn analyze_store_only(prog: &IrProgram) -> (std::collections::HashSet<String>, s
                     }
                 } else if matches!(
                     name,
-                    "arrayIndex" | "arrayLen" | "arrayItems" | "setArray" | "setArrayAppend"
-                        | "param" | "memLoad" | "memStore" | "addrOf" | "assign"
+                    "arrayIndex"
+                        | "arrayLen"
+                        | "arrayItems"
+                        | "setArray"
+                        | "setArrayAppend"
+                        | "param"
+                        | "memLoad"
+                        | "memStore"
+                        | "addrOf"
+                        | "assign"
                 ) {
                     // a by-NAME reference — the first arg is the name
                     if let Some(IrExpr::Str(n, _)) = args.first() {
@@ -143,7 +156,12 @@ fn analyze_store_only(prog: &IrProgram) -> (std::collections::HashSet<String>, s
                 }
                 walk_expr(expr, store, unsafe_v, any_dynamic);
             }
-            IrStmt::If { cond, then, elsifs, else_ } => {
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
                 walk_expr(cond, store, unsafe_v, any_dynamic);
                 for s in then.iter().chain(else_) {
                     walk_stmt(s, store, unsafe_v, any_dynamic);
@@ -170,9 +188,7 @@ fn analyze_store_only(prog: &IrProgram) -> (std::collections::HashSet<String>, s
                     walk_stmt(s, store, unsafe_v, any_dynamic);
                 }
             }
-            IrStmt::Block(stmts)
-            | IrStmt::Subshell(stmts)
-            | IrStmt::Background(stmts) => {
+            IrStmt::Block(stmts) | IrStmt::Subshell(stmts) | IrStmt::Background(stmts) => {
                 for s in stmts {
                     walk_stmt(s, store, unsafe_v, any_dynamic);
                 }
@@ -192,7 +208,10 @@ fn analyze_store_only(prog: &IrProgram) -> (std::collections::HashSet<String>, s
                     walk_expr(&r.target, store, unsafe_v, any_dynamic);
                 }
             }
-            IrStmt::Case { discriminant, clauses } => {
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
                 walk_expr(discriminant, store, unsafe_v, any_dynamic);
                 for c in clauses {
                     for s in &c.body {
@@ -236,7 +255,9 @@ fn analyze_store_only(prog: &IrProgram) -> (std::collections::HashSet<String>, s
 /// the runtime's special-variable handling and are never liftable).
 fn is_plain_var(n: &str) -> bool {
     !n.is_empty()
-        && n.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+        && n.chars()
+            .next()
+            .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
         && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -291,7 +312,12 @@ fn rewrite_setvar_stmts(
                 }
             }
         }
-        IrStmt::If { then, elsifs, else_, .. } => {
+        IrStmt::If {
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
             for s in then.iter_mut().chain(else_.iter_mut()) {
                 rewrite_setvar_stmts(s, store, unsafe_v);
             }
@@ -406,8 +432,11 @@ impl super::Transform for ConstMarkup {
         "const_markup"
     }
     fn run(&self, prog: &mut IrProgram, ctx: &PassContext) {
-        let mut verdicts: Vec<(String, crate::ir::VarKind)> =
-            ctx.const_vars.iter().map(|(n, k)| (n.clone(), *k)).collect();
+        let mut verdicts: Vec<(String, crate::ir::VarKind)> = ctx
+            .const_vars
+            .iter()
+            .map(|(n, k)| (n.clone(), *k))
+            .collect();
         verdicts.sort_by(|a, b| a.0.cmp(&b.0));
         prog.var_const = verdicts;
     }
@@ -416,8 +445,8 @@ impl super::Transform for ConstMarkup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shir_passes::Transform as _;
     use crate::ir::IrProgram;
+    use crate::shir_passes::Transform as _;
 
     fn empty_prog() -> IrProgram {
         IrProgram {

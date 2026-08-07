@@ -56,7 +56,7 @@
 //!   own rc preservation.
 
 use crate::ast::Command;
-use crate::ir::{AssignTarget, IrExpr, IrRedirect, IrStmt, IrProgram, StrStyle};
+use crate::ir::{AssignTarget, IrExpr, IrProgram, IrRedirect, IrStmt, StrStyle};
 use crate::parser::commands::parse_commands_from_text;
 
 /// Apply the transform to a statement list. Returns whether anything
@@ -234,17 +234,15 @@ fn materialize_stmt(st: &mut IrStmt, n: &mut usize) -> bool {
         }
         IrStmt::Expr(e) => materialize_expr(e, n),
         IrStmt::Assign { expr, .. } => materialize_expr(expr, n),
-        IrStmt::Declare { init, .. } => init.as_mut().map(|i| materialize_expr(i, n)).unwrap_or(false),
+        IrStmt::Declare { init, .. } => init
+            .as_mut()
+            .map(|i| materialize_expr(i, n))
+            .unwrap_or(false),
         IrStmt::Output { value, .. } => materialize_expr(value, n),
-        IrStmt::WriteFile {
-            path, content, ..
-        } => materialize_expr(path, n) | materialize_expr(content, n),
-        IrStmt::Exec {
-            cmd,
-            args,
-            env,
-            ..
-        } => {
+        IrStmt::WriteFile { path, content, .. } => {
+            materialize_expr(path, n) | materialize_expr(content, n)
+        }
+        IrStmt::Exec { cmd, args, env, .. } => {
             let mut c = materialize_expr(cmd, n);
             for a in args.iter_mut() {
                 c |= materialize_expr(a, n);
@@ -547,7 +545,10 @@ fn materialize_redirect_call(call_args: &mut [IrExpr], n: &mut usize) -> bool {
         return false;
     }
     // commit: exec args gain the tmp paths
-    if let [IrStmt::Expr(IrExpr::Call { args: call_args2, .. })] = stmts.as_mut_slice() {
+    if let [IrStmt::Expr(IrExpr::Call {
+        args: call_args2, ..
+    })] = stmts.as_mut_slice()
+    {
         if let Some(IrExpr::Array(els)) = call_args2.get_mut(1) {
             els.extend(arg_paths.iter().cloned());
         }
@@ -600,16 +601,19 @@ fn exec_cmd_name(inner: &[IrStmt]) -> Option<String> {
 /// cannot be found (aborts the rewrite).
 fn append_exec_args(inner: &mut [IrStmt], args: &[IrExpr]) -> bool {
     match inner {
-        [IrStmt::Expr(IrExpr::Call { func, args: call_args })] if func == "exec" => {
-            match call_args.get_mut(1) {
-                Some(IrExpr::Array(els)) => {
-                    els.extend(args.iter().cloned());
-                    true
-                }
-                _ => false,
+        [IrStmt::Expr(IrExpr::Call {
+            func,
+            args: call_args,
+        })] if func == "exec" => match call_args.get_mut(1) {
+            Some(IrExpr::Array(els)) => {
+                els.extend(args.iter().cloned());
+                true
             }
-        }
-        [IrStmt::Exec { args: exec_args, .. }] => {
+            _ => false,
+        },
+        [IrStmt::Exec {
+            args: exec_args, ..
+        }] => {
             exec_args.extend(args.iter().cloned());
             true
         }
@@ -717,7 +721,10 @@ mod tests {
         let before = crate::shir_json::shir_to_shir_json(&prog);
         let changed = transform(&mut prog.stmts);
         let after = crate::shir_json::shir_to_shir_json(&prog);
-        assert_eq!(before, after, "unmaterializable producer must not be touched");
+        assert_eq!(
+            before, after,
+            "unmaterializable producer must not be touched"
+        );
         assert!(!changed);
     }
 

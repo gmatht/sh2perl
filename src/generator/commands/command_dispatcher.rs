@@ -98,14 +98,22 @@ pub fn generate_command_impl_with_input(
             // negated exit code: $? = !$?  =>  $CHILD_ERROR = $CHILD_ERROR ? 0 : 1
             let inner = generator.generate_command(cmd);
             // Strip trailing whitespace/semicolons so the do block is clean.
-            let inner_clean = inner.trim().trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t');
+            let inner_clean = inner
+                .trim()
+                .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t');
             if inner_clean.is_empty() {
                 String::new()
             } else if inner_clean.starts_with("!") {
                 // Double negation: !! cmd — negation happens twice, cancels out
-                format!("do {{ {}; }}; $CHILD_ERROR = $CHILD_ERROR ? 0 : 1;\n", inner_clean)
+                format!(
+                    "do {{ {}; }}; $CHILD_ERROR = $CHILD_ERROR ? 0 : 1;\n",
+                    inner_clean
+                )
             } else {
-                format!("do {{ {}; }}; $CHILD_ERROR = $CHILD_ERROR ? 0 : 1;\n", inner_clean)
+                format!(
+                    "do {{ {}; }}; $CHILD_ERROR = $CHILD_ERROR ? 0 : 1;\n",
+                    inner_clean
+                )
             }
         }
         Command::BlankLine => "\n".to_string(),
@@ -166,7 +174,8 @@ pub fn generate_command_impl_with_input(
                             // In a pipeline context, assign to $output (the pipeline
                             // handler declares it); in a standalone context, pass empty
                             // target so the generator prints directly.
-                            let heredoc_target = if generator.current_pipeline_output_id().is_some() {
+                            let heredoc_target = if generator.current_pipeline_output_id().is_some()
+                            {
                                 "$output"
                             } else {
                                 ""
@@ -241,33 +250,23 @@ pub fn generate_command_impl_with_input(
                             let child_var = format!("child_ps_{}", global_counter);
 
                             result.push_str(&generator.indent());
-                            result.push_str(&format!(
-                                "use POSIX qw(mkfifo);\n"));
+                            result.push_str(&format!("use POSIX qw(mkfifo);\n"));
                             result.push_str(&generator.indent());
                             result.push_str(&format!(
                                 "my ${} = {} . '/ps_fifo_$$_{}';\n",
                                 fifo_var, temp_dir_expr, global_counter
                             ));
                             result.push_str(&generator.indent());
-                            result.push_str(&format!(
-                                "unlink ${};\n",
-                                fifo_var
-                            ));
+                            result.push_str(&format!("unlink ${};\n", fifo_var));
                             result.push_str(&generator.indent());
                             result.push_str(&format!(
                                 "mkfifo(${}, 0700) or croak \"mkfifo: $ERRNO\\n\";\n",
                                 fifo_var
                             ));
                             result.push_str(&generator.indent());
-                            result.push_str(&format!(
-                                "my ${} = fork();\n",
-                                child_var
-                            ));
+                            result.push_str(&format!("my ${} = fork();\n", child_var));
                             result.push_str(&generator.indent());
-                            result.push_str(&format!(
-                                "if (${} == 0) {{\n",
-                                child_var
-                            ));
+                            result.push_str(&format!("if (${} == 0) {{\n", child_var));
                             generator.indent_level += 1;
                             result.push_str(&generator.indent());
                             result.push_str(&format!(
@@ -319,7 +318,10 @@ pub fn generate_command_impl_with_input(
                                 global_counter
                             ));
 
-                            if in_stdout_context || !command_can_be_serialized(cmd) || command_tree_is_native_builtin(cmd) {
+                            if in_stdout_context
+                                || !command_can_be_serialized(cmd)
+                                || command_tree_is_native_builtin(cmd)
+                            {
                                 // If we're already in a STDOUT context, or if the command
                                 // cannot be serialized to a bash command string, generate
                                 // the actual Perl code (inline approach).
@@ -334,11 +336,15 @@ pub fn generate_command_impl_with_input(
                                 {
                                     let unique_id = generator.get_unique_id();
                                     result.push_str(&generator.indent());
-                                    result
-                                        .push_str(&format!("    my $output_{} = q{{}};\n", unique_id));
+                                    result.push_str(&format!(
+                                        "    my $output_{} = q{{}};\n",
+                                        unique_id
+                                    ));
                                     result.push_str(&generator.indent());
-                                    result
-                                        .push_str(&format!("    my $output_printed_{};\n", unique_id));
+                                    result.push_str(&format!(
+                                        "    my $output_printed_{};\n",
+                                        unique_id
+                                    ));
                                     generator
                                         .declared_locals
                                         .insert(format!("output_{}", unique_id));
@@ -364,7 +370,10 @@ pub fn generate_command_impl_with_input(
                                             unique_id, unique_id
                                         ));
                                         result.push_str(&generator.indent());
-                                        result.push_str(&format!("    print $output_{};\n", unique_id));
+                                        result.push_str(&format!(
+                                            "    print $output_{};\n",
+                                            unique_id
+                                        ));
                                         result.push_str(&generator.indent());
                                         result.push_str(&format!("}}\n"));
                                     }
@@ -375,8 +384,8 @@ pub fn generate_command_impl_with_input(
                                 // Use backticks via open3 for commands that can be serialized
                                 // to a bash command string (Simple, Pipeline, Subshell, Redirect).
                                 let cmd_str = generator.generate_command_string_for_system(cmd);
-                                let cmd_literal =
-                                    generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
+                                let cmd_literal = generator
+                                    .perl_string_literal_no_interp(&Word::literal(cmd_str));
                                 result.push_str(&generator.indent());
                                 result.push_str(&format!("my $output_ps_{};\n", global_counter));
                                 result.push_str(&generator.indent());
@@ -444,7 +453,11 @@ pub fn generate_command_impl_with_input(
 
                             process_sub_files.push((
                                 temp_var,
-                                format!("{} . '/process_sub_{}.tmp'", get_temp_dir(), global_counter),
+                                format!(
+                                    "{} . '/process_sub_{}.tmp'",
+                                    get_temp_dir(),
+                                    global_counter
+                                ),
                             ));
                         }
                     }
@@ -530,7 +543,8 @@ pub fn generate_command_impl_with_input(
                             for redirect in &all_redirects {
                                 match &redirect.operator {
                                     RedirectOperator::Output => {
-                                        let target = generator.perl_string_literal(&redirect.target);
+                                        let target =
+                                            generator.perl_string_literal(&redirect.target);
                                         result.push_str(&generator.indent());
                                         result.push_str(&format!(
                                             "open my $fh, \'>\', {} or croak \"Cannot write file: $OS_ERROR\\n\";\n",
@@ -540,7 +554,8 @@ pub fn generate_command_impl_with_input(
                                         result.push_str("close $fh;\n");
                                     }
                                     RedirectOperator::Append => {
-                                        let target = generator.perl_string_literal(&redirect.target);
+                                        let target =
+                                            generator.perl_string_literal(&redirect.target);
                                         result.push_str(&generator.indent());
                                         result.push_str(&format!(
                                             "open my $fh, \'>>\', {} or croak \"Cannot append to file: $OS_ERROR\\n\";\n",
@@ -550,7 +565,8 @@ pub fn generate_command_impl_with_input(
                                         result.push_str("close $fh;\n");
                                     }
                                     RedirectOperator::StderrOutput => {
-                                        let target = generator.perl_string_literal(&redirect.target);
+                                        let target =
+                                            generator.perl_string_literal(&redirect.target);
                                         result.push_str(&generator.indent());
                                         result.push_str(&format!(
                                             "open my $fh, \'>\', {} or croak \"Cannot write file: $OS_ERROR\\n\";\n",
@@ -560,7 +576,8 @@ pub fn generate_command_impl_with_input(
                                         result.push_str("close $fh;\n");
                                     }
                                     RedirectOperator::StderrAppend => {
-                                        let target = generator.perl_string_literal(&redirect.target);
+                                        let target =
+                                            generator.perl_string_literal(&redirect.target);
                                         result.push_str(&generator.indent());
                                         result.push_str(&format!(
                                             "open my $fh, \'>>\', {} or croak \"Cannot append to file: $OS_ERROR\\n\";\n",
@@ -798,10 +815,7 @@ pub fn generate_command_impl_with_input(
                         // Note: input_var does NOT include a leading $ — the function adds it.
                         let specific_output =
                             crate::generator::commands::tr::generate_tr_command_for_substitution(
-                                generator,
-                                &tr_cmd,
-                                &temp_var,
-                                "0",
+                                generator, &tr_cmd, &temp_var, "0",
                             );
                         // Replace the trailing bare "$tr_result_0" (which is designed for use
                         // inside a do{...} block) with a print statement for standalone commands.
@@ -813,7 +827,12 @@ pub fn generate_command_impl_with_input(
                             result.push_str(rest);
                             result.push_str(&format!("    print ${};\n", output_var));
                             // Ensure a trailing newline for standalone commands (here-string adds one in bash)
-                            result.push_str(&format!("    if (!(${} =~ {} || ${} eq q{{}})) {{\n", output_var, generator.newline_end_regex(), output_var));
+                            result.push_str(&format!(
+                                "    if (!(${} =~ {} || ${} eq q{{}})) {{\n",
+                                output_var,
+                                generator.newline_end_regex(),
+                                output_var
+                            ));
                             result.push_str(&format!("        print \"\\n\";\n"));
                             result.push_str(&format!("    }}\n"));
                         } else {
@@ -891,7 +910,8 @@ pub fn generate_command_impl_with_input(
 
                             let mut output_redirect_target = None;
                             if let Some(redirect) = output_redirect {
-                                let mode = if matches!(redirect.operator, RedirectOperator::Append) {
+                                let mode = if matches!(redirect.operator, RedirectOperator::Append)
+                                {
                                     ">>"
                                 } else {
                                     ">"
@@ -907,22 +927,25 @@ pub fn generate_command_impl_with_input(
                                 generator.indent_level += 1;
                                 result.push_str(&generator.indent());
                                 result.push_str("open my $original_stdout, '>&', STDOUT\n");
-                                result.push_str("      or die \"Cannot save STDOUT: $OS_ERROR\\n\";\n");
+                                result.push_str(
+                                    "      or die \"Cannot save STDOUT: $OS_ERROR\\n\";\n",
+                                );
                                 result.push_str(&generator.indent());
                                 result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
-                                result.push_str("      or die \"Cannot access file: $OS_ERROR\\n\";\n");
+                                result.push_str(
+                                    "      or die \"Cannot access file: $OS_ERROR\\n\";\n",
+                                );
                             }
 
                             // If there's a stderr redirect, add it inside the do block
-                            let stderr_redirect = all_redirects.iter().find(|r| {
-                                matches!(
-                                    r.operator,
-                                    RedirectOperator::StderrOutput
-                                )
-                            });
+                            let stderr_redirect = all_redirects
+                                .iter()
+                                .find(|r| matches!(r.operator, RedirectOperator::StderrOutput));
                             if let Some(redirect) = stderr_redirect {
                                 let is_fd_dup = match &redirect.target {
-                                    Word::Literal(s, _) => !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
+                                    Word::Literal(s, _) => {
+                                        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+                                    }
                                     _ => false,
                                 };
                                 if is_fd_dup {
@@ -977,7 +1000,9 @@ pub fn generate_command_impl_with_input(
                             if let Some((ref mode, ref target)) = output_redirect_target {
                                 result.push_str(&generator.indent());
                                 result.push_str("open STDOUT, '>&', $original_stdout\n");
-                                result.push_str("      or die \"Cannot restore STDOUT: $OS_ERROR\\n\";\n");
+                                result.push_str(
+                                    "      or die \"Cannot restore STDOUT: $OS_ERROR\\n\";\n",
+                                );
                                 result.push_str(&generator.indent());
                                 result.push_str("close $original_stdout\n");
                                 result.push_str("      or die \"Close failed: $OS_ERROR\\n\";\n");
@@ -990,8 +1015,10 @@ pub fn generate_command_impl_with_input(
                                 stderr_scope_opened = false;
                                 generator.indent_level -= 1;
                                 result.push_str(&generator.indent());
-                                result.push_str("};
-");
+                                result.push_str(
+                                    "};
+",
+                                );
                             }
                             return result;
                         }
@@ -1004,7 +1031,9 @@ pub fn generate_command_impl_with_input(
                             let file2 = &process_sub_files[1];
 
                             // Build arguments: first the original args (flags), then the temp file vars
-                            let mut args: Vec<String> = cmd.args.iter()
+                            let mut args: Vec<String> = cmd
+                                .args
+                                .iter()
                                 .map(|arg| generator.perl_string_literal(arg))
                                 .collect();
                             args.push(format!("${}", file1.0));
@@ -1012,7 +1041,10 @@ pub fn generate_command_impl_with_input(
                             let args_str = args.join(", ");
 
                             result.push_str(&generator.indent());
-                            result.push_str(&format!("$main_exit_code = $CHILD_ERROR = system('cmp', {}) >> 8;\n", args_str));
+                            result.push_str(&format!(
+                                "$main_exit_code = $CHILD_ERROR = system('cmp', {}) >> 8;\n",
+                                args_str
+                            ));
 
                             return result;
                         }
@@ -1064,12 +1096,15 @@ pub fn generate_command_impl_with_input(
                                     Word::Literal(s, _) => Some(s.clone()),
                                     Word::StringInterpolation(interp, _) => {
                                         if interp.parts.len() == 1 {
-                                            if let crate::ast::StringPart::Literal(s) = &interp.parts[0] {
+                                            if let crate::ast::StringPart::Literal(s) =
+                                                &interp.parts[0]
+                                            {
                                                 // Strip surrounding quotes if present
-                                                let bare = if (s.starts_with('"') && s.ends_with('"'))
+                                                let bare = if (s.starts_with('"')
+                                                    && s.ends_with('"'))
                                                     || (s.starts_with('\'') && s.ends_with('\''))
                                                 {
-                                                    &s[1..s.len()-1]
+                                                    &s[1..s.len() - 1]
                                                 } else {
                                                     s
                                                 };
@@ -1081,26 +1116,31 @@ pub fn generate_command_impl_with_input(
                                     _ => None,
                                 }
                             }
-                            let has_echo_flags = echo_cmd.args.iter().any(|a| {
-                                matches!(a, Word::Literal(s, _) if s == "-e" || s == "-n")
-                            });
-                            let all_simple = echo_cmd.args.iter().all(|a| is_simple_literal_arg(a).is_some());
+                            let has_echo_flags = echo_cmd.args.iter().any(
+                                |a| matches!(a, Word::Literal(s, _) if s == "-e" || s == "-n"),
+                            );
+                            let all_simple = echo_cmd
+                                .args
+                                .iter()
+                                .all(|a| is_simple_literal_arg(a).is_some());
                             // Only apply fast path for simple literal echo (no -e/-n flags).
                             if !has_echo_flags && all_simple {
-                                if let Some(redirect) = all_redirects.iter().find(|r| {
-                                    matches!(r.operator, RedirectOperator::Output)
-                                }) {
+                                if let Some(redirect) = all_redirects
+                                    .iter()
+                                    .find(|r| matches!(r.operator, RedirectOperator::Output))
+                                {
                                     let target_str = match &redirect.target {
                                         Word::Literal(s, _) => s.clone(),
                                         _ => generator.word_to_perl(&redirect.target),
                                     };
-                                    let content = echo_cmd.args.iter()
+                                    let content = echo_cmd
+                                        .args
+                                        .iter()
                                         .filter_map(|a| is_simple_literal_arg(a))
                                         .collect::<Vec<_>>()
                                         .join(" ");
-                                    let target_lit = generator.perl_string_literal(
-                                        &Word::literal(target_str.clone()),
-                                    );
+                                    let target_lit = generator
+                                        .perl_string_literal(&Word::literal(target_str.clone()));
                                     let expr = IrExpr::Str(content, StrStyle::DoubleQuoted);
                                     let output_stmt = IrStmt::Output {
                                         value: expr,
@@ -1110,10 +1150,12 @@ pub fn generate_command_impl_with_input(
                                     result.push_str(&generator.indent());
                                     result.push_str(&format!(
                                         "open my $fh, '>', {} or die \"{}: $!\\n\";\n",
-                                        target_lit,
-                                        target_str
+                                        target_lit, target_str
                                     ));
-                                    result.push_str(&stmt_to_perl(&output_stmt, generator.indent_level));
+                                    result.push_str(&stmt_to_perl(
+                                        &output_stmt,
+                                        generator.indent_level,
+                                    ));
                                     result.push_str(&generator.indent());
                                     result.push_str("close $fh;\n");
                                     // Skip the rest of the redirect handler
@@ -1436,11 +1478,13 @@ pub fn generate_command_impl_with_input(
                 result.push_str(&generator.indent());
                 result.push_str("};\n");
             }
-                        if stderr_scope_opened {
+            if stderr_scope_opened {
                 generator.indent_level -= 1;
                 result.push_str(&generator.indent());
-                result.push_str("};
-");
+                result.push_str(
+                    "};
+",
+                );
             }
             // Emit deferred process-substitution cleanup code (close FIFO, wait for child, unlink)
             for cleanup in &deferred_cleanup {

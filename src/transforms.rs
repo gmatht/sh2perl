@@ -17,14 +17,14 @@ use crate::ir::IrStmt;
 
 pub type TransformFn = fn(&mut Vec<IrStmt>) -> bool;
 
+pub mod arith_forms;
+pub mod process_subst;
+pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
 /// Registered transforms. The estree worker APPENDS entries here (and a
 /// `pub mod <name>;` above) when a worker-submitted transform is accepted
 /// into the crate. Each entry is (name, transform_fn).
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
-pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
-pub mod process_subst;
-pub mod arith_forms;
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![

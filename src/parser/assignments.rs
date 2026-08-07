@@ -118,7 +118,10 @@ pub fn parse_array_elements(lexer: &mut Lexer) -> Result<Vec<Word>, ParserError>
                 // parsing elements (mirrors the raw-text scanner's early
                 // return for the same shape).
                 if matches!(
-                    lexer.current.checked_sub(1).and_then(|i| lexer.tokens.get(i)),
+                    lexer
+                        .current
+                        .checked_sub(1)
+                        .and_then(|i| lexer.tokens.get(i)),
                     Some((Token::ArithmeticEvalClose, _, _))
                 ) {
                     break;
@@ -222,7 +225,7 @@ fn parse_arithmetic_expression(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
             }
             Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
-                // Nested (( or $(( 
+                // Nested (( or $((
                 if let Some(text) = lexer.get_current_text() {
                     expression_parts.push(text);
                 }

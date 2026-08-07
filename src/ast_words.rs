@@ -170,9 +170,9 @@ pub enum Word {
     Variable(String, bool, Option<()>), // variable_name, is_mutable, annotations
     ParameterExpansion(ParameterExpansion, Option<()>),
     Array(String, Vec<Word>, Option<()>), // array_name, elements, annotations
-    MapAccess(String, String, Option<()>),  // map_name, key, annotations
-    MapKeys(String, Option<()>),            // !map[@] -> get keys of associative array, annotations
-    MapLength(String, Option<()>),          // #arr[@] -> get length of array, annotations
+    MapAccess(String, String, Option<()>), // map_name, key, annotations
+    MapKeys(String, Option<()>),          // !map[@] -> get keys of associative array, annotations
+    MapLength(String, Option<()>),        // #arr[@] -> get length of array, annotations
     ArraySlice(String, String, Option<String>, Option<()>), // array_name, offset, optional_length, annotations
     Arithmetic(ArithmeticExpression, Option<()>),
     BraceExpansion(BraceExpansion, Option<()>),
@@ -189,7 +189,7 @@ impl std::fmt::Display for Word {
                 // Delegate to ParameterExpansion's own Display impl which
                 // produces correct shell syntax (e.g., ${0##*/} not ${0}##*/).
                 write!(f, "{}", pe)
-            },
+            }
             Word::Array(name, elements, _) => write!(f, "{}=({})", name, word_list_text(elements)),
             Word::MapAccess(map_name, key, _) => write!(f, "{}[{}]", map_name, key),
             Word::MapKeys(map_name, _) => write!(f, "!{}[@]", map_name),

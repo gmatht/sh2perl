@@ -747,13 +747,20 @@ pub fn generate_generic_builtin(
                     if let Word::Literal(s, _) = &cmd.args[i] {
                         if s == "-n" && i + 1 < cmd.args.len() {
                             if let Word::Literal(n, _) = &cmd.args[i + 1] {
-                                if let Ok(v) = n.parse::<usize>() { num_lines = v; }
-                                i += 2; continue;
+                                if let Ok(v) = n.parse::<usize>() {
+                                    num_lines = v;
+                                }
+                                i += 2;
+                                continue;
                             }
                         } else if s.starts_with("-n") {
-                            if let Ok(v) = s[2..].parse::<usize>() { num_lines = v; }
+                            if let Ok(v) = s[2..].parse::<usize>() {
+                                num_lines = v;
+                            }
                         } else if s.starts_with('-') && s.len() > 1 {
-                            if let Ok(v) = s[1..].parse::<usize>() { num_lines = v; }
+                            if let Ok(v) = s[1..].parse::<usize>() {
+                                num_lines = v;
+                            }
                         } else {
                             file_args.push(generator.word_to_perl(&cmd.args[i]));
                         }
@@ -792,9 +799,9 @@ pub fn generate_generic_builtin(
                 )
             }
         }
-        "cut" => {
-            crate::generator::commands::cut::generate_cut_command_with_output(generator, cmd, input_var, 0, output_var)
-        }
+        "cut" => crate::generator::commands::cut::generate_cut_command_with_output(
+            generator, cmd, input_var, 0, output_var,
+        ),
         "paste" => {
             // For now, use the existing signature but we should standardize this
             let paste_output =
@@ -802,7 +809,10 @@ pub fn generate_generic_builtin(
             if output_var.is_empty() {
                 // Standalone paste command: capture the do-block result and print it.
                 let paste_result_var = format!("paste_result_{}", generator.get_unique_id());
-                format!("my ${} = {};\nprint ${};\n", paste_result_var, paste_output, paste_result_var)
+                format!(
+                    "my ${} = {};\nprint ${};\n",
+                    paste_result_var, paste_output, paste_result_var
+                )
             } else {
                 format!("${} = {};\n", output_var, paste_output)
             }
@@ -851,13 +861,11 @@ pub fn generate_generic_builtin(
                 } else {
                     // command name args...: just run the command directly through the shell
                     // to preserve builtin semantics for other builtins like echo, printf, etc.
-                    let cmd_str = generator.generate_command_string_for_system(
-                        &Command::Simple(cmd.clone()),
-                    );
+                    let cmd_str =
+                        generator.generate_command_string_for_system(&Command::Simple(cmd.clone()));
                     if output_var.is_empty() {
                         format!(
                             "$main_exit_code = $CHILD_ERROR = system('bash', '-c', {}) >> 8;\n",
-
                             cmd_str
                         )
                     } else {
@@ -873,12 +881,9 @@ pub fn generate_generic_builtin(
             // env: print environment variables or run a command with modified environment
             // Build a full bash command string from args, preserving env var patterns
             // like VAR=value that the parser may have left as separate tokens.
-            let cmd_str = generator.generate_command_string_for_system(
-                &Command::Simple(cmd.clone()),
-            );
-            let cmd_lit = generator.perl_string_literal_no_interp(
-                &Word::literal(cmd_str),
-            );
+            let cmd_str =
+                generator.generate_command_string_for_system(&Command::Simple(cmd.clone()));
+            let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
             if cmd.args.is_empty() && cmd.env_vars.is_empty() {
                 // env with no args: print all environment variables
                 "do { print qq{{$_\n}} for sort keys %ENV; $CHILD_ERROR = 0; };\n".to_string()
@@ -1044,15 +1049,19 @@ pub fn generate_generic_builtin(
         "read" => {
             // Handle read command - read from input_var if available, otherwise from STDIN
             // Extract variable names from cmd.args (skip flags like -r, -p, -n, -t, -d, -s, -u, -a)
-            let vars: Vec<String> = cmd.args.iter().filter_map(|arg| {
-                if let Word::Literal(s, _) = arg {
-                    if !s.starts_with('-') {
-                        return Some(s.clone());
+            let vars: Vec<String> = cmd
+                .args
+                .iter()
+                .filter_map(|arg| {
+                    if let Word::Literal(s, _) = arg {
+                        if !s.starts_with('-') {
+                            return Some(s.clone());
+                        }
                     }
-                }
-                None
-            }).collect();
-            
+                    None
+                })
+                .collect();
+
             if input_var.is_empty() {
                 // No input variable, read from STDIN
                 if let Some(var_name) = vars.first() {
@@ -1117,34 +1126,77 @@ pub fn generate_generic_builtin(
                 if let Word::Literal(s, _) = arg {
                     if s.starts_with('-') {
                         has_flags = true;
-                        if s.contains('a') { flag_a = true; }
-                        if s.contains('s') { flag_s = true; }
-                        if s.contains('n') { flag_n = true; }
-                        if s.contains('r') { flag_r = true; }
-                        if s.contains('v') { flag_v = true; }
-                        if s.contains('m') { flag_m = true; }
+                        if s.contains('a') {
+                            flag_a = true;
+                        }
+                        if s.contains('s') {
+                            flag_s = true;
+                        }
+                        if s.contains('n') {
+                            flag_n = true;
+                        }
+                        if s.contains('r') {
+                            flag_r = true;
+                        }
+                        if s.contains('v') {
+                            flag_v = true;
+                        }
+                        if s.contains('m') {
+                            flag_m = true;
+                        }
                     }
                 }
             }
-            if !has_flags || flag_s { flag_s = true; }
-            if flag_a { flag_s = true; flag_n = true; flag_r = true; flag_v = true; flag_m = true; }
+            if !has_flags || flag_s {
+                flag_s = true;
+            }
+            if flag_a {
+                flag_s = true;
+                flag_n = true;
+                flag_r = true;
+                flag_v = true;
+                flag_m = true;
+            }
             if output_var.is_empty() {
                 let mut code = "do { use POSIX qw(uname); my ($__sys, $__node, $__rel, $__ver, $__mach) = POSIX::uname(); my @__parts; ".to_string();
-                if flag_s { code.push_str("push @__parts, $__sys; "); }
-                if flag_n { code.push_str("push @__parts, $__node; "); }
-                if flag_r { code.push_str("push @__parts, $__rel; "); }
-                if flag_v { code.push_str("push @__parts, $__ver; "); }
-                if flag_m { code.push_str("push @__parts, $__mach; "); }
+                if flag_s {
+                    code.push_str("push @__parts, $__sys; ");
+                }
+                if flag_n {
+                    code.push_str("push @__parts, $__node; ");
+                }
+                if flag_r {
+                    code.push_str("push @__parts, $__rel; ");
+                }
+                if flag_v {
+                    code.push_str("push @__parts, $__ver; ");
+                }
+                if flag_m {
+                    code.push_str("push @__parts, $__mach; ");
+                }
                 code.push_str("print join(\" \", @__parts) . \"\\n\"; $CHILD_ERROR = 0; };\n");
                 code
             } else {
                 let mut code = format!("do {{ use POSIX qw(uname); my ($__sys, $__node, $__rel, $__ver, $__mach) = POSIX::uname(); my @__parts; ");
-                if flag_s { code.push_str("push @__parts, $__sys; "); }
-                if flag_n { code.push_str("push @__parts, $__node; "); }
-                if flag_r { code.push_str("push @__parts, $__rel; "); }
-                if flag_v { code.push_str("push @__parts, $__ver; "); }
-                if flag_m { code.push_str("push @__parts, $__mach; "); }
-                code.push_str(&format!("${} = join(\" \", @__parts) . \"\\n\"; $CHILD_ERROR = 0; }};\n", output_var));
+                if flag_s {
+                    code.push_str("push @__parts, $__sys; ");
+                }
+                if flag_n {
+                    code.push_str("push @__parts, $__node; ");
+                }
+                if flag_r {
+                    code.push_str("push @__parts, $__rel; ");
+                }
+                if flag_v {
+                    code.push_str("push @__parts, $__ver; ");
+                }
+                if flag_m {
+                    code.push_str("push @__parts, $__mach; ");
+                }
+                code.push_str(&format!(
+                    "${} = join(\" \", @__parts) . \"\\n\"; $CHILD_ERROR = 0; }};\n",
+                    output_var
+                ));
                 code
             }
         }
@@ -1163,7 +1215,10 @@ pub fn generate_generic_builtin(
                 "$CHILD_ERROR = 0;\n".to_string()
             } else {
                 let newname = generator.word_to_perl(&cmd.args[0]);
-                format!("$main_exit_code = $CHILD_ERROR = system('/bin/hostname', {}) >> 8;\n", newname)
+                format!(
+                    "$main_exit_code = $CHILD_ERROR = system('/bin/hostname', {}) >> 8;\n",
+                    newname
+                )
             }
         }
         "chmod" => {
@@ -1251,8 +1306,12 @@ pub fn generate_generic_builtin(
                     }
                     if s.starts_with('-') && !s.starts_with("-") {
                         // Combined flags like -sf
-                        if s.contains('s') { is_symbolic = true; }
-                        if s.contains('f') { is_force = true; }
+                        if s.contains('s') {
+                            is_symbolic = true;
+                        }
+                        if s.contains('f') {
+                            is_force = true;
+                        }
                         continue;
                     }
                 }
@@ -1299,10 +1358,14 @@ pub fn generate_generic_builtin(
         }
         "rmdir" => {
             // rmdir - remove empty directories using Perl's rmdir
-            let files: Vec<String> = cmd.args.iter()
+            let files: Vec<String> = cmd
+                .args
+                .iter()
                 .filter_map(|arg| {
                     if let Word::Literal(s, _) = arg {
-                        if s.starts_with('-') { return None; }
+                        if s.starts_with('-') {
+                            return None;
+                        }
                     }
                     Some(generator.word_to_perl(arg))
                 })

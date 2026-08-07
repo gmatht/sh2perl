@@ -71,9 +71,7 @@ impl super::Analysis for ConstVar {
         "const_var"
     }
     fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
-        ctx.const_vars = crate::shir::analyze_var_const(prog)
-            .into_iter()
-            .collect();
+        ctx.const_vars = crate::shir::analyze_var_const(prog).into_iter().collect();
     }
 }
 

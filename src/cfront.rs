@@ -24,7 +24,7 @@
 //! verdicts ({Int, Str, Any}) for `var_types` — the F1-minimal lattice
 //! (Plan 13) refines them later.
 
-use crate::ir::{BinOpKind, IrExpr, IrProgram, IrStmt, InterpPart, StrStyle};
+use crate::ir::{BinOpKind, InterpPart, IrExpr, IrProgram, IrStmt, StrStyle};
 
 // ── lexer ────────────────────────────────────────────────────────────
 
@@ -62,10 +62,7 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, String> {
                 while i < b.len() && (b[i] as char).is_ascii_digit() {
                     i += 1;
                 }
-                if b[start] as char == '0'
-                    && i < b.len()
-                    && matches!(b[i] as char, 'x' | 'X')
-                {
+                if b[start] as char == '0' && i < b.len() && matches!(b[i] as char, 'x' | 'X') {
                     i += 1;
                     while i < b.len() && (b[i] as char).is_ascii_hexdigit() {
                         i += 1;
@@ -80,10 +77,7 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, String> {
                     toks.push((Tok::IntLit(v), line));
                 }
                 if i < b.len() && b[i] as char == '.' {
-                    return Err(
-                        "cfront: float literals unsupported (for now)"
-                            .to_string(),
-                    );
+                    return Err("cfront: float literals unsupported (for now)".to_string());
                 }
             }
             '"' => {
@@ -111,11 +105,7 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, String> {
                                 '"' => s.push('"'),
                                 '\'' => s.push('\''),
                                 '0' => s.push('\0'),
-                                _ => {
-                                    return Err(format!(
-                                        "cfront: unsupported escape \\{e}"
-                                    ))
-                                }
+                                _ => return Err(format!("cfront: unsupported escape \\{e}")),
                             }
                         }
                         _ => s.push(ch),
@@ -148,20 +138,17 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, String> {
             }
             'a'..='z' | 'A'..='Z' | '_' => {
                 let start = i;
-                while i < b.len()
-                    && ((b[i] as char).is_ascii_alphanumeric()
-                        || b[i] as char == '_')
+                while i < b.len() && ((b[i] as char).is_ascii_alphanumeric() || b[i] as char == '_')
                 {
                     i += 1;
                 }
                 toks.push((Tok::Ident(src[start..i].to_string()), line));
             }
-            '+' | '-' | '*' | '/' | '%' | '=' | '!' | '<' | '>' | '&'
-            | '|' | '^' | '~' | '?' | ':' | '(' | ')' | '[' | ']' | '{'
-            | '}' | ';' | ',' | '.' => {
+            '+' | '-' | '*' | '/' | '%' | '=' | '!' | '<' | '>' | '&' | '|' | '^' | '~' | '?'
+            | ':' | '(' | ')' | '[' | ']' | '{' | '}' | ';' | ',' | '.' => {
                 let two: &[&str] = &[
-                    "++", "--", "+=", "-=", "*=", "/=", "%=", "==", "!=",
-                    "<=", ">=", "&&", "||", "<<", ">>", "->",
+                    "++", "--", "+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||",
+                    "<<", ">>", "->",
                 ];
                 if i + 1 < b.len() {
                     let pair = &src[i..i + 2];
@@ -174,11 +161,7 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, String> {
                 toks.push((Tok::Op(src[i..i + 1].to_string()), line));
                 i += 1;
             }
-            other => {
-                return Err(format!(
-                    "cfront: unexpected character '{other}'"
-                ))
-            }
+            other => return Err(format!("cfront: unexpected character '{other}'")),
         }
     }
     Ok(toks)
@@ -257,11 +240,14 @@ impl Parser {
     fn parse_type(&mut self) -> Result<Option<(String, crate::ir::IrType)>, String> {
         let _ = self.eat_kw("const");
         let base = match self.peek() {
-            Some(Tok::Ident(s)) if matches!(
-                s.as_str(),
-                "int" | "long" | "unsigned" | "short" | "double" | "float"
-                    | "char" | "void"
-            ) => s.clone(),
+            Some(Tok::Ident(s))
+                if matches!(
+                    s.as_str(),
+                    "int" | "long" | "unsigned" | "short" | "double" | "float" | "char" | "void"
+                ) =>
+            {
+                s.clone()
+            }
             _ => return Ok(None),
         };
         self.pos += 1;
@@ -275,7 +261,8 @@ impl Parser {
         let ptr = self.eat_op("*");
         if ptr && base != "char" {
             return Err(
-                "cfront: only char* supported (the pointer subset — for                  now)".to_string(),
+                "cfront: only char* supported (the pointer subset — for                  now)"
+                    .to_string(),
             );
         }
         let verdict = match base.as_str() {
@@ -410,16 +397,10 @@ impl Parser {
             });
         }
         if self.eat_op("++") || self.eat_op("--") {
-            return Err(
-                "cfront: increments only at statement level (for now)"
-                    .to_string(),
-            );
+            return Err("cfront: increments only at statement level (for now)".to_string());
         }
         if self.eat_op("&") || self.eat_op("*") {
-            return Err(
-                "cfront: address-of/dereference unsupported (for now)"
-                    .to_string(),
-            );
+            return Err("cfront: address-of/dereference unsupported (for now)".to_string());
         }
         // casts — reject (the F2 Cast node is the C-frontend project's)
         if matches!(self.peek(), Some(Tok::Op(s)) if s == "(") {
@@ -428,12 +409,9 @@ impl Parser {
             if let Some(Tok::Ident(s)) = self.peek() {
                 if matches!(
                     s.as_str(),
-                    "int" | "long" | "unsigned" | "short" | "double"
-                        | "float" | "char" | "void"
+                    "int" | "long" | "unsigned" | "short" | "double" | "float" | "char" | "void"
                 ) {
-                    return Err(
-                        "cfront: casts unsupported (for now)".to_string(),
-                    );
+                    return Err("cfront: casts unsupported (for now)".to_string());
                 }
             }
             self.pos = save;
@@ -444,20 +422,13 @@ impl Parser {
         let mut e = self.primary()?;
         loop {
             if self.eat_op("++") || self.eat_op("--") {
-                return Err(
-                    "cfront: increments only at statement level (for now)"
-                        .to_string(),
-                );
+                return Err("cfront: increments only at statement level (for now)".to_string());
             } else if self.eat_op("[") {
                 let idx = self.expr()?;
                 self.expect_op("]")?;
                 let name = match e {
                     IrExpr::Var(n, _) => n,
-                    _ => {
-                        return Err(
-                            "cfront: index target must be a var".to_string()
-                        )
-                    }
+                    _ => return Err("cfront: index target must be a var".to_string()),
                 };
                 e = IrExpr::Index {
                     var: name,
@@ -466,11 +437,7 @@ impl Parser {
             } else if self.eat_op("(") {
                 let name = match e {
                     IrExpr::Var(n, _) => n,
-                    _ => {
-                        return Err(
-                            "cfront: call target must be a name".to_string()
-                        )
-                    }
+                    _ => return Err("cfront: call target must be a name".to_string()),
                 };
                 let mut args = Vec::new();
                 if !self.eat_op(")") {
@@ -490,10 +457,7 @@ impl Parser {
                 }
                 // printf/puts/exit are statement-level — keep the call as
                 // an expression; the statement handler rewrites it
-                e = IrExpr::Call {
-                    func: name,
-                    args,
-                };
+                e = IrExpr::Call { func: name, args };
             } else if self.eat_op(".") || self.eat_op("->") {
                 return Err("cfront: structs unsupported (for now)".to_string());
             } else {
@@ -506,9 +470,7 @@ impl Parser {
         match self.next() {
             Some(Tok::IntLit(v)) => Ok(IrExpr::Int(v)),
             Some(Tok::StrLit(s)) => Ok(IrExpr::Str(s, StrStyle::DoubleQuoted)),
-            Some(Tok::CharLit(c)) => {
-                Ok(IrExpr::Str(c.to_string(), StrStyle::DoubleQuoted))
-            }
+            Some(Tok::CharLit(c)) => Ok(IrExpr::Str(c.to_string(), StrStyle::DoubleQuoted)),
             Some(Tok::Ident(name)) => Ok(IrExpr::Var(name, None)),
             Some(Tok::Op(s)) if s == "(" => {
                 let e = self.expr()?;
@@ -554,9 +516,7 @@ impl Parser {
             if self.eat_kw("else") {
                 else_ = self.stmt()?;
             }
-            let (elsifs, else_arm) = if else_.len() == 1
-                && matches!(else_[0], IrStmt::If { .. })
-            {
+            let (elsifs, else_arm) = if else_.len() == 1 && matches!(else_[0], IrStmt::If { .. }) {
                 match else_.pop() {
                     Some(IrStmt::If {
                         cond,
@@ -596,7 +556,11 @@ impl Parser {
             let cond = self.expr()?;
             self.expect_op(")")?;
             self.expect_op(";")?;
-            return Ok(vec![IrStmt::DoWhile { body, cond, until: false }]);
+            return Ok(vec![IrStmt::DoWhile {
+                body,
+                cond,
+                until: false,
+            }]);
         }
         if self.eat_kw("for") {
             self.expect_op("(")?;
@@ -626,10 +590,7 @@ impl Parser {
             if let Some(u) = upd {
                 inner.push(u);
             }
-            init_stmts.push(IrStmt::While {
-                cond,
-                body: inner,
-            });
+            init_stmts.push(IrStmt::While { cond, body: inner });
             return Ok(init_stmts);
         }
         if self.eat_kw("return") {
@@ -806,10 +767,10 @@ impl Parser {
                     return Ok(IrStmt::Exit(args.into_iter().next()));
                 }
                 "puts" => {
-                    let v = args.into_iter().next().unwrap_or(IrExpr::Str(
-                        String::new(),
-                        StrStyle::DoubleQuoted,
-                    ));
+                    let v = args
+                        .into_iter()
+                        .next()
+                        .unwrap_or(IrExpr::Str(String::new(), StrStyle::DoubleQuoted));
                     return Ok(IrStmt::Output {
                         value: v,
                         newline: true,
@@ -820,12 +781,7 @@ impl Parser {
                     let mut it = args.into_iter();
                     let fmt = match it.next() {
                         Some(IrExpr::Str(s, _)) => s,
-                        _ => {
-                            return Err(
-                                "cfront: printf format must be a literal"
-                                    .to_string(),
-                            )
-                        }
+                        _ => return Err("cfront: printf format must be a literal".to_string()),
                     };
                     let rest: Vec<IrExpr> = it.collect();
                     let value = build_printf_interp(&fmt, rest)?;
@@ -842,12 +798,7 @@ impl Parser {
         Ok(IrStmt::Expr(e))
     }
 
-    fn make_assign(
-        &mut self,
-        var: &str,
-        op: &str,
-        rhs: IrExpr,
-    ) -> Result<IrStmt, String> {
+    fn make_assign(&mut self, var: &str, op: &str, rhs: IrExpr) -> Result<IrStmt, String> {
         let expr = match op {
             "=" => rhs,
             "+=" => IrExpr::BinOp {
@@ -922,10 +873,7 @@ fn build_printf_interp(fmt: &str, args: Vec<IrExpr>) -> Result<IrExpr, String> {
             // conversion char
             let mut j = i + 1;
             while j < b.len()
-                && !matches!(
-                    b[j],
-                    'd' | 'i' | 'u' | 'f' | 's' | 'c' | 'x' | 'X' | 'o'
-                )
+                && !matches!(b[j], 'd' | 'i' | 'u' | 'f' | 's' | 'c' | 'x' | 'X' | 'o')
             {
                 j += 1;
             }
@@ -977,12 +925,9 @@ pub fn c_to_ir(src: &str) -> Result<IrProgram, String> {
                         let _t = p.parse_type()?;
                         match p.next() {
                             Some(Tok::Ident(pn)) => {
-                                p.var_types
-                                    .push((pn, crate::ir::IrType::Any));
+                                p.var_types.push((pn, crate::ir::IrType::Any));
                             }
-                            _ => {
-                                return Err("cfront: bad parameter".to_string())
-                            }
+                            _ => return Err("cfront: bad parameter".to_string()),
                         }
                         if p.eat_op(")") {
                             break;
@@ -1053,7 +998,7 @@ pub fn c_to_ir(src: &str) -> Result<IrProgram, String> {
         stmt_lines,
         var_lengths: vec![],
         var_const: vec![],
-            var_lifetimes: vec![],
+        var_lifetimes: vec![],
     })
 }
 
@@ -1081,20 +1026,20 @@ mod tests {
 
     #[test]
     fn hello_world() {
-        let prog = t(
-            "#include <stdio.h>\nint main() { printf(\"hello\\n\"); return 0; }",
-        );
+        let prog = t("#include <stdio.h>\nint main() { printf(\"hello\\n\"); return 0; }");
         assert_eq!(prog.stmts.len(), 2);
         match &prog.stmts[0] {
-            IrStmt::Output { newline: false, value, .. } => {
-                match value {
-                    IrExpr::Interpolate(parts) => match &parts[0] {
-                        InterpPart::Lit(s) => assert_eq!(s, "hello\n"),
-                        _ => panic!("expected literal"),
-                    },
-                    _ => panic!("expected interpolate"),
-                }
-            }
+            IrStmt::Output {
+                newline: false,
+                value,
+                ..
+            } => match value {
+                IrExpr::Interpolate(parts) => match &parts[0] {
+                    InterpPart::Lit(s) => assert_eq!(s, "hello\n"),
+                    _ => panic!("expected literal"),
+                },
+                _ => panic!("expected interpolate"),
+            },
             other => panic!("expected Output, got {:?}", other),
         }
         match &prog.stmts[1] {
@@ -1115,10 +1060,7 @@ mod tests {
         assert!(types
             .iter()
             .any(|(n, t)| n == "sum" && *t == crate::ir::IrType::Int));
-        let has_while = prog
-            .stmts
-            .iter()
-            .any(|s| matches!(s, IrStmt::While { .. }));
+        let has_while = prog.stmts.iter().any(|s| matches!(s, IrStmt::While { .. }));
         assert!(has_while, "for must lower to a While");
     }
 

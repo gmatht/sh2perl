@@ -641,9 +641,13 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                         // Heredoc: include the delimiter and body in the command string
                         let delim = word_to_bash_string(&redirect.target);
                         // Remove surrounding quotes if present
-                        let unquoted_delim = if delim.starts_with('\'') && delim.ends_with('\'') && delim.len() > 1 {
+                        let unquoted_delim = if delim.starts_with('\'')
+                            && delim.ends_with('\'')
+                            && delim.len() > 1
+                        {
                             delim[1..delim.len() - 1].to_string()
-                        } else if delim.starts_with('"') && delim.ends_with('"') && delim.len() > 1 {
+                        } else if delim.starts_with('"') && delim.ends_with('"') && delim.len() > 1
+                        {
                             delim[1..delim.len() - 1].to_string()
                         } else {
                             delim.clone()
@@ -927,9 +931,11 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
         "set" => {
             // Convert shell set options to Perl equivalents
             // Check for "set -- arg1 arg2 ..." which sets positional parameters
-            if let Some(dashdash_pos) = cmd.args.iter().position(|a| {
-                matches!(a, Word::Literal(s, _) if s == "--")
-            }) {
+            if let Some(dashdash_pos) = cmd
+                .args
+                .iter()
+                .position(|a| matches!(a, Word::Literal(s, _) if s == "--"))
+            {
                 // Collect all args after -- into @ARGV (or @_ inside a function)
                 let perl_args: Vec<String> = cmd.args[dashdash_pos + 1..]
                     .iter()
@@ -1025,10 +1031,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                         if generator.declared_locals.contains(var_name)
                             || generator.function_level_vars.contains(var_name)
                         {
-                            output.push_str(&format!(
-                                "$ENV{{{}}} = ${};\n",
-                                var_name, var_name
-                            ));
+                            output.push_str(&format!("$ENV{{{}}} = ${};\n", var_name, var_name));
                         }
                     }
                 }
@@ -1083,7 +1086,10 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("do {{\n"));
                                 output.push_str(&generator.indent());
-                                output.push_str(&format!("    my $output = \"declare -A {}=(\";\n", var));
+                                output.push_str(&format!(
+                                    "    my $output = \"declare -A {}=(\";\n",
+                                    var
+                                ));
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("    for my $key (keys %{}) {{\n", var));
                                 output.push_str(&generator.indent());
@@ -1101,7 +1107,10 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             } else if generator.declared_locals.contains(var) {
                                 // Print scalar variable
                                 output.push_str(&generator.indent());
-                                output.push_str(&format!("print \"declare -- {}=${{{}}}\\n\", ${};\n", var, var, var));
+                                output.push_str(&format!(
+                                    "print \"declare -- {}=${{{}}}\\n\", ${};\n",
+                                    var, var, var
+                                ));
                             } else {
                                 // Variable not declared, just print empty
                                 output.push_str(&generator.indent());
@@ -1143,10 +1152,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                                 }
                                                 Word::ParameterExpansion(pe, _) => {
                                                     perl_value = generator.word_to_perl(
-                                                        &Word::ParameterExpansion(
-                                                            pe.clone(),
-                                                            None,
-                                                        ),
+                                                        &Word::ParameterExpansion(pe.clone(), None),
                                                     );
                                                     i += 1;
                                                 }
@@ -1167,11 +1173,20 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                         }
                                         output.push_str(&generator.indent());
                                         if is_assoc {
-                                            output.push_str(&format!("my %{} = ({});\n", var, perl_value));
+                                            output.push_str(&format!(
+                                                "my %{} = ({});\n",
+                                                var, perl_value
+                                            ));
                                         } else if is_array {
-                                            output.push_str(&format!("my @{} = ({});\n", var, perl_value));
+                                            output.push_str(&format!(
+                                                "my @{} = ({});\n",
+                                                var, perl_value
+                                            ));
                                         } else {
-                                            output.push_str(&format!("my ${} = {};\n", var, perl_value));
+                                            output.push_str(&format!(
+                                                "my ${} = {};\n",
+                                                var, perl_value
+                                            ));
                                         }
                                         generator.declared_locals.insert(var.to_string());
                                     }
@@ -1259,10 +1274,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                         Word::CommandSubstitution(cmd_sub, _) => {
                                             // Handle command substitution
                                             let perl_command = generator.word_to_perl(
-                                                &Word::CommandSubstitution(
-                                                    cmd_sub.clone(),
-                                                    None,
-                                                ),
+                                                &Word::CommandSubstitution(cmd_sub.clone(), None),
                                             );
                                             output.push_str(&generator.indent());
                                             output.push_str(&format!(
@@ -1304,7 +1316,8 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                             i += 1;
                                         }
                                         Word::Arithmetic(arith_expr, _) => {
-                                            let arith_word = Word::Arithmetic(arith_expr.clone(), None);
+                                            let arith_word =
+                                                Word::Arithmetic(arith_expr.clone(), None);
                                             let perl_value = generator.word_to_perl(&arith_word);
                                             output.push_str(&generator.indent());
                                             output.push_str(&format!(
@@ -1327,8 +1340,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                     // Regular assignment without command substitution
                                     let perl_value = shell_value_to_perl(value);
                                     output.push_str(&generator.indent());
-                                    output
-                                        .push_str(&format!("my ${} = {};\n", var, perl_value));
+                                    output.push_str(&format!("my ${} = {};\n", var, perl_value));
                                 }
                                 generator.declared_locals.insert(var.to_string());
                                 generator.function_level_vars.insert(var.to_string());
@@ -1562,31 +1574,22 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     if signal_name == "EXIT" || signal_name == "0" {
                         // EXIT trap -> END block
                         // Use open() based approach instead of qx{...} to avoid check_qx.
-                        let handler_perl_escaped = handler
-                            .replace("\\", "\\\\")
-                            .replace("\'", "\\\'");
+                        let handler_perl_escaped =
+                            handler.replace("\\", "\\\\").replace("\'", "\\\'");
                         output.push_str(&format!(
                             "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = do {{ open(my $__fh, \'-|\', \'sh\', \'-c\', \'{} 2>&1\') or croak \"cmd: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $_r; }}; print $end_out if $end_out ne q{{}}; }}\n",
                             handler_perl_escaped
                         ));
                     } else if signal_name == "DEBUG" {
                         // DEBUG trap
-                        output.push_str(&format!(
-                            "# DEBUG trap not fully supported: {}\n",
-                            handler
-                        ));
+                        output
+                            .push_str(&format!("# DEBUG trap not fully supported: {}\n", handler));
                     } else if signal_name == "RETURN" {
                         // RETURN trap
-                        output.push_str(&format!(
-                            "# RETURN trap not supported: {}\n",
-                            handler
-                        ));
+                        output.push_str(&format!("# RETURN trap not supported: {}\n", handler));
                     } else if signal_name == "ERR" {
                         // ERR trap - use __DIE__ or custom handler
-                        output.push_str(&format!(
-                            "# ERR trap not fully supported: {}\n",
-                            handler
-                        ));
+                        output.push_str(&format!("# ERR trap not fully supported: {}\n", handler));
                     } else if !signal_name.is_empty() {
                         // Other signals: INT, TERM, etc.
                         // Use native Perl for echo commands; qx{bash -c ...} otherwise.
@@ -1602,7 +1605,8 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 signal_name, escaped_msg
                             ));
                         } else {
-                            let handler_escaped = handler.replace("\\", "\\\\").replace("\'", "\\\'");
+                            let handler_escaped =
+                                handler.replace("\\", "\\\\").replace("\'", "\\\'");
                             output.push_str(&format!(
                                 "$SIG{{{}}} = sub {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"trap handler failed: $!\"; close $__fh; }};\n",
                                 signal_name,
