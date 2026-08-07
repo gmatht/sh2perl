@@ -25,6 +25,20 @@ use debashl::{shared_utils::SharedUtils, Generator, Parser};
 // Global flag for --no-magic-numbers
 static NO_MAGIC_NUMBERS: AtomicBool = AtomicBool::new(false);
 
+// `--argv0-source <name>`: the "source-name" $0 semantic. When set, the
+// translated program identifies as the ORIGINAL bash file (<name>) instead
+// of reporting its own invocation path (argv0 pass-through, the default).
+// Perl bakes `$0 = '<name>'`; --estree emits a leading `sh2.argv0 = …`.
+// This is the semantic a translation PRODUCT wants (the JS shell executing
+// foo.sh should say "foo.sh", not the temp JS file name); pass-through is
+// what a faithful POSIX port wants. See harness/argv0-tests/README.md.
+static ARGV0_SOURCE: Mutex<Option<String>> = Mutex::new(None);
+
+/// The `--argv0-source` value, if set.
+pub fn argv0_source() -> Option<String> {
+    ARGV0_SOURCE.lock().unwrap().clone()
+}
+
 // Virtual stdin: wasm/JS embedders (node:wasi has no filesystem preopens)
 // feed file content through `debashc_cli_run_with_input`; the CLI's `-`
 // filename convention (file --estree -, file --perl -, file -) reads this
@@ -67,6 +81,16 @@ fn fix_command_substitution_placeholders(mut code: String) -> String {
     // This is a workaround for the parsing issue with wc -c < "$file" command substitution
     code = code.replace("$(...)", "-s $file");
     code
+}
+
+/// Source-name $0 semantic (`--argv0-source <name>`): bake `$0 = '<name>'`
+/// into the generated Perl so the translated program identifies as the
+/// original bash file, whatever it is invoked as. Default (flag absent) =
+/// argv0 pass-through — the harness supplies argv0 at run time.
+fn apply_argv0_source(gen: &mut Generator) {
+    if let Some(name) = argv0_source() {
+        gen.set_original_script_name(name);
+    }
 }
 
 pub fn main_with_args(args: Vec<String>) {
@@ -114,6 +138,22 @@ pub fn main_with_args(args: Vec<String>) {
         // Process remaining arguments as a command
         if args.len() > 2 {
             let remaining_args = &args[2..];
+            let new_args = vec![args[0].clone()]
+                .into_iter()
+                .chain(remaining_args.iter().cloned())
+                .collect::<Vec<String>>();
+            return main_with_args(new_args);
+        }
+        return;
+    } else if command == "--argv0-source" {
+        if args.len() < 3 {
+            println!("Error: --argv0-source requires a name");
+            return;
+        }
+        *ARGV0_SOURCE.lock().unwrap() = Some(args[2].clone());
+        // Process remaining arguments as a command (flag + value stripped)
+        if args.len() > 3 {
+            let remaining_args = &args[3..];
             let new_args = vec![args[0].clone()]
                 .into_iter()
                 .chain(remaining_args.iter().cloned())
@@ -317,6 +357,7 @@ exit $main_exit_code;
                     // Generate Perl code
                     let mut gen = Generator::new();
                     gen.use_function_signatures = use_function_signatures;
+                    apply_argv0_source(&mut gen);
                     let mut code = gen.generate(&commands);
 
                     // Post-process to fix command substitution placeholders
@@ -977,6 +1018,7 @@ exit $main_exit_code;
                         // Generate Perl code
                         let mut gen = Generator::new();
                         gen.use_function_signatures = use_function_signatures;
+                        apply_argv0_source(&mut gen);
                         let code = gen.generate(&commands);
 
                         // Handle output file option
@@ -1054,6 +1096,7 @@ exit $main_exit_code;
                         // Generate Perl code
                         let mut gen = Generator::new();
                         gen.use_function_signatures = use_function_signatures;
+                        apply_argv0_source(&mut gen);
                         let code = gen.generate(&commands);
 
                         // Handle output file option
@@ -1290,6 +1333,7 @@ exit $main_exit_code;
                             // Generate Perl code
                             let mut gen = Generator::new();
                             gen.use_function_signatures = use_function_signatures;
+                            apply_argv0_source(&mut gen);
                             let perl_code = gen.generate(&commands);
 
                             // Write to temporary file and execute
@@ -1466,6 +1510,7 @@ exit $main_exit_code;
                             // Generate Perl code
                             let mut generator = Generator::new();
                             generator.use_function_signatures = use_function_signatures;
+                            apply_argv0_source(&mut generator);
                             let perl_code = generator.generate(&commands);
 
                             // Write to temporary file and execute
