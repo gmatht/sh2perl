@@ -19,11 +19,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
         let a_refs_b = env_var_refs_var(a_val, b_key);
         let b_refs_a = env_var_refs_var(_b_val, a_key);
         if a_refs_b && !b_refs_a {
-            std::cmp::Ordering::Greater  // a depends on b, so b comes first
+            std::cmp::Ordering::Greater // a depends on b, so b comes first
         } else if b_refs_a && !a_refs_b {
-            std::cmp::Ordering::Less     // b depends on a, so a comes first
+            std::cmp::Ordering::Less // b depends on a, so a comes first
         } else {
-            std::cmp::Ordering::Equal    // no dependency, keep BTreeMap order
+            std::cmp::Ordering::Equal // no dependency, keep BTreeMap order
         }
     });
 
@@ -34,7 +34,34 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             for cap in re.captures_iter(&expr.expression) {
                 let var_name = &cap[1];
                 // Skip Perl keywords and operators
-                if matches!(var_name, "if" | "else" | "for" | "while" | "do" | "not" | "and" | "or" | "xor" | "sub" | "my" | "local" | "our" | "defined" | "undef" | "int" | "length" | "substr" | "keys" | "values" | "scalar" | "join" | "split" | "grep" | "map" | "sort") {
+                if matches!(
+                    var_name,
+                    "if" | "else"
+                        | "for"
+                        | "while"
+                        | "do"
+                        | "not"
+                        | "and"
+                        | "or"
+                        | "xor"
+                        | "sub"
+                        | "my"
+                        | "local"
+                        | "our"
+                        | "defined"
+                        | "undef"
+                        | "int"
+                        | "length"
+                        | "substr"
+                        | "keys"
+                        | "values"
+                        | "scalar"
+                        | "join"
+                        | "split"
+                        | "grep"
+                        | "map"
+                        | "sort"
+                ) {
                     continue;
                 }
                 if !generator.declared_locals.contains(var_name)
@@ -241,11 +268,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             let a_refs_b = env_var_refs_var(a_val, b_key);
             let b_refs_a = env_var_refs_var(_b_val, a_key);
             if a_refs_b && !b_refs_a {
-                std::cmp::Ordering::Greater  // a depends on b, so b comes first
+                std::cmp::Ordering::Greater // a depends on b, so b comes first
             } else if b_refs_a && !a_refs_b {
-                std::cmp::Ordering::Less     // b depends on a, so a comes first
+                std::cmp::Ordering::Less // b depends on a, so a comes first
             } else {
-                std::cmp::Ordering::Equal    // no dependency, keep BTreeMap order
+                std::cmp::Ordering::Equal // no dependency, keep BTreeMap order
             }
         });
         for &(var, value) in &env_vec {
@@ -837,13 +864,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                     let qlen = interpreted.len();
                                                     if qlen >= 2
                                                         && ((interpreted.starts_with('"')
-                                                             && interpreted.ends_with('"'))
+                                                            && interpreted.ends_with('"'))
                                                             || (interpreted.starts_with('\'')
                                                                 && interpreted.ends_with('\'')))
                                                     {
-                                                        interpreted = interpreted
-                                                            [1..qlen - 1]
-                                                            .to_string();
+                                                        interpreted =
+                                                            interpreted[1..qlen - 1].to_string();
                                                     }
 
                                                     // Interpret backslash escapes
@@ -971,39 +997,39 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // For echo commands, handle special variables differently
                         match arg {
                             Word::Variable(var, _, _) => {
-                            match var.as_str() {
-                                "#" => "scalar(@ARGV)".to_string(),
-                                "@" => "@ARGV".to_string(),
-                                "*" => "@ARGV".to_string(),
-                                "?" => "$CHILD_ERROR".to_string(),
-                                "!" => "''".to_string(),
-                                "-" => "''".to_string(),
-                                // `$0` is argv0 (the script name), NOT a
-                                // positional param — and $1/$2/… map to
-                                // @ARGV (top level) or @_ (in a function).
-                                // (Bare `$0`/`$1` used to fall through to
-                                // `$ENV{0}`/`$ENV{1}`, which are never set.)
-                                _ if var.chars().all(|c| c.is_ascii_digit()) => {
-                                    let idx = var.parse::<usize>().unwrap_or(0);
-                                    if idx == 0 {
-                                        "$0".to_string()
-                                    } else if generator.fn_nesting_depth > 0 {
-                                        format!("$_[{}]", idx - 1)
-                                    } else {
-                                        format!("$ARGV[{}]", idx - 1)
+                                match var.as_str() {
+                                    "#" => "scalar(@ARGV)".to_string(),
+                                    "@" => "@ARGV".to_string(),
+                                    "*" => "@ARGV".to_string(),
+                                    "?" => "$CHILD_ERROR".to_string(),
+                                    "!" => "''".to_string(),
+                                    "-" => "''".to_string(),
+                                    // `$0` is argv0 (the script name), NOT a
+                                    // positional param — and $1/$2/… map to
+                                    // @ARGV (top level) or @_ (in a function).
+                                    // (Bare `$0`/`$1` used to fall through to
+                                    // `$ENV{0}`/`$ENV{1}`, which are never set.)
+                                    _ if var.chars().all(|c| c.is_ascii_digit()) => {
+                                        let idx = var.parse::<usize>().unwrap_or(0);
+                                        if idx == 0 {
+                                            "$0".to_string()
+                                        } else if generator.fn_nesting_depth > 0 {
+                                            format!("$_[{}]", idx - 1)
+                                        } else {
+                                            format!("$ARGV[{}]", idx - 1)
+                                        }
                                     }
-                                }
-                                _ => {
-                                    if generator.declared_locals.contains(var)
-                                        || generator.function_level_vars.contains(var)
-                                    {
-                                        format!("${}", var)
-                                    } else {
-                                        format!("$ENV{{{}}}", var)
+                                    _ => {
+                                        if generator.declared_locals.contains(var)
+                                            || generator.function_level_vars.contains(var)
+                                        {
+                                            format!("${}", var)
+                                        } else {
+                                            format!("$ENV{{{}}}", var)
+                                        }
                                     }
                                 }
                             }
-                        },
                             Word::StringInterpolation(interp, _) => {
                                 // Handle quoted variables like "$#" -> scalar(@ARGV)
                                 if interp.parts.len() == 1 {
@@ -1096,13 +1122,12 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                     let qlen = interpreted.len();
                                                     if qlen >= 2
                                                         && ((interpreted.starts_with('"')
-                                                             && interpreted.ends_with('"'))
+                                                            && interpreted.ends_with('"'))
                                                             || (interpreted.starts_with('\'')
                                                                 && interpreted.ends_with('\'')))
                                                     {
-                                                        interpreted = interpreted
-                                                            [1..qlen - 1]
-                                                            .to_string();
+                                                        interpreted =
+                                                            interpreted[1..qlen - 1].to_string();
                                                     }
 
                                                     // Interpret backslash escapes
@@ -1124,12 +1149,20 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                         "!" => result.push_str(""),
                                                         "-" => result.push_str(""),
                                                         _ => {
-                                                            if generator.declared_locals.contains(var)
-                                                                || generator.function_level_vars.contains(var)
+                                                            if generator
+                                                                .declared_locals
+                                                                .contains(var)
+                                                                || generator
+                                                                    .function_level_vars
+                                                                    .contains(var)
                                                             {
-                                                                result.push_str(&format!("${}", var));
+                                                                result
+                                                                    .push_str(&format!("${}", var));
                                                             } else {
-                                                                result.push_str(&format!("$ENV{{{}}}", var));
+                                                                result.push_str(&format!(
+                                                                    "$ENV{{{}}}",
+                                                                    var
+                                                                ));
                                                             }
                                                         }
                                                     }
@@ -1314,7 +1347,6 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             };
                             output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                         }
-
                     }
                 } else {
                     // Check if we have multiple brace expansions that need cartesian product
@@ -1353,15 +1385,14 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             };
                             output.push_str(&crate::ir::stmt_to_perl(&ir_stmt, 0));
                         }
-
                     }
                 }
             }
-        // Set $CHILD_ERROR to 0 for echo commands in statement context (not in pipeline)
-        if generator.current_pipeline_output_id().is_none() {
-            output.push_str(&generator.indent());
-            output.push_str("$CHILD_ERROR = 0;\n");
-        }
+            // Set $CHILD_ERROR to 0 for echo commands in statement context (not in pipeline)
+            if generator.current_pipeline_output_id().is_none() {
+                output.push_str(&generator.indent());
+                output.push_str("$CHILD_ERROR = 0;\n");
+            }
         } else if name == "true" && !cmd.env_vars.is_empty() && cmd.args.is_empty() {
             // This is a standalone assignment (e.g., i=$((i + 1)))
             for (var, value) in &cmd.env_vars {
@@ -1377,7 +1408,34 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             for cap in re.captures_iter(&expr.expression) {
                                 let var_name = &cap[1];
                                 // Skip Perl keywords and operators
-                                if matches!(var_name, "if" | "else" | "for" | "while" | "do" | "not" | "and" | "or" | "xor" | "sub" | "my" | "local" | "our" | "defined" | "undef" | "int" | "length" | "substr" | "keys" | "values" | "scalar" | "join" | "split" | "grep" | "map" | "sort") {
+                                if matches!(
+                                    var_name,
+                                    "if" | "else"
+                                        | "for"
+                                        | "while"
+                                        | "do"
+                                        | "not"
+                                        | "and"
+                                        | "or"
+                                        | "xor"
+                                        | "sub"
+                                        | "my"
+                                        | "local"
+                                        | "our"
+                                        | "defined"
+                                        | "undef"
+                                        | "int"
+                                        | "length"
+                                        | "substr"
+                                        | "keys"
+                                        | "values"
+                                        | "scalar"
+                                        | "join"
+                                        | "split"
+                                        | "grep"
+                                        | "map"
+                                        | "sort"
+                                ) {
                                     continue;
                                 }
                                 if !generator.declared_locals.contains(var_name)
@@ -1426,7 +1484,9 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         // Handle other value types
                         let val = generator.perl_string_literal(value);
                         // Check if the variable is an array/map access like matrix[0,2]
-                        if let Some((array_name, key)) = crate::generator::utils::extract_array_key_impl(var) {
+                        if let Some((array_name, key)) =
+                            crate::generator::utils::extract_array_key_impl(var)
+                        {
                             let key_expr = if key.chars().all(|ch| ch.is_ascii_digit()) {
                                 key
                             } else {
@@ -1441,7 +1501,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 generator.declared_locals.insert(array_name.clone());
                             }
                             output.push_str(&generator.indent());
-                            output.push_str(&format!("${}{}{}{} = {};\n", array_name, sigil, key_expr, close, val));
+                            output.push_str(&format!(
+                                "${}{}{}{} = {};\n",
+                                array_name, sigil, key_expr, close, val
+                            ));
                         } else if !generator.declared_locals.contains(var) {
                             output.push_str(&generator.indent());
                             output.push_str(&format!("my ${} = {};\n", var, val));
@@ -1527,10 +1590,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             };
                             let perl_expr = generator.convert_arithmetic_to_perl(&expr);
                             output.push_str(&generator.indent());
-                            output.push_str(&format!(
-                                "$CHILD_ERROR = ({}) ? 0 : 1;\n",
-                                perl_expr
-                            ));
+                            output.push_str(&format!("$CHILD_ERROR = ({}) ? 0 : 1;\n", perl_expr));
                         }
                     }
                     "wc" => {
@@ -1639,10 +1699,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 output.push_str(&generator.indent());
                                 // Search PATH for the command, similar to `type -P` / `command -v`.
                                 // Use q{} for the colon delimiter because it is not a regex.
-                                output.push_str(&format!(
-                                    "my $__type_cmd = {};\n",
-                                    arg_perl
-                                ));
+                                output.push_str(&format!("my $__type_cmd = {};\n", arg_perl));
                                 output.push_str(&generator.indent());
                                 output.push_str(
                                     "my $__type_result = (grep { -x \"$_/$__type_cmd\" } split(q{:}, $ENV{PATH} // q{}))[0];\n"
@@ -1691,10 +1748,17 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         );
                     }
                 }
-            } else if generator.declared_functions.contains(name) || *name == "greet" || generator.lexical_functions.contains(name) {
+            } else if generator.declared_functions.contains(name)
+                || *name == "greet"
+                || generator.lexical_functions.contains(name)
+            {
                 // Determine whether this is a lexical (nested) function call -> $name->(...)
                 let is_lexical = generator.lexical_functions.contains(name);
-                let call_prefix = if is_lexical { format!("${}->", name) } else { name.clone() };
+                let call_prefix = if is_lexical {
+                    format!("${}->", name)
+                } else {
+                    name.clone()
+                };
 
                 // Function call
                 if cmd.args.is_empty() {
@@ -1773,7 +1837,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     }
                                     Word::Literal(s, _) => {
                                         // Purely numeric literals: emit bare number, not quoted string
-                                        if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) && !(s.len() > 1 && s.starts_with('0')) {
+                                        if !s.is_empty()
+                                            && s.chars().all(|c| c.is_ascii_digit())
+                                            && !(s.len() > 1 && s.starts_with('0'))
+                                        {
                                             s.clone()
                                         } else {
                                             generator.perl_string_literal(arg)
@@ -1811,7 +1878,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&generator.indent());
                     output.push_str(&format!("my @_cmd_{} = ('bash', '{}');\n", cmd_id, name));
                     output.push_str(&generator.indent());
-                    output.push_str(&format!("$main_exit_code = $CHILD_ERROR = system(@_cmd_{}) >> 8;\n", cmd_id));
+                    output.push_str(&format!(
+                        "$main_exit_code = $CHILD_ERROR = system(@_cmd_{}) >> 8;\n",
+                        cmd_id
+                    ));
                 } else {
                     let args: Vec<String> = if name == "perl" {
                         // Special handling for perl command - embed Perl code directly instead of system call
@@ -1961,7 +2031,8 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             "$main_exit_code = $CHILD_ERROR = system('{}', {}) >> 8;\n",
                             name, args_str
                         ));
-                    } else if !name.starts_with("--") && !name.contains('=') && !name.contains(' ') {
+                    } else if !name.starts_with("--") && !name.contains('=') && !name.contains(' ')
+                    {
                         let args_str = args.join(", ");
                         // Store the command name in a variable so the system() call
                         // does NOT start with a quoted string or an array, avoiding
@@ -1982,10 +2053,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             name.clone()
                         };
                         output.push_str(&generator.indent());
-                        output.push_str(&format!(
-                            "my $__cmd_{} = '{}';\n",
-                            cmd_id, safe_name
-                        ));
+                        output.push_str(&format!("my $__cmd_{} = '{}';\n", cmd_id, safe_name));
                         output.push_str(&generator.indent());
                         if args_str.is_empty() {
                             output.push_str(&format!(
@@ -2090,7 +2158,7 @@ pub fn generate_echo_command(
                                 }
                             }
                         }
-                    },
+                    }
                     Word::StringInterpolation(interp, _) => {
                         // Handle quoted variables like "$#" -> scalar(@ARGV)
                         if interp.parts.len() == 1 {
@@ -2484,7 +2552,7 @@ fn handle_brace_expansion_for_command(
                 } else {
                     items.push(format!("(\"{}\")", parts.join("\", \"")));
                 }
-            },
+            }
         }
     }
 
@@ -2494,7 +2562,7 @@ fn handle_brace_expansion_for_command(
             for item in items.iter_mut() {
                 // Items are quoted strings like `"value"`. Inject prefix before value.
                 if item.starts_with('"') && item.ends_with('"') && item.len() >= 2 {
-                    let inner = &item[1..item.len()-1];
+                    let inner = &item[1..item.len() - 1];
                     *item = format!("\"{}{}\"", prefix, inner);
                 } else {
                     *item = format!("\"{}{}\"", prefix, item);
@@ -2504,7 +2572,7 @@ fn handle_brace_expansion_for_command(
         if let Some(suffix) = &expansion.suffix {
             for item in items.iter_mut() {
                 if item.starts_with('"') && item.ends_with('"') && item.len() >= 2 {
-                    let inner = &item[1..item.len()-1];
+                    let inner = &item[1..item.len() - 1];
                     *item = format!("\"{}{}\"", inner, suffix);
                 } else {
                     *item = format!("\"{}{}\"", item, suffix);
@@ -2657,10 +2725,7 @@ fn generate_cartesian_product_for_echo(generator: &mut Generator, args: &[Word])
                     output_pieces.push("\'\'".to_string());
                 } else {
                     // Join all combinations with space (echo separates arguments with space)
-                    let joined = format!(
-                        "join(q[ ], ({}))",
-                        combo_exprs.join(", ")
-                    );
+                    let joined = format!("join(q[ ], ({}))", combo_exprs.join(", "));
                     output_pieces.push(joined);
                 }
             }
@@ -2708,14 +2773,13 @@ fn expand_brace_items(items: &BraceExpansion) -> Vec<String> {
     // In bash, a brace expansion with a single Range item is the only
     // case where ranges are actually expanded. When there are multiple
     // items (e.g. {1..10,20,30..40}), all items are treated as literals.
-    let is_single_range = items.items.len() == 1
-        && matches!(items.items.first(), Some(BraceItem::Range(_)));
+    let is_single_range =
+        items.items.len() == 1 && matches!(items.items.first(), Some(BraceItem::Range(_)));
     for item in &items.items {
         match item {
             BraceItem::Range(range) if is_single_range => {
                 // Handle numeric ranges like {1..5} or {001..005}
-                if let (Ok(start), Ok(end)) =
-                    (range.start.parse::<i32>(), range.end.parse::<i32>())
+                if let (Ok(start), Ok(end)) = (range.start.parse::<i32>(), range.end.parse::<i32>())
                 {
                     let step = range
                         .step
@@ -2723,13 +2787,16 @@ fn expand_brace_items(items: &BraceExpansion) -> Vec<String> {
                         .and_then(|s| s.parse::<i32>().ok())
                         .unwrap_or(1);
                     let mut current = start;
-                    let format_width =
-                        if range.start.starts_with('0') && range.start.len() > 1 {
-                            Some(range.start.len())
-                        } else {
-                            None
-                        };
-                    while if step > 0 { current <= end } else { current >= end } {
+                    let format_width = if range.start.starts_with('0') && range.start.len() > 1 {
+                        Some(range.start.len())
+                    } else {
+                        None
+                    };
+                    while if step > 0 {
+                        current <= end
+                    } else {
+                        current >= end
+                    } {
                         let formatted = if let Some(width) = format_width {
                             format!("{:0width$}", current, width = width)
                         } else {
@@ -2750,7 +2817,11 @@ fn expand_brace_items(items: &BraceExpansion) -> Vec<String> {
                             .unwrap_or(1);
                         let mut current = start_char as i32;
                         let end_code = end_char as i32;
-                        while if step > 0 { current <= end_code } else { current >= end_code } {
+                        while if step > 0 {
+                            current <= end_code
+                        } else {
+                            current >= end_code
+                        } {
                             if let Some(c) = char::from_u32(current as u32) {
                                 expanded.push(c.to_string());
                             }
@@ -2824,8 +2895,9 @@ fn env_var_refs_var(value: &Word, var_name: &str) -> bool {
                     return true;
                 }
                 // Check for ${var_name} patterns in the element
-                if es.starts_with("${") && es.ends_with('}')
-                    && es[2..es.len()-1].contains(var_name)
+                if es.starts_with("${")
+                    && es.ends_with('}')
+                    && es[2..es.len() - 1].contains(var_name)
                 {
                     return true;
                 }

@@ -305,7 +305,15 @@ fn find_nested(root: &IrStmt, top_idx: usize, labels: &[(String, usize)]) -> Opt
     let mut out: Option<Hit> = None;
     let mut path: Vec<(usize, Branch)> = Vec::new();
     let mut loop_steps: Vec<usize> = Vec::new();
-    descend_from(root, top_idx, 0, labels, &mut path, &mut loop_steps, &mut out);
+    descend_from(
+        root,
+        top_idx,
+        0,
+        labels,
+        &mut path,
+        &mut loop_steps,
+        &mut out,
+    );
     out
 }
 
@@ -335,10 +343,17 @@ fn descend_from(
             }
             push_and_walk(else_, idx, Branch::Else, lc, labels, path, loop_steps, out);
         }
-        IrStmt::While { body, .. }
-        | IrStmt::DoWhile { body, .. }
-        | IrStmt::For { body, .. } => {
-            push_and_walk(body, idx, Branch::Body, lc + 1, labels, path, loop_steps, out);
+        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::For { body, .. } => {
+            push_and_walk(
+                body,
+                idx,
+                Branch::Body,
+                lc + 1,
+                labels,
+                path,
+                loop_steps,
+                out,
+            );
         }
         IrStmt::Block(body)
         | IrStmt::Subshell(body)
@@ -349,12 +364,30 @@ fn descend_from(
         }
         IrStmt::Case { clauses, .. } => {
             for (k, c) in clauses.iter().enumerate() {
-                push_and_walk(&c.body, idx, Branch::CaseClause(k), lc, labels, path, loop_steps, out);
+                push_and_walk(
+                    &c.body,
+                    idx,
+                    Branch::CaseClause(k),
+                    lc,
+                    labels,
+                    path,
+                    loop_steps,
+                    out,
+                );
             }
         }
         IrStmt::Pipeline { stages, .. } => {
             for (k, stg) in stages.iter().enumerate() {
-                push_and_walk(stg, idx, Branch::Stage(k), lc, labels, path, loop_steps, out);
+                push_and_walk(
+                    stg,
+                    idx,
+                    Branch::Stage(k),
+                    lc,
+                    labels,
+                    path,
+                    loop_steps,
+                    out,
+                );
             }
         }
         _ => {}
@@ -654,15 +687,19 @@ mod tests {
         let out = run(vec![
             assign_stmt("i", IrExpr::Int(0)),
             label("loop"),
-            assign_stmt("i", IrExpr::BinOp { lhs: Box::new(var("i")), op: BinOpKind::Add, rhs: Box::new(IrExpr::Int(1)) }),
+            assign_stmt(
+                "i",
+                IrExpr::BinOp {
+                    lhs: Box::new(var("i")),
+                    op: BinOpKind::Add,
+                    rhs: Box::new(IrExpr::Int(1)),
+                },
+            ),
             if_cond(vec![goto("loop")]),
             output("i"),
         ]);
         let json = shir_to_shir_json_raw(&program(out.clone()));
-        assert!(
-            json.contains("\"While\""),
-            "expected While, got: {json}"
-        );
+        assert!(json.contains("\"While\""), "expected While, got: {json}");
         assert!(
             json.contains("\"break\""),
             "expected an exit break, got: {json}"
@@ -721,16 +758,26 @@ mod tests {
         let inner_body = vec![
             if_cond(vec![goto("out")]),
             output("inner"),
-            assign_stmt("j", IrExpr::BinOp {
-                lhs: Box::new(var("j")), op: BinOpKind::Add, rhs: Box::new(IrExpr::Int(1)),
-            }),
+            assign_stmt(
+                "j",
+                IrExpr::BinOp {
+                    lhs: Box::new(var("j")),
+                    op: BinOpKind::Add,
+                    rhs: Box::new(IrExpr::Int(1)),
+                },
+            ),
         ];
         let inner_while = while_loop(truthy(), inner_body);
         let inner_block_body = vec![
             inner_while,
-            assign_stmt("i", IrExpr::BinOp {
-                lhs: Box::new(var("i")), op: BinOpKind::Add, rhs: Box::new(IrExpr::Int(1)),
-            }),
+            assign_stmt(
+                "i",
+                IrExpr::BinOp {
+                    lhs: Box::new(var("i")),
+                    op: BinOpKind::Add,
+                    rhs: Box::new(IrExpr::Int(1)),
+                },
+            ),
         ];
         let inner_block = IrStmt::Block(inner_block_body);
         let outer_while = while_loop(truthy(), vec![inner_block]);
@@ -746,7 +793,10 @@ mod tests {
         // receive NO guard — the pre-fix code added one to the outer
         // Block, which would escape the program.
         let n_breaks = json.matches("\"break\"").count();
-        assert_eq!(n_breaks, 2, "expected 2 break sites (goto+guard), got {n_breaks} in {json}");
+        assert_eq!(
+            n_breaks, 2,
+            "expected 2 break sites (goto+guard), got {n_breaks} in {json}"
+        );
     }
 
     /// A pass over an empty list must not panic.

@@ -53,11 +53,8 @@ impl Metric {
     /// Sorted (callee, count) pairs — the canonical order for the
     /// `.estree_metric.tsv` artefact the worker reads.
     pub fn sorted(&self) -> Vec<(String, usize)> {
-        let mut v: Vec<(String, usize)> = self
-            .counts
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
+        let mut v: Vec<(String, usize)> =
+            self.counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v
     }
@@ -206,7 +203,10 @@ fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
             }
         }
         IrStmt::SetChildError(e) => walk_expr(e, counts),
-        IrStmt::Case { discriminant, clauses } => {
+        IrStmt::Case {
+            discriminant,
+            clauses,
+        } => {
             walk_expr(discriminant, counts);
             for clause in clauses {
                 for s in &clause.body {

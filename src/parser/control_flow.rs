@@ -348,7 +348,9 @@ pub fn parse_case_statement(parser: &mut Parser) -> Result<Command, ParserError>
             match w {
                 Word::Literal(s, _) => parts.push(StringPart::Literal(s)),
                 Word::Variable(v, _, _) => parts.push(StringPart::Variable(v)),
-                Word::CommandSubstitution(cmd, _) => parts.push(StringPart::CommandSubstitution(cmd)),
+                Word::CommandSubstitution(cmd, _) => {
+                    parts.push(StringPart::CommandSubstitution(cmd))
+                }
                 Word::StringInterpolation(interp, _) => parts.extend(interp.parts),
                 Word::ParameterExpansion(pe, _) => {
                     parts.push(StringPart::ParameterExpansion(pe));
@@ -397,7 +399,9 @@ pub fn parse_case_statement(parser: &mut Parser) -> Result<Command, ParserError>
                                 parser.lexer.next();
                             }
                         }
-                        Some(Token::ParenOpen) if nested_parens == 0 && current_pattern.trim().is_empty() => {
+                        Some(Token::ParenOpen)
+                            if nested_parens == 0 && current_pattern.trim().is_empty() =>
+                        {
                             // In bash, case patterns can be surrounded by optional parentheses.
                             // When '(' appears at the start of a pattern with no preceding content,
                             // it is just a wrapper delimiter, not part of the pattern or nesting.
@@ -440,10 +444,13 @@ pub fn parse_case_statement(parser: &mut Parser) -> Result<Command, ParserError>
                             parser.lexer.next();
                             if matches!(parser.lexer.peek(), Some(Token::SingleQuotedString)) {
                                 // Get the byte span of the SingleQuotedString token
-                                let (sq_start, sq_end) = parser.lexer.get_span()
-                                    .ok_or_else(|| ParserError::InvalidSyntax(
-                                        "Missing span for SingleQuotedString after Escape".to_string()
-                                    ))?;
+                                let (sq_start, sq_end) =
+                                    parser.lexer.get_span().ok_or_else(|| {
+                                        ParserError::InvalidSyntax(
+                                            "Missing span for SingleQuotedString after Escape"
+                                                .to_string(),
+                                        )
+                                    })?;
                                 let sq_text = parser.lexer.get_raw_token_text()?;
                                 // sq_text = '...' (with surrounding quotes)
                                 // First char is the escaped quote
@@ -475,10 +482,12 @@ pub fn parse_case_statement(parser: &mut Parser) -> Result<Command, ParserError>
                                 // `\#` in a case pattern — eat the '#' as a literal
                                 // and re-inject the rest of the comment line.
                                 current_pattern.push('#');
-                                let (cm_start, cm_end) = parser.lexer.get_span()
-                                    .ok_or_else(|| ParserError::InvalidSyntax(
-                                        "Missing span for Comment after Escape".to_string()
-                                    ))?;
+                                let (cm_start, cm_end) =
+                                    parser.lexer.get_span().ok_or_else(|| {
+                                        ParserError::InvalidSyntax(
+                                            "Missing span for Comment after Escape".to_string(),
+                                        )
+                                    })?;
                                 // Skip the '#' character
                                 let after_start = cm_start + 1;
                                 if after_start < cm_end {
@@ -574,7 +583,9 @@ pub fn parse_while_loop(parser: &mut Parser) -> Result<Command, ParserError> {
         // Skip whitespace/newlines before each condition command
         while matches!(
             parser.lexer.peek(),
-            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)
+            Some(
+                Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn
+            )
         ) {
             parser.lexer.next();
         }
@@ -695,7 +706,11 @@ pub fn parse_while_loop(parser: &mut Parser) -> Result<Command, ParserError> {
     let body = Block {
         commands: body_commands,
     };
-    Ok(Command::While(WhileLoop { condition, body, is_until: false }))
+    Ok(Command::While(WhileLoop {
+        condition,
+        body,
+        is_until: false,
+    }))
 }
 
 pub fn parse_until_loop(parser: &mut Parser) -> Result<Command, ParserError> {
@@ -707,7 +722,9 @@ pub fn parse_until_loop(parser: &mut Parser) -> Result<Command, ParserError> {
     loop {
         while matches!(
             parser.lexer.peek(),
-            Some(Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn)
+            Some(
+                Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn
+            )
         ) {
             parser.lexer.next();
         }
@@ -810,7 +827,11 @@ pub fn parse_until_loop(parser: &mut Parser) -> Result<Command, ParserError> {
     let body = Block {
         commands: body_commands,
     };
-    Ok(Command::While(WhileLoop { condition, body, is_until: true }))
+    Ok(Command::While(WhileLoop {
+        condition,
+        body,
+        is_until: true,
+    }))
 }
 
 pub fn parse_for_loop(parser: &mut Parser) -> Result<Command, ParserError> {
@@ -1429,8 +1450,13 @@ pub fn parse_break_statement(parser: &mut Parser) -> Result<Command, ParserError
         && !matches!(
             parser.lexer.peek(),
             Some(
-                Token::Newline | Token::Semicolon | Token::CarriageReturn
-                | Token::DoubleSemicolon | Token::And | Token::Or | Token::Pipe
+                Token::Newline
+                    | Token::Semicolon
+                    | Token::CarriageReturn
+                    | Token::DoubleSemicolon
+                    | Token::And
+                    | Token::Or
+                    | Token::Pipe
             )
         )
     {
@@ -1456,8 +1482,13 @@ pub fn parse_continue_statement(parser: &mut Parser) -> Result<Command, ParserEr
         && !matches!(
             parser.lexer.peek(),
             Some(
-                Token::Newline | Token::Semicolon | Token::CarriageReturn
-                | Token::DoubleSemicolon | Token::And | Token::Or | Token::Pipe
+                Token::Newline
+                    | Token::Semicolon
+                    | Token::CarriageReturn
+                    | Token::DoubleSemicolon
+                    | Token::And
+                    | Token::Or
+                    | Token::Pipe
             )
         )
     {
@@ -1485,8 +1516,13 @@ pub fn parse_return_statement(parser: &mut Parser) -> Result<Command, ParserErro
         && !matches!(
             parser.lexer.peek(),
             Some(
-                Token::Newline | Token::Semicolon | Token::CarriageReturn
-                | Token::DoubleSemicolon | Token::And | Token::Or | Token::Pipe
+                Token::Newline
+                    | Token::Semicolon
+                    | Token::CarriageReturn
+                    | Token::DoubleSemicolon
+                    | Token::And
+                    | Token::Or
+                    | Token::Pipe
             )
         )
     {
@@ -1544,7 +1580,7 @@ fn parse_arithmetic_expression(parser: &mut Parser) -> Result<Word, ParserError>
                 }
             }
             Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
-                // Nested (( or $(( 
+                // Nested (( or $((
                 if let Some(text) = parser.lexer.get_current_text() {
                     expression_parts.push(text);
                 }
@@ -2005,7 +2041,10 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
                 expression_parts.push("+".to_string());
                 lexer.next();
             }
-            Some(Token::Escape) | Some(Token::EscapedDoubleQuote) | Some(Token::EscapedSingleQuote) | Some(Token::EscapedBacktick) => {
+            Some(Token::Escape)
+            | Some(Token::EscapedDoubleQuote)
+            | Some(Token::EscapedSingleQuote)
+            | Some(Token::EscapedBacktick) => {
                 expression_parts.push("\\".to_string());
                 lexer.next();
             }
@@ -2065,31 +2104,87 @@ fn parse_test_expression(lexer: &mut Lexer) -> Result<Command, ParserError> {
                 lexer.next(); // skip whitespace
             }
             // Handle redirect tokens inside test expressions as literal characters
-            Some(Token::RedirectIn) | Some(Token::RedirectOut) | Some(Token::RedirectAppend)
-            | Some(Token::RedirectInOut) | Some(Token::RedirectAll)
-            | Some(Token::RedirectAllAppend) | Some(Token::RedirectInErr)
-            | Some(Token::RedirectOutErr) | Some(Token::RedirectOutClobber) => {
+            Some(Token::RedirectIn)
+            | Some(Token::RedirectOut)
+            | Some(Token::RedirectAppend)
+            | Some(Token::RedirectInOut)
+            | Some(Token::RedirectAll)
+            | Some(Token::RedirectAllAppend)
+            | Some(Token::RedirectInErr)
+            | Some(Token::RedirectOutErr)
+            | Some(Token::RedirectOutClobber) => {
                 let text = lexer.get_raw_token_text().unwrap_or_default();
                 expression_parts.push(text);
             }
             // Handle missing test operator tokens
-            Some(Token::Socket) => { expression_parts.push("-S".to_string()); lexer.next(); }
-            Some(Token::SymlinkH) => { expression_parts.push("-h".to_string()); lexer.next(); }
-            Some(Token::PipeFile) => { expression_parts.push("-p".to_string()); lexer.next(); }
-            Some(Token::Block) => { expression_parts.push("-b".to_string()); lexer.next(); }
-            Some(Token::Character) => { expression_parts.push("-c".to_string()); lexer.next(); }
-            Some(Token::SetGid) => { expression_parts.push("-g".to_string()); lexer.next(); }
-            Some(Token::Sticky) => { expression_parts.push("-k".to_string()); lexer.next(); }
-            Some(Token::SetUid) => { expression_parts.push("-u".to_string()); lexer.next(); }
-            Some(Token::Owned) => { expression_parts.push("-O".to_string()); lexer.next(); }
-            Some(Token::GroupOwned) => { expression_parts.push("-G".to_string()); lexer.next(); }
-            Some(Token::Modified) => { expression_parts.push("-N".to_string()); lexer.next(); }
-            Some(Token::NewerThan) => { expression_parts.push("-nt".to_string()); lexer.next(); }
-            Some(Token::OlderThan) => { expression_parts.push("-ot".to_string()); lexer.next(); }
-            Some(Token::SameFile) => { expression_parts.push("-ef".to_string()); lexer.next(); }
-            Some(Token::NonZero) => { expression_parts.push("-n".to_string()); lexer.next(); }
-            Some(Token::Zero) => { expression_parts.push("-z".to_string()); lexer.next(); }
-            Some(Token::At) => { expression_parts.push("@".to_string()); lexer.next(); }
+            Some(Token::Socket) => {
+                expression_parts.push("-S".to_string());
+                lexer.next();
+            }
+            Some(Token::SymlinkH) => {
+                expression_parts.push("-h".to_string());
+                lexer.next();
+            }
+            Some(Token::PipeFile) => {
+                expression_parts.push("-p".to_string());
+                lexer.next();
+            }
+            Some(Token::Block) => {
+                expression_parts.push("-b".to_string());
+                lexer.next();
+            }
+            Some(Token::Character) => {
+                expression_parts.push("-c".to_string());
+                lexer.next();
+            }
+            Some(Token::SetGid) => {
+                expression_parts.push("-g".to_string());
+                lexer.next();
+            }
+            Some(Token::Sticky) => {
+                expression_parts.push("-k".to_string());
+                lexer.next();
+            }
+            Some(Token::SetUid) => {
+                expression_parts.push("-u".to_string());
+                lexer.next();
+            }
+            Some(Token::Owned) => {
+                expression_parts.push("-O".to_string());
+                lexer.next();
+            }
+            Some(Token::GroupOwned) => {
+                expression_parts.push("-G".to_string());
+                lexer.next();
+            }
+            Some(Token::Modified) => {
+                expression_parts.push("-N".to_string());
+                lexer.next();
+            }
+            Some(Token::NewerThan) => {
+                expression_parts.push("-nt".to_string());
+                lexer.next();
+            }
+            Some(Token::OlderThan) => {
+                expression_parts.push("-ot".to_string());
+                lexer.next();
+            }
+            Some(Token::SameFile) => {
+                expression_parts.push("-ef".to_string());
+                lexer.next();
+            }
+            Some(Token::NonZero) => {
+                expression_parts.push("-n".to_string());
+                lexer.next();
+            }
+            Some(Token::Zero) => {
+                expression_parts.push("-z".to_string());
+                lexer.next();
+            }
+            Some(Token::At) => {
+                expression_parts.push("@".to_string());
+                lexer.next();
+            }
             None => {
                 return Err(ParserError::InvalidSyntax(
                     "Unexpected end of input in test expression".to_string(),

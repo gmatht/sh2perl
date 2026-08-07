@@ -27,7 +27,7 @@
 //!
 //! This module is compiled only for `wasm32-wasip1` builds (see lib.rs).
 
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::null_mut;
 use std::slice;
 

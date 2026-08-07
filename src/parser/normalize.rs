@@ -34,23 +34,25 @@ use crate::ast::Word;
 fn command_flag_value_chars() -> HashMap<&'static str, &'static str> {
     let mut m = HashMap::new();
     // boolean-only short flags
-    for cmd in ["rm", "wc", "comm", "chmod", "chown", "cp", "mv", "ln", "rmdir", "tee", "diff"] {
+    for cmd in [
+        "rm", "wc", "comm", "chmod", "chown", "cp", "mv", "ln", "rmdir", "tee", "diff",
+    ] {
         m.insert(cmd, "");
     }
-    m.insert("ls", "w");        // -w width
-    m.insert("set", "o");       // -o option (e.g. `set -euo pipefail`)
-    m.insert("uniq", "fs");     // -f skip fields, -s skip chars
-    m.insert("head", "nc");     // -n lines, -c bytes
-    m.insert("tail", "nc");     // -n lines, -c bytes
-    m.insert("sort", "kto");    // -k key, -t separator, -o output
-    m.insert("cut", "dfc");     // -d delimiter, -f fields, -c chars
+    m.insert("ls", "w"); // -w width
+    m.insert("set", "o"); // -o option (e.g. `set -euo pipefail`)
+    m.insert("uniq", "fs"); // -f skip fields, -s skip chars
+    m.insert("head", "nc"); // -n lines, -c bytes
+    m.insert("tail", "nc"); // -n lines, -c bytes
+    m.insert("sort", "kto"); // -k key, -t separator, -o output
+    m.insert("cut", "dfc"); // -d delimiter, -f fields, -c chars
     m.insert("grep", "efmABC"); // -e pattern, -f file, -m max, -A/-B/-C context
     m.insert("egrep", "efmABC");
     m.insert("fgrep", "efmABC");
-    m.insert("cmp", "n");       // -n bytes
-    m.insert("xargs", "n");     // -n max args
-    m.insert("mkdir", "m");     // -m mode
-    m.insert("touch", "dtr");   // -d/-t time, -r reference
+    m.insert("cmp", "n"); // -n bytes
+    m.insert("xargs", "n"); // -n max args
+    m.insert("mkdir", "m"); // -m mode
+    m.insert("touch", "dtr"); // -d/-t time, -r reference
     m
 }
 

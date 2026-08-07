@@ -108,7 +108,12 @@ fn walk_stmt(st: &mut IrStmt, lifts: &[Box<dyn PatternLift>]) -> usize {
     // 2) Recurse into children.
     let mut n = 0;
     match st {
-        IrStmt::If { cond, then, elsifs, else_ } => {
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+        } => {
             n += walk_expr(cond, lifts);
             n += walk_block(then, lifts);
             for (ec, eb) in elsifs.iter_mut() {
@@ -129,7 +134,10 @@ fn walk_stmt(st: &mut IrStmt, lifts: &[Box<dyn PatternLift>]) -> usize {
             n += walk_block(body, lifts);
             n += walk_expr(cond, lifts);
         }
-        IrStmt::Case { discriminant, clauses } => {
+        IrStmt::Case {
+            discriminant,
+            clauses,
+        } => {
             n += walk_expr(discriminant, lifts);
             for cl in clauses.iter_mut() {
                 n += walk_block(&mut cl.body, lifts);
@@ -146,7 +154,10 @@ fn walk_stmt(st: &mut IrStmt, lifts: &[Box<dyn PatternLift>]) -> usize {
         }
         IrStmt::Redirect { inner, .. } => n += walk_block(inner, lifts),
         IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => n += walk_expr(e, lifts),
-        IrStmt::Assign { expr, .. } | IrStmt::Declare { init: Some(expr), .. } => n += walk_expr(expr, lifts),
+        IrStmt::Assign { expr, .. }
+        | IrStmt::Declare {
+            init: Some(expr), ..
+        } => n += walk_expr(expr, lifts),
         IrStmt::WriteFile { path, content, .. } => {
             n += walk_expr(path, lifts);
             n += walk_expr(content, lifts);
@@ -313,9 +324,9 @@ impl Pipeline {
         // result, etc.). The lift phase mutates `work` in place.
         let lifts = apply_lifts(&mut work, &self.lifts);
         let _ = lifts; // the metric (call-site count) is the
-                        // post-lift sh2.* tally; the lift count is
-                        // informational. The Metric is re-tallied below
-                        // to reflect the post-lift IR.
+                       // post-lift sh2.* tally; the lift count is
+                       // informational. The Metric is re-tallied below
+                       // to reflect the post-lift IR.
         let metric = Metric::tally(&work);
         (ctx, work, metric)
     }
@@ -401,7 +412,10 @@ mod tests {
             requires: vec![],
             stmts: vec![IrStmt::Expr(IrExpr::Call {
                 func: "test".to_string(),
-                args: vec![IrExpr::Str("hello".to_string(), crate::ir::StrStyle::SingleQuoted)],
+                args: vec![IrExpr::Str(
+                    "hello".to_string(),
+                    crate::ir::StrStyle::SingleQuoted,
+                )],
             })],
             subs: vec![],
             var_types: vec![],

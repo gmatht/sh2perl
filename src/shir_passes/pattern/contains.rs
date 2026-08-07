@@ -79,8 +79,8 @@ impl super::PatternLift for TestGlob {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::PatternLift;
+    use super::*;
 
     /// All three lifts must implement the trait without panicking,
     /// and their default `try_lift_*` must return `None` in stage 0

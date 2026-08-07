@@ -116,7 +116,10 @@ pub fn generate_parameter_expansion_impl(
         ParameterExpansionOperator::None => {
             // ${var} - just the variable
             // ${#var} - string length: ${#name} -> length($name)
-            if pe.variable.starts_with('#') && !pe.variable.contains('[') && !pe.variable.contains(']') {
+            if pe.variable.starts_with('#')
+                && !pe.variable.contains('[')
+                && !pe.variable.contains(']')
+            {
                 let inner = &pe.variable[1..];
                 let ref_str = if generator.declared_locals.contains(inner)
                     || generator.function_level_vars.contains(inner)
@@ -128,7 +131,9 @@ pub fn generate_parameter_expansion_impl(
                 return format!("length({})", ref_str);
             }
             // ${var:offset} or ${var:offset:length} - substring
-            if pe.variable.contains(':') && !pe.variable.contains('[') && !pe.variable.contains(']')
+            if pe.variable.contains(':')
+                && !pe.variable.contains('[')
+                && !pe.variable.contains(']')
                 && !pe.variable.starts_with(':')
             {
                 if let Some(colon_pos) = pe.variable.find(':') {
@@ -354,10 +359,21 @@ pub fn generate_parameter_expansion_impl(
                         format!("({}) - 1", offset)
                     };
                     if let Some(length_str) = length {
-                        format!("join(\" \", {}[{}..{}])", array_ref, perl_offset, length_str)
+                        format!(
+                            "join(\" \", {}[{}..{}])",
+                            array_ref, perl_offset, length_str
+                        )
                     } else {
-                        format!("join(\" \", {}[{}..$#{}])", array_ref, perl_offset,
-                            if generator.fn_nesting_depth > 0 { "_" } else { "ARGV" })
+                        format!(
+                            "join(\" \", {}[{}..$#{}])",
+                            array_ref,
+                            perl_offset,
+                            if generator.fn_nesting_depth > 0 {
+                                "_"
+                            } else {
+                                "ARGV"
+                            }
+                        )
                     }
                 } else if pe.variable == "#" && offset == "@" && length.is_none() {
                     // ${#@} -> scalar(@ARGV) or scalar(@_)

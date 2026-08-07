@@ -58,10 +58,7 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         if recursive {
             // For recursive copy with a variable destination, use File::Path methods
             output.push_str(&generator.indent());
-            output.push_str(&format!(
-                "if (-d {}) {{\n",
-                dest
-            ));
+            output.push_str(&format!("if (-d {}) {{\n", dest));
             output.push_str(&generator.indent());
             output.push_str(&format!(
                 "    require File::Path; File::Path::make_path({} . '/' . ({} =~ m|([^/]+)$|)[0]);\n",
@@ -84,15 +81,9 @@ pub fn generate_cp_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         } else {
             // Simple copy using File::Copy::copy
             output.push_str(&generator.indent());
-            output.push_str(&format!(
-                "if ( -e {} ) {{\n",
-                src
-            ));
+            output.push_str(&format!("if ( -e {} ) {{\n", src));
             output.push_str(&generator.indent());
-            output.push_str(&format!(
-                "    if ( -d {} ) {{\n",
-                dest
-            ));
+            output.push_str(&format!("    if ( -d {} ) {{\n", dest));
             output.push_str(&generator.indent());
             output.push_str(&format!(
                 "        require File::Copy; File::Copy::copy({}, {} . '/' . ({} =~ m|([^/]+)$|)[0]);\n",

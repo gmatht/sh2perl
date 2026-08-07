@@ -166,12 +166,8 @@ fn generate_command_using_builtins(
                                     generator.get_unique_ipc_vars();
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("\n"));
-                                output.push_str(&format!(
-                                    "my ({}, {});\n",
-                                    in_var, out_var
-                                ));
-                                let cmd_str =
-                                    generator.generate_command_string_for_system(cmd);
+                                output.push_str(&format!("my ({}, {});\n", in_var, out_var));
+                                let cmd_str = generator.generate_command_string_for_system(cmd);
                                 let cmd_literal = generator
                                     .perl_string_literal_no_interp(&Word::literal(cmd_str));
                                 let _pcmd_uid = generator.get_unique_id();
@@ -201,10 +197,10 @@ fn generate_command_using_builtins(
                                 generator.get_unique_ipc_vars();
                             output.push_str(&generator.indent());
                             output.push_str(&format!("\n"));
-                            output
-                                .push_str(&format!("my ({}, {});\n", in_var, out_var));
+                            output.push_str(&format!("my ({}, {});\n", in_var, out_var));
                             let cmd_str = generator.generate_command_string_for_system(cmd);
-                            let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
+                            let cmd_literal =
+                                generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
                             let _pcmd_uid = generator.get_unique_id();
                             output.push_str(&format!(
                                 "my @_pcmd_{} = ('bash', '-c', {});\nmy {} = open3({}, {}, '>&STDERR', @_pcmd_{});\n",
@@ -234,7 +230,8 @@ fn generate_command_using_builtins(
                         output.push_str(&format!("\n"));
                         output.push_str(&format!("my ({}, {});\n", in_var, out_var));
                         let cmd_str = generator.generate_command_string_for_system(cmd);
-                        let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
+                        let cmd_literal =
+                            generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
                         let _pcmd_uid = generator.get_unique_id();
                         output.push_str(&format!(
                             "my @_pcmd_{} = ('bash', '-c', {});\nmy {} = open3({}, {}, '>&STDERR', @_pcmd_{});\n",
@@ -563,14 +560,20 @@ fn generate_command_using_builtins(
             if input_var.is_empty() {
                 // First command in pipeline
                 let cmd_str = generator.generate_command_string_for_system(command);
-                let cmd_literal = generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
+                let cmd_literal =
+                    generator.perl_string_literal_force_interp(&Word::literal(cmd_str));
                 let _pcmd_uid = generator.get_unique_id();
                 format!("\nmy @_pcmd_{} = ('bash', '-c', {});\nmy ({});\nmy {} = open3({}, {}, '>&STDERR', @_pcmd_{});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';\nwaitpid {}, 0;\n", 
                     _pcmd_uid, cmd_literal, in_var, pid_var, in_var, out_var, _pcmd_uid, in_var, out_var, output_var, out_var, pid_var)
             } else {
                 // Subsequent command - use double quotes so Perl interpolates $var
-                let pipe_cmd = format!("echo \"${{{}}}\" | {}", input_var, generator.generate_command_string_for_system(command));
-                let pipe_literal = generator.perl_string_literal_force_interp(&Word::literal(pipe_cmd));
+                let pipe_cmd = format!(
+                    "echo \"${{{}}}\" | {}",
+                    input_var,
+                    generator.generate_command_string_for_system(command)
+                );
+                let pipe_literal =
+                    generator.perl_string_literal_force_interp(&Word::literal(pipe_cmd));
                 let _pcmd_uid = generator.get_unique_id();
                 format!("\nmy @_pcmd_{} = ('bash', '-c', {});\nmy ({});\nmy {} = open3({}, {}, '>&STDERR', @_pcmd_{});\nclose {} or croak 'Close failed: $OS_ERROR';\nmy $temp_result;\n$temp_result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n${} = $temp_result;\nclose {} or croak 'Close failed: $OS_ERROR';
 waitpid {}, 0;\n", 
@@ -749,7 +752,10 @@ pub fn generate_pipeline_for_substitution(
                             let command_str = args.join(" ");
                             // Properly escape quotes in the command string
                             let escaped_command = command_str.replace("\"", "\\\"");
-                            output.push_str(&format!("    $CHILD_ERROR = system(\"{}\") >> 8;\n", escaped_command));
+                            output.push_str(&format!(
+                                "    $CHILD_ERROR = system(\"{}\") >> 8;\n",
+                                escaped_command
+                            ));
                         }
 
                         output.push_str("    my $end_time = [gettimeofday];\n");
@@ -1247,7 +1253,9 @@ fn generate_streaming_pipeline(
 
                                         // Generate line-by-line version of each command
                                         output.push_str(&generator.indent());
-                                        output.push_str(&generate_linebyline_command(generator, cmd, "L", 0));
+                                        output.push_str(&generate_linebyline_command(
+                                            generator, cmd, "L", 0,
+                                        ));
                                     }
                                     Command::Pipeline(pipeline) => {
                                         // Handle nested pipelines in while loop body with line-by-line processing
@@ -1268,14 +1276,18 @@ fn generate_streaming_pipeline(
                             output.push_str(&generator.indent());
                             let output_var = format!("output_{}", unique_id);
                             output.push_str(&generator.indent());
-                            output.push_str(&format!("my @_tmp_lines = split /\\n/, ${};", output_var));
+                            output.push_str(&format!(
+                                "my @_tmp_lines = split /\\n/, ${};",
+                                output_var
+                            ));
                             output.push_str("\n");
                             output.push_str(&generator.indent());
                             output.push_str("pop @_tmp_lines;\n");
                             output.push_str(&generator.indent());
                             output.push_str("push @_tmp_lines, $L;\n");
                             output.push_str(&generator.indent());
-                            output.push_str(&format!("${} = join \"\\n\", @_tmp_lines;", output_var));
+                            output
+                                .push_str(&format!("${} = join \"\\n\", @_tmp_lines;", output_var));
                             output.push_str("\n");
                             output.push_str(&generator.indent());
                             output.push_str(&format!("${} .= \"\\n\";", output_var));
@@ -1886,16 +1898,18 @@ fn generate_linebyline_command(
                                 StringPart::Variable(var) => {
                                     format!("${}", var)
                                 }
-                                StringPart::Literal(s) => {
-                                    s.clone()
-                                }
+                                StringPart::Literal(s) => s.clone(),
                                 _ => return None,
                             };
                             // Check for flags in third part
                             let flags = if interp.parts.len() >= 3 {
                                 if let StringPart::Literal(s) = &interp.parts[2] {
                                     let s = s.trim_matches('/');
-                                    if !s.is_empty() { format!("{}", s) } else { String::new() }
+                                    if !s.is_empty() {
+                                        format!("{}", s)
+                                    } else {
+                                        String::new()
+                                    }
                                 } else {
                                     String::new()
                                 }
@@ -1903,7 +1917,8 @@ fn generate_linebyline_command(
                                 String::new()
                             };
                             // Build the replacement expression, escaping $ and @ in the pattern
-                            let escaped_pattern = pattern_str.replace('$', "\\$").replace('@', "\\@");
+                            let escaped_pattern =
+                                pattern_str.replace('$', "\\$").replace('@', "\\@");
                             if flags.is_empty() {
                                 return Some(format!(
                                     "${} =~ s/{}/{}/;",
@@ -1963,9 +1978,11 @@ fn generate_linebyline_command(
             }) {
                 let expr = generator.word_to_perl(sed_expr);
                 output.push_str(&format!("${} =~ {expr};\n", line_var));
-            } else if let Some(sed_expr) = cmd.args.iter().find(|arg| {
-                matches!(arg, Word::StringInterpolation(_, _))
-            }) {
+            } else if let Some(sed_expr) = cmd
+                .args
+                .iter()
+                .find(|arg| matches!(arg, Word::StringInterpolation(_, _)))
+            {
                 // Handle StringInterpolation args like s/LINE/$i/
                 if let Word::StringInterpolation(interp, _) = sed_expr {
                     if let Some(subst) = handle_interp_sed(interp) {
@@ -2215,29 +2232,29 @@ fn generate_linebyline_command(
 /// Check if a command (or any command in a pipeline/subs hell) has a heredoc redirect.
 fn has_heredoc_redirect(cmd: &Command) -> bool {
     match cmd {
-        Command::Redirect(redirect_cmd) => {
-            redirect_cmd.redirects.iter().any(|r| {
-                matches!(
-                    r.operator,
-                    RedirectOperator::Heredoc | RedirectOperator::HeredocTabs
-                )
-            })
-        }
-        Command::Simple(simple_cmd) => {
-            simple_cmd.redirects.iter().any(|r| {
-                matches!(
-                    r.operator,
-                    RedirectOperator::Heredoc | RedirectOperator::HeredocTabs
-                )
-            })
-        }
+        Command::Redirect(redirect_cmd) => redirect_cmd.redirects.iter().any(|r| {
+            matches!(
+                r.operator,
+                RedirectOperator::Heredoc | RedirectOperator::HeredocTabs
+            )
+        }),
+        Command::Simple(simple_cmd) => simple_cmd.redirects.iter().any(|r| {
+            matches!(
+                r.operator,
+                RedirectOperator::Heredoc | RedirectOperator::HeredocTabs
+            )
+        }),
         Command::Pipeline(p) => p.commands.iter().any(|c| has_heredoc_redirect(c)),
         Command::Subshell(inner) => has_heredoc_redirect(inner),
         Command::Block(b) => b.commands.iter().any(|c| has_heredoc_redirect(c)),
-        Command::And(l, r) | Command::Or(l, r) => has_heredoc_redirect(l) || has_heredoc_redirect(r),
+        Command::And(l, r) | Command::Or(l, r) => {
+            has_heredoc_redirect(l) || has_heredoc_redirect(r)
+        }
         Command::If(s) => {
             has_heredoc_redirect(&s.then_branch)
-                || s.else_branch.as_ref().map_or(false, |e| has_heredoc_redirect(e))
+                || s.else_branch
+                    .as_ref()
+                    .map_or(false, |e| has_heredoc_redirect(e))
         }
         Command::While(w) => w.body.commands.iter().any(|c| has_heredoc_redirect(c)),
         Command::For(f) => f.body.commands.iter().any(|c| has_heredoc_redirect(c)),
@@ -2306,9 +2323,10 @@ fn generate_buffered_pipeline(
     // must appear on its own line after the full pipeline command line).
     // Falling through to the scaffolding path which handles heredocs via
     // temp-file redirects.
-    let has_heredoc = pipeline.commands.iter().any(|cmd| {
-        has_heredoc_redirect(cmd)
-    });
+    let has_heredoc = pipeline
+        .commands
+        .iter()
+        .any(|cmd| has_heredoc_redirect(cmd));
 
     // Only take the clean path when there are no output redirects and no heredocs.
     // Also skip if the pipeline has a source-text comment but no actual commands
@@ -2332,7 +2350,7 @@ fn generate_buffered_pipeline(
 
             // Build a clean IR statement for pipeline capture.
             let pipeline_stmt = IrStmt::Pipeline {
-                stages: vec![],  // Not used when capture is set
+                stages: vec![], // Not used when capture is set
                 last_output: None,
                 capture: Some(output_var.clone()),
                 cmd_str: Some(reconstructed_cmd),
@@ -2362,7 +2380,6 @@ fn generate_buffered_pipeline(
         }
     }
     // ---- End clean path ----
-
 
     if should_print {
         // Wrap the entire pipeline in a block scope to prevent variable contamination
@@ -2449,7 +2466,9 @@ fn generate_buffered_pipeline(
             if i == 0 {
                 // First command - generate output
                 output.push_str(&generator.indent());
-                if matches!(command, Command::Redirect(_)) || matches!(command, Command::Subshell(_)) {
+                if matches!(command, Command::Redirect(_))
+                    || matches!(command, Command::Subshell(_))
+                {
                     // For Redirect and Subshell commands (e.g. cat << EOF, subshells with heredocs),
                     // use the full command generator which preserves redirect information (heredocs, etc.).
                     // The generated code already has proper indentation; do NOT

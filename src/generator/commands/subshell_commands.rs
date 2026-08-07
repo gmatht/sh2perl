@@ -16,7 +16,10 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
     // Use IR Declare { local: true } so the backend can optimize this.
     {
         let stmt = IrStmt::Declare {
-            vars: vec![Decl { name: "ENV".to_string(), sigil: Some(Sigil::Hash) }],
+            vars: vec![Decl {
+                name: "ENV".to_string(),
+                sigil: Some(Sigil::Hash),
+            }],
             init: Some(IrExpr::Var("ENV".to_string(), Some(Sigil::Hash))),
             local: true,
         };
@@ -58,7 +61,10 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
         // automatically restored when the block exits — the same semantics
         // as a bash subshell.
         let stmt = IrStmt::Declare {
-            vars: vec![Decl { name: var_name.clone(), sigil: sigil.clone() }],
+            vars: vec![Decl {
+                name: var_name.clone(),
+                sigil: sigil.clone(),
+            }],
             init: Some(IrExpr::Var(var_name.clone(), sigil)),
             local: false,
         };
@@ -188,8 +194,10 @@ pub fn generate_background_impl(generator: &mut Generator, command: &Command) ->
                                     &Word::literal(inner_cmd.clone()),
                                 );
                                 output.push_str(&generator.indent());
-                                output
-                                    .push_str(&format!("my $_exec_cmd = {}; exec '{}', '-c', $_exec_cmd;\n", inner_lit, name));
+                                output.push_str(&format!(
+                                    "my $_exec_cmd = {}; exec '{}', '-c', $_exec_cmd;\n",
+                                    inner_lit, name
+                                ));
                                 output.push_str(&generator.indent());
                                 output.push_str("croak \"exec failed: $OS_ERROR\\n\";\n");
                                 handled = true;
@@ -205,7 +213,10 @@ pub fn generate_background_impl(generator: &mut Generator, command: &Command) ->
             let cmd_str = crate::generator::redirects::generate_bash_command_string(command);
             let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
             output.push_str(&generator.indent());
-            output.push_str(&format!("my $_exec_cmd = {}; exec 'bash', '-c', $_exec_cmd;\n", cmd_lit));
+            output.push_str(&format!(
+                "my $_exec_cmd = {}; exec 'bash', '-c', $_exec_cmd;\n",
+                cmd_lit
+            ));
             output.push_str(&generator.indent());
             output.push_str("croak \"exec failed: $OS_ERROR\\n\";\n");
         }

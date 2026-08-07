@@ -86,7 +86,9 @@ fn expansion_into_parts(expansion: Word) -> Option<Vec<StringPart>> {
         Word::MapAccess(name, key, _) => Some(vec![StringPart::MapAccess(name, key)]),
         Word::MapKeys(name, _) => Some(vec![StringPart::MapKeys(name)]),
         Word::MapLength(name, _) => Some(vec![StringPart::MapLength(name)]),
-        Word::ArraySlice(name, offset, len, _) => Some(vec![StringPart::ArraySlice(name, offset, len)]),
+        Word::ArraySlice(name, offset, len, _) => {
+            Some(vec![StringPart::ArraySlice(name, offset, len)])
+        }
         Word::Arithmetic(a, _) => Some(vec![StringPart::Arithmetic(a)]),
         Word::CommandSubstitution(c, _) => Some(vec![StringPart::CommandSubstitution(c)]),
         Word::StringInterpolation(interp, _) => Some(interp.parts),
@@ -191,7 +193,11 @@ fn merge_contiguous_quoted_fragments(
                                         s.push_str(t);
                                     }
                                 }
-                                if s.is_empty() { None } else { Some(s) }
+                                if s.is_empty() {
+                                    None
+                                } else {
+                                    Some(s)
+                                }
                             }
                             _ => None,
                         };
@@ -287,17 +293,32 @@ fn merge_contiguous_quoted_fragments(
             // `'a'-suffix`. Same token set the combine loop treats as
             // word-continuation characters (dead in branch A — the loop already
             // consumed them; live for branch B results).
-            Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float)
-            | Some(Token::PaddedNumber) | Some(Token::HexNumber)
-            | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range)
-            | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Colon)
-            | Some(Token::Star) | Some(Token::Percent) | Some(Token::Comma)
-            | Some(Token::Question) | Some(Token::BraceClose)
-            | Some(Token::TestBracket) | Some(Token::TestBracketClose)
-            | Some(Token::Equality) | Some(Token::Caret)
-            | Some(Token::PlusAssign) | Some(Token::MinusAssign)
-            | Some(Token::StarAssign) | Some(Token::SlashAssign)
-            | Some(Token::PercentAssign) | Some(Token::Assign) => {
+            Some(Token::Identifier)
+            | Some(Token::Number)
+            | Some(Token::Float)
+            | Some(Token::PaddedNumber)
+            | Some(Token::HexNumber)
+            | Some(Token::Slash)
+            | Some(Token::Dot)
+            | Some(Token::Range)
+            | Some(Token::Plus)
+            | Some(Token::Minus)
+            | Some(Token::Colon)
+            | Some(Token::Star)
+            | Some(Token::Percent)
+            | Some(Token::Comma)
+            | Some(Token::Question)
+            | Some(Token::BraceClose)
+            | Some(Token::TestBracket)
+            | Some(Token::TestBracketClose)
+            | Some(Token::Equality)
+            | Some(Token::Caret)
+            | Some(Token::PlusAssign)
+            | Some(Token::MinusAssign)
+            | Some(Token::StarAssign)
+            | Some(Token::SlashAssign)
+            | Some(Token::PercentAssign)
+            | Some(Token::Assign) => {
                 if !append_raw_token_text(lexer, word)? {
                     break;
                 }
@@ -512,7 +533,7 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::While) | Some(Token::Until) | Some(Token::For)
             | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
             | Some(Token::Select) | Some(Token::Function)
-        ) {
+    ) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
@@ -646,20 +667,34 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 let mut suffix = String::new();
                 while let Some(tok) = lexer.peek() {
                     match tok {
-                        Token::Identifier | Token::Number | Token::Float
-                        | Token::PaddedNumber | Token::HexNumber
-                        | Token::Slash | Token::Dot | Token::Range
-                        | Token::Plus | Token::Minus | Token::Escape
-                        | Token::Colon | Token::Star | Token::Percent
-                        | Token::Comma | Token::Question | Token::BraceClose
-                        | Token::TestBracket | Token::TestBracketClose
-                        | Token::Assign | Token::Dollar => {
+                        Token::Identifier
+                        | Token::Number
+                        | Token::Float
+                        | Token::PaddedNumber
+                        | Token::HexNumber
+                        | Token::Slash
+                        | Token::Dot
+                        | Token::Range
+                        | Token::Plus
+                        | Token::Minus
+                        | Token::Escape
+                        | Token::Colon
+                        | Token::Star
+                        | Token::Percent
+                        | Token::Comma
+                        | Token::Question
+                        | Token::BraceClose
+                        | Token::TestBracket
+                        | Token::TestBracketClose
+                        | Token::Assign
+                        | Token::Dollar => {
                             // Stop at Dollar if followed by a variable name
                             // (that would be a new variable expansion)
                             if matches!(tok, Token::Dollar) {
-                                let is_var_ref = lexer.peek_n(1).map(|t| {
-                                    matches!(t, Token::Identifier | Token::Number)
-                                }).unwrap_or(false);
+                                let is_var_ref = lexer
+                                    .peek_n(1)
+                                    .map(|t| matches!(t, Token::Identifier | Token::Number))
+                                    .unwrap_or(false);
                                 if is_var_ref {
                                     break;
                                 }
@@ -716,8 +751,16 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 Ok(parse_string_interpolation(&mut sub_lexer)?)
             } else {
                 // Fallback: return the content as a literal
-                let inner = if whole.len() >= 2 && whole.as_bytes()[0] == b'"' { &whole[1..] } else { &whole };
-                let inner = if inner.ends_with('"') { &inner[..inner.len()-1] } else { inner };
+                let inner = if whole.len() >= 2 && whole.as_bytes()[0] == b'"' {
+                    &whole[1..]
+                } else {
+                    &whole
+                };
+                let inner = if inner.ends_with('"') {
+                    &inner[..inner.len() - 1]
+                } else {
+                    inner
+                };
                 Ok(Word::Literal(inner.to_string(), None))
             }
         }
@@ -785,19 +828,35 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 let mut suffix = String::new();
                 while let Some(tok) = lexer.peek() {
                     match tok {
-                        Token::Identifier | Token::Number | Token::Float
-                        | Token::PaddedNumber | Token::HexNumber
-                        | Token::Slash | Token::Dot | Token::Range
-                        | Token::Plus | Token::Minus | Token::Escape
-                        | Token::Colon | Token::Star | Token::Percent
-                        | Token::Comma | Token::Question | Token::BraceClose
-                        | Token::TestBracket | Token::TestBracketClose
-                        | Token::Assign | Token::Dollar => {
+                        Token::Identifier
+                        | Token::Number
+                        | Token::Float
+                        | Token::PaddedNumber
+                        | Token::HexNumber
+                        | Token::Slash
+                        | Token::Dot
+                        | Token::Range
+                        | Token::Plus
+                        | Token::Minus
+                        | Token::Escape
+                        | Token::Colon
+                        | Token::Star
+                        | Token::Percent
+                        | Token::Comma
+                        | Token::Question
+                        | Token::BraceClose
+                        | Token::TestBracket
+                        | Token::TestBracketClose
+                        | Token::Assign
+                        | Token::Dollar => {
                             if matches!(tok, Token::Dollar) {
-                                let is_var_ref = lexer.peek_n(1).map(|t| {
-                                    matches!(t, Token::Identifier | Token::Number)
-                                }).unwrap_or(false);
-                                if is_var_ref { break; }
+                                let is_var_ref = lexer
+                                    .peek_n(1)
+                                    .map(|t| matches!(t, Token::Identifier | Token::Number))
+                                    .unwrap_or(false);
+                                if is_var_ref {
+                                    break;
+                                }
                             }
                             if let Some(text) = lexer.get_current_text() {
                                 suffix.push_str(&text);
@@ -808,7 +867,9 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                                         lexer.next();
                                     }
                                 }
-                            } else { break; }
+                            } else {
+                                break;
+                            }
                         }
                         _ => break,
                     }
@@ -818,7 +879,7 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
             }
             Ok(be_word)
-        },
+        }
         Some(Token::Source) => {
             // Treat standalone 'source' as a normal word (e.g., `source file.sh`)
             lexer.next();
@@ -991,7 +1052,7 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         Token::DoubleQuotedString => {
                             let quoted = lexer.get_string_text()?;
                             let inner = if quoted.starts_with('"') && quoted.ends_with('"') {
-                                &quoted[1..quoted.len()-1]
+                                &quoted[1..quoted.len() - 1]
                             } else {
                                 &quoted
                             };
@@ -1000,7 +1061,7 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         Token::SingleQuotedString => {
                             let quoted = lexer.get_string_text()?;
                             let inner = if quoted.starts_with('\'') && quoted.ends_with('\'') {
-                                &quoted[1..quoted.len()-1]
+                                &quoted[1..quoted.len() - 1]
                             } else {
                                 &quoted
                             };
@@ -1013,12 +1074,12 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 // Strip quotes from value if the regex captured them as part of the token
                 // (e.g. --option="value" or --option='value')
                 if let Some(eq_pos) = text.find('=') {
-                    let value_part = &text[eq_pos+1..];
+                    let value_part = &text[eq_pos + 1..];
                     if value_part.len() >= 2 {
                         if (value_part.starts_with('"') && value_part.ends_with('"'))
                             || (value_part.starts_with('\'') && value_part.ends_with('\''))
                         {
-                            let inner = &value_part[1..value_part.len()-1];
+                            let inner = &value_part[1..value_part.len() - 1];
                             text = format!("{}={}", &text[..eq_pos], inner);
                         }
                     }
@@ -1107,9 +1168,7 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
         Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
             Ok(parse_arithmetic_expression(lexer)?)
         }
-        Some(Token::ArithmeticBracket) => {
-            Ok(parse_arithmetic_bracket(lexer)?)
-        }
+        Some(Token::ArithmeticBracket) => Ok(parse_arithmetic_bracket(lexer)?),
         Some(Token::True) => {
             // Treat standalone 'true' as a normal word (e.g., `true` or `command || true`)
             lexer.next();
@@ -1128,17 +1187,40 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
             // If we encounter a shell keyword token in argument position,
             // treat it as a literal word rather than failing.
             match token {
-                Some(Token::If) | Some(Token::Then) | Some(Token::Else) | Some(Token::Elif)
-                | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
-                | Some(Token::While) | Some(Token::Until) | Some(Token::For)
-                | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-                | Some(Token::Select) | Some(Token::Function) | Some(Token::Bang)
-                | Some(Token::Let) | Some(Token::Break) | Some(Token::Continue)
-                | Some(Token::Return) | Some(Token::Exit) | Some(Token::Shift)
-                | Some(Token::Eval) | Some(Token::Exec) | Some(Token::Source)
-                | Some(Token::Trap) | Some(Token::Wait) | Some(Token::Unset)
-                | Some(Token::Set) | Some(Token::Export) | Some(Token::Readonly)
-                | Some(Token::Declare) | Some(Token::Typeset) | Some(Token::Local) => {
+                Some(Token::If)
+                | Some(Token::Then)
+                | Some(Token::Else)
+                | Some(Token::Elif)
+                | Some(Token::Fi)
+                | Some(Token::Do)
+                | Some(Token::Done)
+                | Some(Token::While)
+                | Some(Token::Until)
+                | Some(Token::For)
+                | Some(Token::Case)
+                | Some(Token::Esac)
+                | Some(Token::In)
+                | Some(Token::Select)
+                | Some(Token::Function)
+                | Some(Token::Bang)
+                | Some(Token::Let)
+                | Some(Token::Break)
+                | Some(Token::Continue)
+                | Some(Token::Return)
+                | Some(Token::Exit)
+                | Some(Token::Shift)
+                | Some(Token::Eval)
+                | Some(Token::Exec)
+                | Some(Token::Source)
+                | Some(Token::Trap)
+                | Some(Token::Wait)
+                | Some(Token::Unset)
+                | Some(Token::Set)
+                | Some(Token::Export)
+                | Some(Token::Readonly)
+                | Some(Token::Declare)
+                | Some(Token::Typeset)
+                | Some(Token::Local) => {
                     let text = lexer.get_current_text().unwrap_or_default();
                     lexer.next();
                     Ok(Word::Literal(text, None))
@@ -1288,7 +1370,7 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
             | Some(Token::While) | Some(Token::Until) | Some(Token::For)
             | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
             | Some(Token::Select) | Some(Token::Function)
-        ) {
+    ) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
@@ -1429,20 +1511,34 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                 let mut suffix = String::new();
                 while let Some(tok) = lexer.peek() {
                     match tok {
-                        Token::Identifier | Token::Number | Token::Float
-                        | Token::PaddedNumber | Token::HexNumber
-                        | Token::Slash | Token::Dot | Token::Range
-                        | Token::Plus | Token::Minus | Token::Escape
-                        | Token::Colon | Token::Star | Token::Percent
-                        | Token::Comma | Token::Question | Token::BraceClose
-                        | Token::TestBracket | Token::TestBracketClose
-                        | Token::Assign | Token::Dollar => {
+                        Token::Identifier
+                        | Token::Number
+                        | Token::Float
+                        | Token::PaddedNumber
+                        | Token::HexNumber
+                        | Token::Slash
+                        | Token::Dot
+                        | Token::Range
+                        | Token::Plus
+                        | Token::Minus
+                        | Token::Escape
+                        | Token::Colon
+                        | Token::Star
+                        | Token::Percent
+                        | Token::Comma
+                        | Token::Question
+                        | Token::BraceClose
+                        | Token::TestBracket
+                        | Token::TestBracketClose
+                        | Token::Assign
+                        | Token::Dollar => {
                             // Stop at Dollar if followed by a variable name
                             // (that would be a new variable expansion)
                             if matches!(tok, Token::Dollar) {
-                                let is_var_ref = lexer.peek_n(1).map(|t| {
-                                    matches!(t, Token::Identifier | Token::Number)
-                                }).unwrap_or(false);
+                                let is_var_ref = lexer
+                                    .peek_n(1)
+                                    .map(|t| matches!(t, Token::Identifier | Token::Number))
+                                    .unwrap_or(false);
                                 if is_var_ref {
                                     break;
                                 }
@@ -1498,8 +1594,16 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                 Ok(parse_string_interpolation(&mut sub_lexer)?)
             } else {
                 // Fallback: return the content as a literal
-                let inner = if whole.len() >= 2 && whole.as_bytes()[0] == b'"' { &whole[1..] } else { &whole };
-                let inner = if inner.ends_with('"') { &inner[..inner.len()-1] } else { inner };
+                let inner = if whole.len() >= 2 && whole.as_bytes()[0] == b'"' {
+                    &whole[1..]
+                } else {
+                    &whole
+                };
+                let inner = if inner.ends_with('"') {
+                    &inner[..inner.len() - 1]
+                } else {
+                    inner
+                };
                 Ok(Word::Literal(inner.to_string(), None))
             }
         }
@@ -1567,19 +1671,35 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                 let mut suffix = String::new();
                 while let Some(tok) = lexer.peek() {
                     match tok {
-                        Token::Identifier | Token::Number | Token::Float
-                        | Token::PaddedNumber | Token::HexNumber
-                        | Token::Slash | Token::Dot | Token::Range
-                        | Token::Plus | Token::Minus | Token::Escape
-                        | Token::Colon | Token::Star | Token::Percent
-                        | Token::Comma | Token::Question | Token::BraceClose
-                        | Token::TestBracket | Token::TestBracketClose
-                        | Token::Assign | Token::Dollar => {
+                        Token::Identifier
+                        | Token::Number
+                        | Token::Float
+                        | Token::PaddedNumber
+                        | Token::HexNumber
+                        | Token::Slash
+                        | Token::Dot
+                        | Token::Range
+                        | Token::Plus
+                        | Token::Minus
+                        | Token::Escape
+                        | Token::Colon
+                        | Token::Star
+                        | Token::Percent
+                        | Token::Comma
+                        | Token::Question
+                        | Token::BraceClose
+                        | Token::TestBracket
+                        | Token::TestBracketClose
+                        | Token::Assign
+                        | Token::Dollar => {
                             if matches!(tok, Token::Dollar) {
-                                let is_var_ref = lexer.peek_n(1).map(|t| {
-                                    matches!(t, Token::Identifier | Token::Number)
-                                }).unwrap_or(false);
-                                if is_var_ref { break; }
+                                let is_var_ref = lexer
+                                    .peek_n(1)
+                                    .map(|t| matches!(t, Token::Identifier | Token::Number))
+                                    .unwrap_or(false);
+                                if is_var_ref {
+                                    break;
+                                }
                             }
                             if let Some(text) = lexer.get_current_text() {
                                 suffix.push_str(&text);
@@ -1590,7 +1710,9 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                                         lexer.next();
                                     }
                                 }
-                            } else { break; }
+                            } else {
+                                break;
+                            }
                         }
                         _ => break,
                     }
@@ -1600,7 +1722,7 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                 }
             }
             Ok(be_word)
-        },
+        }
         Some(Token::Source) => {
             // Treat standalone 'source' as a normal word (e.g., `source file.sh`)
             lexer.next();
@@ -1775,7 +1897,7 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                         Token::DoubleQuotedString => {
                             let quoted = lexer.get_string_text()?;
                             let inner = if quoted.starts_with('"') && quoted.ends_with('"') {
-                                &quoted[1..quoted.len()-1]
+                                &quoted[1..quoted.len() - 1]
                             } else {
                                 &quoted
                             };
@@ -1784,7 +1906,7 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                         Token::SingleQuotedString => {
                             let quoted = lexer.get_string_text()?;
                             let inner = if quoted.starts_with('\'') && quoted.ends_with('\'') {
-                                &quoted[1..quoted.len()-1]
+                                &quoted[1..quoted.len() - 1]
                             } else {
                                 &quoted
                             };
@@ -1797,12 +1919,12 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                 // Strip quotes from value if the regex captured them as part of the token
                 // (e.g. --option="value" or --option='value')
                 if let Some(eq_pos) = text.find('=') {
-                    let value_part = &text[eq_pos+1..];
+                    let value_part = &text[eq_pos + 1..];
                     if value_part.len() >= 2 {
                         if (value_part.starts_with('"') && value_part.ends_with('"'))
                             || (value_part.starts_with('\'') && value_part.ends_with('\''))
                         {
-                            let inner = &value_part[1..value_part.len()-1];
+                            let inner = &value_part[1..value_part.len() - 1];
                             text = format!("{}={}", &text[..eq_pos], inner);
                         }
                     }
@@ -1891,9 +2013,7 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
         Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
             Ok(parse_arithmetic_expression(lexer)?)
         }
-        Some(Token::ArithmeticBracket) => {
-            Ok(parse_arithmetic_bracket(lexer)?)
-        }
+        Some(Token::ArithmeticBracket) => Ok(parse_arithmetic_bracket(lexer)?),
         Some(Token::True) => {
             // Treat standalone 'true' as a normal word (e.g., `true` or `command || true`)
             lexer.next();
@@ -1912,17 +2032,40 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
             // If we encounter a shell keyword token in argument position,
             // treat it as a literal word rather than failing.
             match token {
-                Some(Token::If) | Some(Token::Then) | Some(Token::Else) | Some(Token::Elif)
-                | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
-                | Some(Token::While) | Some(Token::Until) | Some(Token::For)
-                | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-                | Some(Token::Select) | Some(Token::Function) | Some(Token::Bang)
-                | Some(Token::Let) | Some(Token::Break) | Some(Token::Continue)
-                | Some(Token::Return) | Some(Token::Exit) | Some(Token::Shift)
-                | Some(Token::Eval) | Some(Token::Exec) | Some(Token::Source)
-                | Some(Token::Trap) | Some(Token::Wait) | Some(Token::Unset)
-                | Some(Token::Set) | Some(Token::Export) | Some(Token::Readonly)
-                | Some(Token::Declare) | Some(Token::Typeset) | Some(Token::Local) => {
+                Some(Token::If)
+                | Some(Token::Then)
+                | Some(Token::Else)
+                | Some(Token::Elif)
+                | Some(Token::Fi)
+                | Some(Token::Do)
+                | Some(Token::Done)
+                | Some(Token::While)
+                | Some(Token::Until)
+                | Some(Token::For)
+                | Some(Token::Case)
+                | Some(Token::Esac)
+                | Some(Token::In)
+                | Some(Token::Select)
+                | Some(Token::Function)
+                | Some(Token::Bang)
+                | Some(Token::Let)
+                | Some(Token::Break)
+                | Some(Token::Continue)
+                | Some(Token::Return)
+                | Some(Token::Exit)
+                | Some(Token::Shift)
+                | Some(Token::Eval)
+                | Some(Token::Exec)
+                | Some(Token::Source)
+                | Some(Token::Trap)
+                | Some(Token::Wait)
+                | Some(Token::Unset)
+                | Some(Token::Set)
+                | Some(Token::Export)
+                | Some(Token::Readonly)
+                | Some(Token::Declare)
+                | Some(Token::Typeset)
+                | Some(Token::Local) => {
                     let text = lexer.get_current_text().unwrap_or_default();
                     lexer.next();
                     Ok(Word::Literal(text, None))
@@ -2070,40 +2213,52 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 // Check for adjacent suffix tokens (no whitespace gap) that
                 // should be concatenated, like $DEST.new or $var-suffix.
                 if let Some(next_start) = lexer.tokens.get(lexer.current).map(|(_, s, _)| *s) {
-                    let prev_end = lexer.tokens.get(lexer.current.checked_sub(1).unwrap_or(0)).map(|(_, _, e)| *e).unwrap_or(0);
+                    let prev_end = lexer
+                        .tokens
+                        .get(lexer.current.checked_sub(1).unwrap_or(0))
+                        .map(|(_, _, e)| *e)
+                        .unwrap_or(0);
                     if next_start == prev_end {
                         if let Some(Token::Dot) = lexer.peek() {
                             // $var.suffix — consume . and following identifier
-                            let mut parts = vec![
-                                StringPart::Variable(var_name.clone()),
-                            ];
+                            let mut parts = vec![StringPart::Variable(var_name.clone())];
                             lexer.next(); // consume the Dot
                             if let Some(Token::Identifier) = lexer.peek() {
                                 if let Some(id_text) = lexer.get_current_text() {
                                     parts.push(StringPart::Literal(format!(".{}", id_text)));
                                     lexer.next();
-                                    return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
                                 }
                             }
                             // Just the dot
                             parts.push(StringPart::Literal(".".to_string()));
-                            return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                            return Ok(Word::StringInterpolation(
+                                StringInterpolation { parts },
+                                None,
+                            ));
                         }
                         if let Some(Token::Minus) = lexer.peek() {
                             // $var-suffix — consume - and following identifier
-                            let mut parts = vec![
-                                StringPart::Variable(var_name.clone()),
-                            ];
+                            let mut parts = vec![StringPart::Variable(var_name.clone())];
                             lexer.next(); // consume the Minus
                             if let Some(Token::Identifier) = lexer.peek() {
                                 if let Some(id_text) = lexer.get_current_text() {
                                     parts.push(StringPart::Literal(format!("-{}", id_text)));
                                     lexer.next();
-                                    return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
                                 }
                             }
                             parts.push(StringPart::Literal("-".to_string()));
-                            return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                            return Ok(Word::StringInterpolation(
+                                StringInterpolation { parts },
+                                None,
+                            ));
                         }
                     }
                 }
@@ -2211,7 +2366,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 // This is ${!prefix@} or ${!prefix*} - indirect expansion.
                 // In bash this expands to all variable names starting with prefix.
                 // Generate as keys %prefix for Perl.
-                let var_name = &braced_content[1..braced_content.len()-1];
+                let var_name = &braced_content[1..braced_content.len() - 1];
                 return Ok(Word::MapKeys(var_name.to_string(), None));
             } else if braced_content.contains("::") {
                 // ${var::offset} or ${var::offset:length} - substring syntax
@@ -2224,7 +2379,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 return Ok(Word::ParameterExpansion(
                     ParameterExpansion {
                         variable: var_name.to_string(),
-                        operator: ParameterExpansionOperator::ArraySlice("0".to_string(), Some(rest.to_string())),
+                        operator: ParameterExpansionOperator::ArraySlice(
+                            "0".to_string(),
+                            Some(rest.to_string()),
+                        ),
                         is_mutable: true,
                     },
                     None,
@@ -2287,7 +2445,13 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     },
                     None,
                 ));
-            } else if braced_content.contains(':') && !braced_content.contains("::") && !braced_content.contains(":-") && !braced_content.contains(":=") && !braced_content.contains(":+") && !braced_content.contains(":?") {
+            } else if braced_content.contains(':')
+                && !braced_content.contains("::")
+                && !braced_content.contains(":-")
+                && !braced_content.contains(":=")
+                && !braced_content.contains(":+")
+                && !braced_content.contains(":?")
+            {
                 // ${var:offset} or ${var:offset:length} - substring/array-slice
                 // The first colon must not be part of any two-char operator.
                 let colon_pos = braced_content.find(':').unwrap();
@@ -2299,7 +2463,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     return Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                            operator: ParameterExpansionOperator::ArraySlice(
+                                offset.to_string(),
+                                Some(length.to_string()),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2308,7 +2475,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     return Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::ArraySlice(rest.to_string(), None),
+                            operator: ParameterExpansionOperator::ArraySlice(
+                                rest.to_string(),
+                                None,
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2328,7 +2498,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         // pattern-removal or substitution operators, this is a
                         // parameter expansion with brackets in the pattern, not
                         // an array/map access.
-                        if !(map_name.contains('#') || map_name.contains('%') || map_name.contains('/')) {
+                        if !(map_name.contains('#')
+                            || map_name.contains('%')
+                            || map_name.contains('/'))
+                        {
                             // Special case: if key is "@", this is array iteration
                             if key == "@" {
                                 // Check if there's array slicing in braced_content after ']'
@@ -2377,7 +2550,11 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                                 ));
                             }
 
-                            return Ok(Word::MapAccess(map_name.to_string(), key.to_string(), None));
+                            return Ok(Word::MapAccess(
+                                map_name.to_string(),
+                                key.to_string(),
+                                None,
+                            ));
                         }
                         // else: fall through to parameter expansion checks below
                     }
@@ -2464,7 +2641,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 } else {
                     Ok(Word::Variable(braced_content, true, None))
                 }
-            } else if braced_content.contains("%%") && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*")) {
+            } else if braced_content.contains("%%")
+                && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*"))
+            {
                 let parts: Vec<&str> = braced_content.split("%%").collect();
                 if parts.len() == 2 {
                     Ok(Word::ParameterExpansion(
@@ -2496,7 +2675,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 } else {
                     Ok(Word::Variable(braced_content, true, None))
                 }
-            } else if braced_content.contains("%") && !braced_content.contains("%%") && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*")) {
+            } else if braced_content.contains("%")
+                && !braced_content.contains("%%")
+                && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*"))
+            {
                 let parts: Vec<&str> = braced_content.splitn(2, "%").collect();
                 if parts.len() == 2 {
                     Ok(Word::ParameterExpansion(
@@ -2555,7 +2737,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                            operator: ParameterExpansionOperator::DefaultValue(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2587,7 +2771,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                            operator: ParameterExpansionOperator::ErrorIfUnset(
+                                error_msg.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2603,7 +2789,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                            operator: ParameterExpansionOperator::AssignDefault(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2660,7 +2848,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 // ${!prefix@} or ${!prefix*} - indirect expansion.
                 // In bash this expands to all variable names starting with prefix.
                 // Generate as keys %prefix for Perl.
-                let var_name = &prefixed[1..prefixed.len()-1];
+                let var_name = &prefixed[1..prefixed.len() - 1];
                 return Ok(Word::MapKeys(var_name.to_string(), None));
             }
             Ok(Word::Variable(prefixed, true, None))
@@ -2686,7 +2874,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                            operator: ParameterExpansionOperator::DefaultValue(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2698,7 +2888,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                            operator: ParameterExpansionOperator::AssignDefault(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2722,7 +2914,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                                operator: ParameterExpansionOperator::DefaultValue(
+                                    default_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2737,7 +2931,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
+                                operator: ParameterExpansionOperator::DefaultValue(
+                                    alt_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2752,7 +2948,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                                operator: ParameterExpansionOperator::ErrorIfUnset(
+                                    error_msg.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2767,7 +2965,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                                operator: ParameterExpansionOperator::AssignDefault(
+                                    default_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2775,7 +2975,13 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     } else {
                         Ok(Word::Variable(content, true, None))
                     }
-                } else if content.contains(':') && !content.contains("::") && !content.contains(":-") && !content.contains(":=") && !content.contains(":+") && !content.contains(":?") {
+                } else if content.contains(':')
+                    && !content.contains("::")
+                    && !content.contains(":-")
+                    && !content.contains(":=")
+                    && !content.contains(":+")
+                    && !content.contains(":?")
+                {
                     // ${*:offset} or ${*:offset:length} - array slice
                     let colon_pos = content.find(':').unwrap();
                     let var_name = &content[..colon_pos];
@@ -2786,7 +2992,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    offset.to_string(),
+                                    Some(length.to_string()),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2795,7 +3004,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ArraySlice(rest.to_string(), None),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    rest.to_string(),
+                                    None,
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2830,7 +3042,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                            operator: ParameterExpansionOperator::DefaultValue(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2842,7 +3056,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                            operator: ParameterExpansionOperator::AssignDefault(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2867,7 +3083,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                                operator: ParameterExpansionOperator::DefaultValue(
+                                    default_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2883,7 +3101,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
+                                operator: ParameterExpansionOperator::DefaultValue(
+                                    alt_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2899,7 +3119,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                                operator: ParameterExpansionOperator::ErrorIfUnset(
+                                    error_msg.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2915,7 +3137,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                                operator: ParameterExpansionOperator::AssignDefault(
+                                    default_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2923,7 +3147,13 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     } else {
                         Ok(Word::Variable(content, true, None))
                     }
-                } else if content.contains(':') && !content.contains("::") && !content.contains(":-") && !content.contains(":=") && !content.contains(":+") && !content.contains(":?") {
+                } else if content.contains(':')
+                    && !content.contains("::")
+                    && !content.contains(":-")
+                    && !content.contains(":=")
+                    && !content.contains(":+")
+                    && !content.contains(":?")
+                {
                     // ${@:offset} or ${@:offset:length} - array slice
                     let colon_pos = content.find(':').unwrap();
                     let var_name = &content[..colon_pos];
@@ -2934,7 +3164,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    offset.to_string(),
+                                    Some(length.to_string()),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2943,7 +3176,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ArraySlice(rest.to_string(), None),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    rest.to_string(),
+                                    None,
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -3011,7 +3247,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         // body runs (a `$(cmd1\ncmd2)` substitution captures
                         // both — parse-dollar-paren-pipe.sh).
                         let block = crate::ast::Block { commands };
-                        Ok(Word::CommandSubstitution(Box::new(crate::ast::Command::Block(block)), None))
+                        Ok(Word::CommandSubstitution(
+                            Box::new(crate::ast::Command::Block(block)),
+                            None,
+                        ))
                     }
                 }
                 Err(_) => {
@@ -3065,7 +3304,11 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
     let content = content.replace("\\\r\n", "");
 
     if crate::debug::is_debug_enabled() {
-        eprintln!("DEBUG parse_string_interpolation: content len={}, content={:?}", content.len(), &content[..content.len().min(80)]);
+        eprintln!(
+            "DEBUG parse_string_interpolation: content len={}, content={:?}",
+            content.len(),
+            &content[..content.len().min(80)]
+        );
     }
 
     // Parse the string content to extract literal parts and variable references
@@ -3381,7 +3624,14 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
 
                 let next_char = content[i..].chars().next().unwrap();
-                if next_char == '#' || next_char == '@' || next_char == '*' || next_char == '?' || next_char == '-' || next_char == '!' || next_char == '$' {
+                if next_char == '#'
+                    || next_char == '@'
+                    || next_char == '*'
+                    || next_char == '?'
+                    || next_char == '-'
+                    || next_char == '!'
+                    || next_char == '$'
+                {
                     // Special shell variable
                     parts.push(StringPart::Variable(next_char.to_string()));
                     i += 1;
@@ -3463,24 +3713,31 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     if crate::debug::is_debug_enabled() {
                         eprintln!("DEBUG parse_string_interpolation: found $(...), cmd_content len={}, first 80: {:?}", cmd_content.len(), &cmd_content[..cmd_content.len().min(80)]);
                     }
-                    if let Ok(cmds) = crate::parser::commands::parse_commands_from_text(cmd_content) {
+                    if let Ok(cmds) = crate::parser::commands::parse_commands_from_text(cmd_content)
+                    {
                         if crate::debug::is_debug_enabled() {
                             eprintln!("DEBUG parse_string_interpolation: parse_commands_from_text OK, {} commands", cmds.len());
                         }
                         if cmds.is_empty() {
                             parts.push(StringPart::Literal(format!("$({})", cmd_content)));
                         } else if cmds.len() == 1 {
-                            parts.push(StringPart::CommandSubstitution(Box::new(cmds.into_iter().next().unwrap())));
+                            parts.push(StringPart::CommandSubstitution(Box::new(
+                                cmds.into_iter().next().unwrap(),
+                            )));
                         } else {
                             let block = crate::ast::Block { commands: cmds };
-                            parts.push(StringPart::CommandSubstitution(Box::new(crate::ast::Command::Block(block))));
+                            parts.push(StringPart::CommandSubstitution(Box::new(
+                                crate::ast::Command::Block(block),
+                            )));
                         }
                     } else {
                         if crate::debug::is_debug_enabled() {
                             eprintln!("DEBUG parse_string_interpolation: parse_commands_from_text FAILED, trying pipeline");
                         }
                         // Fallback: try the old pipeline-based parser
-                        if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
+                        if let Ok(cmd) =
+                            crate::parser::commands::parse_pipeline_from_text(cmd_content)
+                        {
                             if crate::debug::is_debug_enabled() {
                                 eprintln!("DEBUG parse_string_interpolation: pipeline parser OK");
                             }
@@ -3536,7 +3793,14 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
 
                 let next_char = content[i..].chars().next().unwrap();
-                if next_char == '#' || next_char == '@' || next_char == '*' || next_char == '?' || next_char == '-' || next_char == '!' || next_char == '$' {
+                if next_char == '#'
+                    || next_char == '@'
+                    || next_char == '*'
+                    || next_char == '?'
+                    || next_char == '-'
+                    || next_char == '!'
+                    || next_char == '$'
+                {
                     parts.push(StringPart::Variable(next_char.to_string()));
                     let ch = content[i..].chars().next().unwrap_or('?');
                     i += ch.len_utf8();
@@ -3805,7 +4069,10 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
         let rest = &content[colon_pos + 2..];
         return Ok(ParameterExpansion {
             variable: var_name.to_string(),
-            operator: ParameterExpansionOperator::ArraySlice("0".to_string(), Some(rest.to_string())),
+            operator: ParameterExpansionOperator::ArraySlice(
+                "0".to_string(),
+                Some(rest.to_string()),
+            ),
             is_mutable: true,
         });
     }
@@ -3952,28 +4219,36 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                     let pattern = &rest[2..];
                     return Ok(ParameterExpansion {
                         variable: format!("{}[{}]", var_name, key),
-                        operator: ParameterExpansionOperator::RemoveLongestPrefix(pattern.to_string()),
+                        operator: ParameterExpansionOperator::RemoveLongestPrefix(
+                            pattern.to_string(),
+                        ),
                         is_mutable: true,
                     });
                 } else if rest.starts_with('#') {
                     let pattern = &rest[1..];
                     return Ok(ParameterExpansion {
                         variable: format!("{}[{}]", var_name, key),
-                        operator: ParameterExpansionOperator::RemoveShortestPrefix(pattern.to_string()),
+                        operator: ParameterExpansionOperator::RemoveShortestPrefix(
+                            pattern.to_string(),
+                        ),
                         is_mutable: true,
                     });
                 } else if rest.starts_with("%%") {
                     let pattern = &rest[2..];
                     return Ok(ParameterExpansion {
                         variable: format!("{}[{}]", var_name, key),
-                        operator: ParameterExpansionOperator::RemoveLongestSuffix(pattern.to_string()),
+                        operator: ParameterExpansionOperator::RemoveLongestSuffix(
+                            pattern.to_string(),
+                        ),
                         is_mutable: true,
                     });
                 } else if rest.starts_with('%') {
                     let pattern = &rest[1..];
                     return Ok(ParameterExpansion {
                         variable: format!("{}[{}]", var_name, key),
-                        operator: ParameterExpansionOperator::RemoveShortestSuffix(pattern.to_string()),
+                        operator: ParameterExpansionOperator::RemoveShortestSuffix(
+                            pattern.to_string(),
+                        ),
                         is_mutable: true,
                     });
                 } else if rest == "^^" {
@@ -4027,11 +4302,19 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
     // We only reach here for simple variable names (no brackets) like ${@:3} or ${var:offset}.
     // Also guard against operator patterns like ${var%%pattern} where the pattern
     // contains ':' by checking that no operator characters precede the colon.
-    if content.contains(':') && !content.contains('[') && !content.contains(']') 
-        && !content.contains("::") && !content.contains(":-") && !content.contains(":=") 
-        && !content.contains(":+") && !content.contains(":?") 
-        && !content.contains('%') && !content.contains('#') 
-        && !content.contains('/') && !content.contains('^') && !content.contains(',')
+    if content.contains(':')
+        && !content.contains('[')
+        && !content.contains(']')
+        && !content.contains("::")
+        && !content.contains(":-")
+        && !content.contains(":=")
+        && !content.contains(":+")
+        && !content.contains(":?")
+        && !content.contains('%')
+        && !content.contains('#')
+        && !content.contains('/')
+        && !content.contains('^')
+        && !content.contains(',')
     {
         let colon_pos = content.find(':').unwrap();
         // Only treat as ArraySlice if the colon is at a position that could be
@@ -4044,7 +4327,10 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 let length = &rest[second_colon + 1..];
                 return Ok(ParameterExpansion {
                     variable: var_name.to_string(),
-                    operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                    operator: ParameterExpansionOperator::ArraySlice(
+                        offset.to_string(),
+                        Some(length.to_string()),
+                    ),
                     is_mutable: true,
                 });
             } else {
@@ -4139,7 +4425,10 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 is_mutable: true,
             })
         }
-    } else if content.contains("%") && !content.contains("%%") && !(content.ends_with("%/*") && !content.ends_with("%%/*")) {
+    } else if content.contains("%")
+        && !content.contains("%%")
+        && !(content.ends_with("%/*") && !content.ends_with("%%/*"))
+    {
         let parts: Vec<&str> = content.split("%").collect();
         if parts.len() == 2 {
             Ok(ParameterExpansion {
@@ -4199,7 +4488,13 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 is_mutable: true,
             })
         }
-    } else if content.contains('-') && !content.contains('%') && !content.contains('#') && !content.contains('/') && !content.contains('!') && !content.contains(':') {
+    } else if content.contains('-')
+        && !content.contains('%')
+        && !content.contains('#')
+        && !content.contains('/')
+        && !content.contains('!')
+        && !content.contains(':')
+    {
         // ${var-default} - use default if var is unset (not if empty)
         let parts: Vec<&str> = content.splitn(2, '-').collect();
         if parts.len() == 2 && !parts[0].is_empty() {
@@ -4218,7 +4513,11 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
     } else if content.contains("=-") {
         // ${var=-default} - assign default if var is unset
         let parts: Vec<&str> = content.splitn(2, "=-").collect();
-        if parts.len() == 2 && !parts[0].is_empty() && !parts[0].contains('%') && !parts[0].contains('#') {
+        if parts.len() == 2
+            && !parts[0].is_empty()
+            && !parts[0].contains('%')
+            && !parts[0].contains('#')
+        {
             Ok(ParameterExpansion {
                 variable: parts[0].to_string(),
                 operator: ParameterExpansionOperator::AssignDefault(parts[1].to_string()),

@@ -221,7 +221,12 @@ fn walk_stmt(
             walk_expr(path, p, first, last, escapes, in_closure);
             walk_expr(content, p, first, last, escapes, in_closure);
         }
-        IrStmt::If { cond, then, elsifs, else_ } => {
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+        } => {
             walk_expr(cond, p, first, last, escapes, in_closure);
             walk_stmts(then, pos, first, last, escapes, in_closure, copied);
             for (c, b) in elsifs {
@@ -243,7 +248,13 @@ fn walk_stmt(
         IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
             walk_expr(expr, p, first, last, escapes, in_closure);
         }
-        IrStmt::Exec { cmd, args, redirects, env, .. } => {
+        IrStmt::Exec {
+            cmd,
+            args,
+            redirects,
+            env,
+            ..
+        } => {
             // subprocess boundary: values are uses (kernel copies); the
             // buffers must be alive at the call, nothing is retained.
             walk_expr(cmd, p, first, last, escapes, in_closure);
@@ -276,7 +287,10 @@ fn walk_stmt(
         }
         IrStmt::SetChildError(e) => walk_expr(e, p, first, last, escapes, in_closure),
         IrStmt::Require(_) | IrStmt::RawText(_) => {}
-        IrStmt::Case { discriminant, clauses } => {
+        IrStmt::Case {
+            discriminant,
+            clauses,
+        } => {
             walk_expr(discriminant, p, first, last, escapes, in_closure);
             for c in clauses {
                 walk_stmts(&c.body, pos, first, last, escapes, in_closure, copied);
@@ -373,9 +387,21 @@ fn walk_expr(
                     return;
                 }
                 // subprocess boundaries: uses only (kernel copies)
-                "exec" | "pipeline" | "capture" | "captureWords" | "redirect"
-                | "subshell" | "background" | "forLoop" | "whileLoop" | "whileLoopSync"
-                | "cstyleFor" | "cstyleForSync" | "forIn" | "forOf" | "commandSubstitution" => {
+                "exec"
+                | "pipeline"
+                | "capture"
+                | "captureWords"
+                | "redirect"
+                | "subshell"
+                | "background"
+                | "forLoop"
+                | "whileLoop"
+                | "whileLoopSync"
+                | "cstyleFor"
+                | "cstyleForSync"
+                | "forIn"
+                | "forOf"
+                | "commandSubstitution" => {
                     for a in args {
                         walk_expr(a, pos, first, last, escapes, in_closure);
                     }
@@ -432,8 +458,13 @@ fn walk_expr(
                 walk_expr(v, pos, first, last, escapes, in_closure);
             }
         }
-        IrExpr::Str(_, _) | IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_)
-        | IrExpr::Regex { .. } | IrExpr::Range { .. } | IrExpr::RawExpr(_) => {}
+        IrExpr::Str(_, _)
+        | IrExpr::Int(_)
+        | IrExpr::Bool(_)
+        | IrExpr::Json(_)
+        | IrExpr::Regex { .. }
+        | IrExpr::Range { .. }
+        | IrExpr::RawExpr(_) => {}
     }
 }
 
@@ -456,7 +487,9 @@ fn walk_arith(
             walk_arith(rhs, pos, first, last, escapes, in_closure);
         }
         ArithAst::Un { arg, .. } => walk_arith(arg, pos, first, last, escapes, in_closure),
-        ArithAst::Cond { test, then, else_, .. } => {
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => {
             walk_arith(test, pos, first, last, escapes, in_closure);
             walk_arith(then, pos, first, last, escapes, in_closure);
             walk_arith(else_, pos, first, last, escapes, in_closure);
@@ -477,11 +510,7 @@ fn walk_arith(
 /// Mark every variable appearing in an expression as escaping (used for
 /// array-element stores and function returns: the storage may be
 /// retained past the current scope).
-fn mark_vars_escape(
-    e: &IrExpr,
-    first: &mut HashMap<String, usize>,
-    escapes: &mut HashSet<String>,
-) {
+fn mark_vars_escape(e: &IrExpr, first: &mut HashMap<String, usize>, escapes: &mut HashSet<String>) {
     match e {
         IrExpr::Var(name, _) | IrExpr::Ident(name) => {
             first.entry(name.to_string()).or_insert(0);
@@ -582,7 +611,12 @@ fn mark_stmt_vars_escape(
             mark_vars_escape(path, first, escapes);
             mark_vars_escape(content, first, escapes);
         }
-        IrStmt::If { cond, then, elsifs, else_ } => {
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+        } => {
             mark_vars_escape(cond, first, escapes);
             mark_stmts_vars_escape(then, first, escapes);
             for (c, b) in elsifs {
@@ -601,12 +635,21 @@ fn mark_stmt_vars_escape(
             mark_vars_escape(cond, first, escapes);
             mark_stmts_vars_escape(body, first, escapes);
         }
-        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } | IrStmt::Exit(Some(expr))
-        | IrStmt::SetChildError(expr) | IrStmt::Return(Some(expr)) => {
+        IrStmt::Die { expr, .. }
+        | IrStmt::Warn { expr, .. }
+        | IrStmt::Exit(Some(expr))
+        | IrStmt::SetChildError(expr)
+        | IrStmt::Return(Some(expr)) => {
             mark_vars_escape(expr, first, escapes);
         }
         IrStmt::Exit(None) | IrStmt::Return(None) => {}
-        IrStmt::Exec { cmd, args, redirects, env, .. } => {
+        IrStmt::Exec {
+            cmd,
+            args,
+            redirects,
+            env,
+            ..
+        } => {
             mark_vars_escape(cmd, first, escapes);
             for a in args {
                 mark_vars_escape(a, first, escapes);
@@ -624,7 +667,10 @@ fn mark_stmt_vars_escape(
             }
         }
         IrStmt::Require(_) | IrStmt::RawText(_) => {}
-        IrStmt::Case { discriminant, clauses } => {
+        IrStmt::Case {
+            discriminant,
+            clauses,
+        } => {
             mark_vars_escape(discriminant, first, escapes);
             for c in clauses {
                 mark_stmts_vars_escape(&c.body, first, escapes);
@@ -678,7 +724,9 @@ fn mark_arith_vars_escape(
             mark_arith_vars_escape(rhs, first, escapes);
         }
         ArithAst::Un { arg, .. } => mark_arith_vars_escape(arg, first, escapes),
-        ArithAst::Cond { test, then, else_, .. } => {
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => {
             mark_arith_vars_escape(test, first, escapes);
             mark_arith_vars_escape(then, first, escapes);
             mark_arith_vars_escape(else_, first, escapes);

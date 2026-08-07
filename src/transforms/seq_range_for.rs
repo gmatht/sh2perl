@@ -95,7 +95,10 @@ fn transform_stmt(st: &mut IrStmt) -> bool {
             changed
         }
         IrStmt::If {
-            then, elsifs, else_, ..
+            then,
+            elsifs,
+            else_,
+            ..
         } => {
             let mut changed = false;
             for b in then.iter_mut().chain(else_.iter_mut()) {
@@ -214,12 +217,16 @@ fn seq_range_bounds(iter: &IrExpr) -> Option<(i64, i64)> {
         IrExpr::Call { .. } => iter,
         _ => return None,
     };
-    let IrExpr::Call { func, args } = call else { return None };
+    let IrExpr::Call { func, args } = call else {
+        return None;
+    };
     if func != "captureWords" {
         return None;
     }
     // exactly one statement in the capture: `exec("seq", args)`
-    let [IrExpr::Arrow(stmts)] = args.as_slice() else { return None };
+    let [IrExpr::Arrow(stmts)] = args.as_slice() else {
+        return None;
+    };
     let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = stmts.as_slice() else {
         return None;
     };
@@ -290,7 +297,10 @@ fn stmt_writes_var(st: &IrStmt, var: &str) -> bool {
         IrStmt::DeclareArray { var: name, .. } => name == var,
         IrStmt::Expr(e) => expr_writes_var(e, var),
         IrStmt::If {
-            then, elsifs, else_, ..
+            then,
+            elsifs,
+            else_,
+            ..
         } => {
             stmts_write_var(then, var)
                 || stmts_write_var(else_, var)
@@ -305,9 +315,7 @@ fn stmt_writes_var(st: &IrStmt, var: &str) -> bool {
         // a nested `for var in …` REASSIGNS var in bash (the inner
         // iteration clobbers the outer binding until the outer body
         // ends) — count the loop-var binding itself as a write
-        IrStmt::For { var: v, body, .. } => {
-            v == var || stmts_write_var(body, var)
-        }
+        IrStmt::For { var: v, body, .. } => v == var || stmts_write_var(body, var),
         IrStmt::Case { clauses, .. } => clauses.iter().any(|c| stmts_write_var(&c.body, var)),
         IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| stmts_write_var(s, var)),
         IrStmt::Redirect { inner, .. } => stmts_write_var(inner, var),
@@ -335,8 +343,15 @@ fn expr_writes_var(e: &IrExpr, var: &str) -> bool {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     if matches!(
                         name.as_str(),
-                        "read" | "readarray" | "mapfile" | "unset" | "let" | "eval"
-                            | "declare" | "typeset" | "local"
+                        "read"
+                            | "readarray"
+                            | "mapfile"
+                            | "unset"
+                            | "let"
+                            | "eval"
+                            | "declare"
+                            | "typeset"
+                            | "local"
                     ) {
                         if let Some(IrExpr::Array(wargs)) = args.get(1) {
                             for a in wargs {
@@ -430,8 +445,12 @@ mod tests {
     fn one_arg_seq_starts_at_one() {
         let mut st = seq_for(&["10"], vec![]);
         assert!(transform_stmt(&mut st));
-        let IrStmt::For { iter, .. } = st else { panic!() };
-        let IrExpr::Range { start, end } = iter else { panic!() };
+        let IrStmt::For { iter, .. } = st else {
+            panic!()
+        };
+        let IrExpr::Range { start, end } = iter else {
+            panic!()
+        };
         assert_eq!((start, end), (1, 10));
     }
 
@@ -441,8 +460,12 @@ mod tests {
         // `i <= end` test also runs zero times.
         let mut st = seq_for(&["5", "1"], vec![]);
         assert!(transform_stmt(&mut st));
-        let IrStmt::For { iter, .. } = st else { panic!() };
-        let IrExpr::Range { start, end } = iter else { panic!() };
+        let IrStmt::For { iter, .. } = st else {
+            panic!()
+        };
+        let IrExpr::Range { start, end } = iter else {
+            panic!()
+        };
         assert_eq!((start, end), (5, 1));
     }
 

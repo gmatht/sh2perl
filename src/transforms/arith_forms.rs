@@ -41,7 +41,12 @@ fn transform_stmt(st: &mut IrStmt) -> bool {
     // 1) recurse into children first (bottom-up — so a nested let inside
     //    an If body is rewritten before we look at the parent Exec)
     let mut c = match st {
-        IrStmt::If { cond, then, elsifs, else_ } => {
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+        } => {
             let mut x = transform_expr(cond);
             x |= transform(then);
             for (ec, eb) in elsifs.iter_mut() {
@@ -66,7 +71,10 @@ fn transform_stmt(st: &mut IrStmt) -> bool {
             x |= transform_expr(cond);
             x
         }
-        IrStmt::Case { discriminant, clauses } => {
+        IrStmt::Case {
+            discriminant,
+            clauses,
+        } => {
             let mut x = transform_expr(discriminant);
             for cl in clauses.iter_mut() {
                 x |= transform(&mut cl.body);
@@ -99,10 +107,10 @@ fn transform_stmt(st: &mut IrStmt) -> bool {
         }
         IrStmt::Assign { expr, .. }
         | IrStmt::Output { value: expr, .. }
-        | IrStmt::Declare { init: Some(expr), .. } => transform_expr(expr),
-        IrStmt::WriteFile { path, content, .. } => {
-            transform_expr(path) | transform_expr(content)
-        }
+        | IrStmt::Declare {
+            init: Some(expr), ..
+        } => transform_expr(expr),
+        IrStmt::WriteFile { path, content, .. } => transform_expr(path) | transform_expr(content),
         IrStmt::Redirect { inner, .. } => transform(inner),
         // stmt-level `IrStmt::Exec { cmd:Str("let"), args:[.., Array([Str,..])] }`
         // (defensive — the common shape is the Expr(Call("exec", ...)) above)
@@ -197,7 +205,9 @@ fn build_assigns(items: &[IrExpr]) -> Option<Vec<IrStmt>> {
 /// the call-form inside an Exec stmt (defensive — the common shape is
 /// the Expr(Call("exec", ...)) handled in `lower_let_expr`).
 fn lower_let_stmt(st: &mut IrStmt) -> bool {
-    let IrStmt::Exec { cmd, args, .. } = st else { return false };
+    let IrStmt::Exec { cmd, args, .. } = st else {
+        return false;
+    };
     let is_let = match &*cmd {
         IrExpr::Str(n, _) if n == "let" => true,
         _ => false,
@@ -205,7 +215,9 @@ fn lower_let_stmt(st: &mut IrStmt) -> bool {
     if !is_let {
         return false;
     }
-    let [_, IrExpr::Array(items)] = args.as_slice() else { return false };
+    let [_, IrExpr::Array(items)] = args.as_slice() else {
+        return false;
+    };
     let assigns = match build_assigns(items) {
         Some(a) => a,
         None => return false,
@@ -260,7 +272,10 @@ mod tests {
     fn assert_changes(src: &str) -> String {
         let commands = parse_commands_from_text(src).expect("parse source");
         let mut prog = ast_to_ir_raw(&commands);
-        assert!(transform(&mut prog.stmts), "transform was a no-op for {src}");
+        assert!(
+            transform(&mut prog.stmts),
+            "transform was a no-op for {src}"
+        );
         shir_to_shir_json(&prog)
     }
 
@@ -279,7 +294,10 @@ mod tests {
         assert!(!json.contains("\"let\""), "let exec should be gone: {json}");
         // the Assign payload is the Arith(Assign) form
         assert!(json.contains("\"Arith\""), "missing Arith payload: {json}");
-        assert!(json.contains("\"Assign\""), "missing inner Assign node: {json}");
+        assert!(
+            json.contains("\"Assign\""),
+            "missing inner Assign node: {json}"
+        );
         assert!(json.contains("\"x\""), "missing target var: {json}");
     }
 
@@ -302,14 +320,20 @@ mod tests {
         let json = assert_changes("let \"x++\"");
         assert!(!json.contains("\"let\""), "let exec should be gone: {json}");
         assert!(json.contains("\"IncDec\""), "missing IncDec node: {json}");
-        assert!(json.contains("\"prefix\":false"), "postfix marker wrong: {json}");
+        assert!(
+            json.contains("\"prefix\":false"),
+            "postfix marker wrong: {json}"
+        );
     }
 
     #[test]
     fn let_prefix_incdec() {
         let json = assert_changes("let \"++x\"");
         assert!(json.contains("\"IncDec\""), "missing IncDec: {json}");
-        assert!(json.contains("\"prefix\":true"), "prefix marker wrong: {json}");
+        assert!(
+            json.contains("\"prefix\":true"),
+            "prefix marker wrong: {json}"
+        );
     }
 
     #[test]
@@ -352,7 +376,10 @@ mod tests {
     fn let_in_nested_block_rewrites_recursively() {
         // the let is buried two levels deep
         let json = assert_changes("if true; then let \"x=1\"; fi");
-        assert!(!json.contains("\"let\""), "nested let should be gone: {json}");
+        assert!(
+            !json.contains("\"let\""),
+            "nested let should be gone: {json}"
+        );
         assert!(json.contains("\"Arith\""));
     }
 
@@ -361,8 +388,7 @@ mod tests {
         // `let "foo bar"` is not a valid arith expression; refuse >
         // guess — the whole exec stays (the runtime would error too,
         // so leaving it preserves the user's signal).
-        let commands =
-            parse_commands_from_text("let \"foo bar\"").expect("parse");
+        let commands = parse_commands_from_text("let \"foo bar\"").expect("parse");
         let mut prog = ast_to_ir_raw(&commands);
         let before = shir_to_shir_json(&prog);
         let changed = transform(&mut prog.stmts);

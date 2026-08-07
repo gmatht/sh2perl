@@ -7,9 +7,7 @@ use crate::ir::{self, IrExpr, IrStmt, Sigil, StrStyle};
 /// containing a single Literal part.
 fn extract_literal_from_word(word: &Word) -> Option<String> {
     match word {
-        Word::Literal(s, _) => {
-            Some(s.trim_matches('"').trim_matches('\'').to_string())
-        }
+        Word::Literal(s, _) => Some(s.trim_matches('"').trim_matches('\'').to_string()),
         Word::StringInterpolation(interp, _) => {
             if interp.parts.len() == 1 {
                 if let StringPart::Literal(s) = &interp.parts[0] {
@@ -67,10 +65,7 @@ struct FindArgs {
 
 /// Shared argument-parsing logic used by both `generate_find_command` and
 /// `generate_find_for_substitution`.
-fn parse_find_args(
-    generator: &mut Generator,
-    cmd: &SimpleCommand,
-) -> FindArgs {
+fn parse_find_args(generator: &mut Generator, cmd: &SimpleCommand) -> FindArgs {
     let mut start_dir_raw: Option<String> = None;
     let mut start_dir_perl = String::from(".");
     let mut name_pattern: Option<String> = None;
@@ -301,11 +296,8 @@ pub fn generate_find_command(
         )));
     } else {
         // Print results directly
-        let callback_lines = build_callback_lines_print(
-            &args.file_type,
-            &args.name_pattern,
-            &args.maxdepth,
-        );
+        let callback_lines =
+            build_callback_lines_print(&args.file_type, &args.name_pattern, &args.maxdepth);
 
         let find_call = format!(
             "{0}File::Find::find(sub {{\n{1}\n{0}    }}, {2});\n",
@@ -317,7 +309,8 @@ pub fn generate_find_command(
     }
 
     // Convert IR statements to Perl text
-    stmts.iter()
+    stmts
+        .iter()
         .map(|s| ir::stmt_to_perl(s, indent))
         .collect::<Vec<_>>()
         .join("")
@@ -445,13 +438,15 @@ pub fn generate_find_for_substitution(
     stmts.push(IrStmt::SetChildError(IrExpr::Int(0)));
 
     // Serialize the inner statements indented inside the do-block
-    let inner_code: String = stmts.iter()
+    let inner_code: String = stmts
+        .iter()
         .map(|s| ir::stmt_to_perl(s, indent))
         .collect::<Vec<_>>()
         .join("");
 
     // Wrap in do { ... } with trailing $result;
-    format!("do {{\n{}{indent_str}$result;\n}}",
+    format!(
+        "do {{\n{}{indent_str}$result;\n}}",
         inner_code,
         indent_str = "    ",
     )

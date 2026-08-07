@@ -400,7 +400,10 @@ impl Generator {
         let needs_exit_code = self.needs_exit_code_tracking(ast);
         if needs_exit_code || true {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "main_exit_code".to_string(), sigil: Some(Sigil::Scalar) }],
+                vars: vec![Decl {
+                    name: "main_exit_code".to_string(),
+                    sigil: Some(Sigil::Scalar),
+                }],
                 init: Some(IrExpr::Int(0)),
                 local: false,
             };
@@ -409,7 +412,10 @@ impl Generator {
         // $ls_success is only needed for ls command output parsing
         if self.needs_ls_success(ast) {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "ls_success".to_string(), sigil: Some(Sigil::Scalar) }],
+                vars: vec![Decl {
+                    name: "ls_success".to_string(),
+                    sigil: Some(Sigil::Scalar),
+                }],
                 init: Some(IrExpr::Int(0)),
                 local: false,
             };
@@ -418,7 +424,10 @@ impl Generator {
         // $__set_e is only needed when `set -e` (errexit) is active
         if self.set_e_active {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "__set_e".to_string(), sigil: Some(Sigil::Scalar) }],
+                vars: vec![Decl {
+                    name: "__set_e".to_string(),
+                    sigil: Some(Sigil::Scalar),
+                }],
                 init: Some(IrExpr::Int(0)),
                 local: false,
             };
@@ -427,8 +436,14 @@ impl Generator {
         // $output is only needed when there are top-level output statements
         if needs_exit_code || self.needs_output_var(ast) {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: "output".to_string(), sigil: Some(Sigil::Scalar) }],
-                init: Some(IrExpr::Str("".to_string(), crate::ir::StrStyle::SingleQuoted)),
+                vars: vec![Decl {
+                    name: "output".to_string(),
+                    sigil: Some(Sigil::Scalar),
+                }],
+                init: Some(IrExpr::Str(
+                    "".to_string(),
+                    crate::ir::StrStyle::SingleQuoted,
+                )),
                 local: false,
             };
             output.push_str(&stmt_to_perl(&stmt, 0));
@@ -466,7 +481,10 @@ impl Generator {
         // Use IR Declare nodes so the backend can optimize dead declarations.
         for var in &self.function_level_vars {
             let stmt = IrStmt::Declare {
-                vars: vec![Decl { name: var.clone(), sigil: Some(Sigil::Scalar) }],
+                vars: vec![Decl {
+                    name: var.clone(),
+                    sigil: Some(Sigil::Scalar),
+                }],
                 init: None,
                 local: false,
             };
@@ -475,14 +493,20 @@ impl Generator {
             // as an array or hash in some context.
             if self.associative_arrays.contains(var) {
                 let stmt = IrStmt::Declare {
-                    vars: vec![Decl { name: var.clone(), sigil: Some(Sigil::Hash) }],
+                    vars: vec![Decl {
+                        name: var.clone(),
+                        sigil: Some(Sigil::Hash),
+                    }],
                     init: None,
                     local: false,
                 };
                 output.push_str(&stmt_to_perl(&stmt, 0));
             } else if self.indexed_arrays.contains(var) {
                 let stmt = IrStmt::Declare {
-                    vars: vec![Decl { name: var.clone(), sigil: Some(Sigil::Array) }],
+                    vars: vec![Decl {
+                        name: var.clone(),
+                        sigil: Some(Sigil::Array),
+                    }],
                     init: None,
                     local: false,
                 };
@@ -497,7 +521,10 @@ impl Generator {
         if !self.no_magic_numbers && !self.constants.is_empty() {
             for (name, value) in &self.constants {
                 let stmt = IrStmt::Declare {
-                    vars: vec![Decl { name: name.clone(), sigil: Some(Sigil::Scalar) }],
+                    vars: vec![Decl {
+                        name: name.clone(),
+                        sigil: Some(Sigil::Scalar),
+                    }],
                     init: Some(IrExpr::Int(*value)),
                     local: false,
                 };
@@ -522,7 +549,10 @@ impl Generator {
 
         // Add final exit statement — only if $main_exit_code is tracked.
         if needs_exit_code {
-            let stmt = IrStmt::Exit(Some(IrExpr::Var("main_exit_code".to_string(), Some(Sigil::Scalar))));
+            let stmt = IrStmt::Exit(Some(IrExpr::Var(
+                "main_exit_code".to_string(),
+                Some(Sigil::Scalar),
+            )));
             output.push('\n');
             output.push_str(&stmt_to_perl(&stmt, 0));
         }
@@ -644,7 +674,7 @@ impl Generator {
                 // that need to be translated to Perl expressions instead of treated as literal strings.
                 if trimmed.starts_with("${") && trimmed.contains(':') {
                     // Translate ${var:offset} or ${var:offset:length} -> substr($var, offset, length)
-                    let inner = &trimmed[2..trimmed.len()-1]; // Strip ${ and }
+                    let inner = &trimmed[2..trimmed.len() - 1]; // Strip ${ and }
                     if let Some(colon_pos) = inner.find(':') {
                         let var_name = &inner[..colon_pos];
                         let rest = &inner[colon_pos + 1..];
@@ -658,24 +688,33 @@ impl Generator {
                         if let Some(second_colon) = rest.find(':') {
                             let offset = rest[..second_colon].trim();
                             let length = rest[second_colon + 1..].trim();
-                            let offset_expr = if offset.chars().all(|c| c.is_alphanumeric() || c == '_') && !offset.chars().next().map_or(true, |c| c.is_ascii_digit()) {
-                                format!("${}", offset)
-                            } else {
-                                offset.to_string()
-                            };
-                            let length_expr = if length.chars().all(|c| c.is_alphanumeric() || c == '_') && !length.chars().next().map_or(true, |c| c.is_ascii_digit()) {
-                                format!("${}", length)
-                            } else {
-                                length.to_string()
-                            };
+                            let offset_expr =
+                                if offset.chars().all(|c| c.is_alphanumeric() || c == '_')
+                                    && !offset.chars().next().map_or(true, |c| c.is_ascii_digit())
+                                {
+                                    format!("${}", offset)
+                                } else {
+                                    offset.to_string()
+                                };
+                            let length_expr =
+                                if length.chars().all(|c| c.is_alphanumeric() || c == '_')
+                                    && !length.chars().next().map_or(true, |c| c.is_ascii_digit())
+                                {
+                                    format!("${}", length)
+                                } else {
+                                    length.to_string()
+                                };
                             format!("substr({}, {}, {})", ref_str, offset_expr, length_expr)
                         } else {
                             let offset = rest.trim();
-                            let offset_expr = if offset.chars().all(|c| c.is_alphanumeric() || c == '_') && !offset.chars().next().map_or(true, |c| c.is_ascii_digit()) {
-                                format!("${}", offset)
-                            } else {
-                                offset.to_string()
-                            };
+                            let offset_expr =
+                                if offset.chars().all(|c| c.is_alphanumeric() || c == '_')
+                                    && !offset.chars().next().map_or(true, |c| c.is_ascii_digit())
+                                {
+                                    format!("${}", offset)
+                                } else {
+                                    offset.to_string()
+                                };
                             format!("substr({}, {})", ref_str, offset_expr)
                         }
                     } else {
@@ -688,11 +727,12 @@ impl Generator {
             // Use {} for hash access when the array is known to be associative,
             // or when the key is a quoted string.
             // Use [] for numeric literal keys (indexed array access).
-            let sigil = if self.associative_arrays.contains(&array_name) || key_expr.starts_with('"') {
-                '{'
-            } else {
-                '['
-            };
+            let sigil =
+                if self.associative_arrays.contains(&array_name) || key_expr.starts_with('"') {
+                    '{'
+                } else {
+                    '['
+                };
             let close = if sigil == '{' { '}' } else { ']' };
 
             output.push_str(&self.indent());
@@ -756,7 +796,11 @@ impl Generator {
                         // declarations that bloated the output and created dead variables.
                         // Perl::Critic's ProhibitImplicitNames is satisfied by `my @arr;` alone.
                         output.push_str(&self.indent());
-                        output.push_str(&format!("my @{} = ({});\n", name, elements_perl.join(", ")));
+                        output.push_str(&format!(
+                            "my @{} = ({});\n",
+                            name,
+                            elements_perl.join(", ")
+                        ));
                         self.declared_locals.insert(name.clone());
                         self.indexed_arrays.insert(name.clone());
                     } else {
@@ -782,7 +826,8 @@ impl Generator {
                 _ => {
                     // Other operators on arrays don't make sense in bash; fall through to scalar.
                     output.push_str(&self.indent());
-                    output.push_str(&format!("${} {} {};\n",
+                    output.push_str(&format!(
+                        "${} {} {};\n",
                         name,
                         match assignment.operator {
                             AssignmentOperator::Assign => "=",
@@ -815,7 +860,34 @@ impl Generator {
                 for cap in re.captures_iter(&arith_expr.expression) {
                     let var_name = &cap[1];
                     // Skip Perl keywords and operators
-                    if matches!(var_name, "if" | "else" | "for" | "while" | "do" | "not" | "and" | "or" | "xor" | "sub" | "my" | "local" | "our" | "defined" | "undef" | "int" | "length" | "substr" | "keys" | "values" | "scalar" | "join" | "split" | "grep" | "map" | "sort") {
+                    if matches!(
+                        var_name,
+                        "if" | "else"
+                            | "for"
+                            | "while"
+                            | "do"
+                            | "not"
+                            | "and"
+                            | "or"
+                            | "xor"
+                            | "sub"
+                            | "my"
+                            | "local"
+                            | "our"
+                            | "defined"
+                            | "undef"
+                            | "int"
+                            | "length"
+                            | "substr"
+                            | "keys"
+                            | "values"
+                            | "scalar"
+                            | "join"
+                            | "split"
+                            | "grep"
+                            | "map"
+                            | "sort"
+                    ) {
                         continue;
                     }
                     if !self.declared_locals.contains(var_name)
@@ -850,7 +922,9 @@ impl Generator {
                 // might be uninitialized), we need a defined() guard to match bash semantics:
                 // bash expands $j first, and if it's empty the expression becomes a syntax error.
                 self.function_level_vars.contains(&assignment.variable)
-                    && arith_expr.expression.contains(&format!("${}", assignment.variable))
+                    && arith_expr
+                        .expression
+                        .contains(&format!("${}", assignment.variable))
             } else {
                 false
             };
@@ -913,7 +987,7 @@ impl Generator {
                         if no_comment.ends_with(';') {
                             // Check the character before the `;` — if it closes a block or paren,
                             // it's a statement terminator that should be stripped.
-                            let before = &no_comment[..no_comment.len()-1];
+                            let before = &no_comment[..no_comment.len() - 1];
                             if before.ends_with('}') || before.ends_with(')') {
                                 before.to_string()
                             } else {
@@ -928,7 +1002,10 @@ impl Generator {
                     // Such variables are NOT added to function_level_vars, so
                     // they use $ENV{var} in test expressions.  The assignment
                     // must use the same reference style for consistency.
-                    let is_env_style_var = assignment.variable.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+                    let is_env_style_var = assignment
+                        .variable
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c == '_')
                         && !self.declared_locals.contains(&assignment.variable)
                         && !self.function_level_vars.contains(&assignment.variable);
 
@@ -941,13 +1018,19 @@ impl Generator {
                         // copies the local value into %ENV.
                         self.declared_locals.insert(assignment.variable.clone());
                         if value_perl.starts_with('{') && value_perl.ends_with('}') {
-                            output.push_str(&format!("my ${} = do {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!(
+                                "my ${} = do {};\n",
+                                assignment.variable, value_perl
+                            ));
                             output.push_str(&format!(
                                 "$ENV{{{}}} = ${} if exists $ENV{{{}}};\n",
                                 assignment.variable, assignment.variable, assignment.variable
                             ));
                         } else {
-                            output.push_str(&format!("my ${} = {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!(
+                                "my ${} = {};\n",
+                                assignment.variable, value_perl
+                            ));
                             output.push_str(&format!(
                                 "$ENV{{{}}} = ${} if exists $ENV{{{}}};\n",
                                 assignment.variable, assignment.variable, assignment.variable
@@ -957,17 +1040,27 @@ impl Generator {
                         // Variable was not yet declared — combine declaration + assignment
                         // into `my $var = value;` instead of separate lines.
                         if value_perl.starts_with('{') && value_perl.ends_with('}') {
-                            output.push_str(&format!("my ${} = do {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!(
+                                "my ${} = do {};\n",
+                                assignment.variable, value_perl
+                            ));
                         } else {
-                            output.push_str(&format!("my ${} = {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!(
+                                "my ${} = {};\n",
+                                assignment.variable, value_perl
+                            ));
                         }
                         self.declared_locals.insert(assignment.variable.clone());
                     } else {
                         // Variable already declared, just assign
                         if value_perl.starts_with('{') && value_perl.ends_with('}') {
-                            output.push_str(&format!("${} = do {};\n", assignment.variable, value_perl));
+                            output.push_str(&format!(
+                                "${} = do {};\n",
+                                assignment.variable, value_perl
+                            ));
                         } else {
-                            output.push_str(&format!("${} = {};\n", assignment.variable, value_perl));
+                            output
+                                .push_str(&format!("${} = {};\n", assignment.variable, value_perl));
                         }
                     }
                 }
@@ -977,9 +1070,7 @@ impl Generator {
                     {
                         output.push_str(&self.indent());
                         output.push_str(&format!("my ${};", assignment.variable));
-                        output.push_str(
-                            "\n",
-                        );
+                        output.push_str("\n");
                         self.declared_locals.insert(assignment.variable.clone());
                     }
                     // For ArraySlice values like `${primes[@]:0:1}`, the old env-var
@@ -992,11 +1083,7 @@ impl Generator {
                         ));
                     } else {
                         let value_perl = words::word_to_perl_impl(self, &assignment.value);
-                        output.push_str(&format!(
-                            "${} = {};\n",
-                            assignment.variable,
-                            value_perl
-                        ));
+                        output.push_str(&format!("${} = {};\n", assignment.variable, value_perl));
                     }
                 }
                 AssignmentOperator::MinusAssign => {
@@ -1257,7 +1344,9 @@ impl Generator {
                                 if assign.variable == *var {
                                     if let Word::Arithmetic(arith_expr, _) = &assign.value {
                                         return arith_expr.expression.contains(var)
-                                            || arith_expr.expression.contains(&format!("${}", var));
+                                            || arith_expr
+                                                .expression
+                                                .contains(&format!("${}", var));
                                     }
                                 }
                             }
@@ -1279,14 +1368,19 @@ impl Generator {
                     for cmd in &pipeline.commands {
                         match cmd {
                             Command::While(while_loop) => {
-                                let assigned = self.collect_assigned_vars_in_block(&while_loop.body);
+                                let assigned =
+                                    self.collect_assigned_vars_in_block(&while_loop.body);
                                 for var in &assigned {
                                     let is_self_ref = while_loop.body.commands.iter().any(|cmd| {
                                         if let Command::Assignment(assign) = cmd {
                                             if assign.variable == *var {
-                                                if let Word::Arithmetic(arith_expr, _) = &assign.value {
+                                                if let Word::Arithmetic(arith_expr, _) =
+                                                    &assign.value
+                                                {
                                                     return arith_expr.expression.contains(var)
-                                                        || arith_expr.expression.contains(&format!("${}", var));
+                                                        || arith_expr
+                                                            .expression
+                                                            .contains(&format!("${}", var));
                                                 }
                                             }
                                         }
@@ -1577,14 +1671,31 @@ impl Generator {
                                     // Strip bash operators like :-default, -default, #pattern, etc.
                                     // Include -, +, ?, = (single-char operators without colon) that
                                     // may remain in the variable name from ${var-default} patterns.
-                                    let base_name = var_name.split(|c: char| c == ':' || c == '#' || c == '%' || c == '/' || c == '!' || c == '^' || c == ',' || c == '-' || c == '+' || c == '?' || c == '=')
+                                    let base_name = var_name
+                                        .split(|c: char| {
+                                            c == ':'
+                                                || c == '#'
+                                                || c == '%'
+                                                || c == '/'
+                                                || c == '!'
+                                                || c == '^'
+                                                || c == ','
+                                                || c == '-'
+                                                || c == '+'
+                                                || c == '?'
+                                                || c == '='
+                                        })
                                         .next()
                                         .unwrap_or(var_name)
                                         .to_string();
                                     // Strip leading ! or # (for indirection or length)
-                                    let clean_name = base_name.trim_start_matches('!').trim_start_matches('#').to_string();
+                                    let clean_name = base_name
+                                        .trim_start_matches('!')
+                                        .trim_start_matches('#')
+                                        .to_string();
                                     // Strip array indices like [i], [@], [*]
-                                    let clean_name = if let Some(bracket_pos) = clean_name.find('[') {
+                                    let clean_name = if let Some(bracket_pos) = clean_name.find('[')
+                                    {
                                         clean_name[..bracket_pos].to_string()
                                     } else {
                                         clean_name
@@ -1594,7 +1705,9 @@ impl Generator {
                                     // instead of a locally-declared `my $var;`.
                                     if !clean_name.is_empty()
                                         && clean_name.as_bytes()[0].is_ascii_alphabetic()
-                                        && !clean_name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+                                        && !clean_name
+                                            .chars()
+                                            .all(|c| c.is_ascii_uppercase() || c == '_')
                                     {
                                         test_self.function_level_vars.insert(clean_name);
                                     }
@@ -1605,7 +1718,9 @@ impl Generator {
                                 // $identifier variable
                                 let start = i + 1;
                                 let mut end = start;
-                                while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                                while end < chars.len()
+                                    && (chars[end].is_alphanumeric() || chars[end] == '_')
+                                {
                                     end += 1;
                                 }
                                 let var_name: String = chars[start..end].iter().collect();
@@ -1717,20 +1832,25 @@ impl Generator {
                     || simple.args.iter().any(|a| self.word_has_cmdsub(a))
             }
             Command::Pipeline(p) => p.commands.iter().any(|c| self.cmd_has_cmdsub(c)),
-            Command::And(l, r) | Command::Or(l, r) => self.cmd_has_cmdsub(l) || self.cmd_has_cmdsub(r),
+            Command::And(l, r) | Command::Or(l, r) => {
+                self.cmd_has_cmdsub(l) || self.cmd_has_cmdsub(r)
+            }
             Command::If(stmt) => {
                 self.cmd_has_cmdsub(&stmt.condition)
                     || self.cmd_has_cmdsub(&stmt.then_branch)
-                    || stmt.else_branch.as_ref().map_or(false, |e| self.cmd_has_cmdsub(e))
+                    || stmt
+                        .else_branch
+                        .as_ref()
+                        .map_or(false, |e| self.cmd_has_cmdsub(e))
             }
             Command::While(loop_) => {
                 self.cmd_has_cmdsub(&loop_.condition)
                     || loop_.body.commands.iter().any(|c| self.cmd_has_cmdsub(c))
             }
-            Command::For(loop_) => {
-                loop_.body.commands.iter().any(|c| self.cmd_has_cmdsub(c))
+            Command::For(loop_) => loop_.body.commands.iter().any(|c| self.cmd_has_cmdsub(c)),
+            Command::Subshell(c) | Command::Background(c) | Command::Not(c) => {
+                self.cmd_has_cmdsub(c)
             }
-            Command::Subshell(c) | Command::Background(c) | Command::Not(c) => self.cmd_has_cmdsub(c),
             Command::Block(b) => b.commands.iter().any(|c| self.cmd_has_cmdsub(c)),
             Command::Function(f) => f.body.commands.iter().any(|c| self.cmd_has_cmdsub(c)),
             Command::Redirect(rc) => self.cmd_has_cmdsub(&rc.command),
@@ -1741,9 +1861,10 @@ impl Generator {
     fn word_has_cmdsub(&self, word: &Word) -> bool {
         match word {
             Word::CommandSubstitution(_, _) => true,
-            Word::StringInterpolation(interp, _) => {
-                interp.parts.iter().any(|part| matches!(part, StringPart::CommandSubstitution(_)))
-            }
+            Word::StringInterpolation(interp, _) => interp
+                .parts
+                .iter()
+                .any(|part| matches!(part, StringPart::CommandSubstitution(_))),
             Word::Arithmetic(arith, _) => {
                 let content = &arith.expression;
                 content.contains("$(") || content.contains("`")
@@ -2180,12 +2301,8 @@ impl Generator {
                 }
                 false
             }
-            Command::For(for_cmd) => {
-                self.command_needs_command_sub(&for_cmd.body)
-            }
-            Command::While(while_cmd) => {
-                self.command_needs_command_sub(&while_cmd.body)
-            }
+            Command::For(for_cmd) => self.command_needs_command_sub(&for_cmd.body),
+            Command::While(while_cmd) => self.command_needs_command_sub(&while_cmd.body),
             Command::Function(func) => {
                 for c in &func.body.commands {
                     if self.command_needs_ipc_open3(c) {
@@ -2622,31 +2739,37 @@ impl Generator {
                 }
             }
             Command::Pipeline(p) => p.commands.iter().any(|c| self.command_uses_ls(c)),
-            Command::And(l, r) | Command::Or(l, r) => self.command_uses_ls(l) || self.command_uses_ls(r),
+            Command::And(l, r) | Command::Or(l, r) => {
+                self.command_uses_ls(l) || self.command_uses_ls(r)
+            }
             Command::If(stmt) => {
                 self.command_uses_ls(&stmt.condition)
                     || self.command_uses_ls(&stmt.then_branch)
-                    || stmt.else_branch.as_ref().map_or(false, |e| self.command_uses_ls(e))
+                    || stmt
+                        .else_branch
+                        .as_ref()
+                        .map_or(false, |e| self.command_uses_ls(e))
             }
             Command::While(loop_) => {
                 self.command_uses_ls(&loop_.condition)
                     || loop_.body.commands.iter().any(|c| self.command_uses_ls(c))
             }
-            Command::Case(case_stmt) => {
-                case_stmt.cases.iter().any(|clause| {
-                    clause.body.iter().any(|c| self.command_uses_ls(c))
-                })
-            }
+            Command::Case(case_stmt) => case_stmt
+                .cases
+                .iter()
+                .any(|clause| clause.body.iter().any(|c| self.command_uses_ls(c))),
             Command::For(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_ls(c)),
             Command::Subshell(c) | Command::Background(c) => self.command_uses_ls(c),
             Command::Block(b) => b.commands.iter().any(|c| self.command_uses_ls(c)),
             Command::Function(f) => f.body.commands.iter().any(|c| self.command_uses_ls(c)),
             Command::Redirect(rc) => self.command_uses_ls(&rc.command),
             Command::Not(c) => self.command_uses_ls(c),
-            Command::Assignment(assign) => self.word_has_cmdsub(&assign.value) || {
-                // Check if the value contains an ls-like operation
-                false
-            },
+            Command::Assignment(assign) => {
+                self.word_has_cmdsub(&assign.value) || {
+                    // Check if the value contains an ls-like operation
+                    false
+                }
+            }
             _ => false,
         }
     }
@@ -2862,28 +2985,69 @@ impl Generator {
             Command::Simple(cmd) => {
                 if let Word::Literal(name, _) = &cmd.name {
                     // All commands whose generators emit croak() calls need `use Carp`.
-                    matches!(name.as_str(),
-                        "open3" | "exec" | "system" | "eval" | "tee"
-                        | "cat" | "cp" | "mv" | "rm" | "mkdir" | "touch"
-                        | "grep" | "head" | "tail" | "cut"
-                        | "wc" | "sort" | "uniq" | "diff" | "sed"
-                        | "awk" | "strings" | "xargs" | "comm"
-                        | "paste" | "tr" | "find" | "ls" | "perl"
-                        | "sha256sum" | "sha512sum"
-                        | "wget" | "curl" | "nohup" | "zcat"
+                    matches!(
+                        name.as_str(),
+                        "open3"
+                            | "exec"
+                            | "system"
+                            | "eval"
+                            | "tee"
+                            | "cat"
+                            | "cp"
+                            | "mv"
+                            | "rm"
+                            | "mkdir"
+                            | "touch"
+                            | "grep"
+                            | "head"
+                            | "tail"
+                            | "cut"
+                            | "wc"
+                            | "sort"
+                            | "uniq"
+                            | "diff"
+                            | "sed"
+                            | "awk"
+                            | "strings"
+                            | "xargs"
+                            | "comm"
+                            | "paste"
+                            | "tr"
+                            | "find"
+                            | "ls"
+                            | "perl"
+                            | "sha256sum"
+                            | "sha512sum"
+                            | "wget"
+                            | "curl"
+                            | "nohup"
+                            | "zcat"
                     )
                 } else {
                     false
                 }
             }
             Command::Pipeline(p) => p.commands.iter().any(|c| self.command_uses_croak(c)),
-            Command::And(l, r) | Command::Or(l, r) => self.command_uses_croak(l) || self.command_uses_croak(r),
+            Command::And(l, r) | Command::Or(l, r) => {
+                self.command_uses_croak(l) || self.command_uses_croak(r)
+            }
             Command::If(stmt) => {
                 self.command_uses_croak(&stmt.then_branch)
-                    || stmt.else_branch.as_ref().map_or(false, |e| self.command_uses_croak(e))
+                    || stmt
+                        .else_branch
+                        .as_ref()
+                        .map_or(false, |e| self.command_uses_croak(e))
             }
-            Command::While(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_croak(c)),
-            Command::For(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_croak(c)),
+            Command::While(loop_) => loop_
+                .body
+                .commands
+                .iter()
+                .any(|c| self.command_uses_croak(c)),
+            Command::For(loop_) => loop_
+                .body
+                .commands
+                .iter()
+                .any(|c| self.command_uses_croak(c)),
             Command::Subshell(c) | Command::Background(c) => self.command_uses_croak(c),
             Command::Block(b) => b.commands.iter().any(|c| self.command_uses_croak(c)),
             Command::Function(f) => f.body.commands.iter().any(|c| self.command_uses_croak(c)),
@@ -2901,12 +3065,10 @@ impl Generator {
     fn word_uses_croak(&self, word: &Word) -> bool {
         match word {
             Word::CommandSubstitution(cmd, _) => self.command_uses_croak(cmd),
-            Word::StringInterpolation(interp, _) => {
-                interp.parts.iter().any(|part| match part {
-                    StringPart::CommandSubstitution(cmd) => self.command_uses_croak(cmd),
-                    _ => false,
-                })
-            }
+            Word::StringInterpolation(interp, _) => interp.parts.iter().any(|part| match part {
+                StringPart::CommandSubstitution(cmd) => self.command_uses_croak(cmd),
+                _ => false,
+            }),
             _ => false,
         }
     }
@@ -2930,18 +3092,19 @@ impl Generator {
                                 // Check redirects - if only heredoc redirects,
                                 // no English needed.
                                 let has_file_redirect = cmd.redirects.iter().any(|r| {
-                                    !matches!(r.operator,
-                                        RedirectOperator::Heredoc | RedirectOperator::HeredocTabs)
+                                    !matches!(
+                                        r.operator,
+                                        RedirectOperator::Heredoc | RedirectOperator::HeredocTabs
+                                    )
                                 });
                                 has_file_redirect || !cmd.redirects.is_empty()
                             } else {
                                 true // Has file arguments - may need $OS_ERROR
                             }
                         }
-                        "grep" | "head" | "tail" | "cut" | "tee"
-                            | "wc" | "sort" | "uniq" | "diff" | "sed"
-                            | "awk" | "strings" | "xargs" | "comm"
-                            | "paste" | "tr" | "find" | "ls" | "perl" => true,
+                        "grep" | "head" | "tail" | "cut" | "tee" | "wc" | "sort" | "uniq"
+                        | "diff" | "sed" | "awk" | "strings" | "xargs" | "comm" | "paste"
+                        | "tr" | "find" | "ls" | "perl" => true,
                         _ => false,
                     }
                 } else {
@@ -2949,21 +3112,32 @@ impl Generator {
                 }
             }
             Command::Pipeline(p) => p.commands.iter().any(|c| self.command_uses_english(c)),
-            Command::And(l, r) | Command::Or(l, r) => self.command_uses_english(l) || self.command_uses_english(r),
+            Command::And(l, r) | Command::Or(l, r) => {
+                self.command_uses_english(l) || self.command_uses_english(r)
+            }
             Command::If(stmt) => {
                 self.command_uses_english(&stmt.then_branch)
-                    || stmt.else_branch.as_ref().map_or(false, |e| self.command_uses_english(e))
+                    || stmt
+                        .else_branch
+                        .as_ref()
+                        .map_or(false, |e| self.command_uses_english(e))
             }
-            Command::While(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_english(c)),
-            Command::For(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_english(c)),
+            Command::While(loop_) => loop_
+                .body
+                .commands
+                .iter()
+                .any(|c| self.command_uses_english(c)),
+            Command::For(loop_) => loop_
+                .body
+                .commands
+                .iter()
+                .any(|c| self.command_uses_english(c)),
             Command::Subshell(c) | Command::Background(c) => self.command_uses_english(c),
             Command::Block(b) => b.commands.iter().any(|c| self.command_uses_english(c)),
             Command::Function(f) => f.body.commands.iter().any(|c| self.command_uses_english(c)),
             Command::Redirect(rc) => self.command_uses_english(&rc.command),
             Command::Not(c) => self.command_uses_english(c),
-            Command::Assignment(assign) => {
-                self.word_uses_croak(&assign.value)
-            }
+            Command::Assignment(assign) => self.word_uses_croak(&assign.value),
             _ => false,
         }
     }
@@ -2980,13 +3154,26 @@ impl Generator {
                 }
             }
             Command::Pipeline(p) => p.commands.iter().any(|c| self.command_uses_locale(c)),
-            Command::And(l, r) | Command::Or(l, r) => self.command_uses_locale(l) || self.command_uses_locale(r),
+            Command::And(l, r) | Command::Or(l, r) => {
+                self.command_uses_locale(l) || self.command_uses_locale(r)
+            }
             Command::If(stmt) => {
                 self.command_uses_locale(&stmt.then_branch)
-                    || stmt.else_branch.as_ref().map_or(false, |e| self.command_uses_locale(e))
+                    || stmt
+                        .else_branch
+                        .as_ref()
+                        .map_or(false, |e| self.command_uses_locale(e))
             }
-            Command::While(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_locale(c)),
-            Command::For(loop_) => loop_.body.commands.iter().any(|c| self.command_uses_locale(c)),
+            Command::While(loop_) => loop_
+                .body
+                .commands
+                .iter()
+                .any(|c| self.command_uses_locale(c)),
+            Command::For(loop_) => loop_
+                .body
+                .commands
+                .iter()
+                .any(|c| self.command_uses_locale(c)),
             Command::Subshell(c) | Command::Background(c) => self.command_uses_locale(c),
             Command::Block(b) => b.commands.iter().any(|c| self.command_uses_locale(c)),
             Command::Function(f) => f.body.commands.iter().any(|c| self.command_uses_locale(c)),

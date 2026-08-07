@@ -481,7 +481,9 @@ pub fn generate_ls_command(
     if pipeline_context {
         // Native Perl ls -l using opendir/readdir/stat.
         if _long_format {
-            let files_list: Vec<String> = cmd.args.iter()
+            let files_list: Vec<String> = cmd
+                .args
+                .iter()
                 .filter_map(|a| a.as_literal())
                 .map(|s| generator.perl_string_literal(&Word::literal(s.to_string())))
                 .collect();
@@ -541,9 +543,8 @@ pub fn generate_ls_command(
                 generator.indent_level += 1;
                 if !show_hidden {
                     output.push_str(&generator.indent());
-                    output.push_str(
-                        "next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/;\n",
-                    );
+                    output
+                        .push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/;\n");
                 }
                 if add_slash_to_dirs {
                     output.push_str(&generator.indent());
@@ -820,7 +821,9 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     // If -l (long format) is requested, fall back to shell qx{ls ...} call
     // Native Perl ls -l using opendir/readdir/stat.
     if _long_format {
-        let files_list: Vec<String> = cmd.args.iter()
+        let files_list: Vec<String> = cmd
+            .args
+            .iter()
             .filter_map(|a| a.as_literal())
             .map(|s| generator.perl_string_literal(&Word::literal(s.to_string())))
             .collect();
@@ -846,7 +849,6 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     let all_found_var = format!("ls_all_found_{}", generator.get_unique_id());
 
     if !file_args.is_empty() {
-
         output.push_str(&generate_ls_sections_helper(
             generator,
             &file_args,
