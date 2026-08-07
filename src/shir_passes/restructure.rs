@@ -417,10 +417,18 @@ fn handle_nested(stmts: &mut Vec<IrStmt>, hit: Hit, n: &mut usize) -> bool {
     let final_list = descend_mut(stmts, &hit.path);
     final_list[hit.goto_index] = assign_stmt(&flag, st("1"));
     final_list.insert(hit.goto_index + 1, break_stmt());
-    // 2. guard every outer loop body (skip the innermost — its break is
-    //    already in place)
+    // 2. guard every outer LOOP body (skip the innermost — its break is
+    //    already in place). The parent at each `step` may be a Block
+    //    (e.g. the c-sh-go wraps each for-lowered-to-while in a Block)
+    //    rather than a loop; guarding that body emits an unguarded
+    //    `if (flag) break` that escapes the program (no enclosing
+    //    loop catches the throw). Only real loops (While/For/DoWhile)
+    //    may carry the guard.
     for (k, step) in hit.loop_steps.iter().enumerate() {
         if k == hit.loop_steps.len() - 1 {
+            continue;
+        }
+        if !is_loop_stmt_at(stmts, &hit.path, *step) {
             continue;
         }
         let body = descend_loop_body_mut(stmts, &hit.path, *step);
@@ -434,6 +442,47 @@ fn handle_nested(stmts: &mut Vec<IrStmt>, hit: Hit, n: &mut usize) -> bool {
     // 3. remove the (now fall-through) label
     stmts.remove(hit.lpos);
     true
+}
+
+/// True when the stmt at the given path step is a real loop (the only
+/// stmt kind whose `body` is a loop body). A `Block` at the same
+/// position would also be a `Body` step (Block's body is its child list)
+/// but is NOT a loop — appending `if (flag) break` there escapes the
+/// program. Used by `handle_nested` to skip non-loop steps.
+fn is_loop_stmt_at(stmts: &Vec<IrStmt>, path: &[(usize, Branch)], step: usize) -> bool {
+    let mut list = stmts;
+    for (k, (idx, _br)) in path.iter().enumerate() {
+        let s = &list[*idx];
+        if k == step {
+            return matches!(
+                s,
+                IrStmt::While { .. } | IrStmt::For { .. } | IrStmt::DoWhile { .. }
+            );
+        }
+        list = match s {
+            IrStmt::If { then, .. } => then,
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::Redirect { inner: body, .. }
+            | IrStmt::Function { body, .. } => body,
+            IrStmt::Case { clauses, .. } => {
+                // path's body step into a Case is the union of clause
+                // bodies — but for our purposes, an `if (flag) break`
+                // at the case level is still inside the loop (the
+                // whileLoop catches it). A pure-Case step (no loop
+                // above) would still be wrong, so we conservatively
+                // say false for case steps.
+                return false;
+            }
+            IrStmt::Pipeline { stages, .. } => return false,
+            _ => return false,
+        };
+    }
+    false
 }
 
 /// Re-descend to the statement list at the end of `path`.
@@ -653,6 +702,51 @@ mod tests {
         assert!(!json.contains("\"Label\""), "label survived: {json}");
         assert!(json.contains("__gout"), "no flag var: {json}");
         assert!(json.contains("\"break\""), "no break: {json}");
+    }
+
+    /// t30-bug: nested goto where the loop bodies are wrapped in
+    /// Blocks (the c-sh-go lowers `for (i; c; u) { ... }` to `init;
+    /// while (c) { <Block { body; u }> }`). The pre-fix code added
+    /// `if (flag) break` to the Block's body (a non-loop), so the
+    /// throw escaped every enclosing whileLoopSync and aborted the
+    /// program. The fix: only guard actual loop bodies.
+    #[test]
+    fn nested_goto_through_block_wrapper_does_not_escape() {
+        // Shape: outer Block { outer while { inner Block { inner while {
+        //   if (cond) goto out; printf; j++ } ; i++ } } }
+        // Two real loops; the c-sh-go wraps each for-lowered-to-while
+        // body in a Block. The pre-fix code would have emitted
+        // `if (flag) break` at the outer Block level (after the
+        // outer while) — a break that escapes everything and aborts.
+        let inner_body = vec![
+            if_cond(vec![goto("out")]),
+            output("inner"),
+            assign_stmt("j", IrExpr::BinOp {
+                lhs: Box::new(var("j")), op: BinOpKind::Add, rhs: Box::new(IrExpr::Int(1)),
+            }),
+        ];
+        let inner_while = while_loop(truthy(), inner_body);
+        let inner_block_body = vec![
+            inner_while,
+            assign_stmt("i", IrExpr::BinOp {
+                lhs: Box::new(var("i")), op: BinOpKind::Add, rhs: Box::new(IrExpr::Int(1)),
+            }),
+        ];
+        let inner_block = IrStmt::Block(inner_block_body);
+        let outer_while = while_loop(truthy(), vec![inner_block]);
+        let outer_block_body = vec![outer_while];
+        let outer_block = IrStmt::Block(outer_block_body);
+        let out = run(vec![outer_block, label("out"), output("done")]);
+        let json = shir_to_shir_json_raw(&program(out.clone()));
+        assert!(!json.contains("\"Goto\""), "goto survived: {json}");
+        assert!(!json.contains("\"Label\""), "label survived: {json}");
+        // The inner goto becomes `flag=1; break` (one break). The
+        // outer (the only LOOP step) gets `if (flag) break` at the
+        // end of its body (a second break). The Block wrappers must
+        // receive NO guard — the pre-fix code added one to the outer
+        // Block, which would escape the program.
+        let n_breaks = json.matches("\"break\"").count();
+        assert_eq!(n_breaks, 2, "expected 2 break sites (goto+guard), got {n_breaks} in {json}");
     }
 
     /// A pass over an empty list must not panic.
