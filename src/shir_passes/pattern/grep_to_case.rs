@@ -206,28 +206,27 @@ fn extract_test_grep(producer: &[IrStmt], grepper: &[IrStmt]) -> Option<(IrExpr,
     if producer.is_empty() {
         return None; // single-stage grep (stdin) — refuse
     }
-    // Producer args (`echo <one-arg>` / `printf '%s' <value>`) and the
-    // grep's own args (the `[flags, pattern]` array).
-    let (cmd, producer_args, grep_args) = match (&producer[0], &grepper[0]) {
+    // The producer/grepper calls are `exec("echo", [...])` /
+    // `exec("grep", [...])` — the command NAME is args[0] of each call,
+    // the payload is the Array at args[1].
+    let (producer_payload, grep_args) = match (&producer[0], &grepper[0]) {
         (
-            IrStmt::Expr(IrExpr::Call { func, args: pa }),
+            IrStmt::Expr(IrExpr::Call { func: _, args: pa }),
             IrStmt::Expr(IrExpr::Call { func: gf, args: ga }),
         ) => {
             if *gf != "exec" { return None; }
-            (func.as_str(), pa.as_slice(), ga.as_slice())
+            (pa.as_slice(), ga.as_slice())
         }
         _ => return None,
     };
     // Producer: `echo <one-arg>` or `printf '%s\n' <one-arg>`. The
     // discriminant is the value (a Var for the common `echo "$x"` shape).
-    let disc_expr: IrExpr = match cmd {
-        "echo" => {
-            let [_e, IrExpr::Array(els)] = producer_args else { return None };
+    let disc_expr: IrExpr = match producer_payload {
+        [IrExpr::Str(cmd, _), IrExpr::Array(els)] if cmd == "echo" => {
             if els.len() != 1 { return None; }
             els[0].clone()
         }
-        "printf" => {
-            let [_p, IrExpr::Array(els)] = producer_args else { return None };
+        [IrExpr::Str(cmd, _), IrExpr::Array(els)] if cmd == "printf" => {
             if els.len() != 2 { return None; };
             let fmt = interp_literal(&els[0])?;
             if !fmt_is_plain_percent_s(&fmt) { return None; }
@@ -235,9 +234,21 @@ fn extract_test_grep(producer: &[IrStmt], grepper: &[IrStmt]) -> Option<(IrExpr,
         }
         _ => return None,
     };
-    if !matches!(&disc_expr, IrExpr::Var(_, _)) {
-        return None;
-    }
+    // The discriminant must be a Var or a getVar(name) call (the
+    // standard `echo "$x"` shape — the parser lowers `$x` to a
+    // getVar call). The strong form needs a bare `$x` in the case
+    // discriminant.
+    let disc_var = match &disc_expr {
+        IrExpr::Var(name, _) => name.clone(),
+        IrExpr::Call { func, args } if *func == "getVar" => {
+            if let [IrExpr::Str(name, _)] = args.as_slice() {
+                name.clone()
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
     // Consumer: `exec("grep", [..., pattern])`. The grep's positional
     // args arrive as an Array: either [pattern] (no flags) or
     // [flags, pattern]. Extract the pattern (always the LAST element)
@@ -257,6 +268,7 @@ fn extract_test_grep(producer: &[IrStmt], grepper: &[IrStmt]) -> Option<(IrExpr,
     if pattern_text.chars().any(|c| REGEX_METACHARS.contains(&c) || ANCHORS.contains(&c)) {
         return None;
     }
+    let disc_expr = IrExpr::Var(disc_var, None);
     Some((disc_expr, pattern_text, case_insensitive))
 }
 
@@ -406,26 +418,28 @@ mod tests {
     fn if_cond_grep_lifts_to_case() {
         // `if echo "$x" | grep PAT; then A; else B; fi` →
         //   `case "$x" in *PAT*) A ;; *) B ;; esac`
-        let json = lower("if echo \"$x\" | grep PAT; then A; else B; fi");
+        let json = lower_pipelined("if echo \"$x\" | grep PAT; then A; else B; fi");
         assert!(json.contains("\"type\":\"Case\""), "expected Case: {json}");
-        assert!(json.contains("\"discriminant\":{\"style\":\"DoubleQuoted\",\"type\":\"Str\",\"value\":\"x\"}"));
-        assert!(json.contains("\"value\":\"*PAT*\""));
+        // the discriminant is the VARIABLE (the value, not the literal
+        // text) — the renderers emit `case $x in` / sh2.caseMatch(x, …)
+        assert!(json.contains("\"discriminant\":{\"name\":\"x\",\"sigil\":null,\"type\":\"Var\"}"));
+        assert!(json.contains("\"patterns\":[\"*PAT*\"]"));
     }
 
     #[test]
     fn and_or_chain_lifts_to_case() {
         // `echo "$x" | grep PAT && A || B` →
         //   `case "$x" in *PAT*) A ;; *) B ;; esac`
-        let json = lower("echo \"$x\" | grep PAT && A || B");
+        let json = lower_pipelined("echo \"$x\" | grep PAT && A || B");
         assert!(json.contains("\"type\":\"Case\""), "expected Case: {json}");
-        assert!(json.contains("\"value\":\"*PAT*\""));
+        assert!(json.contains("\"patterns\":[\"*PAT*\"]"));
     }
 
     #[test]
     fn bare_grep_lifts_to_case() {
         // `echo "$x" | grep PAT` as a bare expression statement →
         //   `case "$x" in *PAT*) ;; *) ;; esac` (no arms)
-        let json = lower("echo \"$x\" | grep PAT");
+        let json = lower_pipelined("echo \"$x\" | grep PAT");
         assert!(json.contains("\"type\":\"Case\""), "expected Case: {json}");
     }
 
@@ -434,7 +448,7 @@ mod tests {
         // `.` in the pattern would silently change grep's answer
         // (grep 'a.b' matches aXb; case 'a.b' matches the literal
         // a.b). The lift refuses; the IR keeps the exec shape.
-        let json = lower("if echo \"$x\" | grep 'a.b'; then A; else B; fi");
+        let json = lower_pipelined("if echo \"$x\" | grep 'a.b'; then A; else B; fi");
         // the lift refuses → no Case in the output
         assert!(!json.contains("\"type\":\"Case\""), "regex . must refuse: {json}");
     }
@@ -442,14 +456,14 @@ mod tests {
     #[test]
     fn unsupported_flag_refuses_the_lift() {
         // `-c` has no case analog — refuse
-        let json = lower("if echo \"$x\" | grep -c PAT; then A; else B; fi");
+        let json = lower_pipelined("if echo \"$x\" | grep -c PAT; then A; else B; fi");
         assert!(!json.contains("\"type\":\"Case\""), "-c must refuse: {json}");
     }
 
     #[test]
     fn regex_flag_refuses_the_lift() {
         // `-E` is a regex flag — the strong form refuses regex entirely
-        let json = lower("if echo \"$x\" | grep -E 'a.b'; then A; else B; fi");
+        let json = lower_pipelined("if echo \"$x\" | grep -E 'a.b'; then A; else B; fi");
         assert!(!json.contains("\"type\":\"Case\""), "-E must refuse: {json}");
     }
 
@@ -457,7 +471,7 @@ mod tests {
     fn case_insensitive_lowercases_sides() {
         // `-i` → both sides lowercased via tr; the discriminant is a
         // capture-of-tr, the pattern is the lowered literal `*pat*`.
-        let json = lower("if echo \"$x\" | grep -i PAT; then A; else B; fi");
+        let json = lower_pipelined("if echo \"$x\" | grep -i PAT; then A; else B; fi");
         assert!(json.contains("\"type\":\"Case\""), "-i must lift: {json}");
         // the discriminant is the tr-capture, not a bare Var
         assert!(json.contains("\"tr\""), "lowercased discriminant: {json}");
@@ -470,14 +484,14 @@ mod tests {
         // `*` in the pattern is a glob wildcard; it passes through
         // (`case "$x" in *foo*bar*)` matches the same strings as
         // `grep '*foo*bar*'`). The lift accepts.
-        let json = lower("if echo \"$x\" | grep '*foo*bar*'; then A; else B; fi");
+        let json = lower_pipelined("if echo \"$x\" | grep '*foo*bar*'; then A; else B; fi");
         assert!(json.contains("\"type\":\"Case\""), "glob * must lift: {json}");
     }
 
     #[test]
     fn bracket_glob_passes_through() {
         // `[abc]` is a glob character class — passes through
-        let json = lower("if echo \"$x\" | grep '[abc]'; then A; else B; fi");
+        let json = lower_pipelined("if echo \"$x\" | grep '[abc]'; then A; else B; fi");
         assert!(json.contains("\"type\":\"Case\""), "[abc] must lift: {json}");
     }
 
@@ -486,7 +500,7 @@ mod tests {
         // `-F` (fixed string) is a no-op for the case form (the
         // pattern is already a literal); the lift accepts and the
         // case is emitted.
-        let json = lower("if echo \"$x\" | grep -F PAT; then A; else B; fi");
+        let json = lower_pipelined("if echo \"$x\" | grep -F PAT; then A; else B; fi");
         assert!(json.contains("\"type\":\"Case\""), "-F must lift: {json}");
     }
 
@@ -495,7 +509,7 @@ mod tests {
         // `echo hello | grep PAT` — the LHS is a literal, not a Var.
         // The strong form requires `Var("x")` so the case discriminant
         // is a bare `$x` (anything else needs a temp var — a follow-up).
-        let json = lower("if echo hello | grep PAT; then A; else B; fi");
+        let json = lower_pipelined("if echo hello | grep PAT; then A; else B; fi");
         assert!(!json.contains("\"type\":\"Case\""), "non-Var disc must refuse: {json}");
     }
 
@@ -505,7 +519,7 @@ mod tests {
         // (pipe to a non-test command) is NOT test-position — the
         // lift is a no-op (the contains.rs family handles the
         // `pipeline->sh2.contains` form separately, weaker).
-        let json = lower("echo \"$x\" | grep PAT | wc -l");
+        let json = lower_pipelined("echo \"$x\" | grep PAT | wc -l");
         assert!(!json.contains("\"type\":\"Case\""), "non-test pipe: {json}");
     }
 }

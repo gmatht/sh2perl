@@ -154,6 +154,10 @@ fn ir_stmt_writes_lastexit(stmt: &IrStmt) -> bool {
         IrStmt::Expr(IrExpr::Call { func, .. }) => {
             !matches!(func.as_str(), "setVar" | "setArray" | "shopt" | "define" | "break" | "continue" | "return")
         }
+        // `((i++))` — the arith_forms Assign(Arith(IncDec)) shape writes
+        // the `(( ))` status (the value's nonzeroness) in its lowering
+        IrStmt::Assign { expr, .. } => matches!(expr, IrExpr::Arith(a)
+            if matches!(&**a, ArithAst::IncDec { .. })),
         _ => false,
     }
 }
@@ -270,6 +274,15 @@ fn is_native_let_stmt(stmt: &IrStmt) -> bool {
             matches!(cmd, IrExpr::Str(n, _) if n == "let")
                 && matches!(args.as_slice(), [IrExpr::Str(n2, _), IrExpr::Array(_)] if n2 == "let")
         }
+        // `((i++))` — the arith_forms transform's Assign(Arith(IncDec))
+        // shape (mirror of the `let "i++"` exec): same status semantics,
+        // same deadness treatment (the hot loop's bare `++i`).
+        IrStmt::Assign { targets, expr } => {
+            matches!(expr, IrExpr::Arith(a)
+                if matches!(&**a, ArithAst::IncDec { var, .. }
+                    if targets.len() == 1 && targets[0].indices.is_empty()
+                        && &targets[0].var == var))
+        }
         _ => false,
     }
 }
@@ -351,17 +364,24 @@ fn is_native_echo_stmt(stmt: &IrStmt) -> bool {
 fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMap<usize, bool>) {
     for stmt in stmts {
         if is_native_let_stmt(stmt) && !live.contains(&(stmt as *const IrStmt as usize)) {
-            let args = match stmt {
-                IrStmt::Exec { args, .. } | IrStmt::Expr(IrExpr::Call { args, .. }) => args,
-                _ => unreachable!("is_native_let_stmt matched"),
-            };
-            if let [IrExpr::Str(_, _), IrExpr::Array(a)] = args.as_slice() {
-                if a.iter().all(|arg| match arg {
-                    IrExpr::Str(sv, _) => parse_arith_native(sv).is_some(),
-                    _ => false,
-                }) {
-                    dead.insert(stmt as *const IrStmt as usize, true);
+            // the arith_forms Assign(Arith(IncDec)) shape is always
+            // natively parseable (the transform only emits parsed ASTs)
+            let native = match stmt {
+                IrStmt::Exec { args, .. } | IrStmt::Expr(IrExpr::Call { args, .. }) => {
+                    let native = match args.as_slice() {
+                        [IrExpr::Str(_, _), IrExpr::Array(a)] => a.iter().all(|arg| match arg {
+                            IrExpr::Str(sv, _) => parse_arith_native(sv).is_some(),
+                            _ => false,
+                        }),
+                        _ => false,
+                    };
+                    native
                 }
+                IrStmt::Assign { .. } => true,
+                _ => false,
+            };
+            if native {
+                dead.insert(stmt as *const IrStmt as usize, true);
             }
         }
         // the native echo/printf `(sh2.lastExit = 0)` write is droppable
@@ -10124,6 +10144,67 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         }
         IrStmt::Assign { targets, expr } => {
             let target = &targets[0];
+            // `((i++))` / `((i--))` — the arith_forms transform rewrites
+            // the `let "i++"` exec as `Assign { targets: [i], expr:
+            // Arith(IncDec(i)) }` — the assignment IS the increment, so
+            // wrapping the inc/dec in `i = <incdec>` would clobber the
+            // side effect with the OLD value (`i = i++` never advances).
+            // Emit the inc/dec bare: its JS value is exactly bash's
+            // (postfix = old value, prefix = new value), and the `(( ))`
+            // status (value != 0) is recorded via the Plan 4 ternary —
+            // the pre-transform `let` path's exact emission — or dropped
+            // entirely when the lastExit write is provably dead (the
+            // hot-loop `++i`).
+            if let IrExpr::Arith(a) = expr {
+                if let ArithAst::IncDec { var, .. } = &**a {
+                    if var == &target.var && target.indices.is_empty() {
+                        let inner = arith_to_estree_wrapped(a);
+                        if lastexit_write_is_dead(stmt) {
+                            return Some(Stmt::ExpressionStatement {
+                                expression: inner,
+                            });
+                        }
+                        let nonzero = Expr::BinaryExpression {
+                            operator: "!==".to_string(),
+                            left: Box::new(inner.clone()),
+                            right: Box::new(Expr::Literal {
+                                value: serde_json::Value::from(0),
+                                raw: None,
+                                regex: None,
+                            }),
+                        };
+                        return Some(Stmt::ExpressionStatement {
+                            expression: Expr::ConditionalExpression {
+                                test: Box::new(nonzero),
+                                consequent: Box::new(seq(vec![
+                                    Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(sh2_member("lastExit")),
+                                        right: Box::new(Expr::Literal {
+                                            value: serde_json::Value::from(0),
+                                            raw: None,
+                                            regex: None,
+                                        }),
+                                    },
+                                    bool_lit(true),
+                                ])),
+                                alternate: Box::new(seq(vec![
+                                    Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(sh2_member("lastExit")),
+                                        right: Box::new(Expr::Literal {
+                                            value: serde_json::Value::from(1),
+                                            raw: None,
+                                            regex: None,
+                                        }),
+                                    },
+                                    bool_lit(false),
+                                ])),
+                            },
+                        });
+                    }
+                }
+            }
             if is_lifted(&target.var) && target.indices.is_empty() {
                 // native JS write — the analysis guarantees the source kind
                 let right = match expr {
@@ -14805,6 +14886,146 @@ fn try_native_echo_dead(args: &[IrExpr]) -> Option<Expr> {
 /// flag would print its text like any other word, but the corpus shapes
 /// are single-word; the no-arg `yes` → "y" form and dynamic args keep
 /// the spawn).
+/// `set -- LIT...` / `set a b` / `shift [N]` at statement level — the
+/// positional-store forms: the runtime builtins are one positional write
+/// + a status record (builtins.set/builtins.shift), so the dispatch +
+/// arg flattening + magic scan disappear. Mirrors the builtins exactly:
+/// `set -- a b` assigns the remaining args; `set a b` (no leading
+/// `-`/`+`) assigns ALL args; `set` alone prints the store (refused);
+/// flag forms (`set -e`, `set -o pipefail`) keep the runtime builtin.
+/// `shift` drops the first N positionals (bare = 1; the runtime
+/// `parseInt`s a literal count). Every arg must be scalar: no GLOB/PS/
+/// BADSUB magic markers (the runtime's flattener expands those) and no
+/// array-valued args (the flattener splices arrays — the native form
+/// cannot without shape proof).
+fn try_native_set_shift(name: &str, args: &[IrExpr]) -> Option<Expr> {
+    let [_, IrExpr::Array(items)] = args else {
+        return None;
+    };
+    let scalar = |e: &IrExpr| -> bool {
+        match e {
+            IrExpr::Str(sv, _) => !sv.contains('\u{1}'),
+            IrExpr::Interpolate(_) | IrExpr::Var(..) => true,
+            IrExpr::Call { func, args } if func == "getVar" && args.len() == 1 => true,
+            _ => false,
+        }
+    };
+    let status = || {
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        }
+    };
+    match name {
+        "set" => {
+            if items.is_empty() {
+                return None; // bare `set` prints the store
+            }
+            let (positional_args, ok) = match &items[0] {
+                IrExpr::Str(sv, _) if sv == "--" => (items[1..].to_vec(), true),
+                IrExpr::Str(sv, _) if !sv.starts_with('-') && !sv.starts_with('+') => {
+                    (items.clone(), true)
+                }
+                _ => (items.clone(), false), // flag forms stay on the builtin
+            };
+            if !ok || !positional_args.iter().all(scalar) {
+                return None;
+            }
+            let elems: Vec<Option<Expr>> = positional_args.iter().map(|e| Some(expr_to_estree(e))).collect();
+            Some(seq(vec![
+                Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(sh2_member("positional")),
+                    right: Box::new(Expr::ArrayExpression { elements: elems }),
+                },
+                status(),
+                bool_lit(true),
+            ]))
+        }
+        "shift" => {
+            let n: i64 = match items.as_slice() {
+                [] => Some(1),
+                [IrExpr::Str(sv, _)] => {
+                    // canonical decimal only — the runtime's
+                    // `parseInt("2x")`-style partial parses are not
+                    // reproducible natively (corpus shapes are bare /
+                    // literal counts)
+                    if !sv.is_empty() && sv.chars().all(|c| c.is_ascii_digit()) {
+                        sv.parse::<i64>().ok()
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }?;
+            let slice = Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(sh2_member("positional")),
+                    property: Box::new(Expr::Identifier {
+                        name: "slice".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![Expr::Literal {
+                    value: serde_json::Value::from(n),
+                    raw: None,
+                    regex: None,
+                }],
+                optional: false,
+            };
+            Some(seq(vec![
+                Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(sh2_member("positional")),
+                    right: Box::new(slice),
+                },
+                status(),
+                bool_lit(true),
+            ]))
+        }
+        _ => None,
+    }
+}
+
+/// `pwd` at the module's default stdout sink (the echo sink gates): the
+/// runtime builtin is `emit(cwd + "\n")` then `lastExit = 0` — exactly a
+/// native stdout write of the cwd string plus the status record.
+/// Mirrors the builtin's ORDER (emit first — a closed fd would set
+/// lastExit 1, then the builtin overwrites 0 — the native reproduces the
+/// same final state) and its args-ignored behavior for the bare form.
+fn try_native_pwd_stmt(args: &[IrExpr]) -> Option<Expr> {
+    let [_, IrExpr::Array(items)] = args else {
+        return None;
+    };
+    if !items.is_empty() {
+        return None; // only the bare form (the corpus shape)
+    }
+    let write = printf_write_expr(Expr::BinaryExpression {
+        operator: "+".to_string(),
+        left: Box::new(sh2_member("cwd")),
+        right: Box::new(str_lit("\n")),
+    });
+    Some(seq(vec![
+        write,
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        },
+        bool_lit(true),
+    ]))
+}
+
 fn native_capture_yes_head(pipe: &IrExpr) -> Option<Expr> {
     let IrExpr::Call { func, args } = pipe else {
         return None;
@@ -19838,6 +20059,34 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                 }
             }
+            // `set -- LIT...` / `set a b` / `shift [N]` — the native
+            // positional-store sequence (see try_native_set_shift): the
+            // runtime builtin's exact value (`true` + lastExit 0) minus
+            // the dispatch + flattening + magic scan. The statement form
+            // inherits this lowering through the `IrStmt::Expr` arm.
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), ..] = args.as_slice() {
+                    if matches!(name.as_str(), "set" | "shift") {
+                        if let Some(native) = try_native_set_shift(name, args) {
+                            return native;
+                        }
+                    }
+                }
+            }
+            // `pwd` at the module's default stdout sink (the echo sink
+            // gates): the native cwd write (see try_native_pwd_stmt).
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), ..] = args.as_slice() {
+                    if name == "pwd" && *ECHO_SINK_DEPTH.lock().unwrap() == 0
+                        && !PROGRAM_PERSIST_FD1.lock().unwrap().unwrap_or(true)
+                        && !program_defines_function("pwd")
+                    {
+                        if let Some(native) = try_native_pwd_stmt(args) {
+                            return native;
+                        }
+                    }
+                }
+            }
             // `eval "NAME=VALUE..."` with a STATIC pure-assignment string
             // (expression position): the native store-write sequence — no
             // double bash spawn per evaluation (see try_native_eval).
@@ -20090,13 +20339,54 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                         && (name.ends_with("[@]") || name.ends_with("[*]")
                                             || (name.starts_with('!')
                                                 && !name.contains('*'))
-                                            || name == "@")));
-                    let always_string = matches!(v, IrExpr::Call { func: f, args: a }
-                        if f == "param"
-                            && matches!(a.as_slice(),
-                                [IrExpr::Str(op, _), IrExpr::Str(name, _), ..]
-                                if op == "slice"
-                                    && (name.starts_with('#') || name == "*")));
+                                            || name == "@")))
+                        // `param("slice", NAME, "@", ...)` — the runtime's
+                        // `a === '@' || a === '*'` short-circuit returns
+                        // `arrayItems(name)` BEFORE any store lookup, so a
+                        // plain-name slice with a literal `@`/`*` offset is
+                        // provably an array (the ambiguous array-or-string
+                        // plain-name form only has NUMERIC offsets).
+                        || matches!(v, IrExpr::Call { func: f, args: a }
+                            if f == "param"
+                                && matches!(a.as_slice(),
+                                    [IrExpr::Str(op, _), IrExpr::Str(name, _),
+                                     IrExpr::Str(off, _), ..]
+                                    if op == "slice"
+                                        && (off == "@" || off == "*")
+                                        && !name.starts_with('#')
+                                        && !name.starts_with('!')));
+                    // A non-param arg whose lowered shape is provably a
+                    // STRING (the runtime join is `Array.isArray(v) ?
+                    // v.join(" ") : String(v)` — identity for strings):
+                    // literal/template text, a `String(...)` coercion, or a
+                    // string-method chain rooted at one of those (the
+                    // `String(name).slice(...)` native param slices).
+                    let provably_string = match &ve {
+                        Expr::Literal { .. } | Expr::TemplateLiteral { .. } => true,
+                        Expr::CallExpression { callee, .. } => matches!(&**callee,
+                            Expr::Identifier { name } if name == "String"),
+                        Expr::MemberExpression { object, .. } => {
+                            let mut o = object;
+                            loop {
+                                match &**o {
+                                    Expr::CallExpression { callee, .. } => {
+                                        break matches!(&**callee,
+                                            Expr::Identifier { name } if name == "String");
+                                    }
+                                    Expr::MemberExpression { object: oo, .. } => o = oo,
+                                    _ => break false,
+                                }
+                            }
+                        }
+                        _ => false,
+                    };
+                    let always_string = provably_string
+                        || matches!(v, IrExpr::Call { func: f, args: a }
+                            if f == "param"
+                                && matches!(a.as_slice(),
+                                    [IrExpr::Str(op, _), IrExpr::Str(name, _), ..]
+                                    if op == "slice"
+                                        && (name.starts_with('#') || name == "*")));
                     if always_array {
                         return Expr::CallExpression {
                             callee: Box::new(Expr::MemberExpression {
@@ -20112,7 +20402,21 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         };
                     }
                     if always_string {
-                        return ve; // join of a scalar is String(v) — identity
+                        // join of a scalar is String(v) — identity. The
+                        // param non-slice ops (`:-`/`:=`/`:?`/`#`/`##`/`%`/
+                        // `%%`/`//`/`^^`/`,,`...) always return scalars too
+                        // (the runtime's only array returns are the slice
+                        // paths checked above) — identity for those as
+                        // well (a BADSUB magic marker is still a string,
+                        // which the caller String()s identically).
+                        return ve;
+                    }
+                    if matches!(v, IrExpr::Call { func: f, args: a }
+                        if f == "param"
+                            && matches!(a.as_slice(),
+                                [IrExpr::Str(op, _), ..] if op != "slice"))
+                    {
+                        return ve;
                     }
                     return sh2_call("join", vec![ve]);
                 }
