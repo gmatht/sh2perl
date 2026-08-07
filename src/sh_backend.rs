@@ -463,6 +463,84 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
         out.push_str("    perl -ne 'BEGIN{$p=shift @ARGV} print if /$p/' \"$p\" \"$@\"\n");
         out.push_str("}\n\n");
     }
+    if needs_readlink(&prog.stmts) {
+        out.push_str(r##"
+    _readlink() {
+        _rl_mode=f
+        _rl_nl=0
+        while [ "$#" -gt 1 ]; do
+            case "$1" in
+                -e) _rl_mode=e ;;
+                -m) _rl_mode=m ;;
+                -f) _rl_mode=f ;;
+                -n) _rl_nl=1 ;;
+                *) break ;;
+            esac
+            shift
+        done
+        for _rl_path in "$@"; do
+            case $_rl_path in
+                /*) ;;
+                *) _rl_path=$PWD/$_rl_path ;;
+            esac
+            if [ "$_rl_mode" = m ]; then
+                _rl_ifs=$IFS
+                IFS=/
+                _rl_out=
+                for _rl_c in $_rl_path; do
+                    case $_rl_c in
+                        ''|.) ;;
+                        ..)
+                            case $_rl_out in
+                                */*) _rl_out=${_rl_out%/*} ;;
+                                *) _rl_out= ;;
+                            esac ;;
+                        *) _rl_out=$_rl_out/$_rl_c ;;
+                    esac
+                done
+                IFS=$_rl_ifs
+                [ -n "$_rl_out" ] || _rl_out=/
+                if [ "$_rl_nl" -eq 0 ]; then printf '%s\n' "$_rl_out"; else printf '%s' "$_rl_out"; fi
+                continue
+            fi
+            _rl_dir=${_rl_path%/*}
+            _rl_base=${_rl_path##*/}
+            _rl_old=$PWD
+            if cd "$_rl_dir" 2>/dev/null; then
+                _rl_dir=$(pwd -P)
+                cd "$_rl_old" || :
+            elif [ "$_rl_mode" = e ]; then
+                return 1
+            fi
+            _rl_n=0
+            while [ -L "$_rl_dir/$_rl_base" ] && [ "$_rl_n" -lt 40 ]; do
+                _rl_tgt=$(ls -ld "$_rl_dir/$_rl_base")
+                _rl_tgt=${_rl_tgt#*" -> "}
+                case $_rl_tgt in
+                    /*) _rl_new=$_rl_tgt ;;
+                    *) _rl_new=$_rl_dir/$_rl_tgt ;;
+                esac
+                _rl_dir=${_rl_new%/*}
+                _rl_base=${_rl_new##*/}
+                _rl_n=$((_rl_n + 1))
+            done
+            _rl_out=$_rl_dir/$_rl_base
+            if [ "$_rl_mode" = e ] && [ ! -e "$_rl_out" ]; then
+                return 1
+            fi
+            if [ "$_rl_nl" -eq 0 ]; then printf '%s\n' "$_rl_out"; else printf '%s' "$_rl_out"; fi
+        done
+    }
+
+"##);
+    }
+    out.push_str("_num() {\n");
+    out.push_str("    # bash coerces non-numeric arith values to 0; dash errors\n");
+    out.push_str("    case \"$1\" in\n");
+    out.push_str("        ''|'-'|*[!0-9-]*|-*[!0-9]*) echo 0 ;;\n");
+    out.push_str("        *) echo \"$1\" ;;\n");
+    out.push_str("    esac\n");
+    out.push_str("}\n\n");
     if needs_arr_helper(prog) {
         out.push_str(
             r#"
@@ -1400,6 +1478,85 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
     walk(stmts)
 }
 
+// GNU readlink canonicalize flags (-e/-f/-m, or combined -ef/-fn).
+// readlink(1) is not POSIX at all; -e/-m are GNU-only and even -f
+// is missing on macOS/BSD - so all canonicalize invocations route
+// through the pure-POSIX-sh `_readlink` polyfill. Bare `readlink`
+// (one-level link target) is portable - stays native.
+fn readlink_flag(s: &str) -> bool {
+    s == "-e" || s == "-f" || s == "-m"
+        || (s.starts_with('-') && s.len() > 2
+            && s[1..].chars().all(|c| "efmn".contains(c))
+            && s[1..].chars().any(|c| "efm".contains(c)))
+}
+
+// Does the program need the `_readlink` polyfill prologue?
+// Mirrors needs_grep_p's descent: nested cmdsubs (Call args) and
+// pipelines carry the exec through the IR - the scan must recurse.
+fn needs_readlink(stmts: &[IrStmt]) -> bool {
+    fn has_readlink(e: &IrExpr) -> bool {
+        if let IrExpr::Call { func, args } = e {
+            if (func == "exec" || func == "readlink") && !args.is_empty() {
+                if let IrExpr::Str(cn, _) = &args[0] {
+                    if cn == "readlink" {
+                        let words = match args.get(1) {
+                            Some(IrExpr::Array(items)) => items.as_slice(),
+                            _ => &args[1..],
+                        };
+                        if words.iter().any(|w| matches!(w, IrExpr::Str(s, _) if readlink_flag(s))) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return args.iter().any(has_readlink);
+        }
+        match e {
+            IrExpr::Array(es) => es.iter().any(has_readlink),
+            IrExpr::Object(es) => es.iter().any(|(_, v)| has_readlink(v)),
+            IrExpr::Arrow(stmts) => walk(stmts),
+            _ => false,
+        }
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            match st {
+                IrStmt::Expr(e) => { if has_readlink(e) { return true; } }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    if has_readlink(cond) || walk(body) { return true; }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    if has_readlink(cond) || walk(then) || walk(else_)
+                        || elsifs.iter().any(|(c, b)| has_readlink(c) || walk(b))
+                    { return true; }
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    if walk(body) { return true; }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    if has_readlink(iter) || walk(body) { return true; }
+                }
+                IrStmt::Assign { expr, .. } => { if has_readlink(expr) { return true; } }
+                IrStmt::Redirect { inner, redirects } => {
+                    if walk(inner) { return true; }
+                    for r in redirects {
+                        if has_readlink(&r.target) { return true; }
+                    }
+                }
+                IrStmt::Function { body, .. } => { if walk(body) { return true; } }
+                IrStmt::Case { discriminant, clauses, .. } => {
+                    if has_readlink(discriminant) { return true; }
+                    for c in clauses { if walk(&c.body) { return true; } }
+                }
+                IrStmt::Pipeline { stages, .. } => { for s in stages { if walk(s) { return true; } } }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
 fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)]>) -> Result<String, String> {
     // GNU-only flags: refuse rather than leak an unportable invocation
     if let IrExpr::Str(cn, _) = cmd {
@@ -1813,6 +1970,21 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
             return Ok(":".into());
         }
         return Ok(parts.join("; "));
+    }
+    // `readlink -e/-f/-m` - GNU canonicalize flags. readlink(1) is not
+    // POSIX; -e/-m are GNU-only and even -f is GNU/FreeBSD-only
+    // (macOS/BSD lack it) - route through the `_readlink` polyfill
+    // emitted in the prologue when needs_readlink() fired. Bare
+    // `readlink` (one-level link target) is portable and stays native.
+    if cmd_name == Some("readlink")
+        && args.iter().any(|a| matches!(a, IrExpr::Str(s, _) if readlink_flag(s)))
+    {
+        out.push_str("_readlink");
+        for w in args {
+            out.push(' ');
+            out.push_str(&word_to_sh(w)?);
+        }
+        return Ok(out);
     }
     out.push_str(&word_to_sh(cmd)?);
     for w in args {
@@ -2398,17 +2570,23 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             };
             Ok(format!("$(printf '%s' \"${name}\" | cut -c{range})"))
         }
+        // case-modification: busybox tr treats `[:lower:]`/`[:upper:]`
+        // literally (class support is compile-gated), so use the ASCII
+        // ranges; GNU sed's \U/\L escapes are not portable either
+        // (busybox/BSD sed lack them) - awk toupper/tolower exist in
+        // gawk/mawk/busybox/BSD awk alike and match the old sed's
+        // per-line first-char behaviour.
         "^^" => Ok(format!(
-            "$(printf '%s' \"${name}\" | tr '[:lower:]' '[:upper:]')"
+            "$(printf '%s' \"${name}\" | tr a-z A-Z)"
         )),
         ",," => Ok(format!(
-            "$(printf '%s' \"${name}\" | tr '[:upper:]' '[:lower:]')"
+            "$(printf '%s' \"${name}\" | tr A-Z a-z)"
         )),
         "^" => Ok(format!(
-            "$(printf '%s' \"${name}\" | sed -e 's/^\\(.\\)/\\U\\1/')"
+            "$(printf '%s' \"${name}\" | awk '{{print toupper(substr($0,1,1)) substr($0,2)}}')"
         )),
         "," => Ok(format!(
-            "$(printf '%s' \"${name}\" | sed -e 's/^\\(.\\)/\\L\\1/')"
+            "$(printf '%s' \"${name}\" | awk '{{print tolower(substr($0,1,1)) substr($0,2)}}')"
         )),
         "#" | "##" | "%" | "%%" => {
             let pat = raw_arg(args, 2)?;
@@ -3011,21 +3189,6 @@ fn arith_rewrite(t: &str) -> String {
     while i < b.len() {
         let c = b[i] as char;
         if (c == '+' || c == '-') && i + 1 < b.len() && b[i + 1] == b[i] {
-            // postfix `name++` — previous char is ident, next is not
-            let prev_ident = i > 0 && ident(b[i - 1]);
-            let next_ident = i + 2 < b.len() && ident(b[i + 2]);
-            if prev_ident && !next_ident {
-                let mut s = i - 1;
-                while s > 0 && ident(b[s - 1]) {
-                    s -= 1;
-                }
-                let name = &t[s..i];
-                let (inc, dec) = if c == '+' { ("+ 1", "- 1") } else { ("- 1", "+ 1") };
-                out.truncate(out.len() - (i - s));
-                out.push_str(&format!("(({name} = {name} {inc}) {dec})"));
-                i += 2;
-                continue;
-            }
             // prefix `++name`
             let next_ident2 = i + 2 < b.len() && (b[i + 2].is_ascii_alphabetic() || b[i + 2] == b'_');
             if next_ident2 {
@@ -3072,6 +3235,37 @@ fn arith_rewrite(t: &str) -> String {
                     continue;
                 }
             }
+        }
+        // bare identifier -> $(_num "$name") (bash coerces non-numeric
+        // values to 0, dash errors); assignment LHS stays bare (`x` in
+        // `x = y` is a write target); a postfix ++/-- rewrites first
+        // (the name must stay plain there)
+        if c.is_ascii_alphabetic() || c == b'_' as char {
+            let mut j = i;
+            while j < b.len() && ident(b[j]) {
+                j += 1;
+            }
+            let name = &t[i..j];
+            if j + 1 < b.len() && (b[j] == b'+' || b[j] == b'-') && b[j + 1] == b[j] {
+                let (inc, dec) = if b[j] == b'+' { ("+ 1", "- 1") } else { ("- 1", "+ 1") };
+                out.push_str(&format!("(({name} = {name} {inc}) {dec})"));
+                i = j + 2;
+                continue;
+            }
+            let mut k = j;
+            while k < b.len() && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let is_assign = k < b.len()
+                && b[k] == b'='
+                && !(k + 1 < b.len() && (b[k + 1] == b'=' || b[k + 1] == b'~'));
+            if is_assign {
+                out.push_str(name);
+            } else {
+                out.push_str(&format!("$( _num \"{name}\" )"));
+            }
+            i = j;
+            continue;
         }
         out.push(c);
         i += 1;
@@ -3155,7 +3349,7 @@ fn cstyle_for_to_sh(arith: &str, body: &str) -> String {
 fn arith_to_sh(a: &ArithAst) -> String {
     match a {
         ArithAst::Num(n) => n.to_string(),
-        ArithAst::Var(name) => name.clone(),
+        ArithAst::Var(name) => format!("$( _num \"{name}\" )"),
         ArithAst::Index { var, key } => format!("{var}[{}]", arith_to_sh(key)),
         ArithAst::Bin { op, lhs, rhs } => {
             // dash has no `**` — constant-fold literal powers
