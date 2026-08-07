@@ -54,7 +54,59 @@ static ARITH_POISON_DEPTH: Mutex<usize> = Mutex::new(0);
 /// runtime's `emit` when fd 1 is the default stdout, so the native echo
 /// lowering (see `try_native_echo`) checks this depth before firing.
 static ECHO_SINK_DEPTH: Mutex<usize> = Mutex::new(0);
+/// Subshell/background statement sites whose body provably runs with the
+/// DEFAULT stdout sink (see [`native_echo_sink_sites`]): their arrows
+/// lower WITHOUT the sink-depth bump (the `arrow_native_echo` form), so
+/// echo/printf/pwd statements directly in the body fire the native
+/// `process.stdout.write` lowering. Pointer-keyed on the body stmts
+/// slice; set per compilation by `shir_to_estree`; unset → conservative
+/// (every subshell/background keeps the runtime dispatch — the
+/// pre-existing behavior).
+static NATIVE_ECHO_SINK_SITES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+fn native_echo_sink_site(stmts: &[IrStmt]) -> bool {
+    NATIVE_ECHO_SINK_SITES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(&(stmts.as_ptr() as usize)))
+        .unwrap_or(false)
+}
+/// Does a redirect spec list touch fd 1 (the echo sink)? Only fd-1 specs
+/// change where a body's stdout writes land: fd-0 input redirects
+/// (`cmd < f`, heredocs, herestrings, procsubs — the `while ... done < f`
+/// read-loop family) and fd-2-only redirects leave fd 1 untouched, so the
+/// body's echo/printf/pwd can still lower to native `process.stdout.write`
+/// (the runtime's redirectSync/redirect still installs and restores the
+/// other fds around the body — the fd-1 writes are the only ones the
+/// native lowering replaces). `2>&1`-style dups read fd 1's target but do
+/// not change it; `exec >f`-persist forms carry an fd-1 spec and are
+/// covered (PROGRAM_PERSIST_FD1 additionally disables native echo
+/// program-wide for them).
+fn redirect_specs_touch_fd1(specs: &[(i64, &str, &IrExpr)]) -> bool {
+    specs.iter().any(|(fd, _, _)| *fd == 1)
+}
+/// `redirect` CALL form (expr position): parse the specs array for an
+/// fd-1 object. Any malformed spec is treated as touching fd 1
+/// (conservative — the depth bump stays).
+fn redirect_call_touches_fd1(args: &[IrExpr]) -> bool {
+    let [_, IrExpr::Array(spec_objs)] = args else {
+        return true;
+    };
+    spec_objs.iter().any(|so| match so {
+        IrExpr::Object(props) => props.iter().any(|(k, v)| {
+            k == "fd" && matches!(v, IrExpr::Int(1))
+        }),
+        _ => true,
+    })
+}
 /// Whether the program contains a PERSISTENT fd-1 redirect (a bare
+/// `exec >file` / `exec 1>&2` / `exec 1>&-` — the runtime keeps those in
+/// the fd table after the redirect call). Native top-level `echo` writes
+/// `process.stdout` directly, which is only byte-identical while fd 1 is
+/// the module's default stdout — a persistent fd-1 redirect ANYWHERE in
+/// the program (functions included; the emitter cannot see call-site
+/// contexts) disables the native echo lowering. Set per compilation by
+/// `shir_to_estree`; conservative (any doubt resolves to `true`). (a bare
 /// `exec >file` / `exec 1>&2` / `exec 1>&-` — the runtime keeps those in
 /// the fd table after the redirect call). Native top-level `echo` writes
 /// `process.stdout` directly, which is only byte-identical while fd 1 is
@@ -1299,6 +1351,232 @@ fn native_echo_fn_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<
         return HashSet::new();
     }
     functions.difference(&bad).cloned().collect()
+}
+
+/// `(cmd)` subshell / `(cmd) &` background STATEMENTS and expr-position
+/// `subshell`/`background` calls whose body provably runs with the DEFAULT
+/// stdout sink — the echo/printf/pwd native lowerings (which fire only at
+/// ECHO_SINK_DEPTH == 0) are byte-identical to the runtime builtins' emit
+/// while fd 1 is the default stdout, and a subshell/background body NEVER
+/// swaps fdTargets itself (the runtime clones the fd table at call time
+/// and runs the body in the clone — see `subshell`/`subshellSync`/
+/// `background` in harness/sh2-namespace.mjs): the body's sink is the
+/// ENCLOSING sink at the site.
+///
+/// A site is "default-sink" iff it is not syntactically nested inside an
+/// fd-1-swapping construct:
+///   - a redirect statement / redirect call whose specs touch fd 1
+///     (fd-0 input redirects — `while ... done < f`, heredocs, procsubs —
+///     and fd-2-only redirects leave fd 1 untouched; the mirror of the
+///     emitter's conditional sink bump in the redirect arms, see
+///     [`redirect_specs_touch_fd1`]);
+///   - a pipeline (its stages' fd 1 is the pipe);
+///   - a capture/captureWords/pipeline body (the capture buffer IS the
+///     fd-1 swap);
+///   - a function body whose define arrow is NOT native-echo (a
+///     non-native-echo function may be called under ANY sink — its arrow
+///     lowers with the sink bump); a native-echo function body (see
+///     [`native_echo_fn_set`]) is default-sink by construction (every
+///     call site provably runs with the default stdout), so the walk
+///     REPLACES the swapped flag with that verdict when entering one.
+///
+/// The verdicts must EXACTLY mirror the emission's ECHO_SINK_DEPTH
+/// discipline: a site marked default lowers its arrow WITHOUT the depth
+/// bump (`arrow_native_echo`), so its direct echo/printf/pwd statements
+/// fire the native lowering; an unmarked site keeps `arrow_sink` (depth
+/// bump). Pointer-keyed on the body stmts slice — the emission consults
+/// the same IrStmt/IrExpr objects of the same (cloned) program.
+fn native_echo_sink_sites(
+    prog: &IrProgram,
+    native_echo_fns: &HashSet<String>,
+) -> HashSet<usize> {
+    let mut sites = HashSet::new();
+    fn stmt_walk(
+        st: &IrStmt,
+        swapped: bool,
+        native_echo_fns: &HashSet<String>,
+        sites: &mut HashSet<usize>,
+    ) {
+        match st {
+            IrStmt::Exec { args, redirects, .. } => {
+                // the Exec form's redirects are IrExpr spec objects
+                // (fd/mode/target props), unlike the Redirect statement's
+                // typed IrRedirect list
+                let sw = swapped || redirects.iter().any(|r| match r {
+                    IrExpr::Object(props) => props.iter().any(
+                        |(k, v)| k == "fd" && matches!(v, IrExpr::Int(1)),
+                    ),
+                    _ => true,
+                });
+                for a in args {
+                    expr_walk(a, sw, native_echo_fns, sites);
+                }
+            }
+            IrStmt::Expr(e) => expr_walk(e, swapped, native_echo_fns, sites),
+            IrStmt::Redirect { inner, redirects } => {
+                let sw = swapped
+                    || redirects
+                        .iter()
+                        .any(|r| r.fd.map_or(false, |fd| fd == 1));
+                for b in inner {
+                    stmt_walk(b, sw, native_echo_fns, sites);
+                }
+            }
+            // pipeline stages run with fd 1 swapped to the pipe
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        stmt_walk(b, true, native_echo_fns, sites);
+                    }
+                }
+            }
+            // a subshell/background body runs in a CLONE of the enclosing
+            // fd table — the sink propagates unchanged
+            IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                if !swapped {
+                    sites.insert(body.as_ptr() as usize);
+                }
+                for b in body {
+                    stmt_walk(b, swapped, native_echo_fns, sites);
+                }
+            }
+            IrStmt::Function { name, body } => {
+                // the define arrow's bump depends ONLY on the name's
+                // native-echo verdict (the definition site does not
+                // matter) — replace the flag
+                let sw = !native_echo_fns.contains(name);
+                for b in body {
+                    stmt_walk(b, sw, native_echo_fns, sites);
+                }
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                expr_walk(cond, swapped, native_echo_fns, sites);
+                for b in body {
+                    stmt_walk(b, swapped, native_echo_fns, sites);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                expr_walk(cond, swapped, native_echo_fns, sites);
+                for b in then.iter().chain(else_) {
+                    stmt_walk(b, swapped, native_echo_fns, sites);
+                }
+                for (_, arm) in elsifs {
+                    for b in arm {
+                        stmt_walk(b, swapped, native_echo_fns, sites);
+                    }
+                }
+            }
+            IrStmt::For { iter, body, .. } => {
+                expr_walk(iter, swapped, native_echo_fns, sites);
+                for b in body {
+                    stmt_walk(b, swapped, native_echo_fns, sites);
+                }
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                expr_walk(discriminant, swapped, native_echo_fns, sites);
+                for c in clauses {
+                    for b in &c.body {
+                        stmt_walk(b, swapped, native_echo_fns, sites);
+                    }
+                }
+            }
+            IrStmt::Block(body) => {
+                for b in body {
+                    stmt_walk(b, swapped, native_echo_fns, sites);
+                }
+            }
+            IrStmt::Assign { expr, .. } => expr_walk(expr, swapped, native_echo_fns, sites),
+            _ => {}
+        }
+    }
+    fn expr_walk(
+        e: &IrExpr,
+        swapped: bool,
+        native_echo_fns: &HashSet<String>,
+        sites: &mut HashSet<usize>,
+    ) {
+        match e {
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    stmt_walk(st, swapped, native_echo_fns, sites);
+                }
+            }
+            IrExpr::Capture { expr, .. } => expr_walk(expr, true, native_echo_fns, sites),
+            IrExpr::Call { func, args } => match func.as_str() {
+                // expr-position subshell/background calls — same verdict
+                // as the statement forms (their arrow runs in the
+                // enclosing sink)
+                "subshell" | "background" => {
+                    if !swapped {
+                        if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                            sites.insert(stmts.as_ptr() as usize);
+                        }
+                    }
+                    for a in args {
+                        expr_walk(a, swapped, native_echo_fns, sites);
+                    }
+                }
+                "capture" | "captureWords" | "pipeline" => {
+                    for a in args {
+                        expr_walk(a, true, native_echo_fns, sites);
+                    }
+                }
+                "redirect" => {
+                    let sw = swapped || redirect_call_touches_fd1(args);
+                    for a in args {
+                        expr_walk(a, sw, native_echo_fns, sites);
+                    }
+                }
+                _ => {
+                    for a in args {
+                        expr_walk(a, swapped, native_echo_fns, sites);
+                    }
+                }
+            },
+            IrExpr::Array(items) => {
+                for it in items {
+                    expr_walk(it, swapped, native_echo_fns, sites);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    expr_walk(v, swapped, native_echo_fns, sites);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_walk(lhs, swapped, native_echo_fns, sites);
+                expr_walk(rhs, swapped, native_echo_fns, sites);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                expr_walk(obj, swapped, native_echo_fns, sites);
+                for a in args {
+                    expr_walk(a, swapped, native_echo_fns, sites);
+                }
+            }
+            IrExpr::Ternary { cond, then, else_, .. } => {
+                expr_walk(cond, swapped, native_echo_fns, sites);
+                expr_walk(then, swapped, native_echo_fns, sites);
+                expr_walk(else_, swapped, native_echo_fns, sites);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                expr_walk(expr, swapped, native_echo_fns, sites);
+                expr_walk(default, swapped, native_echo_fns, sites);
+            }
+            IrExpr::Index { key, .. } => expr_walk(key, swapped, native_echo_fns, sites),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(inner) = p {
+                        expr_walk(inner, swapped, native_echo_fns, sites);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for st in &prog.stmts {
+        stmt_walk(st, false, native_echo_fns, &mut sites);
+    }
+    sites
 }
 ///
 /// The sync-function fixpoint (see [`SYNC_FN_CALLS`]) plus the native-
@@ -8419,6 +8697,16 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // lift/scan statics (the emission reads them) and before the main
     // emission.
     *NATIVE_ECHO_FNS.lock().unwrap() = Some(native_echo_fn_set(prog, &functions));
+    // Native-echo-in-subshell/background analysis (see
+    // [`native_echo_sink_sites`]): the body arrows of default-sink
+    // subshell/background sites lower WITHOUT the sink-depth bump, so
+    // their echo/printf/pwd statements go native. Consumes the
+    // native-echo-fn verdicts (a site inside a non-native-echo function
+    // body is not default-sink — the arrow lowers with the bump).
+    *NATIVE_ECHO_SINK_SITES.lock().unwrap() = Some(native_echo_sink_sites(
+        prog,
+        NATIVE_ECHO_FNS.lock().unwrap().as_ref().unwrap(),
+    ));
     // Plan 4 — lastExit-write liveness: which `(( ))`/echo statements' status
     // writes are unread, and which empty-else ifs' synthesized false-path
     // `sh2.lastExit = 0` is droppable (empty under a possible `set -e`).
@@ -9620,12 +9908,55 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
     let [IrExpr::Str(name, _), IrExpr::Array(echo_args)] = args.as_slice() else {
         return None;
     };
-    if name != "echo" {
-        return None;
-    }
-    if echo_args.iter().any(ir_expr_needs_runtime) {
-        return None;
-    }
+    let text: Expr = match name.as_str() {
+        "echo" => {
+            if program_defines_function("echo") {
+                return None;
+            }
+            if echo_args.iter().any(ir_expr_needs_runtime) {
+                return None;
+            }
+            let (joined, no_newline, _) = echo_join_args(echo_args)?;
+            if no_newline {
+                joined
+            } else {
+                Expr::BinaryExpression {
+                    operator: "+".to_string(),
+                    left: Box::new(joined),
+                    right: Box::new(str_lit("\n")),
+                }
+            }
+        }
+        // `printf 'a\n' > file` — the ALL-LITERAL form of the echo
+        // redirect twin: the format and every arg are compile-time
+        // constants, so the whole output text folds through the same
+        // printf engine as `try_native_printf` (the runtime's printf
+        // builtin would produce the identical bytes; `> file` replaces
+        // its fd-1 emit with the file write). Dynamic formats/args keep
+        // the runtime dispatch (their arg-count cycling and expansions
+        // are not compile-time).
+        "printf" => {
+            if program_defines_function("printf") {
+                return None;
+            }
+            let fmt = static_str(echo_args.first()?)?;
+            let pf = printf_parse(&fmt)?;
+            let rest = &echo_args[1.min(echo_args.len())..];
+            let mut lit_args: Vec<String> = Vec::new();
+            for a in rest {
+                match a {
+                    IrExpr::Array(elems) => {
+                        for el in elems {
+                            lit_args.push(static_str(el)?);
+                        }
+                    }
+                    other => lit_args.push(static_str(other)?),
+                }
+            }
+            str_lit(&printf_apply(&pf, &lit_args)?)
+        }
+        _ => return None,
+    };
     let [(fd, mode, target)] = specs else {
         return None;
     };
@@ -9645,16 +9976,6 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
             }
         }
     }
-    let (joined, no_newline, _) = echo_join_args(echo_args)?;
-    let text: Expr = if no_newline {
-        joined
-    } else {
-        Expr::BinaryExpression {
-            operator: "+".to_string(),
-            left: Box::new(joined),
-            right: Box::new(str_lit("\n")),
-        }
-    };
     let write = sh2_fs_call(
         if *mode == "a" { "appendFile" } else { "writeFile" },
         vec![tgt, text],
@@ -11084,7 +11405,17 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             }
         }
         IrStmt::Subshell(stmts) => {
-            let body = arrow_sink(vec![], IrExpr::Arrow(stmts.clone()));
+            // A subshell body NEVER swaps fdTargets itself (the runtime
+            // clones the fd table and runs the body in the clone): when
+            // the site provably sits in the default stdout context (see
+            // [`native_echo_sink_sites`]), the arrow lowers WITHOUT the
+            // sink-depth bump and its direct echo/printf/pwd statements
+            // fire the native `process.stdout.write` lowering.
+            let body = if native_echo_sink_site(stmts) {
+                arrow_native_echo(vec![], IrExpr::Arrow(stmts.clone()))
+            } else {
+                arrow_sink(vec![], IrExpr::Arrow(stmts.clone()))
+            };
             let call = if expr_has_await(&body) {
                 await_call("subshell", vec![body])
             } else {
@@ -11099,7 +11430,11 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::Background(stmts) => Stmt::ExpressionStatement {
             expression: sh2_call(
                 "background",
-                vec![arrow_sink(vec![], IrExpr::Arrow(stmts.clone()))],
+                vec![if native_echo_sink_site(stmts) {
+                    arrow_native_echo(vec![], IrExpr::Arrow(stmts.clone()))
+                } else {
+                    arrow_sink(vec![], IrExpr::Arrow(stmts.clone()))
+                }],
             ),
         },
         IrStmt::Block(stmts) => Stmt::BlockStatement {
@@ -11138,7 +11473,18 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         && matches!(args.as_slice(), [IrExpr::Str(name, _), IrExpr::Array(a)]
                             if name == "exec" && a.is_empty())
             );
-            let body = arrow_sink(vec![], IrExpr::Arrow(inner.clone()));
+            // Only fd-1 specs swap the body's stdout sink (see
+            // [`redirect_specs_touch_fd1`]): an fd-0 input redirect
+            // (`while ... done < f` — the read-loop family) or an
+            // fd-2-only redirect leaves fd 1 untouched, so the body's
+            // echo/printf/pwd can lower to native `process.stdout.write`
+            // (the runtime redirect still installs/restores the other
+            // fds around the body).
+            let body = if redirect_specs_touch_fd1(&redirect_specs) {
+                arrow_sink(vec![], IrExpr::Arrow(inner.clone()))
+            } else {
+                arrow(vec![], IrExpr::Arrow(inner.clone()))
+            };
             let specs = array(
                 redirects
                     .iter()
@@ -14886,13 +15232,85 @@ fn try_native_echo_dead(args: &[IrExpr]) -> Option<Expr> {
 /// flag would print its text like any other word, but the corpus shapes
 /// are single-word; the no-arg `yes` → "y" form and dynamic args keep
 /// the spawn).
+/// `set -e` / `set -e -u -o pipefail` / `set +e` / `set -C` — the shell-
+/// option flag form of the `set` builtin, lowered to the native property
+/// writes. Mirrors harness/sh2-namespace.mjs `builtins.set`'s flag loop
+/// EXACTLY: `-`/`+` per-arg enable/disable, the `e` (errexit), `u`
+/// (nounset), `o` (pending -o) letters, and the `-o name` pair whose only
+/// modeled name is `pipefail` (anything else the runtime ignores —
+/// `nounset`, `-C`/noclobber, `-x`, ... — so the native form ignores it
+/// too, byte-identical to today's runtime dispatch). Non-flag args inside
+/// a flag list are skipped by the runtime (mirrored). Returns the flag
+/// write expressions in ARG ORDER (the runtime's application order); the
+/// caller appends the `lastExit = 0` + `true` status.
+fn try_native_set_flags(items: &[IrExpr]) -> Option<Vec<Expr>> {
+    let word = |e: &IrExpr| -> Option<String> {
+        match e {
+            IrExpr::Str(sv, _) => Some(sv.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                Some(
+                    parts
+                        .iter()
+                        .map(|p| match p {
+                            InterpPart::Lit(s) => s.clone(),
+                            _ => unreachable!("all-Lit checked"),
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    };
+    let mut writes: Vec<Expr> = Vec::new();
+    let mut pending_o: Option<bool> = None;
+    for it in items {
+        let s = word(it)?;
+        if let Some(enable) = pending_o.take() {
+            if s == "pipefail" {
+                writes.push(assign_bool_member("pipefail", enable));
+            }
+            continue;
+        }
+        let enable = s.starts_with('-');
+        if !(s.starts_with('-') || s.starts_with('+')) {
+            continue; // the runtime skips non-flag args inside a flag list
+        }
+        for c in s[1..].chars() {
+            match c {
+                'e' => writes.push(assign_bool_member("errexit", enable)),
+                'u' => writes.push(assign_bool_member("nounset", enable)),
+                'o' => pending_o = Some(enable),
+                _ => {} // the runtime ignores every other letter
+            }
+        }
+    }
+    Some(writes)
+}
+
+/// `sh2.<member> = <bool>` — a native shell-option state write (the
+/// errexit/nounset/pipefail flags the runtime's `set` builtin models).
+fn assign_bool_member(member: &str, v: bool) -> Expr {
+    Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(sh2_member(member)),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(v),
+            raw: None,
+            regex: None,
+        }),
+    }
+}
+
 /// `set -- LIT...` / `set a b` / `shift [N]` at statement level — the
 /// positional-store forms: the runtime builtins are one positional write
 /// + a status record (builtins.set/builtins.shift), so the dispatch +
 /// arg flattening + magic scan disappear. Mirrors the builtins exactly:
 /// `set -- a b` assigns the remaining args; `set a b` (no leading
 /// `-`/`+`) assigns ALL args; `set` alone prints the store (refused);
-/// flag forms (`set -e`, `set -o pipefail`) keep the runtime builtin.
+/// the STATIC flag forms (`set -e`, `set -o pipefail` — see
+/// [`try_native_set_flags`]) lower to the native option writes.
 /// `shift` drops the first N positionals (bare = 1; the runtime
 /// `parseInt`s a literal count). Every arg must be scalar: no GLOB/PS/
 /// BADSUB magic markers (the runtime's flattener expands those) and no
@@ -14925,6 +15343,27 @@ fn try_native_set_shift(name: &str, args: &[IrExpr]) -> Option<Expr> {
         "set" => {
             if items.is_empty() {
                 return None; // bare `set` prints the store
+            }
+            // `set -e` / `set -e -u -o pipefail` / `set +e` — the shell-
+            // option flag forms (see `try_native_set_flags`): the runtime
+            // builtin's whole flag loop is a few property writes, so a
+            // STATIC flag list lowers to the native writes + status.
+            // Dynamic args (the flattener may expand globs/arrays) keep
+            // the dispatch.
+            if matches!(&items[0], IrExpr::Str(sv, _) if sv.starts_with('-') || sv.starts_with('+'))
+            {
+                if items.iter().all(|it| {
+                    matches!(it, IrExpr::Str(sv, _) if !sv.contains('\u{1}'))
+                        || matches!(it, IrExpr::Interpolate(parts)
+                            if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))))
+                }) {
+                    if let Some(flag_writes) = try_native_set_flags(items) {
+                        let mut ex = flag_writes;
+                        ex.push(status());
+                        ex.push(bool_lit(true));
+                        return Some(seq(ex));
+                    }
+                }
             }
             let (positional_args, ok) = match &items[0] {
                 IrExpr::Str(sv, _) if sv == "--" => (items[1..].to_vec(), true),
@@ -20182,13 +20621,23 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // sink (see `arrow_sink`) — native echo/printf must stay
             // suppressed there, so raise ECHO_SINK_DEPTH for the whole arg
             // lowering. Loop/`and`/`or`/`block` arrows run in the CURRENT
-            // sink and are NOT raised here (nor in `arrow`).
+            // sink and are NOT raised here (nor in `arrow`). Two provable
+            // exceptions mirror the statement arms: a `redirect` whose
+            // specs leave fd 1 untouched (fd-0 input / fd-2-only — see
+            // [`redirect_specs_touch_fd1`]) does not swap the body's
+            // stdout, and a `subshell`/`background` site that provably
+            // sits in the default stdout context (see
+            // [`native_echo_sink_sites`]) runs its body in a clone of the
+            // default sink.
             let mapped_args: Vec<Expr> = {
-                let sink_args = matches!(
-                    func.as_str(),
-                    "capture" | "captureWords" | "pipeline" | "subshell" | "background"
-                        | "redirect" | "define"
-                );
+                let sink_args = match func.as_str() {
+                    "capture" | "captureWords" | "pipeline" | "define" => true,
+                    "redirect" => redirect_call_touches_fd1(args),
+                    "subshell" | "background" => {
+                        !matches!(args.first(), Some(IrExpr::Arrow(stmts)) if native_echo_sink_site(stmts))
+                    }
+                    _ => false,
+                };
                 if sink_args {
                     *ECHO_SINK_DEPTH.lock().unwrap() += 1;
                 }
