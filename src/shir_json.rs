@@ -175,6 +175,8 @@ fn stmt_json(s: &IrStmt) -> Value {
         IrStmt::Background(body) => json!({ "type": "Background", "body": stmts_json(body) }),
         IrStmt::Block(body) => json!({ "type": "Block", "body": stmts_json(body) }),
         IrStmt::Expr(e) => json!({ "type": "Expr", "expr": expr_json(e) }),
+        IrStmt::Label(name) => json!({ "type": "Label", "name": name }),
+        IrStmt::Goto(name) => json!({ "type": "Goto", "name": name }),
     }
 }
 

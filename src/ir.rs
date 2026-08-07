@@ -423,6 +423,14 @@ pub enum IrStmt {
     /// Evaluate an expression as a statement (ESTree-path pipelines,
     /// and/or/not, bare sh2.* calls). Perl generator never emits it.
     Expr(IrExpr),
+    /// Label marker — a jump target for `Goto`. Emitted by frontends
+    /// (c-sh-go for C `goto`, future frontends for labeled-break
+    /// families); the shared `restructure_goto` pass (shir_passes/)
+    /// rewrites `Label`/`Goto` into structured flow before any renderer
+    /// sees the IR. Renderers refuse loudly if one survives.
+    Label(String),
+    /// Jump to a `Label`. See `Label`.
+    Goto(String),
 }
 
 // ── Subroutine ───────────────────────────────────────────────────────
@@ -705,6 +713,19 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::RawText(text) => {
             // Splice verbatim — no transformation
             out.push_str(text);
+        }
+
+        // goto/label must have been restructured by the shared
+        // restructure_goto pass (shir_passes/restructure.rs) before the
+        // renderers see the IR. A survivor means the pass's subset was
+        // exceeded — refuse loudly (the backend stub gate counts the
+        // TODO(unsupported) marker).
+        IrStmt::Label(name) | IrStmt::Goto(name) => {
+            emit_indent(out, indent);
+            let kind = if matches!(stmt, IrStmt::Label(_)) { "label" } else { "goto" };
+            out.push_str(&format!(
+                "# TODO(unsupported): {kind} {name} not restructured by restructure_goto\n"
+            ));
         }
 
         // Neutral ESTree-path-only nodes — the Perl generator never emits them.
@@ -4418,6 +4439,7 @@ fn try_embed_newline_in_string_literal(expr: &str) -> Option<String> {
 fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
     match stmt {
         IrStmt::RawText(t) => t.contains("$main_exit_code") || t.contains("main_exit_code"),
+        IrStmt::Label(_) | IrStmt::Goto(_) => false,
         IrStmt::Case { .. }
         | IrStmt::Redirect { .. }
         | IrStmt::Function { .. }
@@ -4528,6 +4550,7 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
                 vars.insert(cap);
             }
         }
+        IrStmt::Label(_) | IrStmt::Goto(_) => {} // no variables
         // Neutral ESTree-path-only nodes carry no Perl variables.
         IrStmt::Case { .. }
         | IrStmt::Redirect { .. }

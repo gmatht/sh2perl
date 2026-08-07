@@ -175,6 +175,7 @@ fn walk_stmt(
 ) {
     let p = *pos;
     match st {
+        IrStmt::Label(_) | IrStmt::Goto(_) => {}
         IrStmt::Assign { targets, expr } => {
             for t in targets {
                 if t.indices.is_empty() {
@@ -552,6 +553,7 @@ fn mark_stmt_vars_escape(
     escapes: &mut HashSet<String>,
 ) {
     match st {
+        IrStmt::Label(_) | IrStmt::Goto(_) => {}
         IrStmt::Assign { targets, expr } => {
             for t in targets {
                 first.entry(t.var.clone()).or_insert(0);

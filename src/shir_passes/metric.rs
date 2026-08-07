@@ -125,6 +125,7 @@ pub struct CalleeCount {
 /// coverage oracle — an unrecognised variant just contributes zero).
 fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
     match stmt {
+        IrStmt::Label(_) | IrStmt::Goto(_) => {} // no sh2.* call sites
         IrStmt::RawText(_) => {
             // Raw text: no sh2.* call sites can be known without parsing
             // the embedded language. Skip — the metric is an under-count

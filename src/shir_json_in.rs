@@ -15,7 +15,7 @@ const KNOWN_STMT: &[&str] = &[
     "Output","WriteFile","Assign","Declare","DeclareArray","If","For","While",
     "DoWhile","Die","Warn","Exec","Pipeline","Return","Exit","SetChildError",
     "Require","RawText","Case","Redirect","Function","Subshell","Background",
-    "Block","Expr",
+    "Block","Expr","Label","Goto",
 ];
 const KNOWN_EXPR: &[&str] = &[
     "Int","Str","Var","Index","BinOp","Call","MethodCall","Ternary","DefinedOr",
@@ -385,6 +385,14 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
         "Expr" => {
             let expr = expr_from(req(o, "expr", where_)?, &format!("{where_}.expr"))?;
             IrStmt::Expr(expr)
+        }
+        "Label" => {
+            let name = req_str(o, "name", where_)?.to_string();
+            IrStmt::Label(name)
+        }
+        "Goto" => {
+            let name = req_str(o, "name", where_)?.to_string();
+            IrStmt::Goto(name)
         }
         _ => unreachable!("checked above"),
     })

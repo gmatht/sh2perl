@@ -885,10 +885,11 @@ exit $main_exit_code;
                 Ok(c) => c,
                 Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
             };
-            let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
+            debashl::shir_passes::restructure_goto_only(&mut prog);
             match debashl::shir::shir_to_estree_json(&prog) {
                 Ok(s) => println!("{}", s),
                 Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
@@ -910,10 +911,11 @@ exit $main_exit_code;
                 Ok(c) => c,
                 Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
             };
-            let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
+            debashl::shir_passes::restructure_goto_only(&mut prog);
             print!("{}", debashl::ir::shir_to_perl(&prog));
         }
         "--mir" => {
