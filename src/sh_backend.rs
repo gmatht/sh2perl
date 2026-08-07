@@ -1175,6 +1175,55 @@ fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
 
 // ── command-position expressions ─────────────────────────────────────
 
+/// Quote any bare `$(...)` or `${...}` in a `[ ]` test string so
+/// word-splitting does not shred command-substitution output.
+/// `[[ -z $(cmd) ]]` becomes `[ -z "$(cmd)" ]` so the cmdsub output
+/// is not field-split/globbed inside `[ ]`.
+fn quote_test_expansions(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n + 16);
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i] as char;
+        if c == '\"' {
+            out.push(c); i += 1;
+            while i < n && (bytes[i] as char) != '\"' { out.push(bytes[i] as char); i += 1; }
+            if i < n { out.push('\"'); i += 1; }
+            continue;
+        }
+        if c == '\'' {
+            out.push(c); i += 1;
+            while i < n && (bytes[i] as char) != '\'' { out.push(bytes[i] as char); i += 1; }
+            if i < n { out.push('\''); i += 1; }
+            continue;
+        }
+        if c == '$' && i + 1 < n && (bytes[i + 1] as char) == '(' {
+            out.push_str("\""); out.push('$'); out.push('(');
+            i += 2;
+            let mut depth = 1i32;
+            while i < n && depth > 0 {
+                let cc = bytes[i] as char;
+                if cc == '(' { depth += 1; }
+                else if cc == ')' { depth -= 1; }
+                out.push(cc); i += 1;
+            }
+            out.push_str("\"");
+            continue;
+        }
+        if c == '$' && i + 1 < n && (bytes[i + 1] as char) == '{' {
+            out.push_str("\""); out.push('$'); out.push('{');
+            i += 2;
+            while i < n && (bytes[i] as char) != '}' { out.push(bytes[i] as char); i += 1; }
+            if i < n { out.push('}'); i += 1; }
+            out.push_str("\"");
+            continue;
+        }
+        out.push(c); i += 1;
+    }
+    out
+}
+
 fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
     match e {
         IrExpr::Call { func, args } => match func.as_str() {
@@ -1236,7 +1285,10 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                         "printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"
                     ))
                 } else {
-                    Ok(format!("[ {} ]", space_test_ops(t)))
+                    // quote bare $(...) and ${...} so word-splitting
+                    // in `[ ]` does not shred cmdsub output
+                    let t = quote_test_expansions(&space_test_ops(t));
+                    Ok(format!("[ {t} ]"))
                 }
             }
             "pipeline" => {
@@ -1850,7 +1902,48 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
             }
         }
     }
-    // `grep -P PAT` — PCRE. ERE-safe patterns lower to `grep -E` inline;
+    // `grep --include=GLOB` (GNU-only flag) - restrict a recursive search
+    // to files matching GLOB. Corpus form: `grep -r PATTERN DIR --include=G`.
+    // Lower: drop the flag, replace DIR with $(find DIR -name G). The
+    // sandbox has busybox find (or Chimera find) which supports -name.
+    if cmd_name == Some("grep") && env.is_none() {
+        if let Some(pidx) = args.iter().position(|a| matches!(
+            a, IrExpr::Str(s, _) if {
+                let c = s.strip_prefix(GLOB_MAGIC).unwrap_or(s);
+                c.starts_with("--include=")
+            }
+        )) {
+            if let IrExpr::Str(fl, _) = &args[pidx] {
+                // the GLOB_MAGIC prefix marks an unquoted glob; --include
+                // accepts a glob, so strip the tag for the pattern match
+                let fl_clean = fl.strip_prefix(GLOB_MAGIC).unwrap_or(fl);
+                let glob = fl_clean.strip_prefix("--include=").unwrap_or("").to_string();
+                let has_r = args.iter().any(|a| matches!(a, IrExpr::Str(s, _) if s == "-r"));
+                if has_r {
+                    let mut words: Vec<String> = Vec::new();
+                    let mut found_pattern = false;
+                    let mut replaced_dir = false;
+                    for (i, a) in args.iter().enumerate() {
+                        if i == pidx { continue; }
+                        let w = word_to_sh(a)?;
+                        if !found_pattern && !w.starts_with('-') {
+                            found_pattern = true;
+                            words.push(w);
+                            continue;
+                        }
+                        if found_pattern && !replaced_dir && !w.starts_with('-') {
+                            words.push(format!("$(find {} -name '{}')", w, glob));
+                            replaced_dir = true;
+                            continue;
+                        }
+                        words.push(w);
+                    }
+                    return Ok(words.join(" "));
+                }
+            }
+        }
+    }
+        // `grep -P PAT` — PCRE. ERE-safe patterns lower to `grep -E` inline;
     // anything else uses the grep_p polyfill (emitted in the prologue):
     // GNU grep -P, macOS gnu-grep, or perl. A pass-through would leak.
     if cmd_name == Some("grep") && env.is_none() {
