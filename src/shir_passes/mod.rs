@@ -76,7 +76,6 @@ use pattern::PatternLift;
 /// lifted `then` body — the recursion re-enters the children for
 /// *other* lifts that may apply deeper).
 pub fn apply_lifts(prog: &mut IrProgram, lifts: &[Box<dyn PatternLift>]) -> usize {
-    eprintln!("DBG_APPLY_LIFTS: n_stmts={} n_lifts={}", prog.stmts.len(), lifts.len());
     let mut n = 0;
     for s in prog.stmts.iter_mut() {
         n += walk_stmt(s, lifts);
