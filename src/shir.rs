@@ -673,12 +673,13 @@ fn mark_loop_status_deadness(st: &IrStmt, live: &HashSet<usize>, dead: &mut Hash
 /// expansion, identical builtin function, minus the async exec machinery
 /// (the whileLoopSync pattern — same semantics, no per-call promises).
 pub(crate) const SYNC_BUILTINS: &[&str] = &[
-    ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue", "cut", "date",
-    "declare", "dirname", "echo", "eval", "exit", "export", "false", "grep", "head",
-    "hostname", "let", "local", "ls", "mapfile", "mktemp", "printf", "pwd", "read",
-    "readarray", "readlink", "readonly", "return", "seq", "sed", "set", "shift", "sort",
-    "source", "stat", "tail", "test", "touch", "tr", "trap", "true", "type", "typeset",
-    "uname", "uniq", "unset", "wc", "which",
+    ".", ":", "basename", "break", "cat", "cd", "cmp", "comm", "continue", "cp", "cut",
+    "date", "declare", "diff", "dirname", "echo", "eval", "exit", "export", "false", "find",
+    "grep", "gzip", "gunzip", "head", "hostname", "let", "local", "ls", "mapfile", "mkdir",
+    "mktemp", "mv", "paste", "printf", "pwd", "read", "readarray", "readlink", "readonly",
+    "return", "rm", "rmdir", "seq", "sed", "set", "sha256sum", "sha512sum", "shift", "sort",
+    "source", "stat", "tail", "tee", "test", "touch", "tr", "trap", "true", "type", "typeset",
+    "uname", "uniq", "unset", "wc", "which", "whoami",
 ];
 /// Names of every function the program defines (IrStmt::Function), set per
 /// compilation by `shir_to_estree` under COMPILE_LOCK. A script-defined
@@ -12835,7 +12836,7 @@ fn native_capture_path(cmd: &str, cmd_args: &[IrExpr]) -> Option<Expr> {
         // yields "" with the same output, the status is not observable
         // here; the runtime capture path keeps full status fidelity for
         // non-lifted forms).
-        "uname" | "date" | "readlink" | "hostname" => {
+        "uname" | "date" | "readlink" | "hostname" | "whoami" => {
             sh2_call(cmd, cmd_args.iter().map(expr_to_estree).collect())
         }
         _ => return None,
