@@ -23,12 +23,17 @@ pub type TransformFn = fn(&mut Vec<IrStmt>) -> bool;
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
 pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
+pub mod process_subst;
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
         // (name, <name>::transform) — estree worker adds entries here
         ("sync-ok-loops", sync_ok_loops::transform),
         ("seq-range-for", seq_range_for::transform),
+        // process substitution: the estree corpus path never reaches this
+        // (estree.rs transform_cmd rewrites `<(...)` pre-IR) — it serves
+        // the --shir export and the A1 ingress (frontend-emitted JSON).
+        ("process-subst", process_subst::transform),
     ]
 }
 

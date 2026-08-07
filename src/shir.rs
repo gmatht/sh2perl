@@ -3711,7 +3711,7 @@ fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
     }
 }
 
-fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
+pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
     Some(match cmd {
         Command::BlankLine => return None,
         Command::TestExpression(t) => {
@@ -4218,6 +4218,21 @@ pub(crate) fn command_to_shell_text(cmd: &Command) -> String {
                 .map(command_to_shell_text)
                 .collect();
             format!("while {cond}; do {}; done", body.join("; "))
+        }
+        Command::Redirect(rc) => {
+            // `sort <(echo y)` — a redirect-carrying producer: the inner
+            // command plus its redirects (process substitution included,
+            // via redirect_shell_text's `<(...)`/`>(...)` forms). Lets
+            // NESTED process substitution round-trip as shell text so the
+            // shared process-subst transform can materialize it.
+            let mut parts: Vec<String> = vec![command_to_shell_text(&rc.command)];
+            for r in &rc.redirects {
+                let t = redirect_shell_text(r);
+                if !t.is_empty() {
+                    parts.push(t);
+                }
+            }
+            parts.join(" ")
         }
         other => format!("{other:?}"),
     }
