@@ -17,6 +17,9 @@ lazy_static::lazy_static! {
     /// Array base names seen in the program (setArray/arrayLen/arrayIndex/
     /// slice usages) — the per-element lowering keys off these.
     static ref ARRAY_NAMES: std::sync::Mutex<HashSet<String>> = Default::default();
+    /// `shopt -s nocasematch` state — the [[ == ]] case emulation folds
+    /// the pattern case-insensitively when set.
+    static ref NOCASEMATCH: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 }
 
 /// Marker prefixes the core's lowering tags unquoted glob / process-
@@ -305,6 +308,7 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
     // collect the array base names (the A1's var_lengths is not carried
     // into IrProgram — the shared core; usage is a sound proxy)
     *ARRAY_NAMES.lock().unwrap() = array_names(prog);
+    *NOCASEMATCH.lock().unwrap() = false;
     let mut out = String::new();
     out.push_str("#!/bin/sh\n");
     if needs_grep_p(&prog.stmts) {
@@ -917,9 +921,24 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                     Ok(format!("[[ {t} ]]"))
                 } else if let Some((lhs, rhs)) = split_test_op(t, "==") {
                     // pattern match: case emulation (dash has no == in test)
-                    Ok(format!(
-                        "case \"{lhs}\" in {rhs}) : ;; *) false ;; esac"
-                    ))
+                    if let Some((neg, rest)) =
+                        rhs.strip_prefix("!(").and_then(|r| r.split_once(')'))
+                    {
+                        // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`:
+                        //   case "$s" in *Y) case "$s" in P Y) false;; *) :;; esac;; *) false;; esac
+                        Ok(format!(
+                            "case \"{lhs}\" in *{rest}) case \"{lhs}\" in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
+                        ))
+                    } else if *NOCASEMATCH.lock().unwrap() {
+                        Ok(format!(
+                            "case \"{lhs}\" in {}) : ;; *) false ;; esac",
+                            fold_case_pattern(&rhs)
+                        ))
+                    } else {
+                        Ok(format!(
+                            "case \"{lhs}\" in {rhs}) : ;; *) false ;; esac"
+                        ))
+                    }
                 } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
                     Ok(format!(
                         "case \"{lhs}\" in {rhs}) false ;; *) : ;; esac"
@@ -985,10 +1004,19 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 let body = arrow_at(args, 1)?;
                 Ok(format!("for (( {arith} )); do {body}; done"))
             }
-            // dash has no shopt builtin — a no-op keeps the script running
-            // (stdout-identical for the corpus's shopt usage: the options
-            // only affect bash-only constructs that fail anyway)
-            "shopt" => Ok(":".into()),
+            // dash has no shopt builtin — a no-op keeps the script running;
+            // track nocasematch (the [[ == ]] emulation folds patterns)
+            "shopt" => {
+                // the A1 shape is [name, Bool(on)]
+                let has = args
+                    .iter()
+                    .any(|a| matches!(a, IrExpr::Str(x, _) if x == "nocasematch"));
+                let on = args
+                    .iter()
+                    .any(|a| matches!(a, IrExpr::Bool(b) if *b));
+                *NOCASEMATCH.lock().unwrap() = has && on;
+                Ok(":".into())
+            }
             "arith" => Ok(format!("(( {} ))", raw_arg(args, 0)?)),
             "break" => Ok("break".into()),
             "continue" => Ok("continue".into()),
@@ -2187,6 +2215,25 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Str(s, _) => Ok(s.clone()),
         other => Err(format!("interp expr not renderable: {other:?}")),
     }
+}
+
+/// Case-fold a glob pattern for `shopt -s nocasematch` emulation:
+/// `foo` -> `[fF][oO][oO]` (glob metachars pass through).
+fn fold_case_pattern(p: &str) -> String {
+    let mut out = String::new();
+    for c in p.chars() {
+        match c {
+            '*' | '?' | '[' | ']' | '\\' | '!' | '^' => out.push(c),
+            c if c.is_ascii_alphabetic() => {
+                out.push('[');
+                out.push(c.to_ascii_lowercase());
+                out.push(c.to_ascii_uppercase());
+                out.push(']');
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The core's test lowering strips the spaces around comparison
