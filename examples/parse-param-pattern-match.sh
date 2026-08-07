@@ -1,4 +1,5 @@
 #!/bin/sh
-# ${0##*[/\\]} and similar pattern-based parameter expansions
-basename=${0##*[/\\]}
+# ${p##*[/\\]} and similar pattern-based parameter expansions
+p=/opt/tool/git-tool
+basename=${p##*[/\\]}
 echo "${basename#git-}"
