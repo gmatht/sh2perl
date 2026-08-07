@@ -1366,6 +1366,31 @@ mod tests {
     }
 
     #[test]
+    fn never_written_var_reads_fold_to_empty() {
+        // SH2_ASSUME_NO_ENV fold: a name with NO write anywhere in the
+        // program reads as the constant "" (the runtime would return the
+        // env fallback, which the documented assumption declares
+        // unobservable). `x`/`y` are never written — `echo "$x $y"`
+        // lowers without a single getVar.
+        let json = to_json("echo \"$x $y\"");
+        assert!(!json.contains("\"getVar\""));
+        // the read-builtin vars are writes: `read x` marks x
+        let json2 = to_json("read x; echo \"$x\"");
+        assert!(json2.contains("\"getVar\""));
+        // an eval/source program disables the fold entirely
+        let json3 = to_json("eval \"echo hi\"; echo \"$x\"");
+        assert!(json3.contains("\"getVar\""));
+        // a nameref TARGET is a write: `typeset -n r=x` makes `r=5`
+        // write x through the runtime's refVars indirection
+        let json4 = to_json("typeset -n r=x; r=5; echo \"$x\"");
+        assert!(json4.contains("\"getVar\""));
+        // a runtime `let` writes its arith idents: `let var++` (the JS
+        // keyword keeps the var store-bound) must not fold the read
+        let json5 = to_json("let var++; echo \"$var\"");
+        assert!(json5.contains("\"getVar\""));
+    }
+
+    #[test]
     fn and_or_chain_store_var_tests_lower_native() {
         // `[[ "$a" == "x" ]] && [[ "$b" == "y" ]]` — the chain links
         // branch on lastExit, so each test records its status natively
@@ -1379,7 +1404,10 @@ mod tests {
         // call has a different callee shape and may legitimately appear)
         assert!(!json
             .contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
-        assert!(json.contains("\"name\":\"getVar\""));
+        // `$a`/`$b` are NEVER WRITTEN — the SH2_ASSUME_NO_ENV fold
+        // lowers their reads to the constant "" (no getVar at all); the
+        // `_g` scratch still evaluates the single read exactly once
+        assert!(!json.contains("\"name\":\"getVar\""));
         assert!(json.contains("\"name\":\"_g\""));
         assert!(!json.contains("unsupported"));
     }
