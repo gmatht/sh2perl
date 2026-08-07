@@ -46,6 +46,20 @@ fn indent(out: &mut String, d: usize) {
 
 // ── statements (block form, newline-terminated) ──────────────────────
 
+// range_of — a numeric-range For iterable (`$(seq A B)` lowered to a
+// Range, or a bare Range / Array([Range])): (start, end). GNU `seq` has no
+// POSIX builtin — lowered to a portable while-loop instead of refusing.
+fn range_of(iter: &IrExpr) -> Option<(i64, i64)> {
+    match iter {
+        IrExpr::Range { start, end } => Some((*start, *end)),
+        IrExpr::Array(items) if items.len() == 1 => match items.first() {
+            Some(IrExpr::Range { start, end }) => Some((*start, *end)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
     match st {
         IrStmt::Expr(e) => {
@@ -89,6 +103,22 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             Ok(())
         }
         IrStmt::For { var, iter, body } => {
+            // GNU $(seq A B) / {A..B} -> a portable while-loop (POSIX has
+            // no seq builtin; the output must run on BSD/macOS sh)
+            if let Some((start, end)) = range_of(iter) {
+                indent(out, d);
+                out.push_str(&format!("{var}={start}\n"));
+                indent(out, d);
+                out.push_str(&format!("while [ \"${var}\" -le {end} ]; do\n"));
+                for b in body {
+                    stmt_to_sh(b, d + 1, out)?;
+                }
+                indent(out, d);
+                out.push_str(&format!("{var}=$(({var} + 1))\n"));
+                indent(out, d);
+                out.push_str("done\n");
+                return Ok(());
+            }
             indent(out, d);
             out.push_str("for ");
             out.push_str(var);
@@ -401,11 +431,9 @@ fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
                 Ok(format!("$({line})"))
             }
             "arith" => Ok(format!("$(({}))", raw_arg(args, 0)?)),
-            "setArray" => {
-                let name = raw_arg(args, 0)?;
-                let items = array_items(args, 1)?;
-                Ok(format!("{name}=({items})"))
-            }
+            "setArray" => Err(
+                "array literals are not POSIX-portable (no arrays in POSIX sh) — refusing".into(),
+            ),
             "setArrayAppend" => {
                 let name = raw_arg(args, 0)?;
                 let items = array_items(args, 1)?;
@@ -525,11 +553,9 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 let value = word_to_sh(arg(args, 2)?)?;
                 Ok(format!("{name}{op}{value}"))
             }
-            "setArray" => {
-                let name = raw_arg(args, 0)?;
-                let items = array_items(args, 1)?;
-                Ok(format!("{name}=({items})"))
-            }
+            "setArray" => Err(
+                "array literals are not POSIX-portable (no arrays in POSIX sh) — refusing".into(),
+            ),
             "setArrayAppend" => {
                 let name = raw_arg(args, 0)?;
                 let items = array_items(args, 1)?;
@@ -574,7 +600,32 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
     }
 }
 
+// GNU-only flags with no POSIX/BSD equivalent: a pass-through is a
+// portability LEAK (the output must run on macOS/BSD sh) — refuse loudly.
+fn gnu_only_flag(cmd: &str, flag: &str) -> bool {
+    match cmd {
+        "grep" => matches!(flag, "-P" | "--perl-regexp"),
+        "sed" => matches!(flag, "-i" | "--in-place"),
+        "head" => matches!(flag, "-z" | "--zero-terminated"),
+        "find" => matches!(flag, "-printf"),
+        "sort" => matches!(flag, "-V" | "--version-sort"),
+        _ => false,
+    }
+}
+
 fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)]>) -> Result<String, String> {
+    // GNU-only flags: refuse rather than leak an unportable invocation
+    if let IrExpr::Str(cn, _) = cmd {
+        for a in args {
+            if let IrExpr::Str(fl, _) = a {
+                if gnu_only_flag(cn, fl) {
+                    return Err(format!(
+                        "GNU-only flag {fl} for {cn} is not portable to POSIX/BSD — refusing"
+                    ));
+                }
+            }
+        }
+    }
     let mut out = String::new();
     if let Some(envs) = env {
         for (k, v) in envs {
@@ -935,16 +986,12 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
         "arith" => Ok(format!("$(({}))", raw_arg(args, 0)?)),
         "brace" => brace_to_sh(args),
         "join" => join_to_sh(arg(args, 0)?, false),
-        "setArray" => {
-            let name = raw_arg(args, 0)?;
-            let items = array_items(args, 1)?;
-            Ok(format!("{name}=({items})"))
-        }
-        "setArrayAppend" => {
-            let name = raw_arg(args, 0)?;
-            let items = array_items(args, 1)?;
-            Ok(format!("{name}+=({items})"))
-        }
+        "setArray" => Err(
+            "array literals are not POSIX-portable (no arrays in POSIX sh) — refusing".into(),
+        ),
+        "setArrayAppend" => Err(
+            "array append is not POSIX-portable (no arrays in POSIX sh) — refusing".into(),
+        ),
         "assign" => {
             let name = raw_arg(args, 0)?;
             let op = raw_arg(args, 1)?;
@@ -958,6 +1005,11 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
 /// `${name}`-family rendering. `list` selects the list form (join
 /// context, `"${arr[@]}"`).
 fn var_ref_to_sh(name: &str, list: bool) -> String {
+    if name == "RANDOM" {
+        // bash-only; POSIX sh has no portable random — POSIX awk's
+        // srand()/rand() (int(rand()*32768) = bash's 0..32767 range)
+        return "$(awk 'BEGIN{srand(); printf \"%d\", int(rand()*32768)}')".into();
+    }
     if list {
         if name == "@" || name == "*" {
             return format!("${{{name}}}");
@@ -1487,11 +1539,20 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             out.push_str("; fi");
             Ok(out)
         }
-        IrStmt::For { var, iter, body } => Ok(format!(
-            "for {var} in {}; do {}; done",
-            for_items_to_sh(iter)?,
-            stmts_inline(body)?
-        )),
+        IrStmt::For { var, iter, body } => {
+            if let Some((start, end)) = range_of(iter) {
+                // portable while form (the block renderer's inline twin)
+                return Ok(format!(
+                    "{var}={start}; while [ \"${var}\" -le {end} ]; do {}; {var}=$(({var} + 1)); done",
+                    stmts_inline(body)?
+                ));
+            }
+            Ok(format!(
+                "for {var} in {}; do {}; done",
+                for_items_to_sh(iter)?,
+                stmts_inline(body)?
+            ))
+        }
         IrStmt::While { cond, body } => Ok(format!(
             "while {}; do {}; done",
             cmd_to_sh(cond)?,
