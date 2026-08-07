@@ -48,10 +48,20 @@ pub mod context;
 pub mod lifetime;
 pub mod metric;
 pub mod pattern;
+pub mod restructure;
 pub mod transform;
 
 pub use context::PassContext;
 pub use metric::{CalleeCount, Metric};
+
+/// Run ONLY the goto-restructuring transform on a program. Used by the
+/// A1 ingress paths (cli --shir-in-estree / --shir-in-perl) so frontend
+/// A1 JSON containing `Label`/`Goto` is restructured before rendering,
+/// without disturbing the other pipeline transforms' behavior.
+pub fn restructure_goto_only(prog: &mut IrProgram) {
+    let ctx = PassContext::default();
+    restructure::RestructureGoto.run(prog, &ctx);
+}
 
 use crate::ir::IrProgram;
 
@@ -125,6 +135,10 @@ impl Pipeline {
                 Box::new(transform::ImportMinimize),
                 Box::new(transform::StoreToNative),
                 Box::new(transform::ConstMarkup),
+                // goto elimination: frontends may emit Label/Goto (C goto,
+                // labeled-break families); shell has no goto, so this runs
+                // for EVERY backend via the shared pipeline.
+                Box::new(restructure::RestructureGoto),
             ],
         }
     }

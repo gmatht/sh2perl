@@ -2798,6 +2798,7 @@ pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> 
 
     fn walk_stmt(st: &IrStmt, acc: &mut Acc, multi_run: bool) {
         match st {
+            IrStmt::Label(_) | IrStmt::Goto(_) => {}
             IrStmt::Assign { targets, expr } => {
                 for t in targets {
                     // array-element writes arrive either with a non-empty
@@ -3482,6 +3483,7 @@ fn loop_fixpoint(
 
 fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
     match s {
+        IrStmt::Label(_) | IrStmt::Goto(_) => {}
         IrStmt::Assign { targets, expr } if targets.len() == 1 && targets[0].indices.is_empty() => {
             let name = targets[0].var.clone();
             state.insert(name, ir_range(expr, state));
@@ -9258,6 +9260,7 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
     }
     fn scan_stmt(s: &IrStmt) -> bool {
         match s {
+            IrStmt::Label(_) | IrStmt::Goto(_) => false,
             IrStmt::Expr(e) => scan_expr(e),
             IrStmt::Output { value, .. } => scan_expr(value),
             IrStmt::WriteFile { path, content, .. } => {
@@ -9370,6 +9373,7 @@ fn ir_may_enable_nocasematch(prog: &IrProgram) -> bool {
     }
     fn scan_stmt(s: &IrStmt) -> bool {
         match s {
+            IrStmt::Label(_) | IrStmt::Goto(_) => false,
             IrStmt::Expr(e) => scan_expr(e),
             IrStmt::Output { value, .. } => scan_expr(value),
             IrStmt::WriteFile { path, content, .. } => {
@@ -9863,10 +9867,45 @@ fn flatten_for_iter(iter: &IrExpr) -> Expr {
 fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
     Some(match stmt {
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "break" => {
-            Stmt::BreakStatement { label: None }
+            // A bare `break` renders as an `sh2.break()` CALL (throws the
+            // BREAK signal caught by the whileLoop/forLoop runtime) — a
+            // native JS break is illegal inside the async loop-body
+            // callback the emitter generates (mirrors the case-lowering's
+            // conversion of source breaks to sh2.break() calls).
+            Stmt::ExpressionStatement {
+                expression: Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "sh2".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "break".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![],
+                    optional: false,
+                },
+            }
         }
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "continue" => {
-            Stmt::ContinueStatement { label: None }
+            Stmt::ExpressionStatement {
+                expression: Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "sh2".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "continue".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![],
+                    optional: false,
+                },
+            }
         }
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "return" => {
             Stmt::ReturnStatement {
