@@ -875,7 +875,7 @@ fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
                 }
                 Ok(format!("$({line})"))
             }
-            "arith" => Ok(format!("$(({}))", raw_arg(args, 0)?)),
+            "arith" => Ok(format!("$(({}))", arith_rewrite(&raw_arg(args, 0)?))),
             "setArray" => {
                 let name = raw_arg(args, 0)?;
                 Ok(set_array_to_sh(&name, &array_items(args, 1)?, false))
@@ -1002,7 +1002,7 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             "cstyleFor" => {
                 let arith = raw_arg(args, 0)?;
                 let body = arrow_at(args, 1)?;
-                Ok(format!("for (( {arith} )); do {body}; done"))
+                Ok(cstyle_for_to_sh(&arith, &body))
             }
             // dash has no shopt builtin — a no-op keeps the script running;
             // track nocasematch (the [[ == ]] emulation folds patterns)
@@ -1017,7 +1017,7 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 *NOCASEMATCH.lock().unwrap() = has && on;
                 Ok(":".into())
             }
-            "arith" => Ok(format!("(( {} ))", raw_arg(args, 0)?)),
+            "arith" => Ok(format!("(( {} ))", arith_rewrite(&raw_arg(args, 0)?))),
             "break" => Ok("break".into()),
             "continue" => Ok("continue".into()),
             "return" => {
@@ -1515,8 +1515,8 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
         let mut parts = Vec::new();
         for a in args {
             let e = match a {
-                IrExpr::Str(s, _) => s.clone(),
-                other => word_to_sh(other)?,
+                IrExpr::Str(s, _) => arith_rewrite(s),
+                other => arith_rewrite(&word_to_sh(other)?),
             };
             parts.push(format!("[ \"$(({e}))\" -ne 0 ]"));
         }
@@ -1890,7 +1890,7 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
         "arrayItems" => Ok(format!("$(_arr_keys {})", raw_arg(args, 0)?)),
         "arrayLen" => Ok(format!("${{{}}}_len", raw_arg(args, 0)?)),
         "capture" | "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
-        "arith" => Ok(format!("$(({}))", raw_arg(args, 0)?)),
+        "arith" => Ok(format!("$(({}))", arith_rewrite(&raw_arg(args, 0)?))),
         "brace" => brace_to_sh(args),
         "join" => join_to_sh(arg(args, 0)?, false),
         "setArray" => {
@@ -2203,7 +2203,7 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
             "arrayItems" => Ok(format!("$(_arr_keys {})", raw_arg(args, 0)?)),
             "arrayLen" => Ok(format!("${{#{}[@]}}", raw_arg(args, 0)?)),
             "capture" | "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
-            "arith" => Ok(format!("$(({}))", raw_arg(args, 0)?)),
+            "arith" => Ok(format!("$(({}))", arith_rewrite(&raw_arg(args, 0)?))),
             "join" => join_to_sh(arg(args, 0)?, false),
             "brace" => brace_to_sh(args),
             other => Err(format!("interp call not renderable: {other:?}")),
@@ -2587,12 +2587,180 @@ fn json_str(v: &serde_json::Value) -> String {
 
 // ── arithmetic ───────────────────────────────────────────────────────
 
+
+/// dash's arithmetic has NO ++/-- and NO `**` — rewrite the raw arith
+/// text (the `arith` call form carries a string, not the AST):
+///   `i++` -> `((i = i + 1) - 1)`   `++i` -> `(i = i + 1)`
+///   `i--` -> `((i = i - 1) + 1)`   `--i` -> `(i = i - 1)`
+///   `2 ** 3` -> `8` (literal powers fold)
+fn arith_rewrite(t: &str) -> String {
+    let b = t.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        if (c == '+' || c == '-') && i + 1 < b.len() && b[i + 1] == b[i] {
+            // postfix `name++` — previous char is ident, next is not
+            let prev_ident = i > 0 && ident(b[i - 1]);
+            let next_ident = i + 2 < b.len() && ident(b[i + 2]);
+            if prev_ident && !next_ident {
+                let mut s = i - 1;
+                while s > 0 && ident(b[s - 1]) {
+                    s -= 1;
+                }
+                let name = &t[s..i];
+                let (inc, dec) = if c == '+' { ("+ 1", "- 1") } else { ("- 1", "+ 1") };
+                out.truncate(out.len() - (i - s));
+                out.push_str(&format!("(({name} = {name} {inc}) {dec})"));
+                i += 2;
+                continue;
+            }
+            // prefix `++name`
+            let next_ident2 = i + 2 < b.len() && (b[i + 2].is_ascii_alphabetic() || b[i + 2] == b'_');
+            if next_ident2 {
+                let mut j = i + 2;
+                while j < b.len() && ident(b[j]) {
+                    j += 1;
+                }
+                let name = &t[i + 2..j];
+                let inc = if c == '+' { "+ 1" } else { "- 1" };
+                out.push_str(&format!("({name} = {name} {inc})"));
+                i = j;
+                continue;
+            }
+        }
+        if c == '*' && i + 1 < b.len() && b[i + 1] == b'*' {
+            // literal power `A ** B` — fold
+            let mut s = i;
+            while s > 0 && b[s - 1].is_ascii_whitespace() {
+                s -= 1;
+            }
+            let mut e = s;
+            while e > 0 && b[e - 1].is_ascii_digit() {
+                e -= 1;
+            }
+            let mut j = i + 2;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let mut k = j;
+            while k < b.len() && b[k].is_ascii_digit() {
+                k += 1;
+            }
+            if e < s && j < k {
+                let a: i64 = t[e..s].parse().unwrap_or(0);
+                let p: i64 = t[j..k].parse().unwrap_or(0);
+                if p >= 0 {
+                    let mut acc: i64 = 1;
+                    for _ in 0..p {
+                        acc = acc.saturating_mul(a);
+                    }
+                    out.truncate(out.len() - (s - e));
+                    out.push_str(&acc.to_string());
+                    i = k;
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+
+/// dash has NO c-style `for (( init; cond; incr ))` — lower to a portable
+/// while loop:
+///   i=2
+///   while [ "$((i))" -le "$((n))" ]; do
+///       body
+///       i=$((i + 1))
+///   done
+fn cstyle_for_to_sh(arith: &str, body: &str) -> String {
+    let mut parts = arith.split(';');
+    let init = parts.next().map(|s| s.trim()).unwrap_or("");
+    let cond = parts.next().map(|s| s.trim()).unwrap_or("1");
+    let incr = parts.next().map(|s| s.trim()).unwrap_or("");
+    let mut out = String::new();
+    if !init.is_empty() {
+        let (name, val) = init.split_once('=').unwrap_or((init, "0"));
+        out.push_str(&format!("{}={}\n", name.trim(), val.trim()));
+    }
+    // the condition: `LHS OP RHS` -> `[ "$((LHS))" -o "$((RHS))" ]`
+    let cond_sh = {
+        let mut cond_sh = String::new();
+        let mut rest = cond;
+        let mut done = false;
+        for (op, flag) in [
+            ("<=", "-le"),
+            (">=", "-ge"),
+            ("==", "-eq"),
+            ("!=", "-ne"),
+            ("<", "-lt"),
+            (">", "-gt"),
+        ] {
+            if let Some(idx) = rest.find(op) {
+                let lhs = rest[..idx].trim();
+                let rhs = rest[idx + op.len()..].trim();
+                if !lhs.is_empty() && !rhs.is_empty() {
+                    cond_sh = format!("[ \"$(({lhs}))\" {flag} \"$(({rhs}))\" ]");
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if !done {
+            // bare expression: nonzero test
+            cond_sh = format!("[ \"$(({rest}))\" -ne 0 ]");
+        }
+        cond_sh
+    };
+    out.push_str(&format!("while {cond_sh}; do {body}; "));
+    if !incr.is_empty() {
+        // `i++` -> `i=$((i + 1))`; `i += 2` -> `i=$((i + 2))`; else evaluate
+        let trimmed = incr.trim();
+        let incr_final = if trimmed.is_empty() {
+            ":".to_string()
+        } else if trimmed.contains("++") {
+            let name = trimmed.trim_end_matches("++").trim();
+            format!("{name}=$(({name} + 1))")
+        } else if trimmed.contains("--") {
+            let name = trimmed.trim_end_matches("--").trim();
+            format!("{name}=$(({name} - 1))")
+        } else if let Some((name, rest)) = trimmed.split_once("+=") {
+            format!("{}=$(({} + {}))", name.trim(), name.trim(), rest.trim())
+        } else if let Some((name, rest)) = trimmed.split_once("-=") {
+            format!("{}=$(({} - {}))", name.trim(), name.trim(), rest.trim())
+        } else {
+            format!("$(({trimmed}))")
+        };
+        out.push_str(&incr_final);
+        out.push(';');
+    }
+    out.push_str(" done");
+    out
+}
+
 fn arith_to_sh(a: &ArithAst) -> String {
     match a {
         ArithAst::Num(n) => n.to_string(),
         ArithAst::Var(name) => name.clone(),
         ArithAst::Index { var, key } => format!("{var}[{}]", arith_to_sh(key)),
         ArithAst::Bin { op, lhs, rhs } => {
+            // dash has no `**` — constant-fold literal powers
+            if op == "**" {
+                if let (ArithAst::Num(a), ArithAst::Num(b)) = (lhs.as_ref(), rhs.as_ref()) {
+                    let mut acc: i64 = 1;
+                    for _ in 0..*b.max(&0) {
+                        acc = acc.saturating_mul(*a);
+                    }
+                    if *b < 0 {
+                        return "0".into();
+                    }
+                    return acc.to_string();
+                }
+            }
             format!("({} {op} {})", arith_to_sh(lhs), arith_to_sh(rhs))
         }
         ArithAst::Un { op, arg } => format!("({op}{})", arith_to_sh(arg)),
@@ -2610,11 +2778,16 @@ fn arith_to_sh(a: &ArithAst) -> String {
             delta,
             prefix,
         } => {
-            let d = if *delta > 0 { "++" } else { "--" };
+            // dash's arithmetic has NO ++/-- — rewrite via assignment
+            // (the expression VALUE is preserved: prefix = new value,
+            // postfix = old value)
+            let (inc, dec) = if *delta > 0 { ("+ 1", "- 1") } else { ("- 1", "+ 1") };
             if *prefix {
-                format!("{d}{var}")
+                // `++i` -> `(i = i + 1)` — value is the NEW value
+                format!("({var} = {var} {inc})")
             } else {
-                format!("{var}{d}")
+                // `i++` -> `((i = i + 1) - 1)` — value is the OLD value
+                format!("(({var} = {var} {inc}) {dec})")
             }
         }
     }
