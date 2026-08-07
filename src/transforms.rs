@@ -24,6 +24,7 @@ pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
 pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
 pub mod process_subst;
+pub mod arith_forms;
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
@@ -34,6 +35,7 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // (estree.rs transform_cmd rewrites `<(...)` pre-IR) — it serves
         // the --shir export and the A1 ingress (frontend-emitted JSON).
         ("process-subst", process_subst::transform),
+        ("arith-forms", arith_forms::transform),
     ]
 }
 

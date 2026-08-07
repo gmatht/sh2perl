@@ -5261,10 +5261,16 @@ fn for_item_ir(w: &Word) -> IrExpr {
 }
 
 // ── arithmetic string → neutral AST ──────────────────────────────────
-/// Recursive-descent parser for `$((...))` content. Returns None when the
-/// expression contains assignments / ++ / -- / anything needing setVar
-/// semantics — those fall back to the runtime `sh2.arith` evaluator.
-fn parse_arith(src: &str) -> Option<ArithAst> {
+/// Recursive-descent parser for `$((...))` content (and `let`/`(( ))`
+/// arg strings — the `Assign`/`IncDec` arms are the let/(( )) lowering
+/// path; the non-write arms are the `$((..))` path). Returns None only
+/// on a genuine syntax error — an arith expression that mentions every
+/// supported construct parses to `Some(ArithAst)`. The native-lowering
+/// eligibility filter (`arith_lowerable` + div/mod-write interaction) is
+/// `parse_arith_native`'s job; the IR-shape transform
+/// (`src/transforms/arith_forms.rs`) consumes the Assign/IncDec nodes
+/// directly.
+pub fn parse_arith(src: &str) -> Option<ArithAst> {
     let chars: Vec<char> = src.chars().collect();
     let mut pos = 0usize;
     let n = chars.len();
@@ -6184,6 +6190,21 @@ fn is_async_call(name: &str) -> bool {
             | "capture" | "captureWords" | "forLoop" | "and" | "or"
     )
 }
+
+/// The async-call names with a runtime *Sync twin (captureSync /
+/// captureWordsSync / pipelineSync / subshellSync / redirectSync /
+/// blockSync plus the existing whileLoopSync/forLoopSync/cstyleForSync):
+/// the generic call arm dispatches to the twin when the WHOLE call is
+/// provably await-free (no AwaitExpression in any lowered arg — the same
+/// verdict the *Sync loops use). Identical semantics minus the per-call
+/// promise/microtask machinery (the whileLoopSync pattern). `exec` is
+/// NOT a twin candidate: its async form is the user-function dispatch /
+/// spawn path, which the sync `builtin` twin (exec_or_builtin) already
+/// covers for sync builtins.
+const SYNC_TWIN_CALLS: &[&str] = &[
+    "capture", "captureWords", "pipeline", "subshell", "redirect", "block", "whileLoop",
+    "forLoop", "cstyleFor",
+];
 
 /// `sh2.exec("name", args)` → sync `sh2.builtin("name", args)` when the
 /// runtime implements `name` as a SYNC builtin (harness builtins.json minus
@@ -10981,12 +11002,19 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 expression: seq(items),
             }
         }
-        IrStmt::Subshell(stmts) => Stmt::ExpressionStatement {
-            expression: await_call(
-                "subshell",
-                vec![arrow_sink(vec![], IrExpr::Arrow(stmts.clone()))],
-            ),
-        },
+        IrStmt::Subshell(stmts) => {
+            let body = arrow_sink(vec![], IrExpr::Arrow(stmts.clone()));
+            let call = if expr_has_await(&body) {
+                await_call("subshell", vec![body])
+            } else {
+                // *Sync twin (see the generic call arm): an await-free
+                // body runs through the sync runtime twin with a plain
+                // arrow — identical state copy/restore, no per-call
+                // promise.
+                sh2_call("subshellSync", vec![sync_arrow_flip(body)])
+            };
+            Stmt::ExpressionStatement { expression: call }
+        }
         IrStmt::Background(stmts) => Stmt::ExpressionStatement {
             expression: sh2_call(
                 "background",
@@ -11029,20 +11057,23 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         && matches!(args.as_slice(), [IrExpr::Str(name, _), IrExpr::Array(a)]
                             if name == "exec" && a.is_empty())
             );
-            Stmt::ExpressionStatement {
-                expression: await_call(
-                    "redirect",
-                    vec![
-                        arrow_sink(vec![], IrExpr::Arrow(inner.clone())),
-                        array(
-                            redirects
-                                .iter()
-                                .map(|r| redirect_spec_to_estree(r, persist))
-                                .collect(),
-                        ),
-                    ],
-                ),
-            }
+            let body = arrow_sink(vec![], IrExpr::Arrow(inner.clone()));
+            let specs = array(
+                redirects
+                    .iter()
+                    .map(|r| redirect_spec_to_estree(r, persist))
+                    .collect(),
+            );
+            let call = if expr_has_await(&body) || expr_has_await(&specs) {
+                await_call("redirect", vec![body, specs])
+            } else {
+                // *Sync twin (see the generic call arm): an await-free
+                // body AND literal (await-free) redirect targets run
+                // through the sync runtime twin — the same spec
+                // install/restore/persist logic, no per-call promise.
+                sh2_call("redirectSync", vec![sync_arrow_flip(body), specs])
+            };
+            Stmt::ExpressionStatement { expression: call }
         }
         IrStmt::Case { discriminant, clauses } => {
             let nocase = CASE_NOCASE.lock().unwrap().unwrap_or(false);
@@ -20910,11 +20941,36 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 }
             }
             let callee_name = exec_or_builtin(func, args);
-            let call = sh2_call(callee_name, mapped_args);
             if is_async_call(callee_name) {
-                await_expr(call)
+                // *Sync twin (the whileLoopSync pattern): a call whose
+                // EVERY lowered arg is await-free — no AwaitExpression
+                // anywhere (capture bodies, pipeline stage arrows,
+                // redirect targets, expression-position loop cond/body) —
+                // dispatches to the runtime's sync twin: identical
+                // semantics (fd swaps, capture strips, lastExit protocol,
+                // subshell state copy) minus the per-call promise/
+                // microtask machinery. The verdict is the same
+                // `expr_has_await` scan the *Sync loops use; an await
+                // anywhere (a capture/exec/spawn inside a body, an
+                // awaited redirect target) keeps the async form. An
+                // await-free body is pure CPU + sync builtins — the same
+                // blocking profile the async form already has (the
+                // builtins are sync either way), so the gate's *Sync
+                // no-blocking-I/O rule holds. The arrows inside flip to
+                // plain functions (`sync_arrow_flip_deep`) — a no-await
+                // async arrow would only allocate a discarded promise.
+                if SYNC_TWIN_CALLS.contains(&callee_name)
+                    && mapped_args.iter().all(|a| !expr_has_await(a))
+                {
+                    sh2_call(
+                        &format!("{callee_name}Sync"),
+                        mapped_args.into_iter().map(sync_arrow_flip_deep).collect(),
+                    )
+                } else {
+                    await_expr(sh2_call(callee_name, mapped_args))
+                }
             } else {
-                call
+                sh2_call(callee_name, mapped_args)
             }
         }
         IrExpr::BinOp { op: BinOpKind::And, lhs, rhs } => {
@@ -21044,6 +21100,143 @@ fn arrow_sink_sync(params: Vec<Expr>, body: IrExpr) -> Expr {
     let out = arrow_body_async(params, body, false);
     *ECHO_SINK_DEPTH.lock().unwrap() -= 1;
     out
+}
+
+/// Flip an already-lowered async arrow to NON-async for the *Sync twins
+/// (subshellSync / redirectSync statement arms): the body was lowered in
+/// the async context and is provably await-free (the caller's
+/// `expr_has_await` verdict), so the same statements are valid in a
+/// plain arrow and run synchronously when called — no promise allocated
+/// per call. Only the `r#async` flag changes; the lowering itself is
+/// untouched (no re-lowering, no per-function decl-seen state consumed
+/// twice).
+fn sync_arrow_flip(arrow: Expr) -> Expr {
+    match arrow {
+        Expr::ArrowFunctionExpression {
+            params,
+            body,
+            expression,
+            r#async: _,
+        } => Expr::ArrowFunctionExpression {
+            params,
+            body,
+            expression,
+            r#async: false,
+        },
+        other => other,
+    }
+}
+
+/// Deep version of [`sync_arrow_flip`] for the generic call arm's *Sync
+/// twin path: the whole call was proven await-free, so EVERY async arrow
+/// inside the args (pipeline stage arrows, loop cond/body arrows, capture
+/// bodies nested under arrays/objects) flips to a plain function — the
+/// runtime twins call them without await, and a no-await async arrow
+/// would only allocate a discarded promise.
+fn sync_arrow_flip_deep(e: Expr) -> Expr {
+    match e {
+        Expr::ArrowFunctionExpression {
+            params,
+            body,
+            expression,
+            r#async: _,
+        } => Expr::ArrowFunctionExpression {
+            params,
+            body,
+            expression,
+            r#async: false,
+        },
+        Expr::ArrayExpression { elements } => Expr::ArrayExpression {
+            elements: elements
+                .into_iter()
+                .map(|el| el.map(sync_arrow_flip_deep))
+                .collect(),
+        },
+        Expr::ObjectExpression { properties } => Expr::ObjectExpression {
+            properties: properties
+                .into_iter()
+                .map(|p| Property {
+                    type_: p.type_,
+                    key: sync_arrow_flip_deep(p.key),
+                    value: sync_arrow_flip_deep(p.value),
+                    kind: p.kind,
+                    computed: p.computed,
+                    shorthand: p.shorthand,
+                })
+                .collect(),
+        },
+        Expr::CallExpression {
+            callee,
+            arguments,
+            optional,
+        } => Expr::CallExpression {
+            callee: Box::new(sync_arrow_flip_deep(*callee)),
+            arguments: arguments.into_iter().map(sync_arrow_flip_deep).collect(),
+            optional,
+        },
+        Expr::MemberExpression {
+            object,
+            property,
+            computed,
+            optional,
+        } => Expr::MemberExpression {
+            object: Box::new(sync_arrow_flip_deep(*object)),
+            property: Box::new(sync_arrow_flip_deep(*property)),
+            computed,
+            optional,
+        },
+        Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
+            quasis,
+            expressions: expressions.into_iter().map(sync_arrow_flip_deep).collect(),
+        },
+        Expr::LogicalExpression { operator, left, right } => Expr::LogicalExpression {
+            operator,
+            left: Box::new(sync_arrow_flip_deep(*left)),
+            right: Box::new(sync_arrow_flip_deep(*right)),
+        },
+        Expr::BinaryExpression { operator, left, right } => Expr::BinaryExpression {
+            operator,
+            left: Box::new(sync_arrow_flip_deep(*left)),
+            right: Box::new(sync_arrow_flip_deep(*right)),
+        },
+        Expr::AssignmentExpression { operator, left, right } => Expr::AssignmentExpression {
+            operator,
+            left: Box::new(sync_arrow_flip_deep(*left)),
+            right: Box::new(sync_arrow_flip_deep(*right)),
+        },
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => Expr::ConditionalExpression {
+            test: Box::new(sync_arrow_flip_deep(*test)),
+            consequent: Box::new(sync_arrow_flip_deep(*consequent)),
+            alternate: Box::new(sync_arrow_flip_deep(*alternate)),
+        },
+        Expr::UnaryExpression {
+            operator,
+            argument,
+            prefix,
+        } => Expr::UnaryExpression {
+            operator,
+            argument: Box::new(sync_arrow_flip_deep(*argument)),
+            prefix,
+        },
+        Expr::SequenceExpression { expressions } => Expr::SequenceExpression {
+            expressions: expressions.into_iter().map(sync_arrow_flip_deep).collect(),
+        },
+        Expr::NewExpression { callee, arguments } => Expr::NewExpression {
+            callee: Box::new(sync_arrow_flip_deep(*callee)),
+            arguments: arguments.into_iter().map(sync_arrow_flip_deep).collect(),
+        },
+        Expr::SpreadElement { argument } => Expr::SpreadElement {
+            argument: Box::new(sync_arrow_flip_deep(*argument)),
+        },
+        Expr::AwaitExpression { .. } => {
+            unreachable!("sync_arrow_flip_deep on an await (the *Sync verdict excludes it)")
+        }
+        Expr::Identifier { .. } | Expr::Literal { .. } => e,
+    }
 }
 
 /// `arrow_sink` twins for functions provably never called under a swapped
