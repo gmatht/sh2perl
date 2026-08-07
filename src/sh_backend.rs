@@ -1858,6 +1858,18 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
         // ONE word, the unquoted form re-splits it (heredoc-apostrophe.sh
         // truncates at the first space without it).
         "getVar" => Ok(format!("\"{}\"", var_ref_to_sh(&raw_arg(args, 0)?, false))),
+        // param expansions in word position are the QUOTED source form
+        // (`echo "\"${x#p}\" "` — bash keeps interior spaces; the core
+        // wraps only unquoted getVar in split(), param has no marker, so
+        // the quote is the safe default). Array/list forms stay bare.
+        "param" => {
+            let s = param_to_sh(args, false)?;
+            if s.starts_with("$(_arr_") || s.starts_with("$(shift") {
+                Ok(s)
+            } else {
+                Ok(format!("\"{s}\"", ))
+            }
+        }
         // the core's word-splitting node: an UNQUOTED `$var` expands and
         // word-splits natively in POSIX sh — render the inner expansion
         // bare (no quotes).
