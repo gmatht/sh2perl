@@ -611,7 +611,8 @@ impl Render {
             self.emit("      if (fnmatch(pat, sc + (n - i), 0) == 0) { best = n - i; break; }");
             self.emit("    }");
             self.emit("  }");
-            self.emit("  strncpy(d, sc + best, cap - 1); d[cap - 1] = 0;");
+            self.emit("  if (best > cap - 1) best = cap - 1;");
+            self.emit("  strncpy(d, sc, best); d[best] = 0;");
             self.emit("  return d;");
             self.emit("}");
             self.emit("");
@@ -931,6 +932,21 @@ impl Render {
         t
     }
 
+    /// Is a param call a LENGTH form (${#x}, ${#arr[@]}, param("slice","#arr","@"))?
+    fn param_is_len(&self, args: &[IrExpr]) -> bool {
+        if let Some(IrExpr::Str(op, _)) = args.first() {
+            if op == "len" || op == "#" {
+                return true;
+            }
+            if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                if name.starts_with('#') {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// The char* C expression for a word's VALUE (numeric operands get a
     /// snprintf temp emitted as statements before the current one).
     fn value_c(&mut self, e: &IrExpr) -> String {
@@ -1011,7 +1027,13 @@ impl Render {
                         )
                     }
                 }
-                "param" => self.param_call(args),
+                "param" => {
+                    if self.param_is_len(args) {
+                        let v = self.param_call(args);
+                        return self.num_temp(&v);
+                    }
+                    self.param_call(args)
+                }
                 "capture" | "captureWords" => self.capture_call(args),
                 "brace" => {
                     let items = brace_expand(args);
@@ -1060,6 +1082,12 @@ impl Render {
                     if self.is_num(&name) {
                         return self.c_ident(&name);
                     }
+                }
+                format!("(int)atoll({})", self.value_c(e))
+            }
+            IrExpr::Call { func, args } if func == "param" => {
+                if self.param_is_len(args) {
+                    return self.call(func, args);
                 }
                 format!("(int)atoll({})", self.value_c(e))
             }
@@ -1803,6 +1831,22 @@ impl Render {
                         }
                     }
                     parts.push(Part::Lit("\n".to_string()));
+                    // `$?` inside the args must be read BEFORE the
+                    // `_sh_rc = 0` below clobbers it — pre-capture
+                    let has_rc = parts.iter().any(|pt| match pt {
+                        Part::Arg(v, _) => v.contains("_sh_rc"),
+                        _ => false,
+                    });
+                    if has_rc {
+                        let q = format!("_q{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!("long long {q} = _sh_rc;"));
+                        for pt in parts.iter_mut() {
+                            if let Part::Arg(v, _) = pt {
+                                *v = v.replace("_sh_rc", &q);
+                            }
+                        }
+                    }
                     let p = self.printf_from_parts(parts);
                     self.need_sh = true;
                     return format!("(_sh_rc = 0, {p})");
@@ -3042,6 +3086,14 @@ impl Render {
                     match p {
                         InterpPart::Lit(s) => out.push(Part::Lit(s.clone())),
                         InterpPart::Expr(x) => {
+                            // length params render as the digit string
+                            let is_len = matches!(x.as_ref(), IrExpr::Call { func, args }
+                                if func == "param" && self.param_is_len(args));
+                            if is_len {
+                                let v = self.expr(x);
+                                out.push(Part::Arg(self.num_temp(&v), NumSpec::Str));
+                                continue;
+                            }
                             let spec = if self.expr_is_num(x) {
                                 self.num_spec(x)
                             } else {
@@ -3102,6 +3154,14 @@ impl Render {
                         )];
                     }
                     return vec![Part::Arg(self.call(func, &args), NumSpec::Str)];
+                }
+                // length params (${#x} / ${#arr[@]}) render as the digit
+                // string — the call returns a number, so num_temp it
+                if func == "param" {
+                    if self.param_is_len(&args) {
+                        let v = self.call(func, &args);
+                        return vec![Part::Arg(self.num_temp(&v), NumSpec::Str)];
+                    }
                 }
                 // other calls: render the call expression; numeric iff the
                 // expression is numeric (stubs return long long → %lld+cast)
@@ -4684,7 +4744,9 @@ fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     collect_store_expr(x, out);
                 }
             }
-            IrStmt::For { iter, body, .. } => {
+            IrStmt::For { var, iter, body, .. } => {
+                // the loop var is ASSIGNED by the loop — a store entry
+                out.insert(var.clone());
                 collect_store_expr(iter, out);
                 collect_store_names(body, out);
             }
