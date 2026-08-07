@@ -374,7 +374,7 @@ impl Render {
             self.emit("}");
             self.emit("");
         }
-        if self.need_time {
+        if self.need_time || self.need_stat {
             self.emit("#include <time.h>");
         }
         self.emit("#include <math.h>");
@@ -619,11 +619,24 @@ impl Render {
         }
         if self.need_stat {
             self.emit("/* [ -f/-d/-e/-s/... ] file tests */");
+            self.emit("static long long _sh_mtime(const char *p) { struct stat st; return stat(p, &st) == 0 ? (long long)st.st_mtime : -1; }");
             self.emit("static int _sh_is_f(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISREG(st.st_mode); }");
             self.emit("static int _sh_is_d(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }");
             self.emit("static int _sh_is_e(const char *p) { struct stat st; return stat(p, &st) == 0; }");
             self.emit("static int _sh_is_s(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_size > 0; }");
             self.emit("static int _sh_is_l(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISLNK(st.st_mode); }");
+            self.emit("static int _sh_is_h(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISLNK(st.st_mode); }");
+            self.emit("static int _sh_is_S(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISSOCK(st.st_mode); }");
+            self.emit("static int _sh_is_p(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISFIFO(st.st_mode); }");
+            self.emit("static int _sh_is_b(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISBLK(st.st_mode); }");
+            self.emit("static int _sh_is_c(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISCHR(st.st_mode); }");
+            self.emit("static int _sh_is_g(const char *p) { struct stat st; return stat(p, &st) == 0 && (st.st_mode & S_ISGID); }");
+            self.emit("static int _sh_is_k(const char *p) { struct stat st; return stat(p, &st) == 0 && (st.st_mode & S_ISVTX); }");
+            self.emit("static int _sh_is_u(const char *p) { struct stat st; return stat(p, &st) == 0 && (st.st_mode & S_ISUID); }");
+            self.emit("static int _sh_is_t(const char *p) { return isatty(atoi(p)); }");
+            self.emit("static int _sh_is_G(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_gid == getgid(); }");
+            self.emit("static int _sh_is_O(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_uid == getuid(); }");
+            self.emit("static int _sh_is_N(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_mtime > time(0); }");
             self.emit("static int _sh_is_r(const char *p) { return access(p, R_OK) == 0; }");
             self.emit("static int _sh_is_w(const char *p) { return access(p, W_OK) == 0; }");
             self.emit("static int _sh_is_x(const char *p) { return access(p, X_OK) == 0; }");
@@ -1110,11 +1123,10 @@ impl Render {
         body(self);
         let body_out = std::mem::replace(&mut self.out, saved);
         self.depth = saved_depth;
-        let ret = if invert {
-            "  return !_sh_system_rc();"
-        } else {
-            "  return _sh_system_rc();"
-        };
+        // bash truthiness: rc == 0 is TRUE — the site's C value must be
+        // the C-truthiness (chains/ifs/whiles all use this convention)
+        let _ = invert;
+        let ret = "  return !_sh_system_rc();";
         let mut s = format!("static int _sh_site_{id}(void) {{\n");
         for line in body_out {
             s.push_str(&line);
@@ -1792,9 +1804,12 @@ impl Render {
                     raw(self, "<");
                     self.sh_word(buf, &rd.target);
                 }
-                "heredoc" => {
+                "heredoc" | "heredoc-tabs" => {
                     // target = the body content (already interpolated by
-                    // the core); a quoted delimiter keeps it literal
+                    // the core); a quoted delimiter keeps it literal.
+                    // `<<-` strips leading tabs from content + delimiter
+                    // (the tab-stripped content arrives pre-stripped from
+                    // the core; the delimiter line uses the same form)
                     raw(self, "<<'_SH2EOF_'\n");
                     let v = self.value_c(&rd.target);
                     addv(self, &v);
@@ -1897,7 +1912,7 @@ impl Render {
                 // gate), rc 0 on success — chdir's return is inverted;
                 // PWD must follow (bash keeps it in sync)
                 format!(
-                    "(_sh_rc = ((chdir({dir}) == 0) ? (setenv(\"PWD\", getcwd(0, 0), 1), 0) : 1))"
+                    "({{ int _r = chdir({dir}); _sh_rc = (_r == 0 ? 0 : 1); if (_r == 0) setenv(\"PWD\", getcwd(0, 0), 1); _r == 0; }})"
                 )
             }
             "exit" => {
@@ -1955,7 +1970,9 @@ impl Render {
                 };
                 self.need_sh = true;
                 self.need_time = true;
-                format!("(_sh_rc = ((_sh_sleep({v}) == 0) ? 0 : 1))")
+                format!(
+                    "({{ int _r = _sh_sleep({v}); _sh_rc = (_r == 0 ? 0 : 1); _r == 0; }})"
+                )
             }
             "read" => {
                 // `read [-r] var...` — read a line into the first var
@@ -1977,14 +1994,19 @@ impl Render {
                 let id = self.c_ident(&target);
                 self.store.insert(target.clone());
                 self.emit(&format!("{id} = _sh_readline();"));
-                format!("(_sh_rc = ({id}[0] ? 0 : 1))")
+                format!(
+                    "({{ int _r = ({id}[0] ? 0 : 1); _sh_rc = _r; _r == 0; }})"
+                )
             }
             "let" => {
                 if let Some(IrExpr::Array(items)) = args.get(1) {
                     if let Some(IrExpr::Str(expr, _)) = items.first() {
                         if let Some(c) = self.let_render(expr) {
                             self.need_sh = true;
-                            return format!("(_sh_rc = (({c}) ? 0 : 1))");
+                            // `let` succeeds (rc 0) iff the arith is nonzero
+                            return format!(
+                                "({{ long long _r = ({c}); _sh_rc = (_r != 0 ? 0 : 1); _r != 0; }})"
+                            );
                         }
                     }
                 }
@@ -2209,7 +2231,8 @@ impl Render {
 
     // ── test lowering ────────────────────────────────────────────────
 
-    /// Quote-aware test tokenizer (mirrors the perl renderer's).
+    /// Quote-aware test tokenizer: `"..."`/`'...'` and `${...}` (with
+    /// embedded spaces in the pattern) stay ONE token.
     fn test_tokens(&self, s: &str) -> Vec<String> {
         let mut toks = Vec::new();
         let chars: Vec<char> = s.chars().collect();
@@ -2220,30 +2243,59 @@ impl Render {
                 i += 1;
                 continue;
             }
+            let mut t = String::new();
             if c == '"' || c == '\'' {
                 let quote = c;
-                let mut j = i + 1;
-                let mut t = String::new();
                 t.push(c);
-                while j < chars.len() && chars[j] != quote {
-                    t.push(chars[j]);
-                    j += 1;
+                i += 1;
+                while i < chars.len() && chars[i] != quote {
+                    t.push(chars[i]);
+                    i += 1;
                 }
-                if j < chars.len() {
-                    t.push(chars[j]);
-                    i = j + 1;
-                } else {
-                    i = j;
+                if i < chars.len() {
+                    t.push(chars[i]);
+                    i += 1;
                 }
                 toks.push(t);
                 continue;
             }
-            let mut j = i;
-            while j < chars.len() && !chars[j].is_whitespace() {
-                j += 1;
+            if c == '$' {
+                // `${...}` — consume through the matching `}` (the
+                // pattern may contain spaces)
+                t.push(c);
+                i += 1;
+                if i < chars.len() && chars[i] == '{' {
+                    t.push('{');
+                    i += 1;
+                    let mut depth = 1;
+                    while i < chars.len() && depth > 0 {
+                        if chars[i] == '{' {
+                            depth += 1;
+                        } else if chars[i] == '}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                t.push('}');
+                                i += 1;
+                                break;
+                            }
+                        }
+                        t.push(chars[i]);
+                        i += 1;
+                    }
+                } else {
+                    while i < chars.len() && !chars[i].is_whitespace() {
+                        t.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                toks.push(t);
+                continue;
             }
-            toks.push(chars[i..j].iter().collect());
-            i = j;
+            while i < chars.len() && !chars[i].is_whitespace() {
+                t.push(chars[i]);
+                i += 1;
+            }
+            toks.push(t);
         }
         toks
     }
@@ -2311,7 +2363,8 @@ impl Render {
                 match flag.as_str() {
                     "-n" => format!("(({v}) && ({v})[0])"),
                     "-z" => format!("(!({v}) || !({v})[0])"),
-                    "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L" => {
+                    "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L" | "-S" | "-p"
+                    | "-b" | "-c" | "-g" | "-k" | "-u" | "-G" | "-O" | "-N" | "-h" => {
                         self.need_stat = true;
                         format!("_sh_is_{}({v})", &flag[1..])
                     }
@@ -2320,6 +2373,19 @@ impl Render {
                         format!("_sh_is_e({v})")
                     }
                     _ => {
+                        // `!-x` — a negated file test (no space)
+                        if let Some(rest) = flag.strip_prefix('!') {
+                            let flag = format!("-{rest}");
+                            if matches!(
+                                flag.as_str(),
+                                "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L"
+                                    | "-S" | "-p" | "-b" | "-c" | "-g" | "-k" | "-u"
+                                    | "-G" | "-O" | "-N" | "-h"
+                            ) {
+                                self.need_stat = true;
+                                return format!("(!_sh_is_{}({v}))", &flag[1..]);
+                            }
+                        }
                         self.mark_todo(&format!("test flag {flag}"));
                         "0".into()
                     }
@@ -2383,6 +2449,17 @@ impl Render {
                     format!("(strcmp({l}, {r}) == 0)")
                 }
             }
+            "-ot" | "-nt" | "-ef" => {
+                // file mtime/newer/exists compares (bash 0 if either missing)
+                self.need_stat = true;
+                match op {
+                    "-ot" => format!("(_sh_mtime({l}) < _sh_mtime({r}))"),
+                    "-nt" => format!("(_sh_mtime({l}) > _sh_mtime({r}))"),
+                    _ => format!(
+                        "(stat({l}, &(struct stat){{0}}) == 0 && stat({r}, &(struct stat){{0}}) == 0)"
+                    ),
+                }
+            }
             "=~" => {
                 self.need_regex = true;
                 let t = format!("_s{}", self.temp_seq);
@@ -2403,6 +2480,35 @@ impl Render {
     /// A test operand → char* C expression (numeric vars via num_temp).
     fn test_value(&mut self, t: &str) -> String {
         let raw = t.trim();
+        // `${name op arg}` — a parameter expansion inside the test.
+        // (The core may DROP the closing `}` when the pattern contains a
+        // `#` — parse the unclosed form too.)
+        if raw.starts_with("${") {
+            let inner = if raw.ends_with('}') {
+                &raw[2..raw.len() - 1]
+            } else {
+                raw.trim_end_matches(' ').trim_start_matches("${")
+            };
+            for op in ["##", "%%", "#", "%", ":-", "-", ":=", "=", "//", "/", "^^", ",,"] {
+                if let Some(pos) = inner.find(op) {
+                    if pos > 0 {
+                        let name = inner[..pos].to_string();
+                        let arg = inner[pos + op.len()..].to_string();
+                        let args = vec![
+                            IrExpr::Str(op.to_string(), crate::ir::StrStyle::DoubleQuoted),
+                            IrExpr::Str(name, crate::ir::StrStyle::DoubleQuoted),
+                            IrExpr::Str(arg, crate::ir::StrStyle::DoubleQuoted),
+                        ];
+                        return self.param_call(&args);
+                    }
+                }
+            }
+            // plain ${name}
+            return self.value_c(&IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![IrExpr::Str(inner.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+            });
+        }
         let dequoted = raw
             .strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
@@ -2765,7 +2871,9 @@ impl Render {
                 if let Some(IrExpr::Str(s, _)) = args.first() {
                     if let Some(c) = self.let_render(s) {
                         self.need_sh = true;
-                        return format!("(_sh_rc = (({c}) ? 0 : 1))");
+                        return format!(
+                            "({{ long long _r = ({c}); _sh_rc = (_r != 0 ? 0 : 1); _r != 0; }})"
+                        );
                     }
                 }
                 self.need_sh = true;
@@ -4452,15 +4560,24 @@ impl Render {
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 0;
 
-        // Preamble: includes, runtime helpers, the global var decls,
-        // then the site/capture helpers (definition-before-use: main +
-        // functions call them), the sh2.* stubs (should be none), the
-        // shell functions, main.
+        // Preamble: shell functions rendered FIRST (into a side buffer)
+        // — their bodies' exec/test needs set the runtime flags BEFORE
+        // emit_runtime, and a function body calling a stub must see its
+        // definition (definition-before-use).
+        let fn_defs = std::mem::take(&mut self.fn_defs);
+        let mut fn_out = Vec::new();
+        let saved_out = std::mem::replace(&mut self.out, Vec::new());
+        for (name, body) in &fn_defs {
+            self.emit_function(name, body, &vars);
+        }
+        fn_out = std::mem::replace(&mut self.out, saved_out);
+        self.fn_defs = fn_defs;
+        // includes, runtime helpers, the global var decls, then the
+        // site/capture helpers (definition-before-use: main + functions
+        // call them), the sh2.* stubs (should be none), main.
         self.emit_runtime();
         self.out.extend(decl_out.iter().cloned());
         self.emit("");
-        // site/capture helper bodies (registered in emission order:
-        // captures register before the sites that use them)
         let cap_bodies = std::mem::take(&mut self.cap_bodies);
         for b in &cap_bodies {
             for line in b.lines() {
@@ -4475,19 +4592,6 @@ impl Render {
             }
             self.emit("");
         }
-        // shell functions rendered FIRST (into a side buffer) so the
-        // sh2.* stub set is complete before the stubs are emitted —
-        // definition-before-use: a function body calling a stub must
-        // see its definition (an implicit declaration then the real
-        // definition is a conflicting-types error).
-        let fn_defs = std::mem::take(&mut self.fn_defs);
-        let mut fn_out = Vec::new();
-        let saved_out = std::mem::replace(&mut self.out, Vec::new());
-        for (name, body) in &fn_defs {
-            self.emit_function(name, body, &vars);
-        }
-        fn_out = std::mem::replace(&mut self.out, saved_out);
-        self.fn_defs = fn_defs;
         if !self.sh2_calls.is_empty() {
             self.emit("/* sh2.* runtime stubs — TODO: implement (harness/sh2-namespace.json) */");
             let names: Vec<String> = self.sh2_calls.iter().cloned().collect();
