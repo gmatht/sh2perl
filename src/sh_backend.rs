@@ -1063,7 +1063,18 @@ fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
                 }
                 Ok(format!("$({line})"))
             }
-            "arith" => Ok(format!("$(({}))", arith_rewrite(&raw_arg(args, 0)?))),
+
+            "arith" => {
+                let raw = raw_arg(args, 0)?;
+                if raw.contains(['"', '\'']) {
+                    // bash errors at RUNTIME (the assignment is skipped);
+                    // dash would fail to PARSE the whole script — a
+                    // failed cmdsub has the same ${x:-d} observable
+                    Ok("$(false)".into())
+                } else {
+                    Ok(format!("$(({}))", arith_rewrite(&raw)))
+                }
+            }
             "setArray" => {
                 let name = raw_arg(args, 0)?;
                 Ok(set_array_to_sh(&name, &array_items(args, 1)?, false))
@@ -1205,7 +1216,14 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 *NOCASEMATCH.lock().unwrap() = has && on;
                 Ok(":".into())
             }
-            "arith" => Ok(format!("(( {} ))", arith_rewrite(&raw_arg(args, 0)?))),
+            "arith" => {
+                let raw = raw_arg(args, 0)?;
+                if raw.contains(['"', '\'']) {
+                    Ok("$(false)".into())
+                } else {
+                    Ok(format!("(( {} ))", arith_rewrite(&raw)))
+                }
+            }
             "break" => Ok("break".into()),
             "continue" => Ok("continue".into()),
             "return" => {
@@ -2308,6 +2326,16 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             }
             let offn: i64 = off.trim().parse().unwrap_or(-1);
             let lenn: i64 = len.trim().parse().unwrap_or(-1);
+            if offn < 0 && (lenn >= 0 || len.is_empty()) {
+                // `${s: -3}` — negative offsets count from the END
+                let start = format!("$((${{#{name}}}{}+1))", offn);
+                let range = if len.is_empty() {
+                    format!("{start}-")
+                } else {
+                    format!("{start}-$(({start}+{lenn}-1))")
+                };
+                return Ok(format!("$(printf '%s' \"${{{name}}}\" | cut -c{range})"));
+            }
             if offn >= 0 && (lenn >= 0 || len.is_empty()) {
                 if !len.is_empty() && lenn == 0 {
                     // `${x:off:0}` — always empty
@@ -2508,7 +2536,18 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
             "arrayLen" => Ok(format!("${{#{}[@]}}", raw_arg(args, 0)?)),
             "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
         "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
-            "arith" => Ok(format!("$(({}))", arith_rewrite(&raw_arg(args, 0)?))),
+
+            "arith" => {
+                let raw = raw_arg(args, 0)?;
+                if raw.contains(['"', '\'']) {
+                    // bash errors at RUNTIME (the assignment is skipped);
+                    // dash would fail to PARSE the whole script — a
+                    // failed cmdsub has the same ${x:-d} observable
+                    Ok("$(false)".into())
+                } else {
+                    Ok(format!("$(({}))", arith_rewrite(&raw)))
+                }
+            }
             "join" => join_to_sh(arg(args, 0)?, false),
             "brace" => brace_to_sh(args),
             other => Err(format!("interp call not renderable: {other:?}")),
