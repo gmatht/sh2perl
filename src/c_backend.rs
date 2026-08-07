@@ -178,6 +178,12 @@ pub struct Render {
     site_bodies: Vec<String>,
     /// emitted capture helper bodies (`static char *_cap_N(void) {...}`)
     cap_bodies: Vec<String>,
+    /// the current param call's args (slice offsets read via args_value_num)
+    cur_param_args: Vec<IrExpr>,
+    /// array names (indexed arrays: `char* name[N]` + `name_len`)
+    arrays: BTreeSet<String>,
+    /// associative-array names (`name_k`/`name_v`/`name_n` stores)
+    assoc_arrays: BTreeSet<String>,
     /// `shopt -s nocasematch` → [[ == ]] globs match case-insensitively
     nocasematch: bool,
     /// rendering inside a shell function body (Return emits `return;`)
@@ -198,6 +204,9 @@ const FIXED_BUF_CAP: u64 = 1024;
 
 /// Per-capture-site result buffer size (command substitution output).
 const CAP_BUF: usize = 65536;
+
+/// Static capacity of the array stores (elements / assoc pairs).
+const ARR_CAP: usize = 1024;
 
 /// Render an `IrProgram` to C source (main() body).
 pub fn shir_to_c(prog: &IrProgram) -> String {
@@ -375,15 +384,6 @@ impl Render {
             self.emit("/* shell-out runtime: build a command line, run it via bash -c */");
             self.emit("static int _sh_rc = 0;");
             self.emit("static int _sh_argc = 0; static char **_sh_argv = 0;");
-            self.emit("static char *_sh_argv_join(char *d, size_t cap) {");
-            self.emit("  d[0] = 0; size_t n = 0;");
-            self.emit("  for (int i = 1; i < _sh_argc; i++) {");
-            self.emit("    if (i > 1 && n + 1 < cap) d[n++] = ' ';");
-            self.emit("    const char *s = _sh_argv[i];");
-            self.emit("    while (s && *s && n + 1 < cap) d[n++] = *s++;");
-            self.emit("  }");
-            self.emit("  d[n] = 0; return d;");
-            self.emit("}");
             self.emit("static char *_sh_cmd = 0; static size_t _sh_cap = 0;");
             self.emit("static char *_sh_wb = 0; static size_t _sh_wcap = 0;");
             self.emit("static char *_sh_wrap = 0; static size_t _sh_wrapcap = 0;");
@@ -436,6 +436,68 @@ impl Render {
             self.emit("    if (*p == '\\'') _sh_badd(b, cap, \"'\\\\''\"); else _sh_baddc(b, cap, *p);");
             self.emit("  }");
             self.emit("  _sh_baddc(b, cap, '\\'');");
+            self.emit("}");
+            self.emit("static void _sh_idx_init(char **b, size_t *cap, const char *name, char **a, size_t n) {");
+            self.emit("  _sh_badd(b, cap, \" \"); _sh_badd(b, cap, name); _sh_badd(b, cap, \"=(\");");
+            self.emit("  for (size_t i = 0; i < n; i++) if (a[i]) _sh_bword(b, cap, a[i]);");
+            self.emit("  _sh_badd(b, cap, \")\");");
+            self.emit("}");
+            self.emit("static void _sh_assoc_init(char **b, size_t *cap, const char *name, char **k, char **v, size_t n) {");
+            self.emit("  _sh_badd(b, cap, \" \"); _sh_badd(b, cap, name); _sh_badd(b, cap, \"=(\");");
+            self.emit("  for (size_t i = 0; i < n; i++) {");
+            self.emit("    if (!k[i]) continue;");
+            self.emit("    _sh_badd(b, cap, \"[\"); _sh_bword(b, cap, k[i]); _sh_badd(b, cap, \"]=\");");
+            self.emit("    _sh_bword(b, cap, v[i] ? v[i] : \"\");");
+            self.emit("  }");
+            self.emit("  _sh_badd(b, cap, \")\");");
+            self.emit("}");
+            self.emit("static void _sh_arr_set(char **a, size_t *len, size_t cap, long long i, const char *v) {");
+            self.emit("  if (i < 0 || i >= (long long)cap || !v) return;");
+            self.emit("  a[i] = (char*)v;");
+            self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
+            self.emit("}");
+            self.emit("static const char *_sh_arr_get(char **a, size_t len, long long i) {");
+            self.emit("  if (i < 0 || i >= (long long)len || !a[i]) return \"\";");
+            self.emit("  return a[i];");
+            self.emit("}");
+            self.emit("static void _sh_assoc_set(char **k, char **v, size_t *n, size_t cap, const char *key, const char *val) {");
+            self.emit("  if (!key) return;");
+            self.emit("  for (size_t i = 0; i < *n; i++)");
+            self.emit("    if (k[i] && strcmp(k[i], key) == 0) { v[i] = (char*)val; return; }");
+            self.emit("  if (*n < cap) { k[*n] = (char*)key; v[*n] = (char*)val; (*n)++; }");
+            self.emit("}");
+            self.emit("static const char *_sh_assoc_get(char **k, char **v, size_t n, const char *key) {");
+            self.emit("  if (!key) return \"\";");
+            self.emit("  for (size_t i = 0; i < n; i++)");
+            self.emit("    if (k[i] && strcmp(k[i], key) == 0) return v[i] ? v[i] : \"\";");
+            self.emit("  return \"\";");
+            self.emit("}");
+            self.emit("static void _sh_join_arr(char *d, size_t cap, char **a, size_t n) {");
+            self.emit("  size_t dn = 0;");
+            self.emit("  for (size_t i = 0; i < n; i++) {");
+            self.emit("    if (i > 0 && dn + 1 < cap) d[dn++] = ' ';");
+            self.emit("    if (!a[i]) continue;");
+            self.emit("    for (const char *s = a[i]; *s && dn + 1 < cap; s++) d[dn++] = *s;");
+            self.emit("  }");
+            self.emit("  d[dn] = 0;");
+            self.emit("}");
+            self.emit("static void _sh_join_keys(char *d, size_t cap, char **k, size_t n) {");
+            self.emit("  size_t dn = 0;");
+            self.emit("  for (size_t i = 0; i < n; i++) {");
+            self.emit("    if (i > 0 && dn + 1 < cap) d[dn++] = ' ';");
+            self.emit("    if (!k[i]) continue;");
+            self.emit("    for (const char *s = k[i]; *s && dn + 1 < cap; s++) d[dn++] = *s;");
+            self.emit("  }");
+            self.emit("  d[dn] = 0;");
+            self.emit("}");
+            self.emit("static char *_sh_argv_join(char *d, size_t cap) {");
+            self.emit("  d[0] = 0; size_t n = 0;");
+            self.emit("  for (int i = 1; i < _sh_argc; i++) {");
+            self.emit("    if (i > 1 && n + 1 < cap) d[n++] = ' ';");
+            self.emit("    const char *s = _sh_argv[i];");
+            self.emit("    while (s && *s && n + 1 < cap) d[n++] = *s++;");
+            self.emit("  }");
+            self.emit("  d[n] = 0; return d;");
             self.emit("}");
             self.emit("/* wrap the built command as `bash -c '<cmd>'` (single-quote escaped) */");
             self.emit("static void _sh_wrap_cmd(const char *cmd) {");
@@ -644,9 +706,13 @@ impl Render {
         match a {
             ArithAst::Num(n) => n.to_string(),
             ArithAst::Var(name) => self.c_ident(name),
-            ArithAst::Index { .. } => {
-                self.mark_todo("arith Index");
-                "0".into()
+            ArithAst::Index { var, key } => {
+                // `$((arr[i]))` — the element's numeric value
+                self.arrays.insert(var.clone());
+                self.need_sh = true;
+                let id = self.c_ident(var);
+                let k = self.arith(key);
+                format!("(long long)atoll(_sh_arr_get({id}, {id}_len, {k}))")
             }
             ArithAst::Bin { op, lhs, rhs } => {
                 let l = self.arith(lhs);
@@ -955,6 +1021,25 @@ impl Render {
                     let items = brace_expand(args);
                     Self::cstr(&items.join(" "))
                 }
+                "arrayIndex" => {
+                    let (Some(name), Some(key)) = (Self::str_arg(args, 0), Self::str_arg(args, 1))
+                    else {
+                        return "0".into();
+                    };
+                    self.array_index_read(&name, &key)
+                }
+                "arrayLen" => match Self::str_arg(args, 0) {
+                    Some(name) => {
+                        let l = self.array_len(&name);
+                        self.num_temp(&l)
+                    }
+                    None => "0".into(),
+                },
+                "arrayItems" | "listVar" => match Self::str_arg(args, 0) {
+                    Some(name) => self.array_join_all(&name),
+                    None => "0".into(),
+                },
+                "join" => self.join_value(args),
                 _ => self.expr(e),
             },
             _ => self.expr(e),
@@ -1313,9 +1398,142 @@ impl Render {
                     self.sh_stage(buf, inner);
                     self.sh_redirect_text(buf, redirects);
                 }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "redirect" => {
+                    // a redirect CALL inside a stage: `cmd > f`
+                    if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                        self.sh_stage(buf, stmts);
+                    }
+                    if let Some(IrExpr::Array(specs)) = args.get(1) {
+                        self.sh_redirect_specs(buf, specs);
+                    }
+                }
+                IrStmt::Expr(IrExpr::BinOp { lhs, op, rhs }) => {
+                    let opstr = match op {
+                        crate::ir::BinOpKind::And => "&&",
+                        crate::ir::BinOpKind::Or => "||",
+                        _ => {
+                            self.mark_todo(&format!("stage binop {:?}", op));
+                            return;
+                        }
+                    };
+                    self.sh_stage_expr(buf, lhs);
+                    self.sh_raw(buf, opstr);
+                    self.sh_stage_expr(buf, rhs);
+                }
+                IrStmt::For { var, iter, body } => {
+                    // shell text: `for v in <iter>; do <body>; done`
+                    // (array init assignments come FIRST — the child
+                    // bash must see the arrays before the loop)
+                    self.sh_array_inits(buf, body);
+                    self.sh_raw(buf, "for");
+                    self.sh_word(buf, &IrExpr::Str(var.clone(), crate::ir::StrStyle::DoubleQuoted));
+                    self.sh_raw(buf, "in");
+                    self.sh_iter_text(buf, iter);
+                    self.sh_raw(buf, "; do");
+                    self.sh_stage(buf, body);
+                    self.sh_raw(buf, "; done");
+                }
+                IrStmt::While { cond, body } => {
+                    self.sh_array_inits(buf, body);
+                    self.sh_raw(buf, "while");
+                    self.sh_stage_expr(buf, cond);
+                    self.sh_raw(buf, "; do");
+                    self.sh_stage(buf, body);
+                    self.sh_raw(buf, "; done");
+                }
+                IrStmt::Subshell(body) => {
+                    self.sh_raw(buf, "(");
+                    self.sh_stage(buf, body);
+                    self.sh_raw(buf, ")");
+                }
+                IrStmt::Case { discriminant, clauses } => {
+                    // `case D in pat) body;; ... esac`
+                    self.sh_raw(buf, "case");
+                    self.sh_stage_expr(buf, discriminant);
+                    self.sh_raw(buf, "in");
+                    for cl in clauses {
+                        let pats = cl.patterns.join("|");
+                        self.sh_raw(buf, &format!("{pats})"));
+                        self.sh_stage(buf, &cl.body);
+                        self.sh_raw(buf, ";;");
+                    }
+                    self.sh_raw(buf, "esac");
+                }
                 _ => {
                     self.mark_todo(&format!("capture body stmt {:?}", s));
                 }
+            }
+        }
+    }
+
+    /// Reconstruct the shell text of a for-iterable (`in <iter>`).
+    fn sh_iter_text(&mut self, buf: CmdBuf, iter: &IrExpr) {
+        match iter {
+            IrExpr::Array(items) => {
+                for w in items {
+                    self.sh_word(buf, w);
+                }
+            }
+            IrExpr::Call { func, args } if func == "param" => {
+                // `${arr[@]}` / `${!map[@]}` — the child bash needs the
+                // array — emit an init assignment first (sh_array_inits
+                // already walked the body; the iter's own array too)
+                let name = Self::str_arg(args, 1).unwrap_or_default();
+                let idx = Self::str_arg(args, 2).unwrap_or_default();
+                if idx == "@" || idx == "*" {
+                    if let Some(keys) = name.strip_prefix('!') {
+                        self.emit(&format!("_sh_addraw({});", Self::cstr(&format!("${{!{keys}[@]}}"))));
+                    } else {
+                        self.emit(&format!("_sh_addraw({});", Self::cstr(&format!("${{{name}[@]}}"))));
+                    }
+                }
+            }
+            IrExpr::Call { func, args } if func == "brace" => {
+                for item in brace_expand(args) {
+                    self.sh_word(buf, &IrExpr::Str(item, crate::ir::StrStyle::DoubleQuoted));
+                }
+            }
+            IrExpr::Call { func, args } if func == "captureWords" || func == "capture" => {
+                // `for x in $(cmd)` — the $(...) text
+                self.emit("_sh_addraw(\"$(\");");
+                if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                    self.sh_stage(buf, stmts);
+                }
+                self.emit("_sh_addraw(\")\");");
+            }
+            IrExpr::Range { start, end } => {
+                self.emit(&format!("_sh_addraw({});", Self::cstr(&format!("$(seq {} {})", start, end))));
+            }
+            other => {
+                self.mark_todo(&format!("stage iter {:?}", other));
+            }
+        }
+    }
+
+    /// Emit shell init assignments for the arrays a stage body reads:
+    /// `arr=('a' 'b')` / `map=([k]='v')` so the child bash sees them.
+    fn sh_array_inits(&mut self, buf: CmdBuf, stmts: &[IrStmt]) {
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        collect_array_refs(stmts, &mut names);
+        let (b, cap) = match buf {
+            CmdBuf::Shared => ("_sh_cmd".to_string(), "&_sh_cap".to_string()),
+            CmdBuf::Private(id) => (format!("_c{id}_cmd"), format!("&_c{id}_cap")),
+        };
+        for n in &names {
+            if !self.arrays.contains(n) {
+                continue;
+            }
+            let id = self.c_ident(n);
+            if self.assoc_arrays.contains(n) {
+                self.emit(&format!(
+                    "_sh_assoc_init({b}, {cap}, {}, {id}_k, {id}_v, {id}_n);",
+                    Self::cstr(n)
+                ));
+            } else {
+                self.emit(&format!(
+                    "_sh_idx_init({b}, {cap}, {}, {id}, {id}_len);",
+                    Self::cstr(n)
+                ));
             }
         }
     }
@@ -1369,6 +1587,38 @@ impl Render {
                 i = j;
             } else {
                 i += 1;
+            }
+        }
+    }
+
+    /// Parse an Array of redirect-spec Objects and append their text.
+    fn sh_redirect_specs(&mut self, buf: CmdBuf, specs: &[IrExpr]) {
+        for sp in specs {
+            if let IrExpr::Object(fields) = sp {
+                let mut fd = 1;
+                let mut mode = String::new();
+                let mut target = IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted);
+                for (k, v) in fields {
+                    match k.as_str() {
+                        "fd" => {
+                            if let IrExpr::Int(n) = v {
+                                fd = *n;
+                            }
+                        }
+                        "mode" => {
+                            mode = Self::str_arg(&[v.clone()], 0).unwrap_or_default();
+                        }
+                        "target" => target = v.clone(),
+                        _ => {}
+                    }
+                }
+                let rds = [crate::ir::IrRedirect {
+                    fd: Some(fd as i32),
+                    mode,
+                    target,
+                    interpolate: true,
+                }];
+                self.sh_redirect_text(buf, &rds);
             }
         }
     }
@@ -2007,9 +2257,22 @@ impl Render {
         let Some(name) = Self::str_arg(args, 1) else {
             return "0".into();
         };
-        // `${arr[1]}` / `${#arr[@]}` — arrays (wave 2 lowers them; the
-        // array machinery registers the name)
+        // `${#arr[@]}` — the core spells it param("slice", "#arr", "@", "")
+        if name.starts_with('#')
+            && (name.ends_with("[@]")
+                || name.ends_with("[*]")
+                || matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*"))
+        {
+            let rest = name[1..]
+                .trim_end_matches("[@]")
+                .trim_end_matches("[*]");
+            if !rest.is_empty() {
+                return self.array_len(rest);
+            }
+        }
+        // `${arr[1]}` / `${#arr[@]}` — the array machinery
         if name.contains('[') || name.contains('@') || name.contains('*') {
+            self.cur_param_args = args.to_vec();
             return self.param_array(&op, &name);
         }
         // `${#x}` — string length
@@ -2096,6 +2359,54 @@ impl Render {
                 ));
                 t
             }
+            "^^" | "^^:" => {
+                self.need_sh = true;
+                let t = self.str_temp(4096);
+                self.emit(&format!(
+                    "{{ char *_u = {var_expr}; size_t _i; for (_i = 0; _u[_i]; _i++) {t}[_i] = (char)toupper((unsigned char)_u[_i]); {t}[_i] = 0; }}"
+                ));
+                t
+            }
+            ",," | ",,:" => {
+                self.need_sh = true;
+                let t = self.str_temp(4096);
+                self.emit(&format!(
+                    "{{ char *_u = {var_expr}; size_t _i; for (_i = 0; _u[_i]; _i++) {t}[_i] = (char)tolower((unsigned char)_u[_i]); {t}[_i] = 0; }}"
+                ));
+                t
+            }
+            "^" | "^:" => {
+                self.need_sh = true;
+                let t = self.str_temp(4096);
+                self.emit(&format!(
+                    "{{ char *_u = {var_expr}; strncpy({t}, _u, 4095); {t}[4095] = 0; if ({t}[0]) {t}[0] = (char)toupper((unsigned char){t}[0]); }}"
+                ));
+                t
+            }
+            "," | ",:" => {
+                self.need_sh = true;
+                let t = self.str_temp(4096);
+                self.emit(&format!(
+                    "{{ char *_u = {var_expr}; strncpy({t}, _u, 4095); {t}[4095] = 0; if ({t}[0]) {t}[0] = (char)tolower((unsigned char){t}[0]); }}"
+                ));
+                t
+            }
+            "dirname" => {
+                self.need_sh = true;
+                let t = self.str_temp(4096);
+                self.emit(&format!(
+                    "{{ const char *_u = {var_expr}; const char *_s = strrchr(_u, '/'); size_t _n = _s ? (size_t)(_s - _u) : 0; if (_n == 0 && _s) _n = 1; strncpy({t}, _u, _n); {t}[_n] = 0; }}"
+                ));
+                t
+            }
+            "basename" => {
+                self.need_sh = true;
+                let t = self.str_temp(4096);
+                self.emit(&format!(
+                    "{{ const char *_u = {var_expr}; const char *_s = strrchr(_u, '/'); strncpy({t}, _s ? _s + 1 : _u, 4095); {t}[4095] = 0; }}"
+                ));
+                t
+            }
             _ => {
                 self.mark_todo(&format!("param op {op}"));
                 var_expr
@@ -2103,18 +2414,18 @@ impl Render {
         }
     }
 
-    /// `${arr[i]}` / `${#arr[@]}` / `${arr[@]:off:len}` — the array
-    /// store (wave 2). Until the array machinery lands, register the
-    /// name and render a stub-free empty (files with arrays fail the
-    /// equivalence gate until then).
+    /// `${arr[i]}` / `${#arr[@]}` / `${arr[@]}` / `${!map[@]}` — array
+    /// reads (element, count, joined elements, assoc keys).
     fn param_array(&mut self, op: &str, name: &str) -> String {
-        let _ = op;
-        let _ = name;
-        // strip the [..] suffix: `arr[1]` → (arr, 1)
-        if let Some(open) = name.find('[') {
-            let var = &name[..open];
-            let key = &name[open + 1..name.len() - 1];
-            return self.array_index_read(var, key);
+        // `${!map[@]}` — the keys
+        if let Some(rest) = name.strip_prefix('!') {
+            let rest = rest
+                .strip_suffix("[@]")
+                .or_else(|| rest.strip_suffix("[*]"))
+                .unwrap_or(rest);
+            if !rest.is_empty() {
+                return self.array_keys_join(rest);
+            }
         }
         // `${#arr[@]}` — length
         if let Some(rest) = name.strip_prefix('#') {
@@ -2124,6 +2435,33 @@ impl Render {
                 .unwrap_or(rest);
             if !rest.is_empty() {
                 return self.array_len(rest);
+            }
+        }
+        // `${arr[@]}` / `${arr[*]}` — all elements
+        if name.ends_with("[@]") || name.ends_with("[*]") {
+            let var = &name[..name.len() - 3];
+            match op {
+                "len" | "#" => return self.array_len(var),
+                "slice" => {
+                    // `${arr[@]:off:len}` — slice of the joined elements
+                    let off = self.args_value_num(2);
+                    let len = self.args_value_num(3);
+                    let joined = self.array_join_all(var);
+                    let t = self.str_temp(65536);
+                    self.emit(&format!(
+                        "_sh_substr({t}, sizeof {t}, {joined}, {off}, {len});"
+                    ));
+                    return t;
+                }
+                _ => return self.array_join_all(var),
+            }
+        }
+        // `${arr[i]}` — element read
+        if let Some(open) = name.find('[') {
+            if name.ends_with(']') {
+                let var = &name[..open];
+                let key = &name[open + 1..name.len() - 1];
+                return self.array_index_read(var, key);
             }
         }
         self.store.insert(name.to_string());
@@ -2288,6 +2626,38 @@ impl Render {
                 "0".into()
             }
             "brace" => Self::cstr(&brace_expand(args).join(" ")),
+            "arrayIndex" => {
+                let (Some(name), Some(key)) = (Self::str_arg(args, 0), Self::str_arg(args, 1))
+                else {
+                    return "0".into();
+                };
+                self.array_index_read(&name, &key)
+            }
+            "arrayLen" => match Self::str_arg(args, 0) {
+                Some(name) => self.array_len(&name),
+                None => "0".into(),
+            },
+            "arrayItems" | "listVar" => match Self::str_arg(args, 0) {
+                Some(name) => self.array_join_all(&name),
+                None => "0".into(),
+            },
+            "setArray" | "setArrayAppend" => {
+                // bare expr position (unusual — Assign normally carries
+                // these): apply to the named array
+                if let Some(name) = Self::str_arg(args, 0) {
+                    let name_c = name.clone();
+                    if func == "setArray" {
+                        let mut a = args.to_vec();
+                        a.remove(0);
+                        self.emit_set_array(&name_c, &a);
+                    } else {
+                        let mut a = args.to_vec();
+                        a.remove(0);
+                        self.emit_set_array_append(&name_c, &a);
+                    }
+                }
+                "(_sh_rc = 0, 1)".into()
+            }
             "split" => match args.first() {
                 Some(x) => self.value_c(x),
                 None => "\"\"".into(),
@@ -2306,36 +2676,7 @@ impl Render {
                     "0".into()
                 }
             }
-            "join" => {
-                // `${arr[@]}` in print position — the elements joined by
-                // a space (a single element is just its value)
-                let items: Vec<IrExpr> = match args.first() {
-                    Some(IrExpr::Array(items)) => items.clone(),
-                    Some(other) => vec![other.clone()],
-                    None => Vec::new(),
-                };
-                if items.is_empty() {
-                    return "\"\"".into();
-                }
-                if items.len() == 1 {
-                    return self.value_c(&items[0]);
-                }
-                let mut fmt = String::new();
-                let mut cargs: Vec<String> = Vec::new();
-                for (i, it) in items.iter().enumerate() {
-                    if i > 0 {
-                        fmt.push_str(" ");
-                    }
-                    fmt.push_str("%s");
-                    cargs.push(self.value_c(it));
-                }
-                let t = self.str_temp(4096);
-                self.emit(&format!(
-                    "snprintf({t}, sizeof {t}, \"{fmt}\", {});",
-                    cargs.join(", ")
-                ));
-                t
-            }
+            "join" => self.join_value(args),
             "whileLoop" => {
                 if let (Some(IrExpr::Arrow(stmts)), Some(cond)) = (args.first(), args.get(1)) {
                     let stmts = stmts.clone();
@@ -2372,54 +2713,194 @@ impl Render {
                     r.sh_stage(CmdBuf::Shared, stmts);
                 }
                 if let Some(IrExpr::Array(specs)) = args.get(1) {
-                    for sp in specs {
-                        if let IrExpr::Object(fields) = sp {
-                            let mut fd = 1;
-                            let mut mode = String::new();
-                            let mut target =
-                                IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted);
-                            for (k, v) in fields {
-                                match k.as_str() {
-                                    "fd" => {
-                                        if let IrExpr::Int(n) = v {
-                                            fd = *n;
-                                        }
-                                    }
-                                    "mode" => {
-                                        mode = Self::str_arg(&[v.clone()], 0).unwrap_or_default();
-                                    }
-                                    "target" => target = v.clone(),
-                                    _ => {}
-                                }
-                            }
-                            let rds = [crate::ir::IrRedirect {
-                                fd: Some(fd as i32),
-                                mode,
-                                target,
-                                interpolate: true,
-                            }];
-                            r.sh_redirect_text(CmdBuf::Shared, &rds);
-                        }
-                    }
+                    r.sh_redirect_specs(CmdBuf::Shared, specs);
                 }
             },
             false,
         )
     }
 
-    // ── arrays (wave 2) ──────────────────────────────────────────────
-
-    fn array_index_read(&mut self, var: &str, key: &str) -> String {
-        // stub-free placeholder until the array store lands
-        let _ = key;
-        self.store.insert(var.to_string());
-        self.store_ref(var)
+    /// The joined-by-space value of a join call's elements.
+    fn join_value(&mut self, args: &[IrExpr]) -> String {
+        let items: Vec<IrExpr> = match args.first() {
+            Some(IrExpr::Array(items)) => items.clone(),
+            Some(other) => vec![other.clone()],
+            None => Vec::new(),
+        };
+        if items.is_empty() {
+            return "\"\"".into();
+        }
+        if items.len() == 1 {
+            return self.value_c(&items[0]);
+        }
+        let mut fmt = String::new();
+        let mut cargs: Vec<String> = Vec::new();
+        for (i, it) in items.iter().enumerate() {
+            if i > 0 {
+                fmt.push_str(" ");
+            }
+            fmt.push_str("%s");
+            cargs.push(self.value_c(it));
+        }
+        let t = self.str_temp(65536);
+        self.emit(&format!(
+            "snprintf({t}, sizeof {t}, \"{fmt}\", {});",
+            cargs.join(", ")
+        ));
+        t
     }
 
-    fn array_len(&mut self, var: &str) -> String {
-        let _ = var;
+    /// A numeric param argument (off/len for slices) — the args are
+    /// IrExprs: Int → literal, Str → parse, var refs → value.
+    fn args_value_num(&mut self, i: usize) -> String {
+        let e = match self.cur_param_args.get(i) {
+            Some(e) => e.clone(),
+            None => return "0".into(),
+        };
+        self.value_num(&e)
+    }
+
+    // ── arrays ───────────────────────────────────────────────────────
+
+    /// `arr[i]=v` / `map[key]=v` — element write (literal or dynamic key).
+    fn emit_array_assign(&mut self, var: &str, key: &IrExpr, val: &IrExpr) {
+        self.arrays.insert(var.to_string());
+        let id = self.c_ident(var);
+        let v = self.value_c(val);
+        if let IrExpr::Str(k, _) = key {
+            // a literal key: numeric for indexed arrays, string for assoc
+            if let Ok(i) = k.trim().parse::<i64>() {
+                self.emit(&format!(
+                    "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {i}, {v});"
+                ));
+            } else {
+                self.assoc_arrays.insert(var.to_string());
+                self.emit(&format!(
+                    "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {}, {v});",
+                    Self::cstr(k)
+                ));
+            }
+        } else {
+            // dynamic key: `arr[$i]=x` — the key is an index value
+            let k = self.value_num(key);
+            self.emit(&format!(
+                "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {k}, {v});"
+            ));
+        }
+        // `arr[$i]=x` — the Str key carries the raw `$i` text
+        if let IrExpr::Str(k, _) = key {
+            if let Some(rest) = k.strip_prefix('$') {
+                if rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    let kv = if self.var_types.contains_key(rest) && self.is_num(rest) {
+                        self.c_ident(rest)
+                    } else {
+                        format!("(long long)atoll({})", self.store_ref(rest))
+                    };
+                    self.emit(&format!(
+                        "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {kv}, {v});"
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// `arr=(a b c)` / `declare -A map; map=([k]=v ...)`
+    fn emit_set_array(&mut self, var: &str, args: &[IrExpr]) {
+        self.arrays.insert(var.to_string());
+        let id = self.c_ident(var);
+        let is_assoc = matches!(args.get(2), Some(IrExpr::Bool(true)));
+        let items: Vec<IrExpr> = match args.get(1) {
+            Some(IrExpr::Array(items)) => items.clone(),
+            _ => vec![],
+        };
+        if is_assoc {
+            self.assoc_arrays.insert(var.to_string());
+            // flat pairs: k1, v1, k2, v2 ...
+            let mut i = 0;
+            while i + 1 < items.len() {
+                let k = self.value_c(&items[i]);
+                let v = self.value_c(&items[i + 1]);
+                self.emit(&format!(
+                    "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {k}, {v});"
+                ));
+                i += 2;
+            }
+            return;
+        }
+        for (i, it) in items.iter().enumerate() {
+            let v = self.value_c(it);
+            self.emit(&format!("{id}[{i}] = {v};"));
+        }
+        self.emit(&format!("{id}_len = {};", items.len()));
+    }
+
+    /// `arr+=(x y)` — append elements
+    fn emit_set_array_append(&mut self, var: &str, args: &[IrExpr]) {
+        self.arrays.insert(var.to_string());
+        let id = self.c_ident(var);
+        let items: Vec<IrExpr> = match args.get(1) {
+            Some(IrExpr::Array(items)) => items.clone(),
+            _ => vec![],
+        };
+        for (i, it) in items.iter().enumerate() {
+            let v = self.value_c(it);
+            self.emit(&format!("{id}[{id}_len + {i}] = {v};"));
+        }
+        self.emit(&format!("{id}_len += {};", items.len()));
+    }
+
+    /// `${arr[i]}` — an element read (char* value)
+    fn array_index_read(&mut self, var: &str, key: &str) -> String {
+        self.arrays.insert(var.to_string());
         self.need_sh = true;
-        "0".into()
+        let id = self.c_ident(var);
+        if let Ok(i) = key.trim().parse::<i64>() {
+            return format!(
+                "(({i} < {id}_len && {id}[{i}]) ? {id}[{i}] : \"\")"
+            );
+        }
+        let k = if let Some(rest) = key.strip_prefix('$') {
+            if rest.chars().all(|c| c.is_ascii_digit()) {
+                format!("(({rest} < _sh_argc && _sh_argv[{rest}]) ? atoll(_sh_argv[{rest}]) : 0)")
+            } else if self.var_types.contains_key(rest) && self.is_num(rest) {
+                format!("(long long)({})", self.c_ident(rest))
+            } else {
+                format!("(long long)atoll({})", self.store_ref(rest))
+            }
+        } else {
+            format!("(long long)atoll({})", Self::cstr(key))
+        };
+        format!("(char*)_sh_arr_get({id}, {id}_len, {k})")
+    }
+
+    /// `${#arr[@]}` — the element count
+    fn array_len(&mut self, var: &str) -> String {
+        self.arrays.insert(var.to_string());
+        let id = self.c_ident(var);
+        self.need_sh = true;
+        format!("(long long){id}_len")
+    }
+
+    /// `${arr[@]}` — all elements joined by a space
+    fn array_join_all(&mut self, var: &str) -> String {
+        self.arrays.insert(var.to_string());
+        self.need_sh = true;
+        let id = self.c_ident(var);
+        let t = self.str_temp(65536);
+        self.emit(&format!("_sh_join_arr({t}, sizeof {t}, {id}, {id}_len);"));
+        t
+    }
+
+    /// `${!map[@]}` — assoc keys joined
+    fn array_keys_join(&mut self, var: &str) -> String {
+        self.arrays.insert(var.to_string());
+        self.assoc_arrays.insert(var.to_string());
+        self.need_sh = true;
+        let id = self.c_ident(var);
+        let t = self.str_temp(65536);
+        self.emit(&format!("_sh_join_keys({t}, sizeof {t}, {id}_k, {id}_n);"));
+        t
     }
 
     /// Split an expression into printf parts: Lit(text) | Arg(cexpr, is_num).
@@ -2526,6 +3007,7 @@ impl Render {
             IrExpr::Call { func, args } if func == "getVar" => {
                 matches!(args.first(), Some(IrExpr::Str(name, _)) if name == "?" || self.is_num(name))
             }
+            IrExpr::Call { func, .. } if func == "arrayLen" => true,
             _ => false,
         }
     }
@@ -2632,8 +3114,34 @@ impl Render {
                     return;
                 };
                 if !t.indices.is_empty() {
-                    self.mark_todo("array-index assign");
+                    // `arr[1]=x` / `map[key]=x` — array element write
+                    self.emit_array_assign(&t.var, &t.indices[0], expr);
                     return;
+                }
+                // `arr[1]=x` — the core flattens the index into the name
+                if let Some(open) = t.var.find('[') {
+                    if t.var.ends_with(']') {
+                        let var = t.var[..open].to_string();
+                        let key = t.var[open + 1..t.var.len() - 1].to_string();
+                        let key_expr = if let Ok(_) = key.parse::<i64>() {
+                            IrExpr::Str(key, crate::ir::StrStyle::DoubleQuoted)
+                        } else {
+                            // dynamic key `arr[$i]=x` — the text keeps $i
+                            IrExpr::Str(key, crate::ir::StrStyle::DoubleQuoted)
+                        };
+                        self.emit_array_assign(&var, &key_expr, expr);
+                        return;
+                    }
+                }
+                if let IrExpr::Call { func, args } = expr {
+                    if func == "setArray" {
+                        self.emit_set_array(&t.var, args);
+                        return;
+                    }
+                    if func == "setArrayAppend" {
+                        self.emit_set_array_append(&t.var, args);
+                        return;
+                    }
                 }
                 // const-markup lift: the declaration already carries the
                 // literal initializer (emit_var_decl) — the assignment
@@ -2785,6 +3293,57 @@ impl Render {
                                 .into_iter()
                                 .map(|s| IrExpr::Str(s, crate::ir::StrStyle::DoubleQuoted))
                                 .collect();
+                        }
+                    }
+                }
+                // array iter: `for x in "${arr[@]}"` (param slice arr @)
+                // and `for k in "${!map[@]}"` (param slice !map @)
+                if items.len() == 1 {
+                    if let IrExpr::Call { func, args } = &items[0] {
+                        if func == "param" {
+                            let op = Self::str_arg(args, 0).unwrap_or_default();
+                            let name = Self::str_arg(args, 1).unwrap_or_default();
+                            let idx = Self::str_arg(args, 2).unwrap_or_default();
+                            if (op == "slice" || op.is_empty()) && (idx == "@" || idx == "*") {
+                                let var_name = self.c_ident(var);
+                                if let Some(keys) = name.strip_prefix('!') {
+                                    // assoc keys
+                                    self.arrays.insert(keys.to_string());
+                                    self.assoc_arrays.insert(keys.to_string());
+                                    self.need_sh = true;
+                                    let kid = self.c_ident(keys);
+                                    self.emit(&format!(
+                                        "for (size_t _ai_{kid} = 0; _ai_{kid} < {kid}_n; _ai_{kid}++) {{"
+                                    ));
+                                    self.depth += 1;
+                                    self.emit(&format!(
+                                        "{var_name} = {kid}_k[_ai_{kid}];"
+                                    ));
+                                    for s in body {
+                                        self.stmt(s);
+                                    }
+                                    self.depth -= 1;
+                                    self.emit("}");
+                                    return;
+                                }
+                                // indexed elements
+                                self.arrays.insert(name.clone());
+                                self.need_sh = true;
+                                let aid = self.c_ident(&name);
+                                self.emit(&format!(
+                                    "for (size_t _ai_{aid} = 0; _ai_{aid} < {aid}_len; _ai_{aid}++) {{"
+                                ));
+                                self.depth += 1;
+                                self.emit(&format!(
+                                    "{var_name} = {aid}[_ai_{aid}];"
+                                ));
+                                for s in body {
+                                    self.stmt(s);
+                                }
+                                self.depth -= 1;
+                                self.emit("}");
+                                return;
+                            }
                         }
                     }
                 }
@@ -3082,11 +3641,13 @@ impl Render {
                 }
             }
             IrStmt::DeclareArray { var, elements, .. } => {
-                // the array store lands in wave 2 — render a stub-free
-                // char* store entry so the file still compiles
-                self.store.insert(var.clone());
-                let _ = elements;
-                self.emit(&format!("/* array {var} */"));
+                self.arrays.insert(var.clone());
+                let id = self.c_ident(var);
+                for (i, e) in elements.iter().enumerate() {
+                    let v = self.value_c(e);
+                    self.emit(&format!("{id}[{i}] = {v};"));
+                }
+                self.emit(&format!("{id}_len = {};", elements.len()));
             }
             IrStmt::Exec { cmd, args, capture, redirects, .. } => {
                 let mut call_args = vec![cmd.clone()];
@@ -3332,6 +3893,24 @@ impl Render {
         let mut decl_out = Vec::new();
         std::mem::swap(&mut self.out, &mut decl_out);
         self.depth = 0;
+        // array stores first (indexed + assoc) — collect the names from
+        // the IR (setArray/arrayIndex/param/index-assign/DeclareArray)
+        collect_array_names(&prog.stmts, &mut self.arrays);
+        for a in &self.arrays {
+            vars.remove(a);
+            self.store.remove(a);
+        }
+        vars.retain(|v| !v.contains('['));
+        self.store.retain(|v| !v.contains('['));
+        let arrays: Vec<String> = self.arrays.iter().cloned().collect();
+        for a in &arrays {
+            let id = self.c_ident(a);
+            self.emit(&format!("static char *{id}[{ARR_CAP}] = {{0}};"));
+            self.emit(&format!("static size_t {id}_len = 0;"));
+        }
+        if !self.arrays.is_empty() {
+            self.emit("");
+        }
         for v in &vars {
             self.emit_var_decl(v);
         }
@@ -3518,6 +4097,258 @@ fn mark_seq_loop_vars(s: &IrStmt, var_types: &mut HashMap<String, IrType>) {
                 mark_seq_loop_vars(x, var_types);
             }
         }
+        _ => {}
+    }
+}
+
+/// Array names: setArray/setArrayAppend/arrayIndex/arrayLen/arrayItems/
+/// listVar/join targets, param `name[...]` reads, index-assign targets,
+/// DeclareArray vars.
+fn collect_array_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr } => {
+                for t in targets {
+                    if !t.indices.is_empty() {
+                        out.insert(t.var.clone());
+                    }
+                    // `arr[1]=x` — the core flattens the index into the name
+                    if let Some(open) = t.var.find('[') {
+                        if t.var.ends_with(']') {
+                            out.insert(t.var[..open].to_string());
+                        }
+                    }
+                    if let IrExpr::Call { func, args } = expr {
+                        if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+                            out.insert(t.var.clone());
+                            let _ = args;
+                        }
+                    }
+                }
+                collect_array_expr(expr, out);
+            }
+            IrStmt::DeclareArray { var, .. } => {
+                out.insert(var.clone());
+            }
+            IrStmt::Expr(e) => collect_array_expr(e, out),
+            IrStmt::Output { value, .. } => collect_array_expr(value, out),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                collect_array_expr(cond, out);
+                collect_array_names(then, out);
+                for (c, b) in elsifs {
+                    collect_array_expr(c, out);
+                    collect_array_names(b, out);
+                }
+                collect_array_names(else_, out);
+            }
+            IrStmt::For { iter, body, .. } => {
+                collect_array_expr(iter, out);
+                collect_array_names(body, out);
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                collect_array_expr(cond, out);
+                collect_array_names(body, out);
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                collect_array_names(b, out);
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                collect_array_names(inner, out);
+                for r in redirects {
+                    collect_array_expr(&r.target, out);
+                }
+            }
+            IrStmt::Function { body, .. } => collect_array_names(body, out),
+            IrStmt::Case { discriminant, clauses } => {
+                collect_array_expr(discriminant, out);
+                for c in clauses {
+                    collect_array_names(&c.body, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_array_names(st, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_array_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+    match e {
+        IrExpr::Call { func, args } => {
+            match func.as_str() {
+                "setArray" | "setArrayAppend" | "arrayIndex" | "arrayLen" | "arrayItems"
+                | "listVar" => {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        out.insert(n.clone());
+                    }
+                }
+                "param" => {
+                    if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                        if let Some(open) = n.find('[') {
+                            if n.ends_with(']') {
+                                out.insert(n[..open].to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for a in args {
+                collect_array_expr(a, out);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_array_expr(lhs, out);
+            collect_array_expr(rhs, out);
+        }
+        IrExpr::Arith(a) => collect_array_arith(a, out),
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    collect_array_expr(x, out);
+                }
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                collect_array_expr(i, out);
+            }
+        }
+        IrExpr::Arrow(body) => collect_array_names(body, out),
+        IrExpr::Index { var, .. } => {
+            out.insert(var.clone());
+        }
+        _ => {}
+    }
+}
+
+/// Array names a stage's statements reference (param `arr[@]`/`arr[i]`,
+/// arrayIndex/arrayItems, getVar of an array) — the stage's child bash
+/// needs shell init assignments for them.
+fn collect_array_refs(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Expr(e) => collect_array_refs_expr(e, out),
+            IrStmt::Assign { expr, .. } => collect_array_refs_expr(expr, out),
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                collect_array_refs_expr(cond, out);
+                collect_array_refs(then, out);
+                for (c, b) in elsifs {
+                    collect_array_refs_expr(c, out);
+                    collect_array_refs(b, out);
+                }
+                collect_array_refs(else_, out);
+            }
+            IrStmt::For { iter, body, .. } => {
+                collect_array_refs_expr(iter, out);
+                collect_array_refs(body, out);
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                collect_array_refs_expr(cond, out);
+                collect_array_refs(body, out);
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                collect_array_refs(b, out);
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                collect_array_refs(inner, out);
+                for r in redirects {
+                    collect_array_refs_expr(&r.target, out);
+                }
+            }
+            IrStmt::Function { body, .. } => collect_array_refs(body, out),
+            IrStmt::Case { discriminant, clauses } => {
+                collect_array_refs_expr(discriminant, out);
+                for c in clauses {
+                    collect_array_refs(&c.body, out);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_array_refs(st, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_array_refs_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+    match e {
+        IrExpr::Call { func, args } => {
+            match func.as_str() {
+                "arrayIndex" | "arrayItems" | "listVar" | "arrayLen" => {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        out.insert(n.clone());
+                    }
+                }
+                "param" => {
+                    if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                        if let Some(open) = n.find('[') {
+                            if n.ends_with(']') {
+                                out.insert(n[..open].to_string());
+                            }
+                        }
+                        if n.ends_with("[@]") || n.ends_with("[*]") {
+                            out.insert(n.trim_end_matches("[@]").trim_end_matches("[*]").to_string());
+                        }
+                    }
+                }
+                "getVar" => {
+                    // `$arr` inside a stage — treat as array element 0
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        if n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            out.insert(n.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for a in args {
+                collect_array_refs_expr(a, out);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_array_refs_expr(lhs, out);
+            collect_array_refs_expr(rhs, out);
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    collect_array_refs_expr(x, out);
+                }
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                collect_array_refs_expr(i, out);
+            }
+        }
+        IrExpr::Arrow(body) => collect_array_refs(body, out),
+        _ => {}
+    }
+}
+
+fn collect_array_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
+    match a {
+        ArithAst::Index { var, key } => {
+            out.insert(var.clone());
+            collect_array_arith(key, out);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            collect_array_arith(lhs, out);
+            collect_array_arith(rhs, out);
+        }
+        ArithAst::Un { arg, .. } => collect_array_arith(arg, out),
+        ArithAst::Cond { test, then, else_, .. } => {
+            collect_array_arith(test, out);
+            collect_array_arith(then, out);
+            collect_array_arith(else_, out);
+        }
+        ArithAst::Assign { rhs, .. } => collect_array_arith(rhs, out),
         _ => {}
     }
 }
