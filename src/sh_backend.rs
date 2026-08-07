@@ -20,6 +20,9 @@ lazy_static::lazy_static! {
     /// `shopt -s nocasematch` state — the [[ == ]] case emulation folds
     /// the pattern case-insensitively when set.
     static ref NOCASEMATCH: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    /// `typeset -i` / `declare -i` integer-attribute vars — their
+    /// assignments are ARITHMETIC (bash: `n=n+1` -> 43).
+    static ref INT_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
 }
 
 /// Marker prefixes the core's lowering tags unquoted glob / process-
@@ -183,7 +186,11 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
 /// bash's stdout exactly (error messages, `echo >&2` diagnostics).
 fn has_fd_dup(prog: &IrProgram) -> bool {
     fn redir_dup(r: &IrRedirect) -> bool {
-        matches!(&r.target, IrExpr::Str(s, _) if s.starts_with('&'))
+        // only `2>&1` (stderr merged INTO stdout) blocks suppression —
+        // the reference's stdout carries that content; `>&2` writes go
+        // to the reference's DISCARDED stderr (suppression matches them)
+        r.fd == Some(2)
+            && matches!(&r.target, IrExpr::Str(s, _) if s.starts_with("&1"))
     }
     fn expr_dup(e: &IrExpr) -> bool {
         match e {
@@ -393,6 +400,7 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
     // into IrProgram — the shared core; usage is a sound proxy)
     *ARRAY_NAMES.lock().unwrap() = array_names(prog);
     *NOCASEMATCH.lock().unwrap() = false;
+    *INT_VARS.lock().unwrap() = Default::default();
     let mut out = String::new();
     out.push_str("#!/bin/sh\n");
     if !has_fd_dup(prog) {
@@ -846,7 +854,18 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
         if i > 0 {
             out.push(' ');
         }
-        let rhs = assign_rhs_to_sh(expr)?;
+        let mut rhs = assign_rhs_to_sh(expr)?;
+        // `typeset -i` vars assign ARITHMETICALLY (`n=n+1` -> 43)
+        if INT_VARS.lock().unwrap().contains(&t.var) && t.indices.is_empty() {
+            let raw = match expr {
+                IrExpr::Str(s, _) => s.clone(),
+                IrExpr::Call { func, args } if func == "getVar" => {
+                    raw_arg(args, 0).unwrap_or_default()
+                }
+                _ => rhs.clone(),
+            };
+            rhs = format!("$(({raw}))");
+        }
         // baked element targets (`arr[1]=x` — the A1 folds the subscript
         // into the var name)
         if let Some((base, idx)) = t.var.strip_suffix(']').and_then(|v| v.split_once('[')) {
@@ -1040,7 +1059,7 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                         "printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"
                     ))
                 } else {
-                    Ok(format!("[ {} ]", space_test_eq(t)))
+                    Ok(format!("[ {} ]", space_test_ops(t)))
                 }
             }
             "pipeline" => {
@@ -1377,7 +1396,17 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
                 IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
                     flags.push(s.clone());
                 }
+                // `typeset -i n=42` — the assignment word stays UNQUOTED
+                // (dash would create a literal "n=42" variable)
+                IrExpr::Str(s, _) if s.contains('=') => words.push(s.clone()),
                 other => words.push(word_to_sh(other)?),
+            }
+        }
+        if flags.iter().any(|f| f.contains('i')) {
+            let mut ints = INT_VARS.lock().unwrap();
+            for w in &words {
+                let name = w.split('=').next().unwrap_or(w.as_str());
+                ints.insert(name.to_string());
             }
         }
         let prefix = if flags.iter().any(|f| f.contains('r')) {
@@ -1802,7 +1831,12 @@ fn lower_procsub_stmt(ps: &[IrRedirect], cmd: &str) -> Result<String, String> {
     for (i, _) in ps.iter().enumerate() {
         names.push(format!("\"$_ps_t{}\"", i + 1));
     }
-    Ok(format!("{pre}{cmd}{args}\nrm -f {}", names.join(" ")))
+    // preserve the command's rc for the NEXT statement's `$?` (bash:
+    // `diff <(a) <(b); echo $?` -> 1 — the rm must not clobber it)
+    Ok(format!(
+        "{pre}{cmd}{args}; rc=$?\nrm -f {}\n[ \"$rc\" -eq 0 ]",
+        names.join(" ")
+    ))
 }
 
 /// Inline (expression-context) process-substitution lowering: the
@@ -2391,6 +2425,20 @@ fn fold_case_pattern(p: &str) -> String {
         }
     }
     out
+}
+
+/// The core's test lowering strips the spaces around comparison
+/// operators (`[ "$X" = "1" ]` arrives as `"$X"="1"`, `[ ! -x f ]` as
+/// `!-x` — dash would read the whole thing as ONE word). Re-insert the
+/// spaces around `=` (outside quoted regions) and after a leading `!`.
+fn space_test_ops(t: &str) -> String {
+    let s = space_test_eq(t);
+    if let Some(rest) = s.strip_prefix('!') {
+        if !rest.starts_with(['!', '=', ' ']) {
+            return format!("! {rest}");
+        }
+    }
+    s
 }
 
 /// The core's test lowering strips the spaces around comparison
