@@ -1993,12 +1993,14 @@ fn brace_to_sh(args: &[IrExpr]) -> Result<String, String> {
     let middles = brace_middles(args, 2)?;
     let suffix = raw_arg(args, 3)?;
 
-    // word = prefix g1 m1 g2 m2 … suffix; each group holds alternatives
+    // word = prefix g1 m1 g2 m2 … suffix; each group holds alternatives.
+    // bash expands LEFT group SLOWEST (`{a..c}1{1..3}` -> a1 a2 a3 b1 b2
+    // b3 c1 c2 c3), so the alt loop must be INNER to the base loop.
     let mut results: Vec<String> = vec![String::new()];
     for (gi, group) in groups.iter().enumerate() {
         let mut next = Vec::new();
-        for alt in group {
-            for base in &results {
+        for base in &results {
+            for alt in group {
                 next.push(format!("{base}{alt}"));
             }
         }
@@ -2021,6 +2023,10 @@ fn brace_to_sh(args: &[IrExpr]) -> Result<String, String> {
 
 /// The groups JSON: `[[{range:[s,e,null,null]} | String, ...], ...]` —
 /// each group is a list of ALTERNATIVES (a range expands to several).
+/// A group that MIXES ranges with plain items is NOT a bash sequence —
+/// bash treats `{1..10,20,30..40}` as a list of LITERAL words (ranges
+/// only expand when the brace is a pure sequence), so the group collapses
+/// to the single literal brace text.
 fn brace_groups(args: &[IrExpr], idx: usize) -> Result<Vec<Vec<String>>, String> {
     let Some(IrExpr::Json(serde_json::Value::Array(groups))) = args.get(idx) else {
         return Err("brace groups not Json".into());
@@ -2030,6 +2036,36 @@ fn brace_groups(args: &[IrExpr], idx: usize) -> Result<Vec<Vec<String>>, String>
         let serde_json::Value::Array(items) = g else {
             return Err("brace group not Array".into());
         };
+        let single_range = items.len() == 1
+            && matches!(items[0], serde_json::Value::Object(ref o) if o.contains_key("range"));
+        if !single_range {
+            // a LIST: bash expands the braces but treats every item as a
+            // LITERAL — ranges only expand in a pure `{x..y}` sequence
+            // (`{1..10,20,30..40}` -> `1..10 20 30..40`)
+            let mut alts = Vec::new();
+            for it in items {
+                match it {
+                    serde_json::Value::String(s) => alts.push(s.clone()),
+                    serde_json::Value::Object(o) => {
+                        if let Some(serde_json::Value::Array(r)) = o.get("range") {
+                            let s0 = r[0].as_str().unwrap_or("");
+                            let s1 = r[1].as_str().unwrap_or("");
+                            let step = r
+                                .get(2)
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty());
+                            match step {
+                                Some(st) => alts.push(format!("{s0}..{s1}..{st}")),
+                                None => alts.push(format!("{s0}..{s1}")),
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push(alts);
+            continue;
+        }
         let mut expanded = Vec::new();
         for it in items {
             expanded.extend(brace_item(it)?);
@@ -2053,40 +2089,87 @@ fn brace_middles(args: &[IrExpr], idx: usize) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// A brace item: a literal string, a `{range:[start,end,step,?]}` — or a
-/// `{nested: [...]}` group (its elements are alternatives) — returns the
-/// alternatives (a range expands to each number).
+/// A brace item: a literal string, a `{range:[start,end,step,width?]}` —
+/// or a `{nested: [...]}` group (its elements are alternatives) — returns
+/// the alternatives (a range expands to each member). Ranges are numeric
+/// (with optional step and zero-padding) or single-letter alphabetic.
 fn brace_item(it: &serde_json::Value) -> Result<Vec<String>, String> {
     match it {
         serde_json::Value::String(s) => Ok(vec![s.clone()]),
         serde_json::Value::Object(o) => {
             if let Some(serde_json::Value::Array(range)) = o.get("range") {
-                let start: i64 = range[0].as_str().unwrap_or("0").parse().unwrap_or(0);
-                let end: i64 = range[1].as_str().unwrap_or("0").parse().unwrap_or(0);
+                let s0 = range[0].as_str().unwrap_or("0");
+                let s1 = range[1].as_str().unwrap_or("0");
                 let step: i64 = match range.get(2) {
                     Some(serde_json::Value::String(s)) if !s.is_empty() => s.parse().unwrap_or(0),
                     _ => 0,
+                };
+                // alphabetic range: `{a..c}` / `{c..a}` (single letters)
+                if s0.chars().count() == 1 && s1.chars().count() == 1 {
+                    let a = s0.chars().next().unwrap();
+                    let b = s1.chars().next().unwrap();
+                    if a.is_ascii_alphabetic() && b.is_ascii_alphabetic()
+                        && a.is_ascii_lowercase() == b.is_ascii_lowercase()
+                    {
+                        let (lo, hi, down) = if a <= b { (a, b, false) } else { (b, a, true) };
+                        let st = if step == 0 { 1 } else { step.abs() } as u8;
+                        let mut out = Vec::new();
+                        if down {
+                            let mut c = hi as u8;
+                            loop {
+                                out.push((c as char).to_string());
+                                if c <= lo as u8 {
+                                    break;
+                                }
+                                c = c.saturating_sub(st);
+                                if c < lo as u8 {
+                                    break;
+                                }
+                            }
+                        } else {
+                            let mut c = lo as u8;
+                            loop {
+                                out.push((c as char).to_string());
+                                if c >= hi as u8 {
+                                    break;
+                                }
+                                c = c.saturating_add(st);
+                                if c > hi as u8 {
+                                    break;
+                                }
+                            }
+                        }
+                        return Ok(out);
+                    }
+                }
+                let start: i64 = s0.parse().unwrap_or(0);
+                let end: i64 = s1.parse().unwrap_or(0);
+                // zero-padding width (bash pads to the longer of the two)
+                let pad = if s0.starts_with('0') || s1.starts_with('0') {
+                    s0.len().max(s1.len())
+                } else {
+                    0
                 };
                 let mut out = Vec::new();
                 if step > 0 {
                     let mut n = start;
                     while n <= end {
-                        out.push(n.to_string());
+                        out.push(pad_num(n, pad));
                         n += step;
                     }
                 } else if step < 0 {
                     let mut n = start;
                     while n >= end {
-                        out.push(n.to_string());
+                        out.push(pad_num(n, pad));
                         n += step;
                     }
                 } else if start <= end {
                     for n in start..=end {
-                        out.push(n.to_string());
+                        out.push(pad_num(n, pad));
                     }
                 } else {
                     for n in (end..=start).rev() {
-                        out.push(n.to_string());
+                        out.push(pad_num(n, pad));
                     }
                 }
                 Ok(out)
@@ -2101,6 +2184,26 @@ fn brace_item(it: &serde_json::Value) -> Result<Vec<String>, String> {
             }
         }
         other => Err(format!("brace item not understood: {other:?}")),
+    }
+}
+
+/// Zero-pad a range member to `width` digits (bash `{00..04..2}` ->
+/// 00 02 04); negative numbers keep their sign.
+fn pad_num(n: i64, width: usize) -> String {
+    if width == 0 {
+        return n.to_string();
+    }
+    let neg = n < 0;
+    let digits = n.abs().to_string();
+    let padded = if digits.len() < width {
+        format!("{}{}", "0".repeat(width - digits.len()), digits)
+    } else {
+        digits
+    };
+    if neg {
+        format!("-{padded}")
+    } else {
+        padded
     }
 }
 
