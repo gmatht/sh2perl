@@ -48,6 +48,11 @@ pub fn show_help(program_name: &str) {
     println!("  --no-debug                     - Disable debug output");
     println!("  --freeze                       - Freeze execution for debugging");
     println!("  --unfreeze                     - Unfreeze execution and continue");
+    println!("  --argv0-source <name>          - Bake the ORIGINAL bash file name as $0 / sh2.argv0");
+    println!("                                 (source-name semantic: the translated program identifies");
+    println!("                                 as <name> whatever it is invoked as; default = argv0");
+    println!("                                 pass-through, the harness supplies argv0 at run time).");
+    println!("                                 See harness/argv0-tests/README.md for the two semantics.");
     println!();
     println!("TIMEOUT OPTIONS:");
     println!();

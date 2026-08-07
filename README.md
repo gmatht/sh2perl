@@ -93,6 +93,12 @@ debashc parse --python "ls | grep test"
 # Convert shell script file to Perl
 debashc file --perl examples/simple.sh
 
+# $0 semantics: default = argv0 pass-through (the translated program reports
+# its own invocation path). Bake the ORIGINAL bash file name instead:
+debashc --argv0-source myapp.sh examples/simple.sh
+debashc --argv0-source myapp.sh file --estree examples/simple.sh
+# (see harness/argv0-tests/README.md for the two semantics)
+
 # Interactive mode
 debashc interactive
 ```
