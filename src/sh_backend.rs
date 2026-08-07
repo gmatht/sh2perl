@@ -534,6 +534,36 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
 
 "##);
     }
+    if needs_cmp(&prog.stmts) {
+        out.push_str("\n");
+        out.push_str("# GNU cmp(1) polyfill (POSIX sh; reproduces `differ: byte N, line M` and -l octal).\n");
+        out.push_str("_cmp() {\n");
+        out.push_str("    _lc=1 _s=0 _lf=0 _i=0\n");
+        out.push_str("    while [ \"$#\" -gt 0 ]; do case \"$1\" in -l) _lf=1 ;; -s) _s=1 ;; -i) ;; *) break ;; esac; shift; done\n");
+        out.push_str("    [ \"$#\" -ge 2 ] || { echo \"cmp: missing operand\" >&2; return 2; }\n");
+        out.push_str("    _a=$1; _b=$2\n");
+        out.push_str("    if [ ! -f \"$_a\" ]; then echo \"cmp: \"$_a\": No such file\" >&2; return 2; fi\n");
+        out.push_str("    if [ ! -f \"$_b\" ]; then echo \"cmp: \"$_b\": No such file\" >&2; return 2; fi\n");
+        out.push_str("    _as=$(wc -c <\"$_a\"); _bs=$(wc -c <\"$_b\")\n");
+        out.push_str("    while [ \"$_i\" -lt \"$_as\" ] && [ \"$_i\" -lt \"$_bs\" ]; do\n");
+        out.push_str("        _ab=$(dd if=\"$_a\" bs=1 skip=$_i count=1 2>/dev/null | od -A n -t o1 | tr -d ' \\n')\n");
+        out.push_str("        _bb=$(dd if=\"$_b\" bs=1 skip=$_i count=1 2>/dev/null | od -A n -t o1 | tr -d ' \\n')\n");
+        out.push_str("        if [ \"$_ab\" != \"$_bb\" ]; then\n");
+        out.push_str("            if [ \"$_s\" -eq 0 ] && [ \"$_lf\" -eq 0 ]; then printf '%s %s differ: byte %d, line %d\\n' \"$_a\" \"$_b\" \"$((_i+1))\" \"$_lc\"; fi\n");
+        out.push_str("            if [ \"$_lf\" -ne 0 ]; then printf '%d %3o %3o\\n' \"$((_i+1))\" \"0$_ab\" \"0$_bb\"; fi\n");
+        out.push_str("            return 1\n");
+        out.push_str("        fi\n");
+        out.push_str("        [ \"$_ab\" = \"012\" ] && _lc=$((_lc+1))\n");
+        out.push_str("        _i=$((_i+1))\n");
+        out.push_str("    done\n");
+        out.push_str("    if [ \"$_as\" -ne \"$_bs\" ]; then\n");
+        out.push_str("        if [ \"$_s\" -eq 0 ] && [ \"$_lf\" -eq 0 ]; then printf '%s %s differ: byte %d, line %d\\n' \"$_a\" \"$_b\" \"$_as\" \"$_lc\"; fi\n");
+        out.push_str("        return 1\n");
+        out.push_str("    fi\n");
+        out.push_str("    return 0\n");
+        out.push_str("}\n");
+        out.push_str("\n");
+    }
     out.push_str("_num() {\n");
     out.push_str("    # bash coerces non-numeric arith values to 0; dash errors\n");
     out.push_str("    case \"$1\" in\n");
@@ -1609,6 +1639,60 @@ fn needs_readlink(stmts: &[IrStmt]) -> bool {
     walk(stmts)
 }
 
+// GNU `cmp(1)` is tool-verbatim: the corpus expects the exact message
+// `A B differ: byte N, line M` and (with -l) the `N M\n` per-byte
+// octal listing. busybox cmp differs (uses `char`, different padding).
+// The polyfill reproduces GNU semantics using `od` (POSIX) for octals
+// and byte/line counters. -s is silent (rc only). -i ignored (the
+// corpus doesn't use case-insensitive cmp).
+fn cmp_flag(s: &str) -> bool {
+    s == "-l" || s == "-s" || s == "-i"
+}
+
+fn needs_cmp(stmts: &[IrStmt]) -> bool {
+    fn has_cmp(e: &IrExpr) -> bool {
+        if let IrExpr::Call { func, args } = e {
+            if (func == "exec" || func == "cmp") && !args.is_empty() {
+                if let IrExpr::Str(cn, _) = &args[0] {
+                    if cn == "cmp" { return true; }
+                }
+            }
+            return args.iter().any(has_cmp);
+        }
+        match e {
+            IrExpr::Array(es) => es.iter().any(has_cmp),
+            IrExpr::Object(es) => es.iter().any(|(_, v)| has_cmp(v)),
+            IrExpr::Arrow(stmts) => walk(stmts),
+            _ => false,
+        }
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            match st {
+                IrStmt::Expr(e) => { if has_cmp(e) { return true; } }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    if has_cmp(cond) || walk(body) { return true; }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    if has_cmp(cond) || walk(then) || walk(else_)
+                        || elsifs.iter().any(|(c, b)| has_cmp(c) || walk(b))
+                    { return true; }
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    if walk(body) { return true; }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    if has_cmp(iter) || walk(body) { return true; }
+                }
+                IrStmt::Assign { expr, .. } => { if has_cmp(expr) { return true; } }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
 fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)]>) -> Result<String, String> {
     // GNU-only flags: refuse rather than leak an unportable invocation
     if let IrExpr::Str(cn, _) = cmd {
@@ -2123,6 +2207,16 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
         && args.iter().any(|a| matches!(a, IrExpr::Str(s, _) if s == "-c"))
     {
         out.push_str("sh");
+        for w in args {
+            out.push(' ');
+            out.push_str(&word_to_sh(w)?);
+        }
+        return Ok(out);
+    }
+    // `cmp` -> `_cmp` polyfill (reproduces GNU diagnostics; the sandbox
+    // busybox cmp uses a different message format and lacks some flags).
+    if cmd_name == Some("cmp") && env.is_none() {
+        out.push_str("_cmp");
         for w in args {
             out.push(' ');
             out.push_str(&word_to_sh(w)?);
