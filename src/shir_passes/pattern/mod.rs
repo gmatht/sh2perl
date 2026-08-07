@@ -15,6 +15,7 @@
 //! the `whileLoopSync` lowering into `sync_loop.rs::WhileLoopSync`, etc.
 
 pub mod contains;
+pub mod grep_to_case;
 
 use crate::ir::{IrExpr, IrStmt};
 
