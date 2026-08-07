@@ -19618,7 +19618,8 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                 IrExpr::Interpolate(_) => true,
                 IrExpr::Var(n, _) => lifted.contains(n.as_str()),
                 IrExpr::Call { func, args } if func == "getVar" => {
-                    matches!(args.as_slice(), [IrExpr::Str(n, _)] if lifted.contains(n.as_str()))
+                    matches!(args.as_slice(), [IrExpr::Str(n, _)]
+                        if lifted.contains(n.as_str()) || positional_name(n))
                 }
                 // `x=$(cmd)` — command substitution ALWAYS yields a string
                 // (the runtime capture strips NULs + trailing newlines and
@@ -19629,15 +19630,6 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
                 // ...); the runtime never sees a lifted var.
                 IrExpr::Call { func, args } if func == "capture" => {
                     matches!(args.as_slice(), [IrExpr::Arrow(_)])
-                }
-                // a POSITIONAL source (`local n=$1` / `x=$1` →
-                // getVar("1")): the native positional read always yields
-                // a string — the exact value the runtime's expandWord /
-                // getVar produce. `$@`/`$*` join, `$#` counts — the
-                // getVar positional family.
-                IrExpr::Call { func, args } if func == "getVar" => {
-                    matches!(args.as_slice(), [IrExpr::Str(n, _)]
-                        if lifted.contains(n.as_str()) || positional_name(n))
                 }
                 _ => false,
             });
