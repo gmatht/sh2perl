@@ -597,22 +597,18 @@ impl Render {
             self.emit("  strncpy(d, sc + best, cap - 1); d[cap - 1] = 0;");
             self.emit("  return d;");
             self.emit("}");
-            self.emit("/* ${s%pat}/${s%%pat} suffix strip (greedy = longest prefix removed) */");
+            self.emit("/* ${s%pat}/${s%%pat} suffix strip (the pattern matches a SUFFIX) */");
             self.emit("static char *_sh_stripsuf(char *d, size_t cap, const char *s, const char *pat, int greedy) {");
             self.emit("  static char sc[65536];");
             self.emit("  strncpy(sc, s, sizeof sc - 1); sc[sizeof sc - 1] = 0;");
-            self.emit("  size_t n = strlen(sc), best = greedy ? 0 : n;");
+            self.emit("  size_t n = strlen(sc), best = n;");
             self.emit("  if (greedy) {");
             self.emit("    for (size_t i = n; i > 0; i--) {");
-            self.emit("      char c = sc[i]; sc[i] = 0;");
-            self.emit("      if (fnmatch(pat, sc, 0) == 0) { best = i; break; }");
-            self.emit("      sc[i] = c;");
+            self.emit("      if (fnmatch(pat, sc + (n - i), 0) == 0) { best = n - i; break; }");
             self.emit("    }");
             self.emit("  } else {");
-            self.emit("    for (size_t i = 0; i < n; i++) {");
-            self.emit("      char c = sc[i]; sc[i] = 0;");
-            self.emit("      if (fnmatch(pat, sc, 0) == 0) { best = i; break; }");
-            self.emit("      sc[i] = c;");
+            self.emit("    for (size_t i = 1; i <= n; i++) {");
+            self.emit("      if (fnmatch(pat, sc + (n - i), 0) == 0) { best = n - i; break; }");
             self.emit("    }");
             self.emit("  }");
             self.emit("  strncpy(d, sc + best, cap - 1); d[cap - 1] = 0;");
@@ -1173,11 +1169,41 @@ impl Render {
                             let t = self.num_temp("_sh_rc");
                             word(self, t);
                         }
-                        Some(n) if self.is_num(n) => {
-                            let t = self.num_temp(&self.c_ident(n));
+                        Some("@") | Some("*") => {
+                            let t = self.str_temp(4096);
+                            self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
                             word(self, t);
                         }
-                        Some(n) => word(self, self.store_ref(n)),
+                        Some(n) if n.chars().all(|c| c.is_ascii_digit()) => {
+                            self.emit(&format!(
+                                "_sh_export(\"_SHARGV\", (({n} < _sh_argc && _sh_argv[{n}]) ? _sh_argv[{n}] : \"\"));"
+                            ));
+                            match buf {
+                                CmdBuf::Shared => self.emit("_sh_add(\"$_SHARGV\");"),
+                                CmdBuf::Private(id) => self.emit(&format!(
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"$_SHARGV\");"
+                                )),
+                            }
+                        }
+                        Some(n) => {
+                            let v = if self.is_num(n) {
+                                let t = self.num_temp(&self.c_ident(n));
+                                t
+                            } else {
+                                self.store_ref(n)
+                            };
+                            self.emit(&format!("_sh_export({}, {v});", Self::cstr(n)));
+                            match buf {
+                                CmdBuf::Shared => self.emit(&format!(
+                                    "_sh_add(\"$\"); _sh_add({});",
+                                    Self::cstr(n)
+                                )),
+                                CmdBuf::Private(id) => self.emit(&format!(
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"$\"); _sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                    Self::cstr(n)
+                                )),
+                            }
+                        }
                         None => word(self, "0".into()),
                     }
                 }
@@ -1220,42 +1246,84 @@ impl Render {
                 }
             },
             IrExpr::Interpolate(parts) => {
-                // assemble the word content (flattened parts) into the
-                // word buffer, then quote the whole as one word
+                // ONE shell word from concatenated segments: literal
+                // parts are single-quoted, getVar parts become `$name`
+                // references (exported) so the child sees FRESH values
+                // (read/loop targets are set inside the child).
                 let parts = flatten_parts(parts);
-                match buf {
-                    CmdBuf::Shared => {
-                        self.emit("_sh_wb_reset();");
-                        for p in parts {
-                            match p {
-                                InterpPart::Lit(s) => {
-                                    self.emit(&format!("_sh_wb_add({});", Self::cstr(&s)))
-                                }
-                                InterpPart::Expr(x) => {
-                                    let v = self.value_c(&x);
-                                    self.emit(&format!("_sh_wb_add({v});"));
-                                }
-                            }
-                        }
-                        word(self, "_sh_wb".into());
-                    }
-                    CmdBuf::Private(id) => {
-                        self.emit(&format!("_sh_bres(&_c{id}_wb, &_c{id}_wcap);"));
-                        for p in parts {
-                            match p {
-                                InterpPart::Lit(s) => self.emit(&format!(
-                                    "_sh_badd(&_c{id}_wb, &_c{id}_wcap, {});",
-                                    Self::cstr(&s)
-                                )),
-                                InterpPart::Expr(x) => {
-                                    let v = self.value_c(&x);
-                                    self.emit(&format!(
-                                        "_sh_badd(&_c{id}_wb, &_c{id}_wcap, {v});"
-                                    ));
+                let mut first_seg = true;
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(s) => {
+                            if first_seg {
+                                word(self, Self::cstr(&s));
+                            } else {
+                                match buf {
+                                    CmdBuf::Shared => self.emit(&format!(
+                                        "_sh_add({});",
+                                        Self::cstr(&format!("'{}'", s.replace('\'', "'\\''")))
+                                    )),
+                                    CmdBuf::Private(id) => self.emit(&format!(
+                                        "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                        Self::cstr(&format!("'{}'", s.replace('\'', "'\\''")))
+                                    )),
                                 }
                             }
+                            first_seg = false;
                         }
-                        word(self, format!("_c{id}_wb"));
+                        InterpPart::Expr(x) => match x.as_ref() {
+                            IrExpr::Call { func, args } if func == "getVar" => {
+                                let n = Self::str_arg(args, 0).unwrap_or_default();
+                                let v = if n == "?" {
+                                    self.num_temp("_sh_rc")
+                                } else if self.is_num(&n) {
+                                    let t = self.num_temp(&self.c_ident(&n));
+                                    t
+                                } else {
+                                    self.store_ref(&n)
+                                };
+                                self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
+                                let ref_text = if n == "?" { v.clone() } else { format!("${n}") };
+                                if first_seg {
+                                    match buf {
+                                        CmdBuf::Shared => self.emit(&format!(
+                                            "_sh_addraw({});",
+                                            Self::cstr(&format!("\"{ref_text}\""))
+                                        )),
+                                        CmdBuf::Private(id) => self.emit(&format!(
+                                            "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                            Self::cstr(&format!("\"{ref_text}\""))
+                                        )),
+                                    }
+                                } else {
+                                    match buf {
+                                        CmdBuf::Shared => self.emit(&format!(
+                                            "_sh_add({});",
+                                            Self::cstr(&format!("\"{ref_text}\""))
+                                        )),
+                                        CmdBuf::Private(id) => self.emit(&format!(
+                                            "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                            Self::cstr(&format!("\"{ref_text}\""))
+                                        )),
+                                    }
+                                }
+                                first_seg = false;
+                            }
+                            _ => {
+                                let v = self.value_c(&x);
+                                if first_seg {
+                                    word(self, v);
+                                } else {
+                                    match buf {
+                                        CmdBuf::Shared => self.emit(&format!("_sh_add({v});")),
+                                        CmdBuf::Private(id) => self.emit(&format!(
+                                            "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {v});"
+                                        )),
+                                    }
+                                }
+                                first_seg = false;
+                            }
+                        },
                     }
                 }
             }
@@ -1625,50 +1693,73 @@ impl Render {
 
     /// Append the redirect text (`> f`, `>> f`, `< f`, heredoc, ...).
     fn sh_redirect_text(&mut self, buf: CmdBuf, redirects: &[crate::ir::IrRedirect]) {
+        let raw = |r: &mut Render, s: &str| match buf {
+            CmdBuf::Shared => r.emit(&format!("_sh_addraw({});", Self::cstr(s))),
+            CmdBuf::Private(id) => r.emit(&format!(
+                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                Self::cstr(&format!(" {s}"))
+            )),
+        };
+        let add = |r: &mut Render, s: &str| match buf {
+            CmdBuf::Shared => r.emit(&format!("_sh_add({});", Self::cstr(s))),
+            CmdBuf::Private(id) => r.emit(&format!(
+                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                Self::cstr(s)
+            )),
+        };
+        // append a C EXPRESSION value (already a string literal / temp)
+        let addv = |r: &mut Render, v: &str| match buf {
+            CmdBuf::Shared => r.emit(&format!("_sh_add({v});")),
+            CmdBuf::Private(id) => {
+                r.emit(&format!("_sh_badd(&_c{id}_cmd, &_c{id}_cap, {v});"))
+            }
+        };
         for rd in redirects {
             let mode = rd.mode.as_str();
             let fd = rd.fd.unwrap_or(1);
-            let fd_pre = if fd == 1 { String::new() } else { format!("{fd}") };
+            let _fd_pre = if fd == 1 { String::new() } else { format!("{fd}") };
             match mode {
                 "w" => {
-                    self.emit("_sh_addraw(\">\");");
-                    self.sh_word(CmdBuf::Shared, &rd.target);
+                    raw(self, ">");
+                    self.sh_word(buf, &rd.target);
                 }
                 "a" => {
-                    self.emit("_sh_addraw(\">>\");");
-                    self.sh_word(CmdBuf::Shared, &rd.target);
+                    raw(self, ">>");
+                    self.sh_word(buf, &rd.target);
                 }
                 "r" | "r+" => {
-                    self.emit("_sh_addraw(\"<\");");
-                    self.sh_word(CmdBuf::Shared, &rd.target);
+                    raw(self, "<");
+                    self.sh_word(buf, &rd.target);
                 }
                 "heredoc" => {
                     // target = the body content (already interpolated by
                     // the core); a quoted delimiter keeps it literal
-                    self.emit("_sh_addraw(\"<<'_SH2EOF_'\\n\");");
+                    raw(self, "<<'_SH2EOF_'\n");
                     let v = self.value_c(&rd.target);
-                    self.emit(&format!("_sh_add({v});"));
-                    self.emit("_sh_add(\"\\n_SH2EOF_\");");
+                    addv(self, &v);
+                    self.emit(&format!(
+                        "{{ size_t _hl = strlen({v}); if (_hl == 0 || {v}[_hl - 1] != '\\n') _sh_add(\"\\n\"); }}"
+                    ));
+                    add(self, "_SH2EOF_");
                 }
                 "herestring" => {
-                    self.emit("_sh_addraw(\"<<<\");");
-                    self.sh_word(CmdBuf::Shared, &rd.target);
+                    raw(self, "<<<");
+                    self.sh_word(buf, &rd.target);
                 }
                 "process-in" => {
-                    self.emit("_sh_addraw(\"<\");");
+                    raw(self, "<");
                     let v = self.value_c(&rd.target);
-                    self.emit(&format!("_sh_add({v});"));
+                    addv(self, &v);
                 }
                 "process-out" => {
-                    self.emit("_sh_addraw(\">\");");
+                    raw(self, ">");
                     let v = self.value_c(&rd.target);
-                    self.emit(&format!("_sh_add({v});"));
+                    addv(self, &v);
                 }
                 _ => {
                     self.mark_todo(&format!("redirect mode {mode}"));
                 }
             }
-            let _ = fd_pre;
         }
     }
 
@@ -1758,7 +1849,14 @@ impl Render {
                 self.need_sh = true;
                 for w in &words {
                     if let Some(name) = Self::str_arg(&[(*w).clone()], 0) {
-                        if !self.is_num(&name) {
+                        if self.arrays.contains(&name) {
+                            let id = self.c_ident(&name);
+                            if self.assoc_arrays.contains(&name) {
+                                self.emit(&format!("{id}_n = 0;"));
+                            } else {
+                                self.emit(&format!("{id}_len = 0;"));
+                            }
+                        } else if !self.is_num(&name) {
                             let id = self.c_ident(&name);
                             self.emit(&format!("{id} = \"\";"));
                         }
@@ -2270,6 +2368,20 @@ impl Render {
                 return self.array_len(rest);
             }
         }
+        // `${arr[@]:off:len}` — param("slice", "arr", "@", off, len)
+        if op == "slice"
+            && matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*")
+        {
+            let joined = self.array_join_all(&name);
+            let off = self.args_value_num(3);
+            let len = self.args_value_num(4);
+            self.need_sh = true;
+            let t = self.str_temp(65536);
+            self.emit(&format!(
+                "_sh_substr({t}, sizeof {t}, {joined}, {off}, {len});"
+            ));
+            return t;
+        }
         // `${arr[1]}` / `${#arr[@]}` — the array machinery
         if name.contains('[') || name.contains('@') || name.contains('*') {
             self.cur_param_args = args.to_vec();
@@ -2299,9 +2411,17 @@ impl Render {
             // positional $N — the function-call argv (empty at top level)
             self.need_sh = true;
             format!("(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")")
-        } else {
-            self.store.insert(name.clone());
+        } else if self.store.contains(&name) {
             self.store_ref(&name)
+        } else {
+            // never-assigned: an environment variable (or unset — the
+            // default/expansion handles it)
+            self.need_sh = true;
+            format!(
+                "(getenv({}) ? getenv({}) : \"\")",
+                Self::cstr(&name),
+                Self::cstr(&name)
+            )
         };
         let val = args.get(2).map(|x| self.value_c(x)).unwrap_or_else(|| "\"\"".into());
         let repl = args.get(3).map(|x| self.value_c(x)).unwrap_or_else(|| "\"\"".into());
@@ -2941,10 +3061,10 @@ impl Render {
                 if func == "getVar" {
                     if let Some(IrExpr::Str(name, _)) = args.first() {
                         if name == "?" {
-                            return vec![Part::Arg("_sh_rc".into(), NumSpec::Num("%d", true))];
+                            return vec![Part::Arg("_sh_rc".into(), NumSpec::Num("%lld", true))];
                         }
                         if name == "#" {
-                            return vec![Part::Arg("(_sh_argc - 1)".into(), NumSpec::Num("%d", true))];
+                            return vec![Part::Arg("(_sh_argc - 1)".into(), NumSpec::Num("%lld", true))];
                         }
                         if name == "@" || name == "*" {
                             self.need_sh = true;
@@ -3349,7 +3469,7 @@ impl Render {
                 }
                 // `for x in $(cmd)` — capture once, split on whitespace
                 if items.len() == 1 {
-                    if let IrExpr::Call { func, .. } = &items[0] {
+                    if let IrExpr::Call { func, args } = &items[0] {
                         if func == "captureWords" || func == "capture" {
                             let cap = self.capture_call(&[items[0].clone()]);
                             self.need_sh = true;
@@ -3368,6 +3488,30 @@ impl Render {
                             self.emit(&format!(
                                 "{var_name} = {ws}[_wi_{wn}];"
                             ));
+                            for s in body {
+                                self.stmt(s);
+                            }
+                            self.depth -= 1;
+                            self.emit("}");
+                            return;
+                        }
+                        if func == "split" {
+                            // `for w in $y` — split the value at runtime
+                            let v = self.value_c(&args[0]);
+                            self.need_sh = true;
+                            let wn = format!("_wn_{}", self.temp_seq);
+                            self.temp_seq += 1;
+                            let ws = format!("_ws_{}", self.temp_seq);
+                            self.temp_seq += 1;
+                            self.emit(&format!(
+                                "char {wn}[65536]; strncpy({wn}, {v}, 65535); {wn}[65535] = 0; char *{ws}[1024]; size_t _wc_{wn} = _sh_split({wn}, {ws}, 1024);"
+                            ));
+                            let var_name = self.c_ident(var);
+                            self.emit(&format!(
+                                "for (size_t _wi_{wn} = 0; _wi_{wn} < _wc_{wn}; _wi_{wn}++) {{"
+                            ));
+                            self.depth += 1;
+                            self.emit(&format!("{var_name} = {ws}[_wi_{wn}];"));
                             for s in body {
                                 self.stmt(s);
                             }
@@ -4042,19 +4186,139 @@ fn collect_fn_defs(
 /// guarantees at most one site, so the first match is the only one.
 fn const_assign_rhs(stmts: &[IrStmt], const_vars: &HashMap<String, VarKind>) -> HashMap<String, IrExpr> {
     let mut out = HashMap::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     for s in stmts {
         if let IrStmt::Assign { targets, expr } = s {
             for t in targets {
                 if t.indices.is_empty()
                     && const_vars.get(&t.var) == Some(&VarKind::Const)
                     && !out.contains_key(&t.var)
+                    && !seen.contains(&t.var)
                 {
                     out.insert(t.var.clone(), expr.clone());
                 }
             }
         }
+        // any READ before the (single) assignment disqualifies the lift —
+        // the hoisted initializer would reorder the write before the read
+        let mut reads = BTreeSet::new();
+        collect_const_reads(s, &mut reads);
+        for r in reads {
+            seen.insert(r);
+        }
     }
     out
+}
+
+/// Names READ by a statement (getVar/param/word mentions) — a const lift
+/// must not move an assignment before an earlier read of the same var.
+fn collect_const_reads(s: &IrStmt, out: &mut BTreeSet<String>) {
+    let mut walk = |e: &IrExpr| collect_const_reads_expr(e, out);
+    match s {
+        IrStmt::Expr(e) => walk(e),
+        IrStmt::Output { value, .. } => walk(value),
+        IrStmt::Assign { expr, .. } => walk(expr),
+        IrStmt::Declare { init, .. } => {
+            if let Some(e) = init {
+                walk(e);
+            }
+        }
+        IrStmt::If { cond, .. } => walk(cond),
+        IrStmt::While { cond, .. } | IrStmt::DoWhile { cond, .. } => walk(cond),
+        IrStmt::Exit(e) | IrStmt::Return(e) => {
+            if let Some(x) = e {
+                walk(x);
+            }
+        }
+        IrStmt::WriteFile { path, content, .. } => {
+            walk(path);
+            walk(content);
+        }
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => walk(expr),
+        IrStmt::SetChildError(e) => walk(e),
+        _ => {}
+    }
+}
+
+fn collect_const_reads_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+    match e {
+        IrExpr::Call { func, args } => {
+            match func.as_str() {
+                "getVar" => {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        out.insert(n.clone());
+                    }
+                }
+                "param" => {
+                    if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                        out.insert(n.clone());
+                    }
+                }
+                _ => {}
+            }
+            for a in args {
+                collect_const_reads_expr(a, out);
+            }
+        }
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => {
+            out.insert(name.clone());
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_const_reads_expr(lhs, out);
+            collect_const_reads_expr(rhs, out);
+        }
+        IrExpr::Arith(a) => collect_const_arith(a, out),
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    collect_const_reads_expr(x, out);
+                }
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                collect_const_reads_expr(i, out);
+            }
+        }
+        IrExpr::Index { var, key, .. } => {
+            out.insert(var.clone());
+            collect_const_reads_expr(key, out);
+        }
+        IrExpr::Arrow(body) => {
+            for s in body {
+                collect_const_reads(s, out);
+            }
+        }
+        IrExpr::Capture { expr, .. } => collect_const_reads_expr(expr, out),
+        _ => {}
+    }
+}
+
+fn collect_const_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
+    match a {
+        ArithAst::Var(name) => {
+            out.insert(name.clone());
+        }
+        ArithAst::Index { var, key } => {
+            out.insert(var.clone());
+            collect_const_arith(key, out);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            collect_const_arith(lhs, out);
+            collect_const_arith(rhs, out);
+        }
+        ArithAst::Un { arg, .. } => collect_const_arith(arg, out),
+        ArithAst::Cond { test, then, else_, .. } => {
+            collect_const_arith(test, out);
+            collect_const_arith(then, out);
+            collect_const_arith(else_, out);
+        }
+        ArithAst::Assign { rhs, .. } => collect_const_arith(rhs, out),
+        ArithAst::IncDec { var, .. } => {
+            out.insert(var.clone());
+        }
+        ArithAst::Num(_) => {}
+    }
 }
 
 /// Seq-range for-loop vars render as Int loops — hoist them at that
