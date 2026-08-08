@@ -20,8 +20,16 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
         collect_fields(st, &mut out)?;
     }
     out.push_str("    public static void main(String[] args) throws Exception {\n");
-    for st in &prog.stmts {
+    // source-mapping comments: ` // line N` (the shIR convention)
+    for (idx, st) in prog.stmts.iter().enumerate() {
+        let before = out.len();
         stmt_to_java(st, 2, &mut out)?;
+        let line = prog.stmt_lines.iter().find(|(i, _)| *i == idx).map(|(_, l)| *l);
+        if let Some(l) = line {
+            if let Some(nl) = out[before..].find('\n') {
+                out.insert_str(before + nl, &format!(" // line {l}"));
+            }
+        }
     }
     out.push_str("    }\n");
     out.push_str("}\n");
