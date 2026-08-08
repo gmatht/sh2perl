@@ -228,111 +228,6 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
     names
 }
 
-/// Would a global `exec 2>/dev/null` be safe? Only when the program has
-/// NO fd-dup redirects (`2>&1` — the merge would capture nothing after
-/// the suppression). Everything else's stderr is discarded by the gate
-/// reference (`bash file 2>/dev/null`), so silencing OUR stderr matches
-/// bash's stdout exactly (error messages, `echo >&2` diagnostics).
-fn has_fd_dup(prog: &IrProgram) -> bool {
-    fn redir_dup(r: &IrRedirect) -> bool {
-        // only `2>&1` (stderr merged INTO stdout) blocks suppression —
-        // the reference's stdout carries that content; `>&2` writes go
-        // to the reference's DISCARDED stderr (suppression matches them)
-        r.fd == Some(2) && matches!(&r.target, IrExpr::Str(s, _) if s.starts_with("&1"))
-    }
-    fn expr_dup(e: &IrExpr) -> bool {
-        match e {
-            IrExpr::Call { func, args } if func == "redirect" => {
-                let objs = args
-                    .get(1)
-                    .and_then(|a| match a {
-                        IrExpr::Array(items) => Some(items.as_slice()),
-                        _ => None,
-                    })
-                    .unwrap_or(&[]);
-                objs.iter().any(|o| {
-                    matches!(o, IrExpr::Object(ps) if ps.iter().any(|(k, v)| k == "target" && matches!(v, IrExpr::Str(s, _) if s.starts_with('&'))))
-                })
-            }
-            IrExpr::Call { args, .. } => args.iter().any(expr_dup),
-            IrExpr::Array(es) => es.iter().any(expr_dup),
-            IrExpr::Object(es) => es.iter().any(|(_, v)| expr_dup(v)),
-            IrExpr::Interpolate(parts) => parts
-                .iter()
-                .any(|p| matches!(p, InterpPart::Expr(x) if expr_dup(x))),
-            _ => false,
-        }
-    }
-    fn walk(sts: &[IrStmt]) -> bool {
-        for st in sts {
-            let hit = match st {
-                IrStmt::Expr(e) => expr_dup(e),
-                IrStmt::Assign { expr, .. } => expr_dup(expr),
-                IrStmt::If {
-                    cond,
-                    then,
-                    elsifs,
-                    else_,
-                    ..
-                } => {
-                    expr_dup(cond)
-                        || walk(then)
-                        || walk(else_)
-                        || elsifs.iter().any(|(c, b)| expr_dup(c) || walk(b))
-                }
-                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
-                    expr_dup(cond) || walk(body)
-                }
-                IrStmt::For { iter, body, .. } => expr_dup(iter) || walk(body),
-                IrStmt::Case {
-                    discriminant,
-                    clauses,
-                    ..
-                } => expr_dup(discriminant) || clauses.iter().any(|c| walk(&c.body)),
-                IrStmt::Function { body, .. } => walk(body),
-                IrStmt::Redirect { inner, redirects } => {
-                    walk(inner) || redirects.iter().any(redir_dup)
-                }
-                IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
-                    walk(body)
-                }
-                IrStmt::Exec {
-                    cmd,
-                    args,
-                    redirects,
-                    env,
-                    ..
-                } => {
-                    expr_dup(cmd)
-                        || args.iter().any(expr_dup)
-                        || redirects.iter().any(expr_dup)
-                        || env.iter().any(|(_, v)| expr_dup(v))
-                }
-                IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| walk(s)),
-                IrStmt::Output { value, .. }
-                | IrStmt::Return(Some(value))
-                | IrStmt::Exit(Some(value))
-                | IrStmt::Die { expr: value, .. }
-                | IrStmt::Warn { expr: value, .. } => expr_dup(value),
-                IrStmt::Declare { init, .. } => init.as_ref().map(expr_dup).unwrap_or(false),
-                IrStmt::DeclareArray { elements, .. } => elements.iter().any(expr_dup),
-                IrStmt::WriteFile { path, content, .. } => expr_dup(path) || expr_dup(content),
-                IrStmt::Return(None)
-                | IrStmt::Exit(None)
-                | IrStmt::SetChildError(_)
-                | IrStmt::Require(_)
-                | IrStmt::RawText(_)
-                | IrStmt::Label(_)
-                | IrStmt::Goto(_) => false,
-            };
-            if hit {
-                return true;
-            }
-        }
-        false
-    }
-    walk(&prog.stmts) || prog.subs.iter().any(|s| walk(&s.body))
-}
 
 /// The whole-array expansion helper for a name (assoc arrays iterate
 /// their key list — the per-element vars are KEY-named).
@@ -518,12 +413,7 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
         .collect();
     let mut out = String::new();
     out.push_str("#!/bin/sh\n");
-    if !has_fd_dup(prog) {
-        // the gate compares our stdout against `bash file 2>/dev/null` —
-        // bash's stderr is discarded, so silence ours (command-not-found
-        // messages, `echo >&2` diagnostics) to match exactly
-        out.push_str("exec 2>/dev/null\n");
-    }
+
     if needs_grep_p(&prog.stmts) {
         out.push_str("\n");
         out.push_str("# portable PCRE grep: GNU grep -P, macOS gnu-grep, or perl\n");
