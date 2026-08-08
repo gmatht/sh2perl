@@ -27,6 +27,16 @@ lazy_static::lazy_static! {
     /// per-element vars are KEY-named (`config_user`) — the expansion
     /// helpers iterate the key list, not indices.
     static ref ASSOC_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
+    /// Provably-numeric variables (the A2 verdicts, `shir::analyze_var_types`
+    /// → `IrType::Int`): their arith reads render as the bare name instead
+    /// of `$( _num "${name}" )` — the runtime coercion is dead weight when
+    /// the value is guaranteed numeric text (bash coerces non-numeric arith
+    /// to 0 anyway; dash only errors when the value is non-numeric, which
+    /// the analysis rules out — every assignment source is an integer
+    /// literal, an arith expression, or another proven-numeric var; the
+    /// drop target must be BARE — dash rejects quoted expansions inside
+    /// `$(( ))`).
+    static ref NUM_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
 }
 
 /// Marker prefixes the core's lowering tags unquoted glob / process-
@@ -501,6 +511,11 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
     *NOCASEMATCH.lock().unwrap() = false;
     *INT_VARS.lock().unwrap() = Default::default();
     *ASSOC_VARS.lock().unwrap() = Default::default();
+    *NUM_VARS.lock().unwrap() = crate::shir::analyze_var_types(prog)
+        .into_iter()
+        .filter(|(_, t)| *t == crate::ir::IrType::Int)
+        .map(|(n, _)| n)
+        .collect();
     let mut out = String::new();
     out.push_str("#!/bin/sh\n");
     if !has_fd_dup(prog) {
@@ -3961,6 +3976,13 @@ fn arith_rewrite(t: &str) -> String {
                 && !(k + 1 < b.len() && (b[k + 1] == b'=' || b[k + 1] == b'~'));
             if is_assign {
                 out.push_str(name);
+            } else if NUM_VARS.lock().unwrap().contains(name) {
+                // known-numeric var: the coercion is dead weight — both
+                // shells evaluate the bare name natively (dash rejects
+                // QUOTED expansions inside $(( )) — `"${name}"` — so the
+                // drop target must be the bare identifier, which the
+                // analysis guarantees to hold numeric text)
+                out.push_str(name);
             } else {
                 out.push_str(&format!("$( _num \"${name}\" )"));
             }
@@ -4048,7 +4070,16 @@ fn cstyle_for_to_sh(arith: &str, body: &str) -> String {
 fn arith_to_sh(a: &ArithAst) -> String {
     match a {
         ArithAst::Num(n) => n.to_string(),
-        ArithAst::Var(name) => format!("$( _num \"${name}\" )"),
+        ArithAst::Var(name) => {
+            if NUM_VARS.lock().unwrap().contains(name) {
+                // known-numeric var: bare read (dash rejects quoted
+                // expansions inside $(( )); the analysis guarantees the
+                // value is numeric text)
+                name.clone()
+            } else {
+                format!("$( _num \"${name}\" )")
+            }
+        }
         ArithAst::Index { var, key } => format!("{var}[{}]", arith_to_sh(key)),
         ArithAst::Bin { op, lhs, rhs } => {
             // dash has no `**` — constant-fold literal powers
