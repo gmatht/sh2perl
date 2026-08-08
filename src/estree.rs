@@ -1309,6 +1309,44 @@ mod tests {
     }
 
     #[test]
+    fn dollar_ref_arith_text_lowers_natively() {
+        // `j=$(( $j*$i ))` INSIDE a for loop (047_for_arithematic): the
+        // runtime arith STRING's `$name` refs strip to a native-lowerable
+        // expression, so the loop body must become bare native JS — no
+        // setVar, no sh2.arith. The refs are PROVABLY SET here (i is the
+        // loop var, j was assigned 0 before the loop... the deletion gate
+        // keeps the unset-j shape on the runtime, see below).
+        let json = to_json("i=0\nj=0\nj=$(( $j*$i ))");
+        assert!(
+            !json.contains("\"name\":\"arith\""),
+            "native-lowerable $ref arith text: no sh2.arith"
+        );
+        assert!(!json.contains("unsupported"));
+        // the UNSET gate: `j=$(( $j*$i ))` with j's ONLY write the arith
+        // text itself — bash substitutes the EMPTY value, `*i` is a
+        // syntax error, the assignment is skipped (047 in the corpus).
+        // The deletion gate must keep the runtime evaluator.
+        let json2 = to_json("for i in 1 2 3; do j=$(( $j*$i )); done");
+        assert!(
+            json2.contains("\"name\":\"arith\""),
+            "unset-at-read $ref arith text keeps sh2.arith"
+        );
+        assert!(!json2.contains("unsupported"));
+        // `let "$n == 5"` — the `(( $n == 5 ))` condition: n is set, the
+        // stripped text parses — the let must lower natively.
+        let json3 = to_json("n=5\nif (( $n == 5 )); then echo equal; fi");
+        assert!(
+            !json3.contains("\"name\":\"builtin\""),
+            "$ref let cond: no builtin dispatch"
+        );
+        assert!(!json3.contains("unsupported"));
+        // `$1` positionals are NOT strip-able — the runtime stays.
+        let json4 = to_json("n=$(( $1 + 0 ))");
+        assert!(json4.contains("\"name\":\"arith\""));
+        assert!(!json4.contains("unsupported"));
+    }
+
+    #[test]
     fn yes_head_capture_lifts_to_native_repeat() {
         // `$(yes Hello | head -3)` — the infinite-producer capture: yes
         // prints `Hello\n` forever, head takes the first 3 lines — the
