@@ -4169,6 +4169,14 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
     // because a regex character class like [a-z] inside a substitution pattern
     // would otherwise be misinterpreted as array access.
     if content.contains('[') && content.contains(']') {
+        // Guard: if the part BEFORE the `[` contains pattern-removal or
+        // substitution operators (`${x##*[/\\]}` — a bracket CLASS inside
+        // the pattern, not a subscript), fall through to the operator
+        // checks below (mirrors the parse_variable_expansion copy).
+        let pattern_op_before_bracket = content.find('[').map_or(false, |bs| {
+            content[..bs].contains('#') || content[..bs].contains('%') || content[..bs].contains('/')
+        });
+        if !pattern_op_before_bracket {
         if let Some(bracket_start) = content.find('[') {
             if let Some(bracket_end) = content.rfind(']') {
                 let var_name = &content[..bracket_start];
@@ -4291,6 +4299,7 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                     is_mutable: true,
                 });
             }
+        }
         }
     }
 

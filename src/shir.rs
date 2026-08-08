@@ -33,6 +33,22 @@ static LIFTED_STRING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// [`native_special_var`]'s set) and the env-resident denylist
 /// ([`ENV_RESIDENT_NAMES`]) never fold.
 static NEVER_WRITTEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Names whose EVERY write in the program is an ARRAY write (set per
+/// compilation by `shir_to_estree`; see [`collect_array_only_written`]).
+/// The plain-name `${arr:off:len}` slice lowering (SH2_ASSUME_ARRAY_SLICE)
+/// consults it: a name in this set is either unset or an array at every
+/// read, so the runtime's array-vs-scalar dispatch is unobservable and
+/// the array branch lowers natively.
+static ARRAY_ONLY_NAMES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Names the emitter may access DIRECTLY on the runtime's plain-object
+/// store (`sh2.vars.<name>` — a property read/write, no getVar/setVar
+/// dispatch; see [`collect_native_store_access`]). Set per compilation
+/// by `shir_to_estree`.
+static NATIVE_STORE_READ_BLOCKED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// The WRITE-side blocker set: the runtime setVar's attribute branches
+/// (`typeset -i/-l/-u`, namerefs, exported/PATH env sync) exclude the
+/// name from native writes (see [`collect_native_store_access`]).
+static NATIVE_STORE_WRITE_BLOCKED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// Names with a REAL (non-arith-text) assignment source (set per
 /// compilation by `shir_to_estree`; see [`collect_arith_ref_set_vars`]).
 /// The `$(( $var ... ))` dollar-ref arith lowering ([`native_arith_text`])
@@ -9512,6 +9528,19 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // (the getVar arms consult it) and after the transforms (the write
     // scan must see the same shape the emitter will emit).
     *NEVER_WRITTEN.lock().unwrap() = collect_never_written(prog);
+    // Provably-array-only-written names (SH2_ASSUME_ARRAY_SLICE — the
+    // plain-name `${arr:off:len}` slice lowering's array-vs-scalar
+    // proof). Set alongside NEVER_WRITTEN (same shape the emitter sees).
+    *ARRAY_ONLY_NAMES.lock().unwrap() = Some(collect_array_only_written(prog));
+    // Native plain-object store access blockers (see
+    // [`collect_native_store_access`]): the names whose runtime getVar/
+    // setVar branches (array/assoc/nameref/attribute/env-sync) forbid a
+    // direct `sh2.vars.<name>` read/write. Set alongside the lift
+    // statics (the emission consults it in store_var_read and the
+    // setVar/Assign arms).
+    let (nsr_blocked, nsw_blocked) = collect_native_store_access(prog);
+    *NATIVE_STORE_READ_BLOCKED.lock().unwrap() = Some(nsr_blocked);
+    *NATIVE_STORE_WRITE_BLOCKED.lock().unwrap() = Some(nsw_blocked);
     // Per-function `local` native lift (fish-sh-go local-scope requests):
     // computed after the lift/scan statics (it consults nothing of them,
     // but the emission reads it alongside) and before the main emission.
@@ -11517,12 +11546,46 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         expression: expr_to_estree(expr),
                     }
                 }
-                _ => Stmt::ExpressionStatement {
-                    expression: sh2_call(
-                        "setVar",
-                        vec![str_lit(&target.var), expr_to_estree(expr)],
-                    ),
-                },
+                _ => {
+                    // Native plain-object store write: `sh2.vars.<name> =
+                    // <call-free rhs>` (the runtime setVar's plain path is
+                    // exactly the String() coercion + vars store; the
+                    // attribute branches — -i/-l/-u/nameref/exported/PATH
+                    // — are excluded by [`native_store_write_ok`], and the
+                    // ARITH_BAD_MAGIC skip / array-join cannot fire for a
+                    // call-free RHS). String()-wrap only non-string RHS
+                    // (native arith numbers) — the store must stay
+                    // string-typed (the runtime String()s every value).
+                    let ve = expr_to_estree(expr);
+                    let native = target.indices.is_empty()
+                        && native_store_write_ok(&target.var)
+                        && call_free_expr(&ve).is_some();
+                    let rhs = if native && !store_rhs_string(&ve) {
+                        Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "String".to_string(),
+                            }),
+                            arguments: vec![ve],
+                            optional: false,
+                        }
+                    } else {
+                        ve
+                    };
+                    Stmt::ExpressionStatement {
+                        expression: if native {
+                            Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(store_member(&target.var)),
+                                right: Box::new(rhs),
+                            }
+                        } else {
+                            sh2_call(
+                                "setVar",
+                                vec![str_lit(&target.var), rhs],
+                            )
+                        },
+                    }
+                }
             }
         }
         IrStmt::If {
@@ -19900,16 +19963,32 @@ fn test_str_to_estree(s: &str) -> Option<Expr> {
                     // handles the split-at-space missing-brace shapes).
                     if is_lifted(&name) {
                         quasis.push(std::mem::take(&mut lit));
-                        exprs.push(sh2_call(
-                            "param",
-                            vec![
-                                str_lit(&op),
-                                str_lit(&name),
-                                str_lit(&a),
-                                str_lit(&b),
-                                Expr::Identifier { name: name.clone() },
-                            ],
-                        ));
+                        // Route the value-override param through the same
+                        // native lowering as the expression path
+                        // (try_native_param): the pure string ops
+                        // (`##`/`#`/`%%`/`%` strips, `^^`/`,,`/`^`/`,`
+                        // cases, `/`/`//` replaces, `:-` defaults, literal
+                        // slices) emit native JS over the inlined binding;
+                        // the rest keep the exact runtime call.
+                        let ir_args = vec![
+                            IrExpr::Str(op.clone(), StrStyle::DoubleQuoted),
+                            IrExpr::Str(name.clone(), StrStyle::DoubleQuoted),
+                            IrExpr::Str(a.clone(), StrStyle::DoubleQuoted),
+                            IrExpr::Str(b.clone(), StrStyle::DoubleQuoted),
+                        ];
+                        let native = try_native_param(&ir_args).unwrap_or_else(|| {
+                            sh2_call(
+                                "param",
+                                vec![
+                                    str_lit(&op),
+                                    str_lit(&name),
+                                    str_lit(&a),
+                                    str_lit(&b),
+                                    Expr::Identifier { name: name.clone() },
+                                ],
+                            )
+                        });
+                        exprs.push(native);
                         changed = true;
                     } else {
                         lit.push_str(&s[i..end]);
@@ -20234,6 +20313,69 @@ fn native_param_default_text(text: &str) -> Option<Expr> {
     None
 }
 
+/// A single bracket-class glob CORE (`[abc]` / `[/\\]` / `[\*]`): the
+/// exact `[...]` shape with a conservative body — no `*`/`?`/`[`/`-`/
+/// `!`/`^` (ranges and negations need more than per-char probes), and
+/// `\\X` escape pairs translate to the literal `X` exactly like the
+/// runtime's classMatch (a TRAILING lone `\\` is a literal backslash —
+/// classMatch's tail case; an escaped `]` is rejected — the runtime's
+/// class scan stops at the first `]`, so the pattern is not a single
+/// class). Returns the class's literal chars — each must map to one
+/// `indexOf`/`lastIndexOf` probe. Used by the `##`/`%` strip-`*`
+/// lowering (`${x##*[/\\]}` — strip through the LAST `/` or `\\`).
+fn glob_class_chars(core: &str) -> Option<Vec<String>> {
+    let body = core.strip_prefix('[')?.strip_suffix(']')?;
+    if body.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut cs = body.chars();
+    while let Some(c) = cs.next() {
+        if c == '\\' {
+            // escape pair: the next char is literal (a trailing lone `\\`
+            // is classMatch's literal-tail case)
+            match cs.next() {
+                Some(x) if x != ']' => out.push(x.to_string()),
+                Some(_) => return None, // `\]` — the runtime's scan stops at the `]`
+                None => out.push("\\".to_string()),
+            }
+            continue;
+        }
+        if matches!(c, '*' | '?' | '[' | '-' | '!' | '^' | ']') {
+            return None;
+        }
+        out.push(c.to_string());
+    }
+    Some(out)
+}
+
+/// `Math.max(a.lastIndexOf(c1), a.lastIndexOf(c2), …)` — the native form
+/// of the runtime's longest-`*C`-prefix/suffix strip (an absent char
+/// contributes -1, which max ignores).
+fn max_last_index_of(val: &Expr, chars: &[String], method: &dyn Fn(Expr, &str, Vec<Expr>) -> Expr) -> Expr {
+    let mut ix = method(val.clone(), "lastIndexOf", vec![str_lit(&chars[0])]);
+    for c in &chars[1..] {
+        ix = Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "Math".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "max".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![
+                ix,
+                method(val.clone(), "lastIndexOf", vec![str_lit(c)]),
+            ],
+            optional: false,
+        };
+    }
+    ix
+}
+
 fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args else {
         return None;
@@ -20340,7 +20482,7 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
         // removal (shortest == longest for literal patterns, exactly like
         // the runtime's literal fast paths)
         "#" | "##" | "%" | "%%" => {
-            let [_, _, IrExpr::Str(p, _)] = args else {
+            let [_, _, IrExpr::Str(p, _), ..] = args else {
                 return None;
             };
             // LITERAL pattern — shortest == longest for literal patterns,
@@ -20379,7 +20521,39 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                 let Some(core) = core else {
                     return None;
                 };
-                if core.is_empty() || !literal_pattern(core) {
+                if core.is_empty() {
+                    None
+                } else if let Some(chars) = glob_class_chars(core) {
+                    // `*[abc]` (prefix ops) / `[abc]*` (suffix ops): the
+                    // runtime matches a prefix/suffix ENDING/STARTING in
+                    // one of the class chars. The longest forms (`##`
+                    // longest-prefix, `%` shortest-suffix) strip through
+                    // the LAST occurrence of ANY class char = max of the
+                    // per-char lastIndexOf (an absent char contributes -1
+                    // which max ignores; all-absent → -1 → slice(0) =
+                    // the whole value, exactly the runtime's no-match
+                    // keep). The shortest forms (`#`/`%%`) need the FIRST
+                    // occurrence — a filtered min an absent -1 would
+                    // poison — and stay on the runtime.
+                    if op == "##" || op == "%" {
+                        let ix = max_last_index_of(&val(), &chars, &method);
+                        if op.starts_with('#') {
+                            Some(cond(
+                                bin(ix.clone(), ">=", int_lit(0)),
+                                method(val(), "slice", vec![bin(ix.clone(), "+", int_lit(1))]),
+                                val(),
+                            ))
+                        } else {
+                            Some(cond(
+                                bin(ix.clone(), ">=", int_lit(0)),
+                                method(val(), "slice", vec![int_lit(0), ix.clone()]),
+                                val(),
+                            ))
+                        }
+                    } else {
+                        None
+                    }
+                } else if !literal_pattern(core) {
                     None
                 } else {
                     let clen = core.chars().count() as i64;
@@ -20421,25 +20595,60 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
         // array-allocate + join. Empty pattern must stay on the runtime
         // (split("") splits chars; bash treats it as a no-op).
         "/" | "//" => {
-            let [_, _, IrExpr::Str(p, _), IrExpr::Str(r, _)] = args else {
+            let [_, _, IrExpr::Str(p, _), IrExpr::Str(r, _), ..] = args else {
                 return None;
             };
-            if !literal_pattern(p) {
+            let rep = fully_lifted_template(r)?;
+            if literal_pattern(p) {
+                if r.contains('$') {
+                    if op == "/" {
+                        return None; // first-match splice needs the runtime
+                    }
+                    return Some(method(
+                        method(val(), "split", vec![str_lit(p)]),
+                        "join",
+                        vec![rep],
+                    ));
+                }
+                let m = if op == "/" { "replace" } else { "replaceAll" };
+                return Some(method(val(), m, vec![str_lit(p), rep]));
+            }
+            // SINGLE bracket-class pattern (`${x//[^a-zA-Z0-9]/_}`): a
+            // glob class matches exactly ONE char and the runtime's
+            // substGlob/substGlobFirst replace each match with the raw
+            // expanded replacement — a JS regex class over the same
+            // chars matches the same single chars (ranges and trailing
+            // `-` behave identically in glob and regex classes), so
+            // `replace(/[class]/g, () => rep)` is the same sequence.
+            // The replacer is a FUNCTION: the runtime inserts the
+            // replacement raw, while JS string replacements interpret
+            // `$&`/`$$`/`$1` sequences.
+            let body = p.strip_prefix('[').and_then(|x| x.strip_suffix(']'))?;
+            if body.is_empty() {
                 return None;
             }
-            let rep = fully_lifted_template(r)?;
-            if r.contains('$') {
-                if op == "/" {
-                    return None; // first-match splice needs the runtime
-                }
-                return Some(method(
-                    method(val(), "split", vec![str_lit(p)]),
-                    "join",
-                    vec![rep],
-                ));
+            let (neg, rest) = match body.chars().next() {
+                Some('!') | Some('^') => (true, &body[1..]),
+                _ => (false, body),
+            };
+            if rest.is_empty()
+                || rest.chars().any(|c| matches!(c, '*' | '?' | '[' | '\\' | ']'))
+            {
+                return None;
             }
+            let re = format!("[{}{rest}]", if neg { "^" } else { "" });
+            let replacer = Expr::ArrowFunctionExpression {
+                params: vec![],
+                body: ArrowBody::Expr(Box::new(rep)),
+                expression: true,
+                r#async: false,
+            };
             let m = if op == "/" { "replace" } else { "replaceAll" };
-            Some(method(val(), m, vec![str_lit(p), rep]))
+            return Some(method(
+                val(),
+                m,
+                vec![regex_lit_flags(&re, if op == "//" { "g" } else { "" }), replacer],
+            ));
         }
         // ${x:-d} — default when empty. `${x:=d}` also WRITES the
         // binding (a JS assignment expression — the runtime's setVar
@@ -20590,6 +20799,113 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                 } else {
                     Some(method(sl, "join", vec![str_lit(" ")]))
                 };
+            }
+            // ── ARRAY-family shapes ── every one mirrors the runtime's
+            // param "slice" dispatch EXACTLY (the `#`/`!`/`@`-offset /
+            // `[@]`-name branches below run BEFORE the runtime's
+            // plain-name array-vs-scalar test, so the array read is
+            // unconditional):
+            //   `${#arr[@]}`   → `String(sh2.arrayLen(name))`
+            //     (runtime: `String(this.arrayLen(real))`)
+            //   `${!arr[@]}`   → `sh2.arrayItems(name)`
+            //     (runtime: `return this.arrayItems(real)`; the `!*`
+            //     bad-substitution form stays on the runtime)
+            //   `${arr[@]}`    → `sh2.arrayItems(name)`
+            //     (runtime: `a === '@' || a === '*'` →
+            //     `this.arrayItems(name)`)
+            //   `${arr[@]:o:l}` → `sh2.arrayItems(name).slice(o, …)`
+            //     (runtime: the `[@]`-suffixed am branch slices the
+            //     array UNCONDITIONALLY — even an unset name slices `[]`)
+            // Each swap drops the runtime's getVar (regex match + switch
+            // + store lookups) + dispatch + switch, keeping the exact
+            // value the param call would return (the same arrayItems /
+            // arrayLen call the runtime's branch makes).
+            let off_arg = match args.get(2) {
+                Some(IrExpr::Str(s, _)) => Some(s.as_str()),
+                _ => None,
+            };
+            let len_arg = match args.get(3) {
+                Some(IrExpr::Str(s, _)) => Some(s.as_str()),
+                _ => None,
+            };
+            let int_of = |t: &str| -> Option<i64> {
+                let t = t.trim();
+                if t.is_empty() {
+                    None
+                } else if t.starts_with('-') {
+                    t[1..].parse::<i64>().ok().map(|v| -v)
+                } else {
+                    t.parse::<i64>().ok()
+                }
+            };
+            // `${#arr[@]}` / `${#arr[*]}` — array length (the runtime's
+            // `#` branch ignores the offset arg; `#@`/`#*` positional
+            // counts and non-plain names stay on the runtime).
+            if let Some(real) = name.strip_prefix('#') {
+                if is_plain_ident(real) && matches!(off_arg, Some("@") | Some("*")) {
+                    return Some(Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "String".to_string(),
+                        }),
+                        arguments: vec![sh2_call("arrayLen", vec![str_lit(real)])],
+                        optional: false,
+                    });
+                }
+            }
+            // `${!arr[@]}` / `${!arr[*]}` — keys/indices (a `*` inside
+            // the real name is the bash "bad substitution" marker and
+            // stays on the runtime).
+            if let Some(real) = name.strip_prefix('!') {
+                if is_plain_ident(real)
+                    && !real.contains('*')
+                    && matches!(off_arg, Some("@") | Some("*"))
+                {
+                    return Some(sh2_call("arrayItems", vec![str_lit(real)]));
+                }
+            }
+            // `${arr[@]}` / `${arr[*]}` — whole-array read.
+            if is_plain_ident(name) && matches!(off_arg, Some("@") | Some("*")) {
+                return Some(sh2_call("arrayItems", vec![str_lit(name)]));
+            }
+            // `${arr[@]:off:len}` — the `[@]`-suffixed name is the
+            // runtime's am branch: the slice is ALWAYS the array slice
+            // (an unset name slices `[]`, never a string). Literal int
+            // offsets only (arith offsets stay on the runtime).
+            if let Some(base) = name.strip_suffix("[@]") {
+                if is_plain_ident(base) {
+                    if let Some(o) = off_arg.and_then(int_of) {
+                        let items = sh2_call("arrayItems", vec![str_lit(base)]);
+                        return match len_arg {
+                            Some(l) if !l.trim().is_empty() => {
+                                let l = int_of(l)?;
+                                Some(method(items, "slice", vec![int_lit(o), int_lit(o + l)]))
+                            }
+                            _ => Some(method(items, "slice", vec![int_lit(o)])),
+                        };
+                    }
+                }
+            }
+            // `${arr:off:len}` with a PLAIN name and LITERAL offsets: the
+            // runtime decides array-vs-scalar from its arrays map at
+            // runtime. Lower natively only for names whose every write is
+            // an ARRAY write (setArray/setArrayAppend/subscript — never
+            // a scalar setVar/assign/declare/read/let) under the
+            // documented SH2_ASSUME_ARRAY_SLICE assumption (default ON):
+            // such a name is either UNSET (the array branch slices `[]`,
+            // the runtime string branch slices `''` — every consumer
+            // String()-coerces both to "") or an ARRAY (both slice the
+            // same elements). Env-resident names never lower (a
+            // caller-set env var would hit the runtime's string branch).
+            if is_plain_ident(name) && assume_array_slice() && array_only_written(name) {
+                if let (Some(o), Some(len)) = (off_arg.and_then(int_of), len_arg) {
+                    let items = sh2_call("arrayItems", vec![str_lit(name)]);
+                    return if len.trim().is_empty() {
+                        Some(method(items, "slice", vec![int_lit(o)]))
+                    } else {
+                        let l = int_of(len)?;
+                        Some(method(items, "slice", vec![int_lit(o), int_lit(o + l)]))
+                    };
+                }
             }
             // A plain-name slice may be an ARRAY: `${arr[@]:o:l}` parses with
             // the BARE name (the `[@]` is dropped by the parser), and the
@@ -22409,6 +22725,807 @@ fn collect_never_written(prog: &IrProgram) -> Option<HashSet<String>> {
     Some(written)
 }
 
+/// Names whose EVERY write in the program is an ARRAY write — the
+/// plain-name `${arr:off:len}` slice lowering's provable-array set
+/// (SH2_ASSUME_ARRAY_SLICE, see [`assume_array_slice`]). A name in the
+/// result is either UNSET or an ARRAY at every read point: the runtime's
+/// `arrays` map only ever gets entries from setArray/setArrayAppend /
+/// subscript writes / DeclareArray, and every scalar-writing construct
+/// (setVar/assign with a plain name, `:=`, the declare-family builtins,
+/// `read`, `let`, arith assignments, `printf -v`, Declare) lands in the
+/// scalar set, which excludes the name. Assoc writes block too (the
+/// runtime's plain-name slice on an ASSOC name falls to the string
+/// branch — `arrays` has no entry — while `arrayItems` would return the
+/// keys: a divergence, so assoc names must not lower).
+fn collect_array_only_written(prog: &IrProgram) -> HashSet<String> {
+    fn mark_word(s: &str, out: &mut HashSet<String>) {
+        // `arr[0]=x` / `arr=()` — the written base name (split `=` and
+        // `[` like collect_never_written's mark_word)
+        let v = s.split('=').next().unwrap_or("").split('[').next().unwrap_or("");
+        if lift_is_ident(v) {
+            out.insert(v.to_string());
+        }
+    }
+    fn mark_words(args: &[IrExpr], out: &mut HashSet<String>) {
+        for a in args {
+            match a {
+                IrExpr::Str(sv, _) => mark_word(sv, out),
+                IrExpr::Array(elems) => {
+                    for el in elems {
+                        if let IrExpr::Str(sv, _) = el {
+                            mark_word(sv, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    /// `let`/`arith`/`cstyleFor` args are ARITHMETIC strings — an ident
+    /// followed by `++`/`--`/`=`/`+=`/`-=`/`*=`/`/=`/`%=` is a WRITE
+    /// (the same scanner collect_never_written uses).
+    fn mark_arith_writes(args: &[IrExpr], out: &mut HashSet<String>) {
+        for a in args {
+            if let IrExpr::Str(sv, _) = a {
+                let bytes = sv.as_bytes();
+                let mut i = 0usize;
+                while i < bytes.len() {
+                    let c = bytes[i] as char;
+                    if (c.is_ascii_alphabetic() || c == '_')
+                        && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+                    {
+                        let start = i;
+                        while i < bytes.len()
+                            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                        {
+                            i += 1;
+                        }
+                        let w = &sv[start..i];
+                        let rest: String = sv[i..].chars().take(2).collect();
+                        if rest.starts_with("++")
+                            || rest.starts_with("--")
+                            || rest.starts_with('=')
+                        {
+                            out.insert(w.to_string());
+                        }
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    fn walk_expr(e: &IrExpr, array: &mut HashSet<String>, scalar: &mut HashSet<String>) {
+        match e {
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    walk_stmt(st, array, scalar);
+                }
+            }
+            IrExpr::Call { func, args } => {
+                match func.as_str() {
+                    "setArray" | "setArrayAppend" => {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            mark_word(n, array);
+                        }
+                    }
+                    // A subscript write (`arr[i]=x`) is an ARRAY write;
+                    // a plain-name setVar/assign is scalar. assocSet is
+                    // blocked (assoc names never lower).
+                    "setVar" | "assign" => {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            if n.contains('[') {
+                                mark_word(n, array);
+                            } else {
+                                mark_word(n, scalar);
+                            }
+                        }
+                    }
+                    "assocSet" | "assocSet2" => {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            mark_word(n, scalar);
+                        }
+                    }
+                    "param" => {
+                        if let [IrExpr::Str(op, _), IrExpr::Str(n, _), ..] = args.as_slice() {
+                            if op == ":=" {
+                                mark_word(n, scalar);
+                            }
+                        }
+                    }
+                    "exec" | "builtin" => {
+                        if let Some(IrExpr::Str(cn, _)) = args.first() {
+                            if matches!(
+                                cn.as_str(),
+                                "read"
+                                    | "declare"
+                                    | "typeset"
+                                    | "local"
+                                    | "export"
+                                    | "readonly"
+                                    | "unset"
+                                    | "let"
+                                    | "eval"
+                                    | "source"
+                                    | "."
+                                    | "trap"
+                            ) {
+                                if cn == "let" {
+                                    mark_arith_writes(&args[1..], scalar);
+                                } else {
+                                    mark_words(&args[1..], scalar);
+                                }
+                            }
+                            // `printf -v NAME FMT ARGS...` writes NAME
+                            if cn == "printf" {
+                                if let Some(IrExpr::Array(pargs)) = args.get(1) {
+                                    if let [IrExpr::Str(f0, _), IrExpr::Str(f1, _), ..] =
+                                        pargs.as_slice()
+                                    {
+                                        if f0 == "-v" {
+                                            mark_word(f1, scalar);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // runtime-evaluated arith strings can contain
+                    // assignments (`let i++`, `((x = 5))`)
+                    "arith" | "arithEval" | "cstyleFor" => {
+                        mark_arith_writes(args, scalar);
+                    }
+                    _ => {}
+                }
+                for a in args {
+                    walk_expr(a, array, scalar);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    walk_expr(el, array, scalar);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, array, scalar);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. }
+            | IrExpr::Ternary {
+                cond: lhs,
+                then: rhs,
+                ..
+            } => {
+                walk_expr(lhs, array, scalar);
+                walk_expr(rhs, array, scalar);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        walk_expr(x, array, scalar);
+                    }
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, array, scalar),
+            IrExpr::Index { key, .. } => walk_expr(key, array, scalar),
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, array, scalar);
+                for a in args {
+                    walk_expr(a, array, scalar);
+                }
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, array, scalar);
+                walk_expr(default, array, scalar);
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(st: &IrStmt, array: &mut HashSet<String>, scalar: &mut HashSet<String>) {
+        match st {
+            IrStmt::Assign { targets, expr } => {
+                // `primes=(2)` lowers to Assign { targets: [primes],
+                // expr: setArray(...) } — the expr walk marks the ARRAY
+                // write; don't double-mark the target as a scalar.
+                // `z+=...` (an assign() expr) is a scalar write.
+                let is_array_expr = matches!(expr, IrExpr::Call { func, .. }
+                    if matches!(func.as_str(), "setArray" | "setArrayAppend"));
+                if !is_array_expr {
+                    for t in targets {
+                        if t.var.contains('[') {
+                            mark_word(&t.var, array);
+                        } else {
+                            mark_word(&t.var, scalar);
+                        }
+                    }
+                }
+                walk_expr(expr, array, scalar);
+            }
+            IrStmt::Declare { vars, .. } => {
+                for v in vars {
+                    mark_word(&v.name, scalar);
+                }
+            }
+            IrStmt::DeclareArray { var, .. } => mark_word(var, array),
+            IrStmt::For { var, iter, body } => {
+                mark_word(var, scalar);
+                walk_expr(iter, array, scalar);
+                for b in body {
+                    walk_stmt(b, array, scalar);
+                }
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr(cond, array, scalar);
+                for b in body {
+                    walk_stmt(b, array, scalar);
+                }
+            }
+            IrStmt::Block(body)
+            | IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                for b in body {
+                    walk_stmt(b, array, scalar);
+                }
+            }
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                walk_expr(cond, array, scalar);
+                for b in then.iter().chain(else_) {
+                    walk_stmt(b, array, scalar);
+                }
+                for (_, b) in elsifs {
+                    for stm in b {
+                        walk_stmt(stm, array, scalar);
+                    }
+                }
+            }
+            IrStmt::Exec {
+                cmd,
+                args,
+                capture,
+                env,
+                ..
+            } => {
+                if let Some(c) = capture {
+                    mark_word(c, scalar);
+                }
+                for (v, _) in env {
+                    mark_word(v, scalar);
+                }
+                if let IrExpr::Str(cn, _) = cmd {
+                    if matches!(
+                        cn.as_str(),
+                        "read"
+                            | "declare"
+                            | "typeset"
+                            | "local"
+                            | "export"
+                            | "readonly"
+                            | "unset"
+                            | "mapfile"
+                            | "readarray"
+                            | "let"
+                            | "eval"
+                            | "source"
+                            | "."
+                            | "trap"
+                    ) {
+                        if cn == "let" {
+                            mark_arith_writes(args, scalar);
+                        } else {
+                            mark_words(args, scalar);
+                        }
+                    }
+                }
+                walk_expr(cmd, array, scalar);
+                for a in args {
+                    walk_expr(a, array, scalar);
+                }
+            }
+            IrStmt::Pipeline {
+                stages, capture, ..
+            } => {
+                if let Some(c) = capture {
+                    mark_word(c, scalar);
+                }
+                for s in stages {
+                    for st in s {
+                        walk_stmt(st, array, scalar);
+                    }
+                }
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                walk_expr(discriminant, array, scalar);
+                for c in clauses {
+                    for b in &c.body {
+                        walk_stmt(b, array, scalar);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => walk_expr(e, array, scalar),
+            IrStmt::Output { value, .. } => walk_expr(value, array, scalar),
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_expr(path, array, scalar);
+                walk_expr(content, array, scalar);
+            }
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => walk_expr(e, array, scalar),
+            IrStmt::SetChildError(e) => walk_expr(e, array, scalar),
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                walk_expr(expr, array, scalar)
+            }
+            _ => {}
+        }
+    }
+    let mut array: HashSet<String> = HashSet::new();
+    let mut scalar: HashSet<String> = HashSet::new();
+    for st in &prog.stmts {
+        walk_stmt(st, &mut array, &mut scalar);
+    }
+    array.difference(&scalar).cloned().collect()
+}
+
+/// SH2_ASSUME_ARRAY_SLICE=0 — keep the runtime `param("slice", NAME,
+/// OFF, LEN)` evaluation for PLAIN-name slices with literal offsets
+/// (the runtime decides array-vs-scalar from its `arrays` map at
+/// runtime). Assumption (default ON): a name whose every write is an
+/// ARRAY write ([`collect_array_only_written`]) is never observed as a
+/// scalar — the runtime's `arrays` map is the only source of truth and
+/// it only ever holds names the program wrote as arrays. The unset case
+/// agrees through every consumer (both branches yield the empty
+/// string/array), and env-resident names never lower (a caller-set env
+/// var would hit the runtime's string branch). The `[@]`-suffixed /
+/// `@`-offset / `#` / `!` forms lower unconditionally (their runtime
+/// branches are array reads no matter what).
+fn assume_array_slice() -> bool {
+    std::env::var("SH2_ASSUME_ARRAY_SLICE").map_or(true, |v| v != "0")
+}
+
+/// Is `name` provably array-or-unset at every read? (the
+/// [`ARRAY_ONLY_NAMES`] static, computed per compilation; None — an
+/// eval/source/trap program — disables the native plain-name slice).
+fn array_only_written(name: &str) -> bool {
+    if env_resident(name) {
+        return false;
+    }
+    ARRAY_ONLY_NAMES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
+
+/// Names the emitter may access DIRECTLY on the runtime's plain-object
+/// store — `sh2.vars.<name>` property reads/writes instead of the
+/// `sh2.getVar`/`sh2.setVar` runtime dispatch (the harness store is a
+/// null-prototype object, see sh2-namespace.mjs `vars:`).
+///
+/// READ eligibility: the runtime getVar's plain-name path is exactly
+/// `vars → env fallback` (plus the nameref/array-element-0/assoc-first
+/// rules and the special-name switch). A name is native-readable iff it
+/// is a plain identifier that the program never writes as an ARRAY,
+/// ASSOC or NAMEREF (those add the element-0/keys/redirect rules) and
+/// is not one of the runtime specials that do NOT fall back to env
+/// (HOSTNAME/BASH_VERSION/BASH/SHELL — served from os/env, not
+/// process.env; every other special is handled by native_special_var
+/// BEFORE store_var_read). The native read is
+/// `(sh2.vars.name ?? process.env.name ?? '')` — vars first, env
+/// fallback — the runtime's exact decision for these names, in every
+/// mode (SH2_ASSUME_NO_ENV on or off).
+///
+/// WRITE eligibility: the runtime setVar's plain-name path is
+/// `String(v)` + the attribute branches — `typeset -i` (arithmetic
+/// coercion), `-l`/`-u` (case), nameref redirect, exported/PATH env
+/// sync, ARITH_BAD_MAGIC skip. A name declared with any of those
+/// attributes (or named PATH) stays on the runtime setVar; everything
+/// else writes `sh2.vars.name` directly. (The readonly attribute is NOT
+/// enforced by the runtime's setVar — no exclusion needed.)
+fn collect_native_store_access(prog: &IrProgram) -> (HashSet<String>, HashSet<String>) {
+    fn mark_word(s: &str, out: &mut HashSet<String>) {
+        let v = s.split('=').next().unwrap_or("").split('[').next().unwrap_or("");
+        if lift_is_ident(v) {
+            out.insert(v.to_string());
+        }
+    }
+    fn mark_words(args: &[IrExpr], out: &mut HashSet<String>) {
+        for a in args {
+            match a {
+                IrExpr::Str(sv, _) => mark_word(sv, out),
+                IrExpr::Array(elems) => {
+                    for el in elems {
+                        if let IrExpr::Str(sv, _) = el {
+                            mark_word(sv, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    fn mark_arith_writes(args: &[IrExpr], out: &mut HashSet<String>) {
+        for a in args {
+            if let IrExpr::Str(sv, _) = a {
+                let bytes = sv.as_bytes();
+                let mut i = 0usize;
+                while i < bytes.len() {
+                    let c = bytes[i] as char;
+                    if (c.is_ascii_alphabetic() || c == '_')
+                        && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+                    {
+                        let start = i;
+                        while i < bytes.len()
+                            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                        {
+                            i += 1;
+                        }
+                        let w = &sv[start..i];
+                        let rest: String = sv[i..].chars().take(2).collect();
+                        if rest.starts_with("++")
+                            || rest.starts_with("--")
+                            || rest.starts_with('=')
+                        {
+                            out.insert(w.to_string());
+                        }
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    /// declare-family args: `declare [-flags] name[=v] ...` — the flags
+    /// decide the attribute sets (i = int arith coercion, l/u = case,
+    /// n = nameref, x = export, A = assoc, a = array, r = readonly — not
+    /// enforced by setVar, no exclusion). Every name in the arg list
+    /// gets ALL the declared flags' exclusions (conservative).
+    fn mark_declare(args: &[IrExpr], arr: &mut HashSet<String>, assoc: &mut HashSet<String>, refs: &mut HashSet<String>, attr: &mut HashSet<String>) {
+        let mut flags = String::new();
+        let mut names: Vec<String> = Vec::new();
+        for a in args {
+            match a {
+                IrExpr::Str(sv, _) if sv.starts_with('-') && sv.len() > 1 => {
+                    flags.push_str(sv);
+                }
+                IrExpr::Str(sv, _) => {
+                    let n = sv.split('=').next().unwrap_or("");
+                    if lift_is_ident(n) {
+                        names.push(n.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        for n in &names {
+            if flags.contains('A') {
+                assoc.insert(n.clone());
+            }
+            if flags.contains('a') {
+                arr.insert(n.clone());
+            }
+            if flags.contains('n') {
+                // the REF name redirects reads AND writes through the
+                // runtime's refVars — the whole word is conservative
+                refs.insert(n.clone());
+                if let Some(IrExpr::Str(w, _)) = args.iter().find(|x| {
+                    matches!(x, IrExpr::Str(s, _) if s.split('=').next() == Some(n.as_str()))
+                }) {
+                    for t in w.split('=').skip(1) {
+                        if lift_is_ident(t) {
+                            refs.insert(t.to_string());
+                        }
+                    }
+                }
+            }
+            if flags.contains('i') || flags.contains('l') || flags.contains('u') || flags.contains('x') {
+                attr.insert(n.clone());
+            }
+        }
+    }
+    fn walk_expr(
+        e: &IrExpr,
+        arr: &mut HashSet<String>,
+        assoc: &mut HashSet<String>,
+        refs: &mut HashSet<String>,
+        attr: &mut HashSet<String>,
+    ) {
+        match e {
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    walk_stmt(st, arr, assoc, refs, attr);
+                }
+            }
+            IrExpr::Call { func, args } => {
+                match func.as_str() {
+                    "setArray" | "setArrayAppend" => {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            mark_word(n, arr);
+                        }
+                    }
+                    "setVar" | "assign" => {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            if n.contains('[') {
+                                mark_word(n, arr);
+                            }
+                        }
+                    }
+                    "assocSet" | "assocSet2" => {
+                        if let Some(IrExpr::Str(n, _)) = args.first() {
+                            mark_word(n, assoc);
+                        }
+                    }
+                    "exec" | "builtin" => {
+                        if let Some(IrExpr::Str(cn, _)) = args.first() {
+                            match cn.as_str() {
+                                "declare" | "typeset" | "local" | "readonly" => {
+                                    mark_declare(&args[1..], arr, assoc, refs, attr);
+                                }
+                                "export" => mark_words(&args[1..], attr),
+                                "mapfile" | "readarray" => mark_words(&args[1..], arr),
+                                "read" | "unset" | "shift" | "let" | "eval" | "source"
+                                | "." | "trap" => {
+                                    if cn == "let" {
+                                        mark_arith_writes(&args[1..], attr);
+                                    } else {
+                                        mark_words(&args[1..], attr);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            // `printf -v NAME FMT ARGS...` writes NAME
+                            if cn == "printf" {
+                                if let Some(IrExpr::Array(pargs)) = args.get(1) {
+                                    if let [IrExpr::Str(f0, _), IrExpr::Str(f1, _), ..] =
+                                        pargs.as_slice()
+                                    {
+                                        if f0 == "-v" {
+                                            mark_word(f1, attr);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "arith" | "arithEval" | "cstyleFor" => {
+                        mark_arith_writes(args, attr);
+                    }
+                    _ => {}
+                }
+                for a in args {
+                    walk_expr(a, arr, assoc, refs, attr);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    walk_expr(el, arr, assoc, refs, attr);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    walk_expr(v, arr, assoc, refs, attr);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. }
+            | IrExpr::Ternary {
+                cond: lhs,
+                then: rhs,
+                ..
+            } => {
+                walk_expr(lhs, arr, assoc, refs, attr);
+                walk_expr(rhs, arr, assoc, refs, attr);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        walk_expr(x, arr, assoc, refs, attr);
+                    }
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, arr, assoc, refs, attr),
+            IrExpr::Index { key, .. } => walk_expr(key, arr, assoc, refs, attr),
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, arr, assoc, refs, attr);
+                for a in args {
+                    walk_expr(a, arr, assoc, refs, attr);
+                }
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, arr, assoc, refs, attr);
+                walk_expr(default, arr, assoc, refs, attr);
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(
+        st: &IrStmt,
+        arr: &mut HashSet<String>,
+        assoc: &mut HashSet<String>,
+        refs: &mut HashSet<String>,
+        attr: &mut HashSet<String>,
+    ) {
+        match st {
+            IrStmt::Assign { targets, expr } => {
+                for t in targets {
+                    if t.var.contains('[') {
+                        mark_word(&t.var, arr);
+                    }
+                }
+                walk_expr(expr, arr, assoc, refs, attr);
+            }
+            IrStmt::Declare { vars, .. } => {
+                for v in vars {
+                    mark_word(&v.name, attr);
+                }
+            }
+            IrStmt::DeclareArray { var, .. } => mark_word(var, arr),
+            IrStmt::For { var, iter, body } => {
+                mark_word(var, attr);
+                walk_expr(iter, arr, assoc, refs, attr);
+                for b in body {
+                    walk_stmt(b, arr, assoc, refs, attr);
+                }
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr(cond, arr, assoc, refs, attr);
+                for b in body {
+                    walk_stmt(b, arr, assoc, refs, attr);
+                }
+            }
+            IrStmt::Block(body)
+            | IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                for b in body {
+                    walk_stmt(b, arr, assoc, refs, attr);
+                }
+            }
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                walk_expr(cond, arr, assoc, refs, attr);
+                for b in then.iter().chain(else_) {
+                    walk_stmt(b, arr, assoc, refs, attr);
+                }
+                for (_, b) in elsifs {
+                    for stm in b {
+                        walk_stmt(stm, arr, assoc, refs, attr);
+                    }
+                }
+            }
+            IrStmt::Exec {
+                cmd,
+                args,
+                capture,
+                env,
+                ..
+            } => {
+                if let Some(c) = capture {
+                    mark_word(c, attr);
+                }
+                for (v, _) in env {
+                    mark_word(v, attr);
+                }
+                if let IrExpr::Str(cn, _) = cmd {
+                    match cn.as_str() {
+                        "declare" | "typeset" | "local" | "readonly" => {
+                            mark_declare(args, arr, assoc, refs, attr);
+                        }
+                        "export" => mark_words(args, attr),
+                        "mapfile" | "readarray" => mark_words(args, arr),
+                        "let" => mark_arith_writes(args, attr),
+                        "read" | "unset" | "shift" => mark_words(args, attr),
+                        _ => {}
+                    }
+                }
+                walk_expr(cmd, arr, assoc, refs, attr);
+                for a in args {
+                    walk_expr(a, arr, assoc, refs, attr);
+                }
+            }
+            IrStmt::Pipeline {
+                stages, capture, ..
+            } => {
+                if let Some(c) = capture {
+                    mark_word(c, attr);
+                }
+                for s in stages {
+                    for st in s {
+                        walk_stmt(st, arr, assoc, refs, attr);
+                    }
+                }
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                walk_expr(discriminant, arr, assoc, refs, attr);
+                for c in clauses {
+                    for b in &c.body {
+                        walk_stmt(b, arr, assoc, refs, attr);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => walk_expr(e, arr, assoc, refs, attr),
+            IrStmt::Output { value, .. } => walk_expr(value, arr, assoc, refs, attr),
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_expr(path, arr, assoc, refs, attr);
+                walk_expr(content, arr, assoc, refs, attr);
+            }
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => walk_expr(e, arr, assoc, refs, attr),
+            IrStmt::SetChildError(e) => walk_expr(e, arr, assoc, refs, attr),
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
+                walk_expr(expr, arr, assoc, refs, attr)
+            }
+            _ => {}
+        }
+    }
+    let mut arr: HashSet<String> = HashSet::new();
+    let mut assoc: HashSet<String> = HashSet::new();
+    let mut refs: HashSet<String> = HashSet::new();
+    let mut attr: HashSet<String> = HashSet::new();
+    for st in &prog.stmts {
+        walk_stmt(st, &mut arr, &mut assoc, &mut refs, &mut attr);
+    }
+    // The runtime specials served from os/env — NOT process.env — must
+    // stay on getVar; every other special is handled before
+    // store_var_read (native_special_var).
+    for s in ["HOSTNAME", "BASH_VERSION", "BASH", "SHELL"] {
+        attr.insert(s.to_string());
+    }
+    // PATH writes always sync process.env in the runtime setVar.
+    attr.insert("PATH".to_string());
+    let mut read_blocked = arr;
+    for n in assoc.union(&refs) {
+        read_blocked.insert(n.clone());
+    }
+    for n in &attr {
+        read_blocked.insert(n.clone());
+    }
+    let mut write_blocked = attr;
+    for n in &refs {
+        write_blocked.insert(n.clone());
+    }
+    (read_blocked, write_blocked)
+}
+
+/// Is a plain store read of `name` lowerable to a direct `sh2.vars.<name>`
+/// property read? (the [`NATIVE_STORE_READ_BLOCKED`] static, computed per
+/// compilation; None — an eval/source/trap program — keeps every runtime
+/// read).
+fn native_store_read_ok(name: &str) -> bool {
+    is_plain_ident(name)
+        && NATIVE_STORE_READ_BLOCKED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| !s.contains(name))
+            .unwrap_or(false)
+}
+
+/// Is a plain store write of `name` lowerable to a direct `sh2.vars.<name>`
+/// assignment? (the [`NATIVE_STORE_WRITE_BLOCKED`] static — attribute
+/// names: `typeset -i/-l/-u`, namerefs, exported, PATH).
+fn native_store_write_ok(name: &str) -> bool {
+    native_store_read_ok(name)
+        && NATIVE_STORE_WRITE_BLOCKED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| !s.contains(name))
+            .unwrap_or(false)
+}
+
 /// Is a plain store read of `name` foldable to the constant `""`? The
 /// name must be never-written in the current program (not in the
 /// [`NEVER_WRITTEN`] static's written set, computed per compilation; None
@@ -22446,7 +23563,109 @@ fn store_var_read(name: &str) -> Expr {
     if never_written_read(name) {
         return str_lit("");
     }
+    if native_store_read_ok(name) {
+        return native_store_read(name);
+    }
     sh2_call("getVar", vec![str_lit(name)])
+}
+
+/// The direct plain-object store read `(sh2.vars.<name> ??
+/// process.env.<name> ?? '')` — the runtime getVar's plain-name path
+/// (vars first, env fallback) as pure property reads: NO dispatch, no
+/// regex, no Map lookups. Exact for every name [`native_store_read_ok`]
+/// admits (never array/assoc/nameref-written, not an os/env special):
+/// the runtime's only other plain-path branches (refVars, arrays
+/// element-0, assoc first-value) cannot fire for those names, and the
+/// env fallback reproduces getVar's `process.env[name] ?? ''`.
+fn native_store_read(name: &str) -> Expr {
+    Expr::LogicalExpression {
+        operator: "??".to_string(),
+        left: Box::new(store_member(name)),
+        right: Box::new(Expr::LogicalExpression {
+            operator: "??".to_string(),
+            left: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier {
+                        name: "process".to_string(),
+                    }),
+                    property: Box::new(Expr::Identifier {
+                        name: "env".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: name.to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            right: Box::new(str_lit("")),
+        }),
+    }
+}
+
+/// `sh2.vars.<name>` — the runtime's plain-object store property.
+fn store_member(name: &str) -> Expr {
+    Expr::MemberExpression {
+        object: Box::new(sh2_member("vars")),
+        property: Box::new(Expr::Identifier {
+            name: name.to_string(),
+        }),
+        computed: false,
+        optional: false,
+    }
+}
+
+/// A setVar/Assign RHS that lowers to a CALL-FREE expression (pure
+/// literals / templates / identifiers / property reads / native arith):
+/// the runtime setVar's ARITH_BAD_MAGIC skip and array-join coercion
+/// cannot fire for it, so the native write `sh2.vars.<name> = <rhs>` is
+/// the exact plain-path assignment. Returns None when the lowered RHS
+/// contains any CallExpression (conservative — those keep the runtime
+/// setVar).
+fn call_free_expr(e: &Expr) -> Option<Expr> {
+    fn has_call(e: &Expr) -> bool {
+        match e {
+            Expr::CallExpression { .. } => true,
+            Expr::MemberExpression { object, .. } => has_call(object),
+            Expr::BinaryExpression { left, right, .. } => has_call(left) || has_call(right),
+            Expr::LogicalExpression { left, right, .. } => has_call(left) || has_call(right),
+            Expr::ConditionalExpression {
+                test,
+                consequent,
+                alternate,
+            } => has_call(test) || has_call(consequent) || has_call(alternate),
+            Expr::AssignmentExpression { left, right, .. } => has_call(left) || has_call(right),
+            Expr::SequenceExpression { expressions } => expressions.iter().any(has_call),
+            Expr::UnaryExpression { argument, .. } => has_call(argument),
+            Expr::TemplateLiteral { expressions, .. } => expressions.iter().any(has_call),
+            Expr::ArrayExpression { elements } => {
+                elements.iter().flatten().any(has_call)
+            }
+            _ => false,
+        }
+    }
+    if has_call(e) {
+        None
+    } else {
+        Some(e.clone())
+    }
+}
+
+/// A store write where the RHS is provably already a STRING (a string
+/// literal or template — the runtime's `String(...)` coercion is an
+/// identity), vs a number-valued RHS (native arith) that needs the
+/// coercion.
+fn store_rhs_string(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::TemplateLiteral { .. }
+            | Expr::Literal {
+                value: serde_json::Value::String(_),
+                ..
+            }
+    )
 }
 
 /// Render a setArray/setArrayAppend argument: Str elements with lifted
@@ -22752,6 +23971,38 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                     if never_written_read(name) {
                         return str_lit("");
+                    }
+                    if native_store_read_ok(name) {
+                        return native_store_read(name);
+                    }
+                }
+            }
+            // `sh2.setVar(name, v)` in EXPRESSION position (the `:=`
+            // default write, `IrStmt::Expr` arith-form assigns): the
+            // native plain-object store write for eligible names with a
+            // call-free RHS (see the Assign arm — same rules).
+            if func == "setVar" {
+                if let [IrExpr::Str(name, _), e] = args.as_slice() {
+                    if native_store_write_ok(name) {
+                        let ve = expr_to_estree(e);
+                        if call_free_expr(&ve).is_some() {
+                            let rhs = if store_rhs_string(&ve) {
+                                ve
+                            } else {
+                                Expr::CallExpression {
+                                    callee: Box::new(Expr::Identifier {
+                                        name: "String".to_string(),
+                                    }),
+                                    arguments: vec![ve],
+                                    optional: false,
+                                }
+                            };
+                            return Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(store_member(name)),
+                                right: Box::new(rhs),
+                            };
+                        }
                     }
                 }
             }
