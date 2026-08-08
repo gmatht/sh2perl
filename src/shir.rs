@@ -6461,6 +6461,19 @@ pub fn parse_arith(src: &str) -> Option<ArithAst> {
     Some(ast)
 }
 
+/// The READ part of [`arith_var_read`] (no Number coercion): the exact
+/// string the runtime's evalArith would see for a bare identifier — a
+/// lifted binding (bare identifier), a runtime special (native
+/// property), or the store read (see [`store_var_read`]).
+fn arith_var_read_expr(name: &str) -> Expr {
+    if is_lifted_num(name) || is_lifted_str(name) || is_local_lifted(name) {
+        return Expr::Identifier {
+            name: name.to_string(),
+        };
+    }
+    native_special_var(name).unwrap_or_else(|| store_var_read(name))
+}
+
 /// `Number(<read>) || 0` — the runtime's arithmetic coercion of a variable
 /// read: lifted NUMERIC vars are already JS numbers (bare identifier);
 /// everything else (lifted strings, store vars, bash specials) goes
@@ -6472,17 +6485,7 @@ fn arith_var_read(name: &str) -> Expr {
             name: name.to_string(),
         };
     }
-    // A local-lifted name (per-function `let` binding, see
-    // [`local_lift_analysis`]) holds the STRING the decl assigned — the
-    // same Number()||0 coercion as string-lifted names; the runtime store
-    // would never see the local (the leak the lift fixes).
-    let read = if is_lifted_str(name) || is_local_lifted(name) {
-        Expr::Identifier {
-            name: name.to_string(),
-        }
-    } else {
-        native_special_var(name).unwrap_or_else(|| store_var_read(name))
-    };
+    let read = arith_var_read_expr(name);
     Expr::LogicalExpression {
         operator: "||".to_string(),
         left: Box::new(Expr::CallExpression {
@@ -6498,6 +6501,73 @@ fn arith_var_read(name: &str) -> Expr {
             regex: None,
         }),
     }
+}
+
+/// The `${#name}` scalar-LENGTH leaf of a native arith expression: the
+/// runtime's evalArith arm is `sh.getVar(name).length` — the value's
+/// JS string length, exactly what this emits (for a lifted binding, the
+/// binding's String() — the canonical-decimal round-trip the lift
+/// guarantees; for a store var, the native store read or the getVar
+/// twin).
+fn arith_len_scalar_read(name: &str) -> Expr {
+    let read = if is_lifted_num(name) {
+        Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "String".to_string(),
+            }),
+            arguments: vec![Expr::Identifier {
+                name: name.to_string(),
+            }],
+            optional: false,
+        }
+    } else {
+        arith_var_read_expr(name)
+    };
+    Expr::MemberExpression {
+        object: Box::new(read),
+        property: Box::new(Expr::Identifier {
+            name: "length".to_string(),
+        }),
+        computed: false,
+        optional: false,
+    }
+}
+
+/// The placeholder-name decoder for the `${#name[@]}` / `${#name[*]}` /
+/// `${#name}` arith-length refs ([`native_arith_text_len`] replaces each
+/// ref with a self-describing placeholder identifier `__sh2lena_<name>`
+/// (array length) / `__sh2lens_<name>` (scalar length); the Var arm of
+/// the JS emission decodes it back to the runtime-exact length leaf).
+/// `None` for any other name (a real variable — parse normally).
+fn arith_len_leaf(name: &str) -> Option<Expr> {
+    if let Some(rest) = name.strip_prefix("__sh2lena_") {
+        if plain_ident(rest) {
+            // evalArith's `${#name[@]}` arm: `Number(sh.arrayLen(name))
+            // || 0` — arrayLen always yields a digit string ("0" for
+            // unset), so the coercion is exact.
+            return Some(Expr::LogicalExpression {
+                operator: "||".to_string(),
+                left: Box::new(Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "Number".to_string(),
+                    }),
+                    arguments: vec![sh2_call("arrayLen", vec![str_lit(rest)])],
+                    optional: false,
+                }),
+                right: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                    regex: None,
+                }),
+            });
+        }
+    }
+    if let Some(rest) = name.strip_prefix("__sh2lens_") {
+        if plain_ident(rest) {
+            return Some(arith_len_scalar_read(rest));
+        }
+    }
+    None
 }
 
 /// Render the arithmetic AST as native JS expressions.
@@ -6562,7 +6632,17 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
             raw: None,
             regex: None,
         },
-        ArithAst::Var(name) => arith_var_read(name),
+        ArithAst::Var(name) => {
+            // `${#name[@]}` / `${#name}` length refs arrive as the
+            // self-describing placeholders [`native_arith_text_len`]
+            // substituted — decode to the runtime-exact length leaf;
+            // any other name is a plain variable read.
+            if let Some(leaf) = arith_len_leaf(name) {
+                leaf
+            } else {
+                arith_var_read(name)
+            }
+        }
         // `x = v` / `x += v` — the assigned VALUE is the expression's
         // value (bash semantics). Lifted numeric vars write the native
         // binding directly (JS compound assignment); store vars write via
@@ -8077,8 +8157,75 @@ fn try_native_eval(args: &[IrExpr]) -> Option<Expr> {
     Some(seq(exprs))
 }
 
-/// Add native-arithmetic assignment sources for the exec forms the walkers
-/// skip marking (see arith_let_args_native / int_declare_names): a
+/// `unset NAME` with a SINGLE plain literal name — the runtime builtin's
+/// unconditional deletes (`delete this.vars[name]` + `delete
+/// process.env[name]` + a row of no-op Map/set deletes) lower to the two
+/// native deletes + the status write: NO builtin dispatch. Exactness
+/// guards:
+///   - the name must be provably absent from every collection the
+///     runtime's other deletes touch — the [`NATIVE_STORE_READ_BLOCKED`]
+///     set (array/assoc/nameref/attribute/exported names, computed per
+///     compilation) — so those deletes really are no-ops;
+///   - the name must not be a local-lifted binding (the store delete
+///     would miss the native binding);
+///   - a plain single ident only: flag forms (`-n`, `-f`), subscripts
+///     (`arr[i]`), dynamic args (word-split values) and multi-name
+///     lists keep the runtime builtin.
+/// The `(delete sh2.vars.<n>, delete process.env.<n>, (sh2.lastExit =
+/// 0), true)` sequence mirrors builtins.unset's writes and status
+/// exactly (lastExit 0, truthy return).
+fn try_native_unset(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Str(cname, _), IrExpr::Array(cargs)] = args else {
+        return None;
+    };
+    if cname != "unset" || cargs.len() != 1 {
+        return None;
+    }
+    let IrExpr::Str(n, _) = &cargs[0] else {
+        return None;
+    };
+    if n.starts_with('-') || !is_plain_ident(n) || !native_store_read_ok(n) || is_local_lifted(n) {
+        return None;
+    }
+    Some(seq(vec![
+        Expr::UnaryExpression {
+            operator: "delete".to_string(),
+            argument: Box::new(store_member(n)),
+            prefix: true,
+        },
+        Expr::UnaryExpression {
+            operator: "delete".to_string(),
+            argument: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier {
+                        name: "process".to_string(),
+                    }),
+                    property: Box::new(Expr::Identifier {
+                        name: "env".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: n.to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            prefix: true,
+        },
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        },
+        bool_lit(true),
+    ]))
+}
 /// natively-lowered `let` writes its args' targets natively (an
 /// `IrExpr::Arith` source — numeric when div/mod-free), and an `-i`
 /// declaration witnesses its names as numeric (`IrExpr::Int(0)` — the
@@ -8626,6 +8773,110 @@ fn native_arith_text(t: &str) -> Option<ArithAst> {
         }
     }
     parse_arith_native(&stripped)
+}
+
+/// Replace the `${#name[@]}` / `${#name[*]}` (array length) and
+/// `${#name}` (scalar length) refs of an arith text with the
+/// self-describing placeholder identifiers `__sh2lena_<name>` /
+/// `__sh2lens_<name>` (the JS emitter's Var arm decodes them back — see
+/// [`arith_len_leaf`]). These refs expand to a DIGIT STRING ALWAYS (an
+/// unset array → "0", an unset scalar → "".length → 0) — unlike a
+/// `$var` ref, the substitution can never break the arith syntax, so no
+/// deletion gate applies to them.
+///
+/// Rejections (keep the runtime evaluator):
+///   - any other `${#...}` shape the runtime's arithExpand handles
+///     (`${#arr[i]}` element length, `${#x:-d}`) or cannot (`${#x[i][@]}`)
+///     — and any `$` shape [`arith_text_dollar_strip`] rejects;
+///   - a ref ADJACENT to an identifier character (`a${#x}`, `${#x}5`,
+///     `${#x}${#y}`) — bash CONCATENATES the substituted length with the
+///     neighbor into one token, which the placeholder split cannot
+///     express;
+///   - the literal token `__sh2len` anywhere in the text (a real variable
+///     whose name collides with the placeholder scheme);
+///   - a ref in a WRITE position (`${#x} = 5` — bash: syntax error; the
+///     placeholder would parse as an assign target and the native path
+///     would WRITE it — the caller's written-vars guard rejects those).
+fn arith_len_strip(t: &str) -> Option<String> {
+    if t.contains("__sh2len") {
+        return None;
+    }
+    let b = t.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(t.len());
+    let mut i = 0;
+    while i < n {
+        if i + 2 < n && b[i] == b'$' && b[i + 1] == b'{' && b[i + 2] == b'#' {
+            let mut j = i + 3;
+            let start = j;
+            while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j == start {
+                return None; // `${#` with no name — runtime-only
+            }
+            let name = &t[start..j];
+            let (array, end) = if j + 3 < n && b[j] == b'[' && (b[j + 1] == b'@' || b[j + 1] == b'*') && b[j + 2] == b']' && b[j + 3] == b'}' {
+                (true, j + 4)
+            } else if j < n && b[j] == b'}' {
+                (false, j + 1)
+            } else {
+                return None; // `${#arr[i]}` / `${#x[i][@]}` / `${#x:-d}` — runtime-only
+            };
+            // adjacency: a length ref touching an identifier character on
+            // either side CONCATENATES in bash (`a${#x}` / `${#x}5` /
+            // `${#x}${#y}`) — the placeholder would merge into one token
+            if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') {
+                return None;
+            }
+            if end < n && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+                return None;
+            }
+            if array {
+                out.push_str("__sh2lena_");
+            } else {
+                out.push_str("__sh2lens_");
+            }
+            out.push_str(name);
+            i = end;
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// The `${#name[@]}` / `${#name[*]}` / `${#name}` length-ref extension of
+/// [`native_arith_text`]: strips the length refs to placeholder
+/// identifiers ([`arith_len_strip`]), then runs the normal native
+/// eligibility gates. EXACT semantics with no assumption — the length
+/// substitution always yields a plain digit string (bash and the runtime
+/// agree: `${#unset_arr[@]}` → 0, `${#unset}` → 0), and the emitter's
+/// length leaf ([`arith_len_leaf`]) mirrors the runtime's evalArith arms
+/// (`Number(sh.arrayLen(name)) || 0` / `sh.getVar(name).length`)
+/// byte-for-byte.
+///
+/// Used ONLY by the `let`/`(( ))` emission twins ([`try_native_let`] /
+/// [`try_native_let_dead`]). The lift walkers and the arith-source
+/// scanners keep the STRICTER [`native_arith_text`] deliberately: a
+/// len-ref let text is lowered natively, but its variables stay
+/// store-bound (the runtime may still read them from OTHER texts —
+/// `getVar("args[i]")` subscript keys evaluate against the store — so
+/// the conservative marks must stay; the native reads then use the
+/// native store path, consistent either way).
+fn native_arith_text_len(t: &str) -> Option<ArithAst> {
+    let stripped = arith_len_strip(t)?;
+    let ast = native_arith_text(&stripped)?;
+    // a placeholder in a WRITE position (`${#x} = 5` — bash: syntax
+    // error, no-op status 2) must never become a native store write
+    if arith_written_vars(&ast)
+        .iter()
+        .any(|w| w.starts_with("__sh2len"))
+    {
+        return None;
+    }
+    Some(ast)
 }
 
 /// The `$ref` arith lowering's "provably set" set: names with at least
@@ -12652,6 +12903,17 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }
                 }
             }
+            // `unset NAME` with a single plain name (see try_native_unset):
+            // the two native deletes — no builtin dispatch.
+            if env.is_empty() && redirects.is_empty() {
+                if let IrExpr::Str(name, _) = cmd {
+                    if name == "unset" {
+                        if let Some(native) = try_native_unset(args) {
+                            return Some(Stmt::ExpressionStatement { expression: native });
+                        }
+                    }
+                }
+            }
             // `rm` / `mkdir` with plain args: a native `sh2.fs.*` promise
             // chain — no spawn, no dispatch (see `try_native_fs_exec`).
             // Redirects/env forms keep the runtime (the redirect wrapper
@@ -14998,7 +15260,10 @@ fn try_native_let(args: &[IrExpr]) -> Option<Expr> {
             let mut parseable = true;
             for arg in a {
                 match arg {
-                    IrExpr::Str(sv, _) => match native_arith_text(sv) {
+                    // the LEN-aware predicate: `${#name[@]}` / `${#name}`
+                    // length refs also lower natively (see
+                    // [`native_arith_text_len`] — exact, no assumption)
+                    IrExpr::Str(sv, _) => match native_arith_text_len(sv) {
                         Some(ast) => {
                             vals.push((arith_to_estree_wrapped(&ast), arith_has_write(&ast)))
                         }
@@ -15082,7 +15347,7 @@ fn try_native_let_dead(args: &[IrExpr]) -> Option<Expr> {
             let mut vals: Vec<Expr> = Vec::new();
             for arg in a {
                 match arg {
-                    IrExpr::Str(sv, _) => match native_arith_text(sv) {
+                    IrExpr::Str(sv, _) => match native_arith_text_len(sv) {
                         Some(ast) => vals.push(arith_to_estree_wrapped(&ast)),
                         None => return None,
                     },
@@ -23190,7 +23455,23 @@ fn collect_native_store_access(prog: &IrProgram) -> (HashSet<String>, HashSet<St
     fn mark_declare(args: &[IrExpr], arr: &mut HashSet<String>, assoc: &mut HashSet<String>, refs: &mut HashSet<String>, attr: &mut HashSet<String>) {
         let mut flags = String::new();
         let mut names: Vec<String> = Vec::new();
+        // the exec args are `[Str("typeset"), Array(words)]` — unwrap
+        // the Array wrapper (the same shape mark_words handles) so the
+        // declare's flags and names actually mark (a missed mark lets a
+        // STRING assign to an int-declared name take the native store
+        // write, silently skipping the runtime's evalArith coercion).
+        let mut flat: Vec<&IrExpr> = Vec::new();
         for a in args {
+            match a {
+                IrExpr::Array(elems) => {
+                    for el in elems {
+                        flat.push(el);
+                    }
+                }
+                other => flat.push(other),
+            }
+        }
+        for a in flat {
             match a {
                 IrExpr::Str(sv, _) if sv.starts_with('-') && sv.len() > 1 => {
                     flags.push_str(sv);
@@ -23560,6 +23841,16 @@ fn never_written_read(name: &str) -> bool {
 /// emission site routes through here so the fold applies uniformly
 /// (plain reads, arith reads, test operands, param value overrides).
 fn store_var_read(name: &str) -> Expr {
+    // a runtime special (`PWD` → sh2.cwd, `?` → sh2.lastExit, ...) is
+    // served from runtime STATE, never the vars/env store — the exact
+    // native twin of the getVar special arm. Idempotent for the callers
+    // that pre-check (arith_var_read_expr, the getVar arm); the
+    // param-default `_g` primary-read path relies on it (a `vars.PWD ??
+    // env.PWD` read would go stale after `cd` — the runtime answers
+    // `this.cwd`).
+    if let Some(special) = native_special_var(name) {
+        return special;
+    }
     if never_written_read(name) {
         return str_lit("");
     }
@@ -24149,33 +24440,80 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     if expr_has_await(&ve) {
                         return sh2_call("join", vec![ve]);
                     }
-                    let always_array = matches!(v, IrExpr::Call { func: f, .. }
-                        if matches!(f.as_str(), "arrayItems" | "listVar"));
-                    let always_array = always_array
-                        || matches!(v, IrExpr::Call { func: f, args: a }
-                            if f == "param"
-                                && matches!(a.as_slice(),
-                                    [IrExpr::Str(op, _), IrExpr::Str(name, _), ..]
-                                    if op == "slice"
-                                        && (name.ends_with("[@]") || name.ends_with("[*]")
-                                            || (name.starts_with('!')
-                                                && !name.contains('*'))
-                                            || name == "@")))
-                        // `param("slice", NAME, "@", ...)` — the runtime's
-                        // `a === '@' || a === '*'` short-circuit returns
-                        // `arrayItems(name)` BEFORE any store lookup, so a
-                        // plain-name slice with a literal `@`/`*` offset is
-                        // provably an array (the ambiguous array-or-string
-                        // plain-name form only has NUMERIC offsets).
-                        || matches!(v, IrExpr::Call { func: f, args: a }
-                            if f == "param"
-                                && matches!(a.as_slice(),
-                                    [IrExpr::Str(op, _), IrExpr::Str(name, _),
-                                     IrExpr::Str(off, _), ..]
-                                    if op == "slice"
-                                        && (off == "@" || off == "*")
-                                        && !name.starts_with('#')
-                                        && !name.starts_with('!')));
+                    // Provably-array IR: raw arrayItems/listVar calls, the
+                    // param whole-array slice forms (always arrays even
+                    // for missing names), and `.slice(off, len)` METHOD
+                    // chains on a provably-array base (Array.prototype
+                    // slice returns an array).
+                    fn ir_always_array(e: &IrExpr) -> bool {
+                        match e {
+                            IrExpr::Call { func: f, .. }
+                                if matches!(f.as_str(), "arrayItems" | "listVar") =>
+                            {
+                                true
+                            }
+                            IrExpr::Call { func: f, args: a }
+                                if f == "param"
+                                    && matches!(a.as_slice(),
+                                        [IrExpr::Str(op, _), IrExpr::Str(name, _), ..]
+                                        if op == "slice"
+                                            && (name.ends_with("[@]") || name.ends_with("[*]")
+                                                || (name.starts_with('!')
+                                                    && !name.contains('*'))
+                                                || name == "@")) =>
+                            {
+                                true
+                            }
+                            // `param("slice", NAME, "@", ...)` — the
+                            // runtime's `a === '@' || a === '*'`
+                            // short-circuit returns `arrayItems(name)`
+                            // BEFORE any store lookup, so a plain-name
+                            // slice with a literal `@`/`*` offset is
+                            // provably an array (the ambiguous
+                            // array-or-string plain-name form only has
+                            // NUMERIC offsets).
+                            IrExpr::Call { func: f, args: a }
+                                if f == "param"
+                                    && matches!(a.as_slice(),
+                                        [IrExpr::Str(op, _), IrExpr::Str(name, _),
+                                         IrExpr::Str(off, _), ..]
+                                        if op == "slice"
+                                            && (off == "@" || off == "*")
+                                            && !name.starts_with('#')
+                                            && !name.starts_with('!')) =>
+                            {
+                                true
+                            }
+                            // A PLAIN-NAME slice with a numeric offset:
+                            // ambiguous array-or-string in general — the
+                            // runtime checks `arrays.get(name)` — but for
+                            // a name provably array-or-unset at every read
+                            // ([`array_only_written`] — the SAME proof
+                            // the param slice emission uses to pick its
+                            // array path) the value is an array (or the
+                            // empty string, and `[].slice().join(" ")`
+                            // is "" — identical). The array-only proof
+                            // is SH2_ASSUME_ARRAY_SLICE-gated (default
+                            // ON; =0 restores the runtime join).
+                            IrExpr::Call { func: f, args: a }
+                                if f == "param"
+                                    && matches!(a.as_slice(),
+                                        [IrExpr::Str(op, _), IrExpr::Str(name, _), ..]
+                                        if op == "slice"
+                                            && !name.starts_with('#')
+                                            && !name.starts_with('!')
+                                            && assume_array_slice()
+                                            && array_only_written(name)) =>
+                            {
+                                true
+                            }
+                            IrExpr::MethodCall { obj, method, .. } => {
+                                method == "slice" && ir_always_array(obj)
+                            }
+                            _ => false,
+                        }
+                    }
+                    let always_array = ir_always_array(v);
                     // A non-param arg whose lowered shape is provably a
                     // STRING (the runtime join is `Array.isArray(v) ?
                     // v.join(" ") : String(v)` — identity for strings):
@@ -24956,6 +25294,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // statement/condition whose EVERY arith arg parses natively).
             if func == "exec" {
                 if let Some(native) = try_native_let(args) {
+                    return native;
+                }
+            }
+            // `unset NAME` with a single plain name (see try_native_unset)
+            // — the two native deletes, no builtin dispatch. The
+            // expression-position twin of the statement arm (pipeline
+            // stages, `&&`/`||` operands, condition positions).
+            if func == "exec" {
+                if let Some(native) = try_native_unset(args) {
                     return native;
                 }
             }

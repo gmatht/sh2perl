@@ -1469,17 +1469,23 @@ mod tests {
         // the read-builtin vars are writes: `read x` marks x
         let json2 = to_json("read x; echo \"$x\"");
         assert!(json2.contains("\"getVar\""));
-        // an eval/source program disables the fold entirely
+        // an eval/source program disables the fold entirely (the eval
+        // may write the name at runtime — the read must stay LIVE): the
+        // native store read `sh2.vars.x ?? env ?? ''` (the runtime's
+        // exact plain path — a getVar CALL would be a dispatch)
         let json3 = to_json("eval \"echo hi\"; echo \"$x\"");
-        assert!(json3.contains("\"getVar\""));
+        assert!(json3.contains("\"name\":\"vars\""));
+        assert!(json3.contains("\"name\":\"x\""));
         // a nameref TARGET is a write: `typeset -n r=x` makes `r=5`
         // write x through the runtime's refVars indirection
         let json4 = to_json("typeset -n r=x; r=5; echo \"$x\"");
-        assert!(json4.contains("\"getVar\""));
+        assert!(json4.contains("\"name\":\"vars\""));
         // a runtime `let` writes its arith idents: `let var++` (the JS
-        // keyword keeps the var store-bound) must not fold the read
+        // keyword keeps the var store-bound) must not fold the read —
+        // the native store read (a `vars.var` property access is legal
+        // JS even for keyword names)
         let json5 = to_json("let var++; echo \"$var\"");
-        assert!(json5.contains("\"getVar\""));
+        assert!(json5.contains("\"name\":\"vars\""));
     }
 
     #[test]
@@ -2030,6 +2036,62 @@ mod tests {
     }
 
     #[test]
+    fn join_of_array_slice_chain_lowers_native() {
+        // `${arr[@]:0:2}` in a template: the IR is `join(param("slice",
+        // "arr", "0", "2"))` — for a provably-array-or-unset name
+        // (array_only_written — the same proof the param slice emission
+        // uses to pick its array path) the value is an array (or "" for
+        // unset, and `[].slice().join(" ")` is "" — identical), so the
+        // runtime join dispatch collapses to the native `.join(" ")`
+        // method on the slice chain.
+        let json = to_json("arr=(a b c d)\necho \"${arr[@]:0:2}\"");
+        // no sh2.join dispatch
+        assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"join\""));
+        // the native chain: arrayItems(...).slice(...).join(" ")
+        assert!(json.contains("\"name\":\"arrayItems\""));
+        assert!(json.contains("\"name\":\"slice\""));
+        assert!(json.contains("\"name\":\"join\""));
+        assert!(json.contains("\"value\":\" \""));
+        // a DYNAMIC plain-name slice (never-written name — the runtime
+        // may see a scalar) keeps the runtime join
+        let json2 = to_json("echo \"${s:0:2}\"");
+        assert!(json2.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"join\""));
+    }
+
+    #[test]
+    fn arith_len_refs_lower_let_and_while_native() {
+        // The `${#name[@]}` / `${#name}` arith-length refs: the runtime's
+        // evalArith arms are `Number(sh.arrayLen(name)) || 0` and
+        // `sh.getVar(name).length` — EXACT native leafs (the length
+        // substitution always yields a digit string, so no unset-var
+        // deletion gate applies; no SH2_ASSUME option needed). A
+        // `(( ${#arr[@]} > 5 ))` condition lowers to the native
+        // comparison: no `let` builtin dispatch, no per-iteration text
+        // parse.
+        let json = to_json("(( ${#arr[@]} > 5 ))");
+        assert!(!json.contains("\"name\":\"builtin\""));
+        assert!(json.contains("\"name\":\"arrayLen\""));
+        assert!(json.contains("\"operator\":\">\""));
+        // `${#s}` — the scalar length is the value's `.length` (the
+        // store read, not a getVar call, for a plain store name)
+        let json2 = to_json("s=abc; (( ${#s} > 2 ))");
+        assert!(!json2.contains("\"name\":\"builtin\""));
+        assert!(!json2.contains("\"name\":\"getVar\""));
+        assert!(json2.contains("\"name\":\"length\""));
+        // a statement-level `while (( i < ${#args[@]} ))` lowers to the
+        // NATIVE while machinery (__sh2_loop_ran protocol) with the
+        // arrayLen cond — no runtime loop, no let dispatch
+        let json3 = to_json("while (( i < ${#args[@]} )); do (( i++ )); done");
+        assert!(json3.contains("__sh2_loop_ran"));
+        assert!(!json3.contains("\"name\":\"builtin\""));
+        assert!(json3.contains("\"name\":\"arrayLen\""));
+        // `${#arr[i]}` — the ELEMENT length (runtime-only shape): keeps
+        // the runtime let dispatch
+        let json4 = to_json("(( ${#arr[i]} > 5 ))");
+        assert!(json4.contains("\"name\":\"builtin\""));
+    }
+
+    #[test]
     fn shopt_and_cstyle_for_lower() {
         let json = to_json("shopt -s extglob");
         // the native shopt lowering: a direct `sh2.shoptState.set(opt, en)`
@@ -2053,12 +2115,18 @@ mod tests {
         // property read, no call), `$(whoami)` → the value twin. The
         // primary read is one `sh2.getVar` (the `_g` single-eval wrap).
         let json = to_json("echo \"${PWD:-$(pwd)}\"");
-        assert!(json.contains("\"name\":\"getVar\""));
+        // the primary read is the runtime special twin `sh2.cwd` (the
+        // `_g` single-eval wrap — the runtime's getVar("PWD") answers
+        // `this.cwd`, never the vars/env store)
         assert!(json.contains("\"name\":\"cwd\""));
+        assert!(json.contains("\"name\":\"_g\""));
         assert!(!json.contains("\"name\":\"param\""));
         assert!(!json.contains("unsupported"));
         let json2 = to_json("echo \"${USER:-$(whoami)}\"");
-        assert!(json2.contains("\"name\":\"getVar\""));
+        // USER is env-resident (never written): the primary read is the
+        // native store read `sh2.vars.USER ?? env.USER ?? ''` (the
+        // runtime's exact plain path)
+        assert!(json2.contains("\"name\":\"USER\""));
         assert!(json2.contains("\"name\":\"whoami\""));
         assert!(!json2.contains("\"name\":\"param\""));
         // the tilde default `${HOME:-$(echo ~)}` is getVar("HOME") (the
@@ -2115,10 +2183,11 @@ mod tests {
         assert!(json2.contains("parameter null or not set"));
         assert!(!json2.contains("\"name\":\"param\""));
         // a STORE-BOUND var (read-builtin — never lifted) keeps the
-        // runtime read (one getVar, the `_g` single-eval wrap); a
-        // LIFTED var reads its native binding (bare identifier)
+        // LIVE read (the `_g` single-eval wrap): the native store read
+        // `sh2.vars.v ?? env ?? ''` — the runtime's exact plain path
+        // (a getVar CALL would be a dispatch)
         let json4 = to_json("read v <<< \"x\"\necho \"${v:?err}\"");
-        assert!(json4.contains("\"name\":\"getVar\""));
+        assert!(json4.contains("\"name\":\"vars\""));
         assert!(!json4.contains("\"name\":\"param\""));
         let json5 = to_json("v=1\necho \"${v:?err}\"");
         assert!(!json5.contains("\"name\":\"getVar\""));
