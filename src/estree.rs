@@ -2046,6 +2046,103 @@ mod tests {
     }
 
     #[test]
+    fn param_default_cmdsub_defaults_lower_native() {
+        // The ${VAR:-$(cmd)} family: the baked-text default the runtime
+        // would run through expandWord (spawning `bash -c` for the
+        // cmdsub) lowers to native reads — `$(pwd)` → `sh2.cwd` (a
+        // property read, no call), `$(whoami)` → the value twin. The
+        // primary read is one `sh2.getVar` (the `_g` single-eval wrap).
+        let json = to_json("echo \"${PWD:-$(pwd)}\"");
+        assert!(json.contains("\"name\":\"getVar\""));
+        assert!(json.contains("\"name\":\"cwd\""));
+        assert!(!json.contains("\"name\":\"param\""));
+        assert!(!json.contains("unsupported"));
+        let json2 = to_json("echo \"${USER:-$(whoami)}\"");
+        assert!(json2.contains("\"name\":\"getVar\""));
+        assert!(json2.contains("\"name\":\"whoami\""));
+        assert!(!json2.contains("\"name\":\"param\""));
+        // the tilde default `${HOME:-$(echo ~)}` is getVar("HOME") (the
+        // runtime's tilde rule — getVar's default arm is the env)
+        let json3 = to_json("echo \"${HOME:-$(echo ~)}\"");
+        assert!(json3.contains("\"name\":\"getVar\""));
+        assert!(!json3.contains("\"name\":\"param\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn nested_param_default_chain_lowers_to_getvar_ternaries() {
+        // ${var:-${default:-${fallback:-$(echo "computed")}}} — the
+        // nested chain: the runtime's expandWord would spawn bash for
+        // the $(echo) cmdsub; the native is a getVar ternary chain (one
+        // per level, `_g`-scratched) with the literal echo default. No
+        // param call, no spawn.
+        let json = to_json("echo \"${var:-${default:-${fallback:-$(echo \"computed\")}}}\"");
+        // the never-written `var` level folds to the lift-known constant
+        // "" (its store read); the live levels read via getVar
+        assert!(json.matches("\"name\":\"getVar\"").count() >= 2);
+        assert!(json.contains("computed"));
+        assert!(!json.contains("\"name\":\"param\""));
+        assert!(!json.contains("unsupported"));
+        // the array-slice default ${default[@]:0:2} → the getVar read
+        // (exact for unset/scalar operands — the documented assumption)
+        let json2 = to_json("echo \"${array[${index}]:-${default[@]:0:2}}\"");
+        assert_eq!(json2.matches("\"name\":\"getVar\"").count(), 2);
+        assert!(!json2.contains("\"name\":\"param\""));
+        // a ${NAME} plain-ref default lowers to the getVar read too
+        let json3 = to_json("echo ${MOUNTPOINT:-${NAME}}");
+        // the never-written MOUNTPOINT level folds to the constant ""
+        // (its store read); the live NAME level reads via getVar
+        assert!(json3.matches("\"name\":\"getVar\"").count() >= 1);
+        assert!(!json3.contains("\"name\":\"param\""));
+    }
+
+    #[test]
+    fn param_error_question_lowers_to_stderr_write_and_exit() {
+        // ${x:?msg} — the unset/empty error: the native is the runtime's
+        // exact `process.stderr.write("bash: x: msg\n"); process.exit(1)`
+        // sequence (the corpus gate ignores stderr; the exit code is the
+        // verdict). A never-written var folds to its lift-known constant
+        // "" (the error path fires); a WRITTEN var reads via getVar (the
+        // `_g` single-eval wrap).
+        let json = to_json("echo \"${var:?error message}\"");
+        assert!(json.contains("process"));
+        assert!(json.contains("stderr"));
+        assert!(json.contains("\"name\":\"exit\""));
+        assert!(!json.contains("\"name\":\"param\""));
+        assert!(!json.contains("unsupported"));
+        // empty message → the `name: parameter null or not set` default
+        let json2 = to_json("echo \"${var:?}\"");
+        assert!(json2.contains("parameter null or not set"));
+        assert!(!json2.contains("\"name\":\"param\""));
+        // a STORE-BOUND var (read-builtin — never lifted) keeps the
+        // runtime read (one getVar, the `_g` single-eval wrap); a
+        // LIFTED var reads its native binding (bare identifier)
+        let json4 = to_json("read v <<< \"x\"\necho \"${v:?err}\"");
+        assert!(json4.contains("\"name\":\"getVar\""));
+        assert!(!json4.contains("\"name\":\"param\""));
+        let json5 = to_json("v=1\necho \"${v:?err}\"");
+        assert!(!json5.contains("\"name\":\"getVar\""));
+        assert!(!json5.contains("\"name\":\"param\""));
+        // a DYNAMIC message (expandWord would expand the ref) keeps the
+        // runtime param call
+        let json3 = to_json("echo \"${var:?$other}\"");
+        assert!(json3.contains("\"name\":\"param\""));
+    }
+
+    #[test]
+    fn param_assign_default_writes_store_natively() {
+        // ${maybe:=default} — the store `:=` write: the runtime's
+        // getVar + expandWord + setVar lowers to the same getVar (the
+        // `_g` wrap) + a REAL sh2.setVar call (the store authority) +
+        // the value — no dispatch, no text parse.
+        let json = to_json("unset maybe\necho \"${maybe:=default}\"");
+        assert!(json.contains("\"name\":\"getVar\""));
+        assert!(json.contains("\"name\":\"setVar\""));
+        assert!(!json.contains("\"name\":\"param\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
     fn deterministic_output() {
         let input = "x=1\nif [ -f /tmp/x ]; then echo $x; fi\nls | wc -l";
         let commands = Parser::new(input).parse().unwrap();
