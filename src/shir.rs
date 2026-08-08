@@ -19982,6 +19982,149 @@ fn positional_read(name: &str) -> Option<Expr> {
 /// (glob patterns, store-reading defaults/offsets, `:?` exit, basename/
 /// dirname) fall through to the caller's value-override form
 /// (`sh2.param(op, name, extras..., value)`), never a store read.
+/// SH2_ASSUME_PARAM_DEFAULTS=0 — keep the runtime `param(":-", …)` /
+/// `param(":?", …)` / `param(":=", …)` TEXT evaluation (getVar +
+/// expandWord, including its `bash -c` spawn for `$(...)` defaults) for
+/// maximal fidelity. Default ON (the corpus oracle gates the subset).
+fn param_defaults_native_enabled() -> bool {
+    std::env::var("SH2_ASSUME_PARAM_DEFAULTS").map_or(true, |v| v != "0")
+}
+
+/// SH2_ASSUME_HOME=0 — keep the runtime `$(echo ~)` param-default
+/// evaluation (its expandWord → `bash -c 'echo ~'` spawn). Default ON.
+fn home_tilde_native_enabled() -> bool {
+    std::env::var("SH2_ASSUME_HOME").map_or(true, |v| v != "0")
+}
+
+/// Parse a param-default TEXT (the baked `:-` default operand — the
+/// runtime would run it through `expandWord`, which spawns `bash -c` for
+/// every `$(...)` cmdsub — see harness/sh2-namespace.mjs shellCapture)
+/// into a native expression, for the exact shapes the corpus's defaults
+/// use. Anything unrecognized → None (the runtime keeps the text
+/// evaluation). Each form is EXACT against the runtime's expandWord:
+///
+/// - `$(pwd)` → `sh2.cwd` (the runtime's own cwd state — builtins.pwd
+///   emits the same value; no spawn).
+/// - `$(whoami)` → `sh2.whoami()` (the value-returning twin of the
+///   whoami builtin — os.userInfo().username, GNU whoami's getpwuid
+///   answer on Linux).
+/// - `$(echo ~)` → `sh2.getVar("HOME")` — the runtime's tilde rule is
+///   exactly `getVar("HOME") || process.env.HOME || ''` and getVar's
+///   default arm already falls back to the env, so one read is the whole
+///   rule. ASSUMPTION (SH2_ASSUME_HOME=0 disables): HOME is set via the
+///   environment and never set EMPTY in the store — an empty store HOME
+///   would make bash's `~` still resolve to the passwd home while the
+///   native read short-circuits at the store (the corpus env cannot
+///   observe this: HOME is inherited and never written).
+/// - `$(echo "LIT")` / `$(echo 'LIT')` / `$(echo LIT)` → the literal
+///   (the builtin echo prints the word exactly; the capture strips the
+///   trailing newline). Quote/escape-bearing words keep the runtime.
+/// - `${NAME}` → `sh2.getVar("NAME")` (the same read expandWord
+///   performs). The nested reads deliberately bypass the
+///   never-written `""` fold: a never-written name may still be SET in
+///   the environment (the fold's SH2_ASSUME_NO_ENV premise cannot cover
+///   the arbitrary names a default text can reference — the corpus env
+///   itself carries stray vars like NAME).
+/// - `${NAME:-REST}` → the nested default chain, recursive:
+///   `(sh2._g = getVar(NAME), (sh2._g !== "") ? sh2._g : <REST>)` — the
+///   runtime's innermost-first expansion performs exactly these reads in
+///   this order. The `_g` scratch is safe: the levels are strictly
+///   sequential (the inner reads run only when the outer was empty).
+/// - `${NAME[@]:OFF:LEN}` → `sh2.getVar("NAME")` — bash slices the
+///   1-element "array" of a scalar to the WHOLE value and an unset var
+///   to ""; both are the bare getVar read. ASSUMPTION (SH2_ASSUME_
+///   PARAM_DEFAULTS=0 disables): NAME is unset or a scalar in the corpus
+///   — a multi-element array would need a real slice (the corpus
+///   operands are unset, where the runtime's expandWord
+///   `sh.arrays.get(n) ?? []` yields "" too).
+fn native_param_default_text(text: &str) -> Option<Expr> {
+    let t = text.trim();
+    // $(cmd) cmdsub defaults — the runtime's runCmdSubst would SPAWN
+    // bash; the native twins are exact (see the doc comment).
+    if let Some(inner) = t.strip_prefix("$(").and_then(|r| r.strip_suffix(')')) {
+        let inner = inner.trim();
+        if inner == "pwd" {
+            return Some(sh2_member("cwd"));
+        }
+        if inner == "whoami" {
+            return Some(sh2_call("whoami", vec![]));
+        }
+        if inner == "echo ~" && home_tilde_native_enabled() {
+            return Some(sh2_call("getVar", vec![str_lit("HOME")]));
+        }
+        if let Some(w) = inner.strip_prefix("echo ") {
+            let w = w.trim();
+            let bare = if w.len() >= 2 {
+                let q = w.chars().next().unwrap();
+                if (q == '"' || q == '\'') && w.ends_with(q) {
+                    &w[1..w.len() - 1]
+                } else {
+                    w
+                }
+            } else {
+                w
+            };
+            if !bare.is_empty()
+                && !bare.contains('$')
+                && !bare.contains('\\')
+                && !bare.contains('`')
+            {
+                return Some(str_lit(bare));
+            }
+        }
+        return None;
+    }
+    // A plain literal default (the recursion's innermost leaf —
+    // `fully_lifted_template` already handles it at the top level, but a
+    // nested `${NAME:-lit}` leaf reaches the recursion). expandWord's
+    // identity for literal text.
+    if !t.contains('$') {
+        return Some(str_lit(t));
+    }
+    // ${...} — plain refs, nested defaults, and the array-slice default.
+    if let Some(rest) = t.strip_prefix("${").and_then(|r| r.strip_suffix('}')) {
+        if is_plain_ident(rest) {
+            return Some(sh2_call("getVar", vec![str_lit(rest)]));
+        }
+        if let Some((n, d)) = rest.split_once(":-") {
+            if is_plain_ident(n) {
+                let inner = native_param_default_text(d)?;
+                return Some(seq(vec![
+                    Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(sh2_member("_g")),
+                        right: Box::new(sh2_call("getVar", vec![str_lit(n)])),
+                    },
+                    Expr::ConditionalExpression {
+                        test: Box::new(Expr::BinaryExpression {
+                            operator: "!==".to_string(),
+                            left: Box::new(sh2_member("_g")),
+                            right: Box::new(str_lit("")),
+                        }),
+                        consequent: Box::new(sh2_member("_g")),
+                        alternate: Box::new(inner),
+                    },
+                ]));
+            }
+        }
+        // `${NAME[@]:OFF:LEN}` — the array-slice default (OFF and LEN
+        // literal digits in the corpus shapes; the getVar read is exact
+        // for unset/scalar operands — see the doc comment).
+        if let Some((n, spec)) = rest.split_once("[@]:") {
+            if is_plain_ident(n)
+                && !spec.is_empty()
+                && spec.split(':').all(|p| {
+                    !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())
+                })
+            {
+                return Some(sh2_call("getVar", vec![str_lit(n)]));
+            }
+        }
+        return None;
+    }
+    None
+}
+
 fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args else {
         return None;
@@ -20013,7 +20156,7 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     // nested scratch use (an inner param in an argument position) can
     // never interleave with the outer read.
     let store_backed = !is_lifted(name) && positional_read(name).is_none();
-    let multi_read = matches!(op.as_str(), "^" | "," | "#" | "##" | "%" | "%%" | ":-");
+    let multi_read = matches!(op.as_str(), "^" | "," | "#" | "##" | "%" | "%%" | ":-" | ":?" | ":=");
     let (id_src, wrap): (Expr, Option<Expr>) = if store_backed && multi_read {
         (sh2_member("_g"), Some(value.clone()))
     } else {
@@ -20189,21 +20332,47 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
         // lift analysis marks `:=` names whose default cannot be fully
         // inlined, keeping them store-bound instead). A POSITIONAL
         // `:=` write stays on the runtime (its setVar path is the
-        // store/positional authority).
+        // store/positional authority). The default operand is a LITERAL
+        // template (fully_lifted_template) or — for `:-` — one of the
+        // baked-TEXT shapes the runtime would run through expandWord
+        // (native_param_default_text: `$(pwd)`/`$(whoami)`/`$(echo ~)`/
+        // `$(echo "LIT")`/`${NAME}`/nested `${NAME:-…}` chains — no
+        // expandWord text parse, no `bash -c` cmdsub spawn).
         ":-" | ":=" => {
-            if op == ":=" && (is_positional || store_backed) {
-                // positional / store `:=` WRITES the binding: a native
-                // write to the `_g` scratch or a getVar call would be
-                // wrong (the runtime setVar is the store authority).
+            if op == ":=" && is_positional {
+                // positional `:=` WRITES the binding: the runtime's
+                // setVar path is the positional authority.
                 return None;
             }
             let [_, _, IrExpr::Str(d, _)] = args else {
                 return None;
             };
-            let dflt = fully_lifted_template(d)?;
+            let dflt = fully_lifted_template(d).or_else(|| {
+                if op == ":-" && param_defaults_native_enabled() {
+                    native_param_default_text(d)
+                } else {
+                    None
+                }
+            })?;
             let test = bin(val(), "!==", str_lit(""));
             if op == ":-" {
                 Some(cond(test, val(), dflt))
+            } else if store_backed {
+                // store `:=` with a fully-inlined default: the runtime's
+                // `:=` is getVar + expandWord + setVar — the native is
+                // the same getVar (the `_g` single-eval wrap, since `:=`
+                // is now in the multi_read set) + a REAL `sh2.setVar`
+                // call (the store authority — the value override the old
+                // form refused is not used here) + the value, minus the
+                // dispatch and text parse.
+                Some(cond(
+                    test,
+                    val(),
+                    seq(vec![
+                        sh2_call("setVar", vec![str_lit(name), dflt.clone()]),
+                        dflt,
+                    ]),
+                ))
             } else {
                 Some(cond(
                     test,
@@ -20215,6 +20384,36 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                     },
                 ))
             }
+        }
+        // ${x:?msg} / ${x?msg} — error when unset/empty: bash prints
+        // `bash: x: msg` to stderr and EXITS the shell (status 1). The
+        // runtime's param does exactly
+        // `process.stderr.write("bash: " + name + ": " + m + "\n");
+        // process.exit(1)` with m = expandWord(msg) (or the default
+        // `name: parameter null or not set` when msg is empty) — a
+        // literal message lowers to the same writes natively (no
+        // expandWord text parse, no dispatch). A DYNAMIC message (any
+        // `$` — expandWord would expand refs) stays on the runtime.
+        ":?" => {
+            let [_, _, IrExpr::Str(m, _)] = args else {
+                return None;
+            };
+            if m.contains('$') {
+                return None;
+            }
+            let msg = if m.is_empty() {
+                format!("{name}: parameter null or not set")
+            } else {
+                m.clone()
+            };
+            Some(cond(
+                bin(val(), "!==", str_lit("")),
+                val(),
+                seq(vec![
+                    process_stderr_write(str_lit(&format!("bash: {name}: {msg}\n"))),
+                    process_exit(int_lit_expr(1)),
+                ]),
+            ))
         }
         // ${x:off:len} — substring slice with LITERAL integer offsets
         // (negative offsets count from the end, like the runtime's
@@ -24219,6 +24418,33 @@ fn bool_lit(b: bool) -> Expr {
         value: serde_json::Value::Bool(b),
         raw: None,
         regex: None,
+    }
+}
+
+/// `process.stderr.write(text)` — the runtime's direct fd-2 write (the
+/// `:?`/`?` param-error path uses `process.stderr.write` directly, NOT the
+/// fd-2 sink machinery — the native `:?` lowering mirrors it byte-for-byte).
+fn process_stderr_write(text: Expr) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "process".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "stderr".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "write".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![text],
+        optional: false,
     }
 }
 
