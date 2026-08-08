@@ -980,6 +980,7 @@ pub(crate) const SYNC_BUILTINS: &[&str] = &[
     "diff",
     "dirname",
     "echo",
+    "egrep",
     "eval",
     "exit",
     "export",
@@ -16519,6 +16520,140 @@ fn try_native_pwd_stmt(args: &[IrExpr]) -> Option<Expr> {
     ]))
 }
 
+/// `echo EXPR | bc` at the module's default stdout sink — the STATEMENT
+/// twin of [`native_capture_echo_bc`] (which covers the `$(...)` capture
+/// position): a STATIC program (all-literal echo arg) folds at compile
+/// time via src/bc.rs's exact GNU-bc semantics, and the whole pipeline
+/// collapses to a native `process.stdout.write` of the folded output —
+/// no bc subprocess spawn, no async pipeline machinery, no fd swaps.
+/// bc's status is 0 whenever the fold succeeds (a fold failure keeps the
+/// spawn, and the pipeline's status is the last stage's = bc's), so the
+/// emitted `(write, sh2.lastExit = 0, true)` sequence is the runtime
+/// pipeline's exact value contract. The echo sink gates (ECHO_SINK_DEPTH
+/// == 0, no persistent fd 1 — the pwd/native-echo precedent) confine the
+/// native write to contexts where fd 1 IS the module stdout; a pipeline
+/// under a capture/redirect/pipeline stage is lowered with the depth
+/// raised, so it keeps the runtime form (the capture position folds via
+/// `native_capture_echo_bc` instead). Dynamic programs (`$x + 1` — no
+/// runtime bc evaluator exists) keep the spawn.
+fn try_native_echo_bc_stmt(pipe: &IrExpr) -> Option<Expr> {
+    if !bc_native_enabled() {
+        return None;
+    }
+    let IrExpr::Call { func, args } = pipe else {
+        return None;
+    };
+    if func != "pipeline" {
+        return None;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else {
+        return None;
+    };
+    if stages.len() != 2 {
+        return None;
+    }
+    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
+        return None;
+    };
+    // stage 1: exec/builtin "echo" — the exact bytes echo writes
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return None;
+    };
+    if !matches!(f1.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
+        return None;
+    };
+    if name1 != "echo" {
+        return None;
+    }
+    // raw-byte / glob / process-substitution markers: the runtime expands
+    // them before bc sees the text — the native path cannot (see
+    // ir_expr_needs_runtime)
+    if echo_args.iter().any(ir_expr_needs_runtime) {
+        return None;
+    }
+    // stage 2: exec("bc") with NO args
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
+        return None;
+    };
+    if f2 != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(name2, _), IrExpr::Array(bc_args)] = a2.as_slice() else {
+        return None;
+    };
+    if name2 != "bc" || !bc_args.is_empty() {
+        return None;
+    }
+    // echo flags (-n only — -e would transform the text the fold cannot
+    // model; the capture twin accepts -e because bc's lexer is
+    // insensitive to the escapes it can produce, but the statement form
+    // emits the BYTES, so refuse the transformation) then exactly ONE
+    // real arg (multiple args join to a multi-statement program — keep
+    // the spawn).
+    let mut arg: Option<&IrExpr> = None;
+    for a in echo_args {
+        if arg.is_none() {
+            if let IrExpr::Str(sv, _) = a {
+                if sv == "-n" {
+                    continue;
+                }
+                if sv == "-e" {
+                    return None;
+                }
+            }
+        }
+        if arg.is_some() {
+            return None;
+        }
+        arg = Some(a);
+    }
+    let arg = arg?;
+    // STATIC program — the compile-time fold (src/bc.rs's exact semantics
+    // + output format). A quoted arg arrives as an Interpolate with only
+    // Lit parts; concatenate them — the runtime's expandWord joins the
+    // parts with the refs' values, so all-Lit == the literal text.
+    let text: Option<String> = match arg {
+        IrExpr::Str(sv, _) => Some(sv.clone()),
+        IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => {
+            Some(
+                parts
+                    .iter()
+                    .map(|p| match p {
+                        InterpPart::Lit(s) => s.clone(),
+                        _ => unreachable!("all-Lit checked"),
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    };
+    let out = bc_eval(&text?).ok()?;
+    // bc's stdout: each expression statement's formatted value + newline
+    // (assignments print nothing); a program whose statements all print
+    // nothing produces NO bytes at all — not even a newline.
+    let out = if out.is_empty() {
+        out
+    } else {
+        format!("{out}\n")
+    };
+    Some(seq(vec![
+        printf_write_expr(str_lit(&out)),
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        },
+        bool_lit(true),
+    ]))
+}
+
 fn native_capture_yes_head(pipe: &IrExpr) -> Option<Expr> {
     let IrExpr::Call { func, args } = pipe else {
         return None;
@@ -22124,6 +22259,30 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                 }
             }
+            // `env` with NO operands (the corpus shape `env | grep …`):
+            // the spawn collapses to the SYNC builtin dispatch (the
+            // builtin's emit is sink-correct everywhere — module stdout,
+            // capture buffer, redirect target — so no sink gates are
+            // needed; see builtins.env for the documented
+            // SH2_ASSUME_ENV gate). The emitter-side gate (default ON;
+            // SH2_ASSUME_ENV=0 restores the exec spawn — the
+            // SH2_BC_NATIVE pattern) keeps the option-off run
+            // byte-identical to the pre-change runtime forms. Flag/
+            // carrying forms (`env -i`, `env NAME=V cmd`) keep the exec
+            // spawn — the builtin cannot run commands, and the
+            // allowlist still admits env for those. Script-defined `env`
+            // functions shadow the builtin — keep the dispatch.
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), IrExpr::Array(env_args)] = args.as_slice() {
+                    if name == "env"
+                        && env_args.is_empty()
+                        && std::env::var("SH2_ASSUME_ENV").map_or(true, |v| v != "0")
+                        && !program_defines_function("env")
+                    {
+                        return sh2_call("builtin", vec![str_lit("env"), array(vec![])]);
+                    }
+                }
+            }
             // `eval "NAME=VALUE..."` with a STATIC pure-assignment string
             // (expression position): the native store-write sequence — no
             // double bash spawn per evaluation (see try_native_eval).
@@ -22703,6 +22862,20 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                 vec![sync_arrow_expr(cond_e), sync_arrow_block(body_e)],
                             );
                         }
+                    }
+                }
+            }
+            // `echo EXPR | bc` at the module's default stdout sink — a
+            // STATIC program folds at compile time (src/bc.rs) and the
+            // whole pipeline collapses to a native stdout write (see
+            // try_native_echo_bc_stmt): no bc spawn, no async pipeline
+            // machinery. Script-defined `echo`/`bc` functions shadow the
+            // builtins — keep the pipeline then (the runtime dispatches
+            // to the function).
+            if func == "pipeline" {
+                if !program_defines_function("echo") && !program_defines_function("bc") {
+                    if let Some(native) = try_native_echo_bc_stmt(e) {
+                        return native;
                     }
                 }
             }
