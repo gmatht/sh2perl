@@ -890,6 +890,10 @@ exit $main_exit_code;
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
             debashl::shir_passes::restructure_goto_only(&mut prog);
+            // process substitution: materialize frontend-emitted
+            // process-in/out into temp-file form (core request
+            // sh-20260807-130936) — same as the file pipeline's transform.
+            debashl::transforms::process_subst::transform_program(&mut prog);
             match debashl::shir::shir_to_estree_json(&prog) {
                 Ok(s) => println!("{}", s),
                 Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
@@ -916,6 +920,7 @@ exit $main_exit_code;
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
             debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
             print!("{}", debashl::ir::shir_to_perl(&prog));
         }
         "--mir" => {

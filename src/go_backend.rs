@@ -4160,7 +4160,14 @@ impl Render {
         }
         text.push(")".to_string());
         text.push(String::new());
-        text.extend(RUNTIME_HELPERS.iter().map(|s| s.to_string()));
+        // Only the runtime helpers the body references (transitively) —
+        // a `name=\"world\"; echo hello` keeps just s2s/fmt.
+        let body_text = {
+            let mut d = self.decl_lines();
+            d.extend(body_out.iter().cloned());
+            d.join("\n")
+        };
+        text.extend(go_used_helpers(&body_text));
         text.push("func main() {".to_string());
         text.extend(self.decl_lines());
         text.extend(body_out.iter().cloned());
@@ -4171,7 +4178,26 @@ impl Render {
                 self.todo
             ));
         }
-        self.out = text;
+        // Trim the import list to what the kept text references.
+        let all = [
+            "\"bufio\"", "\"fmt\"", "\"io\"", "\"os\"", "\"os/exec\"",
+            "\"path/filepath\"", "\"regexp\"", "\"strconv\"", "\"strings\"",
+            "\"syscall\"", "\"unicode/utf8\"",
+        ];
+        let full = text.join("\n");
+        let keep_paths: Vec<String> = all
+            .iter()
+            .map(|q| q.trim_matches('"').to_string())
+            .filter(|q| go_uses_pkg(&full, q.rsplit('/').next().unwrap()))
+            .collect();
+        let mut out2: Vec<String> = Vec::new();
+        for line in text {
+            if let Some(q) = line.trim().strip_prefix("\"").and_then(|r| r.strip_suffix("\"")) {
+                if !keep_paths.contains(&q.to_string()) { continue; }
+            }
+            out2.push(line);
+        }
+        self.out = out2;
     }
 
     /// The per-program declaration lines (vars, st, vars map, fArgs).
@@ -5402,8 +5428,89 @@ fn collect_written_arith(a: &ArithAst, out: &mut BTreeSet<String>, arrays: &mut 
     }
 }
 
-/// The fixed runtime-helper block (package-level, emitted unconditionally;
-/// the import scanner derives the import list from what is referenced).
+/// Word-boundary `qualifier.` test — `fmt.` matches `fmt.Println` but
+/// not `"fmt"` (the import line) or `sprintf`.
+fn go_uses_pkg(s: &str, q: &str) -> bool {
+    let needle = format!("{q}.");
+    let b = s.as_bytes();
+    let wb = needle.as_bytes();
+    if wb.len() > b.len() { return false; }
+    let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    while i + wb.len() <= b.len() {
+        if &b[i..i + wb.len()] == wb && (i == 0 || !is_id(b[i - 1])) { return true; }
+        i += 1;
+    }
+    false
+}
+fn go_contains_word(s: &str, w: &str) -> bool {
+    if w.is_empty() || w.len() > s.len() { return false; }
+    let b = s.as_bytes();
+    let wb = w.as_bytes();
+    let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    while i + wb.len() <= b.len() {
+        if &b[i..i + wb.len()] == wb
+            && (i == 0 || !is_id(b[i - 1]))
+            && (i + wb.len() == b.len() || !is_id(b[i + wb.len()]))
+        { return true; }
+        i += 1;
+    }
+    false
+}
+fn go_split_helpers() -> Vec<(String, Vec<String>)> {
+    let mut segs: Vec<(String, Vec<String>)> = Vec::new();
+    let mut cur: Option<(String, Vec<String>)> = None;
+    for line in RUNTIME_HELPERS {
+        let name = if let Some(r) = line.strip_prefix("func ") {
+            r.split('(').next().map(|x| x.trim().to_string())
+        } else if let Some(r) = line.strip_prefix("var ") {
+            r.split_whitespace().next().map(|x| x.to_string())
+        } else { None };
+        if let Some(n) = name {
+            if let Some(c) = cur.take() { segs.push(c); }
+            cur = Some((n, vec![line.to_string()]));
+        } else if let Some(c) = cur.as_mut() {
+            c.1.push(line.to_string());
+        } else {
+            segs.push((String::new(), vec![line.to_string()]));
+        }
+    }
+    if let Some(c) = cur.take() { segs.push(c); }
+    segs
+}
+fn go_used_helpers(body: &str) -> Vec<String> {
+    let segs = go_split_helpers();
+    let mut needed: BTreeSet<String> = BTreeSet::new();
+    for (name, _) in &segs {
+        if !name.is_empty() && go_contains_word(body, name) { needed.insert(name.clone()); }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (name, lines) in &segs {
+            if name.is_empty() || !needed.contains(name) { continue; }
+            let text = lines.join("\n");
+            for (n2, _) in &segs {
+                if !n2.is_empty() && !needed.contains(n2) && go_contains_word(&text, n2) {
+                    needed.insert(n2.clone());
+                    changed = true;
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (name, lines) in &segs {
+        let keep = (name.is_empty() && segs.iter().any(|(n, _)| !n.is_empty() && needed.contains(n)))
+            || (!name.is_empty() && needed.contains(name));
+        if keep { out.extend(lines.iter().cloned()); }
+    }
+    out
+}
+
+/// The fixed runtime-helper block (package-level; go_used_helpers emits
+/// only the parts the body references, and the import list is trimmed to
+/// what the kept text uses).
 const RUNTIME_HELPERS: &[&str] = &[
     "func s2s(x any) string {",
     "    if x == nil { return \"\" }",
@@ -6203,8 +6310,6 @@ mod pipe_tests {
         for s in &prog.stmts {
             if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
                 if func == "pipeline" {
-                    let t = r.cmd_text_stmts_stage(args);
-                    eprintln!("STAGE TEXT: {:?}", t);
                     let v = r.pipeline_expr(args);
                     eprintln!("PIPE EXPR: {v}");
                 }

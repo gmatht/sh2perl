@@ -1632,11 +1632,16 @@ mod tests {
 
     #[test]
     fn if_then_else_lowers_to_if_statement() {
-        // `[ -f /tmp/x ]` is a file test — a native async lstat chain
-        // (no sh2.test string parse, no dispatch, no blocking lstatSync).
+        // `[ -f /tmp/x ]` is a file test — a sync `sh2.fileTest(flag,
+        // path)` runtime call (evalUnary minus the string parse/dispatch;
+        // no async lstat chain — the chain was the last await in
+        // otherwise-sync loop bodies), wrapped in the native-test status
+        // protocol (`sh2._g = ...`, `sh2.lastExit = ...`). No sh2.test
+        // string parse, no dispatch.
         let json = to_json("if [ -f /tmp/x ]; then echo yes; else echo no; fi");
         assert!(json.contains("\"type\":\"IfStatement\""));
-        assert!(json.contains("\"name\":\"lstat\""));
+        assert!(json.contains("\"name\":\"fileTest\""));
+        assert!(!json.contains("\"name\":\"lstat\""));
         assert!(!json.contains("\"name\":\"test\""));
         assert!(!json.contains("unsupported"));
     }

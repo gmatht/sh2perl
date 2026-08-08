@@ -673,6 +673,18 @@ impl Lexer {
         }
     }
 
+    /// The source line (1-based) of the CURRENT token — the lexer's
+    /// tokens carry BYTE offsets, so map the token's start through the
+    /// line_starts table (binary search). Used by the parser to record
+    /// each top-level statement's line for stmt_lines.
+    pub fn current_line(&self) -> usize {
+        let pos = self.tokens.get(self.current).map(|(_, s, _)| *s).unwrap_or(0);
+        match self.line_starts.binary_search(&pos) {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        }
+    }
+
     pub fn is_eof(&self) -> bool {
         self.current >= self.tokens.len()
     }
