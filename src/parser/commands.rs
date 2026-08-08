@@ -46,7 +46,16 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<Vec<Command>, ParserError> {
+        Ok(self.parse_with_lines()?.0)
+    }
+
+    /// Like `parse`, but also returns the 1-based source line of each
+    /// top-level command (aligned with the returned Vec) — the shIR's
+    /// `stmt_lines` markup, so backends and the web GUI can map generated
+    /// statements back to the source lines they came from.
+    pub fn parse_with_lines(&mut self) -> Result<(Vec<Command>, Vec<usize>), ParserError> {
         let mut commands = vec![];
+        let mut lines: Vec<usize> = vec![];
 
         // Skip initial whitespace but preserve newlines for proper command separation
         let mut newline_count = 0;
@@ -84,6 +93,7 @@ impl Parser {
                 continue;
             }
 
+            let cmd_line = self.lexer.current_line();
             let mut command = self.parse_command()?;
 
             if let Command::Simple(ref simple_cmd) = command {
@@ -125,6 +135,7 @@ impl Parser {
                 }
             }
 
+            lines.push(cmd_line);
             commands.push(command);
 
             // Handle separators and comments after command
@@ -166,6 +177,7 @@ impl Parser {
                         // bash; the Perl renderer's handling is
                         // best-effort.
                         self.lexer.next();
+                        lines.push(self.lexer.current_line());
                         commands.push(Command::Simple(SimpleCommand {
                             name: Word::literal(")".to_string()),
                             args: vec![],
@@ -174,7 +186,7 @@ impl Parser {
                             stdout_used: true,
                             stderr_used: true,
                         }));
-                        return Ok(commands);
+                        return Ok((commands, lines));
                     }
                     Some(Token::Background) => {
                         // Convert last command to background
@@ -204,7 +216,7 @@ impl Parser {
             }
         }
 
-        Ok(commands)
+        Ok((commands, lines))
     }
 
     /// Starting from offset `start`, return the offset of the first non-whitespace token.

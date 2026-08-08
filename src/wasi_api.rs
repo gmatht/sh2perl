@@ -138,6 +138,141 @@ pub extern "C" fn debashc_str_len(ptr: *const u8) -> u32 {
 }
 
 /// `debashc_free(ptr)` — release a buffer returned by a `debashc_*` export.
+
+// ── otranspilerl_* — the unified ABI (all nine backends) ────────
+//
+// Same memory contract as debashc_*: every string export returns a
+// pointer to the data area of a [u32 len][data][0] buffer;
+// otranspilerl_str_len reads the len prefix, otranspilerl_free
+// releases it. otranspilerl_alloc(len) returns the data pointer of a
+// buffer with the same prefix layout.
+//
+// Pipeline: sh source → A1 shIR (the debashl core) → any of the nine
+// renderers (c, go, java, js/estree, perl, python, rust, sh, zig).
+// Non-sh SOURCE languages need the frontend process (not in wasm yet).
+
+/// `otranspilerl_alloc(len)` — a [u32 len][data][0] buffer, returns the
+/// data pointer (the caller writes `len` bytes at it).
+#[no_mangle]
+pub extern "C" fn otranspilerl_alloc(len: usize) -> *mut u8 {
+    if len == 0 {
+        return null_mut();
+    }
+    let total = 4 + len + 1;
+    let layout = Layout::from_size_align(total, 4).expect("valid layout");
+    let ptr = unsafe { alloc(layout) };
+    if ptr.is_null() {
+        return null_mut();
+    }
+    unsafe {
+        *(ptr as *mut u32) = (len as u32).to_le();
+        ptr.add(4)
+    }
+}
+
+/// `otranspilerl_str_len(ptr)` — payload length in bytes (excludes NUL).
+#[no_mangle]
+pub extern "C" fn otranspilerl_str_len(ptr: *const u8) -> u32 {
+    debashc_str_len(ptr)
+}
+
+/// `otranspilerl_free(ptr)` — release a buffer (result or alloc'd input).
+#[no_mangle]
+pub extern "C" fn otranspilerl_free(ptr: *mut u8) {
+    debashc_free(ptr);
+}
+
+/// `otranspilerl_version() -> *mut u8` — "otranspilerl <version>" (JSON
+/// envelope).
+#[no_mangle]
+pub extern "C" fn otranspilerl_version() -> *mut u8 {
+    alloc_string(&ok_json(&format!("otranspilerl {}", env!("CARGO_PKG_VERSION"))))
+}
+
+fn read_str(ptr: *const u8, len: usize) -> String {
+    if ptr.is_null() || len == 0 {
+        return String::new();
+    }
+    unsafe { String::from_utf8_lossy(slice::from_raw_parts(ptr, len)).into_owned() }
+}
+
+fn parse_to_ir(src: &str) -> Result<crate::ir::IrProgram, String> {
+    let (commands, lines) = Parser::new(src).parse_with_lines().map_err(|e| e.to_string())?;
+    Ok(crate::shir::ast_to_ir_with_lines(&commands, &lines))
+}
+
+fn render_ir(prog: &crate::ir::IrProgram, lang: &str) -> Result<String, String> {
+    match lang {
+        "c" => Ok(crate::c_backend::shir_to_c(prog)),
+        "go" => Ok(crate::go_backend::shir_to_go(prog)),
+        "java" => crate::java_backend::shir_to_java(prog),
+        "js" => Ok(crate::js_backend::shir_to_js(prog)),
+        "pl" | "perl" => Ok(crate::perl_backend::shir_to_perl(prog)),
+        "py" | "python" => Ok(crate::python_backend::shir_to_python(prog)),
+        "rs" | "rust" => Ok(crate::rust_backend::shir_to_rust(prog)),
+        "sh" => crate::sh_backend::shir_to_sh(prog),
+        "zig" => Ok(crate::zig_backend::shir_to_zig(prog)),
+        other => Err(format!(
+            "target \"{other}\" not wired (known: js, pl, c, go, py, sh, java, rs, zig, shir)"
+        )),
+    }
+}
+
+fn otranspilerl_transpile_impl(src: &str, src_lang: &str, tgt_lang: &str) -> Result<String, String> {
+    if src_lang == "shir" {
+        let prog = crate::shir_json_in::shir_json_to_ir(src)?;
+        return render_ir(&prog, tgt_lang);
+    }
+    if src_lang == "sh" {
+        let prog = parse_to_ir(src)?;
+        return render_ir(&prog, tgt_lang);
+    }
+    Err(format!(
+        "source language \"{src_lang}\" requires the frontend process spawn, not available in this build; feed the frontend's A1 JSON to render instead"
+    ))
+}
+
+/// `otranspilerl_shir(src, len)` — shell source → A1 shIR JSON.
+#[no_mangle]
+pub extern "C" fn otranspilerl_shir(src: *const u8, src_len: usize) -> *mut u8 {
+    let src = read_str(src, src_len);
+    match parse_to_ir(&src).and_then(|prog| Ok(crate::shir_json::shir_to_shir_json(&prog))) {
+        Ok(out) => alloc_string(&ok_json(&out)),
+        Err(e) => alloc_string(&err_json(&e)),
+    }
+}
+
+/// `otranspilerl_render(a1, len, lang, lang_len)` — A1 shIR JSON → target.
+#[no_mangle]
+pub extern "C" fn otranspilerl_render(a1: *const u8, a1_len: usize, lang: *const u8, lang_len: usize) -> *mut u8 {
+    let a1 = read_str(a1, a1_len);
+    let lang = read_str(lang, lang_len);
+    let res = crate::shir_json_in::shir_json_to_ir(&a1).and_then(|prog| render_ir(&prog, &lang));
+    match res {
+        Ok(out) => alloc_string(&ok_json(&out)),
+        Err(e) => alloc_string(&err_json(&e)),
+    }
+}
+
+/// `otranspilerl_transpile(src, len, srcLang, len, tgtLang, len)` —
+/// source → target (sh and shir sources, in-process).
+#[no_mangle]
+pub extern "C" fn otranspilerl_transpile(
+    src: *const u8,
+    src_len: usize,
+    src_lang: *const u8,
+    src_lang_len: usize,
+    tgt_lang: *const u8,
+    tgt_lang_len: usize,
+) -> *mut u8 {
+    let src = read_str(src, src_len);
+    let src_lang = read_str(src_lang, src_lang_len);
+    let tgt_lang = read_str(tgt_lang, tgt_lang_len);
+    match otranspilerl_transpile_impl(&src, &src_lang, &tgt_lang) {
+        Ok(out) => alloc_string(&ok_json(&out)),
+        Err(e) => alloc_string(&err_json(&e)),
+    }
+}
 #[no_mangle]
 pub extern "C" fn debashc_free(ptr: *mut u8) {
     if ptr.is_null() {

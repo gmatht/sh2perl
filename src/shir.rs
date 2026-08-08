@@ -537,6 +537,167 @@ fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, 
 /// lowering drops the per-iteration `bodyLast` tracking + trailing write
 /// for these loops (a bare native `while (cond) { body }`).
 static LOOP_STATUS_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+/// Loop statement pointers provably executed at least once (sound
+/// constant propagation + test-condition evaluation — see
+/// collect_provably_running_loops). ShIR markup: also serialized as
+/// `"runs": true` on the loop nodes (shir_json.rs), so every backend
+/// consuming the A1 contract knows the body always runs.
+static PROVABLY_RUNS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+// ── prove a loop runs at least once ──────────────────────────────
+// Sound constant propagation over the statements BEFORE the loop, then
+// evaluate a simple test condition. Anything unprovable → false
+// (conservative — the emitter keeps its ran/last machinery).
+fn const_value(expr: &IrExpr) -> Option<i128> {
+    match expr {
+        IrExpr::Int(n) => Some(*n as i128),
+        IrExpr::Str(s, _) => s.trim().parse::<i128>().ok(),
+        IrExpr::Arith(a) => arith_const(a),
+        _ => None,
+    }
+}
+fn arith_const(a: &ArithAst) -> Option<i128> {
+    match a {
+        ArithAst::Num(n) => Some(*n as i128),
+        ArithAst::Bin { op, lhs, rhs } => {
+            let l = arith_const(lhs)?;
+            let r = arith_const(rhs)?;
+            match op.as_str() {
+                "+" => Some(l + r),
+                "-" => Some(l - r),
+                "*" => Some(l * r),
+                "/" => (r != 0).then(|| l / r),
+                "%" => (r != 0).then(|| l % r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+fn test_operand(s: &str, vals: &HashMap<String, i128>) -> Option<i128> {
+    let t = s.trim().trim_matches('"');
+    if let Some(name) = t.strip_prefix('$') {
+        vals.get(name).copied()
+    } else if let Some(name) = t
+        .strip_prefix("${")
+        .and_then(|x| x.strip_suffix('}'))
+    {
+        vals.get(name).copied()
+    } else {
+        t.parse::<i128>().ok()
+    }
+}
+fn eval_test_str(s: &str, vals: &HashMap<String, i128>) -> Option<bool> {
+    const OPS: &[(&str, fn(i128, i128) -> bool)] = &[
+        ("-lt", |a, b| a < b),
+        ("-gt", |a, b| a > b),
+        ("-le", |a, b| a <= b),
+        ("-ge", |a, b| a >= b),
+        ("-eq", |a, b| a == b),
+        ("-ne", |a, b| a != b),
+    ];
+    for (op, f) in OPS {
+        let needle = format!(" {op} ");
+        if let Some(pos) = s.find(&needle) {
+            let left = s[..pos].trim();
+            let right = s[pos + needle.len()..].trim();
+            let l = test_operand(left, vals)?;
+            let r = test_operand(right, vals)?;
+            return Some(f(l, r));
+        }
+    }
+    None
+}
+fn loop_provably_runs_in(stmts: &[IrStmt], idx: usize) -> bool {
+    let st = &stmts[idx];
+    match st {
+        IrStmt::DoWhile { .. } => true,
+        IrStmt::For { iter, .. } => match iter {
+            IrExpr::Array(items) => !items.is_empty(),
+            IrExpr::Range { start, end } => start <= end,
+            _ => false,
+        },
+        IrStmt::While { cond, .. } => {
+            let mut vals: HashMap<String, i128> = HashMap::new();
+            for st in &stmts[..idx] {
+                match st {
+                    IrStmt::Assign { targets, expr }
+                        if targets.len() == 1 && targets[0].indices.is_empty() =>
+                    {
+                        match const_value(expr) {
+                            Some(n) => { vals.insert(targets[0].var.clone(), n); }
+                            None => { vals.remove(&targets[0].var); }
+                        }
+                    }
+                    IrStmt::While { .. }
+                    | IrStmt::DoWhile { .. }
+                    | IrStmt::For { .. }
+                    | IrStmt::If { .. }
+                    | IrStmt::Case { .. }
+                    | IrStmt::Function { .. }
+                    | IrStmt::Subshell(_)
+                    | IrStmt::Background(_)
+                    | IrStmt::Pipeline { .. }
+                    | IrStmt::Block(_) => { vals.clear(); }
+                    _ => {}
+                }
+            }
+            match cond {
+                IrExpr::Call { func, args, .. } if func == "test" => {
+                    if let Some(IrExpr::Str(s, _)) = args.first() {
+                        return eval_test_str(s, &vals).unwrap_or(false);
+                    }
+                    false
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+fn collect_provably_running_loops(stmts: &[IrStmt], out: &mut HashSet<usize>) {
+    for (idx, st) in stmts.iter().enumerate() {
+        if matches!(
+            st,
+            IrStmt::While { .. } | IrStmt::DoWhile { .. } | IrStmt::For { .. }
+        ) && loop_provably_runs_in(stmts, idx)
+        {
+            out.insert(st as *const IrStmt as usize);
+        }
+        let body: Option<&Vec<IrStmt>> = match st {
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => Some(body),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_provably_running_loops(then, out);
+                for (_, b) in elsifs { collect_provably_running_loops(b, out); }
+                collect_provably_running_loops(else_, out);
+                None
+            }
+            _ => None,
+        };
+        if let Some(b) = body { collect_provably_running_loops(b, out); }
+    }
+}
+pub(crate) fn set_provably_running_loops(stmts: &[IrStmt]) {
+    let mut runs = HashSet::new();
+    collect_provably_running_loops(stmts, &mut runs);
+    *PROVABLY_RUNS.lock().unwrap() = Some(runs);
+}
+pub(crate) fn stmt_provably_runs(s: &IrStmt) -> bool {
+    loop_provably_runs(s)
+}
+fn loop_provably_runs(stmt: &IrStmt) -> bool {
+    PROVABLY_RUNS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.contains(&(stmt as *const IrStmt as usize)))
+        .unwrap_or(false)
+}
+
 fn loop_status_write_dead(stmt: &IrStmt) -> bool {
     LOOP_STATUS_DEAD
         .lock()
@@ -2176,17 +2337,33 @@ fn st(s: &str) -> IrExpr {
 // ── AST → IR ─────────────────────────────────────────────────────────
 
 pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
+    ast_to_ir_with_lines(commands, &[])
+}
+
+/// `ast_to_ir` + the shIR `stmt_lines` markup: `lines[i]` is the 1-based
+/// source line of `commands[i]` (from the parser's `parse_with_lines`),
+/// so the A1 contract can carry each top-level statement's line — the
+/// web GUI maps generated statements back to the source lines they came
+/// from.
+pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram {
     // Shared optimization passes (M6): the same optimize_stmts the Perl
     // backend runs now also runs here, so future passes (constant folding,
     // dead-assignment elimination) benefit both consumers of the IR.
     // Then apply worker-submitted transforms (gated by DEBASHC_TRANSFORMS;
     // the estree worker compiles them in + bisects on the corpus).
-    let mut stmts = crate::ir::optimize_stmts(
-        &commands
-            .iter()
-            .filter_map(stmt_for_command)
-            .collect::<Vec<_>>(),
-    );
+    let mut stmt_lines: Vec<(usize, usize)> = Vec::new();
+    let mut stmts: Vec<IrStmt> = Vec::new();
+    for (i, cmd) in commands.iter().enumerate() {
+        if let Some(st) = stmt_for_command(cmd) {
+            if let Some(&l) = lines.get(i) {
+                if l > 0 {
+                    stmt_lines.push((stmts.len(), l));
+                }
+            }
+            stmts.push(st);
+        }
+    }
+    let mut stmts = crate::ir::optimize_stmts(&stmts);
     // Serialize against the shir_to_estree compile lock: the
     // sync-ok-loops transform stores per-compilation POINTER-keyed
     // verdicts in shared statics, and a parallel compilation's unlocked
@@ -2201,7 +2378,7 @@ pub fn ast_to_ir(commands: &[Command]) -> IrProgram {
         stmts,
         subs: vec![],
         var_types: vec![],
-        stmt_lines: vec![],
+        stmt_lines,
         var_lengths: vec![],
         var_const: vec![],
         var_lifetimes: vec![],
@@ -9094,6 +9271,14 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         }
     }
     *LOOP_STATUS_DEAD.lock().unwrap() = Some(loop_status_dead);
+    // shIR markup: which loops provably run at least once (sound const
+    // propagation). The estree emitter skips the ran/last tracking for
+    // them; the A1 JSON carries `"runs": true` for every other backend.
+    {
+        let mut runs = HashSet::new();
+        collect_provably_running_loops(&prog.stmts, &mut runs);
+        *PROVABLY_RUNS.lock().unwrap() = Some(runs);
+    }
     let mut body: Vec<Stmt> = Vec::new();
     // `let x = 0` (numeric) / `let x = ""` (string) at program top. bash
     // reads an unset var as 0 in arithmetic and "" as a string. The
@@ -11025,9 +11210,14 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 if !loop_in_async_region(stmt) && !lowered_stmts_have_signals(&body_stmts) {
                     let errexit = MAY_ERREXIT.lock().unwrap().unwrap_or(true);
                     let dead = loop_status_write_dead(stmt) && !errexit;
+                    // shIR markup: a loop provably run at least once (the
+                    // A1's `"runs": true`) needs no ran/last tracking —
+                    // its trailing `sh2.lastExit = ran ? last : 0` would
+                    // be a no-op. The errexit guard stays.
+                    let provable = loop_provably_runs(stmt);
                     let mut tracked: Vec<Stmt> = Vec::new();
                     let mut inner: Vec<Stmt> = Vec::new();
-                    if !dead {
+                    if !dead && !provable {
                         // `let __sh2_loop_ran = false, __sh2_loop_last = 0;`
                         // — the runtime's `ran`/`bodyLastExit` locals
                         tracked.push(Stmt::VariableDeclaration {
@@ -11064,7 +11254,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         });
                     }
                     inner.extend(body_stmts);
-                    if !dead {
+                    if !dead && !provable {
                         // `__sh2_loop_last = sh2.lastExit;` — the runtime's
                         // bodyLastExit read after the body fn
                         inner.push(Stmt::ExpressionStatement {
@@ -11131,6 +11321,37 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             });
                         }
                         return Some(Stmt::BlockStatement { body: tracked });
+                    }
+                    // provable loop (the A1's `"runs": true`): bare
+                    // native while — the body's last command already leaves
+                    // sh2.lastExit correct — but keep the errexit guard.
+                    if provable && errexit && is_top_level_stmt() {
+                        let mut out = vec![Stmt::WhileStatement {
+                            test: cond_e,
+                            body: Box::new(Stmt::BlockStatement { body: inner }),
+                        }];
+                        out.push(Stmt::IfStatement {
+                            test: Expr::LogicalExpression {
+                                operator: "&&".to_string(),
+                                left: Box::new(sh2_member("errexit")),
+                                right: Box::new(Expr::BinaryExpression {
+                                    operator: "!==".to_string(),
+                                    left: Box::new(sh2_member("lastExit")),
+                                    right: Box::new(Expr::Literal {
+                                        value: serde_json::Value::from(0),
+                                        raw: None,
+                                        regex: None,
+                                    }),
+                                }),
+                            },
+                            consequent: Box::new(Stmt::BlockStatement {
+                                body: vec![Stmt::ExpressionStatement {
+                                    expression: process_exit(sh2_member("lastExit")),
+                                }],
+                            }),
+                            alternate: None,
+                        });
+                        return Some(Stmt::BlockStatement { body: out });
                     }
                     // dead loop status: bare native while, zero tracking
                     return Some(Stmt::WhileStatement {
@@ -18337,14 +18558,32 @@ fn regex_test_pattern(rhs: &str) -> Option<String> {
 /// lifted numeric variables (or integer literals): `"$count" -lt 100`
 /// becomes `count < 100` — no runtime test-string round-trip. Returns None
 /// for anything else (falls back to the injected template / runtime).
+///
+/// Every native form is wrapped in the test-status protocol (see
+/// [`native_test_statused`]): bash records the test's exit status in `$?`
+/// from EVERY position (bare statement, if/while condition, `!`/`&&`/`||`
+/// operand), and the runtime `sh2.test` call records it internally — a
+/// native form must mirror that or `$?` reads go stale (a bare failing
+/// `[ -f x ]` followed by `echo $?` printed the PREVIOUS status).
 fn try_native_test(s: &str) -> Option<Expr> {
+    try_native_test_unstatused(s).map(native_test_statused)
+}
+
+/// The value-only native test (no lastExit write): the single-op scans,
+/// the file-test / `-n`/`-z` / `=~` / glob lowerings, and the compound
+/// `-a`/`-o` chain. `try_native_test` applies the status protocol ONCE at
+/// the outermost level; the compound recursion (see
+/// [`try_native_test_leaf`]) stays unstatused so a compound's leaves are
+/// not double-wrapped (bash records only the whole test's status).
+fn try_native_test_unstatused(s: &str) -> Option<Expr> {
     let s = s.trim();
     // file tests (`-f`/`-d`/`-e`/`-h`/`-s`/`-r`/`-w`/`-x`/`-b`/`-c`/`-p`/
-    // `-S`/`-u`/`-g`/`-k`/`-O`/`-G`/`-N`, optionally `!`-negated): the
-    // runtime's evalUnary is an lstat + flag check, so a native
-    // `await sh2.fs.lstat(p).then(s => <check>, () => false)` is the exact
-    // value minus the string parse + dispatch (and the runtime's BLOCKING
-    // lstatSync — the native chain is async).
+    // `-S`/`-u`/`-g`/`-k`/`-O`/`-G`/`-N`, optionally `!`-negated): a
+    // direct `sh2.fileTest(flag, path)` — the runtime's evalUnary (an
+    // lstat/access + flag check) minus the string parse + dispatch. SYNC:
+    // the old `await sh2.fs.lstat(p).then(...)` chain was the LAST await
+    // in otherwise-sync loop bodies, forcing the per-iteration promise
+    // machinery; the sync call keeps loops on the *Sync gates.
     if let Some(native) = try_native_file_test(s) {
         return Some(native);
     }
@@ -18759,6 +18998,43 @@ fn try_native_test(s: &str) -> Option<Expr> {
     try_native_compound_test(s)
 }
 
+/// The status a native test must record (`$?` reads it back in every
+/// position — see [`try_native_test`]): `(sh2._g = t, sh2.lastExit =
+/// sh2._g ? 0 : 1, sh2._g)` — the established single-eval protocol (t may
+/// contain getVar reads; evaluating it twice would double them and the
+/// metric). The seq is one synchronous run, so a nested scratch use can
+/// never interleave. The runtime `sh2.test` call needs no wrap (it records
+/// lastExit internally); the pure-expression natives (numeric/string/
+/// glob/`=~`/`-n`/`-z`) and the `sh2.fileTest` call (pure value) do.
+fn native_test_statused(t: Expr) -> Expr {
+    let tmp = sh2_member("_g");
+    seq(vec![
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(tmp.clone()),
+            right: Box::new(t),
+        },
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::ConditionalExpression {
+                test: Box::new(tmp.clone()),
+                consequent: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                    regex: None,
+                }),
+                alternate: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(1),
+                    raw: None,
+                    regex: None,
+                }),
+            }),
+        },
+        tmp,
+    ])
+}
+
 /// Split on a top-level ` -conn ` connector (outside quotes and parens),
 /// returning the parts. None when the connector does not appear.
 fn split_test_connector<'a>(s: &'a str, conn: &str) -> Option<Vec<&'a str>> {
@@ -18812,14 +19088,17 @@ fn try_native_test_leaf(s: &str) -> Option<Expr> {
         if rest.starts_with('(') {
             return None;
         }
-        let inner = try_native_test(rest)?;
+        // UNSTATUSED leaf: the enclosing compound records ONE status at
+        // its top level (see [`try_native_test`]); a leaf-level wrap would
+        // be overwritten and double the scratch writes.
+        let inner = try_native_test_unstatused(rest)?;
         return Some(Expr::UnaryExpression {
             operator: "!".to_string(),
             argument: Box::new(inner),
             prefix: true,
         });
     }
-    try_native_test(s)
+    try_native_test_unstatused(s)
 }
 
 /// True when the test string contains any `=`/`==`/`!=`/numeric-op token
@@ -19698,101 +19977,30 @@ fn try_native_file_test(s: &str) -> Option<Expr> {
         return None; // extra tokens after the operand → a compound/other shape
     }
     let path = file_test_operand(operand)?;
-    let chain = if matches!(f, 'r' | 'w' | 'x') {
-        // `-r`/`-w`/`-x` — bash tests access(2) with R_OK/W_OK/X_OK (the
-        // real effective-uid permission, following symlinks), NOT raw mode
-        // bits: a root-owned `crw-------` device is unreadable by a
-        // non-root user even though the owner-read bit is set
-        // (tty-cmdsub.sh). The runtime's evalUnary resolves these flags the
-        // same way (fs.accessSync); this chain is its async twin:
-        // `await sh2.fs.access(P, 4).then(() => true, () => false)`.
-        let want = match f {
-            'r' => 4, // fs.constants.R_OK
-            'w' => 2, // fs.constants.W_OK
-            _ => 1,   // fs.constants.X_OK
-        };
-        let access = sh2_fs_call(
-            "access",
-            vec![
-                path,
-                Expr::Literal {
-                    value: serde_json::Value::from(want),
-                    raw: None,
-                    regex: None,
-                },
-            ],
-        );
-        let then = Expr::CallExpression {
-            callee: Box::new(Expr::MemberExpression {
-                object: Box::new(access),
-                property: Box::new(Expr::Identifier {
-                    name: "then".to_string(),
-                }),
-                computed: false,
-                optional: false,
-            }),
-            arguments: vec![
-                Expr::ArrowFunctionExpression {
-                    params: vec![],
-                    body: ArrowBody::Expr(Box::new(bool_lit(true))),
-                    expression: true,
-                    r#async: false,
-                },
-                Expr::ArrowFunctionExpression {
-                    params: vec![],
-                    body: ArrowBody::Expr(Box::new(bool_lit(false))),
-                    expression: true,
-                    r#async: false,
-                },
-            ],
-            optional: false,
-        };
-        await_expr(then)
-    } else {
-        let check = file_test_check(
-            f,
-            Expr::Identifier {
-                name: "s".to_string(),
-            },
-        )?;
-        let lstat = sh2_fs_call("lstat", vec![path]);
-        let then = Expr::CallExpression {
-            callee: Box::new(Expr::MemberExpression {
-                object: Box::new(lstat),
-                property: Box::new(Expr::Identifier {
-                    name: "then".to_string(),
-                }),
-                computed: false,
-                optional: false,
-            }),
-            arguments: vec![
-                Expr::ArrowFunctionExpression {
-                    params: vec![Expr::Identifier {
-                        name: "s".to_string(),
-                    }],
-                    body: ArrowBody::Expr(Box::new(check)),
-                    expression: true,
-                    r#async: false,
-                },
-                Expr::ArrowFunctionExpression {
-                    params: vec![],
-                    body: ArrowBody::Expr(Box::new(bool_lit(false))),
-                    expression: true,
-                    r#async: false,
-                },
-            ],
-            optional: false,
-        };
-        await_expr(then)
-    };
+    // `[ -f x ]` family → `sh2.fileTest("-f", x)` — the runtime's
+    // evalUnary as a direct flag+path call: the exact bash semantics
+    // (empty-arg rule, cwd resolution, accessSync `-r`/`-w`/`-x` — the
+    // real effective-uid permission, NOT raw mode bits: a root-owned
+    // `crw-------` device is unreadable by a non-root user even though
+    // the owner-read bit is set (tty-cmdsub.sh) — lstatSync + the
+    // missing-path catch table) minus the test-string parse and the
+    // builtin dispatch. SYNC, no await: the async `sh2.fs.lstat/access`
+    // chains this replaces were the LAST await in otherwise-sync loop
+    // bodies/conditions (tty-cmdsub, 064_16, 064_hard_to_generate), which
+    // forced the per-iteration promise machinery; a file test now keeps
+    // its enclosing loop on the *Sync gates (forLoopSync/whileLoopSync).
+    // The status the test must record (`$?`) is written by the caller's
+    // native-test protocol (see `native_test_statused`) — the helper
+    // itself is a pure value.
+    let call = sh2_call("fileTest", vec![str_lit(&format!("-{f}")), path]);
     if negate {
         Some(Expr::UnaryExpression {
             operator: "!".to_string(),
-            argument: Box::new(chain),
+            argument: Box::new(call),
             prefix: true,
         })
     } else {
-        Some(chain)
+        Some(call)
     }
 }
 
@@ -19840,100 +20048,6 @@ fn file_test_operand(op: &str) -> Option<Expr> {
         return None;
     }
     Some(str_lit(bare))
-}
-
-/// The stats-object check for a file-test flag — a pure expression over
-/// the `s` binding (mode bits use the exact S_IFMT values node's lstat
-/// reports, identical to the runtime's isFile()/isDirectory()/... which
-/// node implements the same way).
-fn file_test_check(f: char, s: Expr) -> Option<Expr> {
-    let member = |obj: Expr, prop: &str| Expr::MemberExpression {
-        object: Box::new(obj),
-        property: Box::new(Expr::Identifier {
-            name: prop.to_string(),
-        }),
-        computed: false,
-        optional: false,
-    };
-    let bin = |l: Expr, op: &'static str, r: Expr| Expr::BinaryExpression {
-        operator: op.to_string(),
-        left: Box::new(l),
-        right: Box::new(r),
-    };
-    let int_lit = |i: i64| Expr::Literal {
-        value: serde_json::Value::from(i),
-        raw: None,
-        regex: None,
-    };
-    let mode_check = |want: i64| {
-        bin(
-            bin(member(s.clone(), "mode"), "&", int_lit(61440)),
-            "===",
-            int_lit(want),
-        )
-    };
-    let mode_any = |bits: i64| {
-        bin(
-            bin(member(s.clone(), "mode"), "&", int_lit(bits)),
-            "!==",
-            int_lit(0),
-        )
-    };
-    let getuid = || Expr::CallExpression {
-        callee: Box::new(Expr::MemberExpression {
-            object: Box::new(Expr::Identifier {
-                name: "process".to_string(),
-            }),
-            property: Box::new(Expr::Identifier {
-                name: "getuid".to_string(),
-            }),
-            computed: false,
-            optional: false,
-        }),
-        arguments: vec![],
-        optional: false,
-    };
-    let getgid = || Expr::CallExpression {
-        callee: Box::new(Expr::MemberExpression {
-            object: Box::new(Expr::Identifier {
-                name: "process".to_string(),
-            }),
-            property: Box::new(Expr::Identifier {
-                name: "getgid".to_string(),
-            }),
-            computed: false,
-            optional: false,
-        }),
-        arguments: vec![],
-        optional: false,
-    };
-    Some(match f {
-        'f' => mode_check(0o100000),
-        'd' => mode_check(0o040000),
-        'e' => bool_lit(true),
-        'L' | 'h' => mode_check(0o120000),
-        // `-s`: regular file with a nonzero size (the runtime's
-        // `st.isFile() && st.size > 0`)
-        's' => Expr::LogicalExpression {
-            operator: "&&".to_string(),
-            left: Box::new(mode_check(0o100000)),
-            right: Box::new(bin(member(s, "size"), ">", int_lit(0))),
-        },
-        'b' => mode_check(0o060000),
-        'c' => mode_check(0o020000),
-        'p' => mode_check(0o010000),
-        'S' => mode_check(0o140000),
-        'r' => mode_any(0o444),
-        'w' => mode_any(0o222),
-        'x' => mode_any(0o111),
-        'u' => mode_any(0o4000),
-        'g' => mode_any(0o2000),
-        'k' => mode_any(0o1000),
-        'O' => bin(member(s, "uid"), "===", getuid()),
-        'G' => bin(member(s, "gid"), "===", getgid()),
-        'N' => bin(member(s.clone(), "mtimeMs"), ">", member(s, "atimeMs")),
-        _ => return None,
-    })
 }
 
 /// Conservative "always a string" analysis (slice 4). A variable lifts to a
@@ -22113,9 +22227,16 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         // is metric-neutral and strictly faster; two+ reads
                         // would be a net metric loss and gain nothing over
                         // the runtime test's single store read) and no
-                        // awaits (file tests — the sequence context is
-                        // sync; an await chain would break the enclosing
-                        // async analysis). The native test is evaluated
+                        // awaits (file tests are SYNC now — the sync
+                        // `sh2.fileTest` call; the sequence context is
+                        // sync, so the chain's async analysis is
+                        // undisturbed). `try_native_test` already wrapped
+                        // the native in the status protocol
+                        // (`(sh2._g = t, sh2.lastExit = ..., sh2._g)` —
+                        // one evaluation, the getVar reads counted once);
+                        // the outer wrap below re-records the same status
+                        // for the chain links (same value, harmless
+                        // redundancy). The native test is evaluated
                         // EXACTLY ONCE into the runtime's `_g` scratch
                         // (the guard/not protocol — a duplicated native
                         // would double its getVar reads, and the metric
@@ -22123,21 +22244,6 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         // `(sh2._g = t, sh2.lastExit = sh2._g ? 0 : 1,
                         // sh2._g)`. The seq is one synchronous run, so a
                         // nested scratch use can never interleave.
-                        //
-                        // AWAITED natives (file tests — the async
-                        // `sh2.fs.lstat/access` chains) are legal here too
-                        // OUTSIDE a provably-sync function define arrow:
-                        // `(sh2._g = await t, ...)` runs the getVar reads
-                        // before the await (the single-eval protocol
-                        // holds — the then-arrow uses the promise value,
-                        // and the final `sh2._g` read resumes atomically
-                        // after the assignment), and the chain's enclosing
-                        // context is async by construction (module top
-                        // level / async arrows — the sync-arrow and
-                        // *Sync-loop gates scan the LOWERED body and
-                        // disqualify awaited chains consistently). Inside
-                        // a sync arrow (`in_sync_arrow`) the await would
-                        // be a SyntaxError — the runtime test stays there.
                         let awaited_ok = !in_sync_arrow();
                         if expr_sh2_call_count(&native) <= 1
                             && (!expr_has_await(&native) || awaited_ok)

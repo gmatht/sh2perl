@@ -169,6 +169,12 @@ pub struct Render {
     store: BTreeSet<String>,
     /// shell-out runtime needed (the _sh_* preamble helpers)
     need_sh: bool,
+    /// index range in self.out covering the need_sh runtime helper block
+    /// (recorded at emit_runtime; trim_sh_runtime drops unreferenced
+    /// helpers from it after the body is rendered)
+    runtime_start: usize,
+    runtime_end: usize,
+    runtime_known: bool,
     /// sys/stat.h file tests (test_render -f/-d/...)
     need_stat: bool,
     /// fnmatch.h (test glob `==`/`!=` with * or ?)
@@ -243,6 +249,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_ranges = ranges;
     r.var_widths = widths;
     r.program(&prog);
+    r.trim_sh_runtime();
     r.out.join("\n")
 }
 
@@ -473,7 +480,13 @@ impl Render {
         self.emit("#include <stdio.h>");
         self.emit("#include <stdlib.h>");
         self.emit("#include <string.h>");
-        self.emit("#include <sys/wait.h>");
+        // sys/wait.h is only needed by the shell-out wait macros
+        // (WIFEXITED/WEXITSTATUS in _sh_system_rc/_sh_capture) and is
+        // NOT in tcc's bundled header set — gate it so pure printf/loop
+        // output (no shell-out) compiles in the browser's tcc.
+        if self.need_sh {
+            self.emit("#include <sys/wait.h>");
+        }
         self.emit("#include <unistd.h>"); // chdir/access/getcwd
         self.emit("#include <ctype.h>"); // tolower/... in text transforms
         if self.need_stat {
@@ -504,6 +517,7 @@ impl Render {
         self.emit("#include <assert.h>"); // debug-only length asserts (NDEBUG compiles out)
         self.emit("");
         if self.need_sh {
+            self.runtime_start = self.out.len();
             self.emit("/* shell-out runtime: build a command line, run it via bash -c */");
             self.emit("static int _sh_rc = 0;");
             self.emit("static int _sh_argc = 0; static char **_sh_argv = 0;");
@@ -762,6 +776,8 @@ impl Render {
             self.emit("  return d;");
             self.emit("}");
             self.emit("");
+            self.runtime_end = self.out.len();
+            self.runtime_known = true;
         }
         if self.need_stat {
             self.emit("/* [ -f/-d/-e/-s/... ] file tests */");
@@ -807,6 +823,66 @@ impl Render {
             self.emit("  return nanosleep(&ts, 0);");
             self.emit("}");
             self.emit("");
+        }
+    }
+
+    /// Drop the `_sh_*` shell-out helpers the generated body never uses
+    /// (directly or transitively). Everything in the need_sh block is
+    /// `static` — internal linkage — so an unreferenced helper is dead
+    /// by definition and removing it cannot change behavior. A simple
+    /// `for … echo` loop keeps just `_sh_rc`; command substitution,
+    /// arrays and ${s#pat} keep exactly the helpers they call.
+    fn trim_sh_runtime(&mut self) {
+        if !self.runtime_known || self.runtime_end <= self.runtime_start {
+            return;
+        }
+        let body = self.out[self.runtime_end..].join("\n");
+        let runtime: Vec<String> = self.out[self.runtime_start..self.runtime_end].to_vec();
+
+        let mut segs: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        for line in &runtime {
+            let t = line.trim_start();
+            if t.starts_with("static ") {
+                segs.push((sh_tokens(t).into_iter().collect(), vec![line.clone()]));
+            } else if let Some(last) = segs.last_mut() {
+                last.1.push(line.clone());
+            } else {
+                segs.push((Vec::new(), vec![line.clone()]));
+            }
+        }
+
+        let mut needed: BTreeSet<String> = sh_tokens(&body);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (names, lines) in &segs {
+                if names.iter().any(|n| needed.contains(n)) {
+                    for t in sh_tokens(&lines.join("\n")) {
+                        if needed.insert(t) { changed = true; }
+                    }
+                }
+            }
+        }
+
+        let block_survives = segs
+            .iter()
+            .any(|(names, _)| names.iter().any(|n| needed.contains(n)));
+        let mut kept: Vec<String> = Vec::new();
+        for (idx, (names, lines)) in segs.iter().enumerate() {
+            let keep = names.iter().any(|n| needed.contains(n))
+                || (idx == 0 && block_survives && names.is_empty());
+            if keep {
+                kept.extend(lines.iter().cloned());
+            }
+        }
+        self.out.splice(self.runtime_start..self.runtime_end, kept);
+
+        // sys/wait.h only feeds the WIFEXITED/WEXITSTATUS macros in
+        // _sh_system_rc/_sh_capture — when neither survived the trim it
+        // is dead AND missing from tcc's bundled headers, so drop it.
+        let full = self.out.join("\n");
+        if !full.contains("WIFEXITED") && !full.contains("WEXITSTATUS") {
+            self.out.retain(|l| !l.trim_start().starts_with("#include <sys/wait.h>"));
         }
     }
 
@@ -5674,6 +5750,30 @@ impl Render {
 
 /// Collect every variable name referenced by statements (assign targets,
 /// declare lists, Var reads).
+// All `_sh_…` identifiers in `s` (both calls `_sh_foo(` and variable
+// references `_sh_rc`). Used by trim_sh_runtime's reachability.
+fn sh_tokens(s: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i + 3 < b.len() {
+        if b[i] == b'_'
+            && b[i + 1] == b's'
+            && b[i + 2] == b'h'
+            && b[i + 3] == b'_'
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            let mut j = i + 4;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') { j += 1; }
+            out.insert(s[i..j].to_string());
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     collect_vars_full(stmts, out, &mut BTreeSet::new());
 }
@@ -7571,7 +7671,7 @@ mod tests {
     fn int_render(name: &str, lo: i64, hi: i64, w: Width) -> Render {
         let mut r = Render::default();
         r.var_types.insert(name.to_string(), IrType::Int);
-        r.var_ranges.insert(name.to_string(), (lo, hi));
+        r.var_ranges.insert(name.to_string(), (lo.into(), hi.into()));
         r.var_widths.insert(name.to_string(), w);
         r
     }

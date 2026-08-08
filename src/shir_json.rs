@@ -40,6 +40,10 @@ pub fn shir_to_shir_json(prog: &IrProgram) -> String {
     if prog.var_lifetimes.is_empty() {
         prog.var_lifetimes = crate::shir_passes::lifetime::analyze_var_lifetimes(&prog);
     }
+    // shIR markup: mark loops provably run at least once (`"runs": true`)
+    // so every backend consuming the A1 contract knows the body always
+    // runs (the estree backend uses it to skip its ran/last tracking).
+    crate::shir::set_provably_running_loops(&prog.stmts);
     program_json(&prog, CONTRACT_VERSION).to_string()
 }
 
@@ -136,13 +140,16 @@ fn stmt_json(s: &IrStmt) -> Value {
         IrStmt::For { var, iter, body } => json!({
             "type": "For", "var": var, "iter": expr_json(iter),
             "body": stmts_json(body),
+            "runs": crate::shir::stmt_provably_runs(s),
         }),
         IrStmt::While { cond, body } => json!({
             "type": "While", "cond": expr_json(cond), "body": stmts_json(body),
+            "runs": crate::shir::stmt_provably_runs(s),
         }),
         IrStmt::DoWhile { body, cond, until } => json!({
             "type": "DoWhile", "body": stmts_json(body),
             "cond": expr_json(cond), "until": until,
+            "runs": crate::shir::stmt_provably_runs(s),
         }),
         IrStmt::Die { expr, carp } => json!({
             "type": "Die", "expr": expr_json(expr), "carp": carp,
