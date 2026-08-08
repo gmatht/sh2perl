@@ -33,6 +33,14 @@ static LIFTED_STRING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// [`native_special_var`]'s set) and the env-resident denylist
 /// ([`ENV_RESIDENT_NAMES`]) never fold.
 static NEVER_WRITTEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Names with a REAL (non-arith-text) assignment source (set per
+/// compilation by `shir_to_estree`; see [`collect_arith_ref_set_vars`]).
+/// The `$(( $var ... ))` dollar-ref arith lowering ([`native_arith_text`])
+/// consults it: a provably-set var reads as a plain decimal under
+/// SH2_ASSUME_ARITH_VARS; a var with NO other source may be UNSET at the
+/// read, and bash's EMPTY text substitution must then still parse (the
+/// deletion gate) or the runtime evaluator stays.
+static ARITH_REF_SET: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// Whether `shopt -s nocasematch` may be enabled anywhere in the current
 /// program (set per compilation by `shir_to_estree`; see
 /// `ir_may_enable_nocasematch`). Native case/test substring lifts must
@@ -445,7 +453,7 @@ fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMa
                 IrStmt::Exec { args, .. } | IrStmt::Expr(IrExpr::Call { args, .. }) => {
                     let native = match args.as_slice() {
                         [IrExpr::Str(_, _), IrExpr::Array(a)] => a.iter().all(|arg| match arg {
-                            IrExpr::Str(sv, _) => parse_arith_native(sv).is_some(),
+                            IrExpr::Str(sv, _) => native_arith_text(sv).is_some(),
                             _ => false,
                         }),
                         _ => false,
@@ -7489,7 +7497,7 @@ fn arith_let_args_native(args: &[IrExpr]) -> bool {
         if cname == "let"
             && !cargs.is_empty()
             && cargs.iter().all(|a| {
-                matches!(a, IrExpr::Str(sv, _) if parse_arith_native(sv).is_some())
+                matches!(a, IrExpr::Str(sv, _) if native_arith_text(sv).is_some())
             }))
 }
 
@@ -8070,7 +8078,7 @@ fn collect_native_arith_sources(args: &[IrExpr], assigns: &mut HashMap<String, V
             let mut asts: Vec<ArithAst> = Vec::new();
             for a in cargs {
                 if let IrExpr::Str(sv, _) = a {
-                    if let Some(ast) = parse_arith_native(sv) {
+                    if let Some(ast) = native_arith_text(sv) {
                         asts.push(ast);
                     } else {
                         return; // unreachable via arith_let_args_native
@@ -8444,6 +8452,256 @@ fn parse_arith_native(src: &str) -> Option<ArithAst> {
     Some(a)
 }
 
+/// SH2_ASSUME_ARITH_VARS=0 — turn off the native `$(( $var ... ))`
+/// dollar-ref arith lowering (see [`arith_text_dollar_strip`]).
+///
+/// Documented assumption (default ON): a `$name` / `${name}` reference
+/// inside an arithmetic expansion text holds a CANONICAL DECIMAL integer.
+/// bash substitutes the variable's TEXT into the expression and re-parses
+/// (so `x='2+3'` makes `$(( $x * 2 ))` = 10, and `x=010` parses as octal
+/// 8), which the native lowering cannot express — it coerces the VALUE
+/// (`Number(x) || 0`, the same coercion the runtime's evalArith applies
+/// to a bare identifier). The corpus's `$ref` arith texts are all plain
+/// integers (`$j*$i`, `$i+1`, `$n == 5`, `($n + 1) % 3`), so the native
+/// read is byte-identical. Scripts whose `$((...))` texts reference
+/// non-decimal or expression-valued variables must set
+/// SH2_ASSUME_ARITH_VARS=0 (the runtime's substitute-and-reparse
+/// evaluator is restored).
+fn arith_vars_assume() -> bool {
+    std::env::var("SH2_ASSUME_ARITH_VARS").map_or(true, |v| v != "0")
+}
+
+/// Strip the `$name` / `${name}` references out of a runtime arith text
+/// (`"$j*$i"` → `"j*i"`), so the native arith parser can consume it.
+/// Rejects every other `$` shape the runtime's arithExpand handles
+/// (`$(cmd)` command substitution, `$@`/`$#`/`$?`/`$$`/`$1` positionals,
+/// `${#x}` lengths, `${x[i]}` subscripts, `${x:-d}` operators) — those
+/// keep the runtime evaluator. Also rejects two ADJACENT refs
+/// (`$j$i` — the substituted values would CONCATENATE into one number,
+/// which the stripped `ji` identifier cannot express). Returns the
+/// stripped text plus the `(start, end, name)` spans of every ref in the
+/// ORIGINAL text (the deletion gate in [`native_arith_text`] needs them).
+fn arith_text_dollar_strip(t: &str) -> Option<(String, Vec<(usize, usize, String)>)> {
+    let mut out = String::with_capacity(t.len());
+    let mut refs: Vec<(usize, usize, String)> = Vec::new();
+    let bytes = t.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        if bytes[i] != b'$' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        // `${name}` — braced form
+        let (name, consumed) = if i + 1 < n && bytes[i + 1] == b'{' {
+            let rest = &t[i + 2..];
+            let len = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
+            if len == 0 || rest[len..].chars().next() != Some('}') {
+                return None; // `${#x}` `${x[i]}` `${x:-d}` `${!x}` — runtime-only
+            }
+            (&rest[..len], 2 + len + 1)
+        } else {
+            // `$name` — bare form
+            let rest = &t[i + 1..];
+            let len = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
+            if len == 0 {
+                return None; // `$@` `$#` `$?` `$$` `$1` `$(cmd)` — runtime-only
+            }
+            (&rest[..len], 1 + len)
+        };
+        if !plain_ident(name) {
+            return None;
+        }
+        if i + consumed < n && bytes[i + consumed] == b'$' {
+            return None; // `$j$i` — adjacent refs concatenate their values
+        }
+        refs.push((i, i + consumed, name.to_string()));
+        out.push_str(name);
+        i += consumed;
+    }
+    Some((out, refs))
+}
+
+/// `parse_arith_native` over a `$`-ref arith text: strip the plain
+/// `$name`/`${name}` refs (see [`arith_text_dollar_strip`]), then the
+/// normal native-eligibility filter. Two gates keep the lowering
+/// bash-faithful:
+///   - the OPTION gate: SH2_ASSUME_ARITH_VARS (default ON) — a SET var's
+///     value substitutes as a plain decimal. bash re-parses the
+///     substituted TEXT, so a non-decimal value (`2+3`, `010` octal)
+///     would evaluate differently; the corpus's `$ref` arith texts are
+///     all plain integers.
+///   - the UNSET gate: a var with NO non-arith write source
+///     ([`ARITH_REF_SET`] — `j=$(( $j*$i ))` where the arith is j's only
+///     write) may be UNSET at the read. bash then substitutes the EMPTY
+///     text, which must still parse (a `$j*$i` with unset j becomes
+///     `*i` — a syntax error that aborts the whole expansion; the
+///     runtime's substitute-and-reparse reproduces it, a native
+///     `Number(j)||0` cannot). The deletion gate checks that the text
+///     with every not-provably-set ref removed still parses — if not,
+///     the runtime evaluator stays.
+/// Bare-ident texts (no `$` at all) are unaffected by both gates — they
+/// were already native. Every consumer (the arith-call lowering, the
+/// `let` path, the lift walkers' store-mark skips, the numeric-lift
+/// fixpoint) must use THIS predicate so the marks and the emission always
+/// agree.
+fn native_arith_text(t: &str) -> Option<ArithAst> {
+    if !t.contains('$') {
+        return parse_arith_native(t);
+    }
+    if !arith_vars_assume() {
+        return None;
+    }
+    let (stripped, refs) = arith_text_dollar_strip(t)?;
+    let set_vars = ARITH_REF_SET.lock().unwrap().clone().unwrap_or_default();
+    if refs.iter().any(|(_, _, name)| !set_vars.contains(name)) {
+        // The unset gate: the text with every not-provably-set ref
+        // REMOVED (set refs stay as their names) must still parse — the
+        // empty substitution cannot break the syntax. A fully-empty
+        // result is fine too (`$(( $j ))` with j unset → `$(( ))` → 0,
+        // the runtime's `trim() === ''` rule).
+        let mut deleted = String::with_capacity(t.len());
+        let mut prev = 0usize;
+        for (s, e, name) in &refs {
+            deleted.push_str(&t[prev..*s]);
+            if set_vars.contains(name) {
+                deleted.push_str(name);
+            }
+            prev = *e;
+        }
+        deleted.push_str(&t[prev..]);
+        if !deleted.trim().is_empty() && parse_arith(&deleted).is_none() {
+            return None;
+        }
+    }
+    parse_arith_native(&stripped)
+}
+
+/// The `$ref` arith lowering's "provably set" set: names with at least
+/// one assignment source that is NOT a runtime arith TEXT (a plain `x=v`,
+/// a for-iter, a capture — sources whose value the script itself
+/// produced). A var whose only writes are `j=$(( $j*$i ))` texts may be
+/// UNSET at its first read (bash's empty substitution then decides — the
+/// deletion gate in [`native_arith_text`]); a var with a real source is
+/// set by then (under SH2_ASSUME_ARITH_VARS its value is a plain
+/// decimal). Computed per compilation and stored in [`ARITH_REF_SET`].
+fn collect_arith_ref_set_vars(prog: &IrProgram) -> HashSet<String> {
+    let mut out = HashSet::new();
+    fn walk_stmt(st: &IrStmt, out: &mut HashSet<String>) {
+        match st {
+            IrStmt::Assign { targets, expr } => {
+                let arith_text = matches!(expr, IrExpr::Call { func, args } if func == "arith"
+                    && matches!(args.as_slice(), [IrExpr::Str(_, _)]));
+                if !arith_text {
+                    for t in targets {
+                        if t.indices.is_empty() {
+                            out.insert(t.var.clone());
+                        }
+                    }
+                }
+            }
+            IrStmt::For { var, .. } => {
+                out.insert(var.clone());
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                for b in body {
+                    walk_stmt(b, out);
+                }
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                for b in then.iter().chain(else_) {
+                    walk_stmt(b, out);
+                }
+                for (_, b) in elsifs {
+                    for stm in b {
+                        walk_stmt(stm, out);
+                    }
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for b in stage {
+                        walk_stmt(b, out);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner {
+                    walk_stmt(b, out);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for b in &c.body {
+                        walk_stmt(b, out);
+                    }
+                }
+            }
+            IrStmt::Expr(e) => walk_expr(e, out),
+            IrStmt::Output { value, .. } => walk_expr(value, out),
+            _ => {}
+        }
+    }
+    fn walk_expr(e: &IrExpr, out: &mut HashSet<String>) {
+        match e {
+            IrExpr::Arrow(stmts) => {
+                for st in stmts {
+                    walk_stmt(st, out);
+                }
+            }
+            IrExpr::Call { func, args } => {
+                // `let "x = $n + 1"` / `(( x = ... ))` — a REAL write
+                // (mirror of collect_native_arith_sources' let arm)
+                if func == "exec" {
+                    if let [IrExpr::Str(cn, _), IrExpr::Array(cargs)] = args.as_slice() {
+                        if cn == "let" && arith_let_args_native(args) {
+                            for a in cargs {
+                                if let IrExpr::Str(sv, _) = a {
+                                    if let Some(ast) = native_arith_text(sv) {
+                                        for w in arith_written_vars(&ast) {
+                                            out.insert(w.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    walk_expr(el, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for st in &prog.stmts {
+        walk_stmt(st, &mut out);
+    }
+    out
+}
+
 /// bash variables are strings; JS has real numbers. A variable whose every
 /// assignment is provably numeric (a `$((...))` expression without `/`/`%`
 /// — the only error sources — a numeric literal, or a copy of another
@@ -8558,10 +8816,13 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // excluded: the renderer injects lifted values into them,
                 // so a lifted var may appear inside them.
                 let let_args_native = func == "exec" && arith_let_args_native(args);
+                // `arith` texts are handled by the arith block below (the
+                // native-lowerable ones are exempt from ALL store marks).
                 if func != "getVar"
                     && func != "test"
                     && func != "setArray"
                     && func != "setArrayAppend"
+                    && func != "arith"
                     && !let_args_native
                 {
                     // ANY runtime call's string args (recursing into the
@@ -8579,9 +8840,19 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // identifiers are STORE reads (mark_str_args' `$`-ref scan
                 // would miss ` i = 2; i <= n; i++ `) — mark ALL
                 // identifiers so a lifted binding never desyncs from the
-                // runtime loop.
+                // runtime loop. A `$(( $j*$i ))` text that strips to a
+                // NATIVE-lowerable expression (native_arith_text — the
+                // `$`-refs become native reads, the runtime never sees the
+                // text) is exempt: its vars are not store reads.
                 if matches!(func.as_str(), "cstyleFor" | "arith") {
                     for a in args {
+                        if func == "arith" {
+                            if let IrExpr::Str(t, _) = a {
+                                if native_arith_text(t).is_some() {
+                                    continue;
+                                }
+                            }
+                        }
                         mark_all_idents_args(a, string_ctx);
                     }
                 }
@@ -8593,7 +8864,7 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                     if let [IrExpr::Str(_cn, _), IrExpr::Array(cargs)] = args.as_slice() {
                         for a in cargs {
                             if let IrExpr::Str(sv, _) = a {
-                                if let Some(ast) = parse_arith_native(sv) {
+                                if let Some(ast) = native_arith_text(sv) {
                                     for w in arith_written_vars(&ast) {
                                         excluded.insert(w.clone());
                                     }
@@ -9137,6 +9408,18 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // convention.
                 IrExpr::Str(sv, _) => canonical_int_item(sv),
                 IrExpr::Var(n, _) => lifted.contains(n.as_str()),
+                // `j=$(( $j*$i ))` — a dollar-ref arith TEXT source: the
+                // text strips to a native-lowerable expression
+                // (native_arith_text, see [`arith_text_dollar_strip`]) and
+                // the emitter's Assign arm lowers it to the bare native
+                // value — a plain number, exactly like an `IrExpr::Arith`
+                // source. Div/mod texts stay blocked (a zero divisor
+                // aborts the whole expansion; the arithEval wrapper would
+                // yield "" where a lifted binding must hold a number).
+                IrExpr::Call { func, args } if func == "arith" => {
+                    matches!(args.as_slice(), [IrExpr::Str(t, _)]
+                        if native_arith_text(t).map_or(false, |a| !arith_has_div_mod(&a)))
+                }
                 IrExpr::Call { func, args } if func == "getVar" => {
                     matches!(args.as_slice(), [IrExpr::Str(n, _)] if lifted.contains(n.as_str()))
                 }
@@ -9176,6 +9459,10 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         );
     }
     let prog = &store_to_native;
+    // The `$(( $var ... ))` dollar-ref arith lowering's "provably set"
+    // set — MUST be stored before the lift analyses run (their walkers
+    // consult native_arith_text, which reads the static).
+    *ARITH_REF_SET.lock().unwrap() = Some(collect_arith_ref_set_vars(prog));
     let (num, str) = analyze_loop_var_refs(
         prog,
         &numeric_lift_vars(prog),
@@ -11099,6 +11386,21 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             optional: false,
                         },
                         _ => unreachable!("lifted Number source"),
+                    },
+                    // `j=$(( $j*$i ))` — a dollar-ref arith TEXT source
+                    // (the numeric-lift fixpoint admits it only when it
+                    // strips to a div/mod-free native expression, so the
+                    // raw native value is exactly the number the lift
+                    // promises — no arithEval String wrapper). The
+                    // `$`-refs read via `arith_var_read` (bare identifiers
+                    // for lifted numerics).
+                    IrExpr::Call { func, args } if func == "arith" => match args.as_slice() {
+                        [IrExpr::Str(t, _)] if is_lifted_num(&target.var) => {
+                            let ast = native_arith_text(t)
+                                .expect("lifted arith source must lower natively");
+                            arith_to_estree_wrapped(&ast)
+                        }
+                        _ => expr_to_estree(expr),
                     },
                     _ => unreachable!("lifted var assigned an unanalysed source"),
                 };
@@ -14507,10 +14809,11 @@ fn direct_call_arg_ok(a: &IrExpr) -> bool {
 }
 
 // `let ARITH...` / `(( ARITH ))` — a statement/condition whose
-// EVERY arith arg parses natively (`parse_arith_native`: incl.
+// EVERY arith arg parses natively (`native_arith_text` — incl.
+// `$`-ref texts like `let "$n == 5"` via the dollar-strip, and
 // `++`/`--` and `=`/`+=`/`-=`/`*=` assignments — the
-// `((i++))` per-iteration hot path; rejects `$` refs / `10#`
-// bases / nested writes / `/=`/`%=`), the value is a native
+// `((i++))` per-iteration hot path; rejects `10#` bases /
+// nested writes / `/=`/`%=`), the value is a native
 // expression (lifted vars read bare, store vars as
 // `Number(getVar)||0` — the runtime's exact coercion), with
 // the runtime builtin's status recorded (`let` returns true
@@ -14533,7 +14836,7 @@ fn try_native_let(args: &[IrExpr]) -> Option<Expr> {
             let mut parseable = true;
             for arg in a {
                 match arg {
-                    IrExpr::Str(sv, _) => match parse_arith_native(sv) {
+                    IrExpr::Str(sv, _) => match native_arith_text(sv) {
                         Some(ast) => {
                             vals.push((arith_to_estree_wrapped(&ast), arith_has_write(&ast)))
                         }
@@ -14617,7 +14920,7 @@ fn try_native_let_dead(args: &[IrExpr]) -> Option<Expr> {
             let mut vals: Vec<Expr> = Vec::new();
             for arg in a {
                 match arg {
-                    IrExpr::Str(sv, _) => match parse_arith_native(sv) {
+                    IrExpr::Str(sv, _) => match native_arith_text(sv) {
                         Some(ast) => vals.push(arith_to_estree_wrapped(&ast)),
                         None => return None,
                     },
@@ -20155,10 +20458,13 @@ fn lift_walk_expr(
             // excluded: the renderer injects lifted values into them,
             // so a lifted var may appear inside them.
             let let_args_native = func == "exec" && arith_let_args_native(args);
+            // `arith` texts are handled by the arith block below (the
+            // native-lowerable ones are exempt from ALL store marks).
             if func != "getVar"
                 && func != "test"
                 && func != "setArray"
                 && func != "setArrayAppend"
+                && func != "arith"
                 && !let_args_native
             {
                 for (i, a) in args.iter().enumerate() {
@@ -20194,15 +20500,18 @@ fn lift_walk_expr(
             // store), exactly like `let`/`(( ))` args. The `$`-ref scan
             // (lift_mark_str_args) would miss them — mark ALL identifiers
             // so a lifted binding never desyncs from the runtime loop.
+            // A `$(( $j*$i ))` text that strips to a NATIVE-lowerable
+            // expression (native_arith_text) is exempt — the runtime
+            // never evaluates it (see the numeric-lift twin).
             if matches!(func.as_str(), "cstyleFor" | "arith") {
                 for a in args {
-                    eprintln!(
-                        "SITE-cstyle {}",
-                        match a {
-                            IrExpr::Str(s, _) => s.clone(),
-                            _ => "?".into(),
+                    if func == "arith" {
+                        if let IrExpr::Str(t, _) = a {
+                            if native_arith_text(t).is_some() {
+                                continue;
+                            }
                         }
-                    );
+                    }
                     lift_mark_all_idents_args(a, string_ctx);
                 }
             }
@@ -20214,7 +20523,7 @@ fn lift_walk_expr(
                 if let [IrExpr::Str(_cn, _), IrExpr::Array(cargs)] = args.as_slice() {
                     for a in cargs {
                         if let IrExpr::Str(sv, _) = a {
-                            if let Some(ast) = parse_arith_native(sv) {
+                            if let Some(ast) = native_arith_text(sv) {
                                 for w in arith_written_vars(&ast) {
                                     excluded.insert(w.clone());
                                 }
@@ -21955,6 +22264,36 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                     if never_written_read(name) {
                         return str_lit("");
+                    }
+                }
+            }
+            // `sh2.arith("$j*$i")` — the runtime-evaluated arith STRING
+            // (word_ir emits the call form only when the text is not
+            // natively parseable — a `$name` ref, a cmdsub, a subscript
+            // chain). A text whose `$refs` ALL strip to a native-lowerable
+            // expression (native_arith_text — see [`arith_text_dollar_strip`])
+            // lowers exactly like the `IrExpr::Arith` arm: a div/mod-free
+            // AST emits the bare native value (setVar/echo String() it
+            // exactly like the runtime's `String(evalArith(...))` success
+            // path), div/mod keeps the arithEval try/catch (the zero-
+            // divisor abort). The `$`-refs read via `arith_var_read` — the
+            // exact `Number(v) || 0` coercion the runtime applies.
+            if func == "arith" {
+                if let [IrExpr::Str(t, _)] = args.as_slice() {
+                    if let Some(ast) = native_arith_text(t) {
+                        let inner = arith_to_estree_wrapped(&ast);
+                        if !arith_has_div_mod(&ast) {
+                            return inner;
+                        }
+                        return sh2_call(
+                            "arithEval",
+                            vec![Expr::ArrowFunctionExpression {
+                                params: vec![],
+                                body: ArrowBody::Expr(Box::new(inner)),
+                                expression: true,
+                                r#async: false,
+                            }],
+                        );
                     }
                 }
             }
