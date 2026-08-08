@@ -46,6 +46,12 @@ static ARITH_REF_SET: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// `ir_may_enable_nocasematch`). Native case/test substring lifts must
 /// lowercase to stay exact when it is.
 static CASE_NOCASE: Mutex<Option<bool>> = Mutex::new(None);
+/// Whether the program contains BOTH `shopt -s` and `shopt -u
+/// nocasematch` (set per compilation by `shir_to_estree`; see
+/// `ir_nocase_state_dynamic`): the runtime state can change mid-program,
+/// so static case-folds must fall back to the runtime test/caseMatch
+/// calls, which consult `shoptState` dynamically.
+static CASE_NOCASE_DYNAMIC: Mutex<Option<bool>> = Mutex::new(None);
 /// Nesting depth of `sh2.and`/`sh2.or` arrow lowering (see the BinOp And/Or
 /// arms). The runtime helpers branch on `lastExit`, which a NATIVE test
 /// expression never sets — so inside `&&`/`||` arrows a test must stay a
@@ -4711,7 +4717,7 @@ fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
         // Quote removal FIRST, then tag for globbing: an unquoted `\*` is a
         // literal `*` after removal (never a glob), while `*.txt` globs.
         Word::Literal(s, ann) => {
-            let s2 = shell_quote_removal(s);
+            let s2 = shell_quote_removal(s, ann.is_some());
             // A single-quoted word (`'*.txt'`) is LITERAL — bash never globs
             // it. The parser marks quoted words (ann == Some); without the
             // marker the AST cannot distinguish `'*.txt'` from `*.txt`.
@@ -4757,7 +4763,7 @@ fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
 /// from the raw-text path).
 fn array_element_ir(w: &Word) -> IrExpr {
     match w {
-        Word::Literal(s, _) => st(&shell_quote_removal(s)),
+        Word::Literal(s, ann) => st(&shell_quote_removal(s, ann.is_some())),
         Word::Variable(name, _, _) if name != "@" && name != "*" => {
             call("split", vec![call("getVar", vec![st(name)])])
         }
@@ -5330,14 +5336,34 @@ fn cmdsub_arith_expr(cmd: &Command) -> Option<&str> {
     None
 }
 
-/// Bash quote removal for BARE literal words. The AST loses the quoting
-/// context (single-quoted `'a\b'` and unquoted `a\b` both arrive as
-/// Literal("a\\b")), so mirror what the corpus needs: strip a backslash
-/// before any char EXCEPT those that appear backslash-escaped inside
-/// single-quoted literals in the corpus (printf/tr/sed escape sequences and
-/// the like must survive). The perl generator applies unconditional removal;
-/// this whitelist keeps every currently-passing estree example green.
-fn shell_quote_removal(s: &str) -> String {
+/// Bash quote removal for BARE literal words. The parser marks
+/// single-quoted words (`ann == Some`) — bash keeps backslashes in single
+/// quotes VERBATIM (`'a\\d'` is the four chars `a \ d`), so a
+/// single-quoted literal skips removal entirely. Unquoted text strips a
+/// backslash before any char EXCEPT those that appear backslash-escaped
+/// inside double-quoted literals in the corpus (printf/tr/sed escape
+/// sequences and the like must survive). The perl generator applies
+/// unconditional removal; this whitelist keeps every currently-passing
+/// estree example green.
+fn shell_quote_removal(s: &str, single_quoted: bool) -> String {
+    if single_quoted {
+        // bash keeps backslashes verbatim inside single quotes — EXCEPT a
+        // `\'` sequence, which cannot occur inside a single-quoted run
+        // (the quote would have ended) and therefore is an unquoted
+        // escaped-quote splice the lexer merged in (`'test'\''test'` →
+        // `test'test`): drop that backslash.
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' && matches!(chars.clone().next(), Some('\'')) {
+                chars.next();
+                out.push('\'');
+            } else {
+                out.push(c);
+            }
+        }
+        return out;
+    }
     const KEEP: &[char] = &[
         'n', '"', 'x', 'u', 't', '(', 'v', 'r', 'f', 'b', 'a', '\\', ')', '0', '1', '2', '3', '4',
         '5', '6', '7', '8', '9',
@@ -5363,7 +5389,7 @@ fn shell_quote_removal(s: &str) -> String {
 
 fn word_ir(w: &Word) -> IrExpr {
     match w {
-        Word::Literal(s, _) => st(&shell_quote_removal(s)),
+        Word::Literal(s, ann) => st(&shell_quote_removal(s, ann.is_some())),
         Word::Variable(name, _, _) => call("getVar", vec![st(name)]),
         Word::CommandSubstitution(cmd, _) => match cmdsub_arith_expr(cmd) {
             Some(t) => match parse_arith_native(t) {
@@ -5421,6 +5447,7 @@ fn param_ir(pe: &ParameterExpansion) -> IrExpr {
         ParameterExpansionOperator::RemoveShortestPrefix(p) => ("#".into(), vec![st(p)]),
         ParameterExpansionOperator::RemoveLongestSuffix(p) => ("%%".into(), vec![st(p)]),
         ParameterExpansionOperator::RemoveShortestSuffix(p) => ("%".into(), vec![st(p)]),
+        ParameterExpansionOperator::SubstituteFirst(p, r) => ("/".into(), vec![st(p), st(r)]),
         ParameterExpansionOperator::SubstituteAll(p, r) => ("//".into(), vec![st(p), st(r)]),
         ParameterExpansionOperator::DefaultValue(d) => (":-".into(), vec![st(d)]),
         ParameterExpansionOperator::AssignDefault(d) => (":=".into(), vec![st(d)]),
@@ -9494,6 +9521,7 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     *LOCAL_LIFT.lock().unwrap() = Some(local_lift_analysis(prog));
     FUNCTION_STACK.lock().unwrap().clear();
     *CASE_NOCASE.lock().unwrap() = Some(nocase);
+    *CASE_NOCASE_DYNAMIC.lock().unwrap() = Some(ir_nocase_state_dynamic(prog));
     *MAY_ERREXIT.lock().unwrap() = Some(errexit);
     *PROGRAM_PERSIST_FD1.lock().unwrap() = Some(persist_fd1);
     *PROGRAM_FUNCTIONS.lock().unwrap() = Some(functions.clone());
@@ -10481,102 +10509,166 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
 /// native substring lift must lowercase to stay exact. `shopt -u` after a
 /// `-s` still counts (a static scan cannot prove the runtime state).
 fn ir_may_enable_nocasematch(prog: &IrProgram) -> bool {
-    fn scan_expr(e: &IrExpr) -> bool {
+    ir_nocase_shopt_mask(prog) & 1 != 0
+}
+
+/// True when the program contains BOTH `shopt -s nocasematch` AND
+/// `shopt -u nocasematch`: the runtime state can CHANGE while the program
+/// runs, so a static case-fold of `==`/glob/case at ANY position may hit
+/// the wrong state — those lowerings must fall back to the runtime
+/// test/caseMatch calls (which consult `shoptState` dynamically).
+fn ir_nocase_state_dynamic(prog: &IrProgram) -> bool {
+    ir_nocase_shopt_mask(prog) == 3
+}
+
+/// Scan for `shopt("nocasematch", true/false)` calls anywhere in the
+/// program; bit0 = `-s` seen, bit1 = `-u` seen.
+fn ir_nocase_shopt_mask(prog: &IrProgram) -> u8 {
+    fn scan_expr(e: &IrExpr, mask: &mut u8) {
         match e {
             IrExpr::Call { func, args } => {
                 if func == "shopt"
                     && matches!(args.as_slice(), [IrExpr::Str(opt, _), IrExpr::Bool(en)]
-                        if opt == "nocasematch" && *en)
+                        if opt == "nocasematch")
                 {
-                    return true;
+                    if let [_, IrExpr::Bool(en)] = args.as_slice() {
+                        *mask |= if *en { 1 } else { 2 };
+                    }
                 }
-                args.iter().any(scan_expr)
+                args.iter().for_each(|a| scan_expr(a, mask));
             }
-            IrExpr::Arrow(stmts) => scan_stmts(stmts),
-            IrExpr::Array(elems) => elems.iter().any(scan_expr),
-            IrExpr::Object(props) => props.iter().any(|(_, v)| scan_expr(v)),
-            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
-                InterpPart::Expr(e) => scan_expr(e),
-                InterpPart::Lit(_) => false,
+            IrExpr::Arrow(stmts) => scan_stmts(stmts, mask),
+            IrExpr::Array(elems) => elems.iter().for_each(|e| scan_expr(e, mask)),
+            IrExpr::Object(props) => props.iter().for_each(|(_, v)| scan_expr(v, mask)),
+            IrExpr::Interpolate(parts) => parts.iter().for_each(|p| match p {
+                InterpPart::Expr(e) => scan_expr(e, mask),
+                InterpPart::Lit(_) => {}
             }),
-            IrExpr::Capture { expr, .. } => scan_expr(expr),
-            IrExpr::Index { key, .. } => scan_expr(key),
-            IrExpr::BinOp { lhs, rhs, .. } => scan_expr(lhs) || scan_expr(rhs),
-            IrExpr::MethodCall { obj, args, .. } => scan_expr(obj) || args.iter().any(scan_expr),
+            IrExpr::Capture { expr, .. } => scan_expr(expr, mask),
+            IrExpr::Index { key, .. } => scan_expr(key, mask),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                scan_expr(lhs, mask);
+                scan_expr(rhs, mask);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                scan_expr(obj, mask);
+                args.iter().for_each(|a| scan_expr(a, mask));
+            }
             IrExpr::Ternary { cond, then, else_ } => {
-                scan_expr(cond) || scan_expr(then) || scan_expr(else_)
+                scan_expr(cond, mask);
+                scan_expr(then, mask);
+                scan_expr(else_, mask);
             }
-            IrExpr::DefinedOr { expr, default } => scan_expr(expr) || scan_expr(default),
-            IrExpr::Arith(a) => scan_arith(a),
-            _ => false,
+            IrExpr::DefinedOr { expr, default } => {
+                scan_expr(expr, mask);
+                scan_expr(default, mask);
+            }
+            IrExpr::Arith(a) => scan_arith(a, mask),
+            _ => {}
         }
     }
-    fn scan_arith(a: &ArithAst) -> bool {
+    fn scan_arith(a: &ArithAst, mask: &mut u8) {
         match a {
-            ArithAst::Bin { lhs, rhs, .. } => scan_arith(lhs) || scan_arith(rhs),
-            ArithAst::Un { arg, .. } => scan_arith(arg),
-            ArithAst::Cond { test, then, else_ } => {
-                scan_arith(test) || scan_arith(then) || scan_arith(else_)
+            ArithAst::Bin { lhs, rhs, .. } => {
+                scan_arith(lhs, mask);
+                scan_arith(rhs, mask);
             }
-            ArithAst::Index { key, .. } => scan_arith(key),
-            _ => false,
+            ArithAst::Un { arg, .. } => scan_arith(arg, mask),
+            ArithAst::Cond { test, then, else_ } => {
+                scan_arith(test, mask);
+                scan_arith(then, mask);
+                scan_arith(else_, mask);
+            }
+            ArithAst::Index { key, .. } => scan_arith(key, mask),
+            _ => {}
         }
     }
-    fn scan_stmts(stmts: &[IrStmt]) -> bool {
-        stmts.iter().any(scan_stmt)
-    }
-    fn scan_stmt(s: &IrStmt) -> bool {
-        match s {
-            IrStmt::Label(_) | IrStmt::Goto(_) => false,
-            IrStmt::Expr(e) => scan_expr(e),
-            IrStmt::Output { value, .. } => scan_expr(value),
-            IrStmt::WriteFile { path, content, .. } => scan_expr(path) || scan_expr(content),
-            IrStmt::Assign { targets, expr } => {
-                scan_expr(expr) || targets.iter().any(|t| t.indices.iter().any(scan_expr))
+    fn scan_stmts(stmts: &[IrStmt], mask: &mut u8) {
+        for s in stmts {
+            scan_stmt(s, mask);
+            if *mask == 3 {
+                return; // both seen — early stop
             }
-            IrStmt::Declare { init, .. } => init.as_ref().is_some_and(scan_expr),
-            IrStmt::DeclareArray { elements, .. } => elements.iter().any(scan_expr),
+        }
+    }
+    fn scan_stmt(s: &IrStmt, mask: &mut u8) {
+        match s {
+            IrStmt::Label(_) | IrStmt::Goto(_) => {}
+            IrStmt::Expr(e) => scan_expr(e, mask),
+            IrStmt::Output { value, .. } => scan_expr(value, mask),
+            IrStmt::WriteFile { path, content, .. } => {
+                scan_expr(path, mask);
+                scan_expr(content, mask);
+            }
+            IrStmt::Assign { targets, expr } => {
+                scan_expr(expr, mask);
+                targets
+                    .iter()
+                    .for_each(|t| t.indices.iter().for_each(|i| scan_expr(i, mask)));
+            }
+            IrStmt::Declare { init, .. } => {
+                if let Some(init) = init {
+                    scan_expr(init, mask);
+                }
+            }
+            IrStmt::DeclareArray { elements, .. } => elements.iter().for_each(|e| scan_expr(e, mask)),
             IrStmt::If {
                 cond,
                 then,
                 elsifs,
                 else_,
             } => {
-                scan_expr(cond)
-                    || scan_stmts(then)
-                    || scan_stmts(else_)
-                    || elsifs.iter().any(|(c, b)| scan_expr(c) || scan_stmts(b))
+                scan_expr(cond, mask);
+                scan_stmts(then, mask);
+                scan_stmts(else_, mask);
+                for (c, b) in elsifs {
+                    scan_expr(c, mask);
+                    scan_stmts(b, mask);
+                }
             }
-            IrStmt::For { iter, body, .. } => scan_expr(iter) || scan_stmts(body),
+            IrStmt::For { iter, body, .. } => {
+                scan_expr(iter, mask);
+                scan_stmts(body, mask);
+            }
             IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
-                scan_expr(cond) || scan_stmts(body)
+                scan_expr(cond, mask);
+                scan_stmts(body, mask);
             }
-            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => scan_expr(expr),
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => scan_expr(expr, mask),
             IrStmt::Exec { cmd, args, env, .. } => {
-                scan_expr(cmd)
-                    || args.iter().any(scan_expr)
-                    || env.iter().any(|(_, v)| scan_expr(v))
+                scan_expr(cmd, mask);
+                args.iter().for_each(|a| scan_expr(a, mask));
+                env.iter().for_each(|(_, v)| scan_expr(v, mask));
             }
-            IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| scan_stmts(s)),
-            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => scan_expr(e),
-            IrStmt::SetChildError(e) => scan_expr(e),
+            IrStmt::Pipeline { stages, .. } => stages.iter().for_each(|s| scan_stmts(s, mask)),
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => scan_expr(e, mask),
+            IrStmt::SetChildError(e) => scan_expr(e, mask),
             IrStmt::Case {
                 discriminant,
                 clauses,
-            } => scan_expr(discriminant) || clauses.iter().any(|c| scan_stmts(&c.body)),
+            } => {
+                scan_expr(discriminant, mask);
+                for c in clauses {
+                    scan_stmts(&c.body, mask);
+                }
+            }
             IrStmt::Redirect { inner, redirects } => {
-                scan_stmts(inner) || redirects.iter().any(|r| scan_expr(&r.target))
+                scan_stmts(inner, mask);
+                redirects.iter().for_each(|r| scan_expr(&r.target, mask));
             }
-            IrStmt::Function { body, .. }
-            | IrStmt::Subshell(body)
-            | IrStmt::Background(body)
-            | IrStmt::Block(body) => scan_stmts(body),
-            IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Return(None) | IrStmt::Exit(None) => {
-                false
+            IrStmt::Block(body) => scan_stmts(body, mask),
+            IrStmt::Function { body, .. } | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                scan_stmts(body, mask);
             }
+            IrStmt::Require(_)
+            | IrStmt::RawText(_)
+            | IrStmt::Return(None)
+            | IrStmt::Exit(None) => {}
         }
     }
-    scan_stmts(&prog.stmts)
+    let mut mask = 0u8;
+    scan_stmts(&prog.stmts, &mut mask);
+    mask
 }
 
 /// The temp binding name for a lifted case discriminant. `$` cannot appear
@@ -12348,7 +12440,8 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             discriminant,
             clauses,
         } => {
-            let nocase = CASE_NOCASE.lock().unwrap().unwrap_or(false);
+            let nocase = CASE_NOCASE.lock().unwrap().unwrap_or(false)
+                && !CASE_NOCASE_DYNAMIC.lock().unwrap().unwrap_or(false);
             if let Some(native) = try_native_case(discriminant, clauses, nocase) {
                 return Some(native);
             }
@@ -12846,6 +12939,11 @@ fn eq_test_operand(e: &str) -> Option<Expr> {
 /// evalTest lowercases BOTH sides: the literal is pre-lowercased at emit
 /// time and the value side gets `toLowerCase()`.
 fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
+    // A dynamically-changing nocasematch state cannot be folded statically
+    // — the runtime test consults the real state.
+    if CASE_NOCASE_DYNAMIC.lock().unwrap().unwrap_or(false) {
+        return None;
+    }
     let nocase = CASE_NOCASE.lock().unwrap().unwrap_or(false);
     let build = |operand: Expr, pat: &CasePat| {
         let mut value = Expr::CallExpression {
@@ -15740,6 +15838,11 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
         return None; // env-carrying 3-arg form — keep the dispatch
     };
     if name != "printf" {
+        return None;
+    }
+    // `printf -v VAR FMT...` writes a variable (no stdout) — the runtime
+    // builtin is the store authority; never fold it to a write.
+    if matches!(pargs.first(), Some(IrExpr::Str(f0, _)) if f0 == "-v") {
         return None;
     }
     let fmt = static_str(pargs.first()?)?;
@@ -19385,8 +19488,14 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                     // BOTH sides (evalTest `=`/`==`/`!=`). A native bare
                     // `===` would be case-sensitive — lowercase both
                     // operands under a possible nocasematch (mirrors the
-                    // glob path in try_native_glob_test).
+                    // glob path in try_native_glob_test). When the state
+                    // can CHANGE mid-program (`shopt -u` also present),
+                    // no static fold is exact — fall back to the runtime
+                    // test call, which consults shoptState dynamically.
                     if CASE_NOCASE.lock().unwrap().unwrap_or(false) {
+                        if CASE_NOCASE_DYNAMIC.lock().unwrap().unwrap_or(false) {
+                            return None;
+                        }
                         // the runtime compares `String(ast.l).toLowerCase()`
                         // — wrap both sides in String(...) so the operand
                         // shape matches the gate's allowed string-op
@@ -20301,15 +20410,17 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                 }
             }
         }
-        // ${x//p/r} — replace ALL occurrences. The runtime's literal fast
-        // path is `split(p).join(r)`; a literal `p` with a `$`-free `r`
-        // lowers one step further to `replaceAll(p, r)` — same literal
-        // semantics (JS replaceAll's `$&`/`$1` substitution sequences
-        // cannot fire without a `$` in the replacement; `\` is literal in
-        // both), single-pass instead of array-allocate + join. Empty
-        // pattern must stay on the runtime (split("") splits chars; bash
-        // treats it as a no-op).
-        "//" => {
+        // ${x/p/r} — replace the FIRST occurrence (bash: the leftmost
+        // match); ${x//p/r} — replace ALL occurrences. The runtime's
+        // literal fast paths are indexOf-splice (first) and
+        // `split(p).join(r)` (all); a literal `p` with a `$`-free `r`
+        // lowers one step further to `replace(p, r)` / `replaceAll(p, r)`
+        // — same literal semantics (JS replace/replaceAll's `$&`/`$1`
+        // substitution sequences cannot fire without a `$` in the
+        // replacement; `\` is literal in both), single-pass instead of
+        // array-allocate + join. Empty pattern must stay on the runtime
+        // (split("") splits chars; bash treats it as a no-op).
+        "/" | "//" => {
             let [_, _, IrExpr::Str(p, _), IrExpr::Str(r, _)] = args else {
                 return None;
             };
@@ -20318,13 +20429,17 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
             }
             let rep = fully_lifted_template(r)?;
             if r.contains('$') {
+                if op == "/" {
+                    return None; // first-match splice needs the runtime
+                }
                 return Some(method(
                     method(val(), "split", vec![str_lit(p)]),
                     "join",
                     vec![rep],
                 ));
             }
-            Some(method(val(), "replaceAll", vec![str_lit(p), rep]))
+            let m = if op == "/" { "replace" } else { "replaceAll" };
+            Some(method(val(), m, vec![str_lit(p), rep]))
         }
         // ${x:-d} — default when empty. `${x:=d}` also WRITES the
         // binding (a JS assignment expression — the runtime's setVar
@@ -22065,6 +22180,21 @@ fn collect_never_written(prog: &IrProgram) -> Option<HashSet<String>> {
                                     mark_args(&args[1..], written);
                                 }
                             }
+                            // `printf -v NAME FMT ARGS...` writes NAME
+                            // (the runtime builtin assigns the formatted
+                            // output to the variable instead of stdout).
+                            // The pargs live in the trailing Array arg.
+                            if cn == "printf" {
+                                if let Some(IrExpr::Array(pargs)) = args.get(1) {
+                                    if let [IrExpr::Str(f0, _), IrExpr::Str(f1, _), ..] =
+                                        pargs.as_slice()
+                                    {
+                                        if f0 == "-v" {
+                                            mark_word(f1, written);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     // runtime-evaluated arith strings can contain
@@ -23003,7 +23133,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                 // (expandWord/evalArith), so inject lifted
                                 // refs there.
                                 IrExpr::Str(s, _)
-                                    if matches!(op.as_str(), "#" | "##" | "%" | "%%" | "//")
+                                    if matches!(op.as_str(), "#" | "##" | "%" | "%%" | "/" | "//")
                                         && i == 2 =>
                                 {
                                     cargs.push(str_lit(s));
@@ -24875,8 +25005,16 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
                     Some("getVar") => match arguments.first() {
                         // literal-name getVars are fine: `var` reads are
                         // rewritten to the binding, other names read the
-                        // store as usual
-                        Some(Expr::Literal { .. }) => true,
+                        // store as usual. EXCEPT a baked subscript whose
+                        // text references `var` (`aa[$k]`) — the runtime
+                        // resolves the subscript from the STORE
+                        // (normAssocKey/expandWord), so the per-iteration
+                        // store sync of `var` must stay (mirrors the
+                        // setVar arm below).
+                        Some(Expr::Literal { value, .. }) => match value.as_str() {
+                            Some(n) => !(n.contains('[') && subscript_refs_var(n, var)),
+                            None => true,
+                        },
                         _ => false, // dynamic name — could resolve to var
                     },
                     Some("setVar") | Some("setArray") | Some("setArrayAppend") | Some("assign") => {

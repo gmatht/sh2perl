@@ -2717,7 +2717,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: parts[0].to_string(),
-                            operator: ParameterExpansionOperator::SubstituteAll(
+                            operator: ParameterExpansionOperator::SubstituteFirst(
                                 parts[1].to_string(),
                                 parts[2].to_string(),
                             ),
@@ -4149,14 +4149,13 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
         }
     }
     // Single / pattern substitution: ${var/pattern/replacement} (first
-    // occurrence — the runtime has no first-vs-all distinction, so both map
-    // to SubstituteAll; matches the main parser).
+    // occurrence only — SubstituteFirst).
     if content.contains('/') {
         let parts: Vec<&str> = content.splitn(3, '/').collect();
         if parts.len() == 3 {
             return Ok(ParameterExpansion {
                 variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::SubstituteAll(
+                operator: ParameterExpansionOperator::SubstituteFirst(
                     parts[1].to_string(),
                     parts[2].to_string(),
                 ),
