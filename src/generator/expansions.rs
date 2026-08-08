@@ -270,6 +270,16 @@ pub fn generate_parameter_expansion_impl(
             let r = parameter_var_scalar_ref(generator, &pe.variable);
             format!("{} =~ s/^{}//sr", r, regex)
         }
+        ParameterExpansionOperator::SubstituteFirst(pattern, replacement) => {
+            // ${var/pattern/replacement} - substitute first occurrence only
+            let r = parameter_var_bare_ref(generator, &pe.variable);
+            format!(
+                "{} =~ s/{}/{}/rs",
+                r,
+                escape_regex_pattern(pattern),
+                escape_regex_replacement(replacement)
+            )
+        }
         ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
             // ${var//pattern/replacement} - substitute all occurrences
             let r = parameter_var_bare_ref(generator, &pe.variable);

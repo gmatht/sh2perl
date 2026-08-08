@@ -25,6 +25,9 @@ impl std::fmt::Display for ParameterExpansion {
             ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
                 write!(f, "${{{0}%{1}}}", self.variable, pattern)
             }
+            ParameterExpansionOperator::SubstituteFirst(pattern, replacement) => {
+                write!(f, "${{{0}/{1}/{2}}}", self.variable, pattern, replacement)
+            }
             ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
                 write!(f, "${{{0}//{1}/{2}}}", self.variable, pattern, replacement)
             }
@@ -70,7 +73,8 @@ pub enum ParameterExpansionOperator {
     RemoveShortestSuffix(String), // %pattern
 
     // Pattern substitution
-    SubstituteAll(String, String), // //pattern/replacement
+    SubstituteFirst(String, String), // /pattern/replacement (first match)
+    SubstituteAll(String, String),  // //pattern/replacement
 
     // Default values
     DefaultValue(String),  // :-default
@@ -272,6 +276,12 @@ impl std::fmt::Display for Word {
                             ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
                                 result.push_str(&format!("${{{}}}%{}", pe.variable, pattern))
                             }
+                            ParameterExpansionOperator::SubstituteFirst(pattern, replacement) => {
+                                result.push_str(&format!(
+                                    "${{{}}}/{}/{}",
+                                    pe.variable, pattern, replacement
+                                ))
+                            }
                             ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
                                 result.push_str(&format!(
                                     "${{{}}}//{}/{}",
@@ -452,6 +462,9 @@ impl Word {
                 ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
                     format!("${{{}}}%{}", pe.variable, pattern)
                 }
+                ParameterExpansionOperator::SubstituteFirst(pattern, replacement) => {
+                    format!("${{{}}}/{}/{}", pe.variable, pattern, replacement)
+                }
                 ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
                     format!("${{{}}}//{}/{}", pe.variable, pattern, replacement)
                 }
@@ -556,6 +569,12 @@ impl Word {
                             }
                             ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
                                 result.push_str(&format!("${{{}}}%{}", pe.variable, pattern))
+                            }
+                            ParameterExpansionOperator::SubstituteFirst(pattern, replacement) => {
+                                result.push_str(&format!(
+                                    "${{{}}}/{}/{}",
+                                    pe.variable, pattern, replacement
+                                ))
                             }
                             ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
                                 result.push_str(&format!(
