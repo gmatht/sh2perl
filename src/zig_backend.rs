@@ -1469,8 +1469,15 @@ impl Render {
         let mut body_stmts: Vec<String> = Vec::new();
         std::mem::swap(&mut self.out, &mut body_stmts);
         self.depth = 1;
-        for s in &prog.stmts {
+        for (idx, s) in prog.stmts.iter().enumerate() {
+            let before = self.out.len();
             self.stmt(s);
+            let line = prog.stmt_lines.iter().find(|(i, _)| *i == idx).map(|(_, l)| *l);
+            if let Some(l) = line {
+                if let Some(first) = self.out.get_mut(before) {
+                    *first = format!("{first} // line {l}");
+                }
+            }
         }
         // dead-var guard: Zig rejects declared-but-never-read variables
         for v in &written {

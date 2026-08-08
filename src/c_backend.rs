@@ -136,6 +136,9 @@ pub struct Render {
     /// name -> the single top-level `Assign` RHS of a `Const` var (the
     /// hoisted `const` declaration's initializer).
     const_rhs: HashMap<String, IrExpr>,
+    /// var name → the source line of its Assign (for the const-lift
+    /// `/* line N */` comment).
+    var_line: HashMap<String, usize>,
     /// names already emitted as `const` (the matching Assign stmt is
     /// skipped at emission time).
     const_lifted: BTreeSet<String>,
@@ -246,6 +249,17 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_lengths = prog.var_lengths.iter().cloned().collect();
     r.const_vars = prog.var_const.iter().cloned().collect();
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
+    // var → source line (the const lift hoists the Assign into the decl
+    // block, so the `/* line N */` comment must ride the decl)
+    for (i, st) in prog.stmts.iter().enumerate() {
+        if let IrStmt::Assign { targets, .. } = st {
+            if let Some((_, l)) = prog.stmt_lines.iter().find(|(si, _)| *si == i) {
+                for t in targets {
+                    r.var_line.insert(t.var.clone(), *l);
+                }
+            }
+        }
+    }
     r.var_ranges = ranges;
     r.var_widths = widths;
     r.program(&prog);
@@ -1109,15 +1123,16 @@ impl Render {
             };
             if let Some(init) = init {
                 self.const_lifted.insert(v.to_string());
+                let lc = self.var_line.get(v).map(|l| format!(" /* line {l} */")).unwrap_or_default();
                 if self.is_num(v) {
                     self.emit(&format!(
-                        "const {} {name} = {init};",
+                        "const {} {name} = {init};{lc}",
                         self.width_of_var(v).c_type()
                     ));
                 } else if let Some(b) = self.buf_bound(v) {
-                    self.emit(&format!("const char {name}[{}] = {init};", b + 1));
+                    self.emit(&format!("const char {name}[{}] = {init};{lc}", b + 1));
                 } else {
-                    self.emit(&format!("const char* {name} = {init};"));
+                    self.emit(&format!("const char* {name} = {init};{lc}"));
                 }
                 return;
             }
@@ -5642,8 +5657,18 @@ impl Render {
             self.emit_bound_asserts(&vars);
             self.emit("");
         }
-        for s in &prog.stmts {
+        // source-mapping comments: ` /* line N */` on each top-level
+        // statement's first line (the shIR convention, like perl) — the
+        // web GUI builds its line map from these.
+        for (idx, s) in prog.stmts.iter().enumerate() {
+            let before = self.out.len();
             self.stmt(s);
+            let line = prog.stmt_lines.iter().find(|(i, _)| *i == idx).map(|(_, l)| *l);
+            if let Some(l) = line {
+                if let Some(first) = self.out.get_mut(before) {
+                    *first = format!("{first} /* line {l} */");
+                }
+            }
         }
         self.emit("return 0;");
         std::mem::swap(&mut self.out, &mut body_out);
