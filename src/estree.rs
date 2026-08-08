@@ -1254,6 +1254,60 @@ mod tests {
     }
 
     #[test]
+    fn bare_env_lowers_to_sync_builtin() {
+        // `env | grep '^myexport='` — the bare env form (no operands):
+        // the subprocess spawn collapses to the sync builtin dispatch
+        // (builtins.env dumps process.env — sink-correct everywhere). A
+        // flag/carrying form (`env -i`) keeps the exec spawn (the
+        // builtin cannot run commands).
+        let json = to_json("env | grep '^myexport='");
+        assert!(json.contains("\"value\":\"env\""));
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("\"name\":\"exec\""), "no env spawn");
+        assert!(!json.contains("unsupported"));
+        let json2 = to_json("env -i foo");
+        assert!(json2.contains("\"name\":\"exec\""), "flag forms keep the spawn");
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn egrep_lowers_to_sync_builtin() {
+        // `$(egrep PAT FILE)` — GNU's grep -E alias: SYNC_BUILTINS admits
+        // the name, so the exec spawn becomes the sync builtin dispatch
+        // (builtins.egrep = grep with -E prepended).
+        let json = to_json("x=$(egrep '^pattern' /dev/null)");
+        assert!(json.contains("\"value\":\"egrep\""));
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("\"name\":\"exec\""), "no egrep spawn");
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn echo_pipe_bc_statement_folds_to_native_write() {
+        // statement-form `echo "2+3" | bc` with a STATIC program → the
+        // compile-time bc fold (src/bc.rs): the pipeline + bc subprocess
+        // spawn collapse to a native `process.stdout.write("5\n")` +
+        // status sequence (the try_native_echo_bc_stmt twin of the
+        // capture-position fold). A DYNAMIC program (`$x + 1` — no
+        // runtime bc evaluator) keeps the spawn.
+        let json = to_json("echo \"2+3\" | bc");
+        assert!(json.contains("\"name\":\"write\""));
+        assert!(json.contains("\"value\":\"5\\n\""), "folded 2+3 -> 5\n");
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(!json.contains("unsupported"));
+        // multi-statement programs fold too (scale=2; 5/2 -> 2.50)
+        let json2 = to_json("echo \"scale=2; 5/2\" | bc");
+        assert!(json2.contains("\"value\":\"2.50\\n\""));
+        assert!(!json2.contains("\"name\":\"exec\""));
+        // a dynamic program keeps the pipeline + bc spawn
+        let json3 = to_json("x=1; echo \"$x + 1\" | bc");
+        assert!(json3.contains("\"name\":\"pipeline\""));
+        assert!(json3.contains("\"name\":\"exec\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
     fn cut_herestring_capture_lifts_to_native() {
         // `$(cut -c2 <<< X)` — the here-string feed is the same per-line
         // selection over the target value; the split has no trailing ''
