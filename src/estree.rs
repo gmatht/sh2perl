@@ -4238,6 +4238,7 @@ pub(crate) fn drop_dead_top_decls(prog: Program) -> Program {
     let mut body = prog.body;
     // the leading top-level declarations and their names
     let mut decl_names: Vec<String> = Vec::new();
+    let mut decl_count = 0;
     for st in &body {
         if let Stmt::VariableDeclaration { declarations, .. } = st {
             for d in declarations {
@@ -4245,6 +4246,7 @@ pub(crate) fn drop_dead_top_decls(prog: Program) -> Program {
                     decl_names.push(name.clone());
                 }
             }
+            decl_count += 1;
         } else {
             break; // declarations are leading
         }
@@ -4252,22 +4254,37 @@ pub(crate) fn drop_dead_top_decls(prog: Program) -> Program {
     if decl_names.is_empty() {
         return Program { type_: prog.type_, source_type: prog.source_type, body };
     }
-    let read: Vec<String> = decl_names
-        .iter()
-        .filter(|n| stmts_read(&body, n, false))
-        .cloned()
-        .collect();
-    if read.len() == decl_names.len() {
-        return Program { type_: prog.type_, source_type: prog.source_type, body };
-    }
-    body.retain(|st| match st {
-        Stmt::VariableDeclaration { declarations, .. } => declarations
-            .iter()
-            .any(|d| match &d.id {
-                Expr::Identifier { name } => read.contains(name),
-                _ => true,
+    // Scan each leading declaration's name over the statements AFTER that
+    // declaration: a `let x` later (nested, or a for-init) shadows the
+    // top-level binding for its scope, but the declaration itself is the
+    // binding under examination — counting it as a shadow would treat
+    // every later `x = …` / `$x` as shadowed. The OTHER leading
+    // declarations' initializers DO count as reads (`let middle =
+    // [].concat(numbers.slice(…))` reads `numbers`).
+    let mut keep_leading: Vec<bool> = Vec::with_capacity(decl_count);
+    for (k, st) in body[..decl_count].iter().enumerate() {
+        let any_read = match st {
+            Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
+                matches!(&d.id, Expr::Identifier { name }
+                    if stmts_read(&body[k + 1..], name, false))
             }),
-        _ => true,
+            _ => false,
+        };
+        keep_leading.push(any_read);
+    }
+    // Drop only the LEADING declarations whose names are all unread — a
+    // VariableDeclaration LATER in the body (e.g. the native-array
+    // `let arr = […]` placed after an errexit/set -o sequence, or any
+    // non-hoist declaration) was never analyzed and must NOT be removed.
+    let mut seen = 0usize;
+    body.retain(|_| {
+        if seen < decl_count {
+            let keep = keep_leading[seen];
+            seen += 1;
+            keep
+        } else {
+            true
+        }
     });
     Program { type_: prog.type_, source_type: prog.source_type, body }
 }
