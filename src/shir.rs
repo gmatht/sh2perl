@@ -4900,11 +4900,28 @@ fn merged_words_ir(words: &[Word], single: &dyn Fn(&Word) -> IrExpr) -> Vec<IrEx
     let mut out: Vec<IrExpr> = Vec::new();
     let mut i = 0;
     while i < words.len() {
+        // A plain LITERAL immediately before a brace is the brace's
+        // prefix: `source.{bat,c}` is ONE bash word → `source.bat
+        // source.c` (the parser splits it into Literal("source.") +
+        // BraceExpansion, exactly like `{a,b}{1,2}` splits into two
+        // braces — the merge below re-joins it).
+        let mut pending_prefix: Option<String> = None;
+        if let Word::Literal(s, _) = &words[i] {
+            if i + 1 < words.len() {
+                if matches!(words[i + 1], Word::BraceExpansion(..)) {
+                    pending_prefix = Some(s.clone());
+                    i += 1;
+                }
+            }
+        }
         if let Word::BraceExpansion(be, _) = &words[i] {
             let mut groups = vec![brace_items_json(&be.items)];
             let mut middles: Vec<serde_json::Value> = Vec::new();
             let mut suffix = be.suffix.clone().unwrap_or_default();
-            let prefix = be.prefix.clone().unwrap_or_default();
+            let prefix = match &pending_prefix {
+                Some(p) => format!("{}{}", p, be.prefix.as_deref().unwrap_or("")),
+                None => be.prefix.clone().unwrap_or_default(),
+            };
             i += 1;
             while i < words.len() {
                 if let Word::BraceExpansion(be2, _) = &words[i] {
@@ -12601,7 +12618,12 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // transform's span cap.
             let iter_e = match range {
                 Some((lo, hi)) => expr_to_estree(&range_items_array(lo, hi)),
-                None => expr_to_estree(iter),
+                // `[].concat(...)` — the runtime forLoop/flatten's exact
+                // one-level flatten (an Array iter whose items are
+                // themselves arrays, e.g. a brace-expanded for-list
+                // `for f in source.{a,b,c}`, must NOT reach the runtime
+                // as a nested array — each item would iterate as a list).
+                None => flatten_for_iter(iter),
             };
             // Fast path: a provably-sync loop (the BODY needs no `await`)
             // lowers to the synchronous runtime loop — identical semantics
