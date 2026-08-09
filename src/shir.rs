@@ -4996,6 +4996,15 @@ fn arg_word_ir(w: &Word, assoc: bool) -> IrExpr {
         // literal `*` after removal (never a glob), while `*.txt` globs.
         Word::Literal(s, ann) => {
             let s2 = shell_quote_removal(s, ann.is_some());
+            // A leading `~/` expands to $HOME (bash tilde expansion at
+            // word start — `echo ~/x` → `$HOME/x`). Quoted `'~'` stays
+            // literal. The runtime's tilde rule is exactly getVar("HOME").
+            if ann.is_none() && s2.starts_with("~/") {
+                return IrExpr::Interpolate(vec![
+                    InterpPart::Expr(Box::new(call("getVar", vec![st("HOME")]))),
+                    InterpPart::Lit(s2[1..].to_string()),
+                ]);
+            }
             // A single-quoted word (`'*.txt'`) is LITERAL — bash never globs
             // it. The parser marks quoted words (ann == Some); without the
             // marker the AST cannot distinguish `'*.txt'` from `*.txt`.
@@ -24553,7 +24562,20 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     return Expr::ArrayExpression {
                         elements: brace_expand(prefix, groups, middles, suffix)
                             .iter()
-                            .map(|s| Some(str_lit(s)))
+                            .map(|s| {
+                                // Tilde expansion on the RESULT (`~/x.{a,b}`
+                                // → `~/x.a` → `${HOME}/x.a`) — the same
+                                // word-level `~/` rule the arg lowering
+                                // applies.
+                                if s.starts_with("~/") {
+                                    Some(expr_to_estree(&IrExpr::Interpolate(vec![
+                                        InterpPart::Expr(Box::new(call("getVar", vec![st("HOME")]))),
+                                        InterpPart::Lit(s[1..].to_string()),
+                                    ])))
+                                } else {
+                                    Some(str_lit(s))
+                                }
+                            })
                             .collect(),
                     };
                 }

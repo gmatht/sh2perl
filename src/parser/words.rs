@@ -532,7 +532,7 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
             | Some(Token::While) | Some(Token::Until) | Some(Token::For)
             | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-            | Some(Token::Select) | Some(Token::Function)
+            | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
     ) {
         let mut combined = String::new();
         loop {
@@ -621,7 +621,7 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
                 | Some(Token::While) | Some(Token::Until) | Some(Token::For)
                 | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-                | Some(Token::Select) | Some(Token::Function)
+                | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
                 => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that
@@ -1369,7 +1369,7 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
             | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
             | Some(Token::While) | Some(Token::Until) | Some(Token::For)
             | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-            | Some(Token::Select) | Some(Token::Function)
+            | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
     ) {
         let mut combined = String::new();
         loop {
@@ -1465,7 +1465,7 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                 | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
                 | Some(Token::While) | Some(Token::Until) | Some(Token::For)
                 | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-                | Some(Token::Select) | Some(Token::Function)
+                | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
                 => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that
