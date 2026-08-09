@@ -923,6 +923,33 @@ exit $main_exit_code;
             debashl::transforms::process_subst::transform_program(&mut prog);
             print!("{}", debashl::ir::shir_to_perl(&prog));
         }
+        "--shir-in-sh" => {
+            if args.len() < 3 { println!("Error: --shir-in-sh requires input"); return; }
+            let input = &args[2];
+            let content = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e); std::process::exit(1);
+                }
+                Ok(s)
+            } else {
+                fs::read_to_string(input)
+            };
+            let content = match content {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+            };
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
+            print!("{}", match debashl::sh_backend::shir_to_sh(&prog) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
+            });
+        }
         "--mir" => {
             if args.len() < 3 {
                 println!("Error: --mir command requires input");

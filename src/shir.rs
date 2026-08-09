@@ -13438,6 +13438,23 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 }
             }
         }
+        IrStmt::Exit(e) => Stmt::ExpressionStatement {
+            // `exit` / `exit N` — the A1 statement form (batch frontends
+            // emit it for `exit /b`; the shell source lowers `exit 5` to
+            // an exec-builtin call, handled in the Exec arm). Mirror the
+            // exec path: `process.exit(Number(code))`, or lastExit when
+            // no code is given.
+            expression: process_exit(match e {
+                None => sh2_member("lastExit"),
+                Some(expr) => Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "Number".to_string(),
+                    }),
+                    arguments: vec![expr_to_estree(expr)],
+                    optional: false,
+                },
+            }),
+        },
         other => unreachable!("Perl-only IR statement reached the ESTree renderer: {other:?}"),
     })
 }
