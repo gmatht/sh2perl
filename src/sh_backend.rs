@@ -762,13 +762,6 @@ _cmp() {
 "#,
         );
     }
-    out.push_str("_num() {\n");
-    out.push_str("    # bash coerces non-numeric arith values to 0; dash errors\n");
-    out.push_str("    case \"$1\" in\n");
-    out.push_str("        ''|'-'|*[!0-9-]*|-*[!0-9]*) echo 0 ;;\n");
-    out.push_str("        *) echo \"$1\" ;;\n");
-    out.push_str("    esac\n");
-    out.push_str("}\n\n");
     if needs_arr_helper(prog) {
         out.push_str(
             r#"
@@ -835,18 +828,35 @@ _arr_slice() {
 "#,
         );
     }
+    // `_num()` is a polyfill for the $( _num "…" ) arith-coercion calls:
+    // emit the definition iff the RENDERED body actually calls it (bash
+    // coerces non-numeric arith values to 0, dash errors). Checking the
+    // final body is robust by construction — the definition is present
+    // exactly when a call is, no matter which arith form the core
+    // emitted (the Arith AST or the `arith("$a+$b")` string).
+    let mut body = String::new();
     for st in &prog.stmts {
-        stmt_to_sh(st, 0, &mut out)?;
+        stmt_to_sh(st, 0, &mut body)?;
     }
     for sub in &prog.subs {
-        out.push('\n');
-        out.push_str(&sub.name);
-        out.push_str("() {\n");
+        body.push('\n');
+        body.push_str(&sub.name);
+        body.push_str("() {\n");
         for st in &sub.body {
-            stmt_to_sh(st, 1, &mut out)?;
+            stmt_to_sh(st, 1, &mut body)?;
         }
-        out.push_str("}\n");
+        body.push_str("}\n");
     }
+    if body.contains("$( _num ") {
+        out.push_str("_num() {\n");
+        out.push_str("    # bash coerces non-numeric arith values to 0; dash errors\n");
+        out.push_str("    case \"$1\" in\n");
+        out.push_str("        ''|'-'|*[!0-9-]*|-*[!0-9]*) echo 0 ;;\n");
+        out.push_str("        *) echo \"$1\" ;;\n");
+        out.push_str("    esac\n");
+        out.push_str("}\n\n");
+    }
+    out.push_str(&body);
     Ok(out)
 }
 
