@@ -416,7 +416,7 @@ fn call_purity(func: &str, args: &[IrExpr]) -> &'static str {
         // Emulable: implementable in a backend runtime (state/string/glob/fs-tests)
         "getVar" | "setVar" | "setLastExit" | "assign" | "test" | "grepText" | "listVar"
         | "setArray" | "setArrayAppend" | "arrayItems" | "arrayKeys" | "arrayLen"
-        | "arrayIndex" | "fnCall" | "define" | "forLoop" | "whileLoop" | "block" | "shopt"
+        | "arrayIndex" | "fnCall" | "fnValue" | "define" | "forLoop" | "whileLoop" | "block" | "shopt"
         | "builtin" | "bcSqrt" => "Emulable",
         // Fs: file I/O, no process spawn
         _ if func.starts_with("fs.") => "Fs",

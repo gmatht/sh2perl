@@ -216,7 +216,7 @@ fn collect_shell_vars_from_word(word: &Word, vars: &mut HashSet<String>) {
     }
 }
 
-fn collect_shell_vars_from_command(command: &Command, vars: &mut HashSet<String>) {
+pub(crate) fn collect_shell_vars_from_command(command: &Command, vars: &mut HashSet<String>) {
     match command {
         Command::Simple(cmd) => {
             collect_shell_vars_from_word(&cmd.name, vars);
@@ -516,7 +516,14 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             let grep_output = crate::generator::commands::grep::generate_grep_command(
                                                 generator, simple_cmd, &format!("${}", "input_data"), &unique_id.to_string(), false,
                                             );
-                                            Some(format!("do {{ {} {} }}", input_data, grep_output))
+                                            // The grep code's LAST statement is the
+                                            // $CHILD_ERROR assignment; end the do-block
+                                            // with the result variable so the capture
+                                            // value is the grep output, not the exit code.
+                                            Some(format!(
+                                                "do {{ {} {} $grep_result_{}; }}",
+                                                input_data, grep_output, unique_id
+                                            ))
                                         }
                                         _ => None,
                                     }
@@ -2380,9 +2387,15 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     crate::ir::emit_indent(&mut do_body, 1);
                     do_body.push_str(&format!("my ${} = {};\n", left_var, left_wrapped));
                     // if ($CHILD_ERROR == 0) { ... } else { ... }
+                    // bash concatenates each command's stdout as raw streams
+                    // (then strips trailing newlines); with per-command chomped
+                    // values the separator is a newline between two NON-EMPTY
+                    // outputs (`$(echo a && echo b)` → "a\nb"; `$(true && echo b)`
+                    // → "b", not "\nb").
                     let then_raw = format!(
-                        "{}my ${} = {};\n{}${} . ${};\n",
-                        "        ", right_var, right_wrapped, "        ", left_var, right_var,
+                        "{}my ${} = {};\n{}( ${} ne q{{}} ? ${} . \"\\n\" : q{{}} ) . ${};\n",
+                        "        ", right_var, right_wrapped, "        ", left_var, left_var,
+                        right_var,
                     );
                     crate::ir::emit_stmt(
                         &mut do_body,
@@ -2418,7 +2431,23 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     let mut env_setup = String::new();
                     for var in &shell_vars {
                         if var != "file" {
-                            env_setup.push_str(&format!("    local $ENV{{{}}} = ${};\n", var, var));
+                            // Export the var to the bash child.  Declared Perl
+                            // vars are read directly; undeclared (bash-only, unset)
+                            // vars come from %ENV so the generated code compiles
+                            // under `use strict`.
+                            if generator.declared_locals.contains(var)
+                                || generator.function_level_vars.contains(var)
+                            {
+                                env_setup.push_str(&format!(
+                                    "    local $ENV{{{}}} = ${};\n",
+                                    var, var
+                                ));
+                            } else {
+                                env_setup.push_str(&format!(
+                                    "    local $ENV{{{}}} = $ENV{{{}}};\n",
+                                    var, var
+                                ));
+                            }
                         }
                     }
                     format!(
@@ -3140,14 +3169,40 @@ pub fn convert_string_interpolation_to_perl_impl(
                     }
                     _ => {
                         // Handle other cases
-                        let expr = if pe.variable.contains('[') && pe.variable.contains(']') {
+                        let expr = if pe.variable.starts_with('#')
+                            && !pe.variable.contains('[')
+                            && !pe.variable.contains(']')
+                        {
+                            // ${#var} — string length (the `#`-prefixed
+                            // variable name is the length operator, not a
+                            // variable named `#s`).
+                            let inner = &pe.variable[1..];
+                            if generator.declared_locals.contains(inner)
+                                || generator.function_level_vars.contains(inner)
+                            {
+                                format!("length(${})", inner)
+                            } else {
+                                format!("length($ENV{{{}}} // q{{}})", inner)
+                            }
+                        } else if pe.variable.contains('[') && pe.variable.contains(']') {
                             if let Some(bracket_start) = pe.variable.find('[') {
                                 if let Some(bracket_end) = pe.variable.rfind(']') {
                                     let var_name = &pe.variable[..bracket_start];
                                     let key = &pe.variable[bracket_start + 1..bracket_end];
 
+                                    // An array name that was never assigned/declared is
+                                    // empty in bash (`${unset_arr[i]}` → q{}); emitting a
+                                    // bare `$arr[i]` would be a `use strict` compile error
+                                    // (undeclared @arr).
+                                    let known_array = generator.declared_locals.contains(var_name)
+                                        || generator.indexed_arrays.contains(var_name)
+                                        || generator.associative_arrays.contains(var_name)
+                                        || generator.function_level_vars.contains(var_name);
+
                                     // Check if the key is numeric (indexed array) or string (associative array)
-                                    if key.parse::<usize>().is_ok() {
+                                    if !known_array {
+                                        "q{}".to_string()
+                                    } else if key.parse::<usize>().is_ok() {
                                         // Indexed array access: arr[1] -> $arr[1]
                                         format!("${}[{}]", var_name, key)
                                     } else if generator.associative_arrays.contains(var_name) {
@@ -3205,9 +3260,19 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 format!("({} =~ s/^{}//sr)", expr, regex)
                             }
                             ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
+                                // ${var%suffix} — remove the SHORTEST (rightmost) suffix.
+                                // Reverse the value, strip the shortest prefix of the
+                                // reversed pattern, reverse back (same trick as
+                                // expansions.rs; a plain `s/regex$//r` on the pattern
+                                // would match from the FIRST occurrence, not the last).
+                                let rev_pattern =
+                                    super::expansions::reverse_glob_pattern(pattern);
                                 let regex =
-                                    super::expansions::glob_to_perl_regex_nongreedy(pattern);
-                                format!("({} =~ s/{}$//r)", expr, regex)
+                                    super::expansions::glob_to_perl_regex_nongreedy(&rev_pattern);
+                                format!(
+                                    "scalar reverse( (scalar reverse {}) =~ s/^{}//r )",
+                                    expr, regex
+                                )
                             }
                             ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
                                 let regex = super::expansions::glob_to_perl_regex_greedy(pattern);
@@ -3227,6 +3292,23 @@ pub fn convert_string_interpolation_to_perl_impl(
                             }
                             ParameterExpansionOperator::Dirname => {
                                 format!("( ( {} ) =~ s|/[^/]*$||sr )", expr)
+                            }
+                            ParameterExpansionOperator::SubstituteFirst(pattern, replacement) => {
+                                // ${var/pattern/replacement} — first occurrence only.
+                                // (The string-interpolation `expr` is a scalar value, so
+                                // substitute directly; the pattern/replacement escaping
+                                // mirrors the expansions.rs renderer.)
+                                let pat = super::expansions::escape_regex_pattern(pattern);
+                                let rep =
+                                    super::expansions::escape_regex_replacement(replacement);
+                                format!("({} =~ s/{}/{}/r)", expr, pat, rep)
+                            }
+                            ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
+                                // ${var//pattern/replacement} — all occurrences.
+                                let pat = super::expansions::escape_regex_pattern(pattern);
+                                let rep =
+                                    super::expansions::escape_regex_replacement(replacement);
+                                format!("({} =~ s/{}/{}/gr)", expr, pat, rep)
                             }
                             ParameterExpansionOperator::DefaultValue(default) => {
                                 let default_expr =
@@ -3486,10 +3568,28 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
     }
 
     // Step 1: protect already-`$`-prefixed variables
+    // Undeclared `$name` (unset bash var) is tracked so Step 3 restores it
+    // as `$ENV{name}` — the generated Perl must compile under `use strict`,
+    // and bash arithmetic treats an unset var as 0 (undef in numeric
+    // context is 0 as well).
     let dollar_var_regex = Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_]*)").unwrap();
+    let mut undeclared_dollar_vars: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let protected = dollar_var_regex
         .replace_all(&result, |caps: &regex::Captures| {
-            format!("__DOLLAR_{}__", &caps[1])
+            let var_name = &caps[1];
+            // `ARGV` and `_` are Perl's argument arrays (`$ARGV[0]`,
+            // `$_[0]` inside a function) — NEVER convert them to $ENV.
+            if generator.declared_locals.contains(var_name)
+                || generator.function_level_vars.contains(var_name)
+                || var_name == "ARGV"
+                || var_name == "_"
+            {
+                format!("__DOLLAR_{}__", var_name)
+            } else {
+                undeclared_dollar_vars.insert(var_name.to_string());
+                format!("__DOLLAR_{}__", var_name)
+            }
         })
         .to_string();
 
@@ -3544,11 +3644,16 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
         })
         .to_string();
 
-    // Step 3: restore sentinels to `$name`
+    // Step 3: restore sentinels to `$name` (declared) or `$ENV{name}` (undeclared)
     let restore_regex = Regex::new(r"__DOLLAR_([a-zA-Z_][a-zA-Z0-9_]*)__").unwrap();
     let result = restore_regex
         .replace_all(&converted, |caps: &regex::Captures| {
-            format!("${}", &caps[1])
+            let var_name = &caps[1];
+            if undeclared_dollar_vars.contains(var_name) {
+                format!("$ENV{{{}}}", var_name)
+            } else {
+                format!("${}", var_name)
+            }
         })
         .to_string();
 

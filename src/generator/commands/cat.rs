@@ -117,11 +117,12 @@ pub fn generate_cat_command(
             redir.operator,
             RedirectOperator::Output | RedirectOperator::Append
         ) {
-            if let Word::Literal(filename, _) = &redir.target {
-                output_file = Some(filename.clone());
-            } else {
-                output_file = Some(generator.perl_string_literal(&redir.target));
-            }
+            // Convert the target to a real Perl EXPRESSION: literal filenames
+            // become quoted Perl strings, interpolations (`> "$f"`) become
+            // their variable references.  Re-wrapping later in
+            // perl_string_literal would quote `$f`/`${f}` literally, creating
+            // a file literally named `"${f}"` instead of x.py.
+            output_file = Some(generator.word_to_perl(&redir.target));
         }
     }
 
@@ -161,11 +162,11 @@ pub fn generate_cat_command(
         };
 
         if let Some(filename) = output_file {
-            // Write heredoc content to the output file (raw text for now)
-            let filename_pl = generator.perl_string_literal(&Word::literal(filename));
+            // Write heredoc content to the output file (raw text for now).
+            // `filename` is already a Perl expression (quoted literal or var ref).
             output.push_str(&format!(
                 "open my $fh_cat, '>', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
-                filename_pl
+                filename
             ));
             let body_lit = crate::ir::ir_expr_to_perl(&IrExpr::Str(body, style));
             output.push_str(&format!("print {{$fh_cat}} {};\n", body_lit));

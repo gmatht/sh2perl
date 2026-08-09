@@ -83,6 +83,60 @@ fn fix_command_substitution_placeholders(mut code: String) -> String {
     code
 }
 
+/// Parse C source to A1 shIR JSON through the Go `c-sh-go` frontend —
+/// the production C frontend (the old minimal Rust cfront was removed).
+/// The frontend is the same binary the unified otranspilerl pipeline
+/// spawns: `frontends/c-sh-go/c-sh-go --shir <file> --raw` (build it
+/// with `make` in that directory). Located via `OTRANSPILER_ROOT` or by
+/// walking up from the cwd until a `frontends/c-sh-go/c-sh-go` is
+/// found; the source is staged to a temp file (the frontend reads a
+/// filename).
+fn c_frontend_shir(src: &str) -> Result<String, String> {
+    let exe = std::env::var("OTRANSPILER_ROOT")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let mut dir = std::env::current_dir().ok()?;
+            loop {
+                let cand = dir.join("frontends").join("c-sh-go").join("c-sh-go");
+                if cand.exists() {
+                    return Some(dir);
+                }
+                if !dir.pop() {
+                    break;
+                }
+            }
+            None
+        })
+        .and_then(|root| {
+            let cand = root.join("frontends").join("c-sh-go").join("c-sh-go");
+            if cand.exists() {
+                Some(cand)
+            } else {
+                None
+            }
+        });
+    let Some(exe) = exe else {
+        return Err(
+            "cannot locate the c-sh-go frontend (set OTRANSPILER_ROOT, or build \
+             frontends/c-sh-go with `make` and run from the sh2loop checkout)"
+                .to_string(),
+        );
+    };
+    let tmp = std::env::temp_dir().join(format!("c-sh-go-{}.c", std::process::id()));
+    std::fs::write(&tmp, src).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    let out = std::process::Command::new(&exe)
+        .args(["--shir", tmp.to_str().unwrap_or(""), "--raw"])
+        .output()
+        .map_err(|e| format!("spawn {}: {}", exe.display(), e));
+    let _ = std::fs::remove_file(&tmp);
+    let out = out?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
 /// Source-name $0 semantic (`--argv0-source <name>`): bake `$0 = '<name>'`
 /// into the generated Perl so the translated program identifies as the
 /// original bash file, whatever it is invoked as. Default (flag absent) =
@@ -669,16 +723,10 @@ exit $main_exit_code;
                     eprintln!("Error reading file {}: {}", filename, e);
                     std::process::exit(1);
                 });
-                match debashl::cfront::c_to_ir(&src) {
-                    Ok(mut prog) => {
-                        if !output_lineno {
-                            prog.stmt_lines.clear();
-                        }
-                        println!(
-                            "{}",
-                            debashl::shir_json::shir_to_shir_json(&prog)
-                        );
-                    }
+                // --output-lineno: the Go frontend's A1 carries no
+                // stmt_lines either way — accepted for CLI parity.
+                match c_frontend_shir(&src) {
+                    Ok(json) => println!("{}", json.trim_end()),
                     Err(e) => {
                         eprintln!("{}", e);
                         std::process::exit(1);
@@ -776,9 +824,9 @@ exit $main_exit_code;
             }
         }
         "c" => {
-            // the minimal C frontend: parse a portable-C subset and emit
-            // the SAME ShIR JSON contract the shell frontend produces
-            // (frontend-c-core-needs.md)
+            // the Go c-sh-go frontend: parse C and emit the SAME ShIR
+            // JSON contract the shell frontend produces (delegated, see
+            // c_frontend_shir)
             if args.len() < 3 {
                 println!("Error: c command requires input");
                 return;
@@ -811,16 +859,10 @@ exit $main_exit_code;
             } else {
                 input.to_string()
             };
-            match debashl::cfront::c_to_ir(&src) {
-                Ok(mut prog) => {
-                    if !output_lineno {
-                        prog.stmt_lines.clear();
-                    }
-                    println!(
-                        "{}",
-                        debashl::shir_json::shir_to_shir_json(&prog)
-                    );
-                }
+            // --output-lineno: the Go frontend's A1 carries no
+            // stmt_lines either way — accepted for CLI parity.
+            match c_frontend_shir(&src) {
+                Ok(json) => println!("{}", json.trim_end()),
                 Err(e) => {
                     eprintln!("{}", e);
                     std::process::exit(1);

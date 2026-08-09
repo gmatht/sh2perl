@@ -1090,19 +1090,23 @@ pub fn generate_generic_builtin(
             // Use 0 (exit code zero) so that the if-condition handler's
             // !(...) wrapping produces a truthy Perl value (0 is falsy,
             // so !0 is truthy, matching shell semantics where exit 0
-            // means "success/true").
+            // means "success/true").  Also reset $CHILD_ERROR: bash's
+            // `true` sets $? = 0, and a later `[ "$?" = 0 ]` reads it.
             if output_var.is_empty() {
-                "0;\n".to_string()
+                "$CHILD_ERROR = 0;\n0;\n".to_string()
             } else {
-                format!("0;\n${} = q{};\n", output_var, "")
+                format!("$CHILD_ERROR = 0;\n0;\n${} = q{};\n", output_var, "")
             }
         }
         "false" => {
-            // false command always fails (exit status 1)
+            // false command always fails (exit status 1).  bash sets
+            // $? = 1 and CONTINUES — `exit 1` would terminate the whole
+            // script, so set $CHILD_ERROR and let the surrounding
+            // condition/exit machinery use it.
             if output_var.is_empty() {
-                "exit 1;\n".to_string()
+                "$CHILD_ERROR = 1;\n1;\n".to_string()
             } else {
-                format!("exit 1;\n${} = q{};\n", output_var, "")
+                format!("$CHILD_ERROR = 1;\n1;\n${} = q{};\n", output_var, "")
             }
         }
         "whoami" => {

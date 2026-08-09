@@ -644,6 +644,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+            var_nospace: vec![],
         }
     }
 

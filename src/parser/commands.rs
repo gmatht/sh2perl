@@ -2730,10 +2730,28 @@ impl Parser {
                                 // (${var#pattern}, ${var##pattern}), not a comment start.
                                 // We need to split the Comment at `}` and inject any
                                 // text after `}` as re-lexed tokens (e.g. `]; then`).
-                                let text = self.lexer.handle_comment_with_brace(brace_depth)?;
-                                expansion.push_str(&text);
-                                brace_depth = 0;
-                                break;
+                                // handle_comment_with_brace returns everything up to (but
+                                // NOT including) the matching `}` — the expansion text
+                                // must re-append it so the stored expression is intact
+                                // (the words path re-synthesizes `}` from the operator;
+                                // the test-expression path stores RAW text).
+                                // NOTE: peek the text WITHOUT advancing —
+                                // handle_comment_with_brace expects current to point AT
+                                // the Comment token.
+                                let text = self.lexer.get_current_text().unwrap_or_default();
+                                if text.contains('}') {
+                                    let before =
+                                        self.lexer.handle_comment_with_brace(brace_depth)?;
+                                    expansion.push_str(&before);
+                                    expansion.push('}');
+                                    brace_depth = 0;
+                                    break;
+                                } else {
+                                    // `${#var}` — `#` is the length operator, not a
+                                    // comment start.  Consume the Comment as literal text.
+                                    expansion.push_str(&text);
+                                    self.lexer.next();
+                                }
                             }
                             Some(_) => expansion.push_str(&self.lexer.get_raw_token_text()?),
                             None => {

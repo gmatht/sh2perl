@@ -195,6 +195,7 @@ mod tests {
 
     fn empty_prog() -> IrProgram {
         IrProgram {
+            var_nospace: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![],
@@ -281,6 +282,7 @@ mod tests {
         // `x=5` once, straight-line → Const; `y` reassigned → Var;
         // `z` written by a loop body → Var (multi-run site).
         let prog = IrProgram {
+            var_nospace: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![

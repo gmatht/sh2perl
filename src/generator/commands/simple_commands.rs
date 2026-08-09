@@ -1332,9 +1332,21 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         output.push_str(&format!("print {};\n", args[0]));
                     } else {
                         let in_pipeline = generator.current_pipeline_output_id().is_some();
-                        if args[0] == "q{}" {
-                            // Empty result from unresolved/invalid parameter expansion;
-                            // skip printing to match bash behavior (error on stderr, nothing on stdout).
+                        // `${!name[@]:0:3}` (a `!`-prefixed indirect variable with an
+                        // array slice) is a bash BAD SUBSTITUTION — bash prints an
+                        // error to stderr, skips the whole command (no newline), and
+                        // continues with $? = 1.  Distinguish it from VALID empty
+                        // expansions (`${!var*}` names-list, `${x:-}`) which DO print
+                        // an empty line: only skip for the bad-substitution shape.
+                        let is_bad_subst = cmd.args.iter().any(|a| {
+                            matches!(a, Word::StringInterpolation(interp, _)
+                                if interp.parts.iter().any(|p|
+                                    matches!(p, StringPart::ParameterExpansion(pe)
+                                        if pe.variable.starts_with('!')
+                                            && matches!(pe.operator, ParameterExpansionOperator::ArraySlice(_, _)))))
+                        });
+                        if args[0] == "q{}" && is_bad_subst {
+                            // bash: bad substitution → skip the command entirely.
                         } else if in_pipeline {
                             // Pipeline: accumulate into output buffer
                             output.push_str(&format!("$output .= {} . \"\\n\";\n", args[0]));

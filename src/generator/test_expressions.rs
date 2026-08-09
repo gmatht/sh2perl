@@ -92,6 +92,24 @@ fn convert_shell_var_to_perl(generator: &Generator, var: &str) -> String {
         "$@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
         "$*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
         "$?" => "$CHILD_ERROR".to_string(),  // $? -> exit code
+        _ if processed.starts_with("${") => {
+            // `${var#pat}` / `${var%pat}` / `${var##pat}` / `${var/pat/rep}`
+            // etc. — a full single parameter expansion.  Parse the braced
+            // content and render pattern operators to real Perl (raw `${...}`
+            // would be a `use strict` compile error / Perl comment).
+            let inner = &processed[2..processed.len() - 1];
+            if let Ok(pe) = crate::parser::words::parse_parameter_expansion_content(inner) {
+                if let Some(rendered) =
+                    crate::generator::expansions::render_pattern_param_expansion(generator, &pe)
+                {
+                    rendered
+                } else {
+                    processed
+                }
+            } else {
+                processed
+            }
+        }
         _ if processed.starts_with('$') && processed.len() > 1 => {
             // A bare `$name` reference.  Map undeclared variables to
             // $ENV{name} (avoiding `use strict` compile errors), keep
@@ -125,6 +143,64 @@ fn convert_shell_var_to_perl(generator: &Generator, var: &str) -> String {
                 format!("'{}'", processed.replace("'", "\\'"))
             }
         }
+    }
+}
+
+/// Is the operand an UNQUOTED shell expansion (`$var`, `${...}`, `$(...)`)?
+/// Unquoted expansions word-split in single-bracket `[ ]` tests: if BOTH
+/// operands expand to empty, bash sees only the operator (`[ -gt ]`) and
+/// the single non-empty argument makes the test TRUE.  Quoted operands
+/// and `[[ ]]` never collapse.
+fn is_unquoted_expansion(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with('$') && !t.starts_with('"') && !t.starts_with('\'')
+}
+
+/// Strip one layer of surrounding quotes from a test-expression operand
+/// (DoubleQuotedString / SingleQuotedString tokens keep their quote chars
+/// in the expression text).  `"example"` → `example`; unquoted text is
+/// returned unchanged.
+fn strip_test_quotes(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2
+        && ((t.starts_with('"') && t.ends_with('"'))
+            || (t.starts_with('\'') && t.ends_with('\'')))
+    {
+        t[1..t.len() - 1].to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Render `[ left OP right ]` (numeric compare) reproducing bash's
+/// empty-unquoted-expansion collapse for single-bracket tests:
+///   - both operands unquoted + empty → `[ -gt ]` (single arg) → TRUE
+///   - exactly one empty → bash error → FALSE
+///   - both non-empty → numeric comparison
+/// `[[ ]]` and quoted operands use the plain comparison.
+fn render_numeric_compare(
+    generator: &Generator,
+    left: &str,
+    right: &str,
+    op: &str,
+    double: bool,
+) -> String {
+    let l = convert_shell_var_to_perl(generator, left);
+    let mut r = convert_shell_var_to_perl(generator, right);
+
+    // Replace magic numbers with constants
+    for (const_name, value) in &generator.constants {
+        let value_str = value.to_string();
+        r = r.replace(&value_str, &format!("${}", const_name));
+    }
+
+    if !double && is_unquoted_expansion(left) && is_unquoted_expansion(right) {
+        format!(
+            "(({} eq q{{}} && {} eq q{{}}) || (({} ne q{{}} && {} ne q{{}}) && ({} {} {})))",
+            l, r, l, r, l, op, r
+        )
+    } else {
+        format!("({} {} {})", l, op, r)
     }
 }
 
@@ -293,29 +369,19 @@ pub fn generate_test_expression_impl(
         // Regex matching: [[ $var =~ pattern ]]
         let parts: Vec<&str> = expr.split("=~").collect();
         if parts.len() == 2 {
-            let mut var = parts[0].trim();
+            let var = parts[0].trim();
             let pattern = parts[1].trim();
-            // Fix ${array[@]} which is invalid Perl -> use q{} (empty string) instead
-            if var.contains("[@]") || var.contains("[*]") {
-                var = "q{}";
-            }
-            // Convert to Perl regex matching, using $ENV{var} for undeclared variables
-            let var_ref = if var.starts_with('$') && !var.starts_with("$ENV") {
-                let var_name = var
-                    .trim_start_matches('$')
-                    .trim_start_matches('{')
-                    .trim_end_matches('}');
-                if !generator.declared_locals.contains(var_name)
-                    && !generator.function_level_vars.contains(var_name)
-                {
-                    format!("$ENV{{{}}}", var_name)
-                } else {
-                    var.to_string()
-                }
-            } else {
-                var.to_string()
-            };
-            format!("{} =~ {}", var_ref, generator.format_regex_pattern(pattern))
+            // Convert the operand via the shared var mapper (handles `${...}`
+            // parameter expansions and undeclared→$ENV mapping), then map the
+            // regex pattern (strip surrounding quotes first — DoubleQuotedString
+            // tokens keep their quotes in the expression text).
+            let var_ref = convert_shell_var_to_perl(generator, var);
+            let pattern_unquoted = strip_test_quotes(pattern);
+            format!(
+                "{} =~ {}",
+                var_ref,
+                generator.format_regex_pattern(&pattern_unquoted)
+            )
         } else {
             "0".to_string()
         }
@@ -325,33 +391,38 @@ pub fn generate_test_expression_impl(
         if parts.len() == 2 {
             let var = parts[0].trim();
             let pattern = parts[1].trim();
+            let var_ref = convert_shell_var_to_perl(generator, var);
+            // Patterns keep their quote characters in the expression text
+            // (DoubleQuotedString); strip them so the glob→regex conversion
+            // sees the bare pattern.
+            let pattern_unquoted = strip_test_quotes(pattern);
             if modifiers.extglob {
-                let regex_pattern = generator.convert_extglob_to_perl_regex(pattern);
+                let regex_pattern = generator.convert_extglob_to_perl_regex(&pattern_unquoted);
                 if modifiers.nocasematch {
                     format!(
                         "{} =~ {}i",
-                        var,
+                        var_ref,
                         generator.format_regex_pattern(&regex_pattern)
                     )
                 } else {
                     format!(
                         "{} =~ {}",
-                        var,
+                        var_ref,
                         generator.format_regex_pattern(&regex_pattern)
                     )
                 }
             } else {
-                let regex_pattern = generator.convert_glob_to_regex(pattern);
+                let regex_pattern = generator.convert_glob_to_regex(&pattern_unquoted);
                 if modifiers.nocasematch {
                     format!(
                         "{} =~ {}i",
-                        var,
+                        var_ref,
                         generator.format_regex_pattern(&format!("^{}$", regex_pattern))
                     )
                 } else {
                     format!(
                         "{} =~ {}",
-                        var,
+                        var_ref,
                         generator.format_regex_pattern(&format!("^{}$", regex_pattern))
                     )
                 }
@@ -546,18 +617,7 @@ pub fn generate_test_expression_impl(
         // Numeric less than: [[ $var -lt 2 ]]
         let parts: Vec<&str> = expr.split(" -lt ").collect();
         if parts.len() == 2 {
-            let left = parts[0].trim();
-            let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(generator, left);
-            let mut right_perl = convert_shell_var_to_perl(generator, right);
-
-            // Replace magic numbers with constants
-            for (const_name, value) in &generator.constants {
-                let value_str = value.to_string();
-                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
-            }
-
-            format!("({} < {})", left_perl, right_perl)
+            render_numeric_compare(generator, parts[0].trim(), parts[1].trim(), "<", modifiers.double)
         } else {
             "0".to_string()
         }
@@ -565,18 +625,7 @@ pub fn generate_test_expression_impl(
         // Numeric less than or equal: [[ $var -le 2 ]]
         let parts: Vec<&str> = expr.split(" -le ").collect();
         if parts.len() == 2 {
-            let left = parts[0].trim();
-            let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(generator, left);
-            let mut right_perl = convert_shell_var_to_perl(generator, right);
-
-            // Replace magic numbers with constants
-            for (const_name, value) in &generator.constants {
-                let value_str = value.to_string();
-                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
-            }
-
-            format!("({} <= {})", left_perl, right_perl)
+            render_numeric_compare(generator, parts[0].trim(), parts[1].trim(), "<=", modifiers.double)
         } else {
             "0".to_string()
         }
@@ -584,18 +633,7 @@ pub fn generate_test_expression_impl(
         // Numeric greater than: [[ $var -gt 2 ]]
         let parts: Vec<&str> = expr.split(" -gt ").collect();
         if parts.len() == 2 {
-            let left = parts[0].trim();
-            let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(generator, left);
-            let mut right_perl = convert_shell_var_to_perl(generator, right);
-
-            // Replace magic numbers with constants
-            for (const_name, value) in &generator.constants {
-                let value_str = value.to_string();
-                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
-            }
-
-            format!("({} > {})", left_perl, right_perl)
+            render_numeric_compare(generator, parts[0].trim(), parts[1].trim(), ">", modifiers.double)
         } else {
             "0".to_string()
         }
@@ -603,18 +641,7 @@ pub fn generate_test_expression_impl(
         // Numeric greater than or equal: [[ $var -ge 2 ]]
         let parts: Vec<&str> = expr.split(" -ge ").collect();
         if parts.len() == 2 {
-            let left = parts[0].trim();
-            let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(generator, left);
-            let mut right_perl = convert_shell_var_to_perl(generator, right);
-
-            // Replace magic numbers with constants
-            for (const_name, value) in &generator.constants {
-                let value_str = value.to_string();
-                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
-            }
-
-            format!("({} >= {})", left_perl, right_perl)
+            render_numeric_compare(generator, parts[0].trim(), parts[1].trim(), ">=", modifiers.double)
         } else {
             "0".to_string()
         }
@@ -622,18 +649,7 @@ pub fn generate_test_expression_impl(
         // Numeric equality: [[ $var -eq 2 ]]
         let parts: Vec<&str> = expr.split(" -eq ").collect();
         if parts.len() == 2 {
-            let left = parts[0].trim();
-            let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(generator, left);
-            let mut right_perl = convert_shell_var_to_perl(generator, right);
-
-            // Replace magic numbers with constants
-            for (const_name, value) in &generator.constants {
-                let value_str = value.to_string();
-                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
-            }
-
-            format!("({} == {})", left_perl, right_perl)
+            render_numeric_compare(generator, parts[0].trim(), parts[1].trim(), "==", modifiers.double)
         } else {
             "0".to_string()
         }
@@ -641,18 +657,7 @@ pub fn generate_test_expression_impl(
         // Numeric inequality: [[ $var -ne 2 ]]
         let parts: Vec<&str> = expr.split(" -ne ").collect();
         if parts.len() == 2 {
-            let left = parts[0].trim();
-            let right = parts[1].trim();
-            let left_perl = convert_shell_var_to_perl(generator, left);
-            let mut right_perl = convert_shell_var_to_perl(generator, right);
-
-            // Replace magic numbers with constants
-            for (const_name, value) in &generator.constants {
-                let value_str = value.to_string();
-                right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
-            }
-
-            format!("({} != {})", left_perl, right_perl)
+            render_numeric_compare(generator, parts[0].trim(), parts[1].trim(), "!=", modifiers.double)
         } else {
             "0".to_string()
         }
@@ -996,6 +1001,19 @@ pub fn generate_test_expression_impl(
         if parts.len() == 2 {
             let mut file1 = parts[0].trim().to_string();
             let mut file2 = parts[1].trim().to_string();
+            // `$name` operands must go through the var-mapping helper so
+            // undeclared variables become $ENV{name} (bare `$A` under
+            // `use strict` is a compile error).
+            if let Some(name) = file1.strip_prefix('$') {
+                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    file1 = test_expr_var_ref(generator, name);
+                }
+            }
+            if let Some(name) = file2.strip_prefix('$') {
+                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    file2 = test_expr_var_ref(generator, name);
+                }
+            }
             if !file1.starts_with('$') && !file1.starts_with('"') && !file1.starts_with('\'') {
                 file1 = format!("'{}'", file1);
             }
@@ -1191,8 +1209,11 @@ fn convert_shell_param_expansion_in_test_expr(generator: &Generator, expr: &str)
                     }
                     ParameterExpansionOperator::ErrorIfUnset(error) => {
                         format!(
-                            "(defined {} && {} ne q{{}} ? {} : die('{}'))",
-                            var_ref, var_ref, var_ref, error
+                            "(defined {} && {} ne q{{}} ? {} : do {{ print STDERR {}; exit 1; }})",
+                            var_ref,
+                            var_ref,
+                            var_ref,
+                            crate::ir::safe_perl_q_string(&format!("{}: {}\n", pe.variable, error))
                         )
                     }
                     _ => {

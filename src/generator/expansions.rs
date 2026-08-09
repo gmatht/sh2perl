@@ -1,4 +1,5 @@
 use super::Generator;
+use crate::ir::safe_perl_q_string;
 use crate::ast::*;
 
 /// Returns the Perl variable reference for a shell variable in a parameter expansion.
@@ -84,7 +85,7 @@ fn parameter_var_bare_assignable_ref(generator: &Generator, var_name: &str) -> S
 
 /// Returns the bare sigil-prefixed Perl variable reference (e.g. `$var` or
 /// `$ENV{var}`) for use in places like `$var =~ s/.../`.
-fn parameter_var_bare_ref(generator: &Generator, var_name: &str) -> String {
+pub(crate) fn parameter_var_bare_ref(generator: &Generator, var_name: &str) -> String {
     // $0 is the script name, not a positional parameter.
     if var_name == "0" {
         return "$0".to_string();
@@ -163,8 +164,18 @@ pub fn generate_parameter_expansion_impl(
                         let var_name = &pe.variable[..bracket_start];
                         let key = &pe.variable[bracket_start + 1..bracket_end];
 
+                        // An array name that was never assigned/declared is empty in
+                        // bash (`${unset_arr[i]}` → q{}); emitting a bare `$arr[i]`
+                        // would be a `use strict` compile error (undeclared @arr).
+                        let known_array = generator.declared_locals.contains(var_name)
+                            || generator.indexed_arrays.contains(var_name)
+                            || generator.associative_arrays.contains(var_name)
+                            || generator.function_level_vars.contains(var_name);
+
                         // Check if the key is numeric (indexed array) or string (associative array)
-                        if key.parse::<usize>().is_ok() {
+                        if !known_array {
+                            "q{}".to_string()
+                        } else if key.parse::<usize>().is_ok() {
                             // Indexed array access: arr[1] -> $arr[1]
                             format!("${}[{}]", var_name, key)
                         } else if generator.associative_arrays.contains(var_name) {
@@ -226,11 +237,18 @@ pub fn generate_parameter_expansion_impl(
             )
         }
         ParameterExpansionOperator::ErrorIfUnset(error) => {
-            // ${var:?error} - error if var is empty
+            // ${var:?error} - error if var is empty/unset: print the error to
+            // stderr and exit 1 (bash prints `bash: var: error` and exits 1).
+            // NOTE: plain `die('...')` is NOT usable here — the harness runs
+            // the generated file via `do $__f`, which catches the exception
+            // and returns undef (exit 0), silently swallowing the failure.
             let r = parameter_var_scalar_ref(generator, &pe.variable);
             format!(
-                "(defined {} && {} ne q{{}} ? {} : die('{}'))",
-                r, r, r, error
+                "(defined {} && {} ne q{{}} ? {} : do {{ print STDERR {}; exit 1; }})",
+                r,
+                r,
+                r,
+                safe_perl_q_string(&format!("{}: {}\n", pe.variable, error))
             )
         }
         ParameterExpansionOperator::BadSubstitution => {
@@ -427,6 +445,86 @@ pub fn generate_parameter_expansion_impl(
     }
 }
 
+/// Render a parameter expansion for contexts that only hold `&Generator`
+/// (the test-expression text path re-parses `${...}` operands).  Covers the
+/// pattern-removal / substitution / case-mod operators, which need no
+/// generator mutation.  Returns None for operators this helper doesn't cover
+/// (callers fall back to their existing handling).
+pub(crate) fn render_pattern_param_expansion(
+    generator: &Generator,
+    pe: &ParameterExpansion,
+) -> Option<String> {
+    let out = match &pe.operator {
+        ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
+            // ${var%suffix} — shortest (rightmost) suffix: reverse, strip
+            // the shortest prefix of the reversed pattern, reverse back.
+            let rev_pattern = reverse_glob_pattern(pattern);
+            let regex = glob_to_perl_regex_nongreedy(&rev_pattern);
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!(
+                "scalar reverse( (scalar reverse {}) =~ s/^{}//r )",
+                r, regex
+            )
+        }
+        ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
+            let regex = glob_to_perl_regex_greedy(pattern);
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("{} =~ s/{}$//sr", r, regex)
+        }
+        ParameterExpansionOperator::RemoveShortestPrefix(pattern) => {
+            let regex = glob_to_perl_regex_nongreedy(pattern);
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("{} =~ s/^{}//r", r, regex)
+        }
+        ParameterExpansionOperator::RemoveLongestPrefix(pattern) => {
+            let regex = glob_to_perl_regex_greedy(pattern);
+            let r = parameter_var_scalar_ref(generator, &pe.variable);
+            format!("{} =~ s/^{}//sr", r, regex)
+        }
+        ParameterExpansionOperator::SubstituteFirst(pattern, replacement) => {
+            let r = parameter_var_bare_ref(generator, &pe.variable);
+            format!(
+                "{} =~ s/{}/{}/rs",
+                r,
+                escape_regex_pattern(pattern),
+                escape_regex_replacement(replacement)
+            )
+        }
+        ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
+            let r = parameter_var_bare_ref(generator, &pe.variable);
+            format!(
+                "{} =~ s/{}/{}/grs",
+                r,
+                escape_regex_pattern(pattern),
+                escape_regex_replacement(replacement)
+            )
+        }
+        ParameterExpansionOperator::UppercaseAll => {
+            format!("uc({})", parameter_var_scalar_ref(generator, &pe.variable))
+        }
+        ParameterExpansionOperator::LowercaseAll => {
+            format!("lc({})", parameter_var_scalar_ref(generator, &pe.variable))
+        }
+        ParameterExpansionOperator::UppercaseFirst => {
+            format!("ucfirst({})", parameter_var_scalar_ref(generator, &pe.variable))
+        }
+        ParameterExpansionOperator::Basename => {
+            format!("basename({})", parameter_var_scalar_ref(generator, &pe.variable))
+        }
+        ParameterExpansionOperator::Dirname => {
+            format!("dirname({})", parameter_var_scalar_ref(generator, &pe.variable))
+        }
+        _ => return None,
+    };
+    // Wrap in parens: these operators bind looser than Perl comparison
+    // operators (`a =~ s///r > b` parses as `(a =~ s///r) > b` only if
+    // parenthesized — raw `=~` after `>` would apply to the comparison
+    // result).  The string path emits them bare inside concatenations
+    // where the surrounding quotes disambiguate; the test-expression
+    // path needs explicit grouping.
+    Some(format!("({})", out))
+}
+
 /// Convert a parameter expansion default value to Perl code.
 /// If the default contains command substitutions (`$(...)` or backtick), parse and
 /// convert them; otherwise emit a string literal.
@@ -556,7 +654,7 @@ pub(crate) fn glob_to_perl_regex_greedy(pattern: &str) -> String {
 
 /// Reverse a glob pattern for use with the suffix reverse trick.
 /// e.g. "o*" becomes "*o", "*abc" becomes "abc*"
-fn reverse_glob_pattern(pattern: &str) -> String {
+pub(crate) fn reverse_glob_pattern(pattern: &str) -> String {
     // Collect glob tokens (literals, *, ?)
     let mut tokens: Vec<String> = Vec::new();
     let mut literal = String::new();
@@ -595,7 +693,7 @@ fn reverse_glob_pattern(pattern: &str) -> String {
     tokens.join("")
 }
 
-fn escape_regex_pattern(pattern: &str) -> String {
+pub(crate) fn escape_regex_pattern(pattern: &str) -> String {
     // Escape special regex characters in the pattern.
     // Also escape '/' because the caller embeds the result in s/// with
     // '/' as the delimiter; unescaped '/' would break the substitution.
@@ -615,7 +713,7 @@ fn escape_regex_pattern(pattern: &str) -> String {
         .replace("|", "\\|")
 }
 
-fn escape_regex_replacement(replacement: &str) -> String {
+pub(crate) fn escape_regex_replacement(replacement: &str) -> String {
     // Escape special regex characters in the replacement string
     replacement
         .replace("\\", "\\\\")
