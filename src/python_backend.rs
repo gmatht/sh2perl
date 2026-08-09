@@ -27,6 +27,8 @@ pub struct Render {
     /// syntax error, so Return outside a function lowers to a TODO)
     in_function: usize,
     todo: usize,
+    /// needs `import re` (the grepMatches lift)
+    need_re: bool,
 }
 
 /// Render an `IrProgram` to python source (a runnable script).
@@ -359,6 +361,39 @@ impl Render {
                 self.sh2_stub("test", args, "test")
             }
             // everything else → compile-able sh2.* stub
+            // `grepMatches(text, pattern, flags)` — the `grep -o` lift:
+            // native re.findall (one match per line, grep -o's output).
+            // flags: E (ERE as-is), F (fixed), i (case-insensitive).
+            "grepMatches" => {
+                let text = args.first().map(|a| self.expr(a)).unwrap_or_else(|| "\"\"".into());
+                let pat = match args.get(1) {
+                    Some(IrExpr::Str(s, _)) => s.clone(),
+                    _ => return self.sh2_stub("grepMatches", args, "grepMatches"),
+                };
+                let flags = match args.get(2) {
+                    Some(IrExpr::Str(s, _)) => s.clone(),
+                    _ => String::new(),
+                };
+                self.need_re = true;
+                let mut body = pat;
+                if flags.contains('F') {
+                    let mut lit = String::new();
+                    for c in body.chars() {
+                        if matches!(c, '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\') {
+                            lit.push('\\');
+                        }
+                        lit.push(c);
+                    }
+                    body = lit;
+                } else if !flags.contains('E') {
+                    body = body
+                        .replace("\\\\+", "+").replace("\\\\?", "?")
+                        .replace("\\(", "(").replace("\\)", ")")
+                        .replace("\\\\|", "|").replace("\\\\{", "{").replace("\\\\}", "}");
+                }
+                let rc = format!("\"\\n\".join(re.findall({}, {text}))", Self::py_str(&body));
+                rc
+            }
             _ => self.sh2_stub(func, args, func),
         }
     }
@@ -450,6 +485,14 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => {
+                if let IrExpr::Call { func, .. } = e {
+                    if func == "grepMatches" {
+                        // statement position: the matches are the output
+                        let v = self.expr(e);
+                        self.emit(&format!("print({v})"));
+                        return;
+                    }
+                }
                 let x = self.expr(e);
                 self.emit(&format!("{x}"));
             }
@@ -663,6 +706,9 @@ impl Render {
         self.emit("import os");
         self.emit("import subprocess");
         self.emit("import sys");
+        if self.need_re {
+            self.emit("import re");
+        }
         self.emit("");
         if !self.sh2_calls.is_empty() {
             self.emit("# sh2.* runtime stubs — TODO: implement (harness/sh2-namespace.json)");
