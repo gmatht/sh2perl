@@ -4434,6 +4434,19 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     ),
                     None => "0".to_string(),
                 },
+                // The C frontend's user-function dispatch (the estree
+                // lowers the same A1 to sh2.fnCall) — a direct Perl sub
+                // call: fnCall(name, [args...]) → name(args...).
+                "fnCall" => {
+                    let name = args.first().and_then(call_arg_str).unwrap_or_default();
+                    let call_args: Vec<String> = match args.get(1) {
+                        Some(IrExpr::Array(elems)) => {
+                            elems.iter().map(|a| ir_expr_to_perl(a)).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    format!("{}({})", name, call_args.join(", "))
+                }
                 _ => {
                     let a = args
                         .iter()
