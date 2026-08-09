@@ -5302,13 +5302,16 @@ fn command_to_test_ir(cmd: &Command) -> IrExpr {
     try_lift_grep_contains(&ir).unwrap_or(ir)
 }
 
-/// `echo <arg> | grep <literal> >/dev/null 2>/dev/null` → `contains(arg,
-/// literal)`. grep's exit status with both streams discarded is exactly
-/// "does the line contain the literal pattern"; `echo <arg>` emits one
-/// line, so the lift is a plain substring test. Conservative: only plain
-/// literal patterns free of BRE metacharacters (`^ $ . [ ] * \`), no grep
-/// flags, echo with exactly one argument, both fds redirected to
-/// /dev/null, exactly two pipeline stages.
+/// `echo <arg> | grep <literal> >/dev/null` → `contains(arg, literal)`.
+/// grep's exit status with its OUTPUT discarded is exactly "does the line
+/// contain the literal pattern"; `echo <arg>` emits one line, so the lift
+/// is a plain substring test. Only fd 1 needs the /dev/null redirect:
+/// grep's stderr is not part of the substring semantics (a grep on a
+/// piped single line emits none, and the pipeline form wouldn't preserve
+/// stderr strongly either — a `2>/dev/null` is accepted but not
+/// required). Conservative: only plain literal patterns free of BRE
+/// metacharacters (`^ $ . [ ] * \`), no grep flags, echo with exactly
+/// one argument, exactly two pipeline stages.
 fn try_lift_grep_contains(cond: &IrExpr) -> Option<IrExpr> {
     let IrExpr::Call { func, args } = cond else {
         return None;
@@ -5367,8 +5370,9 @@ fn try_lift_grep_contains(cond: &IrExpr) -> Option<IrExpr> {
     if !is_safe_grep_literal(pat) {
         return None;
     }
-    // both fds discarded to /dev/null (redirect-spec objects)
-    let (mut out, mut err) = (false, false);
+    // the OUTPUT discarded to /dev/null (redirect-spec objects); the
+    // stderr redirect is irrelevant to the substring-test semantics
+    let mut out = false;
     for spec in redirect_specs {
         let IrExpr::Object(entries) = spec else {
             continue;
@@ -5382,15 +5386,11 @@ fn try_lift_grep_contains(cond: &IrExpr) -> Option<IrExpr> {
                 _ => {}
             }
         }
-        if mode == Some("w") && target == Some("/dev/null") {
-            match fd {
-                Some(1) => out = true,
-                Some(2) => err = true,
-                _ => {}
-            }
+        if fd == Some(1) && mode == Some("w") && target == Some("/dev/null") {
+            out = true;
         }
     }
-    if !(out && err) {
+    if !out {
         return None;
     }
     Some(call(
