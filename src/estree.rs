@@ -2586,8 +2586,12 @@ mod tests {
         // exactly `String(i)` (a one-element join never inserts the
         // separator), so the emitter emits the bare value — no array /
         // join machinery. An UNQUOTED `echo $i` is a field-split arg (the
-        // A1 split marker) and legitimately takes the flat/join path (the
-        // shortcut would comma-join a multi-word value).
+        // A1 split marker); when the split is provably a no-op (a
+        // numeric/nospace value — see expr_known_nospace) the arg is a
+        // single provably-scalar value and unwraps to the bare binding
+        // too. An un-scalarizable split (unknown/multi-word value) or an
+        // array-valued arg keeps the flat/join path (the shortcut would
+        // comma-join a multi-word value).
         let json = to_json("i=42; echo \"$i\"");
         assert!(json.contains("\"name\":\"String\""));
         assert!(!json.contains("\"name\":\"join\""), "single arg: no join");
@@ -2596,9 +2600,14 @@ mod tests {
             "single arg: no array"
         );
         assert!(!json.contains("unsupported"));
-        // unquoted: the split arg keeps the flat/join path
+        // unquoted but numeric: the field-split is a provable no-op (i is
+        // a numeric var) — the single scalar arg unwraps, no flat/join
         let json_unq = to_json("i=42; echo $i");
-        assert!(json_unq.contains("\"name\":\"join\""));
+        assert!(!json_unq.contains("\"name\":\"join\""), "numeric single arg: no join");
+        assert!(
+            !json_unq.contains("\"type\":\"ArrayExpression\""),
+            "numeric single arg: no array"
+        );
         // two args keep the word-join
         let json2 = to_json("i=42; echo $i $i");
         assert!(json2.contains("\"name\":\"join\""));
@@ -4145,6 +4154,34 @@ mod migrated_passes_tests {
         let j5 = to_json("if true; then arr=(a b); fi; echo ${arr[1]}");
         assert_eq!(count(&j5, "\"name\":\"setArray\""), 1, "nested setArray keeps runtime: {j5}");
         for j in [&j1, &j2, &j3, &j4, &j5] {
+            assert!(!j.contains("unsupported"));
+        }
+    }
+
+    /// A single provably-scalar echo arg drops the array/join machinery:
+    /// `[i].flat().join(" ")` is exactly `i`, so `echo $i` writes
+    /// `i + "\n"` (the No-Space/numeric skip already scalarized the
+    /// field-split, leaving a stale flat flag). An ARRAY-VALUED single
+    /// arg (${arr[@]}) keeps the flat/join splice.
+    #[test]
+    fn single_scalar_echo_arg_drops_join_machinery() {
+        let json = to_json("i=5; echo $i");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("\"name\":\"flat\""), "no flat: {json}");
+        assert!(!s.contains("\"name\":\"join\""), "no join: {json}");
+        assert!(!s.contains("\"type\":\"ArrayExpression\""), "no array: {json}");
+        assert!(s.contains("\"name\":\"i\""), "bare numeric arg: {json}");
+        assert!(!json.contains("unsupported"));
+        // the loop-counter case from sqrt1337.sh
+        let json2 = to_json("for i in `seq 1 3`; do echo $i; done");
+        assert!(!json2.contains("\"name\":\"flat\""), "loop counter: no flat: {json2}");
+        assert!(!json2.contains("\"name\":\"join\""), "loop counter: no join: {json2}");
+        // an ARRAY-VALUED single arg keeps the flat/join splice
+        let json3 = to_json("arr=(a b c); echo \"${arr[@]}\"");
+        assert!(json3.contains("\"name\":\"flat\""), "array arg keeps flat: {json3}");
+        assert!(json3.contains("\"name\":\"join\""), "array arg keeps join: {json3}");
+        for j in [&json, &json2, &json3] {
             assert!(!j.contains("unsupported"));
         }
     }
