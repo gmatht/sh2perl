@@ -12098,6 +12098,15 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         }
                         _ => expr_to_estree(expr),
                     },
+                    // `w = line(t, 0)` — the out-param transform's multi-
+                    // write destructure (core request c-multi-return): the
+                    // native expression (String(t).split('\n')[i] ?? '' —
+                    // see the `line` arm) assigned straight to the lifted
+                    // binding — the runtime setVar would write the STORE
+                    // and the native read would desync.
+                    IrExpr::Call { func, args } if func == "line" => {
+                        expr_to_estree(expr)
+                    }
                     _ => unreachable!("lifted var assigned an unanalysed source"),
                 };
                 return Some(Stmt::ExpressionStatement {
@@ -24866,6 +24875,54 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         }),
                         arguments: vec![expr_to_estree(n)],
                         optional: false,
+                    };
+                }
+            }
+            // `line(s, i)` — the i-th line of a captured multi-value
+            // return (the out-param transform's multi-write destructure,
+            // core request c-multi-return). Rendered NATIVE so a
+            // setVar/Assign of the result takes the native store-write
+            // path (a runtime `sh2.line` call would keep the store write
+            // while a lifted destructured var reads its native binding).
+            // Exact runtime semantics: `String(v).split('\n')[i] ?? ''`.
+            if func == "line" {
+                if let [v, IrExpr::Str(i, _)] = args.as_slice() {
+                    let ve = expr_to_estree(v);
+                    let idx = i.parse::<i64>().unwrap_or(0);
+                    return Expr::LogicalExpression {
+                        operator: "??".to_string(),
+                        left: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::CallExpression {
+                                callee: Box::new(Expr::MemberExpression {
+                                    object: Box::new(Expr::CallExpression {
+                                        callee: Box::new(Expr::Identifier {
+                                            name: "String".to_string(),
+                                        }),
+                                        arguments: vec![ve],
+                                        optional: false,
+                                    }),
+                                    property: Box::new(Expr::Identifier {
+                                        name: "split".to_string(),
+                                    }),
+                                    computed: false,
+                                    optional: false,
+                                }),
+                                arguments: vec![Expr::Literal {
+                                    value: serde_json::Value::String("\n".to_string()),
+                                    raw: None,
+                                    regex: None,
+                                }],
+                                optional: false,
+                            }),
+                            property: Box::new(Expr::Literal {
+                                value: serde_json::Value::from(idx),
+                                raw: None,
+                                regex: None,
+                            }),
+                            computed: true,
+                            optional: false,
+                        }),
+                        right: Box::new(str_lit("")),
                     };
                 }
             }
