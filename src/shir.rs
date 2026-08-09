@@ -9945,11 +9945,16 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         });
     }
     body.extend(prog.stmts.iter().filter_map(top_stmt_to_estree));
-    Program {
+    // lastExit-tail hoist (src/estree.rs): lift a constant `sh2.lastExit =
+    // N` out of if/else common tails and out of enclosing bare loops. Runs
+    // post-emission on the Program, so every consumer (the CLI's --estree,
+    // the otranspilerl wasm's shir_to_estree_json, the corpus gate) sees
+    // the same hoisted shape.
+    crate::estree::hoist_last_exit(Program {
         type_: "Program",
         source_type: "module",
         body,
-    }
+    })
 }
 
 /// Top-level statement lowering: additionally wraps statement-position calls
