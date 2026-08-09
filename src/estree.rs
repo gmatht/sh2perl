@@ -1013,6 +1013,1019 @@ fn forof_provably_runs(right: &Expr) -> bool {
     }
 }
 
+// ── native-array lowering ───────────────────────────────────────────
+//
+// Migrated from the website's src/lower.js `lowerNativeArrays` (which
+// the corpus gate could never see) into the emitter, so the gate holds
+// it accountable. When the estree PROVES an array is simple — one
+// `sh2.setArray("name", [..])` at top level, then only reads — the
+// runtime store calls become dead weight:
+//
+//   sh2.setArray("arr", [a, b])            →  let arr = [a, b];
+//   sh2.arrayIndex("arr", "1")             →  (arr[1] !== undefined ? arr[1] : "")
+//   sh2.getVar("arr[1]")                   →  (arr[1] !== undefined ? arr[1] : "")
+//   sh2.arrayLen("arr") / param slice "#arr" →  arr.length
+//   sh2.arrayItems("arr") / param slice "arr" →  arr
+//
+// Conservative guards (stricter than lower.js, which predates the
+// current emitter's arrayIndex/arrayItems shapes and never ran under
+// the gate):
+//   • exactly ONE setArray, and it must be a DIRECT top-level statement
+//     (a nested/conditional setArray can't become a `let`);
+//   • the setArray items are an ArrayExpression (a runtime-valued
+//     initializer can't be a JS literal);
+//   • every other ref is an element READ with a literal non-negative
+//     integer index, a `len`, or a `join` — no whole-var reads (`$arr`),
+//     no computed/arithmetic/negative subscripts (the runtime
+//     evalArith's + wraps negatives), no `setVar`/`unset` writes;
+//   • no ref inside a script-function arrow (`let __fn_* = … =>` / the
+//     older `sh2.define` shape) — the function may run before the `let`
+//     initializes (TDZ), and may shadow the name;
+//   • no pre-existing declaration / bare identifier use of the name
+//     anywhere (a native array's uses are all sh2 string args).
+
+#[derive(Default)]
+struct ArrayRefs {
+    /// sh2.setArray("name", [..]) refs seen (any depth).
+    set_arrays: usize,
+    /// The program-body index of the top-level setArray statement.
+    set_array_idx: Option<usize>,
+    /// One of them is the DIRECT expression of a top-level statement.
+    top_set_array: bool,
+    /// Program-body indices of statements containing a READ of the name
+    /// (element/len/join). A read must never EXECUTE before the setArray
+    /// (a native `let` would hit the TDZ; the runtime returns "" for an
+    /// as-yet-unset array).
+    read_stmt_idxs: Vec<usize>,
+    /// A whole-var read (`$arr` → getVar("name") / getVar("name[@]")).
+    whole: bool,
+    /// A write / unset / non-array-valued setArray / non-@ param.
+    writes: bool,
+    /// A ref inside a script-function arrow (deferred invocation).
+    in_fn: bool,
+    /// A computed / non-integer / negative-literal subscript read.
+    index_bad: bool,
+}
+
+fn is_sh2_call(callee: &Expr, fn_name: &str) -> bool {
+    matches!(callee, Expr::MemberExpression { object, property, computed: false, optional: false, .. }
+        if matches!(&**object, Expr::Identifier { name } if name == "sh2")
+            && matches!(&**property, Expr::Identifier { name: p } if p == fn_name))
+}
+
+fn sh2_callee_name(callee: &Expr) -> Option<&str> {
+    match callee {
+        Expr::MemberExpression { object, property, computed: false, optional: false, .. } => {
+            match (&**object, &**property) {
+                (Expr::Identifier { name: o }, Expr::Identifier { name: p }) if o == "sh2" => {
+                    Some(p)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn lit_str<'a>(e: &'a Expr) -> Option<&'a str> {
+    match e {
+        Expr::Literal { value, .. } => value.as_str(),
+        _ => None,
+    }
+}
+
+/// `"name[idx]"` → (name, idx) for a Literal getVar/setVar arg;
+/// `[@]`/`[*]` and bare `"name"` are whole-var (None).
+fn parse_var_arg_str(s: &str) -> Option<(&str, Option<&str>)> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_suffix(']') {
+        if let Some(open) = rest.rfind('[') {
+            let (name, idx) = (&rest[..open], &rest[open + 1..]);
+            if name.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                if idx == "@" || idx == "*" {
+                    return Some((name, None)); // whole-array form
+                }
+                return Some((name, Some(idx)));
+            }
+        }
+    }
+    Some((s, None))
+}
+
+/// Classify one sh2 call into the per-name accumulator.
+fn classify_array_call(
+    fn_name: &str,
+    args: &[Expr],
+    in_fn: bool,
+    stmt_idx: usize,
+    top_set_arrays: &std::collections::HashSet<String>,
+    acc: &mut std::collections::HashMap<String, ArrayRefs>,
+) {
+    let Some(first) = args.first() else { return };
+    let name = match fn_name {
+        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "unset" => match lit_str(first) {
+            Some(n) => n,
+            None => return,
+        },
+        "getVar" | "setVar" => {
+            // Literal "name[idx]" / "name", or template `name[${i}]`
+            match first {
+                Expr::Literal { value, .. } => {
+                    let Some(s) = value.as_str() else { return };
+                    match parse_var_arg_str(s) {
+                        Some((n, _)) => n,
+                        None => return,
+                    }
+                }
+                Expr::TemplateLiteral { quasis, expressions } => {
+                    if quasis.len() == 2 && expressions.len() == 1 {
+                        let head = quasis[0].value.raw.trim_end_matches('[');
+                        if quasis[1].value.raw.trim() == "]" {
+                            head
+                        } else {
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+        "arrayIndex" => match lit_str(first) {
+            Some(n) => n,
+            None => return,
+        },
+        "param" => {
+            let Some(target_arg) = args.get(1) else { return };
+            let Some(target) = lit_str(target_arg) else { return };
+            let Some(op) = lit_str(first) else { return };
+            // slice-of-a-name is an array ref; other params are not
+            if op == "slice" {
+                target.trim_start_matches('#')
+            } else {
+                return;
+            }
+        }
+        _ => return,
+    };
+    let entry = acc.entry(name.to_string()).or_default();
+    if in_fn {
+        entry.in_fn = true;
+    }
+    match fn_name {
+        "setArray" => {
+            entry.set_arrays += 1;
+            if top_set_arrays.contains(name) {
+                entry.top_set_array = true;
+                entry.set_array_idx = Some(stmt_idx);
+            }
+            if !matches!(args.get(1), Some(Expr::ArrayExpression { .. })) {
+                entry.writes = true;
+            }
+        }
+        "setArrayAppend" => entry.writes = true,
+        "getVar" => match args.first() {
+            Some(Expr::Literal { value, .. }) => {
+                if let Some((_, Some(idx))) = parse_var_arg_str(value.as_str().unwrap_or("")) {
+                    if idx.parse::<i64>().map(|v| v >= 0).unwrap_or(false) {
+                        // plain literal element read — OK
+                        entry.read_stmt_idxs.push(stmt_idx);
+                    } else {
+                        entry.index_bad = true;
+                    }
+                } else {
+                    entry.whole = true; // bare name / [@] / [*]
+                }
+            }
+            Some(Expr::TemplateLiteral { .. }) => entry.index_bad = true,
+            _ => {}
+        },
+        "arrayIndex" => match args.get(1) {
+            Some(Expr::Literal { value, .. }) => {
+                if value
+                    .as_i64()
+                    .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    .map(|v| v >= 0)
+                    .unwrap_or(false)
+                {
+                    // plain literal element read — OK
+                    entry.read_stmt_idxs.push(stmt_idx);
+                } else {
+                    entry.index_bad = true;
+                }
+            }
+            _ => entry.index_bad = true,
+        },
+        "arrayLen" | "arrayItems" => entry.read_stmt_idxs.push(stmt_idx),
+        "param" => {
+            let op = args.first().and_then(lit_str).unwrap_or("");
+            let target = args.get(1).and_then(lit_str).unwrap_or("");
+            let mode = args.get(2).and_then(lit_str).unwrap_or("");
+            if op == "slice" && mode == "@" {
+                // len (#name) or join (name) — both reads
+                entry.read_stmt_idxs.push(stmt_idx);
+            } else {
+                entry.writes = true;
+            }
+        }
+        "setVar" => entry.writes = true,
+        "unset" => entry.writes = true,
+        _ => {}
+    }
+}
+
+/// Walk every expr in a statement; `in_fn` becomes true inside a
+/// script-function arrow (`let __fn_* = … =>` / `sh2.define(…, … =>)`).
+fn walk_stmt_exprs(stmt: &Stmt, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
+    match stmt {
+        Stmt::ExpressionStatement { expression } => walk_expr(expression, in_fn, f),
+        Stmt::BlockStatement { body } => {
+            for s in body {
+                walk_stmt_exprs(s, in_fn, f);
+            }
+        }
+        Stmt::IfStatement { test, consequent, alternate, .. } => {
+            walk_expr(test, in_fn, f);
+            walk_stmt_exprs(consequent, in_fn, f);
+            if let Some(a) = alternate {
+                walk_stmt_exprs(a, in_fn, f);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases, .. } => {
+            walk_expr(discriminant, in_fn, f);
+            for c in cases {
+                for s in &c.consequent {
+                    walk_stmt_exprs(s, in_fn, f);
+                }
+            }
+        }
+        Stmt::WhileStatement { test, body, .. } => {
+            walk_expr(test, in_fn, f);
+            walk_stmt_exprs(body, in_fn, f);
+        }
+        Stmt::ForStatement { init, test, update, body, .. } => {
+            walk_stmt_exprs(init, in_fn, f);
+            walk_expr(test, in_fn, f);
+            walk_expr(update, in_fn, f);
+            walk_stmt_exprs(body, in_fn, f);
+        }
+        Stmt::ForOfStatement { left, right, body, .. } => {
+            walk_stmt_exprs(left, in_fn, f);
+            walk_expr(right, in_fn, f);
+            walk_stmt_exprs(body, in_fn, f);
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                walk_expr(&d.id, in_fn, f);
+                if let Some(init) = &d.init {
+                    // `let __fn_<name> = async (...) => {…}` — a script
+                    // function's body (deferred; scope-safety guard)
+                    let fn_arrow = matches!(&d.id, Expr::Identifier { name } if name.starts_with("__fn_"))
+                        && matches!(init, Expr::ArrowFunctionExpression { .. });
+                    walk_expr(init, if fn_arrow { true } else { in_fn }, f);
+                }
+            }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        Stmt::ReturnStatement { argument } => {
+            if let Some(a) = argument {
+                walk_expr(a, in_fn, f);
+            }
+        }
+    }
+}
+
+fn walk_expr(e: &Expr, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
+    f(e, in_fn);
+    match e {
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        Expr::TemplateLiteral { expressions, .. } => {
+            for q in expressions {
+                walk_expr(q, in_fn, f);
+            }
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            walk_expr(callee, in_fn, f);
+            // the older `sh2.define("name", … => {…})` function shape
+            let in_define = is_sh2_call(callee, "define");
+            for a in arguments {
+                walk_expr(a, if in_define { true } else { in_fn }, f);
+            }
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            walk_expr(object, in_fn, f);
+            walk_expr(property, in_fn, f);
+        }
+        Expr::AwaitExpression { argument } => walk_expr(argument, in_fn, f),
+        Expr::ArrowFunctionExpression { params, body, .. } => {
+            for p in params {
+                walk_expr(p, in_fn, f);
+            }
+            match body {
+                ArrowBody::Expr(e) => walk_expr(e, in_fn, f),
+                ArrowBody::Block(s) => walk_stmt_exprs(s, in_fn, f),
+            }
+        }
+        Expr::ObjectExpression { properties } => {
+            for p in properties {
+                walk_expr(&p.key, in_fn, f);
+                walk_expr(&p.value, in_fn, f);
+            }
+        }
+        Expr::ArrayExpression { elements } => {
+            for el in elements.iter().flatten() {
+                walk_expr(el, in_fn, f);
+            }
+        }
+        Expr::SpreadElement { argument } => walk_expr(argument, in_fn, f),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. } => {
+            walk_expr(left, in_fn, f);
+            walk_expr(right, in_fn, f);
+        }
+        Expr::AssignmentExpression { left, right, .. } => {
+            // `__fn_f = async () => {…}` — the script-function binding
+            // (the current emitter's shape: `let __fn_f = null` then the
+            // sequence assigns the arrow). The arrow body is deferred
+            // (scope-safety guard).
+            let fn_assign = matches!(&**left, Expr::Identifier { name } if name.starts_with("__fn_"))
+                && matches!(&**right, Expr::ArrowFunctionExpression { .. });
+            walk_expr(left, in_fn, f);
+            walk_expr(right, if fn_assign { true } else { in_fn }, f);
+        }
+        Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+            walk_expr(test, in_fn, f);
+            walk_expr(consequent, in_fn, f);
+            walk_expr(alternate, in_fn, f);
+        }
+        Expr::UnaryExpression { argument, .. } => walk_expr(argument, in_fn, f),
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions {
+                walk_expr(x, in_fn, f);
+            }
+        }
+        Expr::NewExpression { callee, arguments } => {
+            walk_expr(callee, in_fn, f);
+            for a in arguments {
+                walk_expr(a, in_fn, f);
+            }
+        }
+    }
+}
+
+/// Rewrite a provably-static array to native JS (lower.js's
+/// lowerNativeArrays, moved into the emitter). Runs FIRST in the
+/// post-emission pipeline (mirrors the website's pass order).
+pub(crate) fn lower_native_arrays(prog: Program) -> Program {
+    // Which names have a DIRECT top-level `sh2.setArray("name", [..])`?
+    let mut top_set_arrays: std::collections::HashSet<String> = Default::default();
+    for stmt in &prog.body {
+        if let Stmt::ExpressionStatement { expression } = stmt {
+            if let Expr::CallExpression { callee, arguments, .. } = expression {
+                if is_sh2_call(callee, "setArray") {
+                    if let [Expr::Literal { value, .. }, Expr::ArrayExpression { .. }] =
+                        arguments.as_slice()
+                    {
+                        if let Some(n) = value.as_str() {
+                            top_set_arrays.insert(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Classify every sh2 call in every top-level statement.
+    let mut acc: std::collections::HashMap<String, ArrayRefs> = Default::default();
+    let mut declared: std::collections::HashSet<String> = Default::default();
+    for (stmt_idx, stmt) in prog.body.iter().enumerate() {
+        walk_stmt_exprs(stmt, false, &mut |e, in_fn| {
+            if let Expr::CallExpression { callee, arguments, .. } = e {
+                if let Some(fn_name) = sh2_callee_name(callee) {
+                    classify_array_call(
+                        fn_name,
+                        arguments,
+                        in_fn,
+                        stmt_idx,
+                        &top_set_arrays,
+                        &mut acc,
+                    );
+                }
+            }
+            if let Expr::Identifier { name } = e {
+                declared.insert(name.clone());
+            }
+        });
+    }
+    // Decide: exactly one top-level array-valued setArray; read-only
+    // literal-index refs; nothing whole/write/unset/computed/in-function;
+    // no other bare use of the name anywhere.
+    let natives: std::collections::HashSet<String> = acc
+        .iter()
+        .filter(|(name, a)| {
+            a.set_arrays == 1
+                && a.top_set_array
+                && a.set_array_idx.is_some()
+                && a.read_stmt_idxs
+                    .iter()
+                    .all(|i| a.set_array_idx.unwrap() < *i)
+                && !a.whole
+                && !a.writes
+                && !a.in_fn
+                && !a.index_bad
+                && !declared.contains(*name)
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    if natives.is_empty() {
+        return prog;
+    }
+    // Apply: setArray statement → `let name = items;` (with the runtime
+    // setArray's one-level SPLICE — array-valued items are flattened, so
+    // the initializer is `[].concat(...items)` unless every item is a
+    // plain scalar); rewrite reads everywhere.
+    let body = prog
+        .body
+        .into_iter()
+        .map(|stmt| match &stmt {
+            Stmt::ExpressionStatement { expression } => {
+                if let Expr::CallExpression { callee, arguments, .. } = expression {
+                    if is_sh2_call(callee, "setArray") {
+                        if let [Expr::Literal { value, .. }, items] = arguments.as_slice() {
+                            if let Some(n) = value.as_str() {
+                                if natives.contains(n) {
+                                    let items: Vec<Expr> = match items {
+                                        Expr::ArrayExpression { elements } => elements
+                                            .iter()
+                                            .flatten()
+                                            .map(|e| lower_expr(e.clone(), &natives))
+                                            .collect(),
+                                        _ => vec![],
+                                    };
+                                    let init = if items.iter().all(is_scalar_array_item) {
+                                        Expr::ArrayExpression {
+                                            elements: items.into_iter().map(Some).collect(),
+                                        }
+                                    } else {
+                                        // the runtime splices array-valued
+                                        // items one level ([].concat)
+                                        Expr::CallExpression {
+                                            callee: Box::new(Expr::MemberExpression {
+                                                object: Box::new(Expr::ArrayExpression {
+                                                    elements: vec![],
+                                                }),
+                                                property: Box::new(Expr::Identifier {
+                                                    name: "concat".to_string(),
+                                                }),
+                                                computed: false,
+                                                optional: false,
+                                            }),
+                                            arguments: items,
+                                            optional: false,
+                                        }
+                                    };
+                                    return Stmt::VariableDeclaration {
+                                        kind: "let",
+                                        declarations: vec![VariableDeclarator {
+                                            type_: "VariableDeclarator",
+                                            id: Expr::Identifier {
+                                                name: n.to_string(),
+                                            },
+                                            init: Some(init),
+                                        }],
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::ExpressionStatement {
+                    expression: lower_expr(expression.clone(), &natives),
+                }
+            }
+            _ => lower_stmt(stmt.clone(), &natives),
+        })
+        .collect();
+    Program {
+        type_: prog.type_,
+        source_type: prog.source_type,
+        body,
+    }
+}
+
+/// A setArray item that is provably a plain scalar (a JS array literal
+/// element, no runtime one-level splice needed). Calls, identifiers,
+/// arrays and member reads may hold ARRAYS — the runtime setArray
+/// splices those (`out.push(...e)`), so they take the `[].concat(...)`
+/// initializer form instead.
+fn is_scalar_array_item(e: &Expr) -> bool {
+    match e {
+        Expr::Literal { .. }
+        | Expr::TemplateLiteral { .. }
+        | Expr::UnaryExpression { .. }
+        | Expr::BinaryExpression { .. }
+        | Expr::LogicalExpression { .. }
+        | Expr::ConditionalExpression { .. }
+        | Expr::SequenceExpression { .. }
+        | Expr::AssignmentExpression { .. } => true,
+        _ => false,
+    }
+}
+
+fn lower_stmt(stmt: Stmt, natives: &std::collections::HashSet<String>) -> Stmt {
+    match stmt {
+        Stmt::ExpressionStatement { expression } => Stmt::ExpressionStatement {
+            expression: lower_expr(expression, natives),
+        },
+        Stmt::BlockStatement { body } => Stmt::BlockStatement {
+            body: body.into_iter().map(|s| lower_stmt(s, natives)).collect(),
+        },
+        Stmt::IfStatement { test, consequent, alternate } => Stmt::IfStatement {
+            test: lower_expr(test, natives),
+            consequent: Box::new(lower_stmt(*consequent, natives)),
+            alternate: alternate.map(|a| Box::new(lower_stmt(*a, natives))),
+        },
+        Stmt::SwitchStatement { discriminant, cases } => Stmt::SwitchStatement {
+            discriminant: lower_expr(discriminant, natives),
+            cases: cases
+                .into_iter()
+                .map(|c| SwitchCase {
+                    type_: c.type_,
+                    test: c.test.map(|t| lower_expr(t, natives)),
+                    consequent: c
+                        .consequent
+                        .into_iter()
+                        .map(|s| lower_stmt(s, natives))
+                        .collect(),
+                })
+                .collect(),
+        },
+        Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
+            test: lower_expr(test, natives),
+            body: Box::new(lower_stmt(*body, natives)),
+        },
+        Stmt::ForStatement { init, test, update, body } => Stmt::ForStatement {
+            init: Box::new(lower_stmt(*init, natives)),
+            test: lower_expr(test, natives),
+            update: lower_expr(update, natives),
+            body: Box::new(lower_stmt(*body, natives)),
+        },
+        Stmt::ForOfStatement { left, right, body } => Stmt::ForOfStatement {
+            left: Box::new(lower_stmt(*left, natives)),
+            right: lower_expr(right, natives),
+            body: Box::new(lower_stmt(*body, natives)),
+        },
+        Stmt::VariableDeclaration { declarations, kind } => Stmt::VariableDeclaration {
+            declarations: declarations
+                .into_iter()
+                .map(|d| VariableDeclarator {
+                    type_: d.type_,
+                    id: lower_expr(d.id, natives),
+                    init: d.init.map(|i| lower_expr(i, natives)),
+                })
+                .collect(),
+            kind,
+        },
+        Stmt::BreakStatement { label } => Stmt::BreakStatement { label },
+        Stmt::ContinueStatement { label } => Stmt::ContinueStatement { label },
+        Stmt::ReturnStatement { argument } => Stmt::ReturnStatement {
+            argument: argument.map(|a| lower_expr(a, natives)),
+        },
+    }
+}
+
+/// Replace a matching sh2 read call with its native form; recurse.
+fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
+    if let Expr::CallExpression { callee, arguments, .. } = &e {
+        if let Some(fn_name) = sh2_callee_name(callee) {
+            match fn_name {
+                "arrayIndex" | "getVar" => {
+                    if let Some((name, idx)) = array_read_index(fn_name, arguments) {
+                        if natives.contains(name) {
+                            if let Some(idx) = idx {
+                                return native_element_read(name, idx);
+                            }
+                        }
+                    }
+                }
+                "arrayLen" | "arrayItems" | "param" => {
+                    if let Some((name, len)) = array_len_join(fn_name, arguments) {
+                        if natives.contains(name) {
+                            return if len {
+                                native_len_read(name)
+                            } else {
+                                Expr::Identifier { name: name.to_string() }
+                            };
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    match e {
+        Expr::CallExpression { callee, arguments, optional } => Expr::CallExpression {
+            callee: Box::new(lower_expr(*callee, natives)),
+            arguments: arguments
+                .into_iter()
+                .map(|a| lower_expr(a, natives))
+                .collect(),
+            optional,
+        },
+        Expr::Identifier { .. } | Expr::Literal { .. } => e,
+        Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
+            quasis,
+            expressions: expressions
+                .into_iter()
+                .map(|x| lower_expr(x, natives))
+                .collect(),
+        },
+        Expr::MemberExpression { object, property, computed, optional } => Expr::MemberExpression {
+            object: Box::new(lower_expr(*object, natives)),
+            property: Box::new(lower_expr(*property, natives)),
+            computed,
+            optional,
+        },
+        Expr::AwaitExpression { argument } => Expr::AwaitExpression {
+            argument: Box::new(lower_expr(*argument, natives)),
+        },
+        Expr::ArrowFunctionExpression { params, body, expression, r#async } => {
+            Expr::ArrowFunctionExpression {
+                params: params.into_iter().map(|p| lower_expr(p, natives)).collect(),
+                body: match body {
+                    ArrowBody::Expr(e) => ArrowBody::Expr(Box::new(lower_expr(*e, natives))),
+                    ArrowBody::Block(s) => ArrowBody::Block(Box::new(lower_stmt(*s, natives))),
+                },
+                expression,
+                r#async,
+            }
+        }
+        Expr::ObjectExpression { properties } => Expr::ObjectExpression {
+            properties: properties
+                .into_iter()
+                .map(|p| Property {
+                    type_: p.type_,
+                    key: lower_expr(p.key, natives),
+                    value: lower_expr(p.value, natives),
+                    kind: p.kind,
+                    computed: p.computed,
+                    shorthand: p.shorthand,
+                })
+                .collect(),
+        },
+        Expr::ArrayExpression { elements } => Expr::ArrayExpression {
+            elements: elements
+                .into_iter()
+                .map(|el| el.map(|x| lower_expr(x, natives)))
+                .collect(),
+        },
+        Expr::SpreadElement { argument } => Expr::SpreadElement {
+            argument: Box::new(lower_expr(*argument, natives)),
+        },
+        Expr::LogicalExpression { operator, left, right } => Expr::LogicalExpression {
+            operator,
+            left: Box::new(lower_expr(*left, natives)),
+            right: Box::new(lower_expr(*right, natives)),
+        },
+        Expr::BinaryExpression { operator, left, right } => Expr::BinaryExpression {
+            operator,
+            left: Box::new(lower_expr(*left, natives)),
+            right: Box::new(lower_expr(*right, natives)),
+        },
+        Expr::AssignmentExpression { operator, left, right } => Expr::AssignmentExpression {
+            operator,
+            left: Box::new(lower_expr(*left, natives)),
+            right: Box::new(lower_expr(*right, natives)),
+        },
+        Expr::ConditionalExpression { test, consequent, alternate } => Expr::ConditionalExpression {
+            test: Box::new(lower_expr(*test, natives)),
+            consequent: Box::new(lower_expr(*consequent, natives)),
+            alternate: Box::new(lower_expr(*alternate, natives)),
+        },
+        Expr::UnaryExpression { operator, argument, prefix } => Expr::UnaryExpression {
+            operator,
+            argument: Box::new(lower_expr(*argument, natives)),
+            prefix,
+        },
+        Expr::SequenceExpression { expressions } => Expr::SequenceExpression {
+            expressions: expressions.into_iter().map(|x| lower_expr(x, natives)).collect(),
+        },
+        Expr::NewExpression { callee, arguments } => Expr::NewExpression {
+            callee: Box::new(lower_expr(*callee, natives)),
+            arguments: arguments.into_iter().map(|a| lower_expr(a, natives)).collect(),
+        },
+    }
+}
+
+/// `sh2.getVar("arr[1]")` / `sh2.arrayIndex("arr", "1")` → (name, Some(idx))
+/// for a LITERAL non-negative integer index; None for anything else.
+fn array_read_index<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, Option<i64>)> {
+    let name = lit_str(args.first()?)?;
+    if fn_name == "getVar" {
+        let (n, idx) = parse_var_arg_str(name)?;
+        let idx = idx?;
+        let v = idx.parse::<i64>().ok()?;
+        (v >= 0).then_some((n, Some(v)))
+    } else {
+        let v = args.get(1)?.as_literal_i64()?;
+        (v >= 0).then_some((name, Some(v)))
+    }
+}
+
+/// `sh2.arrayLen("arr")` / `arrayItems("arr")` / `param("slice", …)` →
+/// (name, is_len). `arrayItems` returns the ARRAY (the native echo
+/// wraps it in `[].concat(…).join(" ")`), so the rewrite is the bare
+/// identifier; `len` rewrites to `name.length`.
+fn array_len_join<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, bool)> {
+    match fn_name {
+        "arrayLen" => lit_str(args.first()?).map(|n| (n, true)),
+        "arrayItems" => lit_str(args.first()?).map(|n| (n, false)),
+        "param" => {
+            let op = lit_str(args.first()?)?;
+            let mode = args.get(2).and_then(lit_str)?;
+            if op != "slice" || mode != "@" {
+                return None;
+            }
+            let target = lit_str(args.get(1)?)?;
+            Some((target.trim_start_matches('#'), target.starts_with('#')))
+        }
+        _ => None,
+    }
+}
+
+fn native_element_read(name: &str, idx: i64) -> Expr {
+    let elem = Expr::MemberExpression {
+        object: Box::new(Expr::Identifier {
+            name: name.to_string(),
+        }),
+        property: Box::new(Expr::Literal {
+            value: serde_json::Value::from(idx),
+            raw: None,
+            regex: None,
+        }),
+        computed: true,
+        optional: false,
+    };
+    Expr::ConditionalExpression {
+        test: Box::new(Expr::BinaryExpression {
+            operator: "!==".to_string(),
+            left: Box::new(elem.clone()),
+            right: Box::new(Expr::Identifier {
+                name: "undefined".to_string(),
+            }),
+        }),
+        consequent: Box::new(elem),
+        alternate: Box::new(Expr::Literal {
+            value: serde_json::Value::String(String::new()),
+            raw: None,
+            regex: None,
+        }),
+    }
+}
+
+fn native_len_read(name: &str) -> Expr {
+    Expr::MemberExpression {
+        object: Box::new(Expr::Identifier {
+            name: name.to_string(),
+        }),
+        property: Box::new(Expr::Identifier {
+            name: "length".to_string(),
+        }),
+        computed: false,
+        optional: false,
+    }
+}
+
+trait AsLiteralI64 {
+    fn as_literal_i64(&self) -> Option<i64>;
+}
+impl AsLiteralI64 for Expr {
+    fn as_literal_i64(&self) -> Option<i64> {
+        match self {
+            // The emitter passes bash index TEXT (arrayIndex("arr",
+            // "1")) — accept both JSON numbers and numeric strings.
+            Expr::Literal { value, .. } => value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok())),
+            _ => None,
+        }
+    }
+}
+
+// ── dead-flag removal ───────────────────────────────────────────────
+//
+// Migrated from the website's src/lower.js `dropDeadFlags`. A command
+// statement's VALUE is its success flag — `(cmd?, flag)` — consumed ONLY
+// for the program's last statement (jtsh's runViaTranspiler returns it
+// as the exit code; the harness `_finish` reads sh2.lastExit, which the
+// last statement's status lowering set). Every other statement — loop
+// bodies, blocks, branches, guarded calls' args — has a dead value, so
+// `(cmd, true)` is just `cmd`. Also unwraps 1-element sequences (a bare
+// `(flag)` left after the lastExit hoist) and drops literal-only
+// statements (no side effects).
+//
+// Runs AFTER the lastExit hoist (mirrors the website's pass order). The
+// trailing element is popped ONLY when it is PURE — an if-statement
+// lowers to `(test, lastExit === 0 ? BRANCH : false)` whose tail is the
+// side-effecting BRANCH conditional (writes, calls); popping that would
+// DELETE the branch, so purity is the guard.
+
+fn is_pure_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Literal { .. } | Expr::Identifier { .. } => true,
+        Expr::TemplateLiteral { expressions, .. } => expressions.iter().all(is_pure_expr),
+        Expr::UnaryExpression { argument, .. } => is_pure_expr(argument),
+        Expr::BinaryExpression { left, right, .. } | Expr::LogicalExpression { left, right, .. } => {
+            is_pure_expr(left) && is_pure_expr(right)
+        }
+        Expr::ConditionalExpression { test, consequent, alternate } => {
+            is_pure_expr(test) && is_pure_expr(consequent) && is_pure_expr(alternate)
+        }
+        _ => false,
+    }
+}
+
+/// Process one statement (drop its trailing flag / unwrap / mark dead).
+/// Returns true when the statement is a bare literal (drop it).
+fn drop_stmt_flags(stmt: &mut Stmt) -> bool {
+    if let Stmt::ExpressionStatement { expression } = stmt {
+        if let Expr::SequenceExpression { expressions } = expression {
+            if expressions.len() == 1 {
+                if is_pure_literal(&expressions[0]) {
+                    return true; // a bare `(true)` — no side effects
+                }
+                *expression = expressions.pop().unwrap();
+            } else if is_pure_expr(expressions.last().unwrap()) {
+                expressions.pop();
+                if expressions.len() == 1 {
+                    *expression = expressions.pop().unwrap();
+                }
+            }
+        }
+    }
+    drop_nested_flags(stmt);
+    false
+}
+
+/// Recurse into a statement's nested statement lists (no exemption).
+fn drop_nested_flags(stmt: &mut Stmt) {
+    match stmt {
+        Stmt::ExpressionStatement { expression } => drop_expr_flags(expression),
+        Stmt::BlockStatement { body } => drop_flags_in_list(body),
+        Stmt::IfStatement { test, consequent, alternate } => {
+            drop_expr_flags(test);
+            drop_stmt_flags(consequent);
+            if let Some(a) = alternate {
+                drop_stmt_flags(a);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            drop_expr_flags(discriminant);
+            for c in cases {
+                drop_flags_in_list(&mut c.consequent);
+            }
+        }
+        Stmt::WhileStatement { test, body } => {
+            drop_expr_flags(test);
+            drop_stmt_flags(body);
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            drop_stmt_flags(init);
+            drop_expr_flags(test);
+            drop_expr_flags(update);
+            drop_stmt_flags(body);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            drop_stmt_flags(left);
+            drop_expr_flags(right);
+            drop_stmt_flags(body);
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                drop_expr_flags(&mut d.id);
+                if let Some(i) = &mut d.init {
+                    drop_expr_flags(i);
+                }
+            }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        Stmt::ReturnStatement { argument } => {
+            if let Some(a) = argument {
+                drop_expr_flags(a);
+            }
+        }
+    }
+}
+
+/// Recurse through an expression's nested statement lists (arrow bodies).
+fn drop_expr_flags(e: &mut Expr) {
+    match e {
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        Expr::TemplateLiteral { expressions, .. } => {
+            for x in expressions {
+                drop_expr_flags(x);
+            }
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            drop_expr_flags(callee);
+            for a in arguments {
+                drop_expr_flags(a);
+            }
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            drop_expr_flags(object);
+            drop_expr_flags(property);
+        }
+        Expr::AwaitExpression { argument } => drop_expr_flags(argument),
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            ArrowBody::Expr(e) => drop_expr_flags(e),
+            ArrowBody::Block(s) => drop_nested_flags(s),
+        },
+        Expr::ObjectExpression { properties } => {
+            for p in properties {
+                drop_expr_flags(&mut p.key);
+                drop_expr_flags(&mut p.value);
+            }
+        }
+        Expr::ArrayExpression { elements } => {
+            for el in elements.iter_mut().flatten() {
+                drop_expr_flags(el);
+            }
+        }
+        Expr::SpreadElement { argument } => drop_expr_flags(argument),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. }
+        | Expr::AssignmentExpression { left, right, .. } => {
+            drop_expr_flags(left);
+            drop_expr_flags(right);
+        }
+        Expr::ConditionalExpression { test, consequent, alternate } => {
+            drop_expr_flags(test);
+            drop_expr_flags(consequent);
+            drop_expr_flags(alternate);
+        }
+        Expr::UnaryExpression { argument, .. } => drop_expr_flags(argument),
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions {
+                drop_expr_flags(x);
+            }
+        }
+        Expr::NewExpression { callee, arguments } => {
+            drop_expr_flags(callee);
+            for a in arguments {
+                drop_expr_flags(a);
+            }
+        }
+    }
+}
+
+/// Remove unconsumed success flags from a statement list (no exemption).
+fn drop_flags_in_list(stmts: &mut Vec<Stmt>) {
+    let n = stmts.len();
+    let mut dead = vec![false; n];
+    for i in 0..n {
+        dead[i] = drop_stmt_flags(&mut stmts[i]);
+    }
+    if dead.iter().any(|d| *d) {
+        let mut j = 0;
+        stmts.retain(|_| {
+            let d = dead[j];
+            j += 1;
+            !d
+        });
+    }
+}
+
+/// The program's last statement's VALUE is the exit flag — it keeps its
+/// sequence. Every other statement (all levels) loses its dead flag.
+pub(crate) fn drop_dead_flags(prog: Program) -> Program {
+    let mut body = prog.body;
+    let n = body.len();
+    let mut dead = vec![false; n];
+    for i in 0..n {
+        if i == n - 1 {
+            drop_nested_flags(&mut body[i]); // keep its own value; recurse
+        } else {
+            dead[i] = drop_stmt_flags(&mut body[i]);
+        }
+    }
+    if dead.iter().any(|d| *d) {
+        let mut j = 0;
+        body.retain(|_| {
+            let d = dead[j];
+            j += 1;
+            !d
+        });
+    }
+    Program {
+        type_: prog.type_,
+        source_type: prog.source_type,
+        body,
+    }
+}
+
 // ── process-substitution pre-pass ───────────────────────────────────
 //
 // The parser stores `<(cmd)` both as an argument position (the argument
@@ -2500,8 +3513,10 @@ mod tests {
         let json = to_json("arr=(a b c d)\necho \"${arr[@]:0:2}\"");
         // no sh2.join dispatch
         assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"join\""));
-        // the native chain: arrayItems(...).slice(...).join(" ")
-        assert!(json.contains("\"name\":\"arrayItems\""));
+        // the native chain: arr.slice(...).join(" ") — the array
+        // itself (lowerNativeArrays replaced arrayItems with the bare
+        // binding: the array is provably initialized at top level)
+        assert!(!json.contains("\"name\":\"arrayItems\""));
         assert!(json.contains("\"name\":\"slice\""));
         assert!(json.contains("\"name\":\"join\""));
         assert!(json.contains("\"value\":\" \""));
@@ -3062,6 +4077,110 @@ mod last_exit_hoist_tests {
         assert!(
             !last_stmt_is_lastexit_write(&json),
             "no unconditional post-if write when statuses differ: {json}"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+}
+
+#[cfg(test)]
+mod migrated_passes_tests {
+    use super::*;
+    use crate::Parser;
+
+    fn to_json(input: &str) -> String {
+        let commands = Parser::new(input).parse().unwrap();
+        serde_json::to_string(&ast_to_estree(&commands)).unwrap()
+    }
+
+    fn count(json: &str, needle: &str) -> usize {
+        json.matches(needle).count()
+    }
+
+    /// lowerNativeArrays — a provably-static array drops its runtime
+    /// store calls: setArray → `let arr = [..]`, element reads →
+    /// `(arr[1] !== undefined ? arr[1] : "")`, `${#arr[@]}` → `arr.length`,
+    /// `${arr[@]}` → the bare array (the emitter's `[..].flat().join`
+    /// path joins it with spaces).
+    #[test]
+    fn static_array_lowers_to_native() {
+        let json = to_json("arr=(alpha beta gamma); echo ${arr[1]}");
+        assert_eq!(count(&json, "\"name\":\"setArray\""), 0, "{json}");
+        assert!(json.contains("\"type\":\"VariableDeclaration\""), "{json}");
+        assert!(json.contains("\"name\":\"arr\""), "{json}");
+        assert!(
+            json.contains("\"operator\":\"!==\"") && json.contains("\"name\":\"undefined\""),
+            "element read → (arr[i] !== undefined ? arr[i] : \"\"): {json}"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn array_length_and_items_lower_to_native() {
+        let json = to_json("arr=(a b c); echo ${#arr[@]}; echo \"${arr[@]}\"");
+        assert_eq!(count(&json, "\"name\":\"arrayLen\""), 0, "{json}");
+        assert_eq!(count(&json, "\"name\":\"arrayItems\""), 0, "{json}");
+        assert!(json.contains("\"name\":\"length\""), "len → arr.length: {json}");
+        assert!(json.contains("\"name\":\"arr\""), "items → bare arr: {json}");
+        assert!(!json.contains("unsupported"));
+    }
+
+    /// Whole-var reads (`$arr`), writes (`arr[1]=x`), refs inside a
+    /// script function, and computed subscripts all veto the lowering —
+    /// the array stays on the runtime store.
+    #[test]
+    fn array_lowering_is_conservative() {
+        // whole-var read
+        let j1 = to_json("arr=(a b c); echo $arr");
+        assert_eq!(count(&j1, "\"name\":\"setArray\""), 1, "whole read keeps runtime: {j1}");
+        // element write
+        let j2 = to_json("arr=(a b c); arr[1]=x; echo ${arr[1]}");
+        assert_eq!(count(&j2, "\"name\":\"setArray\""), 1, "write keeps runtime: {j2}");
+        // ref inside a script function (deferred invocation / shadowing)
+        let j3 = to_json("f() { echo ${arr[1]}; }; arr=(a b c); f");
+        assert_eq!(count(&j3, "\"name\":\"setArray\""), 1, "in-function keeps runtime: {j3}");
+        // computed subscript (runtime evalArith + negative wrap)
+        let j4 = to_json("arr=(a b c); i=1; echo ${arr[$i]}");
+        assert_eq!(count(&j4, "\"name\":\"setArray\""), 1, "computed index keeps runtime: {j4}");
+        // a nested (conditional) setArray can't become a top-level `let`
+        let j5 = to_json("if true; then arr=(a b); fi; echo ${arr[1]}");
+        assert_eq!(count(&j5, "\"name\":\"setArray\""), 1, "nested setArray keeps runtime: {j5}");
+        for j in [&j1, &j2, &j3, &j4, &j5] {
+            assert!(!j.contains("unsupported"));
+        }
+    }
+
+    /// dropDeadFlags — every statement except the program's last has a
+    /// dead success flag: `(cmd, true)` unwraps to `cmd` (the flag was
+    /// already stripped from branch tails by the lastExit hoist).
+    #[test]
+    fn dead_flags_dropped_except_program_last() {
+        let json = to_json("if false; then echo yes; fi; echo after");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let stmts = v["body"].as_array().unwrap();
+        // the if's consequent is a bare write — no sequence, no flag
+        let cons = &stmts[0]["consequent"]["body"][0];
+        assert_eq!(cons["expression"]["type"], "CallExpression", "{json}");
+        // the program's LAST statement keeps its sequence (its value is
+        // the exit flag for jtsh's runViaTranspiler)
+        let last = stmts.last().unwrap();
+        assert_eq!(last["expression"]["type"], "SequenceExpression", "{json}");
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn dead_flags_unwrap_one_element_sequences() {
+        // a non-last statement that is a bare `(flag)` (1-element seq)
+        // after the lastExit hoist unwraps/drops; the last keeps it
+        let json = to_json("echo one; echo two");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let stmts = v["body"].as_array().unwrap();
+        assert_eq!(
+            stmts[0]["expression"]["type"], "CallExpression",
+            "non-last statement unwrapped: {json}"
+        );
+        assert_eq!(
+            stmts.last().unwrap()["expression"]["type"], "SequenceExpression",
+            "last statement keeps its flag: {json}"
         );
         assert!(!json.contains("unsupported"));
     }
