@@ -57,6 +57,11 @@ static NATIVE_STORE_WRITE_BLOCKED: Mutex<Option<HashSet<String>>> = Mutex::new(N
 /// read, and bash's EMPTY text substitution must then still parse (the
 /// deletion gate) or the runtime evaluator stays.
 static ARITH_REF_SET: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// The "No spaces" tag verdicts (see `analyze_var_nospace`): the set of
+/// vars whose value is PROVABLY free of IFS whitespace. Set per
+/// compilation by `shir_to_estree`; the `split` call emitter consults it
+/// to skip the word-split on such vars (a provable no-op).
+static VAR_NOSPACE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// Whether `shopt -s nocasematch` may be enabled anywhere in the current
 /// program (set per compilation by `shir_to_estree`; see
 /// `ir_may_enable_nocasematch`). Native case/test substring lifts must
@@ -2413,6 +2418,7 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
         var_lengths: vec![],
         var_const: vec![],
         var_lifetimes: vec![],
+        var_nospace: vec![],
     }
 }
 
@@ -2435,6 +2441,7 @@ pub fn ast_to_ir_raw(commands: &[Command]) -> IrProgram {
         var_lengths: vec![],
         var_const: vec![],
         var_lifetimes: vec![],
+        var_nospace: vec![],
     }
 }
 
@@ -3185,6 +3192,246 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
         }
     }
     lens.into_iter().collect()
+}
+
+/// The "No spaces" tag: per variable, `true` when its value is PROVABLY
+/// free of IFS whitespace (space, tab, newline — the `\s+` word-split
+/// set). Proven sources, propagated to a fixed point:
+///
+///   • numeric values (literals, `$(( ))` arithmetic, numeric binops),
+///   • spaceless string constants (no whitespace chars at all),
+///   • `${x}`/concat/interpolation of already-spaceless values,
+///   • a copy of an already-spaceless variable,
+///   • command substitutions whose command provably emits no whitespace
+///     (`$(tr -d '[:space:]' …)` / `$(tr -d ' \t\n' …)` — the delete set
+///     must cover the whole IFS set; `tr -d ' '` alone removes only the
+///     space char, and the trailing-newline strip leaves inner
+///     newlines/tabs, so it is NOT sufficient).
+///
+/// A variable is tagged only when EVERY assignment site is provably
+/// spaceless; anything runtime (read/eval/capture of unknown commands,
+/// array stores) keeps it untagged. Backends use the tag to skip the
+/// word-split on `$var` expansions — the split is then a provable no-op.
+pub fn analyze_var_nospace(prog: &IrProgram) -> Vec<(String, bool)> {
+    use crate::ir::{InterpPart, IrExpr, IrStmt};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn whitespace_free(s: &str) -> bool {
+        !s.chars().any(char::is_whitespace)
+    }
+
+    /// The command text of a `tr -d <set>` delete set; the set arg is
+    /// usually an Interpolate of literal text (quoted "\t\n " stays a
+    /// literal backslash-t — the shell's $'...' / ANSI-C quoting would
+    /// turn it into a tab — handle the common POSIX-class + literal-set
+    /// forms conservatively).
+    fn tr_delete_set(arg: &IrExpr) -> Option<String> {
+        match arg {
+            IrExpr::Str(s, _) => Some(s.clone()),
+            IrExpr::Interpolate(parts) => {
+                let mut out = String::new();
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(s) => out.push_str(s),
+                        InterpPart::Expr(_) => return None, // dynamic set — no
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// A delete set that provably removes the whole IFS whitespace set.
+    fn covers_ifs_whitespace(set: &str) -> bool {
+        if set.contains("[:space:]") {
+            return true; // the POSIX class — all whitespace
+        }
+        // literal set: must contain the space char, a tab and a newline
+        // (ANSI-C quoting `$'\t\n '` reaches here as real control chars
+        // after the shell's expansion; the raw-text path sees them as
+        // backslash escapes — accept both spellings)
+        let has_space = set.contains(' ') || set.contains("\\ ");
+        let has_tab = set.contains('\t') || set.contains("\\t");
+        let has_nl = set.contains('\n') || set.contains("\\n");
+        has_space && has_tab && has_nl
+    }
+
+    /// Is the capture's command a whitespace-removing `tr -d`? The
+    /// capture's arrow body is `Expr(pipeline([Arrow(…), …, Arrow(last)]))`
+    /// or a single `Expr(exec tr -d <set> …)`. The output of
+    /// `tr -d <ifs-set>` is whitespace-free whatever the input.
+    fn last_stage_tr_deletes_ifs(stmts: &[IrStmt]) -> bool {
+        fn exec_is_tr_deletes(stmts: &[IrStmt]) -> bool {
+            match stmts.last() {
+                Some(IrStmt::Expr(IrExpr::Call { func, args })) if func == "exec" => {
+                    // exec args: [cmd, Array([arg1, arg2, …])]
+                    match (args.first(), args.get(1)) {
+                        (Some(IrExpr::Str(cmd, _)), Some(IrExpr::Array(argv)))
+                            if cmd == "tr" =>
+                        {
+                            match argv.first() {
+                                Some(IrExpr::Str(fl, _)) if fl == "-d" => argv
+                                    .get(1)
+                                    .and_then(tr_delete_set)
+                                    .map(|s| covers_ifs_whitespace(&s))
+                                    .unwrap_or(false),
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    }
+                }
+                Some(IrStmt::Expr(IrExpr::Call { func, args })) if func == "pipeline" => {
+                    match args.first() {
+                        Some(IrExpr::Array(stages)) => stages
+                            .last()
+                            .and_then(|s| match s {
+                                IrExpr::Arrow(b) => Some(b.as_slice()),
+                                _ => None,
+                            })
+                            .map(exec_is_tr_deletes)
+                            .unwrap_or(false),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            }
+        }
+        exec_is_tr_deletes(stmts)
+    }
+
+    fn expr_nospace(
+        e: &IrExpr,
+        verdicts: &BTreeMap<String, bool>,
+        prog: &IrProgram,
+    ) -> bool {
+        match e {
+            IrExpr::Int(_) => true,
+            IrExpr::Str(s, _) => whitespace_free(s),
+            IrExpr::Arith(_) => true, // numeric result
+            IrExpr::BinOp { .. } => true, // numeric binary op
+            IrExpr::Var(name, _) => verdicts.get(name).copied().unwrap_or(false),
+            IrExpr::Ident(name) => verdicts.get(name).copied().unwrap_or(false),
+            IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+                InterpPart::Lit(s) => whitespace_free(s),
+                InterpPart::Expr(x) => expr_nospace(x, verdicts, prog),
+            }),
+            IrExpr::Call { func, args } => match func.as_str() {
+                "getVar" => matches!(args.first(), Some(IrExpr::Str(n, _)) if verdicts.get(n).copied().unwrap_or(false)),
+                "arith" => true, // the numeric result
+                "capture" => {
+                    // command substitution: provably whitespace-free output
+                    matches!(
+                        args.first(),
+                        Some(IrExpr::Arrow(body)) if last_stage_tr_deletes_ifs(body)
+                    )
+                }
+                "param" => {
+                    // ${x}, ${x:-d}, ${x:+d}, ${x:=d}, ${x:?d}, ${x:off:len},
+                    // ${#x} — the result is built from the var value (its
+                    // verdict) and the literal/default/pattern parts
+                    // (whitespace-free requirement on each). Conservative:
+                    // only tag the pure-read forms; everything else stays
+                    // untagged.
+                    match args.first().and_then(|a| match a {
+                        IrExpr::Str(s, _) => Some(s.as_str()),
+                        _ => None,
+                    }) {
+                        Some(op) if op.is_empty() || op == "len" => {
+                            // ${x} / ${#x} — the var value itself
+                            match args.get(1).and_then(|a| match a {
+                                IrExpr::Str(n, _) => Some(n.as_str()),
+                                _ => None,
+                            }) {
+                                Some(name) if !name.starts_with('#') => {
+                                    verdicts.get(name).copied().unwrap_or(false)
+                                }
+                                _ => false,
+                            }
+                        }
+                        Some(":=") | Some(":-") | Some(":+") | Some(":?") | Some("=")
+                        | Some("+") | Some("?") => {
+                            // ${x:-d} etc. — the result is x's value or the
+                            // default: tag only when BOTH are spaceless
+                            let var_ok = match args.get(1).and_then(|a| match a {
+                                IrExpr::Str(n, _) => Some(n.as_str()),
+                                _ => None,
+                            }) {
+                                Some(name) => verdicts.get(name).copied().unwrap_or(false),
+                                _ => false,
+                            };
+                            let default_ok = args.get(2).map(|d| expr_nospace(d, verdicts, prog)).unwrap_or(false);
+                            var_ok && default_ok
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            },
+            IrExpr::Array(_) | IrExpr::Object(_) | IrExpr::Arrow(_) => false,
+            _ => false,
+        }
+    }
+
+    // collect the assignment targets + RHS exprs
+    let mut assigns: Vec<(String, &IrExpr)> = Vec::new();
+    fn walk<'a>(stmts: &'a [IrStmt], assigns: &mut Vec<(String, &'a IrExpr)>) {
+        for st in stmts {
+            match st {
+                IrStmt::Assign { targets, expr } => {
+                    for t in targets {
+                        if t.indices.is_empty() {
+                            assigns.push((t.var.clone(), expr));
+                        }
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk(then, assigns);
+                    for (_, b) in elsifs {
+                        walk(b, assigns);
+                    }
+                    walk(else_, assigns);
+                }
+                IrStmt::For { body, .. }
+                | IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk(body, assigns),
+                IrStmt::Case { clauses, .. } => {
+                    for c in clauses {
+                        walk(&c.body, assigns);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(&prog.stmts, &mut assigns);
+
+    // fixed point: start everything untagged; a var becomes tagged when
+    // EVERY assignment RHS is provably spaceless (monotone — converges)
+    let mut verdicts: BTreeMap<String, bool> = BTreeMap::new();
+    let mut changed = true;
+    let mut guard = 0;
+    while changed && guard < 64 {
+        guard += 1;
+        changed = false;
+        for (name, rhs) in &assigns {
+            let ok = expr_nospace(rhs, &verdicts, prog);
+            let cur = verdicts.get(name).copied().unwrap_or(false);
+            if ok != cur {
+                verdicts.insert(name.clone(), ok);
+                changed = true;
+            }
+        }
+    }
+    // a var with NO assignment sites stays untagged (conservative —
+    // could be unset, a positional, or runtime-provided)
+    let mut out: Vec<(String, bool)> = verdicts.into_iter().collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
@@ -9758,6 +10005,13 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // set — MUST be stored before the lift analyses run (their walkers
     // consult native_arith_text, which reads the static).
     *ARITH_REF_SET.lock().unwrap() = Some(collect_arith_ref_set_vars(prog));
+    *VAR_NOSPACE.lock().unwrap() = Some(
+        crate::shir::analyze_var_nospace(prog)
+            .into_iter()
+            .filter(|(_, b)| *b)
+            .map(|(n, _)| n)
+            .collect(),
+    );
     let (num, str) = analyze_loop_var_refs(
         prog,
         &numeric_lift_vars(prog),
@@ -9945,16 +10199,16 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         });
     }
     body.extend(prog.stmts.iter().filter_map(top_stmt_to_estree));
-    // lastExit-tail hoist (src/estree.rs): lift a constant `sh2.lastExit =
-    // N` out of if/else common tails and out of enclosing bare loops. Runs
-    // post-emission on the Program, so every consumer (the CLI's --estree,
-    // the otranspilerl wasm's shir_to_estree_json, the corpus gate) sees
-    // the same hoisted shape.
-    crate::estree::hoist_last_exit(Program {
+    // Post-emission passes (src/estree.rs) — migrated from the website's
+    // src/lower.js so the corpus gate holds them accountable, in the same
+    // order the website applied them: native-array lowering first, then
+    // the lastExit-tail hoist, then unconsumed success-flag removal.
+    let program = crate::estree::lower_native_arrays(Program {
         type_: "Program",
         source_type: "module",
         body,
-    })
+    });
+    crate::estree::drop_dead_flags(crate::estree::hoist_last_exit(program))
 }
 
 /// Top-level statement lowering: additionally wraps statement-position calls
@@ -23987,6 +24241,39 @@ fn array_elt_to_estree(e: &IrExpr) -> Expr {
     }
 }
 
+/// Does `e` provably hold a value free of IFS whitespace? True for the
+/// "No spaces" tagged vars, numeric values (literals, arith, numeric
+/// binops) and whitespace-free string literals — the `split` (word-split)
+/// emitter skips the split for these (it would be a no-op).
+fn expr_known_nospace(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Int(_) => true,
+        IrExpr::Arith(_) => true,
+        IrExpr::BinOp { .. } => true,
+        IrExpr::Str(s, _) => !s.chars().any(char::is_whitespace),
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => VAR_NOSPACE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.contains(name))
+            .unwrap_or(false),
+        IrExpr::Call { func, args } => match func.as_str() {
+            "getVar" => match args.first() {
+                Some(IrExpr::Str(n, _)) => VAR_NOSPACE
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|s| s.contains(n))
+                    .unwrap_or(false),
+                _ => false,
+            },
+            "arith" => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn expr_to_estree(e: &IrExpr) -> Expr {
     match e {
         IrExpr::Int(i) => Expr::Literal {
@@ -24341,6 +24628,13 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // no dispatch. `String(v)` guards lifted numeric bindings.
             if func == "split" {
                 if let [v] = args.as_slice() {
+                    // the "No spaces" tag: when the value is provably free
+                    // of IFS whitespace (a tagged var, a numeric value, a
+                    // spaceless literal), the word-split is a no-op —
+                    // emit the value directly (no split/filter/join).
+                    if expr_known_nospace(v) {
+                        return expr_to_estree(v);
+                    }
                     let ve = expr_to_estree(v);
                     if expr_has_await(&ve) {
                         return sh2_call("split", vec![ve]);
