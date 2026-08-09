@@ -2261,7 +2261,37 @@ fn arith_text_to_perl(text: &str) -> String {
 /// A word as bash syntax: literals shell-quoted, captures as `$(…)`
 /// (bash evaluates nested command substitution), interpolated words rebuilt
 /// as bash double-quoted `"…$var…"`, vars double-quoted, braces as `{…}`.
+/// Reconstruct bash `${...}` syntax from a `param` Call (the shIR lowering
+/// of parameter expansions), for shell-out command strings.
+fn bash_param_syntax(args: &[IrExpr]) -> String {
+    let op = args.first().and_then(call_arg_str).unwrap_or_default();
+    let name = args.get(1).and_then(call_arg_str).unwrap_or_default();
+    if op == "slice" {
+        let off = args.get(2).and_then(call_arg_str).unwrap_or_default();
+        let len = args.get(3).and_then(call_arg_str).unwrap_or_default();
+        if len.is_empty() {
+            format!("${{{}[{}]}}", name, off)
+        } else {
+            format!("${{{}[{}]:{}}}", name, off, len)
+        }
+    } else if op.is_empty() {
+        // `${map[$k]}` element access — the name carries the bracket.
+        format!("${{{}}}", name)
+    } else {
+        let val = args.get(2).and_then(call_arg_str).unwrap_or_default();
+        format!("${{{}{}{}}}", name, op, val)
+    }
+}
+
 fn bash_word_for(w: &IrExpr) -> String {
+    // The for-iter shape is Array([single word]) — unwrap it.
+    if let IrExpr::Array(elems) = w {
+        if elems.len() == 1 {
+            return bash_word_for(&elems[0]);
+        }
+        let parts: Vec<String> = elems.iter().map(bash_word_for).collect();
+        return parts.join(" ");
+    }
     match w {
         IrExpr::Str(s, _) => {
             if let Some(pat) = s.strip_prefix("\u{1}SH2GLOB\u{1}") {
@@ -2299,6 +2329,10 @@ fn bash_word_for(w: &IrExpr) -> String {
                                     continue;
                                 }
                             }
+                            if func == "param" {
+                                s.push_str(&bash_param_syntax(args));
+                                continue;
+                            }
                         }
                         s.push_str(&render_word(e));
                     }
@@ -2314,6 +2348,7 @@ fn bash_word_for(w: &IrExpr) -> String {
             }
         }
         IrExpr::Call { func, args } if func == "brace" => bash_brace_syntax(args),
+        IrExpr::Call { func, args } if func == "param" => bash_param_syntax(args),
         _ => {
             let wstr = render_word(w);
             // A Perl string literal or a plain scalar: embed safely.
@@ -2866,6 +2901,17 @@ fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
             if let Some(cmd) = expr_to_cmd(inner) {
                 return Some(cmd);
             }
+        }
+        if let IrStmt::For { var, iter, body } = s {
+            // `for k in ${!map[@]}; do …; done` as a pipeline stage — rebuild
+            // the shell text so `… | sort` runs through bash -c like the
+            // original script.
+            let iter_cmd = bash_word_for(iter);
+            let body_cmd = stmts_to_shell_cmd(body)?;
+            return Some(format!(
+                "for {} in {}; do {}; done",
+                var, iter_cmd, body_cmd
+            ));
         }
     }
     None
