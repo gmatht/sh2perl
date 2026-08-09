@@ -1549,31 +1549,42 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                     Ok(format!("[[ {t} ]]"))
                 } else if let Some((lhs, rhs)) = split_test_op(t, "==") {
                     // pattern match: case emulation (dash has no == in test)
-                    if let Some((neg, rest)) =
+                    // A leading `!` negates the WHOLE match (`[[ ! "1" ==
+                    // "2" ]]`) — strip it and prefix `! ` (valid before a
+                    // case in dash and bash). Without this the `!` lands
+                    // inside the quoted lhs (`"!"1"` — a literal).
+                    let negate = lhs.starts_with('!');
+                    let lhs = lhs.trim_start_matches('!');
+                    let case: String = if let Some((neg, rest)) =
                         rhs.strip_prefix("!(").and_then(|r| r.split_once(')'))
                     {
                         // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`:
                         //   case "$s" in *Y) case "$s" in P Y) false;; *) :;; esac;; *) false;; esac
-                        Ok(format!(
+                        format!(
                             "case \"{lhs}\" in *{rest}) case \"{lhs}\" in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
-                        ))
+                        )
                     } else if let Some(inner) =
                         rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')'))
                     {
                         // extglob list match: `@(a|b)` == `a|b`
-                        Ok(format!("case \"{lhs}\" in {inner}) : ;; *) false ;; esac"))
+                        format!("case \"{lhs}\" in {inner}) : ;; *) false ;; esac")
                     } else if let Some(inner) =
                         rhs.strip_prefix("?(").and_then(|r| r.strip_suffix(')'))
                     {
                         // optional: `?(a|b)` matches empty or a|b
-                        Ok(format!("case \"{lhs}\" in |{inner}) : ;; *) false ;; esac"))
+                        format!("case \"{lhs}\" in |{inner}) : ;; *) false ;; esac")
                     } else if *NOCASEMATCH.lock().unwrap() {
-                        Ok(format!(
+                        format!(
                             "case \"{lhs}\" in {}) : ;; *) false ;; esac",
                             fold_case_pattern(&rhs)
-                        ))
+                        )
                     } else {
-                        Ok(format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac"))
+                        format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac")
+                    };
+                    if negate {
+                        Ok(format!("! {case}"))
+                    } else {
+                        Ok(case)
                     }
                 } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
                     Ok(format!("case \"{lhs}\" in {rhs}) false ;; *) : ;; esac"))
