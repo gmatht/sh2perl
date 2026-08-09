@@ -2348,6 +2348,38 @@ fn generate_buffered_pipeline(
             let unique_id = generator.get_unique_id();
             let output_var = format!("output_{}", unique_id);
 
+            // Export shell vars referenced by the reconstructed command so
+            // the bash -c child sees them (`echo "$word" | tr a-z A-Z` —
+            // bash reads $word from its environment).  Declared Perl vars
+            // are exported by value; undeclared env-style vars pass through
+            // %ENV so the generated code compiles under `use strict`.
+            let mut shell_vars = std::collections::HashSet::new();
+            crate::generator::words::collect_shell_vars_from_command(
+                &Command::Pipeline(pipeline.clone()),
+                &mut shell_vars,
+            );
+            let mut shell_vars: Vec<String> = shell_vars.into_iter().collect();
+            shell_vars.sort();
+            let mut env_setup = String::new();
+            for var in &shell_vars {
+                if var != "file" {
+                    if generator.declared_locals.contains(var)
+                        || generator.function_level_vars.contains(var)
+                    {
+                        env_setup.push_str(&format!("    $ENV{{{}}} = ${};\n", var, var));
+                    } else {
+                        env_setup.push_str(&format!(
+                            "    $ENV{{{}}} = $ENV{{{}}};\n",
+                            var, var
+                        ));
+                    }
+                }
+            }
+            // Emit the env exports as plain statements (no do{} wrapper —
+            // the captured variable is declared by the Pipeline statement and
+            // referenced by the print below, so it must stay in scope).
+            output.push_str(&env_setup);
+
             // Build a clean IR statement for pipeline capture.
             let pipeline_stmt = IrStmt::Pipeline {
                 stages: vec![], // Not used when capture is set
@@ -2358,14 +2390,16 @@ fn generate_buffered_pipeline(
             output.push_str(&stmt_to_perl(&pipeline_stmt, 0));
 
             if should_print {
-                // For top-level pipelines, print the captured output with a trailing newline.
-                // Use `print $var, "\n";` which is idiomatic Perl and avoids the
-                // verbose `if (... ne q{} && !defined ...) { print ...; if (!... =~ m{\n\z})` dance.
-                let print_stmt = IrStmt::Output {
-                    value: IrExpr::Var(output_var.clone(), Some(Sigil::Scalar)),
-                    newline: true,
-                    target: None,
-                };
+                // For top-level pipelines, print the captured output.  bash
+                // emits exactly the pipeline's bytes: an EMPTY pipeline
+                // (e.g. `grep -Z -l pattern file | tr '\0' '\n'` with no
+                // matches) prints NOTHING, so the trailing newline must be
+                // conditional on non-empty output — `print $var, "\n";`
+                // unconditionally would add a spurious blank line.
+                let print_stmt = IrStmt::RawText(format!(
+                    "if (${} ne q{{}}) {{ print ${}, \"\\n\"; }}\n",
+                    output_var, output_var
+                ));
                 output.push_str(&stmt_to_perl(&print_stmt, 0));
             } else {
                 // For command substitution, emit the captured variable as the last expression

@@ -16,7 +16,7 @@ pub fn generate_grep_command(
     let mut line_numbers = false;
     let mut ignore_case = false;
     let mut invert_match = false;
-    let mut _word_match = false;
+    let mut word_match = false;
     let mut only_matching = false;
     let mut quiet_mode = false;
     let mut max_count = None;
@@ -146,7 +146,7 @@ pub fn generate_grep_command(
                     invert_match = true;
                 }
                 if s.contains('w') {
-                    _word_match = true;
+                    word_match = true;
                 }
                 if s.contains('o') {
                     only_matching = true;
@@ -670,6 +670,15 @@ pub fn generate_grep_command(
         // Convert \. to . (shell extended regex to Perl) - but keep \. for literal dot
         // Actually, \. in shell regex means literal dot, so we should keep it as \. in Perl
         // No conversion needed for \.
+
+        // -w (word-regexp): the match must be bounded by word characters —
+        // wrap the pattern so grep -w "foo" does NOT match "foobar".
+        // Use lookarounds, not \b: \b fails when the pattern itself starts
+        // or ends with a non-word char (`grep -w "#kernel.printk"` — the
+        // line-start→`#` position is NOT a word boundary).
+        if word_match {
+            regex_pattern = format!("(?<!\\w){}(?!\\w)", regex_pattern);
+        }
 
         // Apply grep filtering
         if invert_match {
@@ -1211,8 +1220,11 @@ pub fn generate_grep_command(
 
     // Set exit status for all grep commands
     // For quiet mode, set exit code based on whether matches were found
+    // GNU grep -L: exit 0 iff at least one input file MATCHED the pattern
+    // (the printed list is the files WITHOUT matches).  A single
+    // non-matching file prints its name but exits 1.
     let exit_condition = if files_without_match {
-        format!("$grep_result_{} ne q{{}}", command_index)
+        format!("scalar @grep_filtered_{} > 0", command_index)
     } else {
         format!("scalar @grep_filtered_{} > 0", command_index)
     };

@@ -538,7 +538,17 @@ impl Generator {
         for command in ast {
             // Reset indentation level for each top-level command to prevent staircase effect
             self.indent_level = 0;
-            let command_output = self.generate_command(command);
+            let command_output = if let Command::TestExpression(test_expr) = command {
+                // A top-level `[ a = b ]` statement must (a) be valid Perl
+                // and (b) set $CHILD_ERROR (bash sets $?; a later `$?` read
+                // or `[ x ] && cmd` chain depends on it).  The bare boolean
+                // expression from generate_test_expression is a syntax error
+                // as a statement.
+                let expr = self.generate_test_expression(test_expr);
+                format!("$CHILD_ERROR = {} ? 0 : 1;\n", expr)
+            } else {
+                self.generate_command(command)
+            };
             output.push_str(&command_output);
 
             // Ensure proper newline separation between commands
@@ -547,14 +557,14 @@ impl Generator {
             }
         }
 
-        // Add final exit statement — only if $main_exit_code is tracked.
+        // Add final exit statement — only when exit-code tracking is needed
+        // (scripts with pipelines, &&/|| chains, etc. where $CHILD_ERROR is
+        // maintained).  Emitting it unconditionally leaks STALE $CHILD_ERROR
+        // values into the exit status (a failed earlier command followed by a
+        // successful `if`/`echo` would exit non-zero, unlike bash).
         if needs_exit_code {
-            let stmt = IrStmt::Exit(Some(IrExpr::Var(
-                "main_exit_code".to_string(),
-                Some(Sigil::Scalar),
-            )));
             output.push('\n');
-            output.push_str(&stmt_to_perl(&stmt, 0));
+            output.push_str("exit ($main_exit_code || $CHILD_ERROR);\n");
         }
 
         // Ensure the output ends with a newline
@@ -955,7 +965,15 @@ impl Generator {
                         // number of `/` before `#` (counting from the last `s` or `m`),
                         // then `#` is inside the regex part of s/// or m//.
                         let no_comment = if let Some(pos) = trimmed.find('#') {
-                            let before_hash = &trimmed[..pos];
+                            // Multi-line values are generated code (do-blocks with their
+                            // own `#` comments, e.g. the tr/grep emulations) — a `#` there
+                            // is a real Perl comment INSIDE the expression, not a trailing
+                            // comment on a one-line shell value.  Only strip for
+                            // single-line values where `#` would split the statement.
+                            if trimmed.contains('\n') {
+                                trimmed.to_string()
+                            } else {
+                                let before_hash = &trimmed[..pos];
                             let quotes_before = before_hash.chars().filter(|&c| c == '"').count();
                             // Check whether # is inside a s/// or m// operator by counting
                             // non-escaped slashes after the last s/m operator.
@@ -981,9 +999,10 @@ impl Generator {
                             } else {
                                 trimmed.to_string()
                             }
-                        } else {
-                            trimmed.to_string()
-                        };
+                        }
+                    } else {
+                        trimmed.to_string()
+                    };
                         if no_comment.ends_with(';') {
                             // Check the character before the `;` — if it closes a block or paren,
                             // it's a statement terminator that should be stripped.
@@ -2040,6 +2059,9 @@ impl Generator {
                 false
             }
             Command::If(if_stmt) => {
+                if self.command_needs_basename(&if_stmt.condition) {
+                    return true;
+                }
                 if self.command_needs_basename(&if_stmt.then_branch) {
                     return true;
                 }
@@ -2050,6 +2072,39 @@ impl Generator {
                 }
                 false
             }
+            Command::Assignment(assign) => {
+                // `cmd=${p##*/}` — a bare assignment whose RHS is a basename
+                // parameter expansion renders `basename(...)` in Perl.
+                self.word_needs_basename(&assign.value)
+            }
+            Command::TestExpression(te) => {
+                // The test-expression TEXT path renders `${...}` expansions
+                // (e.g. `[[ "${p##*/}" == x ]]` → `basename($p)`).
+                let text = &te.expression;
+                text.contains("##*/}") || text.contains("%/*}")
+            }
+            Command::BuiltinCommand(bc) => {
+                // `declare x=${p##*/}` / `local y=${p##*/}` / `exec basename …`
+                for arg in &bc.args {
+                    if self.word_needs_basename(arg) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Command::Subshell(sub) => self.command_needs_basename(sub),
+            Command::Case(case) => {
+                for clause in &case.cases {
+                    for cmd in &clause.body {
+                        if self.command_needs_basename(cmd) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Command::Function(func) => self.command_needs_basename(&func.body.commands[0])
+                || func.body.commands[1..].iter().any(|c| self.command_needs_basename(c)),
             _ => false,
         }
     }

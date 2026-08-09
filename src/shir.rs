@@ -991,6 +991,7 @@ fn mark_loop_status_deadness(st: &IrStmt, live: &HashSet<usize>, dead: &mut Hash
 /// expansion, identical builtin function, minus the async exec machinery
 /// (the whileLoopSync pattern — same semantics, no per-call promises).
 pub(crate) const SYNC_BUILTINS: &[&str] = &[
+    ".",
     ":",
     "basename",
     "break",
@@ -1041,6 +1042,7 @@ pub(crate) const SYNC_BUILTINS: &[&str] = &[
     "sha512sum",
     "shift",
     "sort",
+    "source",
     "stat",
     "tail",
     "tee",
@@ -20674,7 +20676,10 @@ fn test_str_to_estree(s: &str) -> Option<Expr> {
         .into_iter()
         .map(|raw| TemplateElement {
             type_: "TemplateElement",
-            value: TemplateElementValue { raw, cooked: None },
+            value: TemplateElementValue {
+                raw: crate::estree::escape_template_raw(&raw),
+                cooked: Some(raw),
+            },
             tail: false,
         })
         .collect();

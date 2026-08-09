@@ -36,7 +36,7 @@ pub fn generate_mv_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
 
         return format!(
-            "do {{\n    my $mv_cmd_str = {};\n    $CHILD_ERROR = system($mv_cmd_str) >> 8;\n}};\n",
+            "do {{\n    my $mv_cmd_str = {};\n    $main_exit_code = $CHILD_ERROR = system($mv_cmd_str) >> 8;\n}};\n",
             command_lit
         );
     }

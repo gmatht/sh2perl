@@ -107,7 +107,15 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             // where `if func; then` enters when func returns 0.
             // Use `!do { ... }` instead of `!(...)` so multi-statement
             // code (e.g. from redirect commands) is valid in Perl.
-            output.push_str(&format!("!do {{ local $CHILD_ERROR; {} }}", cond));
+            // The do-block must end with `$CHILD_ERROR` (the command's
+            // exit status): the generated command code's LAST expression
+            // is not reliably the status (ls ends with `$ls_success = 1`,
+            // redirect-restore with `open STDOUT ...` = 1), and `!` of
+            // that would invert the condition incorrectly.
+            output.push_str(&format!(
+                "!do {{ local $CHILD_ERROR; {}; $CHILD_ERROR }}",
+                cond
+            ));
         }
     }
     output.push_str(") {\n");
@@ -912,9 +920,13 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
     if !generator.declared_locals.contains(loop_var)
         && !generator.function_level_vars.contains(loop_var)
     {
-        // Variable is not declared anywhere — no need to insert a dead
-        // `my $i;` because `for my $i` declares it lexically.
-        // Just mark it as declared so post-loop code knows it exists.
+        // The IR range path renders `for my $__i (…) { $i = $__i; … }` —
+        // the body references the REAL variable name, so `$i` must exist
+        // as a non-lexical variable under `use strict`.  Declare it before
+        // the loop: bash leaves the loop var holding its last value, so it
+        // cannot be lexical to the loop (Perl's `for my` restores it).
+        output.push_str(&generator.indent());
+        output.push_str(&format!("my ${};\n", loop_var));
         generator.declared_locals.insert(loop_var.clone());
     }
 
@@ -1870,7 +1882,10 @@ fn generate_combined_test_condition(generator: &mut Generator, cmd: &Command) ->
                     .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                     .trim_end_matches(';')
                     .to_string();
-                format!("!do {{ local $CHILD_ERROR; {} }}", c)
+                // End with the command's exit status so `!do { ... }` sees a
+                // value proportional to $CHILD_ERROR (the last expression of
+                // the generated command is not reliably the status).
+                format!("!do {{ local $CHILD_ERROR; {}; $CHILD_ERROR }}", c)
             }
         }
     }

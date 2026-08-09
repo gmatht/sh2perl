@@ -3,7 +3,6 @@ pub mod ast_words;
 pub mod lexer;
 pub mod parser;
 
-pub mod cfront;
 pub mod debug;
 pub mod estree;
 pub mod ir;

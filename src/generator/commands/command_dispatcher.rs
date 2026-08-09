@@ -1423,6 +1423,14 @@ pub fn generate_command_impl_with_input(
                         result.push_str("};\n");
                         result.push_str(&generator.indent());
                         result.push_str("print $tmp;\n");
+                        // bash commands newline-terminate their output (grep,
+                        // ls, basename …); the expression-valued snippet often
+                        // lacks the trailing newline, so add it unless already
+                        // present.  Empty output stays empty.
+                        result.push_str(&generator.indent());
+                        result.push_str(
+                            "if ($tmp ne q{} && !($tmp =~ m{\\n\\z})) { print \"\\n\"; }\n",
+                        );
 
                         // If the generated snippet actually populated the pipeline
                         // output buffer (eg. $output_<id>) but returned an empty

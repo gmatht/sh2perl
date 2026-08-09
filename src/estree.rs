@@ -2504,11 +2504,32 @@ pub(crate) fn quasi_element(raw: &mut String, tail: bool) -> TemplateElement {
     TemplateElement {
         type_: "TemplateElement",
         value: TemplateElementValue {
-            raw: r.clone(),
+            raw: escape_template_raw(&r),
             cooked: Some(r),
         },
         tail,
     }
+}
+
+/// Escape the literal text of a template-literal quasi. The JS emitter
+/// (estree.js → astring) writes `TemplateElement.value.raw` VERBATIM, so
+/// the three characters that are special inside a template literal must
+/// be escaped: `\` (escape leader), `` ` `` (the delimiter) and `$`
+/// (`${` would open an expression slot). `cooked` keeps the unescaped
+/// VALUE. Without this, `echo "a\\b$y"` (bash) and `echo %X%\\`
+/// (batch) emitted `\b`/a bare trailing `\` into the template — a
+/// backspace or an unterminated template literal at eval time.
+pub(crate) fn escape_template_raw(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

@@ -71,6 +71,7 @@ mod tests {
     #[test]
     fn walker_handles_empty_program() {
         let prog = IrProgram {
+            var_nospace: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![],
@@ -91,6 +92,7 @@ mod tests {
     #[test]
     fn walker_handles_non_liftable_program() {
         let prog = IrProgram {
+            var_nospace: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![IrStmt::Expr(IrExpr::Int(42))],

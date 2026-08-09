@@ -1056,6 +1056,25 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                             } else {
                                 &quoted
                             };
+                            // If the quoted value contains an expansion
+                            // (`--x="${VAR}"`), flattening it into the literal
+                            // would lose the variable reference (the generated
+                            // Perl then prints `\${VAR}` literally).  Parse the
+                            // quoted content as an interpolation word and keep
+                            // the prefix as a literal part.
+                            if inner.contains('$') {
+                                let prefix = text.clone();
+                                if let Ok(interp) =
+                                    parse_string_interpolation_from_literal(inner)
+                                {
+                                    let mut parts = vec![StringPart::Literal(prefix)];
+                                    parts.extend(interp.parts);
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
+                                }
+                            }
                             text.push_str(inner);
                         }
                         Token::SingleQuotedString => {
@@ -1080,6 +1099,22 @@ fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
                             || (value_part.starts_with('\'') && value_part.ends_with('\''))
                         {
                             let inner = &value_part[1..value_part.len() - 1];
+                            // `--x="${X}"` — the quoted value holds an expansion;
+                            // keep it as a real interpolation so the generated
+                            // Perl substitutes $X instead of printing `\${X}`.
+                            if inner.contains('$') {
+                                if let Ok(interp) =
+                                    parse_string_interpolation_from_literal(inner)
+                                {
+                                    let mut parts =
+                                        vec![StringPart::Literal(format!("{}=", &text[..eq_pos]))];
+                                    parts.extend(interp.parts);
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
+                                }
+                            }
                             text = format!("{}={}", &text[..eq_pos], inner);
                         }
                     }
@@ -1901,6 +1936,25 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                             } else {
                                 &quoted
                             };
+                            // If the quoted value contains an expansion
+                            // (`--x="${VAR}"`), flattening it into the literal
+                            // would lose the variable reference (the generated
+                            // Perl then prints `\${VAR}` literally).  Parse the
+                            // quoted content as an interpolation word and keep
+                            // the prefix as a literal part.
+                            if inner.contains('$') {
+                                let prefix = text.clone();
+                                if let Ok(interp) =
+                                    parse_string_interpolation_from_literal(inner)
+                                {
+                                    let mut parts = vec![StringPart::Literal(prefix)];
+                                    parts.extend(interp.parts);
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
+                                }
+                            }
                             text.push_str(inner);
                         }
                         Token::SingleQuotedString => {
@@ -1925,6 +1979,22 @@ fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserErr
                             || (value_part.starts_with('\'') && value_part.ends_with('\''))
                         {
                             let inner = &value_part[1..value_part.len() - 1];
+                            // `--x="${X}"` — the quoted value holds an expansion;
+                            // keep it as a real interpolation so the generated
+                            // Perl substitutes $X instead of printing `\${X}`.
+                            if inner.contains('$') {
+                                if let Ok(interp) =
+                                    parse_string_interpolation_from_literal(inner)
+                                {
+                                    let mut parts =
+                                        vec![StringPart::Literal(format!("{}=", &text[..eq_pos]))];
+                                    parts.extend(interp.parts);
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
+                                }
+                            }
                             text = format!("{}={}", &text[..eq_pos], inner);
                         }
                     }

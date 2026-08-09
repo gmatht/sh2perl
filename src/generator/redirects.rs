@@ -570,13 +570,27 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
             for redirect in &redirect_cmd.redirects {
                 match &redirect.operator {
                     RedirectOperator::Input => {
-                        result.push_str(&format!(" < {}", word_to_bash_string(&redirect.target)));
+                        // `{fd}< target` — an explicit fd (e.g. `3<file`) keeps it;
+                        // fd None is the plain ` < target` form.
+                        if let Some(fd) = redirect.fd {
+                            result.push_str(&format!(" {}< {}", fd, word_to_bash_string(&redirect.target)));
+                        } else {
+                            result.push_str(&format!(" < {}", word_to_bash_string(&redirect.target)));
+                        }
                     }
                     RedirectOperator::Output => {
-                        result.push_str(&format!(" > {}", word_to_bash_string(&redirect.target)));
+                        if let Some(fd) = redirect.fd {
+                            result.push_str(&format!(" {}> {}", fd, word_to_bash_string(&redirect.target)));
+                        } else {
+                            result.push_str(&format!(" > {}", word_to_bash_string(&redirect.target)));
+                        }
                     }
                     RedirectOperator::Append => {
-                        result.push_str(&format!(" >> {}", word_to_bash_string(&redirect.target)));
+                        if let Some(fd) = redirect.fd {
+                            result.push_str(&format!(" {}>> {}", fd, word_to_bash_string(&redirect.target)));
+                        } else {
+                            result.push_str(&format!(" >> {}", word_to_bash_string(&redirect.target)));
+                        }
                     }
                     RedirectOperator::ProcessSubstitutionInput(cmd) => {
                         result.push_str(&format!(" <({})", generate_bash_command_string(cmd)));
@@ -588,10 +602,11 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                         result.push_str(&format!(" <<< {}", word_to_bash_string(&redirect.target)));
                     }
                     RedirectOperator::StderrOutput => {
-                        // When the redirection target is a numeric file descriptor (e.g. 1)
-                        // the canonical shell syntax uses an ampersand (e.g. 2>&1). If the
-                        // target serializes to a plain digit we render with the '&' form
-                        // to preserve the original semantics instead of producing "2> 1".
+                        // fd semantics: `2>file` (fd 2, file), `2>&1` (fd 2,
+                        // digit target → dup), `>&4` (fd None → fd 1 dup),
+                        // `3>&-` (explicit fd, close).  The parser stores
+                        // `>&`/`2>&` forms as StderrOutput; the fd field (or
+                        // None = 1 for `>&`) decides the actual descriptor.
                         let tgt = word_to_bash_string(&redirect.target);
                         let tgt_unquoted =
                             if tgt.starts_with('\'') && tgt.ends_with('\'') && tgt.len() > 1 {
@@ -599,10 +614,11 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             } else {
                                 tgt.clone()
                             };
-                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
-                            result.push_str(&format!(" 2>&{}", tgt_unquoted));
+                        let fd_str = redirect.fd.map(|n| n.to_string()).unwrap_or_else(|| "1".to_string());
+                        if tgt_unquoted == "-" || tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
+                            result.push_str(&format!(" {}>&{}", fd_str, tgt_unquoted));
                         } else {
-                            result.push_str(&format!(" 2> {}", tgt));
+                            result.push_str(&format!(" {}> {}", fd_str, tgt));
                         }
                     }
                     RedirectOperator::StderrAppend => {
@@ -613,10 +629,11 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             } else {
                                 tgt.clone()
                             };
-                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
-                            result.push_str(&format!(" 2>>&{}", tgt_unquoted));
+                        let fd_str = redirect.fd.map(|n| n.to_string()).unwrap_or_else(|| "1".to_string());
+                        if tgt_unquoted == "-" || tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
+                            result.push_str(&format!(" {}>>&{}", fd_str, tgt_unquoted));
                         } else {
-                            result.push_str(&format!(" 2>> {}", tgt));
+                            result.push_str(&format!(" {}>> {}", fd_str, tgt));
                         }
                     }
                     RedirectOperator::StderrInput => {
@@ -627,10 +644,11 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             } else {
                                 tgt.clone()
                             };
-                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
-                            result.push_str(&format!(" 2<&{}", tgt_unquoted));
+                        let fd_str = redirect.fd.map(|n| n.to_string()).unwrap_or_else(|| "1".to_string());
+                        if tgt_unquoted == "-" || tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
+                            result.push_str(&format!(" {}<&{}", fd_str, tgt_unquoted));
                         } else {
-                            result.push_str(&format!(" 2< {}", tgt));
+                            result.push_str(&format!(" {}< {}", fd_str, tgt));
                         }
                     }
                     RedirectOperator::InputOutput => {
@@ -696,6 +714,16 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
 // command string. Treat common glob metacharacters as special so patterns
 // like "*.txt" are preserved rather than being unintentionally expanded.
 fn needs_shell_quoting_literal(s: &str) -> bool {
+    needs_shell_quoting_literal_with_globs(s, true)
+}
+
+/// Same as `needs_shell_quoting_literal` but with glob metacharacters
+/// (`*`, `?`, `[`) treated as NON-quotable.  Used for BARE `Word::Literal`
+/// exec args: an unquoted glob must reach the inner bash so IT expands it
+/// (`grep -l pattern *.txt`), and an unmatched glob stays literal (nullglob
+/// off) exactly like the source script.  Quoted source args arrive as
+/// `StringInterpolation` and keep the glob-quoting behavior.
+fn needs_shell_quoting_literal_with_globs(s: &str, quote_globs: bool) -> bool {
     s.contains(' ')
         || s.contains('"')
         || s.contains('\'')
@@ -708,9 +736,9 @@ fn needs_shell_quoting_literal(s: &str) -> bool {
         || s.contains('&')
         || s.contains('<')
         || s.contains('>')
-        || s.contains('*')
-        || s.contains('?')
-        || s.contains('[')
+        || s.contains('(')
+        || s.contains(')')
+        || (quote_globs && (s.contains('*') || s.contains('?') || s.contains('[')))
         || s.contains('{')
         || s.contains('}')
         || s.contains('$')
@@ -726,7 +754,7 @@ fn word_to_bash_string(word: &Word) -> String {
                 return s.clone();
             }
 
-            if needs_shell_quoting_literal(s) {
+            if needs_shell_quoting_literal_with_globs(s, false) {
                 // If the literal contains backslash escape sequences like \n, \t,
                 // we must use double quotes so that bash's echo -e will interpret
                 // them.  Single quotes would preserve the backslash literally.
@@ -1541,6 +1569,28 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 output.push_str(&format!(
                     "do {{ my $eval_input = {}; $CHILD_ERROR = 0; }};  # native Perl\n",
                     concat_expr
+                ));
+            }
+        }
+        "exec" => {
+            // `exec cmd args...` replaces the shell process with the command:
+            // run it as an ordinary simple command and then exit with its
+            // status (nothing after an exec ever runs).  `exec` with no args
+            // just sets redirections (no-op here).  Redirects on the exec
+            // are handled by the outer Redirect wrapper.
+            if !cmd.args.is_empty() {
+                let simple = SimpleCommand {
+                    name: cmd.args[0].clone(),
+                    args: cmd.args[1..].to_vec(),
+                    redirects: vec![],
+                    env_vars: std::collections::BTreeMap::new(),
+                    stdout_used: cmd.stdout_used,
+                    stderr_used: cmd.stderr_used,
+                };
+                output.push_str(&generator.generate_simple_command(&simple));
+                output.push_str(&generator.indent());
+                output.push_str(&format!(
+                    "exit $CHILD_ERROR;\n"
                 ));
             }
         }

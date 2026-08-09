@@ -450,6 +450,7 @@ mod tests {
 
     fn empty_prog() -> IrProgram {
         IrProgram {
+            var_nospace: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![],
@@ -511,6 +512,7 @@ mod tests {
         ctx.const_vars
             .insert("x".to_string(), crate::ir::VarKind::Const);
         let mut prog = IrProgram {
+            var_nospace: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![IrStmt::Expr(IrExpr::Int(1))],

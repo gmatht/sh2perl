@@ -3976,7 +3976,14 @@ fn render_test_operand(tok: &str) -> String {
 fn render_str_literal(s: &str, style: &StrStyle) -> String {
     match style {
         StrStyle::SingleQuoted => {
-            format!("'{}'", s.replace('\'', "\\\\'")).replace("\\'\'", "\\'\\\\'\\'")
+            // Perl single-quote escaping: DOUBLE backslashes first, then
+            // escape quotes.  Escaping only `'` → `\'` is wrong when the
+            // source has `\` before a quote: `\'` in the output would be
+            // read by Perl as escaped-backslash + string CLOSE.
+            format!(
+                "'{}'",
+                s.replace("\\", "\\\\").replace('\'', "\\'")
+            )
         }
         StrStyle::DoubleQuoted | StrStyle::Heredoc => {
             let mut escaped = String::from("\"");
@@ -4234,7 +4241,13 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                             .replace("}", "\\}")
                     )
                 } else {
-                    format!("'{}'", s.replace('\'', "\\'"))
+                    // Double backslashes FIRST, then escape quotes: `\\'` in
+                    // the output would otherwise be read as escaped-backslash
+                    // + string CLOSE (see render_str_literal).
+                    format!(
+                        "'{}'",
+                        s.replace("\\", "\\\\").replace('\'', "\\'")
+                    )
                 }
             }
             StrStyle::DoubleQuoted => {

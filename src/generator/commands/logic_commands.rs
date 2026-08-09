@@ -20,7 +20,14 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
         output.push_str(&generator.indent());
         let right_perl = generator.generate_command(right);
         output.push_str(&right_perl);
-        if !right_perl.ends_with('\n') {
+        // The right side may be another TestExpression — a bare boolean
+        // expression used as a statement MUST end with `;` (e.g. the second
+        // `[[ -f "$1" ]]` in `[[ -n "$1" ]] && [[ -f "$1" ]] && echo`).
+        let right_trim = right_perl.trim_end();
+        if !right_trim.ends_with(';') && !right_trim.ends_with('}') {
+            output.push(';');
+        }
+        if !output.ends_with('\n') {
             output.push('\n');
         }
         output.push_str(&generator.indent());

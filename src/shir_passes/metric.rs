@@ -330,6 +330,7 @@ mod tests {
 
     fn make_prog(stmts: Vec<IrStmt>) -> IrProgram {
         IrProgram {
+            var_nospace: vec![],
             imports: vec![],
             requires: vec![],
             stmts,

@@ -179,7 +179,35 @@ pub fn generate_printf_command(
                 // contains fewer non-%% specifiers than the number of
                 // arguments, generate Perl code that repeats the format across
                 // args. Otherwise emit a normal printf call.
-                if args.is_empty() {
+
+                // bash `%q` (shell-quote the argument): Perl's sprintf has no
+                // %q — emulate it.  Non-`printf`-safe chars are emitted in
+                // `$'...'` form with \n/\t/\r/\\/\xHH escapes; safe
+                // alphanumerics stay bare (matching bash for common cases).
+                if decoded_format.contains("%q") && !args.is_empty() {
+                    // NOTE: builds the $'...' shell-quote literal via string
+                    // concatenation so no raw `\$` escapes appear in Rust source.
+                    let quote_expr = format!(
+                        "do {{ my $__q = {}; my $__n = $__q; $__n =~ s/\\\\/\\\\\\\\/g; $__n =~ s/\x27/\\\\\x27/g; $__n =~ s/\n/\\\\n/g; $__n =~ s/\t/\\\\t/g; $__n =~ s/\r/\\\\r/g; $__n =~ s/([^\x20-\x7E])/sprintf(\"\\\\x%02x\", ord($1))/ge; my $__d = chr(36) . chr(39); my $__e = chr(39); ($__q =~ /^[A-Za-z0-9_.,:+=\\x2F-]+$/) ? $__q : $__d . $__n . $__e; }}",
+                        args.join(", ")
+                    );
+                    // `%q` repeats across multiple args (bash printf semantics).
+                    let mapped = format!(
+                        "join('', map {{ {} }} ({}))",
+                        quote_expr.replace("my $__q = {};", "my $__q = $_;"),
+                        args.join(", ")
+                    );
+                    if is_expression {
+                        output.push_str(&mapped);
+                        output.push_str("\n");
+                    } else {
+                        output.push_str(&format!("print {};\n", mapped));
+                    }
+                    // %q is fully handled above — do NOT fall through to the
+                    // generic printf emission (that would print twice).
+                    output.push_str("$CHILD_ERROR = 0;\n");
+                    return output;
+                } else if args.is_empty() {
                     // (handled above) - keep for clarity
                 }
 
