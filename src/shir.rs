@@ -991,7 +991,6 @@ fn mark_loop_status_deadness(st: &IrStmt, live: &HashSet<usize>, dead: &mut Hash
 /// expansion, identical builtin function, minus the async exec machinery
 /// (the whileLoopSync pattern — same semantics, no per-call promises).
 pub(crate) const SYNC_BUILTINS: &[&str] = &[
-    ".",
     ":",
     "basename",
     "break",
@@ -1042,7 +1041,6 @@ pub(crate) const SYNC_BUILTINS: &[&str] = &[
     "sha512sum",
     "shift",
     "sort",
-    "source",
     "stat",
     "tail",
     "tee",
