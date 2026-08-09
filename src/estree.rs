@@ -4222,3 +4222,206 @@ mod migrated_passes_tests {
         assert!(!json.contains("unsupported"));
     }
 }
+
+// ── dead top-level declaration elimination ────────────────────────────
+//
+// The lifted-numeric/string declarations (`let x = 0` / `let x = ""` at
+// program top) exist so bash's unset-var semantics hold at the top
+// level. A seq-range for (`for (let i = lo; i <= hi; i++)`) declares its
+// OWN `i`, shadowing the hoisted one — if the top-level `i` is never
+// READ (only the for's binding is read inside the loop), the hoisted
+// declaration is dead weight. The walk is scope-aware and conservative:
+// a read inside any scope that re-declares `name` (a nested `let x`, a
+// for-init, a closure param/local) does NOT count; any surviving
+// unshadowed read keeps the declaration.
+pub(crate) fn drop_dead_top_decls(prog: Program) -> Program {
+    let mut body = prog.body;
+    // the leading top-level declarations and their names
+    let mut decl_names: Vec<String> = Vec::new();
+    for st in &body {
+        if let Stmt::VariableDeclaration { declarations, .. } = st {
+            for d in declarations {
+                if let Expr::Identifier { name } = &d.id {
+                    decl_names.push(name.clone());
+                }
+            }
+        } else {
+            break; // declarations are leading
+        }
+    }
+    if decl_names.is_empty() {
+        return Program { type_: prog.type_, source_type: prog.source_type, body };
+    }
+    let read: Vec<String> = decl_names
+        .iter()
+        .filter(|n| stmts_read(&body, n, false))
+        .cloned()
+        .collect();
+    if read.len() == decl_names.len() {
+        return Program { type_: prog.type_, source_type: prog.source_type, body };
+    }
+    body.retain(|st| match st {
+        Stmt::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .any(|d| match &d.id {
+                Expr::Identifier { name } => read.contains(name),
+                _ => true,
+            }),
+        _ => true,
+    });
+    Program { type_: prog.type_, source_type: prog.source_type, body }
+}
+
+fn stmts_read(stmts: &[Stmt], name: &str, shadowed: bool) -> bool {
+    let mut sh = shadowed;
+    for st in stmts {
+        if stmt_read(st, name, sh) {
+            return true;
+        }
+        // a `let x` in this block shadows the remainder of it
+        if stmt_declares(st, name) {
+            sh = true;
+        }
+    }
+    false
+}
+
+fn stmt_read(st: &Stmt, name: &str, shadowed: bool) -> bool {
+    match st {
+        Stmt::ExpressionStatement { expression } => expr_read(expression, name, shadowed),
+        Stmt::BlockStatement { body } => stmts_read(body, name, shadowed),
+        Stmt::IfStatement { test, consequent, alternate } => {
+            expr_read(test, name, shadowed)
+                || stmt_read(consequent, name, shadowed)
+                || alternate
+                    .as_ref()
+                    .map(|a| stmt_read(a, name, shadowed))
+                    .unwrap_or(false)
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            expr_read(discriminant, name, shadowed)
+                || cases.iter().any(|c| {
+                    c.test
+                        .as_ref()
+                        .map(|t| expr_read(t, name, shadowed))
+                        .unwrap_or(false)
+                        || stmts_read(&c.consequent, name, shadowed)
+                })
+        }
+        Stmt::WhileStatement { test, body } => {
+            expr_read(test, name, shadowed) || stmt_read(body, name, shadowed)
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            let declares = stmt_declares(init, name);
+            stmt_read(init, name, shadowed)
+                || expr_read(test, name, shadowed || declares)
+                || expr_read(update, name, shadowed || declares)
+                || stmt_read(body, name, shadowed || declares)
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            let declares = stmt_declares(left, name);
+            stmt_read(left, name, shadowed)
+                || expr_read(right, name, shadowed)
+                || stmt_read(body, name, shadowed || declares)
+        }
+        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| match &d.init {
+            Some(init) => expr_read(init, name, shadowed),
+            None => false,
+        }),
+        Stmt::ReturnStatement { argument } => argument
+            .as_ref()
+            .map(|a| expr_read(a, name, shadowed))
+            .unwrap_or(false),
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => false,
+    }
+}
+
+fn stmt_declares(st: &Stmt, name: &str) -> bool {
+    match st {
+        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
+            matches!(&d.id, Expr::Identifier { name: n } if n == name)
+        }),
+        Stmt::ForStatement { init, .. } => stmt_declares(init, name),
+        Stmt::ForOfStatement { left, .. } => stmt_declares(left, name),
+        _ => false,
+    }
+}
+
+fn expr_read(e: &Expr, name: &str, shadowed: bool) -> bool {
+    match e {
+        Expr::Identifier { name: n } => !shadowed && n == name,
+        Expr::Literal { .. } => false,
+        Expr::TemplateLiteral { expressions, .. } => {
+            expressions.iter().any(|x| expr_read(x, name, shadowed))
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            expr_read(callee, name, shadowed)
+                || arguments.iter().any(|a| expr_read(a, name, shadowed))
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            expr_read(object, name, shadowed) || expr_read(property, name, shadowed)
+        }
+        Expr::AwaitExpression { argument } => expr_read(argument, name, shadowed),
+        Expr::ArrowFunctionExpression { params, body, .. } => {
+            let p_shadows = params
+                .iter()
+                .any(|p| matches!(p, Expr::Identifier { name: n } if n == name));
+            let b_shadows = arrow_body_declares(body, name);
+            arrow_body_read(body, name, shadowed || p_shadows || b_shadows)
+        }
+        Expr::ObjectExpression { properties } => properties.iter().any(|p| {
+            expr_read(&p.value, name, shadowed)
+                || (p.computed && expr_read(&p.key, name, shadowed))
+        }),
+        Expr::ArrayExpression { elements } => {
+            elements.iter().flatten().any(|x| expr_read(x, name, shadowed))
+        }
+        Expr::SpreadElement { argument } => expr_read(argument, name, shadowed),
+        Expr::LogicalExpression { left, right, .. } => {
+            expr_read(left, name, shadowed) || expr_read(right, name, shadowed)
+        }
+        Expr::BinaryExpression { left, right, .. } => {
+            expr_read(left, name, shadowed) || expr_read(right, name, shadowed)
+        }
+        Expr::AssignmentExpression { left, right, .. } => {
+            expr_read(left, name, shadowed) || expr_read(right, name, shadowed)
+        }
+        Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+            expr_read(test, name, shadowed)
+                || expr_read(consequent, name, shadowed)
+                || expr_read(alternate, name, shadowed)
+        }
+        Expr::UnaryExpression { argument, .. } => expr_read(argument, name, shadowed),
+        Expr::SequenceExpression { expressions } => {
+            expressions.iter().any(|x| expr_read(x, name, shadowed))
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            expr_read(callee, name, shadowed)
+                || arguments.iter().any(|a| expr_read(a, name, shadowed))
+        }
+    }
+}
+
+fn arrow_body_read(body: &ArrowBody, name: &str, shadowed: bool) -> bool {
+    match body {
+        ArrowBody::Expr(e) => expr_read(e, name, shadowed),
+        ArrowBody::Block(b) => stmt_read(b, name, shadowed),
+    }
+}
+
+fn arrow_body_declares(body: &ArrowBody, name: &str) -> bool {
+    match body {
+        ArrowBody::Expr(_) => false,
+        ArrowBody::Block(b) => block_declares(b, name),
+    }
+}
+
+fn block_declares(st: &Stmt, name: &str) -> bool {
+    match st {
+        Stmt::BlockStatement { body } => body.iter().any(|s| stmt_declares(s, name)),
+        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
+            matches!(&d.id, Expr::Identifier { name: n } if n == name)
+        }),
+        _ => false,
+    }
+}
