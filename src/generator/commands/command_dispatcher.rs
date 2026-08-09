@@ -970,11 +970,14 @@ pub fn generate_command_impl_with_input(
                                 }
                             }
 
-                            // Set environment variables for the diff command
+                            // The reconstructed diff command references the temp
+                            // file vars as `"$temp_file_ps_N"` — export them so the
+                            // bash child resolves them (bash sees its OWN env, not
+                            // perl's scalars).
                             result.push_str(&generator.indent());
-                            result.push_str(&format!("$ENV{{DIFF_TEMP_FILE1}} = {};\n", file1.1));
+                            result.push_str(&format!("$ENV{{{}}} = ${};\n", file1.0, file1.0));
                             result.push_str(&generator.indent());
-                            result.push_str(&format!("$ENV{{DIFF_TEMP_FILE2}} = {};\n", file2.1));
+                            result.push_str(&format!("$ENV{{{}}} = ${};\n", file2.0, file2.0));
 
                             // Generate the actual diff command
                             let mut modified_diff_cmd = cmd.clone();

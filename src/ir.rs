@@ -1464,12 +1464,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             {
                                 arg_parts.push(a_str);
                             } else {
+                                // A Perl scalar argument (`$temp_file_ps_fh_1`)
+                                // is exported to the bash child's env before the
+                                // shell-out; reference it UNESCAPED so bash
+                                // resolves it (`"$temp_file_ps_fh_1"`).  Escaping
+                                // the `$` made the child see a literal dollar.
                                 arg_parts.push(format!(
                                     "\"{}\"",
-                                    a_str
-                                        .replace("\"", "\\\"")
-                                        .replace("$", "\\$")
-                                        .replace("@", "\\@")
+                                    a_str.replace("\"", "\\\"").replace("@", "\\@")
                                 ));
                             }
                         }
@@ -1501,12 +1503,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             {
                                 arg_parts.push(a_str);
                             } else {
+                                // A Perl scalar argument (`$temp_file_ps_fh_1`)
+                                // is exported to the bash child's env before the
+                                // shell-out; reference it UNESCAPED so bash
+                                // resolves it (`"$temp_file_ps_fh_1"`).  Escaping
+                                // the `$` made the child see a literal dollar.
                                 arg_parts.push(format!(
                                     "\"{}\"",
-                                    a_str
-                                        .replace("\"", "\\\"")
-                                        .replace("$", "\\$")
-                                        .replace("@", "\\@")
+                                    a_str.replace("\"", "\\\"").replace("@", "\\@")
                                 ));
                             }
                         }
