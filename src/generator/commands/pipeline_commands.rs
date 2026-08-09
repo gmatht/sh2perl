@@ -805,11 +805,36 @@ pub fn generate_pipeline_for_substitution(
                 }
             }
 
-            // Disabled: the echo|tr fast-path sometimes produces unbalanced
-            // braces in generated Perl (context: command-substitution inside
-            // a function body).  The generic pipeline handler below generates
-            // correct (if more verbose) code.
-            // if cmd1_name == "echo" && cmd2_name == "tr" { ... }
+            if cmd1_name == "echo" && cmd2_name == "tr" {
+                // `echo "$1" | tr a-z A-Z` — NATIVE Perl: the echo value is a
+                // plain Perl expression (function positional args map
+                // naturally: `$1` → `$_[0]`), and tr transforms it.  This
+                // avoids reconstructing a bash command string (where `$1`
+                // would need bash-side positional args the child lacks).
+                let unique_id = generator.get_unique_id();
+                let input_var = format!("tr_input_{}", unique_id);
+                // echo args: join with a space (echo semantics).  Handle -n/-e
+                // flags minimally by dropping them.
+                let echo_args: Vec<String> = cmd1
+                    .args
+                    .iter()
+                    .filter(|a| !matches!(a, Word::Literal(s, _) if s == "-n" || s == "-e"))
+                    .map(|a| generator.word_to_perl(a))
+                    .collect();
+                let echo_val = if echo_args.is_empty() {
+                    "q{}".to_string()
+                } else {
+                    echo_args.join(" . q{ } . ")
+                };
+                let setup = format!("my ${} = {};\n", input_var, echo_val);
+                let tr_code = crate::generator::commands::tr::generate_tr_command_for_substitution(
+                    generator,
+                    cmd2,
+                    &input_var,
+                    &unique_id.to_string(),
+                );
+                return format!("do {{ {} {} }}", setup, tr_code);
+            }
         }
     }
 

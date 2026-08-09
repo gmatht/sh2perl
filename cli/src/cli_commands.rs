@@ -123,7 +123,9 @@ pub fn parse_input(input: &str) {
 pub fn parse_file(filename: &str) {
     match read_cli_input(filename) {
         Ok(bytes) => {
-            parse_input(&String::from_utf8_lossy(&bytes));
+            // Preserve invalid bytes as PUA markers so the generator can
+            // re-emit them as `\xNN` byte escapes (byte-exact vs bash).
+            parse_input(&debashl::shared_utils::SharedUtils::bytes_to_marked_lossy(&bytes));
         }
         Err(e) => {
             println!("Error reading file {}: {}", filename, e);
@@ -453,7 +455,7 @@ fn extract_backticks_perl_logic(perl_code: &str) -> String {
 pub fn parse_file_to_perl(filename: &str) {
     match read_cli_input(filename) {
         Ok(bytes) => {
-            parse_to_perl(&String::from_utf8_lossy(&bytes));
+            parse_to_perl(&debashl::shared_utils::SharedUtils::bytes_to_marked_lossy(&bytes));
         }
         Err(e) => {
             println!("Error reading file {}: {}", filename, e);

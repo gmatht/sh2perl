@@ -234,6 +234,9 @@ pub fn generate_command_impl_with_input(
                         let _temp_file =
                             format!("{}/process_sub_{}.tmp", get_temp_dir(), global_counter);
                         let temp_var = format!("temp_file_ps_{}", global_counter);
+                        // Generated lexical — register so Word::Variable refs
+                        // (native cmp operands, diff args) render as `$var`.
+                        generator.declared_locals.insert(temp_var.clone());
 
                         // Decide whether to use FIFO or open3 approach.
                         // Non-serializable commands (While, If, etc.) use FIFO to avoid hanging.
@@ -1024,26 +1027,38 @@ pub fn generate_command_impl_with_input(
                         }
                     }
 
-                    // Special handling for cmp command with process substitution
+                    // Special handling for cmp command with process substitution:
+                    // feed the materialized temp-file paths into the NATIVE cmp
+                    // emulation (check_qx forbids system('cmp', ...)).
                     if cmd_name == "cmp" && !process_sub_files.is_empty() {
                         if process_sub_files.len() >= 2 {
                             let file1 = &process_sub_files[0];
                             let file2 = &process_sub_files[1];
 
-                            // Build arguments: first the original args (flags), then the temp file vars
-                            let mut args: Vec<String> = cmd
-                                .args
-                                .iter()
-                                .map(|arg| generator.perl_string_literal(arg))
-                                .collect();
-                            args.push(format!("${}", file1.0));
-                            args.push(format!("${}", file2.0));
-                            let args_str = args.join(", ");
-
+                            // `<(...)` operands arrive as ProcessSubstitutionInput
+                            // redirects, NOT literal args — so the arg list is the
+                            // flags plus the two materialized temp-file vars.
+                            let mut real_args: Vec<Word> = Vec::new();
+                            for a in &cmd.args {
+                                real_args.push(a.clone());
+                            }
+                            real_args.push(Word::Variable(file1.0.clone(), false, None));
+                            real_args.push(Word::Variable(file2.0.clone(), false, None));
+                            let native = crate::generator::commands::cmp::generate_cmp_command(
+                                generator,
+                                &SimpleCommand {
+                                    name: cmd.name.clone(),
+                                    args: real_args,
+                                    redirects: cmd.redirects.clone(),
+                                    env_vars: cmd.env_vars.clone(),
+                                    stdout_used: cmd.stdout_used,
+                                    stderr_used: cmd.stderr_used,
+                                },
+                            );
                             result.push_str(&generator.indent());
                             result.push_str(&format!(
-                                "$main_exit_code = $CHILD_ERROR = system('cmp', {}) >> 8;\n",
-                                args_str
+                                "$main_exit_code = $CHILD_ERROR = {};\n",
+                                native
                             ));
 
                             return result;
@@ -1178,16 +1193,102 @@ pub fn generate_command_impl_with_input(
                 result.push_str(&generator.indent());
                 result.push_str("open my $original_stdout, '>&', STDOUT\n");
                 result.push_str("      or die \"Cannot save STDOUT: $OS_ERROR\\n\";\n");
+                // Save stderr too: `local *STDERR` (used by generate_redirect)
+                // rebinds the Perl handle WITHOUT dup-ing the OS fd 2, so a
+                // bash child spawned via system() would still write to the
+                // original stderr.  Explicit save/restore dups the real fd.
+                result.push_str(&generator.indent());
+                result.push_str("open my $__saved_stderr, '>&', STDERR\n");
+                result.push_str("      or die \"Cannot save STDERR: $OS_ERROR\\n\";\n");
 
-                // Find the output redirect target
-                let output_redirect = all_redirects.iter().find(|r| {
+                // Redirects apply in SOURCE ORDER (bash semantics): a `2>&1`
+                // that appears BEFORE `>file` dups the ORIGINAL stdout, one
+                // that appears AFTER dups the redirected stdout.  The ESTree
+                // backend passes the same redirects as an ordered spec list
+                // to the runtime; here we must order the imperative opens the
+                // same way.  The heredoc (fd 0) redirects are already applied
+                // before this block; remaining Stderr* redirects before the
+                // first Output/Append go FIRST (against the saved STDOUT),
+                // then the output redirect, then the rest.
+                let output_pos = all_redirects.iter().position(|r| {
                     matches!(
                         r.operator,
                         RedirectOperator::Output | RedirectOperator::Append
                     )
                 });
 
-                if let Some(redirect) = output_redirect {
+                let is_stderr_redir = |r: &&Redirect| -> bool {
+                    matches!(
+                        r.operator,
+                        RedirectOperator::StderrOutput
+                            | RedirectOperator::StderrAppend
+                            | RedirectOperator::StderrInput
+                    )
+                };
+
+                // Emit a stderr redirect in-place WITHOUT `local *STDERR`
+                // (which breaks child fd inheritance) — the explicit
+                // $__saved_stderr restore at the end of the block undoes it.
+                let emit_stderr_redirect = |generator: &mut Generator,
+                                            result: &mut String,
+                                            redirect: &Redirect| {
+                    match &redirect.operator {
+                        RedirectOperator::StderrOutput => {
+                            let is_fd_dup = match &redirect.target {
+                                Word::Literal(s, _) => {
+                                    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+                                }
+                                _ => false,
+                            };
+                            if is_fd_dup {
+                                if let Word::Literal(s, _) = &redirect.target {
+                                    let fd_name = match s.as_str() {
+                                        "1" => "STDOUT",
+                                        "2" => "STDERR",
+                                        "0" => "STDIN",
+                                        _ => "STDOUT",
+                                    };
+                                    result.push_str(&format!(
+                                        "open STDERR, '>&', {} or die \"Cannot dup stderr: $OS_ERROR\\n\";\n",
+                                        fd_name
+                                    ));
+                                }
+                            } else {
+                                let target = generator.perl_string_literal(&redirect.target);
+                                result.push_str(&format!(
+                                    "open STDERR, '>', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
+                                    target
+                                ));
+                            }
+                        }
+                        RedirectOperator::StderrAppend => {
+                            let target = generator.perl_string_literal(&redirect.target);
+                            result.push_str(&format!(
+                                "open STDERR, '>>', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
+                                target
+                            ));
+                        }
+                        RedirectOperator::StderrInput => {
+                            let target = generator.perl_string_literal(&redirect.target);
+                            result.push_str(&format!(
+                                "open STDERR, '<', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
+                                target
+                            ));
+                        }
+                        _ => {}
+                    }
+                };
+
+                // Stderr redirects that precede the output redirect in source order.
+                if let Some(opos) = output_pos {
+                    for redirect in all_redirects.iter().take(opos) {
+                        if is_stderr_redir(&redirect) {
+                            emit_stderr_redirect(generator, &mut result, redirect);
+                        }
+                    }
+                }
+
+                if let Some(redirect) = output_pos.and_then(|i| all_redirects.get(i)) {
                     let target = generator.perl_string_literal(&redirect.target);
                     let mode = if matches!(redirect.operator, RedirectOperator::Append) {
                         ">>"
@@ -1202,17 +1303,12 @@ pub fn generate_command_impl_with_input(
                     result.push_str("open STDOUT, '>', 'temp_file.txt'\n");
                     result.push_str("      or die \"Cannot access file: $OS_ERROR\\n\";\n");
                 }
-                // Add stderr redirect inside the output redirect do block
-                if has_stderr_redirect {
-                    for redirect in &all_redirects {
-                        match &redirect.operator {
-                            RedirectOperator::StderrOutput
-                            | RedirectOperator::StderrAppend
-                            | RedirectOperator::StderrInput => {
-                                result.push_str(&generator.generate_redirect(redirect));
-                            }
-                            _ => {}
-                        }
+                // Stderr redirects that follow the output redirect (and, if
+                // there was no output redirect, all of them).
+                let skip = output_pos.map_or(0, |i| i + 1);
+                for redirect in all_redirects.iter().skip(skip) {
+                    if is_stderr_redir(&redirect) {
+                        emit_stderr_redirect(generator, &mut result, redirect);
                     }
                 }
             }
@@ -1481,6 +1577,13 @@ pub fn generate_command_impl_with_input(
                 result.push_str("      or die \"Cannot restore STDOUT: $OS_ERROR\\n\";\n");
                 result.push_str(&generator.indent());
                 result.push_str("close $original_stdout\n");
+                result.push_str("      or die \"Close failed: $OS_ERROR\\n\";\n");
+                // Undo any stderr redirects applied above (explicit fd restore).
+                result.push_str(&generator.indent());
+                result.push_str("open STDERR, '>&', $__saved_stderr\n");
+                result.push_str("      or die \"Cannot restore STDERR: $OS_ERROR\\n\";\n");
+                result.push_str(&generator.indent());
+                result.push_str("close $__saved_stderr\n");
                 result.push_str("      or die \"Close failed: $OS_ERROR\\n\";\n");
                 generator.indent_level -= 1;
                 result.push_str(&generator.indent());

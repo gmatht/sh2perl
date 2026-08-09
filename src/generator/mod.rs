@@ -555,6 +555,28 @@ impl Generator {
             if !command_output.ends_with('\n') {
                 output.push('\n');
             }
+
+            // `set -e` (errexit): bash exits as soon as a TOP-LEVEL command
+            // fails.  Condition-bearing statements are exempt (an `if`
+            // condition, `! cmd`, or the non-final side of `&&`/`||` may
+            // fail without exiting — bash's rule).  `$__set_e` is the
+            // RUNTIME flag, so scripts that toggle set -e mid-flight behave
+            // correctly; the static set_e_active scan only decides whether
+            // the check is worth emitting.
+            if self.set_e_active && matches!(
+                command,
+                Command::TestExpression(_)
+                    | Command::Simple(_)
+                    | Command::Assignment(_)
+                    | Command::BuiltinCommand(_)
+                    | Command::ShoptCommand(_)
+                    | Command::Redirect(_)
+                    | Command::Pipeline(_)
+            ) {
+                output.push_str(
+                    "exit $CHILD_ERROR if $__set_e && $CHILD_ERROR != 0;\n",
+                );
+            }
         }
 
         // Add final exit statement — only when exit-code tracking is needed

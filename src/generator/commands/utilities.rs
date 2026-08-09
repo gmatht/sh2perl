@@ -14,7 +14,7 @@ pub fn escape_perl_string(s: &str) -> String {
                 // Escape non-ASCII characters as \x{...} so that the generated
                 // Perl source remains pure ASCII and PPI does not choke on
                 // multi-byte UTF-8 sequences.
-                result.push_str(&format!("\\x{{{:04X}}}", ch as u32));
+                result.push_str(&crate::generator::utils::perl_char_escape(ch));
             }
         }
     }

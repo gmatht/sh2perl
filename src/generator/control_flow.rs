@@ -1440,12 +1440,12 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     // of whether a param-name map (from name=$1 assignments) was built.
     let uses_pos = check_function_uses_positional_params(&func.body);
     if uses_pos {
-        // Replace $1 through $9 with $_[0] through $_[8]
-        for i in 1..=9 {
-            let old_ref = format!("${}", i);
-            let new_ref = format!("$_[{}]", i - 1);
-            body_code = body_code.replace(&old_ref, &new_ref);
-        }
+        // Replace $1 through $9 with $_[0] through $_[8] — but ONLY outside
+        // single-quoted Perl string literals.  Shell-out command strings are
+        // embedded as `'echo "$1" | tr a-z A-Z'` where `$1` is BASH syntax
+        // for the child's positional arg; rewriting it to `$_[0]` breaks the
+        // child.  A naive .replace("$1", ...) hits those literals too.
+        body_code = replace_positional_outside_quotes(&body_code);
     }
 
     // If we have named parameters, prepend a clean unpacking line and
@@ -1624,6 +1624,49 @@ fn count_structural_braces(code: &str) -> (usize, usize) {
         }
     }
     (opens, closes)
+}
+
+/// Replace `$1`..`$9` with `$_[0]`..`$_[8]` in generated Perl, skipping
+/// single-quoted string literals (where `$1` is literal text — e.g. bash
+/// command strings embedded as `'echo "$1" | tr a-z A-Z'`).
+fn replace_positional_outside_quotes(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    let mut in_single = false;
+    while let Some(c) = chars.next() {
+        if in_single {
+            out.push(c);
+            if c == '\\' {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            } else if c == '\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        if c == '\'' {
+            in_single = true;
+            out.push(c);
+            continue;
+        }
+        if c == '$' {
+            // look ahead for a digit 1..=9
+            if let Some(d) = chars.peek() {
+                if let Some(n) = d.to_digit(10) {
+                    if (1..=9).contains(&n) {
+                        chars.next();
+                        out.push_str(&format!("$_[{}]", n - 1));
+                        continue;
+                    }
+                }
+            }
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn check_function_uses_positional_params(block: &Block) -> bool {

@@ -12,6 +12,7 @@ pub mod utilities;
 pub mod awk;
 pub mod basename;
 pub mod cat;
+pub mod cmp;
 pub mod comm;
 pub mod cp;
 pub mod curl;

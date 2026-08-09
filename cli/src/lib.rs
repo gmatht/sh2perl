@@ -1133,8 +1133,11 @@ exit $main_exit_code;
                     }
                 }
             } else if command.ends_with(".sh") {
-                // Run the shell script directly
-                match fs::read_to_string(command) {
+                // Run the shell script directly.  Read LOSSILY: bash scripts
+                // are byte streams — a non-UTF-8 byte (e.g. ISO-8859-1 in
+                // utf8-non-utf8-content.sh) must not prevent translation;
+                // bash echoes such bytes unchanged.
+                match SharedUtils::read_file_lossy_marked(command) {
                     Ok(content) => {
                         println!("Running shell script: {}", command);
                         // Parse and run the shell script

@@ -9,6 +9,7 @@ fn generate_ls_helper(
     add_slash_to_dirs: bool,
     sort_by_time: bool,
     show_hidden: bool,
+    almost_all: bool,
     long_format: bool,
 ) -> String {
     let mut output = String::new();
@@ -66,7 +67,11 @@ fn generate_ls_helper(
         output.push_str(&generator.indent());
         output.push_str("while ( my $file = readdir $dh ) {\n");
         generator.indent_level += 1;
-        if !show_hidden {
+        if almost_all {
+            // -A: show dotfiles but hide . and ..
+            output.push_str(&generator.indent());
+            output.push_str("next if $file eq q{.} || $file eq q{..};\n");
+        } else if !show_hidden {
             output.push_str(&generator.indent());
             output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/;\n");
         }
@@ -149,6 +154,7 @@ fn generate_ls_sections_helper(
     sort_by_time: bool,
     add_slash_to_dirs: bool,
     show_hidden: bool,
+    almost_all: bool,
 ) -> String {
     let mut output = String::new();
     let inputs_array = format!("ls_inputs_{}", generator.get_unique_id());
@@ -284,7 +290,11 @@ fn generate_ls_sections_helper(
     output.push_str(&generator.indent());
     output.push_str("while ( my $file = readdir $dh ) {\n");
     generator.indent_level += 1;
-    if !show_hidden {
+    if almost_all {
+        // -A: show dotfiles but hide . and ..
+        output.push_str(&generator.indent());
+        output.push_str("next if $file eq q{.} || $file eq q{..};\n");
+    } else if !show_hidden {
         output.push_str(&generator.indent());
         output.push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/;\n");
     }
@@ -399,6 +409,7 @@ pub fn generate_ls_command(
     let mut _long_format = false; // -l flag: long format
     let mut sort_by_time = false; // -t flag: sort by modification time
     let mut show_hidden = false; // -a flag: show hidden files
+    let mut almost_all = false;  // -A flag: almost-all (hide . and ..)
 
     // First pass: collect all file/directory arguments
     let mut file_args = Vec::new();
@@ -447,6 +458,7 @@ pub fn generate_ls_command(
                             'l' => _long_format = true,      // -l flag: long format
                             't' => sort_by_time = true,      // -t flag: sort by modification time
                             'a' => show_hidden = true,       // -a flag: show hidden files
+                            'A' => almost_all = true,       // -A flag: almost-all (hide . & .. only)
                             _ => {}                          // Ignore other flags for now
                         }
                     }
@@ -465,6 +477,7 @@ pub fn generate_ls_command(
                                     'l' => _long_format = true,      // -l flag: long format
                                     't' => sort_by_time = true, // -t flag: sort by modification time
                                     'a' => show_hidden = true,  // -a flag: show hidden files
+                                    'A' => almost_all = true,  // -A flag: almost-all
                                     _ => {}                     // Ignore other flags for now
                                 }
                             }
@@ -541,7 +554,10 @@ pub fn generate_ls_command(
                 output.push_str(&generator.indent());
                 output.push_str("while ( my $file = readdir $dh ) {\n");
                 generator.indent_level += 1;
-                if !show_hidden {
+                if almost_all {
+                    output.push_str(&generator.indent());
+                    output.push_str("next if $file eq q{.} || $file eq q{..};\n");
+                } else if !show_hidden {
                     output.push_str(&generator.indent());
                     output
                         .push_str("next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/;\n");
@@ -587,6 +603,7 @@ pub fn generate_ls_command(
                 add_slash_to_dirs,
                 sort_by_time,
                 show_hidden,
+                almost_all,
                 _long_format,
             ));
         }
@@ -624,6 +641,7 @@ pub fn generate_ls_command(
                     sort_by_time,
                     add_slash_to_dirs,
                     show_hidden,
+                    almost_all,
                 ));
             } else {
                 // Handle a single file or directory argument.
@@ -654,7 +672,10 @@ pub fn generate_ls_command(
                     output.push_str(&generator.indent());
                     output.push_str("while ( my $file = readdir $dh ) {\n");
                     generator.indent_level += 1;
-                    if !show_hidden {
+                    if almost_all {
+                        output.push_str(&generator.indent());
+                        output.push_str("next if $file eq q{.} || $file eq q{..};\n");
+                    } else if !show_hidden {
                         output.push_str(&generator.indent());
                         output.push_str(
                             "next if $file eq q{.} || $file eq q{..} || $file =~ /^[.]/;\n",
@@ -702,6 +723,7 @@ pub fn generate_ls_command(
                 add_slash_to_dirs,
                 sort_by_time,
                 show_hidden,
+                almost_all,
                 _long_format,
             ));
         }
@@ -791,7 +813,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
     let mut _long_format = false; // -l flag: long format
     let mut sort_by_time = false; // -t flag: sort by modification time
     let mut show_hidden = false; // -a flag: show hidden files
-
+    let mut almost_all = false;  // -A flag: almost-all (hide . and ..)
     for arg in &cmd.args {
         if let Word::Literal(s, _) = arg {
             if s.starts_with('-') {
@@ -805,6 +827,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
                         'l' => _long_format = true,   // -l flag: long format
                         't' => sort_by_time = true,   // -t flag: sort by modification time
                         'a' => show_hidden = true,    // -a flag: show hidden files
+                        'A' => almost_all = true,    // -A flag: almost-all
                         _ => {}                       // Ignore other flags for now
                     }
                 }
@@ -857,6 +880,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
             false,
             add_slash_to_dirs,
             show_hidden,
+            almost_all,
         ));
     } else {
         // No file arguments, use default directory
@@ -868,6 +892,7 @@ pub fn generate_ls_for_substitution(generator: &mut Generator, cmd: &SimpleComma
             add_slash_to_dirs,
             false,
             show_hidden,
+            almost_all,
             _long_format,
         ));
     }
