@@ -10208,7 +10208,11 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         source_type: "module",
         body,
     });
-    crate::estree::drop_dead_flags(crate::estree::hoist_last_exit(program))
+    // then the dead top-level declaration elimination (a for-loop's own
+    // `let i` shadows the hoisted `let i = 0`, which is then dead)
+    crate::estree::drop_dead_top_decls(crate::estree::drop_dead_flags(
+        crate::estree::hoist_last_exit(program),
+    ))
 }
 
 /// Top-level statement lowering: additionally wraps statement-position calls
