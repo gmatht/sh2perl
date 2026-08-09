@@ -52,7 +52,7 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
                 '\r' => "\\r".to_string(),
                 '$' => "\\$".to_string(),
                 _ if c.is_ascii() => c.to_string(),
-                _ => format!("\\x{{{:04X}}}", c as u32),
+                _ => super::utils::perl_char_escape(c),
             })
             .collect::<Vec<_>>()
             .join("");
@@ -2127,11 +2127,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if name == "readlink" || name == "realpath" {
                             // Native Perl: Cwd::abs_path() canonizalizes symlinks.
                             let mut args: Vec<String> = Vec::new();
-                            let mut has_f_flag = false;
+                            let mut canonicalize_missing = false; // -m / -f: print even when the path does not exist
                             for arg in &simple_cmd.args {
                                 if let Word::Literal(s, _) = arg {
-                                    if s == "-f" || s == "-e" || s == "-m" {
-                                        has_f_flag = true;
+                                    if s == "-m" || s == "-f" {
+                                        canonicalize_missing = true;
                                     } else if !s.starts_with('-') {
                                         args.push(generator.word_to_perl(arg));
                                     }
@@ -2139,9 +2139,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             }
                             if args.is_empty() {
                                 "do { $CHILD_ERROR = 0; q{} };\n".to_string()
-                            } else if has_f_flag {
+                            } else if canonicalize_missing {
+                                // abs_path fails for missing paths; walk up to
+                                // the deepest existing ancestor and re-append
+                                // the missing suffix (GNU readlink -m/-f).
                                 format!(
-                                    "do {{ use Cwd qw(abs_path); my $_r = abs_path({}); defined $_r ? $_r : q{{}}; }}",
+                                    "do {{ use Cwd qw(abs_path); use File::Basename qw(dirname basename); my $__p = {}; my $__tail = q{{}}; my $__r = abs_path($__p); while (!defined $__r && $__p ne q{{/}} && $__p ne q{{.}}) {{ $__tail = q{{/}} . basename($__p) . $__tail; $__p = dirname($__p); $__r = abs_path($__p); }} defined $__r ? (($__r eq q{{/}} ? q{{}} : $__r) . $__tail) : q{{}}; }}",
                                     args.join(", ")
                                 )
                             } else {

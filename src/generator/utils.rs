@@ -339,6 +339,23 @@ fn try_extract_sort_herestring_var(inner: &str) -> Option<&str> {
     }
 }
 
+
+/// Escape a char for a Perl double-quoted string literal.  Private-use
+/// marker chars (U+E000 + invalid source byte, see
+/// SharedUtils::bytes_to_marked_lossy) are emitted as `\xNN` BYTE escapes
+/// so non-UTF-8 source bytes round-trip byte-for-byte (bash treats scripts
+/// as byte streams).  Other non-ASCII chars become `\x{...}` escapes.
+pub(crate) fn perl_char_escape(c: char) -> String {
+    let cp = c as u32;
+    if (0xE000..=0xE0FF).contains(&cp) {
+        format!("\\x{:02X}", (cp - 0xE000) as u8)
+    } else if !c.is_ascii() {
+        format!("\\x{{{:04X}}}", cp)
+    } else {
+        c.to_string()
+    }
+}
+
 pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
@@ -403,7 +420,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                         '@' => "\\@".to_string(),
                         '$' => "\\$".to_string(),
                         _ if c.is_ascii() => c.to_string(),
-                        _ => format!("\\x{{{:04X}}}", c as u32),
+                        _ => perl_char_escape(c),
                     })
                     .collect::<Vec<_>>()
                     .join("");
@@ -473,7 +490,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 '{' => "\\{".to_string(),
                                 '}' => "\\}".to_string(),
                                 _ if c.is_ascii() => c.to_string(),
-                                _ => format!("\\x{{{:04X}}}", c as u32),
+                                _ => perl_char_escape(c),
                             })
                             .collect::<Vec<_>>()
                             .join("");
@@ -492,7 +509,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 '@' => "\\@".to_string(),
                                 '$' => "\\$".to_string(),
                                 _ if c.is_ascii() => c.to_string(),
-                                _ => format!("\\x{{{:04X}}}", c as u32),
+                                _ => perl_char_escape(c),
                             })
                             .collect::<Vec<_>>()
                             .join("");

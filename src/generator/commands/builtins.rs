@@ -70,6 +70,7 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
         "comm",
         BuiltinCommand::new("comm", "Compare sorted files", false),
     );
+    commands.insert("cmp", BuiltinCommand::new("cmp", "Compare files byte by byte", false));
     commands.insert("diff", BuiltinCommand::new("diff", "Compare files", false));
     commands.insert(
         "tr",
@@ -820,6 +821,10 @@ pub fn generate_generic_builtin(
         "comm" => {
             // For now, use the existing signature but we should standardize this
             crate::generator::commands::comm::generate_comm_command(generator, cmd, input_var, &[])
+        }
+        "cmp" => {
+            // Native cmp: check_qx forbids system(cmp); emulate GNU formats.
+            crate::generator::commands::cmp::generate_cmp_command(generator, cmd)
         }
         "diff" => {
             // For now, use the existing signature but we should standardize this

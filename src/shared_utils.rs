@@ -24,6 +24,42 @@ impl SharedUtils {
         Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 
+    /// Read a file as a byte stream and convert to a String that PRESERVES
+    /// every invalid byte as a private-use marker char (U+E000 + byte).
+    /// bash treats scripts as byte streams (echo of a non-UTF-8 byte passes
+    /// it through), so the Perl generator converts the markers back to
+    /// `\xNN` byte escapes for byte-exact output.
+    pub fn read_file_lossy_marked(path: &str) -> io::Result<String> {
+        let bytes = fs::read(path)?;
+        Ok(Self::bytes_to_marked_lossy(&bytes))
+    }
+
+    pub fn bytes_to_marked_lossy(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match std::str::from_utf8(&bytes[i..]) {
+                Ok(s) => {
+                    out.push_str(s);
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        out.push_str(std::str::from_utf8(&bytes[i..i + valid]).unwrap());
+                        i += valid;
+                    }
+                    // Map ONE invalid byte to a PUA marker (byte streams:
+                    // bash never groups bytes).
+                    let b = bytes[i];
+                    out.push(char::from_u32(0xE000 + b as u32).unwrap());
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
     /// Write content to file with proper UTF-8 encoding
     pub fn write_utf8_file(path: &str, content: &str) -> io::Result<()> {
         // Write UTF-8 content without BOM for better shell compatibility

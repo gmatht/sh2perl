@@ -223,6 +223,10 @@ waitpid $pid, 0;\n",
                 format!("{} . '/process_sub_{}.tmp'", get_temp_dir(), global_counter),
                 temp_var.clone(),
             );
+            // The temp var is a generated lexical; register it so later
+            // Word::Variable refs (e.g. native cmp operands) render as the
+            // scalar `$temp_file_ps_fh_N`, not `$ENV{...}`.
+            generator.declared_locals.insert(temp_var.clone());
 
             // Store the temp_var for use by commands that need it (like grep -f)
             generator.current_process_sub_file = Some(temp_var.clone());
