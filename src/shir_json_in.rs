@@ -128,6 +128,13 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
             .collect(),
         _ => vec![],
     };
+    let var_bash_env = match obj.get("var_bash_env") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => vec![],
+    };
     Ok(IrProgram {
         imports,
         requires,
@@ -139,6 +146,7 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
         var_const,
         var_lifetimes,
         var_nospace,
+        var_bash_env,
     })
 }
 
@@ -1047,7 +1055,8 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
-        var_nospace: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json_raw(&prog);
         assert!(json.contains("\"kind\":\"Float\""), "json: {json}");
@@ -1115,7 +1124,8 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
-        var_nospace: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
         };
         let json = shir_to_shir_json(&prog);
         // valid

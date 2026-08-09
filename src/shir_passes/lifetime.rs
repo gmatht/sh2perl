@@ -752,6 +752,7 @@ mod tests {
     fn empty_prog() -> IrProgram {
         IrProgram {
             var_nospace: vec![],
+            var_bash_env: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![],

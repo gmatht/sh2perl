@@ -581,6 +581,15 @@ pub struct IrProgram {
     /// ignore it are unaffected. Sorted by name for deterministic
     /// serialization.
     pub var_nospace: Vec<(String, bool)>,
+    /// Bash-identity variables the program REFERENCES that bash sets ITSELF
+    /// at startup (never inherited from the environment): HOSTNAME, USER's
+    /// siblings like BASH_VERSION/ZSH_VERSION.  Populated by
+    /// `shir::analyze_var_bash_env`; the Perl backend initializes them
+    /// (HOSTNAME → real hostname via Sys::Hostname) so `${HOSTNAME:-...}`
+    /// matches what a bash run of the same script sees.  Additive —
+    /// backends that ignore it are unaffected.  Sorted for deterministic
+    /// serialization.
+    pub var_bash_env: Vec<String>,
 }
 
 // ── Backend: IR → Perl text ─────────────────────────────────────────
@@ -691,8 +700,22 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
             imports.push("feature 'say'".to_string());
         }
     }
+    // Bash-identity variables the program references: bash sets HOSTNAME
+    // itself at startup (from the hostname), so a faithful translation
+    // initializes it from the REAL hostname at runtime (Sys::Hostname —
+    // pure Perl, no bash dependency).  This is what `shir::analyze_var_bash_env`
+    // detected; without it `${HOSTNAME:-localhost}` would read an unset
+    // env var and print the default even though bash prints the machine
+    // name.
+    let needs_hostname = prog.var_bash_env.iter().any(|n| n == "HOSTNAME");
+    if needs_hostname {
+        imports.push("Sys::Hostname qw(hostname)".to_string());
+    }
     for import in &imports {
         out.push_str(&format!("use {};\n", import));
+    }
+    if needs_hostname {
+        out.push_str("$ENV{HOSTNAME} //= hostname();\n");
     }
     // Blank line after imports block (only if there are imports)
     if !imports.is_empty() {
@@ -1660,7 +1683,11 @@ fn perl_lhs_for(var: &str) -> String {
     }
     let (base, idx) = split_indexed_var(var);
     match idx {
-        Some(i) => format!("${{{}}}{{\"{}\"}}", base, i.replace('\"', "\\\"")),
+        Some(i) => format!(
+            "${}{{\"{}\"}}",
+            base,
+            i.replace('\"', "\\\"").replace('\'', "\\'"),
+            ),
         None => format!("${}", base),
     }
 }
@@ -1678,6 +1705,15 @@ fn var_read(name: &str) -> String {
             Ok(n) => format!("$ARGV[{}]", n - 1),
             Err(_) => format!("${}", name),
         };
+    }
+    if let (base, Some(idx)) = split_indexed_var(name) {
+        // `${map[foo]}` / `${arr[1]}` — element access baked into the var
+        // name by the lowering.  Numeric keys index @arr; non-numeric keys
+        // are hash keys (map{'foo'}).
+        if idx.chars().all(|c| c.is_ascii_digit()) {
+            return format!("${}[{}]", base, idx);
+        }
+        return format!("${}{{'{}'}}", base, idx.replace('\'', "\\'"));
     }
     match name {
         "#" => "$__argc".to_string(),
@@ -1969,10 +2005,30 @@ fn render_param(args: &[IrExpr]) -> String {
         // Array slice: ${arr[@]:off:len} → @arr[off..off+len-1] (0-based;
         // the shIR contract normalizes subscripts).
         "slice" => {
-            let off = args
+            let raw_off = args
                 .get(2)
                 .and_then(call_arg_str)
-                .unwrap_or_else(|| "0".to_string())
+                .unwrap_or_else(|| "0".to_string());
+            let raw_len = args.get(3).and_then(call_arg_str).unwrap_or_default();
+            // `${#arr[@]}` — array LENGTH (the `#`-prefixed name with an
+            // `@` offset and no length).
+            if name.starts_with('#') && raw_off == "@" && raw_len.is_empty() {
+                let arr = &name[1..];
+                return format!("scalar(@{})", arr);
+            }
+            // `${!map[@]}` — HASH KEYS (the `!`-prefixed name with an `@`
+            // offset and no length).
+            if name.starts_with('!') && raw_off == "@" && raw_len.is_empty() {
+                return format!("keys %{}", &name[1..]);
+            }
+            // `${arr[@]}` — all elements: a LIST in iteration contexts, but
+            // a space-joined string in scalar/print contexts.  The legacy
+            // renderer joins; emit join here — callers that need the list
+            // (for-iter) use a different node.
+            if raw_off == "@" && raw_len.is_empty() && !name.starts_with('#') {
+                return format!("join(' ', @{})", name);
+            }
+            let off = raw_off
                 .parse::<i64>()
                 .unwrap_or(0);
             let end = match args.get(3).and_then(call_arg_str) {
@@ -5489,7 +5545,8 @@ impl IrProgram {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
-        var_nospace: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
         }
     }
 }
