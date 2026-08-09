@@ -819,16 +819,17 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         // renderers see the IR. A survivor means the pass's subset was
         // exceeded — refuse loudly (the backend stub gate counts the
         // TODO(unsupported) marker).
-        IrStmt::Label(name) | IrStmt::Goto(name) => {
+        // A Label/Goto that survived restructure_goto (a goto shape
+        // outside the shared pass's subset). Perl HAS goto, so emit the
+        // real `LABEL:` / `goto LABEL;` instead of refusing — the jump
+        // semantics are identical to the source's.
+        IrStmt::Label(name) => {
             emit_indent(out, indent);
-            let kind = if matches!(stmt, IrStmt::Label(_)) {
-                "label"
-            } else {
-                "goto"
-            };
-            out.push_str(&format!(
-                "# TODO(unsupported): {kind} {name} not restructured by restructure_goto\n"
-            ));
+            out.push_str(&format!("{name}: ;\n"));
+        }
+        IrStmt::Goto(name) => {
+            emit_indent(out, indent);
+            out.push_str(&format!("goto {name};\n"));
         }
 
         // Neutral ESTree-path-only nodes — the Perl generator never emits them.
@@ -2725,6 +2726,30 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
 
 /// Rebuild a shell command string from a `redirect` Call (a command plus
 /// fd redirect specs) — used in condition and statement positions.
+/// `exec(cmd, …)` in condition position → the reconstructed shell
+/// command string (the same shape `pipeline_call_to_cmd` handles).
+fn exec_call_to_cmd(call: &IrExpr) -> Option<String> {
+    if let IrExpr::Call { func, args } = call {
+        if func == "exec" {
+            let mut words: Vec<&IrExpr> = Vec::new();
+            // exec(cmd) / exec(cmd, words…): the first arg is the
+            // command itself (e.g. the restructure pass's
+            // `exec("true")` canonical loop condition).
+            if let Some(first) = args.first() {
+                if let IrExpr::Str(..) = first {
+                    words.push(first);
+                }
+            }
+            words.extend(exec_word_args(args));
+            if words.is_empty() {
+                return None;
+            }
+            return Some(words.iter().map(|w| render_word(w)).collect::<Vec<_>>().join(" "));
+        }
+    }
+    None
+}
+
 fn redirect_call_to_cmd(call: &IrExpr) -> Option<String> {
     if let IrExpr::Call { func, args } = call {
         if func == "redirect" {
@@ -4396,6 +4421,19 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         .unwrap_or_default();
                     format!("({})", arith_text_to_perl(&text))
                 }
+                // A command in CONDITION position (while/if tests — the
+                // restructure pass's `while true` canonical form, `while
+                // cmd`, …). Perl's native `exec` would REPLACE the
+                // process instead of returning a status, so run the
+                // command via bash -c and test its exit status (the same
+                // lowering the `redirect`/`block` arms use).
+                "exec" => match exec_call_to_cmd(expr) {
+                    Some(cmd) => format!(
+                        "(system('bash', '-c', {}) == 0)",
+                        safe_perl_q_string(&cmd)
+                    ),
+                    None => "0".to_string(),
+                },
                 _ => {
                     let a = args
                         .iter()
