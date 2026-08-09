@@ -24246,25 +24246,29 @@ fn array_elt_to_estree(e: &IrExpr) -> Expr {
 /// binops) and whitespace-free string literals — the `split` (word-split)
 /// emitter skips the split for these (it would be a no-op).
 fn expr_known_nospace(e: &IrExpr) -> bool {
+    // The value is provably free of IFS whitespace: a spaceless literal, a
+    // numeric expression, a No-Space-tagged var — OR a NUMERIC-LIFTED var
+    // (its runtime binding is a JS number; String(number) is always
+    // whitespace-free — even Infinity/NaN/"1e+21"). The tag analysis only
+    // covers assignment targets, so loop counters (e.g. the native range
+    // for's `i`) never receive it — their Int type is the proof here.
+    fn tagged(name: &str) -> bool {
+        VAR_NOSPACE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.contains(name))
+            .unwrap_or(false)
+    }
     match e {
         IrExpr::Int(_) => true,
         IrExpr::Arith(_) => true,
         IrExpr::BinOp { .. } => true,
         IrExpr::Str(s, _) => !s.chars().any(char::is_whitespace),
-        IrExpr::Var(name, _) | IrExpr::Ident(name) => VAR_NOSPACE
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|s| s.contains(name))
-            .unwrap_or(false),
+        IrExpr::Var(name, _) | IrExpr::Ident(name) => is_lifted_num(name) || tagged(name),
         IrExpr::Call { func, args } => match func.as_str() {
             "getVar" => match args.first() {
-                Some(IrExpr::Str(n, _)) => VAR_NOSPACE
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|s| s.contains(n))
-                    .unwrap_or(false),
+                Some(IrExpr::Str(n, _)) => is_lifted_num(n) || tagged(n),
                 _ => false,
             },
             "arith" => true,
