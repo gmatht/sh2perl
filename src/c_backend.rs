@@ -3906,6 +3906,39 @@ impl Render {
                     "0".into()
                 }
             }
+            // `grepMatches(text, pattern, flags)` — the `grep -o` lift:
+            // native regex.h match-all. flags: E (ERE as-is), F (fixed),
+            // i (case-insensitive); the default is BRE (translated).
+            "grepMatches" => {
+                let text = self.value_c(args.first().unwrap_or(&IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted)));
+                let pat = Self::str_arg(args, 1).unwrap_or_default();
+                let flags = Self::str_arg(args, 2).unwrap_or_default();
+                let mut body = pat.to_string();
+                if flags.contains('F') {
+                    let mut lit = String::new();
+                    for c in body.chars() {
+                        if matches!(c, '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\') {
+                            lit.push('\\');
+                        }
+                        lit.push(c);
+                    }
+                    body = lit;
+                } else if !flags.contains('E') {
+                    body = body
+                        .replace("\\+", "+").replace("\\?", "?")
+                        .replace("\\\\(", "(").replace("\\\\\\)", ")")
+                        .replace("\\|", "|").replace("\\{", "{").replace("\\}", "}");
+                }
+                self.need_regex = true;
+                self.need_sh = true; // _sh_rc (grep's exit status)
+                let mout = self.str_temp(65536);
+                let flags_c = if flags.contains('i') { "REG_ICASE" } else { "0" };
+                self.emit(&format!(
+                    "{{ {mout}[0] = 0; regex_t _rx; if (regcomp(&_rx, {}, REG_EXTENDED | {flags_c}) == 0) {{ regmatch_t _m; const char *_p = {text}; size_t _mo = 0; while (regexec(&_rx, _p, 1, &_m, 0) == 0 && _m.rm_so != _m.rm_eo) {{ size_t _ml = (size_t)(_m.rm_eo - _m.rm_so); if (_mo + _ml + 1 < sizeof {mout}) {{ memcpy({mout} + _mo, _p + _m.rm_so, _ml); _mo += _ml; {mout}[_mo++] = '\\n'; }} _p += _m.rm_eo; }} {mout}[_mo] = 0; regfree(&_rx); _sh_rc = _mo > 0 ? 0 : 1; }} else {{ _sh_rc = 2; }} }}",
+                    Self::cstr(&body),
+                ));
+                format!("{mout}")
+            }
             _ if self.functions.contains(func) => {
                 let id = self.c_ident(func);
                 self.need_sh = true;
@@ -4681,6 +4714,14 @@ impl Render {
                         return;
                     }
                     _ => {}
+                }
+                if let IrExpr::Call { func, .. } = e {
+                    if func == "grepMatches" {
+                        // statement position: the matches are the output
+                        let v = self.expr(e);
+                        self.emit(&format!("printf(\"%s\\n\", (char*)({v}));"));
+                        return;
+                    }
                 }
                 let x = self.expr(e);
                 self.emit(&format!("{x};"));

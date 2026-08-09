@@ -11899,6 +11899,40 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // Expression-position pipelines (&&/||/if operands) are
             // already awaited at their own emission site (see
             // expr_to_estree's async-call await).
+            // The grepMatches statement: the matches are the output —
+            // emit the joined value + trailing newline (grep -o).
+            if let IrExpr::Call { func, args, .. } = e {
+                if func == "grepMatches" {
+                    let args_e: Vec<Expr> = args.iter().map(expr_to_estree).collect();
+                    let call = sh2_call("grepMatches", args_e);
+                    let write = Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::MemberExpression {
+                                object: Box::new(Expr::Identifier {
+                                    name: "process".to_string(),
+                                }),
+                                property: Box::new(Expr::Identifier {
+                                    name: "stdout".to_string(),
+                                }),
+                                computed: false,
+                                optional: false,
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "write".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        arguments: vec![Expr::BinaryExpression {
+                            operator: "+".to_string(),
+                            left: Box::new(call),
+                            right: Box::new(str_lit("\n")),
+                        }],
+                        optional: false,
+                    };
+                    return Some(Stmt::ExpressionStatement { expression: write });
+                }
+            }
             let lowered = expr_to_estree(e);
             Stmt::ExpressionStatement {
                 expression: if sh2_callee_name(&lowered) == Some("pipeline") {
@@ -24667,6 +24701,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // (for-iters `for w in $y`, exec args `set -- $y`): bash splits
             // on default-IFS whitespace and DROPS empty fields (an empty/
             // unset variable → zero fields → zero iterations/args). The
+            // `grepMatches(text, pattern, flags)` — the `grep -o` lift
+            // (transforms/grep_o.rs): a native runtime match-all. The
+            // runtime writes the matches (one per line, grep -o's
+            // output), sets lastExit (0 iff any match) and returns the
+            // match array (the capture/value contexts).
+            if func == "grepMatches" {
+                let args_e: Vec<Expr> = args.iter().map(expr_to_estree).collect();
+                return sh2_call("grepMatches", args_e);
+            }
             // runtime's own pattern (captureWords, exec's name split) is
             // `s.split(/\s+/).filter(w => w.length > 0)` — emit it NATIVE,
             // no dispatch. `String(v)` guards lifted numeric bindings.

@@ -886,6 +886,14 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
     match st {
         IrStmt::Expr(e) => {
             indent(out, d);
+            if let IrExpr::Call { func, .. } = e {
+                if func == "grepMatches" {
+                    // statement position: the matches are the output
+                    out.push_str(&format!("echo \"{}\"", cmd_to_sh(e)?));
+                    out.push('\n');
+                    return Ok(());
+                }
+            }
             out.push_str(&cmd_to_sh(e)?);
             out.push('\n');
             Ok(())
@@ -1669,6 +1677,27 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                     }
                 }
                 Ok(line)
+            }
+            // `grepMatches(text, pattern, flags)` — the `grep -o` lift:
+            // the sh backend keeps the shell's own grep (native) — re-emit
+            // the -o pipeline on the input text.
+            "grepMatches" => {
+                let text = word_to_sh(arg(args, 0)?)?;
+                let pat = raw_arg(args, 1)?;
+                let flags = raw_arg(args, 2)?;
+                let mut line = String::from("printf '%s\n' ");
+                line.push_str(&text);
+                line.push_str(" | grep -o");
+                for c in flags.chars() {
+                    if c == 'E' || c == 'i' || c == 'F' {
+                        line.push(' ');
+                        line.push('-');
+                        line.push(c);
+                    }
+                }
+                line.push(' ');
+                line.push_str(&pat);
+                Ok(format!("$({line})"))
             }
             other => Err(format!("command call not renderable: {other:?}")),
         },
