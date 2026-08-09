@@ -48,9 +48,14 @@ pub fn generate_subshell_impl(generator: &mut Generator, command: &Command) -> S
         {
             continue;
         }
-        // Associative arrays need % sigil instead of $
+        // Associative arrays need % sigil, indexed arrays @ sigil; the
+        // snapshot must match the declared type (`my @first_half = @first_half;`
+        // — a scalar snapshot of an indexed array is an undeclared $first_half
+        // under `use strict`).
         let sigil = if generator.associative_arrays.contains(var_name) {
             Some(Sigil::Hash)
+        } else if generator.indexed_arrays.contains(var_name) {
+            Some(Sigil::Array)
         } else {
             Some(Sigil::Scalar)
         };
