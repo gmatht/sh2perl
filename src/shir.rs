@@ -13810,6 +13810,37 @@ fn echo_arg_scalar(a: &IrExpr) -> Expr {
 /// with a newline (the final arg is a literal with no trailing `\n` even
 /// after the `-e` replaces). The capture strips trailing newlines from the
 /// buffer, so a provably-newline-free join needs no trim wrapper.
+/// A lowered echo arg that is provably a SCALAR value — a one-element
+/// `[x].flat().join(" ")` of it is exactly its string form (flat() is a
+/// no-op on a scalar, join(" ") is String(x)). Identifiers are scalar
+/// only when their binding is provably whitespace-free: a NUMERIC-LIFTED
+/// var (a JS number — String() never has whitespace) or a No-Space-\
+/// tagged var. Other identifiers (native array bindings, untagged
+/// strings) and calls (captureWords/arrayItems results) are
+/// array-valued and must keep the flat/join splice.
+fn estree_arg_is_scalar(e: &Expr) -> bool {
+    match e {
+        Expr::Literal { .. }
+        | Expr::TemplateLiteral { .. }
+        | Expr::UnaryExpression { .. }
+        | Expr::BinaryExpression { .. }
+        | Expr::LogicalExpression { .. }
+        | Expr::ConditionalExpression { .. }
+        | Expr::SequenceExpression { .. }
+        | Expr::AssignmentExpression { .. } => true,
+        Expr::Identifier { name } => {
+            is_lifted_num(name)
+                || VAR_NOSPACE
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|s| s.contains(name))
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
     let mut arg_exprs: Vec<Expr> = Vec::new();
     let mut esc = false;
@@ -13882,10 +13913,15 @@ fn echo_join_args(echo_args: &[IrExpr]) -> Option<(Expr, bool, bool)> {
             .collect::<Vec<_>>()
             .join(" ");
         str_lit(&s)
-    } else if arg_exprs.len() == 1 && !flat {
-        // a single non-literal arg: `[x].join(" ")` is exactly `x` (a
-        // one-element join never inserts the separator) — the common
-        // `echo $var` shape skips the array + join machinery entirely
+    } else if arg_exprs.len() == 1 && (!flat || estree_arg_is_scalar(&arg_exprs[0])) {
+        // a single arg: `[x].flat().join(" ")` / `[x].join(" ")` is
+        // exactly x's string form — a one-element join never inserts the
+        // separator, and flat() is a no-op on a scalar. The `flat` flag
+        // is decided on the IR arg (a split/param arg IS array-valued),
+        // but the lowering may already have scalarized it — e.g. the
+        // No-Space skip turns `sh2.split(i)` into the bare numeric
+        // binding — leaving a stale flag that would keep the
+        // array/join machinery on a scalar: `echo $i` → `i + "\n"`.
         arg_exprs.pop().unwrap()
     } else {
         let mut arr = Expr::ArrayExpression {
