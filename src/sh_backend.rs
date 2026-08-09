@@ -416,14 +416,36 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
 
     if needs_grep_p(&prog.stmts) {
         out.push_str("\n");
-        out.push_str("# portable PCRE grep: GNU grep -P, macOS gnu-grep, or perl\n");
+        out.push_str("# portable PCRE grep: GNU grep -P, macOS gnu-grep, pcregrep/pcre2grep, or perl\n");
         out.push_str("grep_p() {\n");
-        out.push_str("    p=\"$1\"; shift\n");
-        out.push_str("    if grep -P -- \"$p\" \"$@\" 2>/dev/null; then return; fi\n");
+        // Leading grep flags (e.g. `-o -i`) pass through before the pattern;
+        // the first non-flag arg is the pattern, the rest are files. The
+        // renderer emits `grep_p FLAGS PATTERN [FILES…]` — without this a
+        // `grep_p -o PAT` call would treat `-o` as the pattern.
+        out.push_str("    _gp_flags=\n");
+        out.push_str("    while [ \"$#\" -gt 0 ]; do\n");
+        out.push_str("        case \"$1\" in\n");
+        out.push_str("            --) shift; break ;;\n");
+        out.push_str("            -*) _gp_flags=\"$_gp_flags $1\"; shift ;;\n");
+        out.push_str("            *) break ;;\n");
+        out.push_str("        esac\n");
+        out.push_str("    done\n");
+        out.push_str("    [ \"$#\" -eq 0 ] && return 1\n");
+        out.push_str("    _gp_pat=\"$1\"; shift\n");
+        out.push_str("    if grep -P $_gp_flags -- \"$_gp_pat\" \"$@\" 2>/dev/null; then return; fi\n");
         out.push_str(
-            "    if command -v ggrep >/dev/null 2>&1; then ggrep -P -- \"$p\" \"$@\"; return; fi\n",
+            "    if command -v ggrep >/dev/null 2>&1; then ggrep -P $_gp_flags -- \"$_gp_pat\" \"$@\"; return; fi\n",
         );
-        out.push_str("    perl -ne 'BEGIN{$p=shift @ARGV} print if /$p/' \"$p\" \"$@\"\n");
+        out.push_str(
+            "    if command -v pcre2grep >/dev/null 2>&1; then pcre2grep $_gp_flags \"$_gp_pat\" \"$@\"; return; fi\n",
+        );
+        out.push_str(
+            "    if command -v pcregrep >/dev/null 2>&1; then pcregrep $_gp_flags \"$_gp_pat\" \"$@\"; return; fi\n",
+        );
+        out.push_str("    case \"$_gp_flags\" in\n");
+        out.push_str("        *-o*) perl -ne 'BEGIN{$p=shift @ARGV} while (/$p/g) { print \"$&\\n\" }' \"$_gp_pat\" \"$@\" ;;\n");
+        out.push_str("        *)    perl -ne 'BEGIN{$p=shift @ARGV} print if /$p/' \"$_gp_pat\" \"$@\" ;;\n");
+        out.push_str("    esac\n");
         out.push_str("}\n\n");
     }
     if needs_readlink(&prog.stmts) {
@@ -1784,6 +1806,12 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
         match e {
             IrExpr::Array(es) => es.iter().any(has_grep_p),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_grep_p(v)),
+            // pipeline / cmdsub stages nest the stage execs inside Arrow
+            // bodies — without this the grep -P exec in `echo X | grep -P
+            // …` is invisible and the grep_p polyfill prologue is never
+            // emitted (a `grep_p: command not found` at runtime). Mirrors
+            // needs_readlink's arrow descent.
+            IrExpr::Arrow(stmts) => walk(stmts),
             _ => false,
         }
     }
@@ -4347,5 +4375,45 @@ fn str_arg(e: &IrExpr) -> Result<String, String> {
         IrExpr::Int(i) => Ok(i.to_string()),
         IrExpr::Ident(s) => Ok(s.clone()),
         other => Err(format!("expected Str argument, got {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Parser;
+
+    fn render_sh(src: &str) -> String {
+        let commands = Parser::new(src).parse().unwrap();
+        let prog = crate::shir::ast_to_ir(&commands);
+        shir_to_sh(&prog).unwrap()
+    }
+
+    /// `echo X | grep -oP '(?<!…)'` — the -P exec sits inside a pipeline
+    /// stage ARROW; needs_grep_p must descend into it (like
+    /// needs_readlink does) or the grep_p() prologue is omitted and the
+    /// generated script calls an undefined `grep_p` (command not found).
+    #[test]
+    fn pipeline_grep_p_emits_polyfill() {
+        let sh = render_sh("echo x | grep -oP '(?<![:-])\\b\\w+'");
+        assert!(sh.contains("grep_p() {"), "polyfill prologue emitted: {sh}");
+        assert!(sh.contains("grep -P"), "GNU grep -P fallback: {sh}");
+        assert!(
+            sh.contains("pcre2grep") && sh.contains("pcregrep"),
+            "pcre fallbacks: {sh}"
+        );
+        assert!(
+            sh.contains("grep_p -o '(?<![:-])\\b\\w+'"),
+            "call uses grep_p with the -o flag before the pattern: {sh}"
+        );
+    }
+
+    /// A plain (non-pipeline) `grep -P PAT FILE` also needs the polyfill,
+    /// and the pattern must be the polyfill's first argument.
+    #[test]
+    fn plain_grep_p_emits_polyfill() {
+        let sh = render_sh("grep -P '\\bbar\\b' f");
+        assert!(sh.contains("grep_p() {"), "polyfill prologue: {sh}");
+        assert!(sh.contains("grep_p '\\bbar\\b' f"), "call: {sh}");
     }
 }
