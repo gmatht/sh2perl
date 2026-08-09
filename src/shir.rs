@@ -25061,6 +25061,26 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // lastExit, which a native expression never sets — keep the
             // runtime call there (the injected template still inlines
             // lifted values).
+            if func == "ternary" {
+                // `cond ? a : b` — the C frontend's ternary lowering: the
+                // cond is the frontend's test-string (testExpr) OR an
+                // already-lowered truth call (the frontend's testArith —
+                // an arithmetic condition the test-string grammar cannot
+                // express). A test-string is evaluated with the SAME
+                // native-first policy as the `test` call (try_native_test
+                // → sh2.test fallback — lifted vars read natively, so a
+                // lifted cond var is never a stale store read); the
+                // runtime picks the branch.
+                if let [a, b, c] = args.as_slice() {
+                    let t = match a {
+                        IrExpr::Str(sv, _) => try_native_test(sv).unwrap_or_else(|| {
+                            sh2_call("test", vec![str_lit(sv)])
+                        }),
+                        _ => expr_to_estree(a),
+                    };
+                    return sh2_call("ternary", vec![t, expr_to_estree(b), expr_to_estree(c)]);
+                }
+            }
             if func == "test" {
                 // The `[[ ]]` style tag (core request
                 // extglob-nocasematch-20260806) is a trailing Str arg —
