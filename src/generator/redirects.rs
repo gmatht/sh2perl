@@ -1076,6 +1076,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             if opt.contains('p') {
                                 is_print = true;
                             }
+                            i += 1;
                             continue;
                         }
                         // Handle declare -p (print variable definition)
@@ -1116,6 +1117,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("print \"declare -- {}\\\n\";\n", var));
                             }
+                            i += 1;
                         } else {
                             // Check if it's an assignment (var=value)
                             if opt.contains('=') {
