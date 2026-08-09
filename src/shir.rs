@@ -2419,6 +2419,7 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
         var_const: vec![],
         var_lifetimes: vec![],
         var_nospace: vec![],
+        var_bash_env: vec![],
     }
 }
 
@@ -2442,6 +2443,7 @@ pub fn ast_to_ir_raw(commands: &[Command]) -> IrProgram {
         var_const: vec![],
         var_lifetimes: vec![],
         var_nospace: vec![],
+        var_bash_env: vec![],
     }
 }
 
@@ -3212,6 +3214,167 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
 /// spaceless; anything runtime (read/eval/capture of unknown commands,
 /// array stores) keeps it untagged. Backends use the tag to skip the
 /// word-split on `$var` expansions — the split is then a provable no-op.
+/// Bash-identity variables the program REFERENCES that bash sets ITSELF at
+/// startup (never inherited): HOSTNAME (bash sets it from the hostname if
+/// unset), BASH_VERSION / BASH_VERSINFO (bash's own version), ZSH_VERSION
+/// (zsh's).  A faithful Perl translation must initialize these before first
+/// use so `${HOSTNAME:-…}` matches what a bash run sees.  Detected from
+/// `getVar("NAME")` / `param(NAME, …)` calls in the lowered IR.
+pub fn analyze_var_bash_env(prog: &IrProgram) -> Vec<String> {
+    use crate::ir::{IrExpr, IrStmt};
+    use std::collections::BTreeSet;
+
+    const BASH_IDENTITY: [&str; 4] = ["HOSTNAME", "BASH_VERSION", "BASH_VERSINFO", "ZSH_VERSION"];
+
+    fn is_bash_identity(s: &str) -> bool {
+        BASH_IDENTITY.contains(&s)
+    }
+
+    fn walk_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "getVar" {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        if is_bash_identity(n) {
+                            out.insert(n.clone());
+                        }
+                    }
+                }
+                if func == "param" {
+                    // param(op, VAR, …) — the variable is the SECOND arg.
+                    if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                        if is_bash_identity(n) {
+                            out.insert(n.clone());
+                        }
+                    }
+                }
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            IrExpr::Arrow(stmts) => {
+                for s in stmts {
+                    walk_stmt(s, out);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    walk_expr(el, out);
+                }
+            }
+            IrExpr::Object(fields) => {
+                for (_, v) in fields {
+                    walk_expr(v, out);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_expr(lhs, out);
+                walk_expr(rhs, out);
+            }
+            IrExpr::Index { key, .. } => walk_expr(key, out),
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(e) = p {
+                        walk_expr(e, out);
+                    }
+                }
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                walk_expr(cond, out);
+                walk_expr(then, out);
+                walk_expr(else_, out);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                walk_expr(expr, out);
+                walk_expr(default, out);
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                walk_expr(obj, out);
+                for a in args { walk_expr(a, out); }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_stmt(s: &IrStmt, out: &mut BTreeSet<String>) {
+        match s {
+            IrStmt::Expr(e) => walk_expr(e, out),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                walk_expr(cond, out);
+                for st in then { walk_stmt(st, out); }
+                for (_, b) in elsifs {
+                    for st in b { walk_stmt(st, out); }
+                }
+                for st in else_ { walk_stmt(st, out); }
+            }
+            IrStmt::While { cond, body, .. } => {
+                walk_expr(cond, out);
+                for st in body { walk_stmt(st, out); }
+            }
+            IrStmt::DoWhile { body, cond, .. } => {
+                for st in body { walk_stmt(st, out); }
+                walk_expr(cond, out);
+            }
+            IrStmt::For { iter, body, .. } => {
+                walk_expr(iter, out);
+                for st in body { walk_stmt(st, out); }
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                walk_expr(discriminant, out);
+                for clause in clauses {
+                    for st in &clause.body {
+                        walk_stmt(st, out);
+                    }
+                }
+            }
+            IrStmt::Assign { expr, .. } => walk_expr(expr, out),
+            IrStmt::Declare { init, .. } => {
+                if let Some(i) = init { walk_expr(i, out); }
+            }
+            IrStmt::DeclareArray { elements, .. } => {
+                for el in elements { walk_expr(el, out); }
+            }
+            IrStmt::SetChildError(e) => walk_expr(e, out),
+            IrStmt::Exit(Some(e)) => walk_expr(e, out),
+            IrStmt::Return(Some(e)) => walk_expr(e, out),
+            IrStmt::Output { value, .. } => walk_expr(value, out),
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_expr(path, out);
+                walk_expr(content, out);
+            }
+            IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => walk_expr(expr, out),
+            IrStmt::Exec { cmd, args, redirects, env, .. } => {
+                walk_expr(cmd, out);
+                for a in args { walk_expr(a, out); }
+                for r in redirects { walk_expr(r, out); }
+                for (_, v) in env { walk_expr(v, out); }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages {
+                    for st in stage { walk_stmt(st, out); }
+                }
+            }
+            IrStmt::Redirect { inner, redirects, .. } => {
+                for st in inner { walk_stmt(st, out); }
+                for r in redirects { walk_expr(&r.target, out); }
+            }
+            IrStmt::Subshell(block) | IrStmt::Background(block) | IrStmt::Block(block) => {
+                for st in block { walk_stmt(st, out); }
+            }
+            IrStmt::Function { body, .. } => {
+                for st in body { walk_stmt(st, out); }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    for s in &prog.stmts {
+        walk_stmt(s, &mut out);
+    }
+    out.into_iter().collect()
+}
+
 pub fn analyze_var_nospace(prog: &IrProgram) -> Vec<(String, bool)> {
     use crate::ir::{InterpPart, IrExpr, IrStmt};
     use std::collections::{BTreeMap, BTreeSet};

@@ -139,10 +139,13 @@ pub fn parse_to_perl(input: &str) {
 }
 
 pub fn parse_to_perl_with_opts(input: &str, no_magic_numbers: Option<bool>) {
-    let mut generator = Generator::new();
-    if let Some(val) = no_magic_numbers {
-        generator.set_no_magic_numbers(val);
-    }
+    // The Perl backend consumes the shIR (the universal contract), NOT the
+    // AST directly — the AST-side Generator is the legacy text-builder that
+    // the shIR renderer supersedes (PLAN §3).  parse → ast_to_ir →
+    // shir_to_perl.  `no_magic_numbers` is a legacy-generator option the
+    // shIR path ignores (the shIR renderer never emits magic-number
+    // constants).
+    let _ = no_magic_numbers;
 
     // Check if debug is enabled before printing debug output
     if debashl::debug::is_debug_enabled() {
@@ -157,7 +160,8 @@ pub fn parse_to_perl_with_opts(input: &str, no_magic_numbers: Option<bool>) {
             return;
         }
     };
-    let perl_code = generator.generate(&commands);
+    let prog = debashl::shir::ast_to_ir(&commands);
+    let perl_code = debashl::ir::shir_to_perl(&prog);
     println!("Converting to Perl:");
     println!("{}", "=".repeat(50));
     println!("{}", perl_code);

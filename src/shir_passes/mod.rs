@@ -345,6 +345,7 @@ mod tests {
     fn pipeline_runs_on_empty_program() {
         let prog = IrProgram {
             var_nospace: vec![],
+            var_bash_env: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![],
@@ -380,6 +381,7 @@ mod tests {
     fn pipeline_is_deterministic() {
         let prog = IrProgram {
             var_nospace: vec![],
+            var_bash_env: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![IrStmt::Expr(crate::ir::IrExpr::Int(42))],
@@ -411,6 +413,7 @@ mod tests {
         use crate::ir::IrExpr;
         let prog = IrProgram {
             var_nospace: vec![],
+            var_bash_env: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![IrStmt::Expr(IrExpr::Call {
@@ -439,6 +442,7 @@ mod tests {
     fn pipeline_attaches_const_markup() {
         let prog = IrProgram {
             var_nospace: vec![],
+            var_bash_env: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![IrStmt::Assign {

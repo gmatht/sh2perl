@@ -408,11 +408,9 @@ exit $main_exit_code;
                         }
                     };
 
-                    // Generate Perl code
-                    let mut gen = Generator::new();
-                    gen.use_function_signatures = use_function_signatures;
-                    apply_argv0_source(&mut gen);
-                    let mut code = gen.generate(&commands);
+                    // Generate Perl code — via the shIR (universal contract).
+                    let prog = debashl::shir::ast_to_ir(&commands);
+                    let mut code = debashl::ir::shir_to_perl(&prog);
 
                     // Post-process to fix command substitution placeholders
                     code = fix_command_substitution_placeholders(code);
@@ -1091,11 +1089,9 @@ exit $main_exit_code;
                             }
                         };
 
-                        // Generate Perl code
-                        let mut gen = Generator::new();
-                        gen.use_function_signatures = use_function_signatures;
-                        apply_argv0_source(&mut gen);
-                        let code = gen.generate(&commands);
+                        // Generate Perl code — via the shIR (universal contract).
+                        let prog = debashl::shir::ast_to_ir(&commands);
+                        let code = debashl::ir::shir_to_perl(&prog);
 
                         // Handle output file option
                         if let Some(output_filename) = &output_file {
@@ -1172,11 +1168,9 @@ exit $main_exit_code;
                             }
                         };
 
-                        // Generate Perl code
-                        let mut gen = Generator::new();
-                        gen.use_function_signatures = use_function_signatures;
-                        apply_argv0_source(&mut gen);
-                        let code = gen.generate(&commands);
+                        // Generate Perl code — via the shIR (universal contract).
+                        let prog = debashl::shir::ast_to_ir(&commands);
+                        let code = debashl::ir::shir_to_perl(&prog);
 
                         // Handle output file option
                         if let Some(output_filename) = &output_file {
