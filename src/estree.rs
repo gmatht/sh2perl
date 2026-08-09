@@ -564,6 +564,455 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
     }
 }
 
+// ── lastExit-tail hoist ─────────────────────────────────────────────
+//
+// Lifts a constant `sh2.lastExit = N` write out of if/else common
+// tails, then out of the enclosing loop:
+//
+//   if (c) { (write, sh2.lastExit = N) } else { sh2.lastExit = N }
+//     →  if (c) { write } ; sh2.lastExit = N
+//     →  (when that if is the loop body's tail)  sh2.lastExit = N after
+//        the loop
+//
+// Phase 1 (if-hoist): an `if` whose consequent and alternate BOTH end
+// with the same `sh2.lastExit = N` write (a standalone assignment, or
+// the trailing element of a `(…, sh2.lastExit = N[, flag])` sequence)
+// leaves `$?` = N on every path — the write moves after the if with
+// identical semantics (the branches' own reads, all before the tail
+// write, see the same values either way).
+//
+// Phase 2 (loop-hoist): a loop whose body's last statement is a
+// standalone `sh2.lastExit = N` (the shape phase 1 leaves) can have it
+// moved after the loop when the body contains NO other `sh2.lastExit`
+// mention. Soundness:
+//   - no body reads → the pre-loop value is never observed mid-loop
+//     (every read point sees N before and after the move);
+//   - the TRACKED native loop's body ends with the tracking READ
+//     (`__sh2_loop_last = sh2.lastExit`), so phase 2's shape check only
+//     fires on BARE loops — whose final status write is provably dead
+//     (nothing observes `$?` after the loop before the next write), so
+//     the 0-iteration difference (original leaves the pre-loop value,
+//     hoisted writes N) is unobservable;
+//   - the native numeric-range `for` and a materialized-list for-of are
+//     ALWAYS bare but CAN run 0 times (`seq 5 1` / an empty range), so
+//     they additionally require the loop provably runs ≥ 1 iteration.
+//
+// Runs post-emission on the Program, so every consumer (the CLI's
+// --estree, the otranspilerl wasm, the corpus gate) sees it.
+// Deterministic and idempotent (phase 2 leaves no trailing write to
+// re-hoist).
+pub(crate) fn hoist_last_exit(prog: Program) -> Program {
+    Program {
+        type_: prog.type_,
+        source_type: prog.source_type,
+        body: hoist_stmts(prog.body),
+    }
+}
+
+/// `sh2.lastExit` member access?
+fn is_last_exit_member(e: &Expr) -> bool {
+    matches!(e, Expr::MemberExpression { object, property, computed: false, optional: false, .. }
+        if matches!(&**object, Expr::Identifier { name } if name == "sh2")
+            && matches!(&**property, Expr::Identifier { name } if name == "lastExit"))
+}
+
+/// `sh2.lastExit = <num literal>` → Some(N).
+fn last_exit_assign_value(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::AssignmentExpression { operator, left, right } if operator == "=" => {
+            if !is_last_exit_member(left) {
+                return None;
+            }
+            match &**right {
+                Expr::Literal { value, .. } => value.as_i64(),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_pure_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal { .. })
+}
+
+/// A statement list's final statement must be an ExpressionStatement
+/// whose expression ends with the `sh2.lastExit = N` write — standalone
+/// assignment, `(…, sh2.lastExit = N)`, or `(…, sh2.lastExit = N, flag)`.
+fn stmts_tail_write(stmts: &[Stmt]) -> Option<i64> {
+    let last = stmts.last()?;
+    let Stmt::ExpressionStatement { expression } = last else {
+        return None;
+    };
+    match expression {
+        Expr::AssignmentExpression { .. } => last_exit_assign_value(expression),
+        Expr::SequenceExpression { expressions } => {
+            let n = expressions.len();
+            if n == 0 {
+                return None;
+            }
+            if let Some(v) = last_exit_assign_value(&expressions[n - 1]) {
+                return Some(v);
+            }
+            if n >= 2 && is_pure_literal(&expressions[n - 1]) {
+                return last_exit_assign_value(&expressions[n - 2]);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn branch_tail_write(branch: &Stmt) -> Option<i64> {
+    match branch {
+        Stmt::BlockStatement { body } => stmts_tail_write(body),
+        other => stmts_tail_write(std::slice::from_ref(other)),
+    }
+}
+
+/// The common `sh2.lastExit = N` both branches end with (None when the
+/// if has no else, or the branches' tail writes differ / are missing).
+fn if_tail_write(stmt: &Stmt) -> Option<i64> {
+    let Stmt::IfStatement { consequent, alternate, .. } = stmt else {
+        return None;
+    };
+    let c = branch_tail_write(consequent)?;
+    let a = branch_tail_write(alternate.as_deref()?)?;
+    (c == a).then_some(c)
+}
+
+/// Remove the trailing `sh2.lastExit = n` write from a statement. None
+/// when the statement was ONLY the write (drop it entirely).
+fn strip_tail_write(stmt: Stmt, n: i64) -> Option<Stmt> {
+    let Stmt::ExpressionStatement { expression } = stmt else {
+        return Some(stmt);
+    };
+    match expression {
+        Expr::AssignmentExpression { .. } => {
+            if last_exit_assign_value(&expression) == Some(n) {
+                None
+            } else {
+                Some(Stmt::ExpressionStatement { expression })
+            }
+        }
+        Expr::SequenceExpression { mut expressions } => {
+            let m = expressions.len();
+            let write_at = if m >= 1 && last_exit_assign_value(&expressions[m - 1]) == Some(n) {
+                Some(m - 1)
+            } else if m >= 2
+                && is_pure_literal(&expressions[m - 1])
+                && last_exit_assign_value(&expressions[m - 2]) == Some(n)
+            {
+                Some(m - 2)
+            } else {
+                None
+            };
+            match write_at {
+                Some(i) => {
+                    expressions.remove(i);
+                    match expressions.len() {
+                        0 => None,
+                        1 => Some(Stmt::ExpressionStatement {
+                            expression: expressions.pop().unwrap(),
+                        }),
+                        _ => Some(Stmt::ExpressionStatement {
+                            expression: Expr::SequenceExpression { expressions },
+                        }),
+                    }
+                }
+                None => Some(Stmt::ExpressionStatement {
+                    expression: Expr::SequenceExpression { expressions },
+                }),
+            }
+        }
+        other => Some(Stmt::ExpressionStatement { expression: other }),
+    }
+}
+
+/// Strip the trailing write from a branch; a branch that becomes empty
+/// turns into an empty block.
+fn strip_branch_tail(branch: &Stmt, n: i64) -> Stmt {
+    match branch {
+        Stmt::BlockStatement { body } => {
+            let mut body = body.clone();
+            if let Some(last) = body.last() {
+                match strip_tail_write(last.clone(), n) {
+                    Some(s) => *body.last_mut().unwrap() = s,
+                    None => {
+                        body.pop();
+                    }
+                }
+            }
+            Stmt::BlockStatement { body }
+        }
+        other => strip_tail_write(other.clone(), n)
+            .unwrap_or_else(|| Stmt::BlockStatement { body: vec![] }),
+    }
+}
+
+/// `sh2.lastExit = n;`
+fn last_exit_write(n: i64) -> Stmt {
+    Stmt::ExpressionStatement {
+        expression: Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(n),
+                raw: None,
+                regex: None,
+            }),
+        },
+    }
+}
+
+/// Recurse into nested statement lists first (bottom-up), then run the
+/// if-hoist and loop-hoist on this list.
+fn hoist_stmts(stmts: Vec<Stmt>) -> Vec<Stmt> {
+    let mut out: Vec<Stmt> = stmts.into_iter().map(hoist_stmt).collect();
+    hoist_list(&mut out);
+    out
+}
+
+fn hoist_stmt(stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::BlockStatement { body } => Stmt::BlockStatement { body: hoist_stmts(body) },
+        Stmt::IfStatement { test, consequent, alternate } => Stmt::IfStatement {
+            test,
+            consequent: Box::new(hoist_stmt(*consequent)),
+            alternate: alternate.map(|a| Box::new(hoist_stmt(*a))),
+        },
+        Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
+            test,
+            body: Box::new(hoist_stmt(*body)),
+        },
+        Stmt::ForStatement { init, test, update, body } => Stmt::ForStatement {
+            init: Box::new(hoist_stmt(*init)),
+            test,
+            update,
+            body: Box::new(hoist_stmt(*body)),
+        },
+        Stmt::ForOfStatement { left, right, body } => Stmt::ForOfStatement {
+            left: Box::new(hoist_stmt(*left)),
+            right,
+            body: Box::new(hoist_stmt(*body)),
+        },
+        Stmt::SwitchStatement { discriminant, cases } => Stmt::SwitchStatement {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|c| SwitchCase {
+                    type_: c.type_,
+                    test: c.test,
+                    consequent: hoist_stmts(c.consequent),
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+/// Phase 1 (if common tails) then phase 2 (loop tails) on one list.
+fn hoist_list(stmts: &mut Vec<Stmt>) {
+    // Phase 1 — if-hoists.
+    let mut i = 0;
+    while i < stmts.len() {
+        if let Some(n) = if_tail_write(&stmts[i]) {
+            let new_stmt = match stmts[i].clone() {
+                Stmt::IfStatement { test, consequent, alternate } => {
+                    let cons = strip_branch_tail(&consequent, n);
+                    let alt = alternate.map(|a| strip_branch_tail(&a, n));
+                    let alt = match alt {
+                        Some(Stmt::BlockStatement { body }) if body.is_empty() => None,
+                        other => other,
+                    };
+                    Stmt::IfStatement {
+                        test,
+                        consequent: Box::new(cons),
+                        alternate: alt.map(Box::new),
+                    }
+                }
+                _ => unreachable!("if_tail_write only matches IfStatement"),
+            };
+            stmts[i] = new_stmt;
+            stmts.insert(i + 1, last_exit_write(n));
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    // Phase 2 — loop-hoists.
+    let mut j = 0;
+    while j < stmts.len() {
+        match loop_tail_hoist(&stmts[j]) {
+            Some((new_loop, n)) => {
+                stmts[j] = new_loop;
+                stmts.insert(j + 1, last_exit_write(n));
+                j += 2;
+            }
+            None => j += 1,
+        }
+    }
+}
+
+/// The loop body's last statement as a standalone `sh2.lastExit = N`
+/// (the shape phase 1 leaves).
+fn body_tail_write(body: &Stmt) -> Option<i64> {
+    match body {
+        Stmt::BlockStatement { body } => stmts_tail_write(body),
+        other => stmts_tail_write(std::slice::from_ref(other)),
+    }
+}
+
+/// Phase 2: a loop whose body ends with a standalone `sh2.lastExit = N`
+/// → hoist it after the loop (guards in the doc header).
+fn loop_tail_hoist(stmt: &Stmt) -> Option<(Stmt, i64)> {
+    let (body, n) = match stmt {
+        Stmt::WhileStatement { body, .. } => (body, body_tail_write(body)?),
+        Stmt::ForStatement { body, .. } => {
+            let n = body_tail_write(body)?;
+            if !for_provably_runs(stmt) {
+                return None;
+            }
+            (body, n)
+        }
+        Stmt::ForOfStatement { body, right, .. } => {
+            let n = body_tail_write(body)?;
+            if !forof_provably_runs(right) {
+                return None;
+            }
+            (body, n)
+        }
+        _ => return None,
+    };
+    // no OTHER sh2.lastExit mention anywhere in the body (reads or
+    // mid-body writes would observe the pre-loop value)
+    let stripped = strip_body_tail(body, n);
+    if body_mentions_last_exit(&stripped) {
+        return None;
+    }
+    let new_stmt = match stmt {
+        Stmt::WhileStatement { test, .. } => Stmt::WhileStatement {
+            test: test.clone(),
+            body: Box::new(stripped),
+        },
+        Stmt::ForStatement { init, test, update, .. } => Stmt::ForStatement {
+            init: init.clone(),
+            test: test.clone(),
+            update: update.clone(),
+            body: Box::new(stripped),
+        },
+        Stmt::ForOfStatement { left, right, .. } => Stmt::ForOfStatement {
+            left: left.clone(),
+            right: right.clone(),
+            body: Box::new(stripped),
+        },
+        _ => unreachable!(),
+    };
+    Some((new_stmt, n))
+}
+
+fn strip_body_tail(body: &Stmt, n: i64) -> Stmt {
+    match body {
+        Stmt::BlockStatement { body } => {
+            let mut body = body.clone();
+            if let Some(last) = body.last() {
+                match strip_tail_write(last.clone(), n) {
+                    Some(s) => *body.last_mut().unwrap() = s,
+                    None => {
+                        body.pop();
+                    }
+                }
+            }
+            Stmt::BlockStatement { body }
+        }
+        other => strip_tail_write(other.clone(), n)
+            .unwrap_or_else(|| Stmt::BlockStatement { body: vec![] }),
+    }
+}
+
+/// Any remaining `sh2.lastExit` mention in the (already-stripped) body?
+/// Serialization-based: only the `sh2.lastExit` MemberExpression shape
+/// serializes as `"name":"lastExit"` — a string literal containing
+/// "lastExit" serializes as `"value":"lastExit"` and never matches.
+fn body_mentions_last_exit(body: &Stmt) -> bool {
+    serde_json::to_string(body)
+        .map(|json| json.contains("\"name\":\"lastExit\""))
+        .unwrap_or(true) // serialization failure → conservative veto
+}
+
+/// A native numeric-range `for (let i = lo; i <= hi; i++)` provably runs
+/// at least once when the init satisfies the test. The update direction
+/// is irrelevant — only the FIRST test matters.
+fn for_provably_runs(stmt: &Stmt) -> bool {
+    let Stmt::ForStatement { init, test, update, .. } = stmt else {
+        return false;
+    };
+    let Stmt::VariableDeclaration { declarations, .. } = &**init else {
+        return false;
+    };
+    let [d] = declarations.as_slice() else {
+        return false;
+    };
+    let Expr::Identifier { name } = &d.id else {
+        return false;
+    };
+    let Some(Expr::Literal { value, .. }) = &d.init else {
+        return false;
+    };
+    let Some(lo) = value.as_i64() else {
+        return false;
+    };
+    // the counter update shape: `i++` / `++i` / `i--` / `--i`
+    match update {
+        Expr::UnaryExpression { operator, argument, .. }
+            if matches!(operator.as_str(), "++" | "--") =>
+        {
+            match &**argument {
+                Expr::Identifier { name: n } if n == name => {}
+                _ => return false,
+            }
+        }
+        _ => return false,
+    }
+    let Expr::BinaryExpression { operator, left, right } = test else {
+        return false;
+    };
+    let (x, lit) = match (&**left, &**right) {
+        (Expr::Identifier { name: n }, Expr::Literal { value, .. }) if n == name => {
+            let Some(lit) = value.as_i64() else { return false };
+            (lo, lit)
+        }
+        (Expr::Literal { value, .. }, Expr::Identifier { name: n }) if n == name => {
+            let Some(lit) = value.as_i64() else { return false };
+            (lo, lit)
+        }
+        _ => return false,
+    };
+    cmp_value(operator, x, lit)
+}
+
+fn cmp_value(op: &str, a: i64, b: i64) -> bool {
+    match op {
+        "<" => a < b,
+        "<=" => a <= b,
+        ">" => a > b,
+        ">=" => a >= b,
+        "==" | "===" => a == b,
+        "!=" | "!==" => a != b,
+        _ => false,
+    }
+}
+
+/// A for-of over a non-empty array literal provably runs ≥ 1 time (the
+/// materialized range-item fallback — `seq 5 1` materializes to an
+/// EMPTY array and stays unhoisted).
+fn forof_provably_runs(right: &Expr) -> bool {
+    match right {
+        Expr::ArrayExpression { elements } => elements.iter().any(|e| e.is_some()),
+        _ => false,
+    }
+}
+
 // ── process-substitution pre-pass ───────────────────────────────────
 //
 // The parser stores `<(cmd)` both as an argument position (the argument
@@ -1071,18 +1520,22 @@ mod tests {
         // `sh2._finish()` exits with `sh2.lastExit` — bash's exit code is
         // the last command's status and the corpus gate compares exit
         // codes), so a program-final if KEEPS its false-path write.
+        // The lastExit-tail hoist then LIFTS that write after the if —
+        // semantically identical (the reader still sees 0), structurally
+        // a post-if `sh2.lastExit = 0` instead of an else branch.
         let json = to_json("if false; then echo yes; fi");
         assert!(json.contains("\"type\":\"IfStatement\""));
         assert!(
-            json.contains("\"alternate\":{\"type\""),
-            "program-final status read → else kept"
+            json.contains("\"alternate\":null") && json.contains("\"name\":\"lastExit\""),
+            "program-final status read → the false-path write is lifted after the if"
         );
         assert!(!json.contains("unsupported"));
         // a READER keeps the write: `; echo $?` observes the false-path 0
+        // — the hoisted post-if write still precedes the reader
         let json2 = to_json("if false; then echo yes; fi; echo $?");
         assert!(
-            json2.contains("\"alternate\":{\"type\""),
-            "read status → else kept"
+            json2.contains("\"name\":\"lastExit\""),
+            "read status → write kept (lifted after the if)"
         );
         assert!(!json2.contains("unsupported"));
         // a later WRITER shadows the if's status → the write is dead again
@@ -2418,5 +2871,198 @@ mod tests {
         // await-free redirect dispatches to the sync twin redirectSync
         assert!(json2.contains("\"name\":\"redirectSync\""));
         assert!(json2.contains("\"name\":\"builtin\""));
+    }
+}
+
+#[cfg(test)]
+mod last_exit_hoist_tests {
+    use super::*;
+    use crate::Parser;
+
+    fn to_json(input: &str) -> String {
+        let commands = Parser::new(input).parse().unwrap();
+        serde_json::to_string(&ast_to_estree(&commands)).unwrap()
+    }
+
+    fn body(json: &str) -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        v["body"].clone()
+    }
+
+    fn lastexit_count(v: &serde_json::Value) -> usize {
+        serde_json::to_string(v)
+            .unwrap()
+            .matches("\"name\":\"lastExit\"")
+            .count()
+    }
+
+    /// `sh2.lastExit = <number>` at the END of the program body?
+    fn last_stmt_is_lastexit_write(json: &str) -> bool {
+        let b = body(json);
+        let stmts = b.as_array().unwrap();
+        let Some(last) = stmts.last() else { return false };
+        last["expression"]["type"] == "AssignmentExpression"
+            && last["expression"]["left"]["object"]["name"] == "sh2"
+            && last["expression"]["left"]["property"]["name"] == "lastExit"
+    }
+
+    /// The exemplar — `for i in $(seq 1 10000)` with an if/else whose both
+    /// branches end in `sh2.lastExit = 0`:
+    ///
+    ///   for i in `seq 1 10000`; do
+    ///     if echo $((i*i)) | grep 1337 >/dev/null 2>/dev/null; then echo $i; fi
+    ///   done
+    ///
+    /// Phase 1 lifts the write out of both branches of the if; phase 2 then
+    /// lifts it out of the native range loop. Result: the if has no
+    /// alternate, the loop body has NO lastExit mention, and the program
+    /// ends with a single `sh2.lastExit = 0`.
+    #[test]
+    fn sqrt1337_lifts_from_if_branches_then_loop() {
+        let json = to_json(
+            "for i in `seq 1 10000`\n\
+             do\n\
+             \tif echo $((i*i)) | grep 1337 > /dev/null 2> /dev/null\n\
+             \tthen\n\
+             \t\techo $i\n\
+             \tfi\n\
+             done",
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // exactly ONE lastExit write left, and it is the program-final
+        // statement (hoisted out of the loop entirely)
+        assert_eq!(lastexit_count(&v), 1, "one write remains: {json}");
+        assert!(
+            last_stmt_is_lastexit_write(&json),
+            "program-final write: {json}"
+        );
+        // the loop is a native range for whose body has no lastExit mention
+        let stmts = v["body"].as_array().unwrap();
+        let for_stmt = &stmts[stmts.len() - 2];
+        assert_eq!(for_stmt["type"], "ForStatement");
+        assert!(
+            !serde_json::to_string(&for_stmt["body"])
+                .unwrap()
+                .contains("lastExit"),
+            "loop body lastExit-free: {json}"
+        );
+        // the if lost its else (the false-path write was hoisted away)
+        let if_stmt = &for_stmt["body"]["body"][0];
+        assert_eq!(if_stmt["type"], "IfStatement");
+        assert!(
+            if_stmt["alternate"].is_null() || if_stmt["alternate"] == serde_json::Value::Null,
+            "no else: {json}"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+
+    /// The if-hoist is independent of the loop: a top-level
+    /// `if c; then echo hi; fi` also collapses its synthesized false-path
+    /// write into a single post-if write. (The `false` TEST expression
+    /// keeps its own status recording — `(sh2.lastExit = 1, false)` —
+    /// that write is the test command's status, not a branch tail.)
+    #[test]
+    fn top_level_if_common_tail_lifted() {
+        let json = to_json("if false; then echo yes; fi");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let stmts = v["body"].as_array().unwrap();
+        assert_eq!(stmts.len(), 2, "if + hoisted write: {json}");
+        assert_eq!(stmts[0]["type"], "IfStatement");
+        assert!(
+            stmts[0]["alternate"].is_null(),
+            "false-path else collapsed: {json}"
+        );
+        // the then-branch's tail sequence lost its status write
+        let cons = serde_json::to_string(&stmts[0]["consequent"]).unwrap();
+        assert!(
+            !cons.contains("lastExit"),
+            "then-branch status write lifted: {json}"
+        );
+        assert!(
+            last_stmt_is_lastexit_write(&json),
+            "post-if write: {json}"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+
+    /// A `$?` read anywhere in the loop body vetoes the LOOP hoist (the
+    /// pre-loop value would be observed mid-loop) but NOT the if hoist —
+    /// the write stays as the body's tail.
+    #[test]
+    fn loop_hoist_vetoed_by_body_read() {
+        // the if's both-branches write still collapses; the loop keeps it
+        // because `x=$?` reads lastExit in the body
+        let json = to_json(
+            "for i in `seq 1 3`\n\
+             do\n\
+             \tx=$?\n\
+             \tif echo $((i*i)) | grep 1337 > /dev/null 2> /dev/null\n\
+             \tthen\n\
+             \t\techo $i\n\
+             \tfi\n\
+             done",
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let stmts = v["body"].as_array().unwrap();
+        let for_stmt = &stmts[stmts.len() - 1];
+        assert_eq!(for_stmt["type"], "ForStatement");
+        // the loop body still carries the tail write (no post-loop write)
+        assert!(
+            serde_json::to_string(&for_stmt["body"])
+                .unwrap()
+                .contains("lastExit"),
+            "write stays in the body: {json}"
+        );
+        assert!(
+            !last_stmt_is_lastexit_write(&json),
+            "no post-loop hoist: {json}"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+
+    /// The loop-hoist on a native range for requires the loop to provably
+    /// run ≥ 1 time — an empty range (`seq 5 1`) must NOT hoist the write
+    /// out (0 iterations would leave `$?` = the pre-loop value in bash).
+    #[test]
+    fn loop_hoist_vetoed_for_empty_range() {
+        let json = to_json(
+            "for i in `seq 5 1`\n\
+             do\n\
+             \tif echo $((i*i)) | grep 1337 > /dev/null 2> /dev/null\n\
+             \tthen\n\
+             \t\techo $i\n\
+             \tfi\n\
+             done",
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            !last_stmt_is_lastexit_write(&json),
+            "no post-loop hoist for an empty range: {json}"
+        );
+        // the if-hoist still fired inside the loop body
+        let stmts = v["body"].as_array().unwrap();
+        let for_stmt = &stmts[stmts.len() - 1];
+        let body = serde_json::to_string(&for_stmt["body"]).unwrap();
+        assert!(body.contains("lastExit"), "if-tail stays in the body: {json}");
+        assert!(!json.contains("unsupported"));
+    }
+
+    /// Different exit values in the two branches (a failing last command on
+    /// one path) veto the if-hoist — the status after the if differs by
+    /// path, so the write cannot move.
+    #[test]
+    fn differing_branch_tails_not_lifted() {
+        let json = to_json("if false; then false; else echo hi; fi");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // the if keeps a lastExit write in at least one branch
+        assert!(
+            lastexit_count(&v) >= 1,
+            "branch status writes kept: {json}"
+        );
+        assert!(
+            !last_stmt_is_lastexit_write(&json),
+            "no unconditional post-if write when statuses differ: {json}"
+        );
+        assert!(!json.contains("unsupported"));
     }
 }
