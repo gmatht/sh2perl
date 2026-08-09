@@ -572,6 +572,15 @@ pub struct IrProgram {
     /// copy-vs-move / stack-vs-heap decision. Existing backends ignore
     /// it (additive only).
     pub var_lifetimes: Vec<(String, VarLifetime)>,
+    /// The "No spaces" tag (a transform sibling of `var_types`):
+    /// per variable, `true` when its value is PROVABLY free of IFS
+    /// whitespace (space, tab, newline — the `\s+` word-split set).
+    /// Populated by `shir::analyze_var_nospace`; the estree backend
+    /// skips the word-split on `$var` expansions when the tag holds
+    /// (the split would be a provable no-op). Additive — backends that
+    /// ignore it are unaffected. Sorted by name for deterministic
+    /// serialization.
+    pub var_nospace: Vec<(String, bool)>,
 }
 
 // ── Backend: IR → Perl text ─────────────────────────────────────────
@@ -5412,6 +5421,7 @@ impl IrProgram {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+        var_nospace: vec![],
         }
     }
 }

@@ -40,6 +40,9 @@ pub fn shir_to_shir_json(prog: &IrProgram) -> String {
     if prog.var_lifetimes.is_empty() {
         prog.var_lifetimes = crate::shir_passes::lifetime::analyze_var_lifetimes(&prog);
     }
+    if prog.var_nospace.is_empty() {
+        prog.var_nospace = crate::shir::analyze_var_nospace(&prog);
+    }
     // shIR markup: mark loops provably run at least once (`"runs": true`)
     // so every backend consuming the A1 contract knows the body always
     // runs (the estree backend uses it to skip its ran/last tracking).
@@ -72,6 +75,7 @@ fn program_json(p: &IrProgram, contract_version: u32) -> Value {
         "var_lengths": p.var_lengths.iter().map(|(n, l)| json!({"name": n, "max_len": l})).collect::<Vec<_>>(),
         "var_const": p.var_const.iter().map(|(n, k)| json!({"name": n, "kind": k})).collect::<Vec<_>>(),
         "var_lifetimes": p.var_lifetimes.iter().map(|(n, l)| json!({"name": n, "first": l.first, "last": l.last, "escapes": l.escapes})).collect::<Vec<_>>(),
+        "var_nospace": p.var_nospace.iter().map(|(n, b)| json!({"name": n, "nospace": b})).collect::<Vec<_>>(),
         "subs": p.subs.iter().map(sub_json).collect::<Vec<_>>(),
         "stmts": p.stmts.iter().map(stmt_json).collect::<Vec<_>>(),
     })

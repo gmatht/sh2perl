@@ -117,6 +117,17 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
     };
     let var_const = var_const_from(obj.get("var_const"), "Program.var_const")?;
     let var_lifetimes = var_lifetimes_from(obj.get("var_lifetimes"), "Program.var_lifetimes")?;
+    let var_nospace = match obj.get("var_nospace") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| {
+                let n = v.get("name")?.as_str()?.to_string();
+                let b = v.get("nospace").and_then(|x| x.as_bool()).unwrap_or(false);
+                Some((n, b))
+            })
+            .collect(),
+        _ => vec![],
+    };
     Ok(IrProgram {
         imports,
         requires,
@@ -127,6 +138,7 @@ fn program_from_value(v: &Value) -> Result<IrProgram, String> {
         var_lengths,
         var_const,
         var_lifetimes,
+        var_nospace,
     })
 }
 
@@ -1035,6 +1047,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+        var_nospace: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json_raw(&prog);
         assert!(json.contains("\"kind\":\"Float\""), "json: {json}");
@@ -1102,6 +1115,7 @@ mod tests {
             var_lengths: vec![],
             var_const: vec![],
             var_lifetimes: vec![],
+        var_nospace: vec![],
         };
         let json = shir_to_shir_json(&prog);
         // valid
