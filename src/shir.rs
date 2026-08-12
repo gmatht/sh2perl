@@ -12,6 +12,7 @@ use crate::bc::eval as bc_eval;
 use crate::estree::*;
 use crate::ir::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 /// Variables proven (conservatively) to hold ONLY numbers — lifted to
@@ -27,6 +28,156 @@ static LIFTED_STRING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// `shir_to_estree`). Consulted by the arith read coercion: Int64/UInt64
 /// vars read as BigInt (Number would round past 2^53).
 static VAR_TYPES: Mutex<Option<HashMap<String, IrType>>> = Mutex::new(None);
+/// `--true64`: bash arithmetic is true 64-bit. Off by default (numbers
+/// stay JS Numbers — silently wrong past 2^53). When on, `shir_to_estree`
+/// runs `analyze_true64` and homes out-of-±2^53 numeric vars in either a
+/// BigInt64Array slot (self-RMW accumulator chains — V8's native int64
+/// element arithmetic, ~1.8 ns/op) or BigInt values (Int64 — exact, the
+/// C-path lowering).
+static TRUE64: AtomicBool = AtomicBool::new(false);
+static TRUE64_SLOTS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+/// Out-of-±2^53 numeric vars homed as BigInt VALUES (Int64; the slots
+/// win the hot RMW chains, everything else in the big regime is BigInt).
+static TRUE64_INT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Enable/disable the `--true64` bash arithmetic lowering (default off).
+pub fn set_true64(on: bool) {
+    TRUE64.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn true64_enabled() -> bool {
+    TRUE64.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Is `name` homed in a BigInt64Array slot (the `--true64` hot-accumulator
+/// lowering)?
+pub fn slot_var_index(name: &str) -> Option<usize> {
+    TRUE64_SLOTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(name).copied())
+}
+
+/// Is `name` an out-of-±2^53 numeric var homed as BigInt values?
+pub fn true64_int_var(name: &str) -> bool {
+    TRUE64_INT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
+
+/// `--true64` arith leaf wrapping: an ArithAst mentioning a slot var or
+/// an out-of-range Int64 var must render pure BigInt arithmetic (a mixed
+/// BigInt/Number binary op would throw). Num leaves become
+/// `Cast(Int64, Num)` (exact `BigInt("N")`), non-slot Var leaves become
+/// `Cast(Int64, Var)` (BigInt coercion); SLOT vars stay RAW (`__t64[k]`
+/// — the native int64 element read keeps the RMW fast path). Applies to
+/// a cloned program before the lift analyses run — and, at render time,
+/// to the arith parsed out of test-string `$(( ))` operands.
+pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
+    fn mentions(a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Var(n) => slot_var_index(n).is_some() || true64_int_var(n),
+            ArithAst::Index { key, .. } => mentions(key),
+            ArithAst::Bin { lhs, rhs, .. } => mentions(lhs) || mentions(rhs),
+            ArithAst::Un { arg, .. } => mentions(arg),
+            ArithAst::Cond { test, then, else_, .. } => {
+                mentions(test) || mentions(then) || mentions(else_)
+            }
+            ArithAst::Assign { rhs, .. } => mentions(rhs),
+            ArithAst::IncDec { var, .. } => true64_int_var(var) || slot_var_index(var).is_some(),
+            ArithAst::Sizeof(_) | ArithAst::Num(_) => false,
+            ArithAst::Cast { arg, .. } => mentions(arg),
+        }
+    }
+    fn wrap(a: &mut ArithAst) {
+        match a {
+            ArithAst::Num(_) => {
+                *a = ArithAst::Cast {
+                    ty: IrType::Int64,
+                    arg: Box::new(std::mem::replace(a, ArithAst::Num(0))),
+                };
+            }
+            ArithAst::Var(n) => {
+                if slot_var_index(n).is_none() {
+                    *a = ArithAst::Cast {
+                        ty: IrType::Int64,
+                        arg: Box::new(std::mem::replace(a, ArithAst::Num(0))),
+                    };
+                }
+            }
+            ArithAst::Sizeof(_) => {
+                *a = ArithAst::Cast {
+                    ty: IrType::Int64,
+                    arg: Box::new(std::mem::replace(a, ArithAst::Num(0))),
+                };
+            }
+            ArithAst::Index { key, .. } => wrap(key),
+            ArithAst::Bin { lhs, rhs, .. } => {
+                wrap(lhs);
+                wrap(rhs);
+            }
+            ArithAst::Un { arg, .. } => wrap(arg),
+            ArithAst::Cond { test, then, else_, .. } => {
+                wrap(test);
+                wrap(then);
+                wrap(else_);
+            }
+            ArithAst::Assign { rhs, .. } => wrap(rhs),
+            ArithAst::Cast { arg, .. } => wrap(arg),
+            ArithAst::IncDec { .. } => {}
+        }
+    }
+    if mentions(a) {
+        wrap(a);
+    }
+}
+
+/// The program-level wrapper: apply [`wrap_true64_arith_ast`] to every
+/// Arith expr in the program.
+pub fn wrap_true64_arith(prog: &mut IrProgram) {
+    fn walk_stmts(stmts: &mut [IrStmt]) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { expr, .. } => {
+                    if let IrExpr::Arith(a) = expr {
+                        wrap_true64_arith_ast(a);
+                    }
+                }
+                IrStmt::Expr(e) => {
+                    if let IrExpr::Arith(a) = e {
+                        wrap_true64_arith_ast(a);
+                    }
+                }
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    walk_stmts(then);
+                    for (_, arm) in elsifs {
+                        walk_stmts(arm);
+                    }
+                    walk_stmts(else_);
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk_stmts(body),
+                IrStmt::Redirect { inner, .. } => walk_stmts(inner),
+                IrStmt::Function { body, .. } => walk_stmts(body),
+                _ => {}
+            }
+        }
+    }
+    walk_stmts(&mut prog.stmts);
+}
 /// Names with NO write anywhere in the current program (set per
 /// compilation by `shir_to_estree`; see [`collect_never_written`]). A
 /// read of such a name lowers to a constant `""` under the documented
@@ -4110,6 +4261,113 @@ pub fn range_width_name(lo: i128, hi: i128) -> &'static str {
 
 type Range = Option<(i128, i128)>;
 
+/// The exact-integer JS Number bound: values provably inside ±2^53 are
+/// safe as JS Numbers (the default bash lowering); anything that can
+/// escape must be homed in BigInt64Array slots or BigInt values under
+/// `--true64`.
+const SAFE_NUMBER: i128 = 1 << 53;
+
+/// The `--true64` analysis: which numeric vars escape ±2^53 (Int64/BigInt
+/// or a BigInt64Array slot), and which of those are slot-worthy — a
+/// self-RMW accumulator chain (`x = x op e` / `x op= e` / `x++`/`x--`)
+/// assigned inside a loop, where V8's native int64 element arithmetic
+/// applies (the BinInt64 benchmarks: ~1.8 ns/op vs ~5–25 ns for BigInt
+/// values). Returns (int_vars, slot_var -> slot index).
+pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usize>) {
+    fn walk_stmts(
+        stmts: &[IrStmt],
+        numeric: &HashSet<String>,
+        assigned: &mut HashSet<String>,
+        rmw: &mut HashSet<String>,
+        in_loop: &mut HashSet<String>,
+        inside_loop: bool,
+    ) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr } => {
+                    if targets.len() == 1 && targets[0].indices.is_empty() {
+                        let v = &targets[0].var;
+                        if numeric.contains(v) || matches!(expr, IrExpr::Arith(_)) {
+                            assigned.insert(v.clone());
+                        }
+                        if inside_loop && assigned.contains(v) {
+                            in_loop.insert(v.clone());
+                        }
+                        // self-RMW shapes: x = x op e / x op= e / x++ / x--
+                        let is_rmw = matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::Bin { lhs, .. } if matches!(&**lhs, ArithAst::Var(n) if n == v)))
+                            || matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::Assign { var, .. } if var == v))
+                            || matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == v));
+                        if is_rmw {
+                            rmw.insert(v.clone());
+                        }
+                    }
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::DoWhile { body, .. } => {
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, true);
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, inside_loop);
+                }
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    walk_stmts(then, numeric, assigned, rmw, in_loop, inside_loop);
+                    for (_, arm) in elsifs {
+                        walk_stmts(arm, numeric, assigned, rmw, in_loop, inside_loop);
+                    }
+                    walk_stmts(else_, numeric, assigned, rmw, in_loop, inside_loop);
+                }
+                IrStmt::Redirect { inner, .. } => {
+                    walk_stmts(inner, numeric, assigned, rmw, in_loop, inside_loop);
+                }
+                IrStmt::Function { body, .. } => {
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, inside_loop);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let numeric = numeric_lift_vars(prog);
+    let ranges = analyze_var_ranges(prog);
+    let mut assigned = HashSet::new();
+    let mut rmw = HashSet::new();
+    let mut in_loop = HashSet::new();
+    walk_stmts(
+        &prog.stmts,
+        &numeric,
+        &mut assigned,
+        &mut rmw,
+        &mut in_loop,
+        false,
+    );
+    let mut int_vars = HashSet::new();
+    let mut slots: HashMap<String, usize> = HashMap::new();
+    for v in &assigned {
+        // provably inside ±2^53 -> JS Number (the default path is exact)
+        let safe = ranges.get(v).is_some_and(|&(lo, hi)| {
+            lo >= -SAFE_NUMBER && hi <= SAFE_NUMBER
+        });
+        if safe {
+            continue;
+        }
+        int_vars.insert(v.clone());
+    }
+    let mut slot_idx = 0usize;
+    for v in &int_vars {
+        if rmw.contains(v) && in_loop.contains(v) {
+            slots.insert(v.clone(), slot_idx);
+            slot_idx += 1;
+        }
+    }
+    (int_vars, slots)
+}
+
 /// The FRONTEND's integer arithmetic domain, not the storage width:
 /// bash is signed-64-bit wrapped, so a provable range never leaves
 /// [i64::MIN, i64::MAX] — an op/literal that can cross it is top (None).
@@ -6941,30 +7199,52 @@ fn arith_var_read_expr(name: &str) -> Expr {
     native_special_var(name).unwrap_or_else(|| store_var_read(name))
 }
 
+/// `__t64[k]` — a `--true64` BigInt64Array slot element read.
+fn slot_read(k: usize) -> Expr {
+    Expr::MemberExpression {
+        object: Box::new(Expr::Identifier {
+            name: "__t64".to_string(),
+        }),
+        property: Box::new(Expr::Literal {
+            value: serde_json::Value::from(k),
+            raw: None,
+            regex: None,
+        }),
+        computed: true,
+        optional: false,
+    }
+}
+
 /// `Number(<read>) || 0` — the runtime's arithmetic coercion of a variable
 /// read: lifted NUMERIC vars are already JS numbers (bare identifier);
 /// everything else (lifted strings, store vars, bash specials) goes
 /// through the exact `Number(v) || 0` the runtime's evalArith applies.
 /// C Int64/UInt64 vars coerce to BigInt instead — Number would round
-/// past 2^53.
+/// past 2^53. `--true64` slot vars read the raw int64 element.
 fn arith_var_read(name: &str) -> Expr {
-    if is_lifted_num(name) {
-        // already a JS number — no Number()/||0 coercion needed
-        return Expr::Identifier {
-            name: name.to_string(),
-        };
+    // `--true64` slot home: the native int64 element read (the RMW fast
+    // path keeps the value in the array — BinInt64.md §7)
+    if let Some(k) = slot_var_index(name) {
+        return slot_read(k);
     }
     let read = arith_var_read_expr(name);
+    // Int64/UInt64 (C typed or `--true64`) vars coerce to BigInt BEFORE
+    // the lifted-num bare read: a lifted binding may hold a Number (a
+    // string-init `x=5` on a typed var) — BigInt(x) is exact, and
+    // idempotent when x is already a BigInt. Number would round past 2^53.
     if let Some(IrType::Int64 | IrType::UInt64) = var_type_of(name) {
-        // BigInt coercion: exact for store strings (a memLoad result)
-        // and lifted bindings; a plain `BigInt(x)` is idempotent when x
-        // is already a BigInt
         return Expr::CallExpression {
             callee: Box::new(Expr::Identifier {
                 name: "BigInt".to_string(),
             }),
             arguments: vec![read],
             optional: false,
+        };
+    }
+    if is_lifted_num(name) {
+        // already a JS number — no Number()/||0 coercion needed
+        return Expr::Identifier {
+            name: name.to_string(),
         };
     }
     Expr::LogicalExpression {
@@ -7208,6 +7488,20 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
         // postfix = stored ∓ 1 (the delta is ±1, so the old value is
         // exactly one step away — read after the write is order-correct).
         ArithAst::IncDec { var, delta, prefix } => {
+            // `--true64` slot var: a native array-element ++/-- (BigInt
+            // increment, the store wraps mod 2^64 — the 1.1 ns/op
+            // `mem[i] += 1` fast path)
+            if let Some(k) = slot_var_index(var) {
+                return Expr::UnaryExpression {
+                    operator: if *delta > 0 {
+                        "++".to_string()
+                    } else {
+                        "--".to_string()
+                    },
+                    argument: Box::new(slot_read(k)),
+                    prefix: *prefix,
+                };
+            }
             if is_lifted_num(var) {
                 return Expr::UnaryExpression {
                     operator: if *delta > 0 {
@@ -7527,6 +7821,12 @@ fn bigint_method(method: &'static str, inner: Expr) -> Expr {
         ],
         optional: false,
     }
+}
+
+/// `BigInt.asIntN(64, <inner>)` — the bash int64 wrap (used for `--true64`
+/// Int64-var assignment targets).
+fn bigint_wrap_as_intn(inner: Expr) -> Expr {
+    bigint_method("asIntN", inner)
 }
 
 /// Is an ArithAst's top-level value a 64-bit BigInt (the C frontend wraps
@@ -7983,6 +8283,18 @@ fn collect_for_iters(prog: &IrProgram) -> HashMap<String, IrExpr> {
             IrExpr::Call { args, .. } => {
                 for a in args {
                     walk_expr(a, out);
+                }
+            }
+            // the pipeline-CALL form's stage list (`IrStmt::Expr(Call
+            // ("pipeline", [Array([Arrow, ...]))])` — a loop inside a
+            // pipeline stage) — WITHOUT this arm the loop var has no
+            // for-iter entry and the numeric fixpoint's `map_or(true, ..)`
+            // admits it for ANY iterable (a string-key `arrayItems`
+            // iterable then numeric-lifts — `k = Number(k)` corrupts
+            // `foo` → NaN).
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    walk_expr(el, out);
                 }
             }
             _ => {}
@@ -9778,7 +10090,22 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                     // the STORE — setArrayAppend(["$candidate"]),
                     // local("n=$1"), test("$count -lt 100") — so mark every
                     // identifier found there as store-read (not liftable).
-                    for a in args {
+                    for (i, a) in args.iter().enumerate() {
+                        // `${map[$k]}` — the baked-subscript READ name arg
+                        // (param("", "map[$k]")): the emitter rewrites it
+                        // to `sh2.arrayIndex` with native key reads (see
+                        // try_native_param's "" branch / baked_subscript_read)
+                        // — its `$ref`s need no store mark. Mirror of the
+                        // string-lift walker's exemption.
+                        if func == "param" && i == 1 {
+                            if let IrExpr::Str(n, _) = a {
+                                if subscript_keys_assumed_clean()
+                                    && baked_subscript_read(n).is_some()
+                                {
+                                    continue;
+                                }
+                            }
+                        }
                         mark_str_args(a, string_ctx);
                     }
                 }
@@ -10388,6 +10715,19 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
 
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    // `--true64`: bash arithmetic is true 64-bit. Off by default. When
+    // on, out-of-±2^53 numeric vars are homed in BigInt64Array slots
+    // (self-RMW accumulator chains — native int64 element arithmetic) or
+    // BigInt values (Int64, the C-path lowering). The analysis runs on
+    // the ORIGINAL arith shapes (the RMW detection needs the unwrapped
+    // trees); the wrap below then rewrites the leaves on the clone.
+    let (true64_int, true64_slots) = if true64_enabled() {
+        analyze_true64(prog)
+    } else {
+        (HashSet::new(), HashMap::new())
+    };
+    *TRUE64_INT.lock().unwrap() = Some(true64_int.clone());
+    *TRUE64_SLOTS.lock().unwrap() = Some(true64_slots.clone());
     // StoreToNative (core request shir-passes-store-to-native-20260806):
     // convert provably store-only `setVar("v", e)` Expr-stmts to Assign
     // stmts on a clone, so the native lift below fires (a native `x = v`
@@ -10404,6 +10744,12 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
             &mut store_to_native,
             &crate::shir_passes::PassContext::default(),
         );
+    }
+    // `--true64` leaf wrapping: Num leaves -> Cast(Int64, Num) (exact
+    // BigInt("N")), non-slot Var leaves -> Cast(Int64, Var); slot reads
+    // stay RAW (the native int64 element fast path).
+    if true64_enabled() {
+        wrap_true64_arith(&mut store_to_native);
     }
     let prog = &store_to_native;
     // The `$(( $var ... ))` dollar-ref arith lowering's "provably set"
@@ -10422,6 +10768,14 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         &numeric_lift_vars(prog),
         &string_lift_vars(prog, &numeric_lift_vars(prog)),
     );
+    // `--true64`: slot vars are homed in the array — exclude them from
+    // the numeric lift (their reads/writes route through __t64[k]);
+    // out-of-range non-slot vars become Int64 (BigInt) via VAR_TYPES.
+    let num: HashSet<String> = num
+        .iter()
+        .filter(|v| !true64_slots.contains_key(*v))
+        .cloned()
+        .collect();
     // Run ALL analysis passes before touching any static: the lift/scan
     // statics are shared global state, and the determinism unit test
     // compiles concurrently in other threads — a computation between the
@@ -10435,7 +10789,14 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     *LIFTED_STRING.lock().unwrap() = Some(str);
     // C typed vars (frontend-emitted var_types): the arith read coercion
     // for Int64/UInt64 vars uses BigInt (Number would round past 2^53).
-    *VAR_TYPES.lock().unwrap() = Some(prog.var_types.iter().cloned().collect());
+    // `--true64` adds the out-of-range bash vars (non-slot ones) as Int64.
+    let mut vt: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
+    for v in &true64_int {
+        if !true64_slots.contains_key(v) {
+            vt.insert(v.clone(), IrType::Int64);
+        }
+    }
+    *VAR_TYPES.lock().unwrap() = Some(vt);
     // Never-written-var read fold (SH2_ASSUME_NO_ENV): names with no
     // write anywhere in the program. Must be set before the emission
     // (the getVar arms consult it) and after the transforms (the write
@@ -10558,6 +10919,32 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
                 }),
             }],
         });
+    }
+    // `--true64` BigInt64Array slot home for hot accumulator chains (the
+    // native int64 element arithmetic: load/compute/store stays in the
+    // array — ~1.8 ns/op, BinInt64.md §7).
+    if let Some(slots) = TRUE64_SLOTS.lock().unwrap().clone() {
+        if !slots.is_empty() {
+            body.push(Stmt::VariableDeclaration {
+                kind: "const",
+                declarations: vec![VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: Expr::Identifier {
+                        name: "__t64".to_string(),
+                    },
+                    init: Some(Expr::NewExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "BigInt64Array".to_string(),
+                        }),
+                        arguments: vec![Expr::Literal {
+                            value: serde_json::Value::from(slots.len()),
+                            raw: None,
+                            regex: None,
+                        }],
+                    }),
+                }],
+            });
+        }
     }
     for name in sorted_set(&LIFTED_STRING) {
         body.push(Stmt::VariableDeclaration {
@@ -11759,6 +12146,105 @@ fn ir_has_persist_fd1(prog: &IrProgram) -> bool {
 /// in `true` + a lastExit write, so the errexit guard wrapper is dead
 /// weight (call_is_always_true) and the truthiness callers branch on is
 /// preserved.
+/// `cat <<EOF` / `cat <<< "text"` (statement position, default stdout
+/// sink): the fd-0 heredoc/herestring redirect + builtin-cat pair
+/// collapses to a native `process.stdout.write(content)` — exactly what
+/// the runtime's redirect-install (heredoc string target → fd 0) + cat
+/// (readFd0 → emit) does, minus the fd-table swap, the builtin dispatch
+/// and the content round-trip. The heredoc content folds only when the
+/// runtime's expansion is provably identity: a QUOTED heredoc
+/// (`<<'EOF'`) is verbatim by construction (interpolate=false), an
+/// unquoted one must be free of `$`, backticks and backslashes (the
+/// only expandWord triggers). heredoc-tabs applies the runtime's exact
+/// per-line leading-tab strip (before expansion — identity here); the
+/// herestring appends its trailing newline and never interpolates. cat
+/// must have no args or exactly the stdin marker `-` (both read fd 0
+/// only); the fd-0 spec must be the ONLY redirect; the standard
+/// native-echo gates apply (default stdout sink, no script-function
+/// shadow, no persistent fd-1). No new assumption: every runtime
+/// transform is either reproduced at compile time or provably absent.
+fn try_native_cat_heredoc(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<Expr> {
+    if *ECHO_SINK_DEPTH.lock().unwrap() != 0 {
+        return None;
+    }
+    if program_defines_function("cat") {
+        return None;
+    }
+    if PROGRAM_PERSIST_FD1.lock().unwrap().unwrap_or(true) {
+        return None;
+    }
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    let [IrExpr::Str(name, _), IrExpr::Array(cat_args)] = args.as_slice() else {
+        return None;
+    };
+    if name != "cat" {
+        return None;
+    }
+    // No args or the bare stdin marker — both read fd 0 only.
+    let arg_ok = cat_args.is_empty()
+        || matches!(cat_args.as_slice(), [IrExpr::Str(s, _)] if s == "-");
+    if !arg_ok {
+        return None;
+    }
+    let [r] = redirects else {
+        return None;
+    };
+    if r.fd.unwrap_or(0) != 0 {
+        return None;
+    }
+    let content: String = match r.mode.as_str() {
+        "heredoc" | "heredoc-tabs" => {
+            let IrExpr::Str(body, _) = &r.target else {
+                return None;
+            };
+            if r.interpolate && body.chars().any(|c| matches!(c, '$' | '`' | '\\')) {
+                // the runtime's expandWord (or bash itself) would transform it
+                return None;
+            }
+            let mut body = body.clone();
+            if r.mode == "heredoc-tabs" {
+                // the runtime's heredoc-tabs transform (before expansion):
+                // strip leading tabs per line — exact compile-time twin
+                body = body
+                    .split('\n')
+                    .map(|l| l.trim_start_matches('\t'))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            body
+        }
+        "herestring" => {
+            // the runtime appends a newline to herestrings and never
+            // interpolates them — a static target folds exactly
+            let IrExpr::Str(target, _) = &r.target else {
+                return None;
+            };
+            let mut t = target.clone();
+            t.push('\n');
+            t
+        }
+        _ => return None,
+    };
+    Some(seq(vec![
+        printf_write_expr(str_lit(&content)),
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        },
+        bool_lit(true),
+    ]))
+}
+
 fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) -> Option<Expr> {
     if program_defines_function("echo") {
         return None;
@@ -12556,11 +13042,52 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     }
                 }
             }
+            // `--true64` slot target: the value's home is the
+            // BigInt64Array — a native int64 element write (the store
+            // wraps mod 2^64; the RMW fast path applies when the RHS
+            // reads the same slot). The wrapped arith RHS is already
+            // pure BigInt (raw slot reads + BigInt literals).
+            if let Some(k) = slot_var_index(&target.var) {
+                let right = match expr {
+                    IrExpr::Arith(a) => arith_to_estree_wrapped(a),
+                    IrExpr::Int(i) => bigint_lit_expr(*i),
+                    IrExpr::Str(sv, _) => bigint_lit_expr(
+                        sv.trim().parse::<i64>().unwrap_or(0),
+                    ),
+                    // other sources (getVar of another var, captures)
+                    // don't occur for self-RMW chains; a BigInt coercion
+                    // of the generic expr keeps the slot exact
+                    other => Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "BigInt".to_string(),
+                        }),
+                        arguments: vec![expr_to_estree(other)],
+                        optional: false,
+                    },
+                };
+                return Some(Stmt::ExpressionStatement {
+                    expression: Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(slot_read(k)),
+                        right: Box::new(right),
+                    },
+                });
+            }
             if is_lifted(&target.var) && target.indices.is_empty() {
                 // native JS write — the analysis guarantees the source kind
                 let right = match expr {
-                    // numeric-lifted source
-                    IrExpr::Arith(a) => arith_to_estree_wrapped(a),
+                    // numeric-lifted source; a `--true64` Int64 var wraps
+                    // at 2^64 (bash's int64 semantics)
+                    IrExpr::Arith(a) => {
+                        let inner = arith_to_estree_wrapped(a);
+                        if var_type_of(&target.var)
+                            == Some(IrType::Int64)
+                        {
+                            bigint_wrap_as_intn(inner)
+                        } else {
+                            inner
+                        }
+                    }
                     IrExpr::Int(i) => Expr::Literal {
                         value: serde_json::Value::from(*i),
                         raw: None,
@@ -13540,6 +14067,42 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             } else {
                 arrow_sink(vec![], IrExpr::Arrow(stmts.clone()))
             };
+            // State-free subshell fold: a body that provably cannot
+            // mutate shell state (no store/array/positional/cwd/fd-table
+            // writes, no cd/export/unset/trap/... builtins, no function
+            // calls, no redirects/pipelines/captures/backgrounds — only
+            // emits, lastExit/_g writes, store reads and pure value
+            // twins) cannot OBSERVE the runtime's state copy/restore
+            // (the clone shares the same values; only lastExit/_g are
+            // not isolated, and those are exactly the fields the body
+            // may touch). The whole subshellSync call collapses to an
+            // IIFE of the same arrow + the runtime's exact return
+            // protocol `this.lastExit === 0` (the subshell's exit status
+            // stays as the body left it — the runtime does not restore
+            // lastExit either). No new assumption: the body's effects
+            // are identical with or without the copy. Await-free only
+            // (the flipped arrow runs synchronously; an async IIFE would
+            // hand the caller a promise instead of the status boolean).
+            if !expr_has_await(&body) && subshell_body_state_free(&body) {
+                return Some(Stmt::ExpressionStatement {
+                    expression: seq(vec![
+                        Expr::CallExpression {
+                            callee: Box::new(sync_arrow_flip(body)),
+                            arguments: vec![],
+                            optional: false,
+                        },
+                        Expr::BinaryExpression {
+                            operator: "===".to_string(),
+                            left: Box::new(sh2_member("lastExit")),
+                            right: Box::new(Expr::Literal {
+                                value: serde_json::Value::from(0),
+                                raw: None,
+                                regex: None,
+                            }),
+                        },
+                    ]),
+                });
+            }
             let call = if expr_has_await(&body) {
                 await_call("subshell", vec![body])
             } else {
@@ -13579,6 +14142,14 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // herestring redirect form of the substring test — no spawn,
             // no fd plumbing (see `try_native_grep_q_redirect`).
             if let Some(native) = try_native_grep_q_redirect(inner, &redirect_specs) {
+                return Some(Stmt::ExpressionStatement { expression: native });
+            }
+            // `cat <<EOF` / `cat <<< "text"` (statement position): the
+            // fd-0 heredoc/herestring redirect form of the stdin-copy — a
+            // native write of the folded heredoc content replaces the
+            // redirect + builtin-cat pair (see try_native_cat_heredoc;
+            // same default-sink gates as the echo lowerings).
+            if let Some(native) = try_native_cat_heredoc(inner, redirects) {
                 return Some(Stmt::ExpressionStatement { expression: native });
             }
             // `exec 3>&1` (exec with no command): bash installs the redirects
@@ -20581,10 +21152,37 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                 // number (store vars inside coerce via Number()||0, the
                 // arith semantics — the test sees a number, never NaN).
                 if let Some(inner) = e.strip_prefix("$((").and_then(|x| x.strip_suffix("))")) {
-                    let a = parse_arith(inner)?;
-                    return Some((arith_to_estree_wrapped(&a), false));
+                    let mut a = parse_arith(inner)?;
+                    // `--true64`: a test operand touching a slot/Int64 var
+                    // must render pure BigInt arithmetic (mixed ops throw).
+                    // Div/mod: BigInt % 0 throws (Number % 0 -> NaN) — the
+                    // arithEval try/catch maps the bash zero-divisor abort
+                    // to "" (test false), exactly the Number path's NaN.
+                    wrap_true64_arith_ast(&mut a);
+                    let rendered = arith_to_estree_wrapped(&a);
+                    if true64_enabled() && arith_has_div_mod(&a) {
+                        return Some((
+                            sh2_call(
+                                "arithEval",
+                                vec![Expr::ArrowFunctionExpression {
+                                    params: vec![],
+                                    body: ArrowBody::Expr(Box::new(rendered)),
+                                    expression: true,
+                                    r#async: false,
+                                }],
+                            ),
+                            false,
+                        ));
+                    }
+                    return Some((rendered, false));
                 }
                 let bare = e.strip_prefix('$').unwrap_or(e);
+                // `--true64` slot var: a raw int64 element read — a pure
+                // BigInt (never NaN; the BigInt-vs-Number comparison is
+                // exact, unlike Number(BigInt) which rounds past 2^53)
+                if let Some(k) = slot_var_index(bare) {
+                    return Some((slot_read(k), false));
+                }
                 if is_lifted(bare) {
                     // lifted NUMERIC vars are pure numbers (never NaN);
                     // lifted STRING vars need the intVal guard like any
@@ -21150,6 +21748,15 @@ fn test_str_to_estree(s: &str) -> Option<Expr> {
                         changed = true;
                         continue;
                     }
+                    // `--true64` slot var in the arith region: the native
+                    // int64 element read (the test string must not read
+                    // the STORE — the slot is the home)
+                    if let Some(slot_k) = slot_var_index(w) {
+                        quasis.push(std::mem::take(&mut lit));
+                        exprs.push(slot_read(slot_k));
+                        changed = true;
+                        continue;
+                    }
                     lit.push_str(w);
                     continue;
                 }
@@ -21170,6 +21777,11 @@ fn test_str_to_estree(s: &str) -> Option<Expr> {
                     exprs.push(Expr::Identifier {
                         name: inner.to_string(),
                     });
+                    changed = true;
+                } else if let Some(slot_k) = slot_var_index(inner) {
+                    // `--true64` slot var in `${x}`: inject the element read
+                    quasis.push(std::mem::take(&mut lit));
+                    exprs.push(slot_read(slot_k));
                     changed = true;
                 } else if let Some((name, op, a, b)) = split_test_param(inner) {
                     // `${name op args}` on a LIFTED variable: the runtime
@@ -21232,6 +21844,14 @@ fn test_str_to_estree(s: &str) -> Option<Expr> {
                     exprs.push(Expr::Identifier {
                         name: name.to_string(),
                     });
+                    changed = true;
+                    i += 1 + name_len;
+                    continue;
+                }
+                // `--true64` slot var: inject the element read
+                if let Some(slot_k) = slot_var_index(name) {
+                    quasis.push(std::mem::take(&mut lit));
+                    exprs.push(slot_read(slot_k));
                     changed = true;
                     i += 1 + name_len;
                     continue;
@@ -21680,7 +22300,53 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
         |p: &str| !p.is_empty() && p.is_ascii() && !p.chars().any(|c| matches!(c, '*' | '?' | '['));
     let native = match op.as_str() {
         // ${x} — a plain read of the binding (like the getVar lift)
-        "" => Some(id()),
+        "" => {
+            // `${base[$v]}` — the baked-subscript READ: the runtime
+            // resolves the subscript from the STORE (normAssocKey /
+            // evalArith), which is stale for LIFTED refs — rewrite to
+            // `sh2.arrayIndex("base", <native key>)` with the refs' key
+            // parts (lifted refs → native binding reads; store-bound
+            // refs → `store_var_read`, whose store is synced). See
+            // [`baked_subscript_read`] / [`subscript_keys_assumed_clean`]
+            // (the assoc-key-shape gate).
+            if let Some((base, parts)) = baked_subscript_read(name) {
+                if subscript_keys_assumed_clean() {
+                    let key = if parts.len() == 1 && parts[0].0 {
+                        // a bare single-ref subscript — the value itself
+                        let (_, v) = &parts[0];
+                        if is_lifted(v) {
+                            Expr::Identifier { name: v.clone() }
+                        } else {
+                            store_var_read(v)
+                        }
+                    } else {
+                        let mut concat: Option<Expr> = None;
+                        for (is_ref, part) in &parts {
+                            let pe: Expr = if *is_ref {
+                                if is_lifted(part) {
+                                    Expr::Identifier { name: part.clone() }
+                                } else {
+                                    store_var_read(part)
+                                }
+                            } else {
+                                str_lit(part)
+                            };
+                            concat = Some(match concat {
+                                None => pe,
+                                Some(prev) => Expr::BinaryExpression {
+                                    operator: "+".to_string(),
+                                    left: Box::new(prev),
+                                    right: Box::new(pe),
+                                },
+                            });
+                        }
+                        concat.unwrap_or_else(|| str_lit(""))
+                    };
+                    return Some(sh2_call("arrayIndex", vec![str_lit(base), key]));
+                }
+            }
+            Some(id())
+        }
         // ${#x} — string length
         "len" => Some(member(val(), "length")),
         // ${x^^} / ${x,,} — case conversion
@@ -22474,7 +23140,22 @@ fn lift_walk_expr(
                                 && !n.contains('*')
                                 && !n.starts_with('#')
                                 && !n.starts_with('!');
-                            if plain {
+                            // a baked-subscript READ name (`${map[$k]}` —
+                            // `param("", "map[$k]")`): the emitter
+                            // rewrites it to `sh2.arrayIndex` with native
+                            // key reads (try_native_param's "" branch),
+                            // so its `$ref`s need no store mark — lifting
+                            // them is sound (a ref that stays store-bound
+                            // keeps a synced store read in the key). The
+                            // rewrite is SH2_ASSUME_SUBSCRIPT_KEYS-gated —
+                            // option-off keeps the marks (the vars stay
+                            // store-bound, the store stays synced, the
+                            // baked reads are byte-identical to the
+                            // pre-change forms).
+                            if plain
+                                || (subscript_keys_assumed_clean()
+                                    && baked_subscript_read(n).is_some())
+                            {
                                 continue;
                             }
                         }
@@ -24801,6 +25482,12 @@ fn never_written_read(name: &str) -> bool {
 /// emission site routes through here so the fold applies uniformly
 /// (plain reads, arith reads, test operands, param value overrides).
 fn store_var_read(name: &str) -> Expr {
+    // `--true64` slot var: the slot IS the home — a native int64 element
+    // read (the string observation sites interpolate/printf/test/getVar
+    // all route through here; the BigInt stringifies exactly)
+    if let Some(k) = slot_var_index(name) {
+        return slot_read(k);
+    }
     // a runtime special (`PWD` → sh2.cwd, `?` → sh2.lastExit, ...) is
     // served from runtime STATE, never the vars/env store — the exact
     // native twin of the getVar special arm. Idempotent for the callers
@@ -25264,6 +25951,12 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // SH2_ASSUME_NO_ENV contract — see [`never_written_read`])
             if func == "getVar" {
                 if let [IrExpr::Str(name, _)] = args.as_slice() {
+                    // `--true64` slot var: the slot IS the home (echo /
+                    // printf / interpolation observation points read the
+                    // native int64 element — BigInt stringifies exactly)
+                    if let Some(k) = slot_var_index(name) {
+                        return slot_read(k);
+                    }
                     if is_lifted(name) {
                         return Expr::Identifier { name: name.clone() };
                     }
@@ -26941,6 +27634,217 @@ fn arrow_native_echo_sync(params: Vec<Expr>, body: IrExpr) -> Expr {
     arrow_body_async(params, body, false)
 }
 
+/// State-free subshell body check (the `( ... )` statement fold — see
+/// the `IrStmt::Subshell` arm): the body may only touch the shell state
+/// through `sh2.lastExit`/`sh2._g` (the two fields the runtime's
+/// subshell/subshellSync deliberately do NOT isolate), read the store
+/// and current sink, or call pure value twins / emit-only builtins.
+/// Anything that would have been isolated by the subshell's state
+/// copy/restore — store writes (`sh2.setVar`/`sh2.vars.x =`/`assign`/
+/// `setArray`...), positional/cwd writes, fd-table mutations
+/// (redirect/pipeline/capture/background/loops), state-mutating builtins
+/// (cd/export/unset/typeset/declare/local/readonly/trap/eval/set/shopt/
+/// read/exec/...), function calls, `process.chdir`/`process.env` writes,
+/// `let` declarations — refuses the fold.
+fn subshell_body_state_free(e: &Expr) -> bool {
+    match e {
+        // Await/objects/arrays can only appear under refused calls
+        // (their arguments are checked before reaching here) — refuse.
+        Expr::Literal { .. } | Expr::Identifier { .. } => true,
+        Expr::TemplateLiteral { expressions, .. } => {
+            expressions.iter().all(subshell_body_state_free)
+        }
+        Expr::UnaryExpression { argument, .. } => subshell_body_state_free(argument),
+        Expr::BinaryExpression { left, right, .. } | Expr::LogicalExpression { left, right, .. } => {
+            subshell_body_state_free(left) && subshell_body_state_free(right)
+        }
+        Expr::ConditionalExpression {
+            test,
+            consequent,
+            alternate,
+        } => {
+            subshell_body_state_free(test)
+                && subshell_body_state_free(consequent)
+                && subshell_body_state_free(alternate)
+        }
+        Expr::SequenceExpression { expressions } => {
+            expressions.iter().all(subshell_body_state_free)
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            subshell_body_state_free(object) && subshell_body_state_free(property)
+        }
+        // arrays/objects appear in redirect spec lists and pipeline stage
+        // lists — allow when every element/value is free
+        Expr::ArrayExpression { elements } => elements
+            .iter()
+            .flatten()
+            .all(subshell_body_state_free),
+        Expr::ObjectExpression { properties } => properties.iter().all(|p| {
+            subshell_body_state_free(&p.key) && subshell_body_state_free(&p.value)
+        }),
+        Expr::AssignmentExpression {
+            left, operator: _, right,
+        } => {
+            // only `sh2.lastExit` / `sh2._g` writes are not isolated by
+            // the subshell; every other assignment (sh2.vars.x =,
+            // sh2.cwd =, sh2.positional =, process.env.x =, ...) leaks
+            // under the fold
+            match &**left {
+                Expr::MemberExpression {
+                    object,
+                    property,
+                    computed: false,
+                    optional: _,
+                } if matches!(&**object, Expr::Identifier { name } if name == "sh2") => {
+                    matches!(&**property, Expr::Identifier { name } if name == "lastExit" || name == "_g")
+                        && subshell_body_state_free(right)
+                }
+                _ => false,
+            }
+        }
+        Expr::CallExpression {
+            callee,
+            arguments,
+            optional: _,
+        } => {
+            match &**callee {
+                // process.stdout.write / process.stderr.write — pure
+                // emits through the CURRENT (shared) sink; the subshell
+                // does not isolate the sink objects
+                Expr::MemberExpression {
+                    object,
+                    property,
+                    computed: false,
+                    optional: _,
+                } if matches!(
+                    &**object,
+                    Expr::MemberExpression {
+                        object: o2,
+                        property: p2,
+                        computed: false,
+                        optional: _,
+                    } if matches!(&**o2, Expr::Identifier { name } if name == "process")
+                        && matches!(&**p2, Expr::Identifier { name } if name == "stdout"
+                            || name == "stderr")
+                ) =>
+                {
+                    matches!(&**property, Expr::Identifier { name } if name == "write")
+                        && arguments.iter().all(subshell_body_state_free)
+                }
+                // String(...) / Number(...) / Math.* — pure coercions
+                Expr::MemberExpression {
+                    object,
+                    property: _,
+                    computed: false,
+                    optional: _,
+                } if matches!(&**object, Expr::Identifier { name } if name == "String"
+                    || name == "Number" || name == "Math"
+                    || name == "process") =>
+                {
+                    arguments.iter().all(subshell_body_state_free)
+                }
+                Expr::Identifier { name } if name == "String" || name == "Number" => {
+                    arguments.iter().all(subshell_body_state_free)
+                }
+                // sh2.* calls
+                Expr::MemberExpression {
+                    object,
+                    property,
+                    computed: false,
+                    optional: _,
+                } if matches!(&**object, Expr::Identifier { name } if name == "sh2") => {
+                    let name = match &**property {
+                        Expr::Identifier { name } => name.as_str(),
+                        _ => return false,
+                    };
+                    // store READS + pure value twins — no state mutation
+                    const PURE_FNS: &[&str] = &[
+                        "getVar", "arrayItems", "arrayIndex", "arrayLen", "listVar", "split",
+                        "join", "test", "fileTest", "grepText", "cutText", "arith", "arithEval",
+                        "caseMatch", "imod", "idiv", "uname", "date", "readlink", "hostname",
+                        "whoami", "basename", "dirname", "mktempValue", "lastExit", "_g",
+                    ];
+                    if PURE_FNS.contains(&name) {
+                        return arguments.iter().all(subshell_body_state_free);
+                    }
+                    // self-contained state-cloning machinery (subshell/
+                    // block/pipeline/redirect/capture) — each saves and
+                    // restores its own fdTargets/state in a `finally`, so
+                    // under the fold its effect is identical; allowed when
+                    // every arg (the nested bodies!) is itself state-free
+                    // (recursion). `background` stays refused: its job is
+                    // deferred to a microtask that outlives the fold's
+                    // synchronous scope.
+                    const CLONE_FNS: &[&str] = &[
+                        "subshell", "subshellSync", "block", "blockSync", "pipeline",
+                        "pipelineSync", "redirect", "redirectSync", "capture", "captureSync",
+                        "captureWords", "captureWordsSync",
+                    ];
+                    if CLONE_FNS.contains(&name) {
+                        return arguments.iter().all(subshell_body_state_free);
+                    }
+                    // emit/read-only builtins (the runtime's builtins.* —
+                    // everything else may mutate store/cwd/fd/process
+                    // state: cd/export/unset/typeset/declare/local/
+                    // readonly/trap/eval/set/shopt/read/exec/let/...
+                    if name == "builtin" {
+                        const PURE_BUILTINS: &[&str] = &[
+                            "echo", "printf", "pwd", "true", "false", "test", "cat", "head",
+                            "tail", "wc", "sort", "uniq", "grep", "egrep", "tr", "cut", "sed",
+                            "cmp", "comm", "diff", "paste", "find", "ls", "which", "whoami",
+                            "hostname", "uname", "date", "readlink", "basename", "dirname",
+                            "stat", "touch", "tee", "sha256sum", "sha512sum", "gzip", "gunzip",
+                            "mktemp", "rm", "rmdir", "cp", "mv", "mkdir", "env",
+                        ];
+                        return matches!(arguments.first(), Some(Expr::Literal { value, .. })
+                            if value.as_str().map(|s| PURE_BUILTINS.contains(&s)).unwrap_or(false))
+                            && arguments.iter().skip(1).all(subshell_body_state_free);
+                    }
+                    false
+                }
+                _ => false,
+            }
+        }
+        Expr::ArrowFunctionExpression {
+            params: _, body, expression: _, r#async: _,
+        } => match body {
+            ArrowBody::Expr(e) => subshell_body_state_free(e),
+            // a multi-statement arrow body is a BlockStatement Stmt —
+            // recurse through the statement list
+            ArrowBody::Block(st) => subshell_stmt_state_free(st),
+        },
+        // anything else (awaits, objects, arrays, ...) — refuse
+        _ => false,
+    }
+}
+
+/// Statement-level twin of [`subshell_body_state_free`] for the
+/// multi-statement arrow bodies (blocks, ifs, returns).
+fn subshell_stmt_state_free(st: &Stmt) -> bool {
+    match st {
+        Stmt::BlockStatement { body } => body.iter().all(subshell_stmt_state_free),
+        Stmt::ExpressionStatement { expression } => subshell_body_state_free(expression),
+        Stmt::IfStatement {
+            test,
+            consequent,
+            alternate,
+        } => {
+            subshell_body_state_free(test)
+                && subshell_stmt_state_free(consequent)
+                && alternate
+                    .as_deref()
+                    .map(subshell_stmt_state_free)
+                    .unwrap_or(true)
+        }
+        Stmt::ReturnStatement { argument } => argument
+            .as_ref()
+            .map(|e| subshell_body_state_free(e))
+            .unwrap_or(true),
+        // VariableDeclaration (let) and anything else — refuse
+        _ => false,
+    }
+}
+
 fn arrow_body(params: Vec<Expr>, body: IrExpr) -> Expr {
     arrow_body_async(params, body, true)
 }
@@ -27648,6 +28552,114 @@ fn sh2_name_arg(e: &Expr) -> Option<&str> {
         }
     }
     None
+}
+
+/// A baked-subscript READ name (`${map[$k]}` → `param("", "map[$k]")`):
+/// base is a plain identifier, the subscript text's `$`-refs are ALL plain
+/// `$v`/`${v}` names (no cmdsubs, no `$1`-style positionals, no specials,
+/// no param ops, no adjacent-ref concatenation — `$i$j`). The emitter
+/// rewrites the read to `sh2.arrayIndex("base", <native key>)` with the
+/// refs' native binding reads (try_native_param's `""` branch), so the
+/// refs need no store mark: lifting them is sound, and a ref that stays
+/// store-bound for other reasons keeps a synced store read in the key.
+/// Returns the base and the subscript's (literal text | ref name) parts.
+fn baked_subscript_read(name: &str) -> Option<(&str, Vec<(bool, String)>)> {
+    let open = name.find('[')?;
+    let close = name.rfind(']')?;
+    if close != name.len() - 1 || close <= open {
+        return None;
+    }
+    let base = &name[..open];
+    if !lift_is_ident(base) {
+        return None;
+    }
+    // PIPESTATUS is a getVar-special subscript (the runtime reads
+    // `this.pipeStatuses`); arrayIndex has no such arm — the rewrite
+    // must never fire for it.
+    if base == "PIPESTATUS" {
+        return None;
+    }
+    let sub = &name[open + 1..close];
+    if sub.is_empty() {
+        return None;
+    }
+    // `[@]`/`[*]` are the whole-array/join forms — getVar joins them with
+    // IFS (or returns the values array); arrayIndex's `*`/`@` arm returns
+    // the raw values array — a divergence, so they never rewrite.
+    if sub == "@" || sub == "*" {
+        return None;
+    }
+    let mut parts: Vec<(bool, String)> = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    let bytes = sub.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            // a backslash-escaped `$`/`\` — literal text, not a ref
+            if i + 1 < bytes.len() {
+                lit.push(bytes[i] as char);
+                lit.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            return None;
+        }
+        if bytes[i] != b'$' {
+            lit.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let rest = &sub[i + 1..];
+        if rest.is_empty() {
+            return None;
+        }
+        // `${v}` / `$v` — a plain ref; anything else (`$(`, `${#x}`,
+        // `${x:...}`, `$1`, `$@`) refuses the rewrite
+        let (v, consumed) = if rest.starts_with('{') {
+            let r2 = &rest[1..];
+            let n = r2
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
+            if n == 0 || n >= r2.len() || r2.as_bytes()[n] != b'}' {
+                return None;
+            }
+            (r2[..n].to_string(), n + 2)
+        } else {
+            let n = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
+            if n == 0 {
+                return None;
+            }
+            (rest[..n].to_string(), n)
+        };
+        if !lit.is_empty() {
+            parts.push((false, std::mem::take(&mut lit)));
+        }
+        parts.push((true, v));
+        i += 1 + consumed;
+    }
+    if !lit.is_empty() {
+        parts.push((false, lit));
+    }
+    Some((base, parts))
+}
+
+/// `SH2_ASSUME_SUBSCRIPT_KEYS` (default ON; `=0` restores the runtime
+/// baked-subscript read): the native-key rewrite (`sh2.arrayIndex("map",
+/// k)` for `${map[$k]}` with a lifted `k`) is EXACT for indexed arrays —
+/// both paths evalArith the same key text — but for ASSOC arrays the
+/// runtime's normAssocKey strips quotes/brackets and expandWord's `$`/
+/// backtick sequences from the key VALUE, while the baked text form
+/// expands `$k` to the raw value without re-processing. The corpus's
+/// assoc keys/values are clean text (no quotes/brackets/`$`/whitespace
+/// edges), where the two paths agree byte-for-byte; a quoted or
+/// `$`-bearing key VALUE would diverge. `=0` keeps the store-based read
+/// (and the store marks) for maximal fidelity.
+fn subscript_keys_assumed_clean() -> bool {
+    std::env::var("SH2_ASSUME_SUBSCRIPT_KEYS").map_or(true, |v| v != "0")
 }
 
 /// Does a baked subscript name (`map[$k]`, `arr[$i+1]`) reference `var`
