@@ -2,22 +2,34 @@ pub mod ast;
 pub mod ast_words;
 pub mod lexer;
 pub mod parser;
-// pub mod mir; // TODO: Fix MIR implementation
-pub mod ir;
+
 pub mod debug;
 pub mod estree;
-pub mod cfront;
+pub mod ir;
 pub mod shir;
-pub mod transforms;
 pub mod shir_json;
 pub mod js_backend; // worktree-local: JS backend renderer (branch backend/js)
+pub mod transforms;
 
-pub mod shir_json_in;
 pub mod bc;
 pub mod generator;
+pub mod shir_json_in;
+// Unified backend fleet: the renderers merged from the backend worktrees
+// (branch backend/<lang>). Each consumes the ShIR in-process and emits
+// <lang> source — one library, every target (PLAN §4 "unified otranspiler").
+pub mod c_backend;
+pub mod go_backend;
+pub mod java_backend;
+pub mod js_backend;
 pub mod mir_simple;
+pub mod perl_backend;
+pub mod python_backend;
+pub mod rust_backend;
+pub mod sh_backend;
 pub mod shared_utils;
+pub mod shir_passes;
 pub mod variable_analysis;
+pub mod zig_backend;
 // Browser (JS/wasm-bindgen) API — wasm32-unknown-unknown only.
 #[cfg(not(target_os = "wasi"))]
 pub mod wasm;
@@ -33,7 +45,7 @@ pub use ast::*;
 pub use lexer::{Lexer, Token};
 pub use parser::commands::Parser;
 pub use parser::utilities::ParserUtilities;
-// pub use mir::*; // TODO: Fix MIR implementation
+
 pub use generator::Generator;
 #[cfg(test)]
 pub mod estree_debug_tests {

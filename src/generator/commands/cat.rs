@@ -12,7 +12,7 @@ fn cat_requires_shell(cmd: &SimpleCommand) -> bool {
             if text == "|" {
                 true
             } else if text == "-" {
-                false  // cat - is just stdin, can be handled natively
+                false // cat - is just stdin, can be handled natively
             } else {
                 text.starts_with('-')
             }
@@ -23,7 +23,7 @@ fn cat_requires_shell(cmd: &SimpleCommand) -> bool {
                     if text == "|" {
                         true
                     } else if text == "-" {
-                        false  // cat - is stdin, handled natively
+                        false // cat - is stdin, handled natively
                     } else {
                         text.starts_with('-')
                     }
@@ -55,9 +55,10 @@ pub fn generate_cat_command_for_substitution(
         if words.is_empty() {
             words.push("cat");
         }
-        let args_perl: Vec<String> = words.iter().map(|w| {
-            format!("'{}'", w.replace("'", "'\\''"))
-        }).collect();
+        let args_perl: Vec<String> = words
+            .iter()
+            .map(|w| format!("'{}'", w.replace("'", "'\\''")))
+            .collect();
         return format!(
             "do {{ my $cat_out = q{{}}; my $cat_pid = open3(my $cat_in, my $cat_out_r, undef, {}); close $cat_in or croak 'Close failed: $OS_ERROR'; local $INPUT_RECORD_SEPARATOR = undef; $cat_out = <$cat_out_r>; close $cat_out_r or croak 'Close failed: $OS_ERROR'; waitpid $cat_pid, 0; $cat_out; }}",
             args_perl.join(", ")
@@ -112,12 +113,16 @@ pub fn generate_cat_command(
             has_heredoc = true;
         }
         // Check for output redirect: > file or >> file
-        if matches!(redir.operator, RedirectOperator::Output | RedirectOperator::Append) {
-            if let Word::Literal(filename, _) = &redir.target {
-                output_file = Some(filename.clone());
-            } else {
-                output_file = Some(generator.perl_string_literal(&redir.target));
-            }
+        if matches!(
+            redir.operator,
+            RedirectOperator::Output | RedirectOperator::Append
+        ) {
+            // Convert the target to a real Perl EXPRESSION: literal filenames
+            // become quoted Perl strings, interpolations (`> "$f"`) become
+            // their variable references.  Re-wrapping later in
+            // perl_string_literal would quote `$f`/`${f}` literally, creating
+            // a file literally named `"${f}"` instead of x.py.
+            output_file = Some(generator.word_to_perl(&redir.target));
         }
     }
 
@@ -157,17 +162,14 @@ pub fn generate_cat_command(
         };
 
         if let Some(filename) = output_file {
-            // Write heredoc content to the output file (raw text for now)
-            let filename_pl = generator.perl_string_literal(&Word::literal(filename));
+            // Write heredoc content to the output file (raw text for now).
+            // `filename` is already a Perl expression (quoted literal or var ref).
             output.push_str(&format!(
                 "open my $fh_cat, '>', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
-                filename_pl
+                filename
             ));
             let body_lit = crate::ir::ir_expr_to_perl(&IrExpr::Str(body, style));
-            output.push_str(&format!(
-                "print {{$fh_cat}} {};\n",
-                body_lit
-            ));
+            output.push_str(&format!("print {{$fh_cat}} {};\n", body_lit));
             output.push_str(&format!(
                 "close $fh_cat or croak \"Close failed: $OS_ERROR\\n\";\n"
             ));

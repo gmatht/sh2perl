@@ -8,6 +8,11 @@
 //!     analyses serialized; `Any` = runtime store, omitted from the list).
 //!   - ask A3: `purity` on Exec/Pipeline — `PureCpu` | `Emulable` | `Spawn`
 //!     (builtin vs external classification, conservative).
+//!   - const-markup: `var_const` — conservative const/var verdicts per
+//!     assigned variable (`Const` | `Var`; the C backend emits `const`).
+//!   - lifetime: `var_lifetimes` — per-variable live spans (first/last
+//!     access positions) + the escape bit (the C backend's per-point
+//!     buffer sizing and copy-vs-move input).
 //! Deterministic: same input → byte-identical JSON.
 //!
 //! Usage: `debashc file --shir foo.sh` (or `debashc --shir <input>`).
@@ -26,6 +31,25 @@ pub fn shir_to_shir_json(prog: &IrProgram) -> String {
     if prog.var_types.is_empty() {
         prog.var_types = crate::shir::analyze_var_types(&prog);
     }
+    if prog.var_lengths.is_empty() {
+        prog.var_lengths = crate::shir::analyze_string_lengths(&prog);
+    }
+    if prog.var_const.is_empty() {
+        prog.var_const = crate::shir::analyze_var_const(&prog);
+    }
+    if prog.var_lifetimes.is_empty() {
+        prog.var_lifetimes = crate::shir_passes::lifetime::analyze_var_lifetimes(&prog);
+    }
+    if prog.var_nospace.is_empty() {
+        prog.var_nospace = crate::shir::analyze_var_nospace(&prog);
+    }
+    if prog.var_bash_env.is_empty() {
+        prog.var_bash_env = crate::shir::analyze_var_bash_env(&prog);
+    }
+    // shIR markup: mark loops provably run at least once (`"runs": true`)
+    // so every backend consuming the A1 contract knows the body always
+    // runs (the estree backend uses it to skip its ran/last tracking).
+    crate::shir::set_provably_running_loops(&prog.stmts);
     program_json(&prog, CONTRACT_VERSION).to_string()
 }
 
@@ -51,6 +75,11 @@ fn program_json(p: &IrProgram, contract_version: u32) -> Value {
         "requires": p.requires,
         "var_types": p.var_types.iter().map(|(n, t)| json!({"name": n, "type": t})).collect::<Vec<_>>(),
         "stmt_lines": p.stmt_lines.iter().map(|(i, l)| json!({"stmt": i, "line": l})).collect::<Vec<_>>(),
+        "var_lengths": p.var_lengths.iter().map(|(n, l)| json!({"name": n, "max_len": l})).collect::<Vec<_>>(),
+        "var_const": p.var_const.iter().map(|(n, k)| json!({"name": n, "kind": k})).collect::<Vec<_>>(),
+        "var_lifetimes": p.var_lifetimes.iter().map(|(n, l)| json!({"name": n, "first": l.first, "last": l.last, "escapes": l.escapes})).collect::<Vec<_>>(),
+        "var_nospace": p.var_nospace.iter().map(|(n, b)| json!({"name": n, "nospace": b})).collect::<Vec<_>>(),
+        "var_bash_env": p.var_bash_env,
         "subs": p.subs.iter().map(sub_json).collect::<Vec<_>>(),
         "stmts": p.stmts.iter().map(stmt_json).collect::<Vec<_>>(),
     })
@@ -69,11 +98,19 @@ fn sub_json(s: &IrSub) -> Value {
 
 fn stmt_json(s: &IrStmt) -> Value {
     match s {
-        IrStmt::Output { value, newline, target } => json!({
+        IrStmt::Output {
+            value,
+            newline,
+            target,
+        } => json!({
             "type": "Output", "value": expr_json(value),
             "newline": newline, "target": target,
         }),
-        IrStmt::WriteFile { path, content, append } => json!({
+        IrStmt::WriteFile {
+            path,
+            content,
+            append,
+        } => json!({
             "type": "WriteFile", "path": expr_json(path),
             "content": expr_json(content), "append": append,
         }),
@@ -88,12 +125,21 @@ fn stmt_json(s: &IrStmt) -> Value {
             "init": init.as_ref().map(|e| expr_json(e)),
             "local": local,
         }),
-        IrStmt::DeclareArray { var, sigil, elements } => json!({
+        IrStmt::DeclareArray {
+            var,
+            sigil,
+            elements,
+        } => json!({
             "type": "DeclareArray", "var": var,
             "sigil": sigil_json(*sigil),
             "elements": elements.iter().map(expr_json).collect::<Vec<_>>(),
         }),
-        IrStmt::If { cond, then, elsifs, else_ } => json!({
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+        } => json!({
             "type": "If", "cond": expr_json(cond),
             "then": stmts_json(then),
             "elsifs": elsifs.iter().map(|(c, b)| json!({"cond": expr_json(c), "body": stmts_json(b)})).collect::<Vec<_>>(),
@@ -102,13 +148,16 @@ fn stmt_json(s: &IrStmt) -> Value {
         IrStmt::For { var, iter, body } => json!({
             "type": "For", "var": var, "iter": expr_json(iter),
             "body": stmts_json(body),
+            "runs": crate::shir::stmt_provably_runs(s),
         }),
         IrStmt::While { cond, body } => json!({
             "type": "While", "cond": expr_json(cond), "body": stmts_json(body),
+            "runs": crate::shir::stmt_provably_runs(s),
         }),
         IrStmt::DoWhile { body, cond, until } => json!({
             "type": "DoWhile", "body": stmts_json(body),
             "cond": expr_json(cond), "until": until,
+            "runs": crate::shir::stmt_provably_runs(s),
         }),
         IrStmt::Die { expr, carp } => json!({
             "type": "Die", "expr": expr_json(expr), "carp": carp,
@@ -116,19 +165,42 @@ fn stmt_json(s: &IrStmt) -> Value {
         IrStmt::Warn { expr, carp } => json!({
             "type": "Warn", "expr": expr_json(expr), "carp": carp,
         }),
-        IrStmt::Exec { cmd, args, capture, redirects, env } => {
+        IrStmt::Exec {
+            cmd,
+            args,
+            capture,
+            redirects,
+            env,
+        } => {
             let mut o = serde_json::Map::new();
             o.insert("type".into(), "Exec".into());
             o.insert("cmd".into(), expr_json(cmd));
-            o.insert("args".into(), json!(args.iter().map(expr_json).collect::<Vec<_>>()));
+            o.insert(
+                "args".into(),
+                json!(args.iter().map(expr_json).collect::<Vec<_>>()),
+            );
             o.insert("capture".into(), json!(capture));
-            o.insert("redirects".into(), json!(redirects.iter().map(expr_json).collect::<Vec<_>>()));
-            o.insert("env".into(), json!(env.iter().map(|(k, v)| json!({"name": k, "value": expr_json(v)})).collect::<Vec<_>>()));
+            o.insert(
+                "redirects".into(),
+                json!(redirects.iter().map(expr_json).collect::<Vec<_>>()),
+            );
+            o.insert(
+                "env".into(),
+                json!(env
+                    .iter()
+                    .map(|(k, v)| json!({"name": k, "value": expr_json(v)}))
+                    .collect::<Vec<_>>()),
+            );
             // ask A3: purity classification (builtin vs external, conservative)
             o.insert("purity".into(), exec_purity(cmd, capture).into());
             Value::Object(o)
         }
-        IrStmt::Pipeline { stages, last_output, capture, cmd_str } => json!({
+        IrStmt::Pipeline {
+            stages,
+            last_output,
+            capture,
+            cmd_str,
+        } => json!({
             "type": "Pipeline",
             "stages": stages.iter().map(|s| stmts_json(s)).collect::<Vec<_>>(),
             "last_output": last_output,
@@ -141,7 +213,10 @@ fn stmt_json(s: &IrStmt) -> Value {
         IrStmt::SetChildError(e) => json!({ "type": "SetChildError", "expr": expr_json(e) }),
         IrStmt::Require(m) => json!({ "type": "Require", "module": m }),
         IrStmt::RawText(t) => json!({ "type": "RawText", "text": t }),
-        IrStmt::Case { discriminant, clauses } => json!({
+        IrStmt::Case {
+            discriminant,
+            clauses,
+        } => json!({
             "type": "Case", "discriminant": expr_json(discriminant),
             "clauses": clauses.iter().map(|c| json!({
                 "patterns": c.patterns, "body": stmts_json(&c.body),
@@ -158,6 +233,8 @@ fn stmt_json(s: &IrStmt) -> Value {
         IrStmt::Background(body) => json!({ "type": "Background", "body": stmts_json(body) }),
         IrStmt::Block(body) => json!({ "type": "Block", "body": stmts_json(body) }),
         IrStmt::Expr(e) => json!({ "type": "Expr", "expr": expr_json(e) }),
+        IrStmt::Label(name) => json!({ "type": "Label", "name": name }),
+        IrStmt::Goto(name) => json!({ "type": "Goto", "name": name }),
     }
 }
 
@@ -187,7 +264,10 @@ fn expr_json(e: &IrExpr) -> Value {
             let mut o = serde_json::Map::new();
             o.insert("type".into(), "Call".into());
             o.insert("func".into(), func.clone().into());
-            o.insert("args".into(), json!(args.iter().map(expr_json).collect::<Vec<_>>()));
+            o.insert(
+                "args".into(),
+                json!(args.iter().map(expr_json).collect::<Vec<_>>()),
+            );
             // ask A3: purity classification per the A4 namespace spec
             // (harness/sh2-namespace.json). `exec` refines by cmd name:
             // builtin → Emulable, external → Spawn.
@@ -304,14 +384,27 @@ fn style_json(s: &StrStyle) -> &'static str {
 
 fn binop_json(op: &BinOpKind) -> &'static str {
     match op {
-        BinOpKind::Add => "Add", BinOpKind::Sub => "Sub", BinOpKind::Mul => "Mul",
-        BinOpKind::Div => "Div", BinOpKind::Mod => "Mod", BinOpKind::Pow => "Pow",
+        BinOpKind::Add => "Add",
+        BinOpKind::Sub => "Sub",
+        BinOpKind::Mul => "Mul",
+        BinOpKind::Div => "Div",
+        BinOpKind::Mod => "Mod",
+        BinOpKind::Pow => "Pow",
         BinOpKind::Concat => "Concat",
-        BinOpKind::Eq => "Eq", BinOpKind::Ne => "Ne", BinOpKind::Lt => "Lt",
-        BinOpKind::Gt => "Gt", BinOpKind::Le => "Le", BinOpKind::Ge => "Ge",
-        BinOpKind::And => "And", BinOpKind::Or => "Or", BinOpKind::Not => "Not",
-        BinOpKind::BitAnd => "BitAnd", BinOpKind::BitOr => "BitOr", BinOpKind::BitXor => "BitXor",
-        BinOpKind::ShiftL => "ShiftL", BinOpKind::ShiftR => "ShiftR",
+        BinOpKind::Eq => "Eq",
+        BinOpKind::Ne => "Ne",
+        BinOpKind::Lt => "Lt",
+        BinOpKind::Gt => "Gt",
+        BinOpKind::Le => "Le",
+        BinOpKind::Ge => "Ge",
+        BinOpKind::And => "And",
+        BinOpKind::Or => "Or",
+        BinOpKind::Not => "Not",
+        BinOpKind::BitAnd => "BitAnd",
+        BinOpKind::BitOr => "BitOr",
+        BinOpKind::BitXor => "BitXor",
+        BinOpKind::ShiftL => "ShiftL",
+        BinOpKind::ShiftR => "ShiftR",
     }
 }
 
@@ -321,24 +414,27 @@ fn binop_json(op: &BinOpKind) -> &'static str {
 fn call_purity(func: &str, args: &[IrExpr]) -> &'static str {
     match func {
         // PureCpu (namespace spec): no I/O, no state beyond args
-        "contains" | "join" | "brace" | "idiv" | "imod" | "arith" | "arithEval"
-        | "trimCapture" | "dirname" | "basename" | "not" | "guard" | "caseMatch"
-        | "param" | "callDirect" => "PureCpu",
+        "contains" | "join" | "brace" | "idiv" | "imod" | "arith" | "arithEval" | "trimCapture"
+        | "dirname" | "basename" | "not" | "guard" | "caseMatch" | "split" | "param"
+        | "callDirect" => "PureCpu",
         // Emulable: implementable in a backend runtime (state/string/glob/fs-tests)
-        "getVar" | "setVar" | "setLastExit" | "assign" | "test" | "grepText"
-        | "listVar" | "setArray" | "setArrayAppend" | "arrayItems" | "arrayKeys"
-        | "arrayLen" | "arrayIndex" | "fnCall" | "define" | "forLoop" | "whileLoop"
-        | "block" | "shopt" | "builtin" | "bcSqrt" => "Emulable",
+        "getVar" | "setVar" | "setLastExit" | "assign" | "test" | "grepText" | "listVar"
+        | "setArray" | "setArrayAppend" | "arrayItems" | "arrayKeys" | "arrayLen"
+        | "arrayIndex" | "fnCall" | "fnValue" | "define" | "forLoop" | "whileLoop" | "block" | "shopt"
+        | "builtin" | "bcSqrt" | "ternary" | "arrayStore" | "memAdvance" | "memTest" | "line" => "Emulable",
         // Fs: file I/O, no process spawn
         _ if func.starts_with("fs.") => "Fs",
         // Spawn: must fork/exec or connect processes
         "exec" => match args.first() {
             Some(IrExpr::Str(name, _)) | Some(IrExpr::Ident(name))
-                if crate::shir::SYNC_BUILTINS.contains(&name.as_str()) => "Emulable",
+                if crate::shir::SYNC_BUILTINS.contains(&name.as_str()) =>
+            {
+                "Emulable"
+            }
             _ => "Spawn",
         },
-        "capture" | "captureWords" | "pipeline" | "redirect" | "subshell"
-        | "background" | "callUndefined" | "unsupported" => "Spawn",
+        "capture" | "captureWords" | "pipeline" | "redirect" | "subshell" | "background"
+        | "callUndefined" | "unsupported" => "Spawn",
         // Control-flow signals
         "return" | "break" | "continue" | "exit" => "Control",
         _ => "Spawn", // unknown → conservative
