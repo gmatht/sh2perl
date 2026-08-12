@@ -7507,6 +7507,28 @@ fn arith_is_bigint(a: &ArithAst) -> bool {
     matches!(a, ArithAst::Cast { ty, .. } if matches!(ty, IrType::Int64 | IrType::UInt64))
 }
 
+/// A `memLoad` read from a 64-bit-elem heap pointer (the C frontend passes
+/// the element C type name as the third arg): the value is a store string
+/// — `parseInt` would round it past 2^53, so printf renders it directly.
+fn mem_load_is_64(e: &IrExpr) -> bool {
+    if let IrExpr::Call { func, args } = e {
+        if func == "memLoad" && args.len() >= 3 {
+            if let IrExpr::Str(t, _) = &args[2] {
+                return matches!(
+                    t.as_str(),
+                    "long long"
+                        | "unsigned long long"
+                        | "long"
+                        | "unsigned long"
+                        | "int64"
+                        | "u64"
+                );
+            }
+        }
+    }
+    false
+}
+
 /// Render a C cast `(T)x` for the C-executed ESTree path:
 ///   Int32   -> `x | 0`            (wrap mod 2^32, signed)
 ///   UInt32  -> `x >>> 0`          (wrap mod 2^32, unsigned)
@@ -16997,11 +17019,14 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
                     // C-frontend i64 args render as `BigInt(...)` — a
                     // `parseInt(BigInt)` would throw, so %d/%i on a
                     // BigInt-typed arg renders the arg directly (the
-                    // template stringifies the BigInt exactly).
-                    arg_is_bigint.push(matches!(
-                        other,
-                        IrExpr::Arith(a) if arith_is_bigint(a)
-                    ));
+                    // template stringifies the BigInt exactly). Same for
+                    // memLoad reads from 64-bit-elem heap pointers: the
+                    // value is a store string — parseInt would round it
+                    // past 2^53.
+                    arg_is_bigint.push(
+                        matches!(other, IrExpr::Arith(a) if arith_is_bigint(a))
+                            || mem_load_is_64(other),
+                    );
                 }
             }
         }
