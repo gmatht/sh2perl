@@ -7,6 +7,15 @@ want from core". Grounding: the current IR surface (`src/ir.rs` —
 `BinOpKind` set, `IrExpr`/`IrStmt` node inventories), the A2 type verdict
 (`IrType {Int, Str, Any}`), and the shared ShIR JSON contract (A1, landed).
 
+> Status update 2026-08-12: **F1 (partially) and F2 (partially) landed** —
+> the four sized int kinds (`Int32/Int64/UInt32/UInt64` in `IrType`, as
+> `{"kind":"Int32"}` etc.) and the `Cast`/`Sizeof` ARITH nodes exist and
+> round-trip (c-sh-go emits them; the C-executed ESTree path lowers i32 via
+> `|0`/`Math.imul`/`>>>0` and i64/u64 via BigInt — see
+> `benchmarks/i64/BinInt64.md`). Still on the table: the full lattice
+> (I8/U8/I16/U16/F32/F64/Char/Ptr/Array/Struct), the IrExpr-level
+> Cast/Sizeof/Member/Comma/AddrOf/Deref, goto/labels, CSwitch.
+
 ## 0. TL;DR
 
 C is the nearest thing to a universal *target* ("lots of things compile

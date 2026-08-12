@@ -865,6 +865,8 @@ impl Render {
                 self.sh2_calls.insert("arith".into());
                 "sh2Arith()".to_string()
             }
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
 
@@ -1447,6 +1449,9 @@ impl Render {
             | IrStmt::Goto(_) => {
                 self.mark_todo(&format!("stmt {:?}", s));
             }
+            IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
+            IrStmt::Continue => self.emit("continue;"),
+            IrStmt::Break => self.emit("break;"),
         }
     }
 

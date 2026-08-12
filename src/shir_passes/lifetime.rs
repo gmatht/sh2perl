@@ -245,6 +245,13 @@ fn walk_stmt(
             walk_expr(cond, p, first, last, escapes, in_closure);
             walk_stmts(body, pos, first, last, escapes, in_closure, copied);
         }
+        IrStmt::ForInit { init, cond, step, body } => {
+            walk_stmts(init, pos, first, last, escapes, in_closure, copied);
+            walk_expr(cond, p, first, last, escapes, in_closure);
+            walk_stmts(step, pos, first, last, escapes, in_closure, copied);
+            walk_stmts(body, pos, first, last, escapes, in_closure, copied);
+        }
+        IrStmt::Continue | IrStmt::Break => {}
         IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
             walk_expr(expr, p, first, last, escapes, in_closure);
         }
@@ -504,6 +511,10 @@ fn walk_arith(
             access(var, pos, first, last, escapes, in_closure);
         }
         ArithAst::Num(_) => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => {
+            walk_arith(arg, pos, first, last, escapes, in_closure);
+        }
     }
 }
 
@@ -635,6 +646,13 @@ fn mark_stmt_vars_escape(
             mark_vars_escape(cond, first, escapes);
             mark_stmts_vars_escape(body, first, escapes);
         }
+        IrStmt::ForInit { init, cond, step, body } => {
+            mark_stmts_vars_escape(init, first, escapes);
+            mark_vars_escape(cond, first, escapes);
+            mark_stmts_vars_escape(step, first, escapes);
+            mark_stmts_vars_escape(body, first, escapes);
+        }
+        IrStmt::Continue | IrStmt::Break => {}
         IrStmt::Die { expr, .. }
         | IrStmt::Warn { expr, .. }
         | IrStmt::Exit(Some(expr))
@@ -741,6 +759,8 @@ fn mark_arith_vars_escape(
             escapes.insert(var.clone());
         }
         ArithAst::Num(_) => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => mark_arith_vars_escape(arg, first, escapes),
     }
 }
 

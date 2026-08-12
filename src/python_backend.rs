@@ -238,6 +238,8 @@ impl Render {
                 self.sh2_calls.insert("arith".into());
                 format!("sh2_arith()")
             }
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
 

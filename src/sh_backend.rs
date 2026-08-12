@@ -145,6 +145,13 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                     expr_names(cond, names);
                     walk(body, names);
                 }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init, names);
+                    expr_names(cond, names);
+                    walk(step, names);
+                    walk(body, names);
+                }
+                IrStmt::Continue | IrStmt::Break => {}
                 IrStmt::For { iter, body, .. } => {
                     expr_names(iter, names);
                     walk(body, names);
@@ -344,6 +351,10 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                 IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
                     expr_uses_arr(cond) || walk(body)
                 }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init) || expr_uses_arr(cond) || walk(step) || walk(body)
+                }
+                IrStmt::Continue | IrStmt::Break => false,
                 IrStmt::For { iter, body, .. } => expr_uses_arr(iter) || walk(body),
                 IrStmt::Case {
                     discriminant,
@@ -999,6 +1010,19 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             }
             indent(out, d);
             out.push_str("done\n");
+            Ok(())
+        }
+        IrStmt::ForInit { .. } => Err(
+            "sh renderer: un-stripped ForInit (the strip_cfor pass should have lowered it)".into(),
+        ),
+        IrStmt::Continue => {
+            indent(out, d);
+            out.push_str("continue\n");
+            Ok(())
+        }
+        IrStmt::Break => {
+            indent(out, d);
+            out.push_str("break\n");
             Ok(())
         }
         IrStmt::DoWhile { body, cond, until } => {
@@ -4092,6 +4116,10 @@ fn arith_to_sh(a: &ArithAst) -> String {
                 format!("(({var} = {var} {inc}) {dec})")
             }
         }
+        // C-frontend nodes (never emitted by the shell path): sizeof is a
+        // compile-time constant; casts are identity (shell arith is 64-bit).
+        ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+        ArithAst::Cast { arg, .. } => arith_to_sh(arg),
     }
 }
 
@@ -4176,6 +4204,11 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             cmd_to_sh(cond)?,
             stmts_inline(body)?
         )),
+        IrStmt::ForInit { .. } => Err(
+            "sh renderer: un-stripped ForInit (the strip_cfor pass should have lowered it)".into(),
+        ),
+        IrStmt::Continue => Ok(format!("continue")),
+        IrStmt::Break => Ok(format!("break")),
         IrStmt::DoWhile { body, cond, until } => {
             let neg = if *until { "" } else { "! " };
             Ok(format!(

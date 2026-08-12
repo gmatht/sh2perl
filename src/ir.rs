@@ -47,6 +47,13 @@ pub enum Sigil {
 //   Any  -> runtime store (mixed/unknown typing; shell vars are strings)
 // Populated by `shir::analyze_var_types`; serialized in the ShIR JSON
 // (ask A1). Existing backends ignore it (additive only).
+//
+// The C-style sized variants (Int32/Int64/UInt32/UInt64) are emitted by
+// the C frontend (c-sh-go) from the C declarator types; the C-executed
+// ESTree path lowers Int32/UInt32 to native JS numbers with `|0` /
+// `Math.imul` / `>>>0` wrap semantics and Int64/UInt64 to BigInt
+// (BigInt64Array for array storage) — see the BinInt64 benchmarks in
+// benchmarks/i64/. Other backends treat them as Int (additive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrType {
     Int,
@@ -58,6 +65,27 @@ pub enum IrType {
     /// to the old derive output). Additive: backends that ignore the
     /// annotation are unaffected.
     Float(u8),
+    /// C `int` — signed 32-bit, wraps mod 2^32. Serialized as `{"kind": "Int32"}`.
+    Int32,
+    /// C `long long` — signed 64-bit, wraps mod 2^64. Serialized as `{"kind": "Int64"}`.
+    Int64,
+    /// C `unsigned int` — unsigned 32-bit. Serialized as `{"kind": "UInt32"}`.
+    UInt32,
+    /// C `unsigned long long` — unsigned 64-bit. Serialized as `{"kind": "UInt64"}`.
+    UInt64,
+}
+
+impl IrType {
+    /// C `sizeof(T)` in bytes for the sized variants (the C frontend's
+    /// model: int = 4, long long = 8); the widthless Int/Str/Any have no
+    /// C size (None).
+    pub fn c_sizeof(&self) -> Option<i64> {
+        match self {
+            IrType::Int32 | IrType::UInt32 => Some(4),
+            IrType::Int64 | IrType::UInt64 => Some(8),
+            _ => None,
+        }
+    }
 }
 
 impl serde::Serialize for IrType {
@@ -71,6 +99,19 @@ impl serde::Serialize for IrType {
                 let mut st = s.serialize_struct("IrType", 2)?;
                 st.serialize_field("kind", "Float")?;
                 st.serialize_field("width", w)?;
+                st.end()
+            }
+            // Sized C ints serialize as {"kind": "Int32"} etc.
+            IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64 => {
+                use serde::ser::SerializeStruct;
+                let kind = match self {
+                    IrType::Int32 => "Int32",
+                    IrType::Int64 => "Int64",
+                    IrType::UInt32 => "UInt32",
+                    _ => "UInt64",
+                };
+                let mut st = s.serialize_struct("IrType", 1)?;
+                st.serialize_field("kind", kind)?;
                 st.end()
             }
         }
@@ -110,10 +151,19 @@ impl<'de> serde::Deserialize<'de> for IrType {
                         }
                     }
                 }
-                match (kind.as_deref(), width) {
-                    (Some("Float"), Some(w)) => Ok(IrType::Float(w)),
+                match kind.as_deref() {
+                    Some("Float") => match width {
+                        Some(w) => Ok(IrType::Float(w)),
+                        None => Err(serde::de::Error::custom(
+                            "expected {\"kind\":\"Float\",\"width\":N}",
+                        )),
+                    },
+                    Some("Int32") => Ok(IrType::Int32),
+                    Some("Int64") => Ok(IrType::Int64),
+                    Some("UInt32") => Ok(IrType::UInt32),
+                    Some("UInt64") => Ok(IrType::UInt64),
                     _ => Err(serde::de::Error::custom(
-                        "expected {\"kind\":\"Float\",\"width\":N}",
+                        "expected {\"kind\":\"Float\",\"width\":N} or {\"kind\":\"Int32\"} etc.",
                     )),
                 }
             }
@@ -255,6 +305,19 @@ pub enum ArithAst {
         var: String,
         delta: i64,
         prefix: bool,
+    },
+    /// C `sizeof(T)` — a compile-time constant; the core folds it to
+    /// `Num(4|8)` for the sized variants (see `IrType::c_sizeof`) before
+    /// any backend renders it. Kept as a node so the A1 JSON carries the
+    /// typed C construct (the C frontend emits it).
+    Sizeof(IrType),
+    /// C cast `(T)x` — width/signedness coercion. The C-executed ESTree
+    /// path renders it as `| 0` (Int32), `>>> 0` (UInt32), `BigInt(...)`
+    /// (Int64/UInt64); other backends treat it as identity (widthless
+    /// native arithmetic).
+    Cast {
+        ty: IrType,
+        arg: Box<ArithAst>,
     },
 }
 
@@ -415,12 +478,31 @@ pub enum IrStmt {
         elsifs: Vec<(IrExpr, Vec<IrStmt>)>,
         else_: Vec<IrStmt>,
     },
-    /// for loop
+    /// for loop (the shell foreach: `for i in a b c`)
     For {
         var: String,
         iter: IrExpr,
         body: Vec<IrStmt>,
     },
+    /// C-style for (init; cond; step) — the RICH form imperative frontends
+    /// (C, C++) emit. The shell-flavored renderers never see it: the
+    /// `strip_cfor` pass lowers it to `init; while(cond){body; step}` (with
+    /// the step re-inserted before every body `continue`), and a renderer
+    /// that DOES encounter one refuses (REFUSE > GUESS). The shell `For`
+    /// above stays the foreach.
+    ForInit {
+        init: Vec<IrStmt>,
+        cond: IrExpr,
+        step: Vec<IrStmt>,
+        body: Vec<IrStmt>,
+    },
+    /// continue / break — first-class control flow (not a `Call(func:
+    /// "continue")` disguised as a runtime builtin). Rendered to the
+    /// runtime's `sh2.continue()` / `sh2.break()` in async bodies, or a
+    /// native ContinueStatement/BreakStatement where legal. The
+    /// deserializer still accepts the legacy Call-form for old A1s.
+    Continue,
+    Break,
     /// while loop
     While { cond: IrExpr, body: Vec<IrStmt> },
     /// do { } while/until
@@ -877,7 +959,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 out.push_str(&format!("my ${} = {};\n", save, var));
                 saves.push((name.clone(), save, sigil.clone()));
             }
-            for s in body {
+            for s in body.iter() {
                 emit_stmt(out, s, indent);
             }
             for (name, save, sigil) in saves {
@@ -946,7 +1028,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str(&format!("sub {} {{\n", name));
             emit_indent(out, indent + 1);
             out.push_str("local @ARGV = @_;\n");
-            for s in body {
+            for s in body.iter() {
                 emit_stmt(out, s, indent + 1);
             }
             emit_indent(out, indent);
@@ -1100,6 +1182,57 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         } else {
                             emit_indent(out, indent);
                             out.push_str("die \"debashc: shIR pipeline not yet supported by the Perl backend\\n\";\n");
+                        }
+                    }
+                    "and" | "or" => {
+                        // `A && B` / `A || B` composition.  Args are
+                        // Arrow(stmts) closures; a single-arg `and` is a
+                        // plain sequential group (the process-sub
+                        // materialization wrapper).
+                        let stmts: Vec<&Vec<IrStmt>> = args
+                            .iter()
+                            .filter_map(|a| match a {
+                                IrExpr::Arrow(b) => Some(b),
+                                _ => None,
+                            })
+                            .collect();
+                        if stmts.len() == 1 {
+                            for s in stmts[0] {
+                                emit_stmt(out, s, indent);
+                            }
+                        } else if stmts.len() >= 2 {
+                            for (i, body) in stmts.iter().enumerate() {
+                                let is_first = i == 0;
+                                let is_last = i + 1 == stmts.len();
+                                if is_first {
+                                    // A: run, capture its status.
+                                    for s in body.iter() {
+                                        emit_stmt(out, s, indent);
+                                    }
+                                } else if is_last {
+                                    // B: run only when the chain status allows.
+                                    emit_indent(out, indent);
+                                    if func == "and" {
+                                        out.push_str("if ($CHILD_ERROR == 0) {\n");
+                                    } else {
+                                        out.push_str("if ($CHILD_ERROR != 0) {\n");
+                                    }
+                                    for s in body.iter() {
+                                        emit_stmt(out, s, indent + 1);
+                                    }
+                                    emit_indent(out, indent);
+                                    out.push_str("}\n");
+                                } else {
+                                    // Middle stages: run, then update the
+                                    // chain status from the last emitted command.
+                                    for s in body.iter() {
+                                        emit_stmt(out, s, indent);
+                                    }
+                                }
+                            }
+                        } else {
+                            emit_indent(out, indent);
+                            out.push_str("$CHILD_ERROR = 0;\n");
                         }
                     }
                     "caseMatch" | "define" | "subshell" | "background" => {
@@ -1423,7 +1556,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str(&format!("for my ${} ({}) {{\n", tmp, iter_str));
             emit_indent(out, indent + 1);
             out.push_str(&format!("${} = ${};\n", var, tmp));
-            for s in body {
+            for s in body.iter() {
                 emit_stmt(out, s, indent + 1);
             }
             emit_indent(out, indent);
@@ -1434,13 +1567,36 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             let cond_str = ir_expr_to_perl(cond);
             emit_indent(out, indent);
             out.push_str(&format!("while ({}) {{\n", cond_str));
-            for s in body {
+            for s in body.iter() {
                 emit_stmt(out, s, indent + 1);
             }
             emit_indent(out, indent);
             out.push_str("}\n");
         }
-
+        IrStmt::ForInit { init, cond, step, body } => {
+            let cond_str = ir_expr_to_perl(cond);
+            for i in init.iter() {
+                emit_stmt(out, i, indent);
+            }
+            emit_indent(out, indent);
+            out.push_str(&format!("for (; {} ;) {{\n", cond_str));
+            for s in body.iter() {
+                emit_stmt(out, s, indent + 1);
+            }
+            for st in step.iter() {
+                emit_stmt(out, st, indent + 1);
+            }
+            emit_indent(out, indent);
+            out.push_str("}\n");
+        }
+        IrStmt::Continue => {
+            emit_indent(out, indent);
+            out.push_str("next;\n");
+        }
+        IrStmt::Break => {
+            emit_indent(out, indent);
+            out.push_str("last;\n");
+        }
         IrStmt::Die { expr, carp } => {
             let e = ir_expr_to_perl(expr)
                 .replace("$ERRNO", "$!")
@@ -1614,7 +1770,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             let cond_str = ir_expr_to_perl(cond);
             emit_indent(out, indent);
             out.push_str("do {\n");
-            for s in body {
+            for s in body.iter() {
                 emit_stmt(out, s, indent + 1);
             }
             emit_indent(out, indent);
@@ -1812,6 +1968,10 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
                 format!("({} {}= 1)", v, if *delta < 0 { "-" } else { "+" })
             }
         }
+        // C-frontend nodes (never emitted by the shell path): sizeof is a
+        // compile-time constant; casts are identity (Perl IV is 64-bit).
+        ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+        ArithAst::Cast { arg, .. } => arith_ast_to_perl(arg),
     }
 }
 
@@ -3502,6 +3662,8 @@ fn collect_read_vars_arith(ast: &ArithAst, out: &mut Vec<(String, Sigil)>) {
             }
         }
         ArithAst::Num(_) => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => collect_read_vars_arith(arg, out),
     }
 }
 
@@ -4924,6 +5086,13 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
         IrStmt::While { cond, body } => {
             expr_refers_to_main_exit(cond) || body.iter().any(|s| stmt_refers_to_main_exit(s))
         }
+        IrStmt::ForInit { init, cond, step, body } => {
+            init.iter().any(stmt_refers_to_main_exit)
+                || expr_refers_to_main_exit(cond)
+                || step.iter().any(stmt_refers_to_main_exit)
+                || body.iter().any(|s| stmt_refers_to_main_exit(s))
+        }
+        IrStmt::Continue | IrStmt::Break => false,
         IrStmt::DoWhile { body, cond, .. } => {
             expr_refers_to_main_exit(cond) || body.iter().any(|s| stmt_refers_to_main_exit(s))
         }
@@ -5072,19 +5241,32 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
         }
         IrStmt::For { iter, body, .. } => {
             collect_vars_in_expr(iter, vars);
-            for s in body {
+            for s in body.iter() {
                 collect_vars_in_stmt(s, vars);
             }
         }
         IrStmt::While { cond, body } => {
             collect_vars_in_expr(cond, vars);
-            for s in body {
+            for s in body.iter() {
                 collect_vars_in_stmt(s, vars);
             }
         }
+        IrStmt::ForInit { init, cond, step, body } => {
+            for i in init {
+                collect_vars_in_stmt(i, vars);
+            }
+            collect_vars_in_expr(cond, vars);
+            for st in step {
+                collect_vars_in_stmt(st, vars);
+            }
+            for s in body.iter() {
+                collect_vars_in_stmt(s, vars);
+            }
+        }
+        IrStmt::Continue | IrStmt::Break => {}
         IrStmt::DoWhile { body, cond, .. } => {
             collect_vars_in_expr(cond, vars);
-            for s in body {
+            for s in body.iter() {
                 collect_vars_in_stmt(s, vars);
             }
         }

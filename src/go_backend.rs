@@ -932,6 +932,10 @@ impl Render {
                     t
                 }
             }
+            // C-frontend nodes (never emitted by the shell path): sizeof is
+            // a compile-time constant; casts are identity (Go int64).
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
 
@@ -1860,6 +1864,9 @@ impl Render {
                 let t = self.cmd_text_stmts(b)?;
                 Some(format!("( {t} )"))
             }
+            IrStmt::ForInit { .. } => None,
+            IrStmt::Continue => Some("continue".to_string()),
+            IrStmt::Break => Some("break".to_string()),
             IrStmt::While { cond, body } => {
                 let b = self.cmd_text_stmts(body)?;
                 // multi-command condition (`while cmd1; cmd2; do …`)
@@ -2805,6 +2812,21 @@ impl Render {
             | IrStmt::Label(_)
             | IrStmt::Goto(_) => {
                 self.mark_todo(&format!("stmt {:?}", s));
+            }
+            IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
+            IrStmt::Continue => {
+                if self.loop_depth > 0 {
+                    self.emit("continue;");
+                } else {
+                    self.mark_todo("continue outside a loop");
+                }
+            }
+            IrStmt::Break => {
+                if self.loop_depth > 0 {
+                    self.emit("break;");
+                } else {
+                    self.mark_todo("break outside a loop");
+                }
             }
         }
     }

@@ -307,6 +307,23 @@ impl Render {
                 self.sh2_calls.insert("arith".into());
                 format!("sh2_arith()")
             }
+            // C-frontend nodes (never emitted by the shell path): sizeof is
+            // a compile-time constant; casts lower to the JS width idioms
+            // (`| 0` for int, `BigInt.asIntN(64, …)` for long long).
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { ty, arg } => {
+                let inner = self.arith(arg);
+                match ty {
+                    // Number(...) first: the arg may already be a BigInt
+                    // (an i64 sub-expression cast down to int)
+                    IrType::Int32 => format!("(Number({inner}) | 0)"),
+                    IrType::UInt32 => format!("(Number({inner}) >>> 0)"),
+                    IrType::Int64 => format!("BigInt.asIntN(64, BigInt({inner}))"),
+                    IrType::UInt64 => format!("BigInt.asUintN(64, BigInt({inner}))"),
+                    IrType::Float(32) => format!("Math.fround({inner})"),
+                    _ => inner,
+                }
+            }
         }
     }
 
@@ -969,5 +986,8 @@ fn collect_vars_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
         ArithAst::IncDec { var, .. } => {
             out.insert(var.clone());
         }
+        ArithAst::Num(_) => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => collect_vars_arith(arg, out),
     }
 }

@@ -1061,6 +1061,11 @@ impl Render {
                     format!("{}{}", name, if *delta >= 0 { "++" } else { "--" })
                 }
             }
+            // C-frontend nodes (never emitted by the shell path): sizeof
+            // is a compile-time constant; casts render as C casts (the C
+            // target's native widening/narrowing).
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
 
@@ -6023,6 +6028,8 @@ fn collect_const_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
             out.insert(var.clone());
         }
         ArithAst::Num(_) => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => collect_const_arith(arg, out),
     }
 }
 
@@ -6858,6 +6865,8 @@ fn collect_store_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
             out.insert(var.clone());
         }
         ArithAst::Num(_) => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => collect_store_arith(arg, out),
     }
 }
 
@@ -7163,6 +7172,8 @@ fn arith_leaves_at_width(a: &ArithAst, r: &Render, w: Width, has_var: &mut bool)
             *has_var = true;
             r.is_num(var) && r.width_of_var(var) == w
         }
+        ArithAst::Sizeof(_) => true, // a compile-time constant fits any width
+        ArithAst::Cast { arg, .. } => arith_leaves_at_width(arg, r, w, has_var),
     }
 }
 
@@ -7552,6 +7563,8 @@ fn arith_vars(a: &ArithAst, out: &mut Vec<String>) {
         ArithAst::Assign { rhs, .. } => arith_vars(rhs, out),
         ArithAst::IncDec { var, .. } => out.push(var.clone()),
         ArithAst::Num(_) => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => arith_vars(arg, out),
     }
 }
 
@@ -7582,6 +7595,8 @@ fn arith_shell(a: &ArithAst) -> String {
                 format!("{var}{u}{d}")
             }
         }
+        ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+        ArithAst::Cast { arg, .. } => arith_shell(arg),
     }
 }
 
