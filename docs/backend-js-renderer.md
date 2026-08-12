@@ -2,46 +2,49 @@
 
 Worktree-local JS backend. The renderer lives in `src/js_backend.rs`
 (`pub fn shir_to_js(&IrProgram) -> String`), wired into the CLI as
-`--shir-in-js` (stdin `-` or a file of ShIR JSON → JS source on stdout),
-mirroring the `--shir-in-perl` arm. The gate probes the flag with the
+`--shir-in-js` (stdin `-` or a file of ShIR JSON → ESTree JSON on stdout),
+mirroring the `--shir-in-estree` arm. The gate probes the flag with the
 "ShIR JSON ingress" marker, then renders the shared corpus.
 
-## Lowable subset (native lowering)
+## The contract: estree→js, not a hand-rolled JS printer
 
-- Output / `exec echo` → `process.stdout.write(...)` / `console.log(...)`
-- Assign / Declare (with A2 `var_types` coercion: `Int` → `expr_as_num`,
-  numeric `Str("5")` literals parsed; `Str`/Any → as-is)
-- DeclareArray → `name = [...];`
-- If / For (`for (let i of ...)`) / While / DoWhile / Block
-- Exit → `process.exit(...)`; Return (inside `main()` / subs)
-- Functions (`IrStmt::Function`, `IrSub`) → `function ...`
-- `getVar` on typed vars → bare identifier; `test` mini-evaluator
-  (`-gt -lt -ge -le -eq -ne -n -z`, `=`, `==`, `!=`, single operand)
-- Arith: native JS with `Number(x) || 0` coercion on non-Int vars
-  (`**` → `Math.pow`; `Assign`/`IncDec` → `sh2.arith` stub)
-- BinOp: `Not` is unary (rhs is a parser duplication — ignore it)
+`shir_to_js` delegates to the core's `shir::shir_to_estree_json` — the
+output is the ESTree JSON data contract (PLAN §1.2), byte-identical to
+`--shir-in-estree`. JS text is produced OUTSIDE sh2perl by the harness:
 
-Everything else emits a compile-able `sh2_*()` stub or a
-`/* TODO(unsupported) */` marker (sanitized against `*/`). All 535
-corpus renders pass `node --check`.
+- `harness/estree-gen.mjs` — ESTree JSON → JS text (astring + the
+  `lower.js` optimization passes, both from sh2runtime).
+- `harness/estree-runner.mjs` — runs the generated JS under node with the
+  real `sh2.*` runtime namespace (`harness/sh2-namespace.mjs`).
 
-## Gotchas learned
+The backend gate (`setup_backends.sh --backend-gate js`) executes the
+emitted JSON through estree-runner.mjs (`--source <file>` so `$0` matches
+what `bash <file>` sees) and diffs stdout against bash — the same
+execution path as the estree corpus gate (`fail-estree`).
 
-- Identifiers are mangled against JS reserved words (`js_ident`).
-- Indexed assign targets arrive as whole names (`map[foo]`) — hoist the
-  base name as `{}` so index writes are valid JS.
-- Vars are hoisted as `let` at the top of `main()` (mirrors the C
-  renderer), so `return` at top level stays valid.
-- `main()` is invoked at the end; the program is a Node script
-  (`#!/usr/bin/env node`, `"use strict"`).
+## Why this replaced the original draft
 
-## Next steps (in order)
+The first `shir_to_js` rendered a small native subset (echo/printf,
+assignment, if/loops, simple tests, arith) and emitted compile-able
+`sh2_*()` stubs (`console.error` + `process.exit(2)`) or
+`/* TODO(unsupported) */` markers for everything else. That draft was
+honestly measured at 55/614 corpus files executing correctly — the
+runtime port it was waiting for already exists in the harness, and the
+worktree now uses it directly.
 
-1. Runtime: port the `sh2.*` namespace (see
-   `backends/c/docs/backend-c-core-needs.md` §7 for the per-language
-   table; `harness/sh2-namespace.json` is the spec). Stubs currently
-   `console.error` + `process.exit(2)`.
-2. Grow the native subset: `param`/`join`/`slice` echo args, `setArray`,
-   `WriteFile`, `Case`, `Redirect` (native shell-lexing helpers), then
-   `Pipeline`/`Subshell`/`Background`.
-3. A per-language sh2.*-usage metric (mirror `harness/sh2stat.pl`).
+## Gotchas
+
+- The emitted JSON is the A1 ESTree contract: shell semantics are
+  `sh2.*` namespace calls, NOT native JS — do not grep the output for
+  `sh2.*` as if it were stubs (the stub gate is disabled for js).
+- `$0` semantics: the gate passes `--source <file>` to estree-runner.mjs
+  so argv0-based output agrees with bash.
+- Keep `shir_to_js` total: a serialization error emits a valid-JSON
+  non-ESTree object so the executor fails loudly.
+
+## Next steps
+
+- Nothing to port — the sh2.* runtime is the harness's
+  `sh2-namespace.mjs`. The js backend's remaining work is identical to
+  the estree backend's: lower `sh2.*` call sites / grow the whitelist
+  (metric: `fail-estree --metric`), all single-owner in the shared core.

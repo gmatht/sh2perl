@@ -20,7 +20,6 @@ pub mod shir_json_in;
 pub mod c_backend;
 pub mod go_backend;
 pub mod java_backend;
-pub mod js_backend;
 pub mod mir_simple;
 pub mod perl_backend;
 pub mod python_backend;
