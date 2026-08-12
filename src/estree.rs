@@ -3418,11 +3418,23 @@ mod tests {
 
     #[test]
     fn heredoc_lowers_to_redirect_with_body() {
+        // `cat << 'EOF'` — the state-free heredoc cat fold (see
+        // try_native_cat_heredoc): a literal quoted heredoc + builtin-cat
+        // pair at the default stdout sink collapses to a native write of
+        // the heredoc content — no redirect spec object, no dispatch.
         let json = to_json("cat << 'EOF'\nhi there\nEOF");
-        assert!(json.contains("\"value\":\"heredoc\""));
         assert!(json.contains("hi there"));
-        assert!(json.contains("\"value\":false"));
+        assert!(!json.contains("\"value\":\"heredoc\""));
+        assert!(json.contains("\"name\":\"stdout\""));
         assert!(!json.contains("unsupported"));
+        // an interpolating heredoc (`$` in the UNQUOTED body) stays on
+        // the runtime redirect + builtin pair (the quoted `<<'EOF'` form
+        // is verbatim by construction and folds)
+        let json2 = to_json("cat << EOF\nhi $name\nEOF");
+        assert!(json2.contains("\"value\":\"heredoc\""));
+        assert!(json2.contains("\"name\":\"builtin\""));
+        assert!(json2.contains("\"value\":\"cat\""));
+        assert!(!json2.contains("unsupported"));
     }
 
     #[test]
@@ -3439,16 +3451,29 @@ mod tests {
 
     #[test]
     fn subshell_lowers_to_subshell_call() {
-        // `(echo hi)` — the body is a sync builtin, so the await-free
-        // subshell dispatches to the sync twin subshellSync (identical
-        // state copy/restore minus the per-call promise).
+        // `(echo hi)` — the body is state-free (a native write + lastExit),
+        // so the subshell collapses to a bare IIFE of the same body +
+        // `sh2.lastExit === 0` (the runtime's exact return protocol) —
+        // no state copy/restore, no dispatch.
         let json = to_json("(echo hi)");
-        assert!(json.contains("\"name\":\"subshellSync\""));
+        assert!(!json.contains("\"name\":\"subshellSync\""));
+        assert!(json.contains("\"name\":\"lastExit\""));
         assert!(!json.contains("unsupported"));
+        // a state-WRITING body (store write) keeps the sync twin
+        let json1 = to_json("(x=1)");
+        assert!(json1.contains("\"name\":\"subshellSync\""));
+        assert!(!json1.contains("unsupported"));
         // a spawn inside keeps the async subshell
         let json2 = to_json("(awk '{print $1}')");
         assert!(json2.contains("\"name\":\"subshell\""));
         assert!(json2.contains("\"type\":\"AwaitExpression\""));
+        // a state-free body CONTAINING self-contained machinery (a
+        // pipeline of emits) folds too — the pipeline's fd swaps are
+        // restored in its own finally, identical under the fold
+        let json3 = to_json("(echo a | grep a)");
+        assert!(!json3.contains("\"name\":\"subshellSync\""));
+        assert!(!json3.contains("\"name\":\"pipelineSync\""));
+        assert!(!json3.contains("unsupported"));
     }
 
     #[test]
@@ -3554,6 +3579,25 @@ mod tests {
         // may see a scalar) keeps the runtime join
         let json2 = to_json("echo \"${s:0:2}\"");
         assert!(json2.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"join\""));
+    }
+
+    #[test]
+    fn baked_subscript_read_uses_native_key() {
+        // `${map[$k]}` with a lifted `k` (the loop var): the baked-text
+        // store read (`sh2.getVar("map[$k]")` — the runtime resolves
+        // `$k` from the STORE) rewrites to `sh2.arrayIndex("map", k)`
+        // with the native binding — no store sync, no store round-trip.
+        // SH2_ASSUME_SUBSCRIPT_KEYS-gated (see baked_subscript_read).
+        let json = to_json("declare -A map\nmap[foo]=bar\nfor k in \"${!map[@]}\"; do echo \"${map[$k]}\"; done");
+        assert!(json.contains("\"name\":\"arrayIndex\""));
+        assert!(json.contains("\"value\":\"map\""));
+        // no per-iteration store sync of the lifted loop var
+        assert!(!json.contains("\"value\":\"k\""));
+        assert!(!json.contains("\"name\":\"getVar\""));
+        // `[@]`/`[*]` whole-array forms and PIPESTATUS never rewrite
+        // (the join / pipeStatuses arms are getVar-special)
+        let json2 = to_json("declare -A map\nmap[a]=1\necho \"${map[*]}\"\necho \"${PIPESTATUS[0]}\"");
+        assert!(json2.contains("\"name\":\"getVar\""));
     }
 
     #[test]
