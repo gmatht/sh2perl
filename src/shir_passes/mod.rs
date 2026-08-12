@@ -49,6 +49,7 @@ pub mod lifetime;
 pub mod metric;
 pub mod pattern;
 pub mod restructure;
+pub mod strip;
 pub mod transform;
 
 pub use context::PassContext;
@@ -64,6 +65,7 @@ pub fn restructure_goto_only(prog: &mut IrProgram) {
 }
 
 pub use pattern::grep_to_case::GrepToCase;
+pub use strip::strip_cfor;
 use pattern::PatternLift;
 
 /// Apply every registered pattern lift to the program in place. The
