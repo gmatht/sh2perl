@@ -1,4 +1,4 @@
 #!/bin/sh
 # Echo with escaped backtick inside double quotes
-echo "Invalid configuration \`$1\': more than four components" >&2
+echo "Invalid configuration \`$1\': more than four components"
 exit 1

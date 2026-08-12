@@ -1,6 +1,8 @@
 #!/bin/bash
 # @ in test expressions
-if [[ "$0" = @(pattern) ]]; then
-    true
+shopt -s extglob
+x=foo
+if [[ "$x" = @(foo|bar) ]]; then
+    echo "matched"
 fi
 printf "parsed OK\\n"

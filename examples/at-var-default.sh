@@ -1,4 +1,4 @@
 #!/bin/bash
 # ${@:-default} - @ in variable expansion with default
-OPTS=${@:-""}
+OPTS=${@:-"default"}
 echo "$OPTS"
