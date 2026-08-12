@@ -75,6 +75,7 @@ pub struct Render {
     arith_vars: BTreeSet<String>, // vars used in arithmetic → forced Int
     arrays: BTreeSet<String>, // indexed arrays
     arith_assigned: BTreeSet<String>, // vars assigned from $((...)) → Num in GLSL
+    float_vars: BTreeSet<String>, // vars assigned from a float bc capture → GLSL float
     fns: BTreeSet<String>,    // user function names
     fn_bodies: BTreeMap<String, Vec<IrStmt>>, // Function stmt bodies (hoisted)
     fn_order: Vec<String>,    // first-seen order (deterministic emission)
@@ -270,6 +271,7 @@ impl Default for Render {
             arith_vars: BTreeSet::new(),
             arrays: BTreeSet::new(),
             arith_assigned: BTreeSet::new(),
+            float_vars: BTreeSet::new(),
             fns: BTreeSet::new(),
             fn_bodies: BTreeMap::new(),
             fn_order: Vec::new(),
@@ -377,7 +379,9 @@ impl Render {
             }
         }
         for n in vars {
-            if self.is_num_ident(&n) {
+            if self.float_vars.contains(&n) {
+                self.emit(&format!("float {n};"));
+            } else if self.is_num_ident(&n) {
                 self.emit(&format!("int {n};"));
             } else {
                 self.emit(&format!("ivec2 {n};"));
@@ -943,7 +947,9 @@ impl Render {
             },
             IrExpr::Bool(b) => format!("({})", if *b { 1 } else { 0 }),
             IrExpr::Var(n, _) | IrExpr::Ident(n) => {
-                if self.is_num(n) {
+                if self.float_vars.contains(n) {
+                    format!("int({})", self.ident(n))
+                } else if self.is_num(n) {
                     self.ident(n)
                 } else {
                     format!("s2i({})", self.ident(n))
@@ -1900,7 +1906,7 @@ impl Render {
                     src.push_str(s);
                 }
                 InterpPart::Expr(e) => {
-                    slots.push(e);
+                    slots.push(&e);
                     src.push_str(&format!("__bcv{}", slots.len() - 1));
                 }
             }
@@ -1924,6 +1930,198 @@ impl Render {
         Some(format!(
             "(({guard}) ? /* TODO(bc div-by-zero) */ 0 : ({glsl}))"
         ))
+    }
+
+    // ── float bc captures ──────────────────────────────────────────
+    // `v=$(echo "scale=4; $x * 0.5" | bc)` — the bash shader authors
+    // FLOAT math with bc; the GLSL lowering emits the exact float
+    // expression (fp32 — bc's exact decimal truncation vs float
+    // rounding is fine for a visual shader). The var becomes a GLSL
+    // float (see float_vars); reads in int contexts cast via int().
+    // ArithAst's Num is i64-only, so a tiny precedence parser handles
+    // the float grammar directly (numbers may carry a decimal point).
+    fn bc_float_expr(&mut self, pipe: &IrExpr) -> Option<String> {
+        // unwrap the cmdsub wrapper: `$(…)` arrives as Capture/capture
+        let pipe = match pipe {
+            IrExpr::Capture { expr, .. } => expr,
+            IrExpr::Call { func, args } if func == "capture" || func == "captureWords" => {
+                self.capture_pipeline(args)?
+            }
+            other => other,
+        };
+        let echo_args = self.pipeline_echo_bc(pipe)?;
+        let (arg, _no_newline) = self.bc_single_arg(&echo_args)?;
+        let IrExpr::Interpolate(parts) = &arg else { return None };
+        let mut src = String::new();
+        let mut slots: Vec<&IrExpr> = Vec::new();
+        let mut has_float = false;
+        for p in parts {
+            match p {
+                InterpPart::Lit(t) => {
+                    let mut t = t.as_str();
+                    // strip a leading `scale=K;` / `scale=K ` statement
+                    if src.is_empty() {
+                        if let Some(rest) = t.strip_prefix("scale=") {
+                            let mut it = rest.splitn(2, |c| c == ';' || c == ' ');
+                            if let Some(_k) = it.next() {
+                                if let Some(rest2) = it.next() {
+                                    t = rest2;
+                                }
+                            }
+                        }
+                    }
+                    if t.contains('.') {
+                        has_float = true;
+                    }
+                    if !t.chars().all(|c| {
+                        c.is_ascii_digit()
+                            || c.is_whitespace()
+                            || matches!(c, '+' | '-' | '*' | '/' | '%' | '(' | ')' | '.' | '^')
+                    }) {
+                        return None;
+                    }
+                    src.push_str(t);
+                }
+                InterpPart::Expr(e) => {
+                    slots.push(e);
+                    src.push_str(&format!("__bcv{}", slots.len() - 1));
+                }
+            }
+        }
+        if !has_float || slots.is_empty() {
+            return None;
+        }
+        Some(self.parse_float_expr(&src, &slots))
+    }
+
+    /// Tokenize + precedence-climb `src` (numbers, `__bcvK`, + - * / % ^
+    /// and parens) into a GLSL float expression. `^` right-assoc (bc);
+    /// unary minus binds tighter than `^` (`-2^2` → 4, so `^` here is
+    /// left-recursive and the unary applies first — bc parity).
+    fn parse_float_expr(&mut self, src: &str, slots: &[&IrExpr]) -> String {
+        let toks = self.lex_float(src);
+        let (v, rest) = self.float_prec(&toks, 0, slots);
+        let _ = rest;
+        v
+    }
+
+    fn lex_float(&mut self, src: &str) -> Vec<(String, usize)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        let b = src.as_bytes();
+        while i < b.len() {
+            let c = b[i] as char;
+            if c.is_whitespace() {
+                i += 1;
+                continue;
+            }
+            if c.is_ascii_digit() || c == '.' {
+                let mut j = i;
+                let mut dot = false;
+                while j < b.len() {
+                    let ch = b[j] as char;
+                    if ch.is_ascii_digit() {
+                        j += 1;
+                    } else if ch == '.' && !dot {
+                        dot = true;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                out.push((src[i..j].to_string(), i));
+                i = j;
+                continue;
+            }
+            if src[i..].starts_with("__bcv") {
+                let mut j = i + 5;
+                while j < b.len() && (b[j] as char).is_ascii_digit() {
+                    j += 1;
+                }
+                out.push((src[i..j].to_string(), i));
+                i = j;
+                continue;
+            }
+            if matches!(c, '+' | '-' | '*' | '/' | '%' | '(' | ')') {
+                out.push((c.to_string(), i));
+                i += 1;
+                continue;
+            }
+            if c == '^' {
+                out.push(("^".to_string(), i));
+                i += 1;
+                continue;
+            }
+            i += 1; // unknown char — skip (bc would error too)
+        }
+        out
+    }
+
+    /// Precedence-climbing: returns (glsl, next-token-index).
+    fn float_prec(
+        &mut self,
+        toks: &[(String, usize)],
+        min_prec: u8,
+        slots: &[&IrExpr],
+    ) -> (String, usize) {
+        let (mut lhs, mut idx) = self.float_unary(toks, 0, slots);
+        while idx < toks.len() {
+            let (op, _) = &toks[idx];
+            let (p, right_assoc) = match op.as_str() {
+                "+" | "-" => (1, false),
+                "*" | "/" | "%" => (2, false),
+                "^" => (3, true),
+                _ => break,
+            };
+            if p < min_prec {
+                break;
+            }
+            idx += 1;
+            let (rhs, ni) = self.float_prec(toks, p + if right_assoc { 0 } else { 1 }, slots);
+            idx = ni;
+            let r = match op.as_str() {
+                "^" => format!("pow({lhs}, {rhs})"),
+                "%" => format!("mod({lhs}, {rhs})"),
+                _ => format!("(({lhs}) {op} ({rhs}))"),
+            };
+            lhs = r;
+        }
+        (lhs, idx)
+    }
+
+    fn float_unary(
+        &mut self,
+        toks: &[(String, usize)],
+        idx: usize,
+        slots: &[&IrExpr],
+    ) -> (String, usize) {
+        if idx >= toks.len() {
+            return ("0.0".to_string(), idx);
+        }
+        let (t, _) = &toks[idx];
+        match t.as_str() {
+            "-" | "+" => {
+                let (v, ni) = self.float_unary(toks, idx + 1, slots);
+                (format!("({}{v})", if t == "-" { "-" } else { "" }), ni)
+            }
+            "(" => {
+                let (v, ni) = self.float_prec(toks, 0, slots);
+                if ni < toks.len() && toks[ni].0 == ")" {
+                    (format!("({v})"), ni + 1)
+                } else {
+                    (v, ni)
+                }
+            }
+            _ => {
+                if t.starts_with("__bcv") {
+                    let k: usize = t[5..].parse().unwrap_or(0);
+                    let e = slots.get(k).copied().unwrap_or(&IrExpr::Int(0));
+                    (format!("float({})", self.expr_num(e)), idx + 1)
+                } else {
+                    (t.clone(), idx + 1)
+                }
+            }
+        }
     }
 
     /// ArithAst → GLSL int, mapping `__bcvK` placeholders to the slot
@@ -2067,6 +2265,15 @@ impl Render {
                                 }
                             }
                         }
+                    }
+                }
+                // a float bc capture (`v=$(echo "scale=K; …0.5" | bc)`)
+                // → the var becomes a GLSL float holding the expression
+                if let Some(glsl) = self.bc_float_expr(expr) {
+                    if targets.len() == 1 && targets[0].indices.is_empty() {
+                        self.float_vars.insert(targets[0].var.clone());
+                        self.emit(&format!("{} = {glsl};", self.ident(&targets[0].var)));
+                        return;
                     }
                 }
                 for t in targets {
@@ -2293,6 +2500,13 @@ impl Render {
                         return;
                     };
                     if args.len() >= 2 {
+                        // a float bc capture (`v=$(echo "scale=K; …0.5" | bc)`)
+                        // → the var becomes a GLSL float holding the expr
+                        if let Some(glsl) = self.bc_float_expr(&args[1]) {
+                            self.float_vars.insert(base.to_string());
+                            self.emit(&format!("{} = {glsl};", self.ident(base)));
+                            return;
+                        }
                         let v = self.ident(base);
                         let val = if self.is_num(base) {
                             self.expr_num(&args[1])
