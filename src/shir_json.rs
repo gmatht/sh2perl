@@ -150,6 +150,13 @@ fn stmt_json(s: &IrStmt) -> Value {
             "body": stmts_json(body),
             "runs": crate::shir::stmt_provably_runs(s),
         }),
+        IrStmt::ForInit { init, cond, step, body } => json!({
+            "type": "ForInit", "init": stmts_json(init), "cond": expr_json(cond),
+            "step": stmts_json(step), "body": stmts_json(body),
+            "runs": crate::shir::stmt_provably_runs(s),
+        }),
+        IrStmt::Continue => json!({ "type": "Continue", "runs": crate::shir::stmt_provably_runs(s) }),
+        IrStmt::Break => json!({ "type": "Break", "runs": crate::shir::stmt_provably_runs(s) }),
         IrStmt::While { cond, body } => json!({
             "type": "While", "cond": expr_json(cond), "body": stmts_json(body),
             "runs": crate::shir::stmt_provably_runs(s),
@@ -340,6 +347,10 @@ fn arith_json(a: &ArithAst) -> Value {
         }),
         ArithAst::IncDec { var, delta, prefix } => json!({
             "type": "IncDec", "var": var, "delta": delta, "prefix": prefix,
+        }),
+        ArithAst::Sizeof(ty) => json!({ "type": "Sizeof", "ty": ty }),
+        ArithAst::Cast { ty, arg } => json!({
+            "type": "Cast", "ty": ty, "arg": arith_json(arg),
         }),
     }
 }

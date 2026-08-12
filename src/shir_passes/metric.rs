@@ -178,6 +178,19 @@ fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
                 walk_stmt(s, counts);
             }
         }
+        IrStmt::ForInit { init, cond, step, body } => {
+            for i in init {
+                walk_stmt(i, counts);
+            }
+            walk_expr(cond, counts);
+            for st in step {
+                walk_stmt(st, counts);
+            }
+            for s in body {
+                walk_stmt(s, counts);
+            }
+        }
+        IrStmt::Continue | IrStmt::Break => {}
         IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
             walk_expr(expr, counts);
         }
@@ -320,6 +333,8 @@ fn walk_arith(a: &crate::ir::ArithAst, counts: &mut HashMap<String, usize>) {
         }
         ArithAst::Assign { rhs, .. } => walk_arith(rhs, counts),
         ArithAst::IncDec { .. } => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => walk_arith(arg, counts),
     }
 }
 

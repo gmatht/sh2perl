@@ -568,6 +568,10 @@ impl Render {
                     format!("({v}{op})")
                 }
             }
+            // C-frontend nodes (never emitted by the shell path): sizeof
+            // is a compile-time constant; casts are identity (Perl IV).
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
 
@@ -2082,6 +2086,9 @@ impl Render {
                     "{kind} {name} not restructured by restructure_goto"
                 ));
             }
+            IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
+            IrStmt::Continue => self.emit("next;"),
+            IrStmt::Break => self.emit("last;"),
         }
     }
 

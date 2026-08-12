@@ -3032,6 +3032,8 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
             }
             ArithAst::Assign { var, rhs, .. } => (var == v) as usize + arith_count_reads(rhs, v),
             ArithAst::IncDec { var, .. } => (var == v) as usize,
+            ArithAst::Sizeof(_) => 0,
+            ArithAst::Cast { arg, .. } => arith_count_reads(arg, v),
         }
     }
 
@@ -3884,6 +3886,8 @@ pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> 
             // writes already recorded via arith_written_vars above
             ArithAst::Assign { rhs, .. } => walk_arith(rhs, acc, multi_run),
             ArithAst::IncDec { .. } => {}
+            ArithAst::Sizeof(_) => {}
+            ArithAst::Cast { arg, .. } => walk_arith(arg, acc, multi_run),
         }
     }
 
@@ -3950,6 +3954,19 @@ pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> 
                     walk_stmt(s, acc, true);
                 }
             }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for i in init {
+                    walk_stmt(i, acc, multi_run);
+                }
+                walk_expr(cond, acc, multi_run);
+                for st in step {
+                    walk_stmt(st, acc, multi_run);
+                }
+                for s in body {
+                    walk_stmt(s, acc, true);
+                }
+            }
+            IrStmt::Continue | IrStmt::Break => {}
             // a function may run 0..N times — its sites are multi-run
             IrStmt::Function { body, .. } => {
                 for s in body {
@@ -4645,6 +4662,16 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         IrStmt::While { cond, body } => {
             loop_fixpoint(state, body, None, cond_bound(cond));
         }
+        IrStmt::ForInit { init, cond, step, body } => {
+            for i in init {
+                walk_stmt_ranges(i, state);
+            }
+            for st in step {
+                walk_stmt_ranges(st, state);
+            }
+            loop_fixpoint(state, body, None, cond_bound(cond));
+        }
+        IrStmt::Continue | IrStmt::Break => {}
         IrStmt::DoWhile { body, cond, until } => {
             let b = cond_bound(cond);
             let b = if *until {
@@ -7418,6 +7445,145 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
             consequent: Box::new(arith_to_estree(then)),
             alternate: Box::new(arith_to_estree(else_)),
         },
+        // C-frontend nodes: sizeof is a compile-time constant; casts lower
+        // to the JS width idioms (`| 0` / `>>> 0` / BigInt) for the
+        // C-executed path.
+        ArithAst::Sizeof(ty) => Expr::Literal {
+            value: serde_json::Value::from(ty.c_sizeof().unwrap_or(4)),
+            raw: None,
+            regex: None,
+        },
+        ArithAst::Cast { ty, arg } => arith_cast_to_estree(*ty, arg),
+    }
+}
+
+/// `BigInt("N")` — a BigInt literal rendered as a call (the A1/ESTree
+/// JSON contract has no `bigint` field; the generic runner evaluates
+/// `BigInt(...)`). The STRING form keeps i64 literals exact — a Number
+/// literal would round at 2^53.
+fn bigint_lit_expr(n: i64) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(Expr::Identifier {
+            name: "BigInt".to_string(),
+        }),
+        arguments: vec![Expr::Literal {
+            value: serde_json::Value::from(n.to_string()),
+            raw: None,
+            regex: None,
+        }],
+        optional: false,
+    }
+}
+
+/// `BigInt.asIntN(64, x)` / `BigInt.asUintN(64, x)` — the 64-bit wrap
+/// (signed/unsigned) for the C-executed ESTree path.
+fn bigint_method(method: &'static str, inner: Expr) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::Identifier {
+                name: "BigInt".to_string(),
+            }),
+            property: Box::new(Expr::Identifier {
+                name: method.to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![
+            Expr::Literal {
+                value: serde_json::Value::from(64),
+                raw: None,
+                regex: None,
+            },
+            inner,
+        ],
+        optional: false,
+    }
+}
+
+/// Is an ArithAst's top-level value a 64-bit BigInt (the C frontend wraps
+/// every Int64/UInt64-typed expression in `Cast(Int64|UInt64, …)`)?
+fn arith_is_bigint(a: &ArithAst) -> bool {
+    matches!(a, ArithAst::Cast { ty, .. } if matches!(ty, IrType::Int64 | IrType::UInt64))
+}
+
+/// Render a C cast `(T)x` for the C-executed ESTree path:
+///   Int32   -> `x | 0`            (wrap mod 2^32, signed)
+///   UInt32  -> `x >>> 0`          (wrap mod 2^32, unsigned)
+///   Int64   -> `BigInt.asIntN(64, BigInt(x))`
+///   UInt64  -> `BigInt.asUintN(64, BigInt(x))`
+///   Float(32) -> `Math.fround(x)`
+///   Float(64)/widthless -> identity
+fn arith_cast_to_estree(ty: IrType, arg: &ArithAst) -> Expr {
+    let inner = arith_to_estree(arg);
+    let bin = |op: &'static str, wrap_num: bool| {
+        let left = if wrap_num {
+            Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "Number".to_string(),
+                }),
+                arguments: vec![inner.clone()],
+                optional: false,
+            }
+        } else {
+            inner.clone()
+        };
+        Expr::BinaryExpression {
+            operator: op.to_string(),
+            left: Box::new(left),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        }
+    };
+    match ty {
+        // Number(...) first: the arg may already be a BigInt (an i64
+        // sub-expression cast down to int) — `bigint | 0` would throw.
+        IrType::Int32 => bin("|", true),
+        IrType::UInt32 => bin(">>>", true),
+        // exact i64 literal (no asIntN wrap needed — the value already
+        // fits; the string keeps it exact past 2^53)
+        IrType::Int64 => match arg {
+            ArithAst::Num(n) => bigint_lit_expr(*n),
+            _ => bigint_method("asIntN", Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "BigInt".to_string(),
+                }),
+                arguments: vec![inner],
+                optional: false,
+            }),
+        },
+        // u64: the i64 value is the two's-complement bit pattern (the
+        // frontend emits negative i64 for u64 values >= 2^63); the STRING
+        // form keeps the literal exact past 2^53
+        IrType::UInt64 => match arg {
+            ArithAst::Num(n) => bigint_method("asUintN", bigint_lit_expr(*n)),
+            _ => bigint_method("asUintN", Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "BigInt".to_string(),
+                }),
+                arguments: vec![inner],
+                optional: false,
+            }),
+        },
+
+        IrType::Float(32) => Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "Math".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "fround".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![inner],
+            optional: false,
+        },
+        _ => inner,
     }
 }
 
@@ -11198,6 +11364,10 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
             IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
                 scan_expr(cond) || scan_stmts(body)
             }
+            IrStmt::ForInit { init, cond, step, body } => {
+                scan_stmts(init) || scan_expr(cond) || scan_stmts(step) || scan_stmts(body)
+            }
+            IrStmt::Continue | IrStmt::Break => false,
             IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => scan_expr(expr),
             IrStmt::Exec { cmd, args, env, .. } => {
                 match cmd {
@@ -11366,6 +11536,19 @@ fn ir_nocase_shopt_mask(prog: &IrProgram) -> u8 {
                 scan_expr(cond, mask);
                 scan_stmts(body, mask);
             }
+            IrStmt::ForInit { init, cond, step, body } => {
+                for i in init {
+                    scan_stmt(i, mask);
+                }
+                scan_expr(cond, mask);
+                for st in step {
+                    scan_stmt(st, mask);
+                }
+                for s in body {
+                    scan_stmt(s, mask);
+                }
+            }
+            IrStmt::Continue | IrStmt::Break => {}
             IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => scan_expr(expr, mask),
             IrStmt::Exec { cmd, args, env, .. } => {
                 scan_expr(cmd, mask);
@@ -11899,6 +12082,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 },
             }
         }
+        // first-class continue/break — rendered to the RUNTIME calls
+        // (the generated code runs inside async arrow bodies where a
+        // native continue/break can't cross the boundary; the runtime's
+        // loop machinery interprets sh2.continue()/sh2.break()).
+        IrStmt::Continue => Stmt::ExpressionStatement {
+            expression: sh2_call("continue", vec![]),
+        },
+        IrStmt::Break => Stmt::ExpressionStatement {
+            expression: sh2_call("break", vec![]),
+        },
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "continue" => {
             Stmt::ExpressionStatement {
                 expression: Expr::CallExpression {
@@ -16523,6 +16716,15 @@ fn printf_scan_spec(
     if i >= chars.len() {
         return None;
     }
+    // C length modifiers: `l` / `ll` (also `L`) precede the conversion
+    // char; they don't change the output for the supported conversions
+    // (the value is a plain integer, signedness follows the conversion).
+    while i < chars.len() && (chars[i] == 'l' || chars[i] == 'L') {
+        i += 1;
+    }
+    if i >= chars.len() {
+        return None;
+    }
     let conv = chars[i];
     if !matches!(
         conv,
@@ -16604,7 +16806,7 @@ fn printf_one(
 ) -> Option<String> {
     match conv {
         's' => printf_pad(arg, flags, width, 's'),
-        'd' | 'i' => printf_pad(&js_parse_int(arg)?.to_string(), flags, width, 'd'),
+        'd' | 'i' | 'u' => printf_pad(&js_parse_int(arg)?.to_string(), flags, width, 'd'),
         _ => None,
     }
 }
@@ -16643,7 +16845,7 @@ fn printf_parse(fmt: &str) -> Option<PrintfFmt> {
                 if conv == '%' {
                     text.push('%');
                 } else {
-                    if !matches!(conv, 's' | 'd' | 'i') {
+                    if !matches!(conv, 's' | 'd' | 'i' | 'u') {
                         return None;
                     }
                     if !text.is_empty() {
@@ -16778,6 +16980,7 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
             return None;
         }
         let mut arg_exprs: Vec<Expr> = Vec::new();
+        let mut arg_is_bigint: Vec<bool> = Vec::new();
         for a in rest {
             match a {
                 // array-valued args (captureWords/listVar/split/
@@ -16789,7 +16992,17 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
                     return None;
                 }
                 IrExpr::Array(_) => return None,
-                other => arg_exprs.push(expr_to_estree(other)),
+                other => {
+                    arg_exprs.push(expr_to_estree(other));
+                    // C-frontend i64 args render as `BigInt(...)` — a
+                    // `parseInt(BigInt)` would throw, so %d/%i on a
+                    // BigInt-typed arg renders the arg directly (the
+                    // template stringifies the BigInt exactly).
+                    arg_is_bigint.push(matches!(
+                        other,
+                        IrExpr::Arith(a) if arith_is_bigint(a)
+                    ));
+                }
             }
         }
         let arg_at = |ai: usize| -> Expr {
@@ -16797,6 +17010,9 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
                 Some(e) => e.clone(),
                 None => str_lit(""),
             }
+        };
+        let bigint_at = |ai: usize| -> bool {
+            arg_is_bigint.get(ai).copied().unwrap_or(false)
         };
         let passes = if pf.n_specs == 0 {
             arg_exprs.len().max(1)
@@ -16840,9 +17056,13 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
                         });
                         quasi.clear();
                         let arg = arg_at(ai);
+                        let big = bigint_at(ai);
                         expressions.push(match conv {
                             's' => arg,
-                            'd' | 'i' => Expr::LogicalExpression {
+                            // BigInt args render directly (template
+                            // stringification); parseInt(BigInt) throws
+                            'd' | 'i' | 'u' if big => arg,
+                            'd' | 'i' | 'u' => Expr::LogicalExpression {
                                 operator: "||".to_string(),
                                 left: Box::new(Expr::CallExpression {
                                     callee: Box::new(Expr::Identifier {
@@ -22569,6 +22789,8 @@ fn lift_arith_mentions(a: &ArithAst, name: &str) -> bool {
         }
         ArithAst::Assign { var, rhs, .. } => var == name || lift_arith_mentions(rhs, name),
         ArithAst::IncDec { var, .. } => var == name,
+        ArithAst::Sizeof(_) => false,
+        ArithAst::Cast { arg, .. } => lift_arith_mentions(arg, name),
     }
 }
 

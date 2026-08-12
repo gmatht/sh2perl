@@ -19,6 +19,9 @@ const KNOWN_STMT: &[&str] = &[
     "DeclareArray",
     "If",
     "For",
+    "ForInit",
+    "Continue",
+    "Break",
     "While",
     "DoWhile",
     "Die",
@@ -64,7 +67,7 @@ const KNOWN_EXPR: &[&str] = &[
     "Object",
 ];
 const KNOWN_ARITH: &[&str] = &[
-    "Num", "Var", "Index", "Bin", "Un", "Cond", "Assign", "IncDec",
+    "Num", "Var", "Index", "Bin", "Un", "Cond", "Assign", "IncDec", "Sizeof", "Cast",
 ];
 
 pub fn shir_json_to_ir(json: &str) -> Result<IrProgram, String> {
@@ -179,38 +182,44 @@ fn var_types_from(v: Option<&Value>, where_: &str) -> Result<Vec<(String, IrType
                     let o = require_obj(e, &format!("{where_}[{i}]"))?;
                     let n = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();
                     let t = req(o, "type", &format!("{where_}[{i}]"))?;
-                    let irt = match t {
-                        serde_json::Value::String(s) => match s.as_str() {
-                            "Int" => IrType::Int,
-                            "Str" => IrType::Str,
-                            "Any" => IrType::Any,
-                            other => {
-                                return Err(format!(
-                                    "{where_}[{i}].type: {other} not in Int/Str/Any"
-                                ))
-                            }
-                        },
-                        serde_json::Value::Object(o) => match (
-                            o.get("kind").and_then(|k| k.as_str()),
-                            o.get("width").and_then(|w| w.as_u64()),
-                        ) {
-                            (Some("Float"), Some(w)) if w <= 255 => IrType::Float(w as u8),
-                            _ => {
-                                return Err(format!(
-                                    "{where_}[{i}].type: expected {{{{kind: Float, width: N}}}}"
-                                ))
-                            }
-                        },
-                        _ => {
-                            return Err(format!(
-                                "{where_}[{i}].type: expected a type string or Float object"
-                            ))
-                        }
-                    };
+                    let irt = ir_type_from(t, &format!("{where_}[{i}].type"))?;
                     Ok((n, irt))
                 })
                 .collect()
         }
+    }
+}
+
+/// Parse an IrType from its A1 JSON form: a plain string for the
+/// widthless verdicts ("Int"/"Str"/"Any") or an object for the sized
+/// variants ({"kind":"Float","width":N}, {"kind":"Int32"}, …).
+pub fn ir_type_from(t: &Value, where_: &str) -> Result<IrType, String> {
+    match t {
+        serde_json::Value::String(s) => match s.as_str() {
+            "Int" => Ok(IrType::Int),
+            "Str" => Ok(IrType::Str),
+            "Any" => Ok(IrType::Any),
+            other => Err(format!("{where_}: {other} not in Int/Str/Any")),
+        },
+        serde_json::Value::Object(o) => {
+            let kind = o.get("kind").and_then(|k| k.as_str());
+            match kind {
+                Some("Float") => match o.get("width").and_then(|w| w.as_u64()) {
+                    Some(w) if w <= 255 => Ok(IrType::Float(w as u8)),
+                    _ => Err(format!("{where_}: expected {{{{kind: Float, width: N}}}}")),
+                },
+                Some("Int32") => Ok(IrType::Int32),
+                Some("Int64") => Ok(IrType::Int64),
+                Some("UInt32") => Ok(IrType::UInt32),
+                Some("UInt64") => Ok(IrType::UInt64),
+                _ => Err(format!(
+                    "{where_}: expected {{{{kind: Float, width: N}}}} or {{{{kind: Int32}}}} etc."
+                )),
+            }
+        }
+        _ => Err(format!(
+            "{where_}: expected a type string or a typed-int/Float object"
+        )),
     }
 }
 
@@ -395,11 +404,21 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
             IrStmt::For { var, iter, body }
         }
+        "ForInit" => {
+            let init = stmts_from(o.get("init"), &format!("{where_}.init"))?;
+            let cond = expr_from(req(o, "cond", where_)?, &format!("{where_}.cond"))?;
+            let step = stmts_from(o.get("step"), &format!("{where_}.step"))?;
+            let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
+            IrStmt::ForInit { init, cond, step, body }
+        }
+        "Continue" => IrStmt::Continue,
+        "Break" => IrStmt::Break,
         "While" => {
             let cond = expr_from(req(o, "cond", where_)?, &format!("{where_}.cond"))?;
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
             IrStmt::While { cond, body }
         }
+
         "DoWhile" => {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
             let cond = expr_from(req(o, "cond", where_)?, &format!("{where_}.cond"))?;
@@ -881,6 +900,18 @@ fn arith_from(v: &Value, where_: &str) -> Result<ArithAst, String> {
             let prefix = req_bool(o, "prefix", where_)?;
             ArithAst::IncDec { var, delta, prefix }
         }
+        "Sizeof" => {
+            let ty = ir_type_from(req(o, "ty", where_)?, &format!("{where_}.ty"))?;
+            ArithAst::Sizeof(ty)
+        }
+        "Cast" => {
+            let ty = ir_type_from(req(o, "ty", where_)?, &format!("{where_}.ty"))?;
+            let arg = arith_from(req(o, "arg", where_)?, &format!("{where_}.arg"))?;
+            ArithAst::Cast {
+                ty,
+                arg: Box::new(arg),
+            }
+        }
         _ => unreachable!("checked above"),
     })
 }
@@ -1066,6 +1097,79 @@ mod tests {
         prog.var_types = vec![("y".to_string(), IrType::Int)];
         let json2 = crate::shir_json::shir_to_shir_json_raw(&prog);
         assert!(json2.contains("\"type\":\"Int\""), "json: {json2}");
+    }
+
+    /// The sized C int types round-trip through the A1 JSON as
+    /// {"kind": "Int32"} etc., and the Cast/Sizeof arith nodes survive.
+    #[test]
+    fn typed_int_type_roundtrip() {
+        use crate::ir::{ArithAst, IrExpr, IrStmt, IrType};
+        for (ty, kind) in [
+            (IrType::Int32, "Int32"),
+            (IrType::Int64, "Int64"),
+            (IrType::UInt32, "UInt32"),
+            (IrType::UInt64, "UInt64"),
+        ] {
+            let mut prog = IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts: vec![IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "x".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Arith(Box::new(ArithAst::Cast {
+                        ty,
+                        arg: Box::new(ArithAst::Sizeof(ty)),
+                    })),
+                }],
+                subs: vec![],
+                var_types: vec![("x".to_string(), ty)],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_bash_env: vec![],
+            };
+            let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+            assert!(
+                json.contains(&format!("\"kind\":\"{kind}\"")),
+                "{kind} not in json: {json}"
+            );
+            let prog2 = shir_json_to_ir(&json).expect("deser");
+            assert_eq!(
+                prog2.var_types,
+                vec![("x".to_string(), ty)],
+                "{kind} var_types round-trip"
+            );
+            // the Cast/Sizeof arith nodes survive the round-trip
+            prog.var_types = vec![];
+            let json3 = crate::shir_json::shir_to_shir_json_raw(&prog);
+            assert!(json3.contains("\"type\":\"Cast\""), "json: {json3}");
+            assert!(json3.contains("\"type\":\"Sizeof\""), "json: {json3}");
+            let prog3 = shir_json_to_ir(&json3).expect("deser cast/sizeof");
+            assert!(
+                matches!(
+                    prog3.stmts.first(),
+                    Some(IrStmt::Assign { expr, .. })
+                        if matches!(expr, IrExpr::Arith(a)
+                            if matches!(a.as_ref(), ArithAst::Cast { ty: t, .. } if *t == ty))
+                ),
+                "Cast node lost in round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn c_sizeof_constants() {
+        use crate::ir::IrType;
+        assert_eq!(IrType::Int32.c_sizeof(), Some(4));
+        assert_eq!(IrType::UInt32.c_sizeof(), Some(4));
+        assert_eq!(IrType::Int64.c_sizeof(), Some(8));
+        assert_eq!(IrType::UInt64.c_sizeof(), Some(8));
+        assert_eq!(IrType::Int.c_sizeof(), None);
     }
 
     /// The const-markup round-trips: `--shir` attaches the verdicts
