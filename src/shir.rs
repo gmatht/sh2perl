@@ -23,6 +23,10 @@ static LIFTED_NUMERIC: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// Provably-string variables lifted to native JS string bindings
 /// (`let x = ""`; reads are bare `x`; writes `x = <string expr>`).
 static LIFTED_STRING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// C typed vars (the frontend-emitted `var_types`; set per compilation by
+/// `shir_to_estree`). Consulted by the arith read coercion: Int64/UInt64
+/// vars read as BigInt (Number would round past 2^53).
+static VAR_TYPES: Mutex<Option<HashMap<String, IrType>>> = Mutex::new(None);
 /// Names with NO write anywhere in the current program (set per
 /// compilation by `shir_to_estree`; see [`collect_never_written`]). A
 /// read of such a name lowers to a constant `""` under the documented
@@ -6941,6 +6945,8 @@ fn arith_var_read_expr(name: &str) -> Expr {
 /// read: lifted NUMERIC vars are already JS numbers (bare identifier);
 /// everything else (lifted strings, store vars, bash specials) goes
 /// through the exact `Number(v) || 0` the runtime's evalArith applies.
+/// C Int64/UInt64 vars coerce to BigInt instead — Number would round
+/// past 2^53.
 fn arith_var_read(name: &str) -> Expr {
     if is_lifted_num(name) {
         // already a JS number — no Number()/||0 coercion needed
@@ -6949,6 +6955,18 @@ fn arith_var_read(name: &str) -> Expr {
         };
     }
     let read = arith_var_read_expr(name);
+    if let Some(IrType::Int64 | IrType::UInt64) = var_type_of(name) {
+        // BigInt coercion: exact for store strings (a memLoad result)
+        // and lifted bindings; a plain `BigInt(x)` is idempotent when x
+        // is already a BigInt
+        return Expr::CallExpression {
+            callee: Box::new(Expr::Identifier {
+                name: "BigInt".to_string(),
+            }),
+            arguments: vec![read],
+            optional: false,
+        };
+    }
     Expr::LogicalExpression {
         operator: "||".to_string(),
         left: Box::new(Expr::CallExpression {
@@ -6964,6 +6982,16 @@ fn arith_var_read(name: &str) -> Expr {
             regex: None,
         }),
     }
+}
+
+/// The declared C type of a var (the per-compilation VAR_TYPES static),
+/// or None for untyped/shell vars.
+fn var_type_of(name: &str) -> Option<IrType> {
+    VAR_TYPES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(name).copied())
 }
 
 /// The `${#name}` scalar-LENGTH leaf of a native arith expression: the
@@ -10405,6 +10433,9 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     collect_program_functions(&prog.stmts, &mut functions);
     *LIFTED_NUMERIC.lock().unwrap() = Some(num);
     *LIFTED_STRING.lock().unwrap() = Some(str);
+    // C typed vars (frontend-emitted var_types): the arith read coercion
+    // for Int64/UInt64 vars uses BigInt (Number would round past 2^53).
+    *VAR_TYPES.lock().unwrap() = Some(prog.var_types.iter().cloned().collect());
     // Never-written-var read fold (SH2_ASSUME_NO_ENV): names with no
     // write anywhere in the program. Must be set before the emission
     // (the getVar arms consult it) and after the transforms (the write
