@@ -29760,6 +29760,29 @@ mod range_analysis_tests {
         assert_eq!(range_width_name(i64::MAX as i128, i64::MAX as i128), "i64");
     }
 
+    /// `--true64`: a self-RMW accumulator in a loop with an UNPROVABLE
+    /// range gets a BigInt64Array slot; a bounded loop counter stays a
+    /// JS Number; a function-local is excluded (its init bypasses the
+    /// slot branch).
+    #[test]
+    fn true64_slot_selection() {
+        // accumulator: range unprovable (x*2 with a huge bound), self-RMW
+        // in a loop -> slot
+        let src = "x=1\nwhile [ $x -lt 10000000000000000 ]; do x=$((x * 2)); done";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let (int_vars, slots) = analyze_true64(&prog);
+        assert!(int_vars.contains("x"), "x must be out-of-±2^53 (int_vars)");
+        assert_eq!(slots.get("x"), Some(&0), "x must be slot 0");
+        // a function-local accumulator is excluded from slots (the `let
+        // i = init` declaration would desync the slot)
+        let src2 = "f() { local i=3; while [ $i -lt 10 ]; do i=$((i + 2)); done; }";
+        let cmds2 = crate::Parser::new(src2).parse().expect("parse");
+        let prog2 = ast_to_ir(&cmds2);
+        let (_iv2, slots2) = analyze_true64(&prog2);
+        assert!(!slots2.contains_key("i"), "function-local i must not be slotted");
+    }
+
     #[test]
     fn branch_join_and_loop_fixpoint() {
         // if cond; then x=1; else x=1000000; fi → x ∈ [1, 1000000] → u32
