@@ -929,6 +929,11 @@ exit $main_exit_code;
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
+            // C-family `for (init; cond; step)` A1: lower the rich
+            // ForInit to init + while (core request
+            // c-sh-go-20260812-205941 — the ESTree renderer panics on an
+            // UNSTRIPPED ForInit).
+            debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             // process substitution: materialize frontend-emitted
             // process-in/out into temp-file form (core request
@@ -959,6 +964,7 @@ exit $main_exit_code;
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
+            debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
             print!("{}", debashl::ir::shir_to_perl(&prog));
@@ -983,6 +989,7 @@ exit $main_exit_code;
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
+            debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
             print!("{}", match debashl::sh_backend::shir_to_sh(&prog) {
