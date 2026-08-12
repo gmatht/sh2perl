@@ -25,6 +25,7 @@ pub mod perl_backend;
 pub mod python_backend;
 pub mod rust_backend;
 pub mod sh_backend;
+pub mod glsl_backend;
 pub mod shared_utils;
 pub mod shir_passes;
 pub mod variable_analysis;

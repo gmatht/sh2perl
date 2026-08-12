@@ -9047,12 +9047,22 @@ fn decl_source_to_estree(name: &str, src: &IrExpr) -> Expr {
 
 /// `local x=1` / `declare x=1` / ... with value sources whose names are
 /// ALL lifted (expression position — &&/|| operands, pipeline stages):
-/// the native binding-write sequence `(x = <value>, ...,
-/// sh2.lastExit = 0, true)` — the runtime builtin's exact store-write
-/// model (no scope stack, re-init per call) minus the dispatch.
+/// the native binding-write sequence `(x = <value>, ..., sh2.lastExit =
+/// 0, true)` — the runtime builtin's exact store-write model (no scope
+/// stack, re-init per call) minus the dispatch. STORE-BOUND names (not
+/// lifted, but [`native_store_write_ok`] — no array/assoc/nameref/
+/// attribute/exported story) take the native plain-object store write
+/// `(sh2.vars.x = <value>, ..., sh2.lastExit = 0, true)` instead: the
+/// runtime local/declare write exactly `vars[k] = v` for a pure value
+/// (expandWord is the identity on the already-expanded literal/ref), and
+/// setVar's attribute branches cannot fire for an unblocked name. Mixed
+/// lifted+store sets refuse (keep the runtime builtin).
 fn try_native_declare_stmt(args: &[IrExpr]) -> Option<Expr> {
     let pairs = declare_sources(args)?;
-    if !pairs.iter().all(|(n, _)| is_lifted(n)) {
+    let store_path = pairs
+        .iter()
+        .all(|(n, _)| !is_lifted(n) && !is_local_lifted(n) && native_store_write_ok(n));
+    if !pairs.iter().all(|(n, _)| is_lifted(n)) && !store_path {
         return None;
     }
     let mut exprs: Vec<Expr> = Vec::new();
@@ -9060,9 +9070,239 @@ fn try_native_declare_stmt(args: &[IrExpr]) -> Option<Expr> {
         let right = decl_source_to_estree(&name, &src);
         exprs.push(Expr::AssignmentExpression {
             operator: "=".to_string(),
-            left: Box::new(Expr::Identifier { name }),
+            left: Box::new(if store_path {
+                store_member(&name)
+            } else {
+                Expr::Identifier { name }
+            }),
             right: Box::new(right),
         });
+    }
+    exprs.push(Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(sh2_member("lastExit")),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(0),
+            raw: None,
+            regex: None,
+        }),
+    });
+    exprs.push(bool_lit(true));
+    Some(seq(exprs))
+}
+
+/// Does a word the runtime's `builtin()` dispatch would see carry a magic
+/// marker (GLOB/PS/BADSUB/ARITH/ARRAY_LIT)? Those make the dispatch
+/// expand/abort before the builtin runs — a native lowering must refuse
+/// them (it cannot reproduce the expansion).
+fn exec_word_has_magic(s: &str) -> bool {
+    s.starts_with(GLOB_MAGIC) || s.starts_with(PS_MAGIC) || s.starts_with(ARITH_BAD_MAGIC)
+}
+
+/// `local -a arr=(...)` / `declare -A map=(...)` — the array/assoc
+/// declaration with a setArray value: the runtime's builtin() dispatch
+/// STRIPS the setArray's ARRAY_LIT_MAGIC return (the side effect already
+/// stored the array) and the declaration builtin then sees only the flag
+/// words — a no-op (flags only, no names) + lastExit 0. The native
+/// emission `(sh2.setArray(...), sh2.lastExit = 0, true)` is the exact
+/// same sequence minus the dispatch + flatten + magic scan.
+fn try_native_array_declare(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Str(cname, _), IrExpr::Array(cargs)] = args else {
+        return None;
+    };
+    if !matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") {
+        return None;
+    }
+    // flag words, then exactly one setArray call, nothing else
+    let mut setarray: Option<&IrExpr> = None;
+    for a in cargs {
+        match a {
+            IrExpr::Str(sv, _) if sv.starts_with('-') || sv.starts_with('+') => {}
+            IrExpr::Call { func, .. } if func == "setArray" => {
+                if setarray.is_some() {
+                    return None;
+                }
+                setarray = Some(a);
+            }
+            _ => return None,
+        }
+    }
+    let call = setarray?;
+    let ve = expr_to_estree(call);
+    Some(seq(vec![
+        ve,
+        Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }),
+        },
+        bool_lit(true),
+    ]))
+}
+
+/// `declare -A map` / `local -A info` — the bare associative-array
+/// declaration (no values): the runtime's declaration builtin takes the
+/// early assoc branch — `assocNames.add(name)` for each name, lastExit 0,
+/// nothing else (no attribute sets, no vars writes). The native
+/// `(sh2.assocNames.add("map"), sh2.lastExit = 0, true)` is the exact
+/// same sequence minus the dispatch + flatten + flag scan. Only the
+/// PURE `-A` flag form (no other letters — the runtime's assoc branch
+/// ignores them, but the corpus shapes are pure) and bare names (no
+/// `=` values — the value forms need assocSet).
+fn try_native_assoc_declare(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Str(cname, _), IrExpr::Array(cargs)] = args else {
+        return None;
+    };
+    if !matches!(cname.as_str(), "local" | "declare" | "typeset" | "readonly") {
+        return None;
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for a in cargs {
+        match a {
+            IrExpr::Str(sv, _) if sv == "-A" => {}
+            IrExpr::Str(sv, _) if is_plain_ident(sv) => names.push(sv),
+            _ => return None,
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let mut exprs: Vec<Expr> = Vec::new();
+    for n in names {
+        exprs.push(sh2_state_set("assocNames", "add", n));
+    }
+    exprs.push(Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(sh2_member("lastExit")),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(0),
+            raw: None,
+            regex: None,
+        }),
+    });
+    exprs.push(bool_lit(true));
+    Some(seq(exprs))
+}
+
+/// `export NAME=VALUE` / `export NAME` — the runtime builtin's exact
+/// writes (vars + process.env + the exported set) minus the dispatch +
+/// flattening + magic scan: `(sh2.vars.NAME = v, process.env.NAME = v,
+/// sh2.exported.add("NAME"), sh2.lastExit = 0, true)`. Unlike the
+/// declare family, the runtime export does NO expandWord — the arg text
+/// is stored verbatim — so any fully-expanded word is pure: a single
+/// `NAME=VALUE` word (the merged text), the split form `NAME=` + a value
+/// expr (the emitter's quoted-value shape), or a bare `NAME` (the
+/// conditional env sync: `NAME in vars ? process.env.NAME =
+/// vars.NAME : undefined`). Flag forms (`-p`/`-f`/`-n`) and magic-bearing
+/// args keep the runtime builtin. `sh2.exported.add` is a state-Map
+/// method call (whitelisted in estree_gate.pl alongside
+/// `sh2.functions.set`).
+fn try_native_export(args: &[IrExpr]) -> Option<Expr> {
+    let [IrExpr::Str(cname, _), IrExpr::Array(cargs)] = args else {
+        return None;
+    };
+    if cname != "export" || cargs.is_empty() {
+        return None;
+    }
+    let mut exprs: Vec<Expr> = Vec::new();
+    let mut i = 0;
+    while i < cargs.len() {
+        let IrExpr::Str(sv, _) = &cargs[i] else {
+            return None;
+        };
+        if exec_word_has_magic(sv) {
+            return None;
+        }
+        if sv.starts_with('-') {
+            return None; // flags: -p / -f / -n / ...
+        }
+        // split form: `NAME=` + the value expr (the runtime's flat arg
+        // list carries the already-expanded value as the next element;
+        // the builtin loops it as a separate no-`=` word — a harmless
+        // `exported.add("")` — the effective write is vars/env/exported
+        // for NAME with the value).
+        if let Some(rest) = sv.strip_suffix('=') {
+            if is_plain_ident(rest) {
+                let value = match cargs.get(i + 1) {
+                    Some(IrExpr::Str(vs, _)) if !exec_word_has_magic(vs) => str_lit(vs),
+                    Some(v) => {
+                        let ve = expr_to_estree(v);
+                        if store_rhs_string(&ve) {
+                            ve
+                        } else {
+                            Expr::CallExpression {
+                                callee: Box::new(Expr::Identifier {
+                                    name: "String".to_string(),
+                                }),
+                                arguments: vec![ve],
+                                optional: false,
+                            }
+                        }
+                    }
+                    None => str_lit(""),
+                };
+                exprs.push(Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(store_member(rest)),
+                    right: Box::new(value.clone()),
+                });
+                exprs.push(Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(process_env_member(rest)),
+                    right: Box::new(value),
+                });
+                exprs.push(sh2_state_set("exported", "add", rest));
+                i += 2;
+                continue;
+            }
+            return None;
+        }
+        // a single `NAME=VALUE` word or a bare `NAME`
+        match sv.split_once('=') {
+            Some((k, v)) if is_plain_ident(k) => {
+                exprs.push(Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(store_member(k)),
+                    right: Box::new(str_lit(v)),
+                });
+                exprs.push(Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(process_env_member(k)),
+                    right: Box::new(str_lit(v)),
+                });
+                exprs.push(sh2_state_set("exported", "add", k));
+            }
+            _ if is_plain_ident(sv) => {
+                // bare `export NAME`: exported.add + the conditional env
+                // sync (the runtime's `if (a in this.vars) process.env[a]
+                // = this.vars[a]` — the null-prototype store has no
+                // inherited keys, so `!== undefined` is the `in` test).
+                exprs.push(sh2_state_set("exported", "add", sv));
+                exprs.push(Expr::ConditionalExpression {
+                    test: Box::new(Expr::BinaryExpression {
+                        operator: "!=".to_string(),
+                        left: Box::new(store_member(sv)),
+                        right: Box::new(Expr::Identifier {
+                            name: "undefined".to_string(),
+                        }),
+                    }),
+                    consequent: Box::new(Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(process_env_member(sv)),
+                        right: Box::new(store_member(sv)),
+                    }),
+                    alternate: Box::new(Expr::Identifier {
+                        name: "undefined".to_string(),
+                    }),
+                });
+            }
+            _ => return None,
+        }
+        i += 1;
     }
     exprs.push(Expr::AssignmentExpression {
         operator: "=".to_string(),
@@ -14574,6 +14814,23 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             });
                         }
                     }
+                    // `local -a arr=(...)` / `declare -A map=(...)` — the
+                    // array/assoc declaration whose setArray side effect
+                    // is the whole story (the builtin() dispatch strips
+                    // the magic and the declaration becomes a no-op): the
+                    // bare setArray call + status.
+                    if matches!(name.as_str(), "local" | "declare" | "typeset" | "readonly") {
+                        if let Some(native) = try_native_array_declare(args) {
+                            return Some(Stmt::ExpressionStatement { expression: native });
+                        }
+                    }
+                    // `declare -A map` (bare, no values) — the assocNames
+                    // registration + status (see try_native_assoc_declare).
+                    if matches!(name.as_str(), "local" | "declare" | "typeset" | "readonly") {
+                        if let Some(native) = try_native_assoc_declare(args) {
+                            return Some(Stmt::ExpressionStatement { expression: native });
+                        }
+                    }
                     if let Some(native) = try_native_declare_stmt(args) {
                         return Some(Stmt::ExpressionStatement { expression: native });
                     }
@@ -14598,6 +14855,17 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 if let IrExpr::Str(name, _) = cmd {
                     if name == "unset" {
                         if let Some(native) = try_native_unset(args) {
+                            return Some(Stmt::ExpressionStatement { expression: native });
+                        }
+                    }
+                }
+            }
+            // `export NAME[=VALUE]` with pure words (see try_native_export):
+            // the vars/env/exported writes — no builtin dispatch.
+            if env.is_empty() && redirects.is_empty() {
+                if let IrExpr::Str(name, _) = cmd {
+                    if name == "export" {
+                        if let Some(native) = try_native_export(args) {
                             return Some(Stmt::ExpressionStatement { expression: native });
                         }
                     }
@@ -22623,7 +22891,10 @@ fn native_param_default_text(text: &str) -> Option<Expr> {
             return Some(sh2_call("whoami", vec![]));
         }
         if inner == "echo ~" && home_tilde_native_enabled() {
-            return Some(sh2_call("getVar", vec![str_lit("HOME")]));
+            // the runtime's tilde rule is exactly `getVar("HOME") ||
+            // process.env.HOME || ''` — the native store read (with the
+            // env fallback) is the same value without the dispatch.
+            return Some(store_var_read_no_fold("HOME"));
         }
         if let Some(w) = inner.strip_prefix("echo ") {
             let w = w.trim();
@@ -22657,7 +22928,7 @@ fn native_param_default_text(text: &str) -> Option<Expr> {
     // ${...} — plain refs, nested defaults, and the array-slice default.
     if let Some(rest) = t.strip_prefix("${").and_then(|r| r.strip_suffix('}')) {
         if is_plain_ident(rest) {
-            return Some(sh2_call("getVar", vec![str_lit(rest)]));
+            return Some(store_var_read_no_fold(rest));
         }
         if let Some((n, d)) = rest.split_once(":-") {
             if is_plain_ident(n) {
@@ -22666,7 +22937,7 @@ fn native_param_default_text(text: &str) -> Option<Expr> {
                     Expr::AssignmentExpression {
                         operator: "=".to_string(),
                         left: Box::new(sh2_member("_g")),
-                        right: Box::new(sh2_call("getVar", vec![str_lit(n)])),
+                        right: Box::new(store_var_read_no_fold(n)),
                     },
                     Expr::ConditionalExpression {
                         test: Box::new(Expr::BinaryExpression {
@@ -22690,12 +22961,29 @@ fn native_param_default_text(text: &str) -> Option<Expr> {
                     !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())
                 })
             {
-                return Some(sh2_call("getVar", vec![str_lit(n)]));
+                return Some(store_var_read_no_fold(n));
             }
         }
         return None;
     }
     None
+}
+
+/// The param-default read for a plain name: the native plain-object
+/// store read (`sh2.vars.<n> ?? process.env.<n> ?? ''`) when the name is
+/// eligible, else the runtime getVar. Deliberately WITHOUT the
+/// never-written `""` fold ([`store_var_read`] applies it): a
+/// never-written name may still be SET in the caller's environment, and
+/// the nested default chains must stay live (parameter-expansion-nested.sh
+/// caught the fold's unsoundness for nested reads — the doc comment on
+/// the `:-` family). The native read keeps the env fallback, so it is
+/// exact either way.
+fn store_var_read_no_fold(name: &str) -> Expr {
+    if native_store_read_ok(name) {
+        native_store_read(name)
+    } else {
+        sh2_call("getVar", vec![str_lit(name)])
+    }
 }
 
 /// A single bracket-class glob CORE (`[abc]` / `[/\\]` / `[\*]`): the
@@ -23119,14 +23407,25 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                 // is now in the multi_read set) + a REAL `sh2.setVar`
                 // call (the store authority — the value override the old
                 // form refused is not used here) + the value, minus the
-                // dispatch and text parse.
+                // dispatch and text parse. A name eligible for the
+                // native plain-object store write ([`native_store_write_ok`])
+                // with a call-free default takes the property write
+                // instead — the runtime setVar's plain path exactly.
+                let write = if native_store_write_ok(name)
+                    && call_free_expr(&dflt).is_some()
+                {
+                    Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(store_member(name)),
+                        right: Box::new(dflt.clone()),
+                    }
+                } else {
+                    sh2_call("setVar", vec![str_lit(name), dflt.clone()])
+                };
                 Some(cond(
                     test,
                     val(),
-                    seq(vec![
-                        sh2_call("setVar", vec![str_lit(name), dflt.clone()]),
-                        dflt,
-                    ]),
+                    seq(vec![write, dflt]),
                 ))
             } else {
                 Some(cond(
@@ -25741,14 +26040,32 @@ fn collect_native_store_access(prog: &IrProgram) -> (HashSet<String>, HashSet<St
                                 }
                                 "export" => mark_words(&args[1..], attr),
                                 "mapfile" | "readarray" => mark_words(&args[1..], arr),
-                                "read" | "unset" | "shift" | "let" | "eval" | "source"
-                                | "." | "trap" => {
+                                "read" | "shift" | "let" | "eval" | "source" | "."
+                                | "trap" => {
                                     if cn == "let" {
                                         mark_arith_writes(&args[1..], attr);
                                     } else {
                                         mark_words(&args[1..], attr);
                                     }
                                 }
+                                // `unset` CLEARS every attribute (vars/env/refVars/
+                                // intVars/lcVars/ucVars/roVars/arrays/assocNames/assocStore)
+                                // and the store-property access paths (the native
+                                // read/write/delete forms) are exact for a name whose
+                                // only story is unset — the runtime's other deletes are
+                                // no-ops for a name absent from every collection. The
+                                // LIFT walkers still mark unset names store-bound (their
+                                // own exclusion list — a native identifier binding would
+                                // desync from the store delete), so the unset mark here
+                                // only ever blocked the native store access itself.
+                                // Attribute-carrying names (intVars/lcVars/ucVars/
+                                // exported/PATH) stay blocked via their own declare/export
+                                // marks.
+                                "unset" => {}
+                                // a bare `export` (no operands) prints the environment
+                                // dump — not a write; `export NAME[=VALUE]` keeps the
+                                // attr write-block below (a later plain `NAME=v` assign
+                                // must sync process.env through the runtime setVar).
                                 _ => {}
                             }
                             // `printf -v NAME FMT ARGS...` writes NAME
@@ -25960,9 +26277,25 @@ fn collect_native_store_access(prog: &IrProgram) -> (HashSet<String>, HashSet<St
     for n in assoc.union(&refs) {
         read_blocked.insert(n.clone());
     }
-    for n in &attr {
-        read_blocked.insert(n.clone());
+    // HOSTNAME/BASH_VERSION/BASH/SHELL are read-blocked SEPARATELY from
+    // the attr set: the runtime getVar serves them from os/env (os.hostname()
+    // etc. — bash sets HOSTNAME at startup, the env never carries it), so
+    // the native `vars.n ?? env.n ?? ''` read (env fallback) would answer
+    // "" where the runtime answers the os value — they must stay on
+    // getVar for READS. Their write-side blocking (via attr) is moot
+    // (never written in-script) but harmless.
+    for s in ["HOSTNAME", "BASH_VERSION", "BASH", "SHELL"] {
+        read_blocked.insert(s.to_string());
     }
+    // NOTE: attr names (intVars/lcVars/ucVars/exported/PATH/let-written,
+    // plus the os/env specials) are deliberately NOT read-blocked: the
+    // runtime getVar's plain path for them is exactly `vars → env
+    // fallback` (the attributes only alter setVar's WRITE path — the
+    // int/lc/uc coercion and the exported/PATH env sync — and the
+    // specials HOSTNAME/BASH_VERSION/BASH/SHELL are served separately
+    // via native_special_var), so the native `vars.n ?? env.n ?? ''`
+    // read is exact. They stay WRITE-blocked (below) so the coercion/
+    // env-sync cannot be skipped.
     let mut write_blocked = attr;
     for n in &refs {
         write_blocked.insert(n.clone());
@@ -26100,6 +26433,57 @@ fn store_member(name: &str) -> Expr {
             name: name.to_string(),
         }),
         computed: false,
+        optional: false,
+    }
+}
+
+/// `process.env.<name>` — the native export/unset env twin (property
+/// read/write, not a call).
+fn process_env_member(name: &str) -> Expr {
+    Expr::MemberExpression {
+        object: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::Identifier {
+                name: "process".to_string(),
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "env".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        property: Box::new(Expr::Identifier {
+            name: name.to_string(),
+        }),
+        computed: false,
+        optional: false,
+    }
+}
+
+/// `sh2.<map>.<method>(name)` — a state-Map method call on the runtime's
+/// own state fields (the `sh2.functions.set` / `sh2.shoptState.set`
+/// pattern; estree_gate.pl's is_sh2_state check): `sh2.exported.add(n)`
+/// for the native export. Not a sh2.* dispatch (the metric's callee
+/// shape is `sh2.<name>(...)` — the member chain has no sh2 object).
+fn sh2_state_set(map: &str, method: &str, name: &str) -> Expr {
+    Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "sh2".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: map.to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            property: Box::new(Expr::Identifier {
+                name: method.to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![str_lit(name)],
         optional: false,
     }
 }
@@ -26297,6 +26681,26 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 if let [IrExpr::Str(name, _), ..] = args.as_slice() {
                     if matches!(name.as_str(), "local" | "declare" | "typeset" | "readonly") {
                         if let Some(native) = try_native_declare_stmt(args) {
+                            return native;
+                        }
+                        // `local -a arr=(...)` — the setArray-side-effect
+                        // form (expression twin of the statement arm).
+                        if let Some(native) = try_native_array_declare(args) {
+                            return native;
+                        }
+                        // `local -A info` (bare) — the assocNames form.
+                        if let Some(native) = try_native_assoc_declare(args) {
+                            return native;
+                        }
+                    }
+                }
+            }
+            // `export NAME[=VALUE]` with pure words (expression position):
+            // the vars/env/exported writes — no builtin dispatch.
+            if func == "exec" {
+                if let [IrExpr::Str(name, _), ..] = args.as_slice() {
+                    if name == "export" {
+                        if let Some(native) = try_native_export(args) {
                             return native;
                         }
                     }
@@ -28203,7 +28607,19 @@ fn subshell_body_state_free(e: &Expr) -> bool {
         Expr::TemplateLiteral { expressions, .. } => {
             expressions.iter().all(subshell_body_state_free)
         }
-        Expr::UnaryExpression { argument, .. } => subshell_body_state_free(argument),
+        Expr::UnaryExpression {
+            operator,
+            argument,
+            prefix: _,
+        } => {
+            // `delete sh2.vars.x` / `delete process.env.x` — the native
+            // unset/export lowering — a state mutation the fold must not
+            // leak (the subshell's vars/env copy is the isolation).
+            if operator == "delete" {
+                return false;
+            }
+            subshell_body_state_free(argument)
+        }
         Expr::BinaryExpression { left, right, .. } | Expr::LogicalExpression { left, right, .. } => {
             subshell_body_state_free(left) && subshell_body_state_free(right)
         }

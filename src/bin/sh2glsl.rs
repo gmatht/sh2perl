@@ -31,6 +31,7 @@ fn main() {
             &ShGlslOptions {
                 es100: true,      // pair with the WebGL1 vertex shader
                 color_out: true,  // out_buf bytes 0..3 → gl_FragColor
+                tex_size: 16,     // texture bridges (uv_x/uv_y + tex_r/g/b)
             }
         )
     );

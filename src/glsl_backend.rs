@@ -101,11 +101,17 @@ pub struct ShGlslOptions {
     ///   vcolor_r/g/b        ← int(vColor.rgb * 255.0)  (varying input)
     /// `putb N` emits a single byte into out_buf.
     pub color_out: bool,
+    /// When > 0, seed the texture bridges (uv_x/uv_y = the texel index
+    /// from the `vUv` varying at this size; tex_r/g/b = the sampled
+    /// colour at that texel) and declare `uniform sampler2D uTex;` +
+    /// `varying vec2 vUv;` — the bash program can then read the block
+    /// texture per pixel, all in integer arithmetic.
+    pub tex_size: u32,
 }
 
 impl Default for ShGlslOptions {
     fn default() -> Self {
-        Self { es100: false, color_out: false }
+        Self { es100: false, color_out: false, tex_size: 0 }
     }
 }
 
@@ -129,6 +135,12 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
         for n in ["frag_x", "frag_y", "vcolor_r", "vcolor_g", "vcolor_b"] {
             r.vars.insert(n.to_string());
             r.arith_vars.insert(n.to_string());
+        }
+        if opts.tex_size > 0 {
+            for n in ["uv_x", "uv_y", "tex_r", "tex_g", "tex_b"] {
+                r.vars.insert(n.to_string());
+                r.arith_vars.insert(n.to_string());
+            }
         }
     }
     r.types = prog.var_types.iter().cloned().collect();
@@ -166,6 +178,10 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
     } else {
         // render fragment: the varying arrives from the vertex shader
         r.emit(if r.opts.es100 { "varying vec4 vColor;" } else { "in vec4 vColor;" });
+        if opts.tex_size > 0 {
+            r.emit(if r.opts.es100 { "varying vec2 vUv;" } else { "in vec2 vUv;" });
+            r.emit("uniform sampler2D uTex;");
+        }
     }
     r.emit("");
     r.emit("void main() {");
@@ -177,6 +193,20 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
         r.emit("g_vcolor_r = int(vColor.r * 255.0);");
         r.emit("g_vcolor_g = int(vColor.g * 255.0);");
         r.emit("g_vcolor_b = int(vColor.b * 255.0);");
+        if opts.tex_size > 0 {
+            let f = |v: u32| format!("{v}.0");
+            let sz = f(opts.tex_size);
+            // uv_x/uv_y: the texel index (0..tex_size) from the varying
+            r.emit(&format!("g_uv_x = int(vUv.x * {sz});"));
+            r.emit(&format!("g_uv_y = int(vUv.y * {sz});"));
+            // tex_r/g/b: the texel's colour (center-sampled), 0..255
+            let uv = format!(
+                "(vec2(float(g_uv_x), float(g_uv_y)) + vec2(0.5)) / {sz}"
+            );
+            r.emit(&format!("g_tex_r = int(texture2D(uTex, {uv}).r * 255.0);"));
+            r.emit(&format!("g_tex_g = int(texture2D(uTex, {uv}).g * 255.0);"));
+            r.emit(&format!("g_tex_b = int(texture2D(uTex, {uv}).b * 255.0);"));
+        }
     }
     for s in &prog.stmts {
         r.stmt(s);
