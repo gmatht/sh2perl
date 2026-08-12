@@ -2962,9 +2962,12 @@ mod tests {
         // lowers without a single getVar.
         let json = to_json("echo \"$x $y\"");
         assert!(!json.contains("\"getVar\""));
-        // the read-builtin vars are writes: `read x` marks x
+        // the read-builtin vars are writes: `read x` marks x — the read
+        // stays LIVE, but as the native plain-object store read (the
+        // runtime read's setVar write is the plain path — no dispatch)
         let json2 = to_json("read x; echo \"$x\"");
-        assert!(json2.contains("\"getVar\""));
+        assert!(json2.contains("\"name\":\"vars\""));
+        assert!(!json2.contains("\"getVar\""));
         // an eval/source program disables the fold entirely (the eval
         // may write the name at runtime — the read must stay LIVE): the
         // native store read `sh2.vars.x ?? env ?? ''` (the runtime's
@@ -3322,7 +3325,8 @@ mod tests {
         assert!(json2.contains("\"type\":\"TemplateLiteral\""));
         assert!(!json2.contains("unsupported"));
         let json3 = to_json("read name\necho \"Hello $name\"");
-        assert!(json3.contains("\"name\":\"getVar\""));
+        assert!(json3.contains("\"name\":\"vars\""));
+        assert!(!json3.contains("\"name\":\"getVar\""));
         assert!(!json3.contains("unsupported"));
     }
 
@@ -3396,11 +3400,14 @@ mod tests {
         assert!(!json.contains("\"name\":\"pipeline\""));
         assert!(!json.contains("\"name\":\"exec\""));
         assert!(!json.contains("unsupported"));
-        // the runtime-var sqrt form (store-bound $n → sh2.getVar)
+        // the runtime-var sqrt form (store-bound $n → the native store
+        // read — the read-builtin write is a plain setVar, exact as a
+        // property read)
         let json2 = to_json("read n; echo \"$(echo \"sqrt($n)\" | bc)\"");
         assert!(json2.contains("\"name\":\"sqrt\""), "native sqrt expr");
         assert!(json2.contains("\"name\":\"floor\""));
-        assert!(json2.contains("\"name\":\"getVar\""));
+        assert!(json2.contains("\"name\":\"vars\""));
+        assert!(!json2.contains("\"name\":\"getVar\""));
         assert!(!json2.contains("\"name\":\"pipeline\""));
         assert!(!json2.contains("\"name\":\"capture\""));
         assert!(!json2.contains("\"name\":\"exec\""));
@@ -3607,10 +3614,13 @@ mod tests {
         assert!(json.contains("\"operator\":\"++\""));
         // a non-numeric source blocks the lift too (the runtime coerces
         // `i=foo` to 0 via the typeset attribute — a native binding would
-        // desync from the store)
+        // desync from the store). The WRITE stays sh2.setVar (the int
+        // coercion); the READ is the native store read (getVar's plain
+        // path for an intVars name is the vars store — the attribute only
+        // alters the write side).
         let json3 = to_json("typeset -i i\ni=foo\n((i++))");
         assert!(json3.contains("\"name\":\"setVar\""));
-        assert!(json3.contains("\"name\":\"getVar\""));
+        assert!(!json3.contains("\"name\":\"getVar\""));
         // the same lift works through `let` statements without any declare
         let json4 = to_json("((i++))");
         assert!(!json4.contains("\"name\":\"setVar\""));
@@ -3732,10 +3742,12 @@ mod tests {
         assert!(json2.contains("\"name\":\"USER\""));
         assert!(json2.contains("\"name\":\"whoami\""));
         assert!(!json2.contains("\"name\":\"param\""));
-        // the tilde default `${HOME:-$(echo ~)}` is getVar("HOME") (the
-        // runtime's tilde rule — getVar's default arm is the env)
+        // the tilde default `${HOME:-$(echo ~)}` is the native store
+        // read (the runtime's tilde rule is getVar("HOME") — vars then
+        // env fallback — the property read is the same value without
+        // the dispatch)
         let json3 = to_json("echo \"${HOME:-$(echo ~)}\"");
-        assert!(json3.contains("\"name\":\"getVar\""));
+        assert!(json3.contains("\"name\":\"HOME\""));
         assert!(!json3.contains("\"name\":\"param\""));
         assert!(!json3.contains("unsupported"));
     }
@@ -3749,21 +3761,24 @@ mod tests {
         // param call, no spawn.
         let json = to_json("echo \"${var:-${default:-${fallback:-$(echo \"computed\")}}}\"");
         // the never-written `var` level folds to the lift-known constant
-        // "" (its store read); the live levels read via getVar
-        assert!(json.matches("\"name\":\"getVar\"").count() >= 2);
+        // "" (its store read); the live levels read via the native
+        // store read (env-fallback property reads — no getVar dispatch)
+        assert!(!json.contains("\"name\":\"getVar\""));
         assert!(json.contains("computed"));
         assert!(!json.contains("\"name\":\"param\""));
         assert!(!json.contains("unsupported"));
-        // the array-slice default ${default[@]:0:2} → the getVar read
-        // (exact for unset/scalar operands — the documented assumption)
+        // the array-slice default ${default[@]:0:2} → the native store
+        // read (exact for unset/scalar operands — the documented
+        // assumption); the ${array[${index}]} PRIMARY stays a runtime
+        // getVar (a subscript name — not a plain ident)
         let json2 = to_json("echo \"${array[${index}]:-${default[@]:0:2}}\"");
-        assert_eq!(json2.matches("\"name\":\"getVar\"").count(), 2);
+        assert_eq!(json2.matches("\"name\":\"getVar\"").count(), 1);
         assert!(!json2.contains("\"name\":\"param\""));
-        // a ${NAME} plain-ref default lowers to the getVar read too
+        // a ${NAME} plain-ref default lowers to the native store read too
         let json3 = to_json("echo ${MOUNTPOINT:-${NAME}}");
         // the never-written MOUNTPOINT level folds to the constant ""
-        // (its store read); the live NAME level reads via getVar
-        assert!(json3.matches("\"name\":\"getVar\"").count() >= 1);
+        // (its store read); the live NAME level reads natively
+        assert!(!json3.contains("\"name\":\"getVar\""));
         assert!(!json3.contains("\"name\":\"param\""));
     }
 
@@ -3806,12 +3821,49 @@ mod tests {
         // ${maybe:=default} — the store `:=` write: the runtime's
         // getVar + expandWord + setVar lowers to the same getVar (the
         // `_g` wrap) + a REAL sh2.setVar call (the store authority) +
-        // the value — no dispatch, no text parse.
+        // the value — no dispatch, no text parse. The unset-clean name
+        // takes the native plain-object store paths everywhere: the
+        // primary read is `sh2.vars.maybe ?? env ?? ''` and the write
+        // is `sh2.vars.maybe = "default"` (the runtime setVar's plain
+        // path — no attributes, no env sync).
         let json = to_json("unset maybe\necho \"${maybe:=default}\"");
-        assert!(json.contains("\"name\":\"getVar\""));
-        assert!(json.contains("\"name\":\"setVar\""));
+        assert!(json.contains("\"name\":\"vars\""));
+        assert!(!json.contains("\"name\":\"getVar\""));
+        assert!(!json.contains("\"name\":\"setVar\""));
         assert!(!json.contains("\"name\":\"param\""));
         assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn export_unset_and_store_declare_lower_to_native_store_paths() {
+        // `export NAME=VALUE` — the runtime builtin's exact writes
+        // (vars + process.env + the exported set) minus the dispatch:
+        // `(sh2.vars.DEBUG = "1", process.env.DEBUG = "1",
+        // sh2.exported.add("DEBUG"), sh2.lastExit = 0)` — no builtin
+        // call. The bare `export NAME` form gets the conditional env
+        // sync (the runtime's `a in vars` check).
+        let json = to_json("export DEBUG=1");
+        assert!(json.contains("\"name\":\"exported\""));
+        assert!(json.contains("\"name\":\"DEBUG\""));
+        assert!(!json.contains("\"name\":\"builtin\""));
+        let json2 = to_json("SHELL_VAR=hello\nexport SHELL_VAR");
+        assert!(json2.contains("\"name\":\"exported\""));
+        assert!(!json2.contains("\"name\":\"builtin\""));
+        // `unset NAME` — the two native deletes (vars + env); a
+        // later read is the native plain-object store read (the unset
+        // name carries no attributes — the store access is exact).
+        let json3 = to_json("unset x\necho \"$x\"");
+        assert!(json3.contains("\"operator\":\"delete\""));
+        assert!(json3.contains("\"name\":\"vars\""));
+        assert!(!json3.contains("\"name\":\"builtin\""));
+        assert!(!json3.contains("\"name\":\"getVar\""));
+        // a STORE-BOUND `local i=0` (the var stays store-bound via the
+        // baked-subscript mark) — the native `sh2.vars.i = "0"` store
+        // write, no builtin dispatch (the lifted-name twin keeps the
+        // identifier write).
+        let json4 = to_json("f() { local i=0; echo ${arr[$i]}; }; f");
+        assert!(json4.contains("\"name\":\"vars\""));
+        assert!(!json4.contains("\"value\":\"local\""));
     }
 
     #[test]

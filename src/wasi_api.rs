@@ -32,6 +32,8 @@ use std::ptr::null_mut;
 use std::slice;
 
 use crate::estree::ast_to_estree_json;
+use crate::glsl_backend::{shir_to_glsl_opts, ShGlslOptions};
+use crate::shir::ast_to_ir_raw;
 use crate::{Generator, Lexer, Parser};
 
 /// Allocate a `[u32 len][data][0]` buffer and return a pointer to `data`.
@@ -109,6 +111,28 @@ pub extern "C" fn debashc_to_estree(input: *const u8, input_len: usize) -> *mut 
             Ok(json) => alloc_string(&ok_json(&json)),
             Err(e) => alloc_string(&err_json(&e)),
         },
+        Err(e) => alloc_string(&err_json(&e)),
+    }
+}
+
+/// `debashc_to_glsl(input, input_len) -> *mut u8` — shell → **GLSL ES 1.00
+/// render fragment** (the MIMEcroft shader pipeline): the bash program
+/// becomes a fragment shader with the frag_x/frag_y/vcolor_*/uv_*/tex_*
+/// bridges (see glsl_backend) — so the browser can compile bash-authored
+/// shaders through the otranspiler wasm, no native binary needed.
+#[no_mangle]
+pub extern "C" fn debashc_to_glsl(input: *const u8, input_len: usize) -> *mut u8 {
+    let input = unsafe { slice::from_raw_parts(input, input_len) };
+    let input = String::from_utf8_lossy(input);
+    match Parser::new(&input).parse() {
+        Ok(commands) => {
+            let prog = ast_to_ir_raw(&commands);
+            let glsl = shir_to_glsl_opts(
+                &prog,
+                &ShGlslOptions { es100: true, color_out: true, tex_size: 16 },
+            );
+            alloc_string(&ok_json(&glsl))
+        }
         Err(e) => alloc_string(&err_json(&e)),
     }
 }
