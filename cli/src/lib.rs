@@ -268,6 +268,12 @@ pub fn main_with_args(args: Vec<String>) {
         return;
     }
 
+    // `--true64`: bash arithmetic is true 64-bit (out-of-±2^53 numeric
+    // vars home in BigInt64Array slots or BigInt values). Off by default.
+    if args.iter().any(|a| a == "--true64") {
+        debashl::shir::set_true64(true);
+    }
+
     // Parse AST formatting options and input/output options
     let mut ast_options = AstFormatOptions::default();
     let mut input_file: Option<String> = None;
@@ -911,7 +917,12 @@ exit $main_exit_code;
         }
         "--shir-in-estree" => {
             if args.len() < 3 { println!("Error: --shir-in-estree requires input"); return; }
-            let input = &args[2];
+            // `--true64` may sit between the mode and the filename
+            let input = args
+                .iter()
+                .skip(2)
+                .find(|a| *a != "--true64")
+                .unwrap_or(&args[2]);
             let content = if input == "-" {
                 let mut s = String::new();
                 if let Err(e) = std::io::stdin().read_to_string(&mut s) {

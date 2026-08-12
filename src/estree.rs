@@ -3023,6 +3023,67 @@ mod tests {
     }
 
     #[test]
+    fn test_lowerings_extglob_and_quoted_spaces_and_lt() {
+        // The test-expression lowering family:
+        // 1. extglob `==` (`[[ $x == !(*.min).js ]]` — bash matches the
+        //    pattern with extglob semantics) → an anchored regex literal
+        //    with the `s` flag (dotAll — the runtime's `*`/`?` match any
+        //    char incl. newlines): `^[\\s\\S]*(?<!(?:\\.min))\\.js$`.
+        // 2. `[[ "a" < "b" ]]` lexical `<` → a native JS string `<`.
+        // 3. `[[ "hello world" =~ ^hello ]]` — a quoted literal WITH a
+        //    space in the `=~` value operand → native regex `.test`.
+        // 4. `[[ ! -e /no/such/file ]]` — the `!` without a space before
+        //    the file-test flag → `!sh2.fileTest(...)`.
+        // 5. `[ "$(echo hello)" = "hello" ]` — a literal echo cmdsub
+        //    operand → the compile-time folded value.
+        let json = to_json(
+            "shopt -s extglob; f=file.js; [[ $f == !(*.min).js ]] && echo a; [[ \"a\" < \"b\" ]] && echo b; [[ \"hello world\" =~ ^hello ]] && echo c; [[ ! -e /no/such/file ]] && echo d; [ \"$(echo hello)\" = \"hello\" ] && echo e",
+        );
+        // no sh2.test DISPATCH anywhere (a regex-literal `.test()` method
+        // call has a different callee shape)
+        assert!(!json
+            .contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        // the extglob lookbehind regex
+        assert!(json.contains("(?<!"));
+        assert!(json.contains("\\\\.min"));
+        // the `s` flag on the regex literal
+        assert!(json.contains("\"flags\":\"s\""));
+        // the lexical `<`
+        assert!(json.contains("\"operator\":\"<\""));
+        // the quoted-space `=~` literal
+        assert!(json.contains("hello world"));
+        // the `!`-file-test
+        assert!(json.contains("\"name\":\"fileTest\""));
+        assert!(json.contains("\"operator\":\"!\""));
+        // the folded echo cmdsub literal
+        assert!(json.contains("\"value\":\"hello\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn nocase_dynamic_literal_test_folds_when_invariant() {
+        // `shopt -s nocasematch` + `shopt -u nocasematch` both present →
+        // the shopt state is DYNAMIC, so runtime-dependent comparisons
+        // stay on the runtime test call — EXCEPT literal-vs-literal
+        // comparisons whose result is case-folding-invariant (`"abc" ==
+        // "abc"` is true under every state and folds natively; `"ABC"
+        // == "abc"` differs by state and must stay on the runtime).
+        let json = to_json(
+            "shopt -s nocasematch; [[ \"abc\" == \"abc\" ]] && echo a; [[ \"ABC\" == \"abc\" ]] && echo b; shopt -u nocasematch",
+        );
+        // the invariant comparison folded natively (the sh2.test DISPATCH
+        // that remains belongs to the `"ABC" == "abc"` case)
+        assert!(json.contains("\"value\":\"abc\""));
+        assert!(!json.contains("unsupported"));
+        // and the state-dependent one keeps the runtime call
+        let json2 = to_json(
+            "shopt -s nocasematch; [[ \"ABC\" == \"abc\" ]] && echo b; shopt -u nocasematch",
+        );
+        assert!(json2
+            .contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+    }
+
+    #[test]
     fn status_equality_lowers_to_lastexit_read() {
         // `[ "$?" = "0" ]` — the `$?` sigil is a status-field read, not
         // a glob `?`: `String(sh2.lastExit) === "0"`, zero dispatches.
