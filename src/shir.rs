@@ -11,6 +11,7 @@ use crate::ast::*;
 use crate::bc::eval as bc_eval;
 use crate::estree::*;
 use crate::ir::*;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
@@ -77,6 +78,25 @@ pub fn true64_int_var(name: &str) -> bool {
 /// — the native int64 element read keeps the RMW fast path). Applies to
 /// a cloned program before the lift analyses run — and, at render time,
 /// to the arith parsed out of test-string `$(( ))` operands.
+pub fn arith_mentions_true64(a: &ArithAst) -> bool {
+    fn mentions(a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Var(n) => slot_var_index(n).is_some() || true64_int_var(n),
+            ArithAst::Index { key, .. } => mentions(key),
+            ArithAst::Bin { lhs, rhs, .. } => mentions(lhs) || mentions(rhs),
+            ArithAst::Un { arg, .. } => mentions(arg),
+            ArithAst::Cond { test, then, else_, .. } => {
+                mentions(test) || mentions(then) || mentions(else_)
+            }
+            ArithAst::Assign { rhs, .. } => mentions(rhs),
+            ArithAst::IncDec { var, .. } => true64_int_var(var) || slot_var_index(var).is_some(),
+            ArithAst::Sizeof(_) | ArithAst::Num(_) => false,
+            ArithAst::Cast { arg, .. } => mentions(arg),
+        }
+    }
+    mentions(a)
+}
+
 pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
     fn mentions(a: &ArithAst) -> bool {
         match a {
@@ -3805,7 +3825,8 @@ pub fn analyze_var_types(prog: &IrProgram) -> Vec<(String, crate::ir::IrType)> {
 /// completely (missing names = never assigned, pure reads).
 pub fn analyze_var_const(prog: &IrProgram) -> Vec<(String, crate::ir::VarKind)> {
     use crate::ir::{ArithAst, IrExpr, IrStmt, VarKind};
-    use std::collections::{HashMap, HashSet};
+    use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
     #[derive(Default)]
     struct Acc {
@@ -4280,6 +4301,7 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
         assigned: &mut HashSet<String>,
         rmw: &mut HashSet<String>,
         in_loop: &mut HashSet<String>,
+        unsafe_write: &mut HashSet<String>,
         inside_loop: bool,
     ) {
         for s in stmts {
@@ -4293,40 +4315,93 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
                         if inside_loop && assigned.contains(v) {
                             in_loop.insert(v.clone());
                         }
-                        // self-RMW shapes: x = x op e / x op= e / x++ / x--
                         let is_rmw = matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::Bin { lhs, .. } if matches!(&**lhs, ArithAst::Var(n) if n == v)))
                             || matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::Assign { var, .. } if var == v))
                             || matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == v));
                         if is_rmw {
                             rmw.insert(v.clone());
                         }
+                    } else {
+                        // indexed/multi-target assigns bypass the slot
+                        // branch — the targets can't be slot-homed
+                        for t in targets {
+                            unsafe_write.insert(t.var.clone());
+                        }
                     }
                 }
                 IrStmt::While { body, .. }
                 | IrStmt::For { body, .. }
                 | IrStmt::DoWhile { body, .. } => {
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, true);
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, true);
                 }
                 IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, inside_loop);
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
                 }
-                IrStmt::If {
-                    then,
-                    elsifs,
-                    else_,
-                    ..
-                } => {
-                    walk_stmts(then, numeric, assigned, rmw, in_loop, inside_loop);
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk_stmts(then, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
                     for (_, arm) in elsifs {
-                        walk_stmts(arm, numeric, assigned, rmw, in_loop, inside_loop);
+                        walk_stmts(arm, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
                     }
-                    walk_stmts(else_, numeric, assigned, rmw, in_loop, inside_loop);
+                    walk_stmts(else_, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
                 }
                 IrStmt::Redirect { inner, .. } => {
-                    walk_stmts(inner, numeric, assigned, rmw, in_loop, inside_loop);
+                    walk_stmts(inner, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
                 }
                 IrStmt::Function { body, .. } => {
-                    walk_stmts(body, numeric, assigned, rmw, in_loop, inside_loop);
+                    // function-locals get their inits baked into `let`
+                    // declarations (bypassing the Assign slot branch) —
+                    // every var written in a function body (plain
+                    // Assigns, `local`/`declare` builtins, setVar) is
+                    // unsafe for slots (kept as Int64/BigInt values)
+                    fn mark_fn_writes(s: &IrStmt, out: &mut HashSet<String>) {
+                        match s {
+                            IrStmt::Assign { targets, .. } => {
+                                for t in targets {
+                                    out.insert(t.var.clone());
+                                }
+                            }
+                            IrStmt::Expr(IrExpr::Call { func, args, .. }) => {
+                                if matches!(func.as_str(), "setVar" | "local" | "declare") {
+                                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                                        out.insert(n.clone());
+                                    }
+                                }
+                            }
+                            IrStmt::If { then, elsifs, else_, .. } => {
+                                for s in then {
+                                    mark_fn_writes(s, out);
+                                }
+                                for (_, arm) in elsifs {
+                                    for s in arm {
+                                        mark_fn_writes(s, out);
+                                    }
+                                }
+                                for s in else_ {
+                                    mark_fn_writes(s, out);
+                                }
+                            }
+                            IrStmt::While { body, .. }
+                            | IrStmt::For { body, .. }
+                            | IrStmt::DoWhile { body, .. }
+                            | IrStmt::Block(body)
+                            | IrStmt::Subshell(body)
+                            | IrStmt::Background(body) => {
+                                for s in body {
+                                    mark_fn_writes(s, out);
+                                }
+                            }
+                            IrStmt::Redirect { inner, .. } => {
+                                for s in inner {
+                                    mark_fn_writes(s, out);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    for s in body {
+                        mark_fn_writes(s, unsafe_write);
+                    }
+                    walk_stmts(body, numeric, assigned, rmw, in_loop, unsafe_write, inside_loop);
                 }
                 _ => {}
             }
@@ -4338,21 +4413,20 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
     let mut assigned = HashSet::new();
     let mut rmw = HashSet::new();
     let mut in_loop = HashSet::new();
+    let mut unsafe_write = HashSet::new();
     walk_stmts(
         &prog.stmts,
         &numeric,
         &mut assigned,
         &mut rmw,
         &mut in_loop,
+        &mut unsafe_write,
         false,
     );
     let mut int_vars = HashSet::new();
     let mut slots: HashMap<String, usize> = HashMap::new();
     for v in &assigned {
-        // provably inside ±2^53 -> JS Number (the default path is exact)
-        let safe = ranges.get(v).is_some_and(|&(lo, hi)| {
-            lo >= -SAFE_NUMBER && hi <= SAFE_NUMBER
-        });
+        let safe = ranges.get(v).is_some_and(|&(lo, hi)| lo >= -SAFE_NUMBER && hi <= SAFE_NUMBER);
         if safe {
             continue;
         }
@@ -4360,15 +4434,16 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
     }
     let mut slot_idx = 0usize;
     for v in &int_vars {
-        if rmw.contains(v) && in_loop.contains(v) {
+        // slot-worthy: self-RMW accumulator written ONLY through plain
+        // single-target Assigns in a loop (a string/local/declare write
+        // would desync the slot from the value's other home)
+        if rmw.contains(v) && in_loop.contains(v) && !unsafe_write.contains(v) {
             slots.insert(v.clone(), slot_idx);
             slot_idx += 1;
         }
     }
     (int_vars, slots)
-}
-
-/// The FRONTEND's integer arithmetic domain, not the storage width:
+}/// The FRONTEND's integer arithmetic domain, not the storage width:
 /// bash is signed-64-bit wrapped, so a provable range never leaves
 /// [i64::MIN, i64::MAX] — an op/literal that can cross it is top (None).
 /// The C frontend's unsigned types widen this per variable once
@@ -7835,6 +7910,36 @@ fn arith_is_bigint(a: &ArithAst) -> bool {
     matches!(a, ArithAst::Cast { ty, .. } if matches!(ty, IrType::Int64 | IrType::UInt64))
 }
 
+/// Collect the divisor operands of every `/` and `%` in an ArithAst (for
+/// the `--true64` zero-divisor guards in test operands — BigInt % 0
+/// throws where Number % 0 gives NaN).
+fn collect_true64_divisors(a: &ArithAst, out: &mut Vec<ArithAst>) {
+    match a {
+        ArithAst::Bin { op, lhs, rhs } => {
+            if op == "/" || op == "%" {
+                out.push((**rhs).clone());
+            }
+            collect_true64_divisors(lhs, out);
+            collect_true64_divisors(rhs, out);
+        }
+        ArithAst::Un { arg, .. } => collect_true64_divisors(arg, out),
+        ArithAst::Cond {
+            test,
+            then,
+            else_,
+            ..
+        } => {
+            collect_true64_divisors(test, out);
+            collect_true64_divisors(then, out);
+            collect_true64_divisors(else_, out);
+        }
+        ArithAst::Assign { rhs, .. } => collect_true64_divisors(rhs, out),
+        ArithAst::Cast { arg, .. } => collect_true64_divisors(arg, out),
+        ArithAst::Index { key, .. } => collect_true64_divisors(key, out),
+        _ => {}
+    }
+}
+
 /// A `memLoad` read from a 64-bit-elem heap pointer (the C frontend passes
 /// the element C type name as the third arg): the value is a store string
 /// — `parseInt` would round it past 2^53, so printf renders it directly.
@@ -10769,9 +10874,16 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
         &string_lift_vars(prog, &numeric_lift_vars(prog)),
     );
     // `--true64`: slot vars are homed in the array — exclude them from
-    // the numeric lift (their reads/writes route through __t64[k]);
-    // out-of-range non-slot vars become Int64 (BigInt) via VAR_TYPES.
+    // BOTH lifts (their reads/writes route through __t64[k]; a lifted
+    // `let i = init` declaration would bake the init into the binding,
+    // desyncing the slot). Out-of-range non-slot vars become Int64
+    // (BigInt) via VAR_TYPES.
     let num: HashSet<String> = num
+        .iter()
+        .filter(|v| !true64_slots.contains_key(*v))
+        .cloned()
+        .collect();
+    let str: HashSet<String> = str
         .iter()
         .filter(|v| !true64_slots.contains_key(*v))
         .cloned()
@@ -11309,22 +11421,148 @@ fn glob_class_to_regex(cls: &str) -> String {
 /// groups), and `\$name`-shaped escapes (the runtime's expandWord is
 /// NOT backslash-aware and expands them anyway).
 fn glob_to_regex(pat: &str) -> Option<String> {
+    let cs: Vec<char> = pat.chars().collect();
     let mut out = String::from("^");
-    let mut chars = pat.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut i = 0usize;
+    glob_to_regex_segs(&cs, &mut i, &mut out)?;
+    if i != cs.len() {
+        return None;
+    }
+    out.push('$');
+    Some(out)
+}
+
+/// Split an extglob group's inner text into `|`-alternatives at paren
+/// depth 0 (the runtime's splitTopLevel).
+fn split_glob_alts(inner: &[char]) -> Vec<Vec<char>> {
+    let mut parts = Vec::new();
+    let mut cur = Vec::new();
+    let mut depth = 0i32;
+    for &ch in inner {
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+        }
+        if ch == '|' && depth == 0 {
+            parts.push(std::mem::take(&mut cur));
+            continue;
+        }
+        cur.push(ch);
+    }
+    parts.push(cur);
+    parts
+}
+
+/// The segment loop of [`glob_to_regex`] (shared with the extglob-alt
+/// recursion — alts translate UNANCHORED; the caller adds `^`/`$`).
+fn glob_to_regex_segs(cs: &[char], i: &mut usize, out: &mut String) -> Option<()> {
+    while *i < cs.len() {
+        let c = cs[*i];
         match c {
-            '*' => out.push_str(".*"),
-            '?' => out.push('.'),
+            '?' | '*' | '+' | '@' | '!' => {
+                // extglob group — ONLY `+(`, `@(`, `!(` (the runtime's
+                // parseGlob consumes `?`/`*` in their own branches BEFORE
+                // the extglob check, so `?(`/`*(` are a plain any/star
+                // followed by literal parens there — the `(` then refuses
+                // below, keeping those shapes on the runtime call).
+                if *i + 1 < cs.len()
+                    && matches!(c, '+' | '@' | '!')
+                    && cs[*i + 1] == '('
+                {
+                    let mut depth = 0i32;
+                    let mut j = *i + 1;
+                    let mut inner_end = None;
+                    while j < cs.len() {
+                        match cs[j] {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    inner_end = Some(j);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if let Some(end) = inner_end {
+                        let inner: Vec<char> = cs[*i + 2..end].to_vec();
+                        let alts = split_glob_alts(&inner);
+                        if c == '!' {
+                            // `!(A1|A2)`: the group consumes a prefix that
+                            // NO alt matches in full. That reduces to a
+                            // SUFFIX test exactly when every alt starts
+                            // with `*` (the star absorbs the segment's
+                            // head, so "segment matches `*R`" ⟺ "segment
+                            // ends with R") — then a lookbehind at the
+                            // split point is exact. The group must sit at
+                            // the pattern START (the empty-prefix split at
+                            // position 0 is always valid there; mid-pattern
+                            // the lookbehind would inspect the preceding
+                            // segments' tail instead of the prefix).
+                            if out != "^" {
+                                return None;
+                            }
+                            let mut alts_re: Vec<String> = Vec::new();
+                            for a in &alts {
+                                if a.is_empty() || a[0] != '*' {
+                                    return None;
+                                }
+                                let mut sub = String::new();
+                                let mut k = 1usize;
+                                glob_to_regex_segs(a, &mut k, &mut sub)?;
+                                if k != a.len() {
+                                    return None;
+                                }
+                                alts_re.push(sub);
+                            }
+                            out.push_str("[\\s\\S]*(?<!(?:");
+                            out.push_str(&alts_re.join("|"));
+                            out.push_str("))");
+                        } else {
+                            let mut alts_re: Vec<String> = Vec::new();
+                            for a in &alts {
+                                let mut sub = String::new();
+                                let mut k = 0usize;
+                                glob_to_regex_segs(a, &mut k, &mut sub)?;
+                                if k != a.len() {
+                                    return None;
+                                }
+                                alts_re.push(sub);
+                            }
+                            let core = format!("(?:{})", alts_re.join("|"));
+                            match c {
+                                '?' => out.push_str(&format!("{core}?")),
+                                '*' => out.push_str(&format!("{core}*")),
+                                '+' => out.push_str(&format!("{core}+")),
+                                _ => out.push_str(&core), // '@'
+                            }
+                        }
+                        *i = end + 1;
+                        continue;
+                    }
+                    // no close paren — parseGlob treats the char literally
+                }
+                match c {
+                    '*' => out.push_str(".*"),
+                    '?' => out.push('.'),
+                    _ => out.push_str(&regex_escape_lit(c)),
+                }
+                *i += 1;
+            }
             '\\' => {
-                let Some(n) = chars.next() else {
+                let Some(&n) = cs.get(*i + 1) else {
                     out.push_str("\\\\"); // trailing `\`: literal (parseGlob)
+                    *i += 1;
                     continue;
                 };
                 if n == '$' {
                     // `\$name`: the runtime's expandWord expands it (its
                     // `$name` regex is not escape-aware) — mirror by
                     // refusing (the pattern stays on the runtime switch).
-                    if let Some(&nxt) = chars.peek() {
+                    if let Some(&nxt) = cs.get(*i + 2) {
                         if nxt.is_ascii_alphanumeric()
                             || matches!(nxt, '_' | '{' | '(' | '@' | '#' | '*' | '?' | '$')
                         {
@@ -11333,28 +11571,31 @@ fn glob_to_regex(pat: &str) -> Option<String> {
                     }
                 }
                 out.push_str(&regex_escape_lit(n));
+                *i += 2;
             }
             '[' => {
                 // parseGlob: optional `!`/`^` negation, then chars up to
                 // the FIRST `]` (an unterminated `[` is a literal).
                 let mut cls = String::new();
                 let mut neg = false;
-                if let Some(&n) = chars.peek() {
-                    if n == '!' || n == '^' {
-                        neg = true;
-                        chars.next();
-                    }
+                let mut j = *i + 1;
+                if j < cs.len() && (cs[j] == '!' || cs[j] == '^') {
+                    neg = true;
+                    j += 1;
                 }
                 let mut closed = false;
-                for n in chars.by_ref() {
+                while j < cs.len() {
+                    let n = cs[j];
                     if n == ']' {
                         closed = true;
                         break;
                     }
                     cls.push(n);
+                    j += 1;
                 }
                 if !closed {
                     out.push_str("\\[");
+                    *i += 1;
                 } else if cls.is_empty() {
                     // classMatch on an empty class: never a hit (or
                     // ALWAYS a hit when negated — a `[!]` matches any
@@ -11364,6 +11605,7 @@ fn glob_to_regex(pat: &str) -> Option<String> {
                     } else {
                         out.push_str("[^\\s\\S]");
                     }
+                    *i = j + 1;
                 } else {
                     out.push('[');
                     if neg {
@@ -11371,13 +11613,17 @@ fn glob_to_regex(pat: &str) -> Option<String> {
                     }
                     out.push_str(&glob_class_to_regex(&cls));
                     out.push(']');
+                    *i = j + 1;
                 }
             }
             '(' | ')' | '$' => return None, // extglob / runtime expansion
-            _ => out.push_str(&regex_escape_lit(c)),
+            _ => {
+                out.push_str(&regex_escape_lit(c));
+                *i += 1;
+            }
         }
     }
-    Some(out)
+    Some(())
 }
 
 /// Lower a `case` whose EVERY pattern is one of the [`CasePat`] shapes to a
@@ -14785,11 +15031,28 @@ fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
                 left: Box::new(value.clone()),
                 right: Box::new(str_lit(&lit_str(lit))),
             },
-            // The caller gates to Substr/Prefix/Suffix before calling
-            // build — a Glob pattern (regex translation) never reaches
-            // the test-lowering match. Keep the arm for exhaustiveness.
-            CasePat::Glob(_) => {
-                unreachable!("glob patterns are filtered before the test-lowering match")
+            // The caller gates to Substr/Prefix/Suffix/Glob before calling
+            // build.
+            CasePat::Glob(re) => {
+                // The general glob grammar (incl. the extglob `@(`/`!(`
+                // groups): an anchored regex literal with the `s` flag
+                // (dotAll — the runtime's `*`/`?` match any char incl.
+                // newlines, mirroring the case-lowering's regex exec
+                // convention). The `s`-flag regex against the same
+                // coerced/lowercased value is exactly globMatch.
+                let test = Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(regex_lit_flags(re, "s")),
+                        property: Box::new(Expr::Identifier {
+                            name: "test".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![value.clone()],
+                    optional: false,
+                };
+                test
             }
         };
         if negate {
@@ -14802,14 +15065,24 @@ fn try_native_glob_test(lhs: &str, rhs: &str, negate: bool) -> Option<Expr> {
             inc
         }
     };
-    if let Some(pat) = classify_case_pat(rhs.trim()) {
+    // The pattern is classified from the NOCASE-LOWERCASED text (the
+    // runtime lowercases BOTH sides under nocasematch; the build closure
+    // lowercases the value side). `glob_to_regex` refused `$`-containing
+    // patterns (the runtime would expand them), so a reached Glob is
+    // expansion-free and the anchored regex is exact.
+    let pat_src = if nocase {
+        rhs.trim().to_lowercase()
+    } else {
+        rhs.trim().to_string()
+    };
+    if let Some(pat) = classify_case_pat(&pat_src) {
         // only the GLOB shapes lift natively here: a bare operand
         // containing `=`/`<`/`>` would tokenize into separate test tokens
         // (the runtime splits on them), so Exact/Any stay on the runtime
         // (the plain-equality path already covers exact literals).
         if matches!(
             &pat,
-            CasePat::Substr(_) | CasePat::Prefix(_) | CasePat::Suffix(_)
+            CasePat::Substr(_) | CasePat::Prefix(_) | CasePat::Suffix(_) | CasePat::Glob(_)
         ) {
             if let Some(l) = str_operand(lhs) {
                 return Some(build(l, &pat));
@@ -20679,6 +20952,13 @@ fn test_value_operand(op: &str) -> Option<Expr> {
         .strip_prefix('"')
         .and_then(|x| x.strip_suffix('"'))
         .unwrap_or(op);
+    // `$(echo LIT)` — a literal echo command substitution: the captured
+    // value (echo's output minus the capture's trailing-newline strip) is
+    // a compile-time string. Placed before the `$`-name branch (a bare
+    // `$(` is not a variable read).
+    if let Some(v) = fold_echo_cmdsub_text(bare) {
+        return Some(str_lit(&v));
+    }
     if let Some(name) = bare
         .strip_prefix("${")
         .and_then(|x| x.strip_suffix('}'))
@@ -20705,14 +20985,110 @@ fn test_value_operand(op: &str) -> Option<Expr> {
         }
         return Some(store_var_read(name));
     }
+    // A QUOTED literal may contain whitespace (the runtime tokenizer
+    // consumes the quoted region as ONE token); an unquoted one may not
+    // (whitespace would split it into separate test tokens).
+    let quoted = op.strip_prefix('"').is_some();
     if !bare.is_empty()
         && !bare
             .chars()
-            .any(|c| matches!(c, '$' | '`' | '\\' | '"' | '\'' | ' ' | '\t'))
+            .any(|c| matches!(c, '$' | '`' | '\\' | '"' | '\''))
+        && (quoted || !bare.chars().any(|c| matches!(c, ' ' | '\t')))
     {
         return Some(str_lit(bare));
     }
     None
+}
+
+/// `$(echo LIT...)` — a literal echo command substitution inside a test
+/// operand: the captured value (the runtime's echo output minus the
+/// capture's trailing-newline strip) is a compile-time string. The whole
+/// operand text must BE the cmdsub (a `$(...)` embedded in a larger word
+/// stays on the runtime). Echo args must be literal words — no `$`,
+/// backtick, backslash, glob or paren chars (the runtime would expand/
+/// parse them); `"..."`/`'...'` quotes strip; a `-n` flag is harmless
+/// (the capture strips the newline anyway); any other `-`-flag refuses
+/// (escape processing changes the output bytes). A script-defined `echo`
+/// function shadows the builtin — refuse then (the runtime would call
+/// the function).
+fn fold_echo_cmdsub_text(operand: &str) -> Option<String> {
+    if program_defines_function("echo") {
+        return None;
+    }
+    let inner = operand
+        .strip_prefix("$(")
+        .and_then(|x| x.strip_suffix(')'))?;
+    let words = shell_words_simple(inner)?;
+    if words.first().map(String::as_str) != Some("echo") {
+        return None;
+    }
+    let args = &words[1..];
+    if args.is_empty() {
+        return Some(String::new()); // `$(echo)` → "\n" → capture ""
+    }
+    let mut out = String::new();
+    for (i, a) in args.iter().enumerate() {
+        if a.len() > 1 && a.starts_with('-') {
+            return None; // a flag arg (`-n` is harmless but refused anyway)
+        }
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(a);
+    }
+    Some(out)
+}
+
+/// Minimal shell-word splitter for [`fold_echo_cmdsub_text`]: whitespace
+/// splits; `"..."`/`'...'` quotes group and strip; backslash, `$`,
+/// backtick, glob metachars and parens refuse (the runtime would expand
+/// or re-parse them — the fold only covers clean literal words).
+fn shell_words_simple(s: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let cs: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < cs.len() {
+        let c = cs[i];
+        match c {
+            ' ' | '\t' => {
+                if started {
+                    words.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+                i += 1;
+            }
+            '"' | '\'' => {
+                started = true;
+                let q = c;
+                i += 1;
+                let mut inner = String::new();
+                while i < cs.len() && cs[i] != q {
+                    if matches!(cs[i], '\\' | '$' | '`') {
+                        return None;
+                    }
+                    inner.push(cs[i]);
+                    i += 1;
+                }
+                if i >= cs.len() {
+                    return None; // unterminated quote
+                }
+                i += 1;
+                cur.push_str(&inner);
+            }
+            '\\' | '$' | '`' | '*' | '?' | '[' | ']' | '(' | ')' => return None,
+            _ => {
+                started = true;
+                cur.push(c);
+                i += 1;
+            }
+        }
+    }
+    if started {
+        words.push(cur);
+    }
+    Some(words)
 }
 
 /// Conservative JS-RegExp validity check (sound, not complete): accepts
@@ -20998,6 +21374,14 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                         Some(b) => (b, true),
                         None => (operand, false),
                     };
+                // `$(echo LIT)` — a literal echo cmdsub (see
+                // [`fold_echo_cmdsub_text`]): the captured value is a
+                // compile-time string, so `-n`/`-z` fold exactly. Placed
+                // before the `$`-name branch (a bare `$(` is not a
+                // variable read).
+                if let Some(v) = fold_echo_cmdsub_text(bare) {
+                    return Some(str_lit(&v));
+                }
                 // `$name` / `${name}` — the runtime expands the operand
                 // from the store; lifted bindings read natively.
                 if let Some(name) = bare
@@ -21033,12 +21417,16 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                 if bare.is_empty() && quoted {
                     return Some(str_lit(""));
                 }
-                // literal operand — no `$`, backtick, backslash, quotes or
-                // whitespace (the tokenizer would split on those)
+                // literal operand — no `$`, backtick, backslash or quotes;
+                // whitespace is fine INSIDE a quoted operand (the runtime
+                // tokenizer consumes a quoted region — spaces included —
+                // as ONE token; unquoted whitespace would split the test
+                // into separate tokens).
                 if !bare.is_empty()
                     && !bare
                         .chars()
-                        .any(|c| matches!(c, '$' | '`' | '\\' | '"' | '\'' | ' ' | '\t'))
+                        .any(|c| matches!(c, '$' | '`' | '\\' | '"' | '\''))
+                    && (quoted || !bare.chars().any(|c| matches!(c, ' ' | '\t')))
                 {
                     return Some(str_lit(bare));
                 }
@@ -21142,12 +21530,27 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
             // runtime's intVal guard (bash `[ $x -ne 5 ]` with x="abc" is
             // an "integer expression expected" error → the whole test is
             // FALSE, never `NaN !== 5` → true).
-            fn num_operand(e: &str) -> Option<(Expr, bool)> {
+            fn num_operand(e: &str) -> Option<(Expr, bool, bool)> {
                 let e = e.trim();
+                // `$(echo LIT)` — a literal echo cmdsub: substitute its
+                // QUOTED folded value so the existing literal handling
+                // applies (a non-numeric value stays a risky string — the
+                // runtime's intVal errors → the whole test false — the
+                // same NaN guard the literal path already emits).
+                let folded = e
+                    .strip_prefix('"')
+                    .and_then(|x| x.strip_suffix('"'))
+                    .and_then(fold_echo_cmdsub_text)
+                    .or_else(|| fold_echo_cmdsub_text(e));
+                let e = if let Some(v) = folded {
+                    Cow::Owned(format!("\"{v}\""))
+                } else {
+                    Cow::Borrowed(e)
+                };
                 let e = e
                     .strip_prefix('"')
                     .and_then(|x| x.strip_suffix('"'))
-                    .unwrap_or(e);
+                    .unwrap_or(&e);
                 // `$(( ... ))` — parsed natively; arith always yields a
                 // number (store vars inside coerce via Number()||0, the
                 // arith semantics — the test sees a number, never NaN).
@@ -21155,33 +21558,42 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                     let mut a = parse_arith(inner)?;
                     // `--true64`: a test operand touching a slot/Int64 var
                     // must render pure BigInt arithmetic (mixed ops throw).
-                    // Div/mod: BigInt % 0 throws (Number % 0 -> NaN) — the
-                    // arithEval try/catch maps the bash zero-divisor abort
-                    // to "" (test false), exactly the Number path's NaN.
+                    let bigint = true64_enabled() && arith_mentions_true64(&a);
                     wrap_true64_arith_ast(&mut a);
                     let rendered = arith_to_estree_wrapped(&a);
                     if true64_enabled() && arith_has_div_mod(&a) {
-                        return Some((
-                            sh2_call(
-                                "arithEval",
-                                vec![Expr::ArrowFunctionExpression {
-                                    params: vec![],
-                                    body: ArrowBody::Expr(Box::new(rendered)),
-                                    expression: true,
-                                    r#async: false,
-                                }],
-                            ),
-                            false,
-                        ));
+                        // BigInt % 0 throws (Number % 0 -> NaN); bash
+                        // ABORTS the expansion on a zero divisor (empty ->
+                        // test false). Guard each divisor: `(d ===
+                        // BigInt("0") ? NaN : <arith>)` — NaN === 0 is
+                        // false, exactly the abort semantics.
+                        let mut expr = rendered;
+                        let mut divs: Vec<ArithAst> = Vec::new();
+                        collect_true64_divisors(&a, &mut divs);
+                        for d in divs.into_iter().rev() {
+                            let div = arith_to_estree_wrapped(&d);
+                            expr = Expr::ConditionalExpression {
+                                test: Box::new(Expr::BinaryExpression {
+                                    operator: "===".to_string(),
+                                    left: Box::new(div),
+                                    right: Box::new(bigint_lit_expr(0)),
+                                }),
+                                consequent: Box::new(Expr::Identifier {
+                                    name: "NaN".to_string(),
+                                }),
+                                alternate: Box::new(expr),
+                            };
+                        }
+                        return Some((expr, false, bigint));
                     }
-                    return Some((rendered, false));
+                    return Some((rendered, false, bigint));
                 }
                 let bare = e.strip_prefix('$').unwrap_or(e);
                 // `--true64` slot var: a raw int64 element read — a pure
                 // BigInt (never NaN; the BigInt-vs-Number comparison is
                 // exact, unlike Number(BigInt) which rounds past 2^53)
                 if let Some(k) = slot_var_index(bare) {
-                    return Some((slot_read(k), false));
+                    return Some((slot_read(k), false, true));
                 }
                 if is_lifted(bare) {
                     // lifted NUMERIC vars are pure numbers (never NaN);
@@ -21196,6 +21608,7 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                             name: bare.to_string(),
                         },
                         !is_lifted_num(bare),
+                        false,
                     ));
                 }
                 if let Ok(v) = e.parse::<i64>() {
@@ -21206,6 +21619,7 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                             regex: None,
                         },
                         false,
+                        false,
                     ));
                 }
                 // `$?` / `$#` / `$$` are the runtime's own numeric state
@@ -21213,17 +21627,17 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                 // strings (NaN-risky, like store vars).
                 if let Some(native) = native_special_var(bare) {
                     let risky = !matches!(bare, "?" | "#" | "$");
-                    return Some((native, risky));
+                    return Some((native, risky, false));
                 }
                 if is_plain_ident(bare) {
                     // a plain store var is a string read (risky)
-                    return Some((store_var_read(bare), true));
+                    return Some((store_var_read(bare), true, false));
                 }
                 None
             }
             let l = num_operand(lhs);
             let r = num_operand(rhs);
-            let (Some((l, l_risky)), Some((r, r_risky))) = (l, r) else {
+            let (Some((l, l_risky, l_big)), Some((r, r_risky, r_big))) = (l, r) else {
                 // an operand failed to lower — this ` -op ` position is a
                 // false match (a compound tail / quoted text); keep
                 // scanning for the real operator (the compound path at
@@ -21232,6 +21646,23 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                 continue;
             };
             if !l_risky && !r_risky {
+                // `--true64` BigInt operands: `0n === 0` is FALSE (strict
+                // equality does not coerce BigInt/Number) — equality ops
+                // wrap the BigInt operand in Number() (exact: Number of a
+                // nonzero BigInt is never 0). Relational ops keep the raw
+                // BigInt (exact — BigInt vs Number comparisons are legal).
+                let eq = js == "===" || js == "!==";
+                let numof = |e: Expr| -> Expr {
+                    Expr::CallExpression {
+                        callee: Box::new(Expr::Identifier {
+                            name: "Number".to_string(),
+                        }),
+                        arguments: vec![e],
+                        optional: false,
+                    }
+                };
+                let l = if eq && l_big { numof(l) } else { l };
+                let r = if eq && r_big { numof(r) } else { r };
                 return Some(Expr::BinaryExpression {
                     operator: js.to_string(),
                     left: Box::new(l),
@@ -21375,6 +21806,37 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                     // test call, which consults shoptState dynamically.
                     if CASE_NOCASE.lock().unwrap().unwrap_or(false) {
                         if CASE_NOCASE_DYNAMIC.lock().unwrap().unwrap_or(false) {
+                            // The shopt state can change mid-program, so no
+                            // static fold is exact — EXCEPT a literal-vs-
+                            // literal comparison whose result is
+                            // case-folding-invariant: the runtime folds
+                            // BOTH sides with toLowerCase (ASCII), so when
+                            // `(l == r) == (lc(l) == lc(r))` the raw `===`
+                            // is the same value under every shopt state.
+                            // ASCII-only literals (Rust's to_lowercase and
+                            // JS's toLowerCase agree there; non-ASCII could
+                            // diverge) with no NUL (the runtime truncates
+                            // the pattern at NUL).
+                            if let (Expr::Literal { value: lv, .. }, Expr::Literal { value: rv, .. }) =
+                                (&l, &r)
+                            {
+                                let (ls, rs) = (
+                                    lv.as_str().unwrap_or(""),
+                                    rv.as_str().unwrap_or(""),
+                                );
+                                if !ls.contains('\u{0}')
+                                    && !rs.contains('\u{0}')
+                                    && ls.is_ascii()
+                                    && rs.is_ascii()
+                                    && (ls == rs) == (ls.to_lowercase() == rs.to_lowercase())
+                                {
+                                    return Some(Expr::BinaryExpression {
+                                        operator: js.to_string(),
+                                        left: Box::new(stringify(l)),
+                                        right: Box::new(stringify(r)),
+                                    });
+                                }
+                            }
                             return None;
                         }
                         // the runtime compares `String(ast.l).toLowerCase()`
@@ -21416,6 +21878,69 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
             idx += 1;
         }
     }
+    // `[[ ]]` lexical `<` / `>` string comparison (`"a"<"b"` — bash's
+    // strcoll under the C locale; the runtime's evalTest is a plain JS
+    // `l < r` on the String() forms — a native comparison is the same
+    // value, no glob matching, no nocasematch folding). The runtime
+    // tokenizer splits on `<`/`>` even mid-word, so every position is a
+    // potential operator; quoted/`$`-operands go through
+    // test_value_operand (glob metachars are LITERALS here — unlike
+    // `==`/`!=`, `<`/`>` never glob-match).
+    for (op, js) in [("<", "<"), (">", ">")] {
+        let mut in_q = false;
+        let mut idx = 0usize;
+        let b = s.as_bytes();
+        while idx < b.len() {
+            if b[idx] == b'\'' {
+                if let Some(close) = s[idx + 1..].find('\'') {
+                    idx += close + 2;
+                    continue;
+                }
+                idx += 1;
+                continue;
+            }
+            if b[idx] == b'"' {
+                in_q = !in_q;
+                idx += 1;
+                continue;
+            }
+            if !in_q && s[idx..].starts_with(op) {
+                // `$(( ... ))` arith regions can contain `<`/`>` — the
+                // operand check below rejects the split pieces, so a
+                // false match merely continues the scan (or falls to the
+                // `-eq`/compound paths / the runtime).
+                let (lhs, rhs) = (&s[..idx], &s[idx + op.len()..]);
+                // parens in an operand mean `$(( ... ))` arith or a
+                // grouping — the runtime evaluates/parses those; a native
+                // split would compare garbage text. Refuse (the scan
+                // continues; a `$(( ... ))` whole-test operand stays on
+                // the runtime).
+                if lhs.contains(['(', ')']) || rhs.contains(['(', ')']) {
+                    idx += 1;
+                    continue;
+                }
+                let l = test_value_operand(lhs);
+                let r = test_value_operand(rhs);
+                let (Some(l), Some(r)) = (l, r) else {
+                    idx += 1;
+                    continue;
+                };
+                let stringify = |e: Expr| Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "String".to_string(),
+                    }),
+                    arguments: vec![e],
+                    optional: false,
+                };
+                return Some(Expr::BinaryExpression {
+                    operator: js.to_string(),
+                    left: Box::new(stringify(l)),
+                    right: Box::new(stringify(r)),
+                });
+            }
+            idx += 1;
+        }
+    }
     // Compound `-a` / `-o` chains: the runtime's parseTest binds `-a`
     // tighter than `-o` (`or()` calls `and()`), `!` negates ONE primary,
     // and both short-circuit — a native `&&`/`||` chain of native leaves
@@ -21423,7 +21948,24 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
     // minus the string tokenize/parse/dispatch. Only top-level
     // connectors count: quoted `-a`/`-o` text and paren-grouped
     // compounds stay on the runtime.
-    try_native_compound_test(s)
+    if let Some(native) = try_native_compound_test(s) {
+        return Some(native);
+    }
+    // `!`-negated unary at the top level (`!-e /no/such/file` — the
+    // `[[ ! -e ... ]]` serializer drops the space after `!`): recurse
+    // and negate — the same rule as the compound-leaf path (`!` negates
+    // ONE primary; `!(` is an extglob word, never the operator).
+    if let Some(rest) = s.strip_prefix('!') {
+        if !rest.starts_with('(') {
+            let inner = try_native_test_unstatused(rest.trim())?;
+            return Some(Expr::UnaryExpression {
+                operator: "!".to_string(),
+                argument: Box::new(inner),
+                prefix: true,
+            });
+        }
+    }
+    None
 }
 
 /// The status a native test must record (`$?` reads it back in every
@@ -22998,10 +23540,17 @@ fn file_test_operand(op: &str) -> Option<Expr> {
         }
         return None;
     }
+    // whitespace is fine inside a QUOTED path (the runtime tokenizer
+    // keeps quoted spaces in the operand; unquoted whitespace would split
+    // the test into extra tokens).
+    let quoted = op.starts_with('"') || op.starts_with('\'');
     if bare
         .chars()
         .any(|c| matches!(c, '"' | '\'' | '\\' | '`' | '\n' | '\t' | '\r'))
     {
+        return None;
+    }
+    if !quoted && bare.chars().any(|c| matches!(c, ' ' | '\t')) {
         return None;
     }
     Some(str_lit(bare))
