@@ -11846,21 +11846,139 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
         } else {
             "writeFile"
         },
-        vec![tgt, text],
+        vec![tgt.clone(), text],
     );
-    Some(seq(vec![
-        await_expr(write),
-        Expr::AssignmentExpression {
-            operator: "=".to_string(),
-            left: Box::new(sh2_member("lastExit")),
-            right: Box::new(Expr::Literal {
-                value: serde_json::Value::from(0),
-                raw: None,
-                regex: None,
+    // Write-failure tolerance (core request
+    // go-sh-writefile-eacces): bash reports `bash: <target>: Permission
+    // denied`, sets status 1 and CONTINUES — the uncaught fs rejection
+    // would kill the whole module (empty stdout). Mirror the runtime's
+    // generic redirect error path: `.then(r => (sh2.lastExit = 0, true),
+    // e => (stderr report, sh2.lastExit = 1, false))` — the falsy tail
+    // keeps `&&`/`||`/errexit semantics of the redirect command.
+    let err_msg = Expr::BinaryExpression {
+        operator: "+".to_string(),
+        left: Box::new(Expr::BinaryExpression {
+            operator: "+".to_string(),
+            left: Box::new(Expr::BinaryExpression {
+                operator: "+".to_string(),
+                left: Box::new(Expr::BinaryExpression {
+                    operator: "+".to_string(),
+                    left: Box::new(str_lit("bash: ")),
+                    right: Box::new(tgt.clone()),
+                }),
+                right: Box::new(str_lit(": ")),
             }),
-        },
-        bool_lit(true),
-    ]))
+            right: Box::new(Expr::ConditionalExpression {
+                test: Box::new(Expr::BinaryExpression {
+                    operator: "===".to_string(),
+                    left: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier {
+                            name: "e".to_string(),
+                        }),
+                        property: Box::new(Expr::Identifier {
+                            name: "code".to_string(),
+                        }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    right: Box::new(str_lit("EACCES")),
+                }),
+                consequent: Box::new(str_lit("Permission denied")),
+                alternate: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier {
+                        name: "e".to_string(),
+                    }),
+                    property: Box::new(Expr::Identifier {
+                        name: "code".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+            }),
+        }),
+        right: Box::new(str_lit("\n")),
+    };
+    let stderr_write = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "process".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "stderr".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "write".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![err_msg],
+        optional: false,
+    };
+    let set1 = Expr::AssignmentExpression {
+        operator: "=".to_string(),
+        left: Box::new(sh2_member("lastExit")),
+        right: Box::new(Expr::Literal {
+            value: serde_json::Value::from(1),
+            raw: None,
+            regex: None,
+        }),
+    };
+    let then = Expr::ArrowFunctionExpression {
+        params: vec![Expr::Identifier {
+            name: "r".to_string(),
+        }],
+        body: ArrowBody::Expr(Box::new(seq(vec![
+            Expr::AssignmentExpression {
+                operator: "=".to_string(),
+                left: Box::new(sh2_member("lastExit")),
+                right: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(0),
+                    raw: None,
+                    regex: None,
+                }),
+            },
+            bool_lit(true),
+        ]))),
+        expression: true,
+        r#async: false,
+    };
+    let catch = Expr::ArrowFunctionExpression {
+        params: vec![Expr::Identifier {
+            name: "e".to_string(),
+        }],
+        body: ArrowBody::Expr(Box::new(seq(vec![stderr_write, set1, bool_lit(false)]))),
+        expression: true,
+        r#async: false,
+    };
+    let chained = Expr::CallExpression {
+        callee: Box::new(Expr::MemberExpression {
+            object: Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::MemberExpression {
+                    object: Box::new(write),
+                    property: Box::new(Expr::Identifier {
+                        name: "then".to_string(),
+                    }),
+                    computed: false,
+                    optional: false,
+                }),
+                arguments: vec![then],
+                optional: false,
+            }),
+            property: Box::new(Expr::Identifier {
+                name: "catch".to_string(),
+            }),
+            computed: false,
+            optional: false,
+        }),
+        arguments: vec![catch],
+        optional: false,
+    };
+    Some(await_expr(chained))
 }
 
 /// Native-loop signal scan: does a LOWERED loop body contain a control-flow
@@ -12661,26 +12779,59 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     let errexit = MAY_ERREXIT.lock().unwrap().unwrap_or(true);
                     let dead = loop_status_write_dead(stmt) && !errexit;
                     // shIR markup: a loop provably run at least once (the
-                    // A1's `"runs": true`) needs no ran/last tracking —
-                    // its trailing `sh2.lastExit = ran ? last : 0` would
-                    // be a no-op. The errexit guard stays.
+                    // A1's `"runs": true`) needs no `ran` flag — but when
+                    // the loop's status write is LIVE (a trailing loop's
+                    // final status is observable through sh2._finish, a
+                    // `$?` read, or errexit) the `__sh2_loop_last` tracking
+                    // STAYS: the final cond evaluation's `sh2.lastExit = 1`
+                    // would leak otherwise (bash's loop status is the last
+                    // BODY command's status, or 0 — never the cond's;
+                    // 031_control_flow_loops.sh ends with a provable while
+                    // and bash exits 0 while the bare loop left lastExit 1).
                     let provable = loop_provably_runs(stmt);
                     let mut tracked: Vec<Stmt> = Vec::new();
                     let mut inner: Vec<Stmt> = Vec::new();
-                    if !dead && !provable {
-                        // `let __sh2_loop_ran = false, __sh2_loop_last = 0;`
-                        // — the runtime's `ran`/`bodyLastExit` locals
-                        tracked.push(Stmt::VariableDeclaration {
-                            kind: "let",
-                            declarations: vec![
-                                VariableDeclarator {
-                                    type_: "VariableDeclarator",
-                                    id: Expr::Identifier {
-                                        name: "__sh2_loop_ran".to_string(),
+                    if !dead {
+                        if !provable {
+                            // `let __sh2_loop_ran = false, __sh2_loop_last = 0;`
+                            // — the runtime's `ran`/`bodyLastExit` locals
+                            tracked.push(Stmt::VariableDeclaration {
+                                kind: "let",
+                                declarations: vec![
+                                    VariableDeclarator {
+                                        type_: "VariableDeclarator",
+                                        id: Expr::Identifier {
+                                            name: "__sh2_loop_ran".to_string(),
+                                        },
+                                        init: Some(bool_lit(false)),
                                     },
-                                    init: Some(bool_lit(false)),
+                                    VariableDeclarator {
+                                        type_: "VariableDeclarator",
+                                        id: Expr::Identifier {
+                                            name: "__sh2_loop_last".to_string(),
+                                        },
+                                        init: Some(Expr::Literal {
+                                            value: serde_json::Value::from(0),
+                                            raw: None,
+                                            regex: None,
+                                        }),
+                                    },
+                                ],
+                            });
+                            inner.push(Stmt::ExpressionStatement {
+                                expression: Expr::AssignmentExpression {
+                                    operator: "=".to_string(),
+                                    left: Box::new(Expr::Identifier {
+                                        name: "__sh2_loop_ran".to_string(),
+                                    }),
+                                    right: Box::new(bool_lit(true)),
                                 },
-                                VariableDeclarator {
+                            });
+                        } else {
+                            // Provable: only `let __sh2_loop_last = 0;`
+                            tracked.push(Stmt::VariableDeclaration {
+                                kind: "let",
+                                declarations: vec![VariableDeclarator {
                                     type_: "VariableDeclarator",
                                     id: Expr::Identifier {
                                         name: "__sh2_loop_last".to_string(),
@@ -12690,21 +12841,12 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                                         raw: None,
                                         regex: None,
                                     }),
-                                },
-                            ],
-                        });
-                        inner.push(Stmt::ExpressionStatement {
-                            expression: Expr::AssignmentExpression {
-                                operator: "=".to_string(),
-                                left: Box::new(Expr::Identifier {
-                                    name: "__sh2_loop_ran".to_string(),
-                                }),
-                                right: Box::new(bool_lit(true)),
-                            },
-                        });
+                                }],
+                            });
+                        }
                     }
                     inner.extend(body_stmts);
-                    if !dead && !provable {
+                    if !dead {
                         // `__sh2_loop_last = sh2.lastExit;` — the runtime's
                         // bodyLastExit read after the body fn
                         inner.push(Stmt::ExpressionStatement {
@@ -12721,22 +12863,29 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             body: Box::new(Stmt::BlockStatement { body: inner }),
                         });
                         // `sh2.lastExit = __sh2_loop_ran ? __sh2_loop_last : 0;`
+                        // (provable: `__sh2_loop_last` directly — it ran)
                         tracked.push(Stmt::ExpressionStatement {
                             expression: Expr::AssignmentExpression {
                                 operator: "=".to_string(),
                                 left: Box::new(sh2_member("lastExit")),
-                                right: Box::new(Expr::ConditionalExpression {
-                                    test: Box::new(Expr::Identifier {
-                                        name: "__sh2_loop_ran".to_string(),
-                                    }),
-                                    consequent: Box::new(Expr::Identifier {
+                                right: Box::new(if provable {
+                                    Expr::Identifier {
                                         name: "__sh2_loop_last".to_string(),
-                                    }),
-                                    alternate: Box::new(Expr::Literal {
-                                        value: serde_json::Value::from(0),
-                                        raw: None,
-                                        regex: None,
-                                    }),
+                                    }
+                                } else {
+                                    Expr::ConditionalExpression {
+                                        test: Box::new(Expr::Identifier {
+                                            name: "__sh2_loop_ran".to_string(),
+                                        }),
+                                        consequent: Box::new(Expr::Identifier {
+                                            name: "__sh2_loop_last".to_string(),
+                                        }),
+                                        alternate: Box::new(Expr::Literal {
+                                            value: serde_json::Value::from(0),
+                                            raw: None,
+                                            regex: None,
+                                        }),
+                                    }
                                 }),
                             },
                         });
@@ -12772,37 +12921,14 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         }
                         return Some(Stmt::BlockStatement { body: tracked });
                     }
-                    // provable loop (the A1's `"runs": true`): bare
-                    // native while — the body's last command already leaves
-                    // sh2.lastExit correct — but keep the errexit guard.
-                    if provable && errexit && is_top_level_stmt() {
-                        let mut out = vec![Stmt::WhileStatement {
-                            test: cond_e,
-                            body: Box::new(Stmt::BlockStatement { body: inner }),
-                        }];
-                        out.push(Stmt::IfStatement {
-                            test: Expr::LogicalExpression {
-                                operator: "&&".to_string(),
-                                left: Box::new(sh2_member("errexit")),
-                                right: Box::new(Expr::BinaryExpression {
-                                    operator: "!==".to_string(),
-                                    left: Box::new(sh2_member("lastExit")),
-                                    right: Box::new(Expr::Literal {
-                                        value: serde_json::Value::from(0),
-                                        raw: None,
-                                        regex: None,
-                                    }),
-                                }),
-                            },
-                            consequent: Box::new(Stmt::BlockStatement {
-                                body: vec![Stmt::ExpressionStatement {
-                                    expression: process_exit(sh2_member("lastExit")),
-                                }],
-                            }),
-                            alternate: None,
-                        });
-                        return Some(Stmt::BlockStatement { body: out });
-                    }
+                    // The !dead case returned above (tracked). Here the
+                    // loop's status write is DEAD (and no errexit): the
+                    // bare native while is fine — nobody observes the
+                    // final cond's lastExit. (The old provable+errexit
+                    // branch was subsumed: errexit forces !dead, so a
+                    // provable loop under errexit now takes the tracking
+                    // path above, where the restored loop status feeds
+                    // the guard.)
                     // dead loop status: bare native while, zero tracking
                     return Some(Stmt::WhileStatement {
                         test: cond_e,
@@ -25299,7 +25425,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // impl is String(h).includes(n), so emit it NATIVE (no dispatch)
             if func == "contains" {
                 if let [h, n] = args.as_slice() {
-                    return Expr::CallExpression {
+                    let native = Expr::CallExpression {
                         callee: Box::new(Expr::MemberExpression {
                             object: Box::new(Expr::CallExpression {
                                 callee: Box::new(Expr::Identifier {
@@ -25317,6 +25443,45 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         arguments: vec![expr_to_estree(n)],
                         optional: false,
                     };
+                    if *AND_OR_DEPTH.lock().unwrap() == 0 {
+                        return native;
+                    }
+                    // Status-recording (core request
+                    // go-sh-contains-and-or): `contains` operands inside
+                    // `&&`/`||` chains branch on `sh2.lastExit`
+                    // (native_and_or's protocol), which a bare native
+                    // `.includes` never sets — record it exactly like the
+                    // `test` arm: `(sh2._g = String(h).includes(n),
+                    // sh2.lastExit = sh2._g ? 0 : 1, sh2._g)`. The
+                    // sequence value is the boolean, so bare if-cond
+                    // uses are unchanged, and `!contains` (not_native)
+                    // derives lastExit from the boolean value.
+                    let tmp = sh2_member("_g");
+                    return seq(vec![
+                        Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(tmp.clone()),
+                            right: Box::new(native),
+                        },
+                        Expr::AssignmentExpression {
+                            operator: "=".to_string(),
+                            left: Box::new(sh2_member("lastExit")),
+                            right: Box::new(Expr::ConditionalExpression {
+                                test: Box::new(tmp.clone()),
+                                consequent: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(0),
+                                    raw: None,
+                                    regex: None,
+                                }),
+                                alternate: Box::new(Expr::Literal {
+                                    value: serde_json::Value::from(1),
+                                    raw: None,
+                                    regex: None,
+                                }),
+                            }),
+                        },
+                        tmp,
+                    ]);
                 }
             }
             // `line(s, i)` — the i-th line of a captured multi-value

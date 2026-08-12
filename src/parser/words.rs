@@ -3352,8 +3352,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
 // Placeholder functions - these would need to be implemented based on the actual AST structures
 
 fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
-    use crate::ast::{Command, SimpleCommand, StringInterpolation, StringPart, Word};
-    use std::collections::{BTreeMap, HashMap};
+    use crate::ast::{StringInterpolation, Word};
 
     // Get the double-quoted string content (this includes the quotes)
     let string_content = lexer.get_string_text()?;
@@ -3365,13 +3364,7 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
         &string_content
     };
 
-    let content = content.replace("\\\"", "\"");
-    let content = content.replace("\\\\", "\\");
-    // Remove backslash-newline line continuations (\<newline>)
-    // that were not handled by the lexer's regex (logos captures
-    // them inside the DoubleQuotedString token).
-    let content = content.replace("\\\n", "");
-    let content = content.replace("\\\r\n", "");
+    let content = unescape_interpolation_content(content);
 
     if crate::debug::is_debug_enabled() {
         eprintln!(
@@ -3380,6 +3373,37 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
             &content[..content.len().min(80)]
         );
     }
+
+    let parts = scan_interpolation_parts(&content)?;
+
+    Ok(Word::StringInterpolation(
+        StringInterpolation { parts },
+        None,
+    ))
+}
+
+/// The double-quoted-string content preprocessing shared by both
+/// interpolation scanners: `\"` → `"`, `\\` → `\`, and backslash-newline
+/// line continuations are removed (the lexer's DoubleQuotedString regex
+/// captures them inside the token).
+fn unescape_interpolation_content(content: &str) -> String {
+    content
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
+        .replace("\\\n", "")
+        .replace("\\\r\n", "")
+}
+
+/// Scan a double-quoted string's content into interpolation parts:
+/// literal text, `$var` / `${...}` / `$((...))` / `$(...)` / backtick
+/// substitutions. Shared by the lexer-driven `parse_string_interpolation`
+/// and the LongOption-quoted-value path
+/// (`parse_string_interpolation_from_literal` — `--x="${X}"` must keep
+/// the expansion as a part, not flatten it into the literal; the corpus
+/// test parse-longoption-with-dollar.sh documents this).
+fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserError> {
+    use crate::ast::{Command, SimpleCommand, StringPart};
+    use std::collections::BTreeMap;
 
     // Parse the string content to extract literal parts and variable references
     let mut parts = Vec::new();
@@ -3417,8 +3441,13 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     parts.push(StringPart::Literal(format!("\\\\`{}\\\\`", cmd_content)));
                 }
             } else {
-                // Unmatched escaped backtick, treat as literal
-                parts.push(StringPart::Literal("\\\\`".to_string()));
+                // Unmatched escaped backtick (`\\\`` = escaped backslash
+                // + escaped backtick in a DQS): bash consumes BOTH escapes —
+                // `\\` → `\` and `\`` → a literal backtick — so the
+                // literal text is `\`` (one backslash + backtick), NOT the
+                // raw `\\\``. (echo-with-escaped-backtick.sh: top-level
+                // DQS `\`` with no closing pair.)
+                parts.push(StringPart::Literal("\\`".to_string()));
                 i = cmd_start;
             }
         } else if content[i..].starts_with("\\`") {
@@ -3450,8 +3479,15 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     parts.push(StringPart::Literal(format!("\\`{}\\`", cmd_content)));
                 }
             } else {
-                // Unmatched escaped backtick, treat as literal
-                parts.push(StringPart::Literal("\\`".to_string()));
+                // Unmatched single-escaped backtick (a DQS `\\`` with no
+                // closing pair): bash consumes the backslash — the result
+                // is a literal backtick, NOT `\\`` (echo-with-escaped-
+                // backtick.sh + -and-quotes.sh print `Invalid
+                // configuration `...`). In a backtick-cmdsub context a
+                // MATCHED `\\`...\\`` pair is a nested substitution (the
+                // branch above); an unmatched one is a literal backtick
+                // in every context.
+                parts.push(StringPart::Literal("`".to_string()));
                 i = cmd_start;
             }
         } else if content[i..].starts_with("`") {
@@ -3916,18 +3952,18 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
         parts.push(StringPart::Literal(content.to_string()));
     }
 
-    Ok(Word::StringInterpolation(
-        StringInterpolation { parts },
-        None,
-    ))
+    Ok(parts)
 }
 
-/// Parse a literal string as string interpolation to handle escaped backticks
+/// Parse a literal string as string interpolation — the LongOption lexer
+/// path (`--x="${X}"` merges the quoted value into the option text as raw
+/// text) and the Perl generator's echo/arg handling re-parse a quoted
+/// value that may hold expansions. The FULL scanner runs here (not just
+/// backticks): `--x="${X}"` must produce a ParameterExpansion part or the
+/// generated code prints `\${X}` literally (parse-longoption-with-dollar.sh). to handle escaped backticks
 pub fn parse_string_interpolation_from_literal(
     literal: &str,
 ) -> Result<StringInterpolation, ParserError> {
-    use crate::ast::{StringInterpolation, StringPart};
-
     // Remove outer quotes if present
     let content = if (literal.starts_with('"') && literal.ends_with('"'))
         || (literal.starts_with('\'') && literal.ends_with('\''))
@@ -3937,162 +3973,9 @@ pub fn parse_string_interpolation_from_literal(
         literal
     };
 
-    // Parse the string content to extract literal parts and command substitutions
-    let mut parts = Vec::new();
-    let mut current_literal = String::new();
-    let mut i = 0;
+    let content = unescape_interpolation_content(content);
 
-    while i < content.len() {
-        if content[i..].starts_with("\\\\`") {
-            // We found an escaped backtick command substitution
-            // First, add any accumulated literal text
-            if !current_literal.is_empty() {
-                parts.push(StringPart::Literal(current_literal.clone()));
-                current_literal.clear();
-            }
-
-            // Find the closing escaped backtick
-            i += 3; // skip the \\`
-            let cmd_start = i;
-            while i < content.len() && !content[i..].starts_with("\\\\`") {
-                let ch = content[i..].chars().next().unwrap_or('?');
-                i += ch.len_utf8();
-            }
-
-            if i < content.len() {
-                // We found a complete escaped command substitution
-                let cmd_content = &content[cmd_start..i];
-                i += 3; // skip the closing \\`
-
-                // Parse the command content as a pipeline (to handle pipes)
-                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
-                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
-                } else {
-                    // Fall back to treating it as a literal
-                    parts.push(StringPart::Literal(format!("\\\\`{}\\\\`", cmd_content)));
-                }
-            } else {
-                // Unmatched escaped backtick, treat as literal
-                parts.push(StringPart::Literal("\\\\`".to_string()));
-                i = cmd_start;
-            }
-        } else if content[i..].starts_with("\\`") {
-            // We found a single-escaped backtick command substitution
-            // First, add any accumulated literal text
-            if !current_literal.is_empty() {
-                parts.push(StringPart::Literal(current_literal.clone()));
-                current_literal.clear();
-            }
-
-            // Find the closing escaped backtick
-            i += 2; // skip the \`
-            let cmd_start = i;
-            while i < content.len() && !content[i..].starts_with("\\`") {
-                let ch = content[i..].chars().next().unwrap_or('?');
-                i += ch.len_utf8();
-            }
-
-            if i < content.len() {
-                // We found a complete escaped command substitution
-                let cmd_content = &content[cmd_start..i];
-                i += 2; // skip the closing \`
-
-                // Parse the command content as a pipeline (to handle pipes)
-                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
-                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
-                } else {
-                    // Fall back to treating it as a literal
-                    parts.push(StringPart::Literal(format!("\\`{}\\`", cmd_content)));
-                }
-            } else {
-                // Unmatched escaped backtick, treat as literal
-                parts.push(StringPart::Literal("\\`".to_string()));
-                i = cmd_start;
-            }
-        } else if content[i..].starts_with("`") {
-            // We found a backtick command substitution
-            // First, add any accumulated literal text
-            if !current_literal.is_empty() {
-                parts.push(StringPart::Literal(current_literal.clone()));
-                current_literal.clear();
-            }
-
-            // Find the closing backtick
-            i += 1; // skip the opening `
-            let cmd_start = i;
-            while i < content.len() && content[i..].chars().next() != Some('`') {
-                let ch = content[i..].chars().next().unwrap_or('?');
-                i += ch.len_utf8();
-            }
-
-            if i < content.len() {
-                // We found a complete command substitution
-                let cmd_content = &content[cmd_start..i];
-                i += 1; // skip the closing `
-
-                // Parse the command content using the full parser to handle pipelines
-                let sub_lexer = Lexer::new(cmd_content);
-                let mut sub_parser = Parser::new_with_lexer(sub_lexer);
-                match sub_parser.parse() {
-                    Ok(commands) => {
-                        eprintln!(
-                            "DEBUG: String interpolation parsed command '{}' as {} commands",
-                            cmd_content,
-                            commands.len()
-                        );
-                        if commands.len() == 1 {
-                            parts.push(StringPart::CommandSubstitution(Box::new(
-                                commands[0].clone(),
-                            )));
-                        } else if commands.is_empty() {
-                            // If no commands parsed, treat as a simple command with the text as argument
-                            let placeholder_cmd = Command::Simple(SimpleCommand {
-                                name: Word::Literal("echo".to_string(), None),
-                                args: vec![Word::Literal(cmd_content.to_string(), None)],
-                                redirects: Vec::new(),
-                                env_vars: BTreeMap::new(),
-                                stdout_used: true,
-                                stderr_used: true,
-                            });
-                            parts.push(StringPart::CommandSubstitution(Box::new(placeholder_cmd)));
-                        } else {
-                            // If multiple commands, use the first one
-                            parts.push(StringPart::CommandSubstitution(Box::new(
-                                commands[0].clone(),
-                            )));
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "DEBUG: String interpolation failed to parse command '{}': {:?}",
-                            cmd_content, e
-                        );
-                        // Fall back to treating it as a literal
-                        parts.push(StringPart::Literal(format!("`{}`", cmd_content)));
-                    }
-                }
-            } else {
-                // Unmatched backtick, treat as literal
-                parts.push(StringPart::Literal("`".to_string()));
-                i = cmd_start;
-            }
-        } else {
-            // Add to current literal
-            let ch = content[i..].chars().next().unwrap();
-            current_literal.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-
-    // Add any remaining literal text
-    if !current_literal.is_empty() {
-        parts.push(StringPart::Literal(current_literal));
-    }
-
-    // If we have no parts, this shouldn't happen, but handle it gracefully
-    if parts.is_empty() {
-        parts.push(StringPart::Literal(content.to_string()));
-    }
+    let parts = scan_interpolation_parts(&content)?;
 
     Ok(StringInterpolation { parts })
 }

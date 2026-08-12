@@ -220,7 +220,8 @@ fn render_ir(prog: &crate::ir::IrProgram, lang: &str) -> Result<String, String> 
 
 fn otranspilerl_transpile_impl(src: &str, src_lang: &str, tgt_lang: &str) -> Result<String, String> {
     if src_lang == "shir" {
-        let prog = crate::shir_json_in::shir_json_to_ir(src)?;
+        let mut prog = crate::shir_json_in::shir_json_to_ir(src)?;
+        crate::shir_passes::strip_cfor(&mut prog);
         return render_ir(&prog, tgt_lang);
     }
     if src_lang == "sh" {
@@ -247,7 +248,11 @@ pub extern "C" fn otranspilerl_shir(src: *const u8, src_len: usize) -> *mut u8 {
 pub extern "C" fn otranspilerl_render(a1: *const u8, a1_len: usize, lang: *const u8, lang_len: usize) -> *mut u8 {
     let a1 = read_str(a1, a1_len);
     let lang = read_str(lang, lang_len);
-    let res = crate::shir_json_in::shir_json_to_ir(&a1).and_then(|prog| render_ir(&prog, &lang));
+    let res = crate::shir_json_in::shir_json_to_ir(&a1)
+        .and_then(|mut prog| {
+            crate::shir_passes::strip_cfor(&mut prog);
+            render_ir(&prog, &lang)
+        });
     match res {
         Ok(out) => alloc_string(&ok_json(&out)),
         Err(e) => alloc_string(&err_json(&e)),
