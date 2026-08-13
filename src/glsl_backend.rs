@@ -138,7 +138,8 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
             r.arith_vars.insert(n.to_string());
         }
         if opts.tex_size > 0 {
-            for n in ["uv_x", "uv_y", "tex_r", "tex_g", "tex_b"] {
+            for n in ["uv_x", "uv_y", "tex_r", "tex_g", "tex_b",
+                      "damage", "cr_r", "cr_g", "cr_b", "cr_a"] {
                 r.vars.insert(n.to_string());
                 r.arith_vars.insert(n.to_string());
             }
@@ -182,6 +183,8 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
         if opts.tex_size > 0 {
             r.emit(if r.opts.es100 { "varying vec2 vUv;" } else { "in vec2 vUv;" });
             r.emit("uniform sampler2D uTex;");
+            r.emit("uniform sampler2D uCrack;");
+            r.emit("uniform int uDamage;");
         }
     }
     r.emit("");
@@ -207,6 +210,12 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
             r.emit(&format!("g_tex_r = int(texture2D(uTex, {uv}).r * 255.0);"));
             r.emit(&format!("g_tex_g = int(texture2D(uTex, {uv}).g * 255.0);"));
             r.emit(&format!("g_tex_b = int(texture2D(uTex, {uv}).b * 255.0);"));
+            // the crack overlay: uDamage (0..3) + the crack texel (RGBA)
+            r.emit("g_damage = uDamage;");
+            r.emit(&format!("g_cr_r = int(texture2D(uCrack, {uv}).r * 255.0);"));
+            r.emit(&format!("g_cr_g = int(texture2D(uCrack, {uv}).g * 255.0);"));
+            r.emit(&format!("g_cr_b = int(texture2D(uCrack, {uv}).b * 255.0);"));
+            r.emit(&format!("g_cr_a = int(texture2D(uCrack, {uv}).a * 255.0);"));
         }
     }
     for s in &prog.stmts {
@@ -1255,7 +1264,9 @@ impl Render {
                 self.todo += 1;
                 return format!("/* TODO(getVar {}) */ 0", sanitize(name));
             };
-            if self.is_num(base) {
+            if self.float_vars.contains(base) {
+                format!("int({})", self.ident(base))
+            } else if self.is_num(base) {
                 self.ident(base)
             } else {
                 format!("s2i({})", self.ident(base))
@@ -2000,7 +2011,7 @@ impl Render {
     /// left-recursive and the unary applies first — bc parity).
     fn parse_float_expr(&mut self, src: &str, slots: &[&IrExpr]) -> String {
         let toks = self.lex_float(src);
-        let (v, rest) = self.float_prec(&toks, 0, slots);
+        let (v, rest) = self.float_prec(&toks, 0, 0, slots);
         let _ = rest;
         v
     }
@@ -2061,10 +2072,11 @@ impl Render {
     fn float_prec(
         &mut self,
         toks: &[(String, usize)],
+        start: usize,
         min_prec: u8,
         slots: &[&IrExpr],
     ) -> (String, usize) {
-        let (mut lhs, mut idx) = self.float_unary(toks, 0, slots);
+        let (mut lhs, mut idx) = self.float_unary(toks, start, slots);
         while idx < toks.len() {
             let (op, _) = &toks[idx];
             let (p, right_assoc) = match op.as_str() {
@@ -2077,7 +2089,8 @@ impl Render {
                 break;
             }
             idx += 1;
-            let (rhs, ni) = self.float_prec(toks, p + if right_assoc { 0 } else { 1 }, slots);
+            let (rhs, ni) =
+                self.float_prec(toks, idx, p + if right_assoc { 0 } else { 1 }, slots);
             idx = ni;
             let r = match op.as_str() {
                 "^" => format!("pow({lhs}, {rhs})"),
@@ -2105,7 +2118,7 @@ impl Render {
                 (format!("({}{v})", if t == "-" { "-" } else { "" }), ni)
             }
             "(" => {
-                let (v, ni) = self.float_prec(toks, 0, slots);
+                let (v, ni) = self.float_prec(toks, idx + 1, 0, slots);
                 if ni < toks.len() && toks[ni].0 == ")" {
                     (format!("({v})"), ni + 1)
                 } else {
@@ -2440,6 +2453,7 @@ impl Render {
             IrStmt::WriteFile { .. } => self.mark_todo("write-file"),
             IrStmt::Die { .. } => self.mark_todo("die"),
             IrStmt::Warn { .. } => self.mark_todo("warn"),
+            IrStmt::Try { .. } => self.mark_todo("try"),
             IrStmt::Output {
                 value,
                 newline,
