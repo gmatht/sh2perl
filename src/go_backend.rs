@@ -1898,7 +1898,7 @@ impl Render {
                 let list = self.cmd_text_expr(iter)?;
                 Some(format!("for {var} in {list}; do {b}; done"))
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 let b = self.cmd_text_stmts(body)?;
                 Some(format!("{name}() {{ {b}; }}"))
             }
@@ -2611,7 +2611,7 @@ impl Render {
                     self.stmt(s);
                 }
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 let m = self.go_ident(name);
                 self.mark_written(name);
                 self.functions.insert(name.clone());
@@ -5384,7 +5384,7 @@ fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>, arrays: &mut BT
                     collect_written(&c.body, out, arrays);
                 }
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 out.insert(name.clone());
                 collect_written(body, out, arrays);
             }

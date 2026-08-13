@@ -5857,7 +5857,7 @@ fn collect_fn_defs(
 ) {
     for s in stmts {
         match s {
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 names.insert(name.clone());
                 defs.push((name.clone(), body.clone()));
             }

@@ -1095,7 +1095,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("esac\n");
             Ok(())
         }
-        IrStmt::Function { name, body } => {
+        IrStmt::Function { name, body, .. } => {
             indent(out, d);
             out.push_str(name);
             out.push_str("() {\n");
@@ -4264,7 +4264,7 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             out.push_str(" esac");
             Ok(out)
         }
-        IrStmt::Function { name, body } => Ok(format!("{name}() {{ {}; }}", stmts_inline(body)?)),
+        IrStmt::Function { name, body, .. } => Ok(format!("{name}() {{ {}; }}", stmts_inline(body)?)),
         IrStmt::Redirect { inner, redirects } => {
             let mut out = herestring_wrap(redirects, stmts_inline(inner)?)?;
             out.push_str(&redirects_to_sh(redirects)?);

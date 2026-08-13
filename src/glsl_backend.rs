@@ -76,6 +76,11 @@ pub struct Render {
     arrays: BTreeSet<String>, // indexed arrays
     arith_assigned: BTreeSet<String>, // vars assigned from $((...)) → Num in GLSL
     float_vars: BTreeSet<String>, // vars assigned from a float bc capture → GLSL float
+    used_str: bool,   // the program uses strings/scratch (the ES-3.00-only runtime)
+    used_putb: bool,  // the program emits output bytes (putb)
+    used_ipow: bool,  // arithmetic ** (pow)
+    used_isqrt: bool, // arithmetic sqrt
+    putb_pos: usize,  // ES 1.00: the fixed out_buf slot for the next putb
     fns: BTreeSet<String>,    // user function names
     fn_bodies: BTreeMap<String, Vec<IrStmt>>, // Function stmt bodies (hoisted)
     fn_order: Vec<String>,    // first-seen order (deterministic emission)
@@ -273,7 +278,7 @@ impl Default for Render {
         Render {
             out: Vec::new(),
             body: Vec::new(),
-            phase: Phase::Body,
+            phase: Phase::Header,
             depth: 0,
             types: BTreeMap::new(),
             vars: BTreeSet::new(),
@@ -281,6 +286,11 @@ impl Default for Render {
             arrays: BTreeSet::new(),
             arith_assigned: BTreeSet::new(),
             float_vars: BTreeSet::new(),
+            used_str: false,
+            used_putb: false,
+            used_ipow: false,
+            used_isqrt: false,
+            putb_pos: 0,
             fns: BTreeSet::new(),
             fn_bodies: BTreeMap::new(),
             fn_order: Vec::new(),
@@ -339,6 +349,9 @@ impl Render {
 
     // ── string table ────────────────────────────────────────────────
     fn strlit(&mut self, s: &str) -> String {
+        if self.phase == Phase::Body {
+            self.used_str = true;
+        }
         if let Some(&(o, l)) = self.str_offsets.get(s) {
             return format!("ivec2({o}, {l})");
         }
@@ -353,6 +366,14 @@ impl Render {
     }
 
     fn emit_table(&mut self) {
+        // ES 1.00 has no array constructors at all — and the string
+        // machinery (s_tab, s2i/itos/cat/strEq/scratch) is an ES-3.00
+        // runtime (dynamic indexing of non-uniform arrays is illegal in
+        // ES 1.00). Render fragments like the game's are pure integer
+        // pipelines and use NO strings — omit the table entirely then.
+        if !self.used_str {
+            return;
+        }
         // ES 1.00 needs the size in the constructor: int[N](...) — ES
         // 3.00 allows the shorthand int[](...).
         let ctor = |n: usize, items: &str| {
@@ -396,8 +417,10 @@ impl Render {
                 self.emit(&format!("ivec2 {n};"));
             }
         }
-        self.emit(&format!("int s_scratch[{SCRATCH_CAP}];"));
-        self.emit("int s_spos = 0;");
+        if self.used_str {
+            self.emit(&format!("int s_scratch[{SCRATCH_CAP}];"));
+            self.emit("int s_spos = 0;");
+        }
         self.emit(&format!("int out_buf[{OUT_CAP}];"));
         self.emit("int out_len = 0;");
         self.emit(&format!("ivec2 g_pa[{PARAM_CAP}];"));
@@ -414,6 +437,10 @@ impl Render {
 
     // ── runtime helpers ─────────────────────────────────────────────
     fn emit_helpers(&mut self) {
+        // the string/scratch runtime — only when the program uses it
+        if !self.used_str {
+            return;
+        }
         self.emit("int s2i(ivec2 s) {");
         self.emit("    int v = 0; int i = 0; int sign = 1;");
         self.emit("    if (s.y > 0 && s_tab[s.x] == 45) { sign = -1; i = 1; }");
@@ -473,12 +500,15 @@ impl Render {
         self.emit("    return pi == p.y;");
         self.emit("}");
         self.emit("");
+        if self.used_ipow {
         self.emit("int ipow(int a, int b) {");
         self.emit("    int r = 1;");
         self.emit("    for (int i = 0; i < b; i++) { r = r * a; }");
         self.emit("    return r;");
         self.emit("}");
         self.emit("");
+        }
+        if self.used_isqrt {
         self.emit("int isqrt32(int v) {");
         self.emit("    if (v <= 0) return 0;");
         self.emit("    int lo = 0;");
@@ -491,6 +521,7 @@ impl Render {
         self.emit("    return lo;");
         self.emit("}");
         self.emit("");
+        }
     }
 
     fn emit_fn_prototypes(&mut self) {
@@ -643,7 +674,7 @@ impl Render {
                     }
                 }
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 if !self.fns.contains(name) {
                     self.fn_order.push(name.clone());
                 }
@@ -1046,8 +1077,17 @@ impl Render {
             BinOpKind::Sub => "-",
             BinOpKind::Mul => "*",
             BinOpKind::Div => "/",
-            BinOpKind::Mod => "%",
+            BinOpKind::Mod => {
+                // ES 1.00 has no integer % — lower to a - b*(a/b) (GLSL
+                // int division truncates toward zero, like bash's %)
+                return if self.opts.es100 {
+                    format!("(({l}) - (({r}) * (({l}) / ({r}))))")
+                } else {
+                    format!("(({l}) % ({r}))")
+                };
+            }
             BinOpKind::Pow => {
+                self.used_ipow = true;
                 return format!("ipow({l}, {r})");
             }
             BinOpKind::BitAnd => "&",
@@ -1383,13 +1423,19 @@ impl Render {
                 let l = self.arith(lhs);
                 let r = self.arith(rhs);
                 match op.as_str() {
-                    "**" => format!("ipow({l}, {r})"),
+                    "**" => {
+                        self.used_ipow = true;
+                        format!("ipow({l}, {r})")
+                    }
                     "&&" | "||" => {
                         let g = if op == "&&" { "&&" } else { "||" };
                         format!("((({l}) != 0) {g} (({r}) != 0)) ? 1 : 0")
                     }
                     "==" | "!=" | "<" | "<=" | ">" | ">=" => {
                         format!("(({l}) {op} ({r})) ? 1 : 0")
+                    }
+                    "%" if self.opts.es100 => {
+                        format!("(({l}) - (({r}) * (({l}) / ({r}))))")
                     }
                     _ => format!("(({l}) {op} ({r}))"),
                 }
@@ -1895,6 +1941,7 @@ impl Render {
         {
             if l1.trim_end() == "sqrt(" && l2.trim_start() == ")" {
                 let n = self.expr_num(inner);
+                self.used_isqrt = true;
                 return Some(format!(
                     "(({n}) >= 0 ? isqrt32({n}) : /* TODO(bc neg sqrt) */ 0)"
                 ));
@@ -2165,6 +2212,9 @@ impl Render {
                     }
                     "==" | "!=" | "<" | "<=" | ">" | ">=" => {
                         format!("(({l}) {op} ({r})) ? 1 : 0")
+                    }
+                    "%" if self.opts.es100 => {
+                        format!("(({l}) - (({r}) * (({l}) / ({r}))))")
                     }
                     _ => format!("(({l}) {op} ({r}))"),
                 }
@@ -2493,9 +2543,17 @@ impl Render {
             // `putb N` — emit one byte into out_buf (the render-mode
             // colour channel). GLSL has no char type; N is an int 0-255.
             IrExpr::Call { func, args } if func == "putb" => {
+                self.used_putb = true;
                 if let Some(n) = args.first() {
                     let v = self.expr_num(n);
-                    self.emit(&format!("putCh({v});"));
+                    if self.opts.es100 {
+                        // ES 1.00: a fixed const index (the runtime's
+                        // out_buf[out_len++] is dynamic — not allowed)
+                        self.emit(&format!("out_buf[{}] = {v};", self.putb_pos));
+                        self.putb_pos += 1;
+                    } else {
+                        self.emit(&format!("putCh({v});"));
+                    }
                 } else {
                     self.mark_todo("putb no arg");
                 }
@@ -2625,7 +2683,15 @@ impl Render {
                         _ => items[0].clone(),
                     };
                     let v = self.expr_num(&item);
-                    self.emit(&format!("putCh({v});"));
+                    self.used_putb = true;
+                    if self.opts.es100 {
+                        // ES 1.00: a fixed const index (the runtime's
+                        // out_buf[out_len++] is dynamic — not allowed)
+                        self.emit(&format!("out_buf[{}] = {v};", self.putb_pos));
+                        self.putb_pos += 1;
+                    } else {
+                        self.emit(&format!("putCh({v});"));
+                    }
                 } else {
                     self.mark_todo("putb arity");
                 }

@@ -1962,7 +1962,7 @@ impl Render {
                     self.mark_todo("case clauses");
                 }
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 self.funcs.insert(name.clone());
                 let mut saved = self.in_func;
                 self.in_func += 1;
@@ -2122,7 +2122,7 @@ impl Render {
     fn collect_funcs(&mut self, stmts: &[IrStmt]) {
         for s in stmts {
             match s {
-                IrStmt::Function { name, body } => {
+                IrStmt::Function { name, body, .. } => {
                     self.funcs.insert(name.clone());
                     self.collect_funcs(body);
                 }

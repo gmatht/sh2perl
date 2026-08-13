@@ -618,7 +618,41 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
         "Function" => {
             let name = req_str(o, "name", where_)?.to_string();
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
-            IrStmt::Function { name, body }
+            // PowerShell named blocks (core-request powershell-sh-go): an
+            // optional map `block_name -> stmt[]` (dynamicparam / begin /
+            // process / end / clean). Absent = no named blocks (all
+            // existing frontend emits parse unchanged). Unknown block
+            // names REFUSE — the ESTree renderer dispatches on exactly
+            // these five and a stray name would silently miscompile.
+            let mut named_blocks: Vec<(String, Vec<IrStmt>)> = Vec::new();
+            match o.get("named_blocks") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::Object(m)) => {
+                    for (k, v) in m {
+                        if !matches!(
+                            k.as_str(),
+                            "dynamicparam" | "begin" | "process" | "end" | "clean"
+                        ) {
+                            return Err(format!(
+                                "{where_}.named_blocks: unknown block name `{k}` (expected dynamicparam/begin/process/end/clean)"
+                            ));
+                        }
+                        let stmts =
+                            stmts_from(Some(v), &format!("{where_}.named_blocks.{k}"))?;
+                        named_blocks.push((k.clone(), stmts));
+                    }
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "{where_}.named_blocks: expected an object of block_name -> stmt[], got {other}"
+                    ));
+                }
+            }
+            IrStmt::Function {
+                name,
+                body,
+                named_blocks,
+            }
         }
         "Subshell" => {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
@@ -1453,5 +1487,50 @@ mod tests {
             "corpus_roundtrip: {} examples, {} byte-equal, {} deser-failed (skipped)",
             total, pass, drf
         );
+    }
+
+    /// PowerShell named blocks (core-request
+    /// powershell-sh-go-20260813-134825): a `Function` node with a
+    /// `named_blocks` map round-trips through the A1 JSON (emit →
+    /// ingress → emit) and the ESTree renderer wraps the blocks in their
+    /// PowerShell order (dynamicparam, begin, process per input item,
+    /// end, body, clean).
+    #[test]
+    fn named_blocks_roundtrip_and_render() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+        {"type":"Function","name":"foo","body":[],"named_blocks":{
+          "begin":[{"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"start","style":"DoubleQuoted"}]}]}}],
+          "process":[{"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"item","style":"DoubleQuoted"}]}]}}],
+          "end":[{"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"done","style":"DoubleQuoted"}]}]}}]
+        }}
+      ]}"#;
+        let prog1 = shir_json_to_ir(src).expect("ingress accepts named_blocks");
+        let json1 = shir_to_shir_json(&prog1);
+        let prog2 = shir_json_to_ir(&json1).expect("re-ingress");
+        assert_eq!(json1, shir_to_shir_json(&prog2), "named_blocks round-trips");
+        // emit only when non-empty: a bash function stays 3 fields
+        assert!(
+            !round_trip("foo() { echo hi; }").contains("named_blocks"),
+            "empty named_blocks not emitted"
+        );
+        let with_blocks = shir_to_shir_json(&prog1);
+        assert!(with_blocks.contains("\"named_blocks\":{\"begin\":"), "map emitted: {with_blocks}");
+        // the ESTree renderer: begin once, process per input line, end after
+        let estree = crate::shir::shir_to_estree_json(&prog1).expect("render");
+        let begin = estree.find("\"value\":\"start\"");
+        let process = estree.find("pipelineInputLines");
+        let end = estree.find("\"value\":\"done\"");
+        assert!(begin.is_some() && process.is_some() && end.is_some(), "wrapper rendered");
+        assert!(begin.unwrap() < process.unwrap(), "begin before process loop");
+        assert!(process.unwrap() < end.unwrap(), "process loop before end");
+    }
+
+    /// Unknown named-block names REFUSE at ingress (the ESTree renderer
+    /// dispatches on exactly the five PowerShell block names).
+    #[test]
+    fn named_blocks_unknown_name_refuses() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[{"type":"Function","name":"foo","body":[],"named_blocks":{"bogus":[]}}]}"#;
+        let err = shir_json_to_ir(src).expect_err("unknown block name refuses");
+        assert!(err.contains("unknown block name"), "{err}");
     }
 }

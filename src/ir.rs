@@ -596,7 +596,21 @@ pub enum IrStmt {
         redirects: Vec<IrRedirect>,
     },
     /// Shell function definition (positional args via the runtime).
-    Function { name: String, body: Vec<IrStmt> },
+    ///
+    /// `named_blocks` — PowerShell-style named blocks (`dynamicparam` /
+    /// `begin` / `process` / `end` / `clean`), as `(block_name, stmts)`
+    /// pairs (core-request powershell-sh-go). EMPTY for bash functions
+    /// (bash has no named blocks). ESTree-path only: the ESTree renderer
+    /// (shir.rs) wraps them into the define arrow with their per-block
+    /// execution semantics (begin once, process once PER pipeline input
+    /// item, end/clean once); the other backends render `body` and ignore
+    /// the field. A frontend emitting named blocks targets the ESTree
+    /// backend (the A1-ingress oracle is `debashc --shir-in-estree`).
+    Function {
+        name: String,
+        body: Vec<IrStmt>,
+        named_blocks: Vec<(String, Vec<IrStmt>)>,
+    },
     /// Subshell — copy semantics (env/fd snapshot, run, discard).
     Subshell(Vec<IrStmt>),
     /// Background — run asynchronously.
@@ -1048,7 +1062,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             emit_indent(out, indent);
             out.push_str("}\n");
         }
-        IrStmt::Function { name, body } => {
+        IrStmt::Function { name, body, .. } => {
             // Shell function → Perl sub. `local @ARGV = @_` maps the bash
             // positional params ($1 → $ARGV[0]) onto the function's args;
             // the body's statements render inline (bash functions share the
@@ -3869,9 +3883,17 @@ fn rewrite_fn_calls(stmts: &[IrStmt], fns: &std::collections::HashSet<String>) -
                     })
                     .collect(),
             },
-            IrStmt::Function { name, body } => IrStmt::Function {
+            IrStmt::Function {
+                name,
+                body,
+                named_blocks,
+            } => IrStmt::Function {
                 name: name.clone(),
                 body: rewrite_fn_calls(body, fns),
+                named_blocks: named_blocks
+                    .iter()
+                    .map(|(k, v)| (k.clone(), rewrite_fn_calls(v, fns)))
+                    .collect(),
             },
             IrStmt::Subshell(body) => IrStmt::Subshell(rewrite_fn_calls(body, fns)),
             IrStmt::Background(body) => IrStmt::Background(rewrite_fn_calls(body, fns)),
