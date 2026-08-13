@@ -1189,9 +1189,18 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 Some(mut cmd) => {
                     let mut ok = true;
                     let mut heredocs: Vec<(String, String)> = Vec::new();
+                    // Interpolated/variable redirect targets (`> "$f"`,
+                    // `> /tmp/x.$$.tmp` — triage-perl t32_redirect,
+                    // examples/pid_tempfile): the target expr is NOT a
+                    // plain Str, so the bash text cannot carry it (bash
+                    // would expand `$$` to the CHILD's pid and would not
+                    // see `$f` at all). Bind the target to a temp %ENV
+                    // slot in Perl FIRST (the pid/var values are Perl's),
+                    // then reference `"$__sh2_rdN"` in the bash command
+                    // (bash children inherit %ENV).
+                    let mut prelude: Vec<String> = Vec::new();
                     for r in redirects {
                         let fd = r.fd.unwrap_or(1);
-                        let target = call_arg_str(&r.target).unwrap_or_default();
                         match r.mode.as_str() {
                             "heredoc" => {
                                 // <<EOF — the body is the target; feed it via
@@ -1202,20 +1211,57 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                     "'_SH2DOC_'"
                                 };
                                 cmd.push_str(&format!(" <<{}", delim));
-                                heredocs.push(("_SH2DOC_".to_string(), target));
+                                heredocs.push((
+                                    "_SH2DOC_".to_string(),
+                                    call_arg_str(&r.target).unwrap_or_default(),
+                                ));
                             }
                             "herestring" => {
+                                let target = call_arg_str(&r.target).unwrap_or_default();
                                 cmd.push_str(&format!(
                                     " <<< '{}'",
                                     target.replace('\'', "'\\\\''")
                                 ));
                             }
-                            _ => {
-                                if !append_redirect_frag(&mut cmd, fd as i64, &r.mode, &target) {
-                                    ok = false;
-                                    break;
+                            _ => match call_arg_str(&r.target) {
+                                Some(t) => {
+                                    if !append_redirect_frag(&mut cmd, fd as i64, &r.mode, &t) {
+                                        ok = false;
+                                        break;
+                                    }
                                 }
-                            }
+                                None => {
+                                    // w/a/r file redirect with an
+                                    // interpolated target — bind it in Perl
+                                    // and reference the env slot from bash.
+                                    if !matches!(r.mode.as_str(), "w" | "a" | "r") {
+                                        ok = false;
+                                        break;
+                                    }
+                                    static RD_SEQ: std::sync::atomic::AtomicUsize =
+                                        std::sync::atomic::AtomicUsize::new(0);
+                                    let tmp = format!(
+                                        "__sh2_rd{}",
+                                        RD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    );
+                                    prelude.push(format!(
+                                        "$ENV{{{}}} = {};",
+                                        tmp,
+                                        render_word(&r.target)
+                                    ));
+                                    let op = match r.mode.as_str() {
+                                        "w" => ">",
+                                        "a" => ">>",
+                                        _ => "<",
+                                    };
+                                    let frag = match fd {
+                                        0 => format!(" < \"${tmp}\""),
+                                        1 => format!(" > \"${tmp}\""),
+                                        n => format!(" {}> \"${tmp}\"", n),
+                                    };
+                                    cmd.push_str(&frag);
+                                }
+                            },
                         }
                     }
                     for (delim, body) in heredocs {
@@ -1227,6 +1273,11 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         cmd.push_str(&delim);
                     }
                     if ok {
+                        for line in prelude {
+                            emit_indent(out, indent);
+                            out.push_str(&line);
+                            out.push('\n');
+                        }
                         emit_shell_cmd(out, indent, &cmd);
                     } else {
                         emit_indent(out, indent);
@@ -2749,6 +2800,12 @@ fn var_exports_str(cmd: &str) -> String {
         if name == "ENV" {
             continue;
         }
+        // Temp env slots (the Redirect arm's `__sh2_rdN` bindings) are
+        // ALREADY in %ENV — re-exporting would reference the undeclared
+        // perl var `$__sh2_rdN` (compile error under strict).
+        if name.starts_with("__sh2_") {
+            continue;
+        }
         if name
             .chars()
             .next()
@@ -2793,6 +2850,24 @@ fn generator_emulate_command(cmd: &str, words: &[&IrExpr]) -> Option<String> {
         _ => None,
     })?;
     let mut gen = crate::generator::Generator::new();
+    // The modern-IR preamble declares every referenced script var as
+    // `my $name` (see shir_to_perl's collect_assigned/read_vars), while
+    // the Generator's emulations read undeclared vars via `$ENV{name}`.
+    // Register the command's non-env var reads as declared locals so the
+    // emulations read the LIVE `$name` (examples/pid_tempfile, the t32
+    // redirect twin: `cat "$tmpf"` read `$ENV{tmpf}` while the value
+    // lived in `my $tmpf` — a guaranteed undef mismatch). Env-style
+    // (uppercase) names stay `$ENV{...}`: they are real environment
+    // variables, not preamble locals.
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for w in words {
+        word_var_reads(w, &mut names);
+    }
+    for n in names {
+        if is_emulatable_var_name(&n) {
+            gen.declared_locals.insert(n);
+        }
+    }
     let perl = crate::generator::commands::simple_commands::generate_simple_command_impl(
         &mut gen, &simple,
     );
@@ -2801,6 +2876,91 @@ fn generator_emulate_command(cmd: &str, words: &[&IrExpr]) -> Option<String> {
     } else {
         Some(perl)
     }
+}
+
+/// Collect the variable names a word expression READS (getVar/Var nodes,
+/// including inside Interpolate parts / Call args / Array elements).
+fn word_var_reads(e: &IrExpr, out: &mut std::collections::HashSet<String>) {
+    match e {
+        IrExpr::Var(n, _) => {
+            out.insert(n.clone());
+        }
+        // The A1 read form: getVar("name") — the name is the Str arg.
+        IrExpr::Call { func, args } if func == "getVar" => {
+            if let Some(IrExpr::Str(n, _)) = args.first() {
+                out.insert(n.clone());
+            }
+            for a in args {
+                word_var_reads(a, out);
+            }
+        }
+        IrExpr::Call { args, .. } => {
+            for a in args {
+                word_var_reads(a, out);
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                word_var_reads(i, out);
+            }
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let InterpPart::Expr(x) = p {
+                    word_var_reads(x, out);
+                }
+            }
+        }
+        IrExpr::Arith(a) => arith_var_reads(a.as_ref(), out),
+        _ => {}
+    }
+}
+
+/// The ArithAst half of [`word_var_reads`]: collect the variable names an
+/// arithmetic AST reads.
+fn arith_var_reads(a: &ArithAst, out: &mut std::collections::HashSet<String>) {
+    match a {
+        ArithAst::Var(n) => {
+            out.insert(n.clone());
+        }
+        ArithAst::Ident(n) => {
+            out.insert(n.clone());
+        }
+        ArithAst::Index { var, key, .. } => {
+            out.insert(var.clone());
+            arith_var_reads(key, out);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_var_reads(lhs, out);
+            arith_var_reads(rhs, out);
+        }
+        ArithAst::Cond { test, then, else_ } => {
+            arith_var_reads(test, out);
+            arith_var_reads(then, out);
+            arith_var_reads(else_, out);
+        }
+        ArithAst::Un { arg, .. } => arith_var_reads(arg, out),
+        ArithAst::Assign { rhs, .. } => arith_var_reads(rhs, out),
+        ArithAst::IncDec { var, .. } => {
+            out.insert(var.clone());
+        }
+        _ => {}
+    }
+}
+
+/// A name the generator may render as `$name` (a preamble local): a plain
+/// identifier, not env-style (uppercase — real env vars stay $ENV{..})
+/// and not a positional/special name ($1, $?, ...).
+fn is_emulatable_var_name(name: &str) -> bool {
+    if is_env_style_var_name(name) {
+        return false;
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The modern IR packs all of a command's word arguments into a single
@@ -6064,5 +6224,80 @@ impl IrProgram {
             var_nospace: vec![],
             var_bash_env: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The t32_redirect A1 shape (triage-perl-20260814-033432): a
+    /// Redirect whose target is an Interpolate carrying the PID
+    /// (`/tmp/zsh_t32_redirect.$$.tmp` — the `$$` interp part lowers to
+    /// getVar("$")). The perl renderer must (1) bind the target to a temp
+    /// %ENV slot with PERL's pid (bash -c's `$$` would be the CHILD's
+    /// pid — a different file), and (2) keep the cat-side read a valid
+    /// `${$}` interpolation — the old emission `${\$}` was a syntax
+    /// error.
+    #[test]
+    fn redirect_pid_target_env_binding() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Redirect","inner":[{"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"data","style":"DoubleQuoted"}]}]}}],"redirects":[{"fd":1,"mode":"w","interpolate":true,"target":{"type":"Interpolate","parts":[{"kind":"lit","text":"/tmp/zsh_t32_redirect."},{"kind":"expr","expr":{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"$","style":"DoubleQuoted"}]}},{"kind":"lit","text":".tmp"}]}}]},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"cat","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"split","purity":"PureCpu","args":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"x","style":"DoubleQuoted"}]}]}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("t32 A1 ingress");
+        let perl = shir_to_perl(&prog);
+        // the redirect target is bound in perl ($$ = perl's pid) ...
+        // the seq number is process-global (shared across tests) —
+        // match the shape without pinning the number
+        assert!(
+            regex::Regex::new(r#"\$ENV\{__sh2_rd\d+\} = "/tmp/zsh_t32_redirect\." \. \(\$\$\) \. "\.tmp";"#)
+                .unwrap()
+                .is_match(&perl),
+            "perl-side target binding: {perl}"
+        );
+        // ... and referenced from the bash -c text (env passthrough), with
+        // NO bogus `$ENV{__sh2_rd0} = $__sh2_rd0;` re-export (undeclared
+        // var under strict)
+        assert!(
+            regex::Regex::new(r#"> \"\$__sh2_rd\d+\""#)
+                .unwrap()
+                .is_match(&perl),
+            "bash text references the env slot: {perl}"
+        );
+        assert!(
+            !perl.contains("$__sh2_rd0 = $__sh2_rd0"),
+            "no self-export of the env slot: {perl}"
+        );
+    }
+
+    /// The pid_tempfile shape (examples/pid_tempfile.sh): the redirect
+    /// target is a getVar (`> "$tmpf"`) and the cat/rm reads go through
+    /// the generator emulation — they must read the LIVE `my $tmpf`
+    /// (`${tmpf}`), not `$ENV{tmpf}` (never populated; the value lives in
+    /// the preamble local).
+    #[test]
+    fn redirect_var_target_and_emulated_reads() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"tmpf","sigil":null,"indices":[]}],"expr":{"type":"Interpolate","parts":[{"kind":"lit","text":"/tmp/"},{"kind":"expr","expr":{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"$","style":"DoubleQuoted"}]}},{"kind":"lit","text":".txt"}]}},
+            {"type":"Redirect","inner":[{"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"hello","style":"DoubleQuoted"}]}]}}],"redirects":[{"fd":1,"mode":"w","interpolate":true,"target":{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"tmpf","style":"DoubleQuoted"}]}}]},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"cat","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"split","purity":"PureCpu","args":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"tmpf","style":"DoubleQuoted"}]}]}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("pid_tempfile A1 ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(
+            regex::Regex::new(r#"\$ENV\{__sh2_rd\d+\} = \$tmpf;"#)
+                .unwrap()
+                .is_match(&perl),
+            "var target bound from the live local: {perl}"
+        );
+        assert!(
+            perl.contains("open my $fh, '<', \"${tmpf}\""),
+            "cat reads the live local: {perl}"
+        );
+        assert!(
+            !perl.contains("$ENV{tmpf}"),
+            "no stale ENV read: {perl}"
+        );
     }
 }

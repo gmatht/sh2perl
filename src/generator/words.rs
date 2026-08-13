@@ -62,8 +62,13 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
         // Only escape $ when it is NOT followed by a valid Perl identifier
         // character or {, to preserve existing Perl interpolation markers
         // that may remain in literal text from incomplete parser splits.
+        // `$` INSIDE an interpolation block (`${...}` — the generator's
+        // PID form `${$}`, `triage-perl t32_redirect`) is part of the
+        // variable-name expression, not an interpolation start: escaping
+        // it mangles `${$}` into the syntax error `${\$}`.
         let mut result = String::with_capacity(current_string.len() + 8);
         let bytes = current_string.as_bytes();
+        let mut in_interp_braces = false;
         let mut i = 0;
         while i < bytes.len() {
             match bytes[i] {
@@ -100,21 +105,38 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
                     }
                 }
                 b'$' => {
-                    let next = if i + 1 < bytes.len() {
-                        Some(bytes[i + 1])
-                    } else {
-                        None
-                    };
-                    let should_escape = match next {
-                        Some(b'a'..=b'z') | Some(b'A'..=b'Z') | Some(b'0'..=b'9') | Some(b'_')
-                        | Some(b'{') => false,
-                        _ => true,
-                    };
-                    if should_escape {
-                        result.push_str("\\$");
-                    } else {
+                    if in_interp_braces {
+                        // part of a `${...}` name expression — never an
+                        // interpolation start
                         result.push('$');
+                    } else {
+                        let next = if i + 1 < bytes.len() {
+                            Some(bytes[i + 1])
+                        } else {
+                            None
+                        };
+                        let should_escape = match next {
+                            Some(b'a'..=b'z')
+                            | Some(b'A'..=b'Z')
+                            | Some(b'0'..=b'9')
+                            | Some(b'_')
+                            | Some(b'{') => false,
+                            _ => true,
+                        };
+                        if should_escape {
+                            result.push_str("\\$");
+                        } else {
+                            result.push('$');
+                            if next == Some(b'{') {
+                                in_interp_braces = true;
+                            }
+                        }
                     }
+                }
+                b'}' => {
+                    // close an interpolation block (no-op on literal })
+                    in_interp_braces = false;
+                    result.push('}');
                 }
                 c => {
                     result.push(c as char);
