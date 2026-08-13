@@ -96,7 +96,9 @@ pub struct Render {
 /// Renderer options — the default (ES 3.00 stdout-computation) is the
 /// original sketch; `es100`/`color_out` switch to a **render fragment**
 /// that pairs with a hand-written ES 1.00 vertex shader (the MIMEcroft
-/// game writes its fragment shader in bash and compiles it here).
+/// game writes its fragment shader in bash and compiles it here);
+/// `vert_out` switches to a **render vertex shader** — the MIMEcroft
+/// game now authors BOTH stages in bash.
 #[derive(Clone, Copy, Debug)]
 pub struct ShGlslOptions {
     /// Emit GLSL ES 1.00 (WebGL1): no `#version 300 es`, fragment input
@@ -109,17 +111,36 @@ pub struct ShGlslOptions {
     ///   vcolor_r/g/b        ← int(vColor.rgb * 255.0)  (varying input)
     /// `putb N` emits a single byte into out_buf.
     pub color_out: bool,
+    /// Vertex mode: emit a **vertex shader** instead of a fragment
+    /// shader. Input bridges come from the vertex attributes and the
+    /// camera/object uniforms (all ×1000 so bash stays integer); the
+    /// program sets float `vp_x/y/z/w` (gl_Position) and int
+    /// `vc_r/g/b/a` + `vu_u/v` (×1000 — the vColor/vUv varyings), which
+    /// the backend writes out at the end of main(). No `putb`/byte
+    /// output in this mode — there is no fragment colour.
+    pub vert_out: bool,
     /// When > 0, seed the texture bridges (uv_x/uv_y = the texel index
     /// from the `vUv` varying at this size; tex_r/g/b = the sampled
     /// colour at that texel) and declare `uniform sampler2D uTex;` +
     /// `varying vec2 vUv;` — the bash program can then read the block
     /// texture per pixel, all in integer arithmetic.
     pub tex_size: u32,
+    /// The render target's larger canvas extent (width or height). Seeds
+    /// the frag_x/frag_y input bridges (0..max_view) for the mediump
+    /// interval proof — the shader reads gl_FragCoord, whose exact range
+    /// only the caller knows (the sh2runtime device canvas is 800×600).
+    /// 0 = unknown → `mediump int` is never emitted (the ES 1.00
+    /// mandatory fragment precision is only safe when every integer
+    /// intermediate provably fits ±2^15). mediump FLOAT additionally
+    /// requires max_view ≤ 2048 (its 10-bit mantissa represents exact
+    /// integers only to 2^11, so gl_FragCoord loses pixel accuracy past
+    /// that).
+    pub max_view: u32,
 }
 
 impl Default for ShGlslOptions {
     fn default() -> Self {
-        Self { es100: false, color_out: false, tex_size: 0 }
+        Self { es100: false, color_out: false, vert_out: false, tex_size: 0, max_view: 0 }
     }
 }
 
@@ -136,22 +157,6 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
     prog.var_types = crate::shir::analyze_var_types(&prog);
     let mut r = Render::default();
     r.opts = *opts;
-    // the render-mode input bridges are int globals whether or not the
-    // program happens to use every one of them (GLSL tolerates an
-    // unused varying; an undeclared variable does not compile).
-    if opts.color_out {
-        for n in ["frag_x", "frag_y", "vcolor_r", "vcolor_g", "vcolor_b"] {
-            r.vars.insert(n.to_string());
-            r.arith_vars.insert(n.to_string());
-        }
-        if opts.tex_size > 0 {
-            for n in ["uv_x", "uv_y", "tex_r", "tex_g", "tex_b",
-                      "damage", "cr_r", "cr_g", "cr_b", "cr_a"] {
-                r.vars.insert(n.to_string());
-                r.arith_vars.insert(n.to_string());
-            }
-        }
-    }
     r.types = prog.var_types.iter().cloned().collect();
     // pass 1: collect vars / arrays / functions / string literals
     for s in &prog.stmts {
@@ -161,6 +166,79 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
         r.fns.insert(sub.name.clone());
         for s in &sub.body {
             r.collect_stmt(s);
+        }
+    }
+    // Input bridges are seeded/declared ONLY when the program references
+    // them (see the color_out seeding below) — pass 1 collected every
+    // reference into r.vars (direct Var reads, $(( )) arith, test
+    // strings, getVar). Referenced bridges are native ints: the numeric
+    // verdict comes from arith_vars (a bridge has no var_types entry —
+    // the program never assigns it).
+    if opts.color_out {
+        let mut bridges: Vec<&str> = vec![
+            "frag_x", "frag_y", "vcolor_r", "vcolor_g", "vcolor_b",
+        ];
+        if opts.tex_size > 0 {
+            bridges.extend([
+                "uv_x", "uv_y", "tex_r", "tex_g", "tex_b",
+                "damage", "cr_r", "cr_g", "cr_b", "cr_a",
+            ]);
+        }
+        for n in bridges {
+            if r.vars.contains(n) {
+                r.arith_vars.insert(n.to_string());
+            }
+        }
+        // the texture sample coordinate reads the uv bridges even when
+        // the program only references tex/cr — imply them so they get
+        // declared (the seeds below write g_uv_x/g_uv_y).
+        if opts.tex_size > 0
+            && r.uses_any(&["uv_x", "uv_y", "tex_r", "tex_g", "tex_b",
+                            "cr_r", "cr_g", "cr_b", "cr_a"])
+        {
+            for n in ["uv_x", "uv_y"] {
+                r.vars.insert(n.to_string());
+                r.arith_vars.insert(n.to_string());
+            }
+        }
+    }
+    if opts.vert_out {
+        // vertex mode: the input bridges (attributes + uniforms, all
+        // ×1000 so bash stays integer) are native ints — same rule as
+        // the fragment bridges: force any referenced one to Int.
+        let bridges: Vec<&str> = vec![
+            "ap_x", "ap_y", "ap_z",          // aPosition  ×1000 (±500)
+            "ash_r", "ash_g", "ash_b",        // aShade     ×1000 (450..1000)
+            "auv_u", "auv_v",                  // aUv        ×1000 (0..1000)
+            "ucp_x", "ucp_y", "ucp_z",        // uCamPos    ×1000 (world)
+            "ucy_m",                           // uCamYaw    ×1000 (milli-degrees)
+            "ucs",                             // uCamShift  ×1000 (milli-NDC strafe)
+            "uop_x", "uop_y", "uop_z",        // uObjPos    ×1000 (cell centre)
+            "usc_x", "usc_y", "usc_z",        // uScale     ×1000 (1 → 1000)
+            "ublk_r", "ublk_g", "ublk_b",     // uBlockColor ×1000 (0..1000)
+            "uov",                             // uOverlay   ×1000 (0 or 1000)
+        ];
+        for n in bridges {
+            if r.vars.contains(n) {
+                r.arith_vars.insert(n.to_string());
+            }
+        }
+        // the output vars the emission reads back — force them into
+        // r.vars so they are ALWAYS declared (the program may set only
+        // some of them; the final gl_Position/vColor/vUv lines read all).
+        // vp_* become floats via the bc captures; vc_*/vu_* stay ints
+        // (they are only ever assigned int expressions), so force them
+        // into arith_vars too — the A2 verdict alone would leave a
+        // plain `vu_u=$auv_u` string-typed.
+        for n in [
+            "vp_x", "vp_y", "vp_z", "vp_w",
+            "vc_r", "vc_g", "vc_b", "vc_a",
+            "vu_u", "vu_v",
+        ] {
+            r.vars.insert(n.to_string());
+        }
+        for n in ["vc_r", "vc_g", "vc_b", "vc_a", "vu_u", "vu_v"] {
+            r.arith_vars.insert(n.to_string());
         }
     }
     // pass 2: RENDER THE BODY FIRST — the string table must be COMPLETE
@@ -175,7 +253,49 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
         }
     }
     r.emit_fn_defs();
-    if !r.opts.color_out {
+    if r.opts.vert_out {
+        // render vertex: the attribute/uniform inputs (each declared
+        // ONLY when the program references its bridge — the device
+        // binds attributes by name and skips inactive ones, and a
+        // WebGL uniform write to an undeclared uniform is a no-op, so
+        // the game's unconditional uCamPos/uObjPos/… writes stay safe)
+        // and the two varyings the fragment shader may consume.
+        if r.uses_any(&["ap_x", "ap_y", "ap_z"]) {
+            r.emit("attribute vec3 aPosition;");
+        }
+        if r.uses_any(&["ash_r", "ash_g", "ash_b"]) {
+            r.emit("attribute vec3 aShade;");
+        }
+        if r.uses_any(&["auv_u", "auv_v"]) {
+            r.emit("attribute vec2 aUv;");
+        }
+        if r.uses_any(&["ucp_x", "ucp_y", "ucp_z"]) {
+            r.emit("uniform vec3 uCamPos;");
+        }
+        if r.vars.contains("ucy_m") {
+            r.emit("uniform float uCamYaw;");
+        }
+        if r.vars.contains("ucs") {
+            r.emit("uniform float uCamShift;");
+        }
+        if r.uses_any(&["uop_x", "uop_y", "uop_z"]) {
+            r.emit("uniform vec3 uObjPos;");
+        }
+        if r.uses_any(&["usc_x", "usc_y", "usc_z"]) {
+            r.emit("uniform vec3 uScale;");
+        }
+        if r.uses_any(&["ublk_r", "ublk_g", "ublk_b"]) {
+            r.emit("uniform vec3 uBlockColor;");
+        }
+        if r.vars.contains("uov") {
+            r.emit("uniform float uOverlay;");
+        }
+        // the varyings — always written at the end of main() (the
+        // fragment shader declares the ones it consumes; a vertex-only
+        // varying is legal ES 1.00 and links fine).
+        r.emit("varying vec4 vColor;");
+        r.emit("varying vec2 vUv;");
+    } else if !r.opts.color_out {
         if r.opts.es100 {
             // ES 1.00 has no `out` — outColor is a local, written to
             // gl_FragColor at the end of main().
@@ -185,12 +305,30 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
         }
         r.emit("uniform int u_mode;");
     } else {
-        // render fragment: the varying arrives from the vertex shader
-        r.emit(if r.opts.es100 { "varying vec4 vColor;" } else { "in vec4 vColor;" });
-        if opts.tex_size > 0 {
+        // render fragment: the varying arrives from the vertex shader.
+        // Declare each input ONLY when the program references it (a
+        // WebGL uniform write to an undeclared uniform is a no-op, and
+        // an unconsumed vertex varying links fine — the game's
+        // unconditional uTex/uCrack/uDamage writes stay safe, and a
+        // texture-less fragment carries none of the machinery).
+        let vcolor = r.uses_any(&["vcolor_r", "vcolor_g", "vcolor_b"]);
+        let uv = r.uses_any(&["uv_x", "uv_y", "tex_r", "tex_g", "tex_b",
+                              "cr_r", "cr_g", "cr_b", "cr_a"]);
+        let tex = r.uses_any(&["tex_r", "tex_g", "tex_b"]);
+        let crack = r.uses_any(&["cr_r", "cr_g", "cr_b", "cr_a"]);
+        if vcolor {
+            r.emit(if r.opts.es100 { "varying vec4 vColor;" } else { "in vec4 vColor;" });
+        }
+        if uv {
             r.emit(if r.opts.es100 { "varying vec2 vUv;" } else { "in vec2 vUv;" });
+        }
+        if tex {
             r.emit("uniform sampler2D uTex;");
+        }
+        if crack {
             r.emit("uniform sampler2D uCrack;");
+        }
+        if r.vars.contains("damage") {
             r.emit("uniform int uDamage;");
         }
     }
@@ -203,7 +341,9 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
     if r.fns.is_empty() {
         let locals: Vec<String> = r.vars.iter().map(|n| r.ident(n)).collect();
         for n in locals {
-            if r.float_vars.contains(&n) {
+            // float_vars stores the UNMANGLED var name
+            let name = n.strip_prefix("g_").unwrap_or(&n);
+            if r.float_vars.contains(name) {
                 r.emit(&format!("float {n};"));
             } else if r.is_num_ident(&n) {
                 r.emit(&format!("int {n};"));
@@ -216,37 +356,171 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
         }
     }
     if r.opts.color_out {
-        // input bridges — bash reads these as ints
-        r.emit("g_frag_x = int(gl_FragCoord.x);");
-        r.emit("g_frag_y = int(gl_FragCoord.y);");
-        r.emit("g_vcolor_r = int(vColor.r * 255.0);");
-        r.emit("g_vcolor_g = int(vColor.g * 255.0);");
-        r.emit("g_vcolor_b = int(vColor.b * 255.0);");
+        // input bridges — bash reads these as ints; seed only the ones
+        // the program references (pass 1 collected them into r.vars).
+        if r.vars.contains("frag_x") {
+            r.emit("g_frag_x = int(gl_FragCoord.x);");
+        }
+        if r.vars.contains("frag_y") {
+            r.emit("g_frag_y = int(gl_FragCoord.y);");
+        }
+        if r.vars.contains("vcolor_r") {
+            r.emit("g_vcolor_r = int(vColor.r * 255.0);");
+        }
+        if r.vars.contains("vcolor_g") {
+            r.emit("g_vcolor_g = int(vColor.g * 255.0);");
+        }
+        if r.vars.contains("vcolor_b") {
+            r.emit("g_vcolor_b = int(vColor.b * 255.0);");
+        }
         if opts.tex_size > 0 {
-            let f = |v: u32| format!("{v}.0");
-            let sz = f(opts.tex_size);
-            // uv_x/uv_y: the texel index (0..tex_size) from the varying
-            r.emit(&format!("g_uv_x = int(vUv.x * {sz});"));
-            r.emit(&format!("g_uv_y = int(vUv.y * {sz});"));
-            // tex_r/g/b: the texel's colour (center-sampled), 0..255
-            let uv = format!(
-                "(vec2(float(g_uv_x), float(g_uv_y)) + vec2(0.5)) / {sz}"
-            );
-            r.emit(&format!("g_tex_r = int(texture2D(uTex, {uv}).r * 255.0);"));
-            r.emit(&format!("g_tex_g = int(texture2D(uTex, {uv}).g * 255.0);"));
-            r.emit(&format!("g_tex_b = int(texture2D(uTex, {uv}).b * 255.0);"));
-            // the crack overlay: uDamage (0..3) + the crack texel (RGBA)
-            r.emit("g_damage = uDamage;");
-            r.emit(&format!("g_cr_r = int(texture2D(uCrack, {uv}).r * 255.0);"));
-            r.emit(&format!("g_cr_g = int(texture2D(uCrack, {uv}).g * 255.0);"));
-            r.emit(&format!("g_cr_b = int(texture2D(uCrack, {uv}).b * 255.0);"));
-            r.emit(&format!("g_cr_a = int(texture2D(uCrack, {uv}).a * 255.0);"));
+            let uv_needed = r.uses_any(&[
+                "uv_x", "uv_y", "tex_r", "tex_g", "tex_b",
+                "cr_r", "cr_g", "cr_b", "cr_a",
+            ]);
+            if uv_needed {
+                let f = |v: u32| format!("{v}.0");
+                let sz = f(opts.tex_size);
+                // uv_x/uv_y: the texel index (0..tex_size) from the
+                // varying — a prerequisite for every texture sample
+                r.emit(&format!("g_uv_x = int(vUv.x * {sz});"));
+                r.emit(&format!("g_uv_y = int(vUv.y * {sz});"));
+                // tex_r/g/b: the texel's colour (center-sampled), 0..255
+                let uv = format!(
+                    "(vec2(float(g_uv_x), float(g_uv_y)) + vec2(0.5)) / {sz}"
+                );
+                // Sample each texture ONCE into a vec4 local, then
+                // swizzle — the three tex (resp. four crack) seeds use
+                // the same coordinates, and drivers may not CSE
+                // identical texture2D calls, so this is 2 fetches per
+                // fragment instead of 7.
+                if r.vars.contains("tex_r")
+                    || r.vars.contains("tex_g")
+                    || r.vars.contains("tex_b")
+                {
+                    r.emit(&format!("vec4 _tex = texture2D(uTex, {uv});"));
+                    if r.vars.contains("tex_r") {
+                        r.emit("g_tex_r = int(_tex.r * 255.0);");
+                    }
+                    if r.vars.contains("tex_g") {
+                        r.emit("g_tex_g = int(_tex.g * 255.0);");
+                    }
+                    if r.vars.contains("tex_b") {
+                        r.emit("g_tex_b = int(_tex.b * 255.0);");
+                    }
+                }
+                // the crack overlay: uDamage (0..3) + the crack texel
+                if r.vars.contains("damage") {
+                    r.emit("g_damage = uDamage;");
+                }
+                if r.vars.contains("cr_r")
+                    || r.vars.contains("cr_g")
+                    || r.vars.contains("cr_b")
+                    || r.vars.contains("cr_a")
+                {
+                    r.emit(&format!("vec4 _crack = texture2D(uCrack, {uv});"));
+                    if r.vars.contains("cr_r") {
+                        r.emit("g_cr_r = int(_crack.r * 255.0);");
+                    }
+                    if r.vars.contains("cr_g") {
+                        r.emit("g_cr_g = int(_crack.g * 255.0);");
+                    }
+                    if r.vars.contains("cr_b") {
+                        r.emit("g_cr_b = int(_crack.b * 255.0);");
+                    }
+                    if r.vars.contains("cr_a") {
+                        r.emit("g_cr_a = int(_crack.a * 255.0);");
+                    }
+                }
+            }
+        }
+    }
+    if r.opts.vert_out {
+        // vertex input bridges — attributes/uniforms ×1000, seeded only
+        // when the program references them (pass 1 collected them).
+        // uCamYaw arrives in DEGREES with milli precision (0..360000
+        // milli-degrees — the game's fmt_pos string); the other
+        // position/colour values are world units ×1000.
+        if r.vars.contains("ap_x") {
+            r.emit("g_ap_x = int(aPosition.x * 1000.0);");
+        }
+        if r.vars.contains("ap_y") {
+            r.emit("g_ap_y = int(aPosition.y * 1000.0);");
+        }
+        if r.vars.contains("ap_z") {
+            r.emit("g_ap_z = int(aPosition.z * 1000.0);");
+        }
+        if r.vars.contains("ash_r") {
+            r.emit("g_ash_r = int(aShade.r * 1000.0);");
+        }
+        if r.vars.contains("ash_g") {
+            r.emit("g_ash_g = int(aShade.g * 1000.0);");
+        }
+        if r.vars.contains("ash_b") {
+            r.emit("g_ash_b = int(aShade.b * 1000.0);");
+        }
+        if r.vars.contains("auv_u") {
+            r.emit("g_auv_u = int(aUv.x * 1000.0);");
+        }
+        if r.vars.contains("auv_v") {
+            r.emit("g_auv_v = int(aUv.y * 1000.0);");
+        }
+        if r.vars.contains("ucp_x") {
+            r.emit("g_ucp_x = int(uCamPos.x * 1000.0);");
+        }
+        if r.vars.contains("ucp_y") {
+            r.emit("g_ucp_y = int(uCamPos.y * 1000.0);");
+        }
+        if r.vars.contains("ucp_z") {
+            r.emit("g_ucp_z = int(uCamPos.z * 1000.0);");
+        }
+        if r.vars.contains("ucy_m") {
+            r.emit("g_ucy_m = int(uCamYaw * 1000.0);");
+        }
+        if r.vars.contains("ucs") {
+            r.emit("g_ucs = int(uCamShift * 1000.0);");
+        }
+        if r.vars.contains("uop_x") {
+            r.emit("g_uop_x = int(uObjPos.x * 1000.0);");
+        }
+        if r.vars.contains("uop_y") {
+            r.emit("g_uop_y = int(uObjPos.y * 1000.0);");
+        }
+        if r.vars.contains("uop_z") {
+            r.emit("g_uop_z = int(uObjPos.z * 1000.0);");
+        }
+        if r.vars.contains("usc_x") {
+            r.emit("g_usc_x = int(uScale.x * 1000.0);");
+        }
+        if r.vars.contains("usc_y") {
+            r.emit("g_usc_y = int(uScale.y * 1000.0);");
+        }
+        if r.vars.contains("usc_z") {
+            r.emit("g_usc_z = int(uScale.z * 1000.0);");
+        }
+        if r.vars.contains("ublk_r") {
+            r.emit("g_ublk_r = int(uBlockColor.r * 1000.0);");
+        }
+        if r.vars.contains("ublk_g") {
+            r.emit("g_ublk_g = int(uBlockColor.g * 1000.0);");
+        }
+        if r.vars.contains("ublk_b") {
+            r.emit("g_ublk_b = int(uBlockColor.b * 1000.0);");
+        }
+        if r.vars.contains("uov") {
+            r.emit("g_uov = int(uOverlay * 1000.0);");
         }
     }
     for s in &prog.stmts {
         r.stmt(s);
     }
-    if r.opts.color_out {
+    if r.opts.vert_out {
+        // the bash program's float vp_* (gl_Position, world units) and
+        // int vc_*/vu_* (×1000 — the vColor/vUv varyings)
+        r.emit("gl_Position = vec4(g_vp_x, g_vp_y, g_vp_z, g_vp_w);");
+        r.emit("vColor = vec4(float(g_vc_r) / 1000.0, float(g_vc_g) / 1000.0, float(g_vc_b) / 1000.0, float(g_vc_a) / 1000.0);");
+        r.emit("vUv = vec2(float(g_vu_u) / 1000.0, float(g_vu_v) / 1000.0);");
+    } else if r.opts.color_out {
         // the bash program's out_buf bytes 0..3 are the fragment colour
         r.emit("gl_FragColor = vec4(float(out_buf[0]) / 255.0, float(out_buf[1]) / 255.0, float(out_buf[2]) / 255.0, float(out_buf[3]) / 255.0);");
     } else {
@@ -277,12 +551,43 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
     } else {
         r.emit("// GLSL ES 1.00 (WebGL1) — generated by the sh→GLSL backend");
     }
-    r.emit("precision highp float;");
-    r.emit("precision highp int;");
-    if r.used_str || !r.opts.color_out || (r.used_putb && !r.opts.es100) {
+    // mediump gate: emit the ES 1.00 MANDATORY fragment precision when a
+    // proof shows it is safe. highp int / highp float are OPTIONAL in
+    // ES 1.00 fragment shaders — the generated shader compiles on every
+    // WebGL1 implementation only when it uses the mandatory mediump
+    // forms. The interval proof (fits_mediump_int) must bound every
+    // integer intermediate within ±2^15; mediump float additionally
+    // needs the canvas within its exact-integer range (gl_FragCoord).
+    let mediump_int = r.opts.es100
+        && r.opts.color_out
+        && r.opts.max_view > 0
+        && !r.used_str
+        && prog.subs.is_empty()
+        && fits_mediump_int(&prog, &r.opts);
+    // highp is REQUIRED in ES 1.00 vertex shaders (only fragment
+    // shaders may drop to the mandatory mediump) — a render vertex
+    // always keeps highp float/int for the position math.
+    let mediump_float = r.opts.es100
+        && !r.opts.vert_out
+        && r.opts.max_view > 0
+        && r.opts.max_view <= 2048;
+    r.emit(if mediump_float {
+        "precision mediump float;"
+    } else {
+        "precision highp float;"
+    });
+    r.emit(if mediump_int {
+        "precision mediump int;"
+    } else {
+        "precision highp int;"
+    });
+    if r.used_str || (!r.opts.color_out && !r.opts.vert_out)
+        || (r.used_putb && !r.opts.es100)
+    {
         // OUT_CAP is referenced by the putCh guard (string runtime / ES
         // 3.00 putb) and the ES 3.00 u_mode readback; a pure ES 1.00
-        // render fragment (putb at fixed slots) never needs it.
+        // render fragment (putb at fixed slots) never needs it, and a
+        // render vertex writes gl_Position — no byte buffer at all.
         r.emit(&format!("const int OUT_CAP = {OUT_CAP};"));
     }
     r.emit("");
@@ -291,11 +596,117 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
     r.emit_helpers();
     r.emit_fn_prototypes();
     r.out.extend(body);
-    format!(
+    // post-pass: strip parens that wrap a bare atom (identifier or
+    // integer literal) — `(6)` → `6`, `(g_r)` → `g_r`. Atoms have no
+    // operator precedence to disturb, so this is semantics-neutral; it
+    // removes most of the defensive-paren noise from the arithmetic
+    // pipelines. Comments are skipped.
+    let out = format!(
         "{}\n// TODO(unsupported): {} construct(s) — see shir_to_glsl limitations\n",
         r.out.join("\n"),
         r.todo
-    )
+    );
+    strip_atom_parens(&out)
+}
+
+/// True when `rest` begins with an atom (GLSL identifier or integer
+/// literal) directly followed by `)` — i.e. `rest` is `"atom)"`.
+fn atom_paren(rest: &str) -> (bool, usize) {
+    let b = rest.as_bytes();
+    if b.is_empty() {
+        return (false, 0);
+    }
+    let first = b[0] as char;
+    let mut j = 0;
+    if first.is_ascii_digit() {
+        while j < b.len() && (b[j] as char).is_ascii_digit() {
+            j += 1;
+        }
+    } else if first.is_ascii_alphabetic() || first == '_' {
+        while j < b.len() {
+            let c = b[j] as char;
+            if c.is_ascii_alphanumeric() || c == '_' {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+    } else {
+        return (false, 0);
+    }
+    (j > 0 && j < b.len() && b[j] == b')', j)
+}
+
+/// `(atom)` → `atom` everywhere outside comments. Only parens whose
+/// content is exactly one identifier or integer literal are removed
+/// (`(out_buf[0])`, `(255.0)`, `texture2D(`, `(g_x / 6)` etc. are all
+/// left untouched — they are not atoms). A `(` directly after an
+/// identifier is a CALL/constructor paren (`itos(g_x)`) and is never
+/// touched. Iterated to a fixpoint: `((1))` → `(1)` → `1`.
+fn strip_atom_parens(s: &str) -> String {
+    let mut cur = s.to_string();
+    loop {
+        let next = strip_atom_parens_once(&cur);
+        if next == cur {
+            return cur;
+        }
+        cur = next;
+    }
+}
+
+fn strip_atom_parens_once(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        // `//` comment: copy to end of line untouched
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            let end = s[i..]
+                .find('\n')
+                .map(|p| i + p)
+                .unwrap_or(s.len());
+            out.push_str(&s[i..end]);
+            i = end;
+            continue;
+        }
+        // `/* */` comment: copy the whole block untouched
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            match s[i + 2..].find("*/") {
+                Some(p) => {
+                    out.push_str(&s[i..i + 2 + p + 2]);
+                    i = i + 2 + p + 2;
+                }
+                None => {
+                    out.push_str(&s[i..]);
+                    break;
+                }
+            }
+            continue;
+        }
+        if b[i] == b'(' {
+            // `(` directly after an identifier char is a CALL/constructor
+            // paren (`itos(g_x)`, `float(x)`), not a grouping paren —
+            // stripping it would fuse the callee into the argument
+            // (`itosg_x`). Only grouping parens (preceded by space/
+            // operator/paren/etc.) may wrap a bare atom.
+            let prev_is_ident = i > 0 && {
+                let c = b[i - 1] as char;
+                c.is_ascii_alphanumeric() || c == '_'
+            };
+            if !prev_is_ident {
+                let (is_atom, len) = atom_paren(&s[i + 1..]);
+                if is_atom {
+                    // `(atom)` → `atom` (the closing `)` is consumed too)
+                    out.push_str(&s[i + 1..i + 1 + len]);
+                    i = i + 1 + len + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
 }
 
 impl Default for Render {
@@ -357,6 +768,12 @@ impl Render {
             s.push('v');
         }
         format!("g_{s}")
+    }
+
+    /// True when pass 1 collected a reference to any of `names` (used to
+    /// gate the input-bridge declarations/seeding on actual use).
+    fn uses_any(&self, names: &[&str]) -> bool {
+        names.iter().any(|n| self.vars.contains(*n))
     }
 
     fn var_ty(&self, name: &str) -> Ty {
@@ -444,7 +861,9 @@ impl Render {
         // dynamic indexing of local arrays.
         if !self.fns.is_empty() {
             for n in vars {
-                if self.float_vars.contains(&n) {
+                // float_vars stores the UNMANGLED var name
+                let name = n.strip_prefix("g_").unwrap_or(&n);
+                if self.float_vars.contains(name) {
                     self.emit(&format!("float {n};"));
                 } else if self.is_num_ident(&n) {
                     self.emit(&format!("int {n};"));
@@ -464,10 +883,10 @@ impl Render {
         // const slots and the colour line reads back 0..3 — a 4-slot (or
         // putb-sized) buffer is enough, with no counter and no cap const.
         let dyn_out = self.used_str || (self.used_putb && !self.opts.es100);
-        if !self.opts.color_out || dyn_out {
+        if !self.opts.vert_out && (!self.opts.color_out || dyn_out) {
             self.emit(&format!("int out_buf[{OUT_CAP}];"));
             self.emit("int out_len = 0;");
-        } else {
+        } else if !self.opts.vert_out {
             let cap = std::cmp::max(4, self.putb_pos);
             self.emit(&format!("int out_buf[{cap}];"));
         }
@@ -653,6 +1072,20 @@ impl Render {
                         }
                     }
                 }
+                // a float bc capture (`v=$(echo "scale=K; …0.5" | bc)`) —
+                // detected in pass 1 so the main() locals (declared
+                // before the body renders) declare it GLSL float. A
+                // float-var copy (`v=$w` — w already float) propagates
+                // the verdict the same way.
+                if targets.len() == 1 && targets[0].indices.is_empty() {
+                    if self.is_float_bc_capture(expr) {
+                        self.float_vars.insert(targets[0].var.clone());
+                    } else if let Some(n) = self.var_name_of(expr) {
+                        if self.float_vars.contains(n) {
+                            self.float_vars.insert(targets[0].var.clone());
+                        }
+                    }
+                }
             }
             IrStmt::Declare { vars, init, .. } => {
                 for Decl { name, .. } in vars {
@@ -789,6 +1222,18 @@ impl Render {
                         if let Some(IrExpr::Str(name, _)) = args.first() {
                             if let Some(base) = base_var_name(name) {
                                 self.vars.insert(base.to_string());
+                                // float bc capture via the setVar call
+                                // form (same pass-1 detection); float-var
+                                // copies propagate the verdict too.
+                                if args.len() >= 2 {
+                                    if self.is_float_bc_capture(&args[1]) {
+                                        self.float_vars.insert(base.to_string());
+                                    } else if let Some(n) = self.var_name_of(&args[1]) {
+                                        if self.float_vars.contains(n) {
+                                            self.float_vars.insert(base.to_string());
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -912,11 +1357,40 @@ impl Render {
         }
     }
 
-    /// `$name` / `${name}` / `"$name"` tokens inside a test string.
+    /// `$name` / `${name}` / `"$name"` / `$(( … ))` tokens inside a test
+    /// string.
     fn collect_test_vars(&mut self, text: &str) {
         let mut rest = text;
         while let Some(pos) = rest.find('$') {
             let after = &rest[pos + 1..];
+            if after.starts_with("((") {
+                // $(( arith )) — collect the vars the arithmetic reads
+                // (test operands parse the same expression at render
+                // time; without this the bridge gating would under-
+                // declare a `[ $((frag_x * 2)) -gt 3 ]` reference).
+                let chars: Vec<char> = after.chars().collect();
+                let mut depth = 0i32;
+                let mut j = 0;
+                let mut started = false;
+                while j < chars.len() {
+                    if chars[j] == '(' {
+                        depth += 1;
+                        started = true;
+                    } else if chars[j] == ')' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                    if started && depth == 0 {
+                        break;
+                    }
+                }
+                let inner = after[2..j.saturating_sub(2)].to_string();
+                if let Some(a) = crate::shir::parse_arith(&inner) {
+                    self.collect_arith(&a);
+                }
+                rest = &after[j.min(after.len())..];
+                continue;
+            }
             let mut name = String::new();
             if after.starts_with('{') {
                 for c in after[1..].chars() {
@@ -2060,6 +2534,10 @@ impl Render {
     // float (see float_vars); reads in int contexts cast via int().
     // ArithAst's Num is i64-only, so a tiny precedence parser handles
     // the float grammar directly (numbers may carry a decimal point).
+    //
+    // Pass-1 twin: [`Self::is_float_bc_capture`] detects the shape
+    // during collect (without emitting) so the main() locals — which
+    // are declared BEFORE the body renders — know the var is a float.
     fn bc_float_expr(&mut self, pipe: &IrExpr) -> Option<String> {
         // unwrap the cmdsub wrapper: `$(…)` arrives as Capture/capture
         let pipe = match pipe {
@@ -2093,10 +2571,18 @@ impl Render {
                     if t.contains('.') {
                         has_float = true;
                     }
+                    // `c(` / `s(` = the bc trig functions (cos/sin —
+                    // GNU bc's c()/s(), the vertex shader's camera
+                    // rotation); anything else alphabetic is rejected
+                    // so a typo fails loudly (TODO) instead of parsing
+                    // silently wrong.
                     if !t.chars().all(|c| {
                         c.is_ascii_digit()
                             || c.is_whitespace()
-                            || matches!(c, '+' | '-' | '*' | '/' | '%' | '(' | ')' | '.' | '^')
+                            || matches!(
+                                c,
+                                '+' | '-' | '*' | '/' | '%' | '(' | ')' | '.' | '^' | 'c' | 's'
+                            )
                     }) {
                         return None;
                     }
@@ -2114,10 +2600,85 @@ impl Render {
         Some(self.parse_float_expr(&src, &slots))
     }
 
+    /// Pass-1 twin of [`Self::bc_float_expr`]: does `pipe` have the
+    /// float-bc-capture shape (`echo "scale=K; …0.5" | bc` with a
+    /// decimal literal AND at least one var slot)? Mirrors the
+    /// unwrap/scale-strip/char-filter of bc_float_expr without emitting
+    /// (it only pattern-matches and clones — safe during collect).
+    fn is_float_bc_capture(&mut self, pipe: &IrExpr) -> bool {
+        let pipe = match pipe {
+            IrExpr::Capture { expr, .. } => expr,
+            IrExpr::Call { func, args }
+                if func == "capture" || func == "captureWords" =>
+            {
+                let Some(p) = self.capture_pipeline(args) else { return false };
+                p
+            }
+            other => other,
+        };
+        let Some(echo_args) = self.pipeline_echo_bc(pipe) else { return false };
+        let Some((arg, _no_newline)) = self.bc_single_arg(&echo_args) else {
+            return false;
+        };
+        let IrExpr::Interpolate(parts) = &arg else { return false };
+        let mut has_float = false;
+        let mut slots = 0;
+        for p in parts {
+            match p {
+                InterpPart::Lit(t) => {
+                    let mut t = t.as_str();
+                    if t.contains('.') {
+                        has_float = true;
+                    }
+                    // strip a leading `scale=K;` / `scale=K ` (the same
+                    // strip bc_float_expr applies before the filter)
+                    if t.starts_with("scale=") {
+                        if let Some(rest) = t.strip_prefix("scale=") {
+                            let mut it = rest.splitn(2, |c| c == ';' || c == ' ');
+                            if let Some(_k) = it.next() {
+                                if let Some(rest2) = it.next() {
+                                    t = rest2;
+                                }
+                            }
+                        }
+                    }
+                    if !t.chars().all(|c| {
+                        c.is_ascii_digit()
+                            || c.is_whitespace()
+                            || matches!(
+                                c,
+                                '+' | '-' | '*' | '/' | '%' | '(' | ')' | '.' | '^' | 'c' | 's'
+                            )
+                    }) {
+                        return false;
+                    }
+                }
+                InterpPart::Expr(_) => slots += 1,
+            }
+        }
+        has_float && slots > 0
+    }
+
+    /// The var name when `e` is a direct variable reference in any of
+    /// the shapes the ShIR uses (Var/Ident nodes and `getVar("name")`
+    /// calls — the interpolated `$rad` in a bc capture is a getVar).
+    fn var_name_of<'a>(&self, e: &'a IrExpr) -> Option<&'a str> {
+        match e {
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(n),
+            IrExpr::Call { func, args } if func == "getVar" => match args.first() {
+                Some(IrExpr::Str(n, _)) => Some(n.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Tokenize + precedence-climb `src` (numbers, `__bcvK`, + - * / % ^
     /// and parens) into a GLSL float expression. `^` right-assoc (bc);
     /// unary minus binds tighter than `^` (`-2^2` → 4, so `^` here is
-    /// left-recursive and the unary applies first — bc parity).
+    /// left-recursive and the unary applies first — bc parity). The bc
+    /// trig functions `c(…)`/`s(…)` become the GLSL `cos`/`sin`
+    /// built-ins (same fp32 semantics in the browser).
     fn parse_float_expr(&mut self, src: &str, slots: &[&IrExpr]) -> String {
         let toks = self.lex_float(src);
         let (v, rest) = self.float_prec(&toks, 0, 0, slots);
@@ -2160,6 +2721,13 @@ impl Render {
                 }
                 out.push((src[i..j].to_string(), i));
                 i = j;
+                continue;
+            }
+            // bc trig: `c(` / `s(` — cos/sin (only when followed by a
+            // paren, so `c`/`s` cannot appear as bare unknowns).
+            if (c == 'c' || c == 's') && i + 1 < b.len() && b[i + 1] as char == '(' {
+                out.push((format!("{c}("), i));
+                i += 2;
                 continue;
             }
             if matches!(c, '+' | '-' | '*' | '/' | '%' | '(' | ')') {
@@ -2222,6 +2790,18 @@ impl Render {
         }
         let (t, _) = &toks[idx];
         match t.as_str() {
+            "c(" | "s(" => {
+                // bc trig → GLSL cos/sin: parse the parenthesised
+                // argument, emit the built-in (fp32 in the browser,
+                // same as the hand-written shader's cos()/sin()).
+                let (v, ni) = self.float_prec(toks, idx + 1, 0, slots);
+                let name = if t == "c(" { "cos" } else { "sin" };
+                if ni < toks.len() && toks[ni].0 == ")" {
+                    (format!("{name}({v})"), ni + 1)
+                } else {
+                    (format!("{name}({v})"), ni)
+                }
+            }
             "-" | "+" => {
                 let (v, ni) = self.float_unary(toks, idx + 1, slots);
                 (format!("({}{v})", if t == "-" { "-" } else { "" }), ni)
@@ -2238,7 +2818,16 @@ impl Render {
                 if t.starts_with("__bcv") {
                     let k: usize = t[5..].parse().unwrap_or(0);
                     let e = slots.get(k).copied().unwrap_or(&IrExpr::Int(0));
-                    (format!("float({})", self.expr_num(e)), idx + 1)
+                    // a float var slot is emitted DIRECTLY — a
+                    // float(int()) round-trip would truncate the value
+                    // to an integer and break chained float math
+                    // (rad → c/s → rel → NDC).
+                    match self.var_name_of(e) {
+                        Some(n) if self.float_vars.contains(n) => {
+                            (self.ident(n), idx + 1)
+                        }
+                        _ => (format!("float({})", self.expr_num(e)), idx + 1),
+                    }
                 } else {
                     (t.clone(), idx + 1)
                 }
@@ -2404,6 +2993,17 @@ impl Render {
                 for t in targets {
                     if t.indices.is_empty() {
                         let v = self.ident(&t.var);
+                        // a float var assigned from a float var (`vp_x=$wx`
+                        // in the vertex shader) is a direct float copy —
+                        // expr_num would truncate through int().
+                        if self.float_vars.contains(&t.var) {
+                            if let Some(n) = self.var_name_of(expr) {
+                                if self.float_vars.contains(n) {
+                                    self.emit(&format!("{v} = {};", self.ident(n)));
+                                    return;
+                                }
+                            }
+                        }
                         let val = if self.is_num(&t.var) {
                             self.expr_num(expr)
                         } else {
@@ -2642,6 +3242,16 @@ impl Render {
                             return;
                         }
                         let v = self.ident(base);
+                        // a float var assigned from a float var is a
+                        // direct float copy (expr_num truncates to int)
+                        if self.float_vars.contains(base) {
+                            if let Some(n) = self.var_name_of(&args[1]) {
+                                if self.float_vars.contains(n) {
+                                    self.emit(&format!("{v} = {};", self.ident(n)));
+                                    return;
+                                }
+                            }
+                        }
                         let val = if self.is_num(base) {
                             self.expr_num(&args[1])
                         } else {
@@ -3221,6 +3831,492 @@ fn sanitize(s: &str) -> String {
     s.replace("*/", "*_/").replace("/*", "/_*")
 }
 
+// ── mediump gate: interval proof that every int intermediate fits ────
+// GLSL ES 1.00 fragment shaders MUST support `mediump int`/`mediump
+// float`; `highp` is optional there. The generated shader compiles on
+// every WebGL1 implementation only when it stays within the mandatory
+// mediump forms. A forward interval analysis over the rendered
+// arithmetic proves that no integer intermediate exceeds ±2^15 (the
+// mediump int guarantee), including the `%` emulation `a - b*(a/b)`
+// (three intermediates of its own). Unprovable constructs fail closed →
+// highp. Everything is deliberately conservative: this gate may refuse
+// mediump, but must never emit it unsoundly.
+
+/// The mediump int guarantee: values in [-32768, 32767] (16-bit signed).
+const MEDIUMP_I16: i128 = 32767;
+
+#[derive(Clone, Copy)]
+struct Range {
+    lo: i128,
+    hi: i128,
+}
+
+impl Range {
+    fn point(v: i64) -> Option<Range> {
+        let v = v as i128;
+        if v < -MEDIUMP_I16 - 1 || v > MEDIUMP_I16 {
+            None // the literal itself does not fit mediump int
+        } else {
+            Some(Range { lo: v, hi: v })
+        }
+    }
+
+    fn fits(self) -> bool {
+        self.lo >= -MEDIUMP_I16 - 1 && self.hi <= MEDIUMP_I16
+    }
+
+    fn join(a: Range, b: Range) -> Range {
+        Range { lo: a.lo.min(b.lo), hi: a.hi.max(b.hi) }
+    }
+
+    fn abs_max(self) -> i128 {
+        self.lo.abs().max(self.hi.abs())
+    }
+
+    fn add(a: Option<Range>, b: Option<Range>) -> Option<Range> {
+        let (a, b) = (a?, b?);
+        let r = Range { lo: a.lo + b.lo, hi: a.hi + b.hi };
+        r.fits().then_some(r)
+    }
+
+    fn sub(a: Option<Range>, b: Option<Range>) -> Option<Range> {
+        let (a, b) = (a?, b?);
+        let r = Range { lo: a.lo - b.hi, hi: a.hi - b.lo };
+        r.fits().then_some(r)
+    }
+
+    fn mul(a: Option<Range>, b: Option<Range>) -> Option<Range> {
+        let (a, b) = (a?, b?);
+        let c = [
+            a.lo * b.lo,
+            a.lo * b.hi,
+            a.hi * b.lo,
+            a.hi * b.hi,
+        ];
+        let r = Range { lo: c.iter().min().copied().unwrap(), hi: c.iter().max().copied().unwrap() };
+        r.fits().then_some(r)
+    }
+
+    /// Truncating integer division (GLSL int `/`): with a zero-free
+    /// divisor, |a/b| ≤ ceil(max|a| / min|b|) — truncation only shrinks
+    /// magnitude, so this is a sound bound. Sign is discarded (the
+    /// result may be either), which is fine for the mediump check.
+    fn div(a: Option<Range>, b: Option<Range>) -> Option<Range> {
+        let (a, b) = (a?, b?);
+        if b.lo <= 0 && b.hi >= 0 {
+            return None; // divisor may be zero → undefined
+        }
+        let mb = b.lo.abs().min(b.hi.abs());
+        let bound = (a.abs_max() + mb - 1) / mb; // ceil
+        if bound > MEDIUMP_I16 {
+            return None;
+        }
+        Some(Range { lo: -bound, hi: bound })
+    }
+
+    /// The `%` emulation `a - b*(a/b)` — THREE intermediates must fit:
+    /// `a/b`, `b*(a/b)`, and the subtraction. The remainder's own range
+    /// is |a%b| < |b|.
+    fn rem(a: Option<Range>, b: Option<Range>) -> Option<Range> {
+        let (a, b) = (a?, b?);
+        if b.lo <= 0 && b.hi >= 0 {
+            return None;
+        }
+        let mb_min = b.lo.abs().min(b.hi.abs());
+        let mb_max = b.lo.abs().max(b.hi.abs());
+        let ma = a.abs_max();
+        let q = (ma + mb_min - 1) / mb_min; // ceil |a/b|
+        let bq = mb_max * q; // |b*(a/b)|
+        if q > MEDIUMP_I16 || bq > MEDIUMP_I16 || ma + bq > MEDIUMP_I16 {
+            return None;
+        }
+        let r = Range { lo: -mb_max, hi: mb_max };
+        r.fits().then_some(r)
+    }
+}
+
+/// Forward interval analysis over the A1 statements. Returns false when
+/// any construct cannot be proven (loops, functions, arrays, unknown
+/// calls) or when any integer intermediate exceeds ±2^15.
+fn fits_mediump_int(prog: &IrProgram, opts: &ShGlslOptions) -> bool {
+    if !prog.subs.is_empty() {
+        return false; // function bodies / recursion → unprovable
+    }
+    let mut vars: std::collections::HashMap<String, Option<Range>> = std::collections::HashMap::new();
+    // input bridge ranges (the renderer's seeds; only referenced ones
+    // are ever read)
+    let seed = |vars: &mut std::collections::HashMap<String, Option<Range>>, name: &str, hi: i64| {
+        vars.insert(name.to_string(), Some(Range { lo: 0, hi: hi as i128 })); // [0, hi]
+    };
+    if opts.color_out {
+        seed(&mut vars, "frag_x", opts.max_view as i64);
+        seed(&mut vars, "frag_y", opts.max_view as i64);
+        seed(&mut vars, "vcolor_r", 255);
+        seed(&mut vars, "vcolor_g", 255);
+        seed(&mut vars, "vcolor_b", 255);
+        if opts.tex_size > 0 {
+            seed(&mut vars, "uv_x", opts.tex_size as i64);
+            seed(&mut vars, "uv_y", opts.tex_size as i64);
+            seed(&mut vars, "tex_r", 255);
+            seed(&mut vars, "tex_g", 255);
+            seed(&mut vars, "tex_b", 255);
+            seed(&mut vars, "cr_r", 255);
+            seed(&mut vars, "cr_g", 255);
+            seed(&mut vars, "cr_b", 255);
+            seed(&mut vars, "cr_a", 255);
+            seed(&mut vars, "damage", 3);
+        }
+    }
+    walk_stmts(&prog.stmts, &mut vars)
+}
+
+/// Range of a numeric IrExpr; None = unprovable (fails the gate).
+fn expr_range(e: &IrExpr, vars: &std::collections::HashMap<String, Option<Range>>) -> Option<Range> {
+    match e {
+        IrExpr::Int(n) => Range::point(*n),
+        IrExpr::Str(s, _) => s.trim().parse::<i64>().ok().and_then(Range::point),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => vars.get(n).copied().flatten(),
+        IrExpr::Arith(a) => arith_range(a, vars),
+        IrExpr::BinOp { lhs, op, rhs } => match op {
+            BinOpKind::Add => Range::add(expr_range(lhs, vars), expr_range(rhs, vars)),
+            BinOpKind::Sub => Range::sub(expr_range(lhs, vars), expr_range(rhs, vars)),
+            BinOpKind::Mul => Range::mul(expr_range(lhs, vars), expr_range(rhs, vars)),
+            BinOpKind::Div => Range::div(expr_range(lhs, vars), expr_range(rhs, vars)),
+            BinOpKind::Mod => Range::rem(expr_range(lhs, vars), expr_range(rhs, vars)),
+            BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Gt
+            | BinOpKind::Le | BinOpKind::Ge | BinOpKind::And | BinOpKind::Or
+            | BinOpKind::Not => Range::point(1), // comparisons/booleans → 0/1
+            BinOpKind::Concat | BinOpKind::Pow | BinOpKind::BitAnd | BinOpKind::BitOr
+            | BinOpKind::BitXor | BinOpKind::ShiftL | BinOpKind::ShiftR => None,
+        },
+        IrExpr::Ternary { cond, then, else_ } => {
+            expr_range(cond, vars)?;
+            let t = expr_range(then, vars)?;
+            let e = expr_range(else_, vars)?;
+            Some(Range::join(t, e))
+        }
+        IrExpr::Call { func, args } => match func.as_str() {
+            "arith" => match args.first() {
+                Some(IrExpr::Str(text, _)) => {
+                    crate::shir::parse_arith(text).and_then(|a| arith_range(&a, vars))
+                }
+                _ => None,
+            },
+            "getVar" => match args.first() {
+                Some(IrExpr::Str(name, _)) => {
+                    let n = name.trim_start_matches('$');
+                    vars.get(n).copied().flatten()
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Range of an arithmetic AST node; None = unprovable.
+fn arith_range(a: &ArithAst, vars: &std::collections::HashMap<String, Option<Range>>) -> Option<Range> {
+    match a {
+        ArithAst::Num(n) => Range::point(*n),
+        ArithAst::Var(n) | ArithAst::Ident(n) => vars.get(n).copied().flatten(),
+        ArithAst::Index { .. } => None, // arrays out of scope
+        ArithAst::Bin { op, lhs, rhs } => {
+            let l = arith_range(lhs, vars);
+            let r = arith_range(rhs, vars);
+            match op.as_str() {
+                "+" => Range::add(l, r),
+                "-" => Range::sub(l, r),
+                "*" => Range::mul(l, r),
+                "/" => Range::div(l, r),
+                "%" => Range::rem(l, r),
+                "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||" => Range::point(1),
+                _ => None, // **, shifts, unknown
+            }
+        }
+        ArithAst::Un { op, arg } => {
+            let x = arith_range(arg, vars)?;
+            match op.as_str() {
+                "-" => Some(Range { lo: -x.hi, hi: -x.lo }),
+                "+" => Some(x),
+                "!" => Range::point(1),
+                "~" => Range::add(Range::point(-1), Some(Range { lo: -x.hi, hi: -x.lo })),
+                _ => None,
+            }
+        }
+        ArithAst::Cond { test, then, else_ } => {
+            arith_range(test, vars)?;
+            let t = arith_range(then, vars)?;
+            let e = arith_range(else_, vars)?;
+            Some(Range::join(t, e))
+        }
+        ArithAst::Assign { var, op, rhs } => {
+            // `x op= e` inside $(( )) — the read-modify-write intermediate
+            let cur = vars.get(var).copied().flatten();
+            let r = arith_range(rhs, vars);
+            let next = match op.as_str() {
+                "=" => r,
+                "+=" => Range::add(cur, r),
+                "-=" => Range::sub(cur, r),
+                "*=" => Range::mul(cur, r),
+                "/=" => Range::div(cur, r),
+                "%=" => Range::rem(cur, r),
+                _ => None,
+            };
+            next
+        }
+        ArithAst::IncDec { var, delta, .. } => {
+            let cur = vars.get(var).copied().flatten()?;
+            Range::add(Some(cur), Range::point(*delta as i64))
+        }
+        ArithAst::Sizeof(_) => Range::point(4),
+        ArithAst::Cast { arg, .. } => arith_range(arg, vars),
+    }
+}
+
+/// Numeric tokens inside a test string must fit (`[ "$x" -gt 150 ]`, or
+/// `[ $((fx * 7)) -gt 3 ]`): literals ≤ ±2^15 and `$((…))` sub-arithmetic
+/// provable. Bare `$var` operands are covered by their assignments.
+fn test_text_ok(text: &str, vars: &std::collections::HashMap<String, Option<Range>>) -> bool {
+    for tok in test_tokenize(text) {
+        let t = tok.trim();
+        if let Some(inner) = t.strip_prefix("$((").and_then(|x| x.strip_suffix("))")) {
+            match crate::shir::parse_arith(inner) {
+                Some(a) => {
+                    if arith_range(&a, vars).is_none() {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        } else if let Ok(n) = t.parse::<i64>() {
+            if Range::point(n).is_none() {
+                return false;
+            }
+        }
+        // `$var` / quoted words / operators — no integer value of its
+        // own beyond the assignments already checked.
+    }
+    true
+}
+
+/// `split(getVar("r"))` → `getVar("r")` (the putb arg wrapper the shell
+/// lowering adds for unquoted reads). Any other shape is passed through.
+fn unwrap_split(e: &IrExpr) -> IrExpr {
+    if let IrExpr::Call { func, args } = e {
+        if func == "split" {
+            if let Some(inner) = args.first() {
+                return inner.clone();
+            }
+        }
+    }
+    e.clone()
+}
+
+fn test_ok(cond: &IrExpr, vars: &std::collections::HashMap<String, Option<Range>>) -> bool {
+    match cond {
+        IrExpr::Call { func, args } if func == "test" => args.iter().all(|a| match a {
+            IrExpr::Str(text, _) => test_text_ok(text, vars),
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+fn walk_stmts(stmts: &[IrStmt], vars: &mut std::collections::HashMap<String, Option<Range>>) -> bool {
+    for s in stmts {
+        if !walk_stmt(s, vars) {
+            if std::env::var("GLSL_MEDIUMP_DEBUG").is_ok() {
+                eprintln!("mediump gate: failing stmt = {s:?}");
+            }
+            return false;
+        }
+    }
+    true
+}
+
+fn walk_stmt(s: &IrStmt, vars: &mut std::collections::HashMap<String, Option<Range>>) -> bool {
+    match s {
+        IrStmt::Assign { targets, expr } => {
+            let r = expr_range(expr, vars);
+            if r.is_none() {
+                return false;
+            }
+            for t in targets {
+                if !t.indices.is_empty() {
+                    return false; // array element write
+                }
+                vars.insert(t.var.clone(), r);
+            }
+            true
+        }
+        IrStmt::Declare { vars: decls, init, .. } => {
+            let r = match init {
+                Some(i) => match expr_range(i, vars) {
+                    Some(r) => Some(r),
+                    None => return false,
+                },
+                None => None,
+            };
+            for Decl { name, .. } in decls {
+                vars.insert(name.clone(), r);
+            }
+            true
+        }
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+        } => {
+            if !test_ok(cond, vars) {
+                return false;
+            }
+            let mut branches: Vec<std::collections::HashMap<String, Option<Range>>> = Vec::new();
+            let mut t = vars.clone();
+            if !walk_stmts(then, &mut t) {
+                return false;
+            }
+            branches.push(t);
+            for (e, body) in elsifs {
+                if !test_ok(e, vars) {
+                    return false;
+                }
+                let mut b = vars.clone();
+                if !walk_stmts(body, &mut b) {
+                    return false;
+                }
+                branches.push(b);
+            }
+            let mut el = vars.clone();
+            if !walk_stmts(else_, &mut el) {
+                return false;
+            }
+            branches.push(el);
+            // union of every branch + the pre-branch state (a var
+            // unknown/unbounded in ANY branch poisons the merge)
+            let names: BTreeSet<String> =
+                branches.iter().flat_map(|m| m.keys().cloned()).collect();
+            for n in names {
+                let mut acc: Option<Range> = None;
+                let mut poisoned = false;
+                for b in &branches {
+                    match b.get(&n) {
+                        Some(Some(r)) => {
+                            acc = Some(match acc {
+                                Some(a) => Range::join(a, *r),
+                                None => *r,
+                            })
+                        }
+                        Some(None) => poisoned = true,
+                        None => {}
+                    }
+                }
+                vars.insert(n, if poisoned { None } else { acc });
+            }
+            true
+        }
+        IrStmt::Block(body) => walk_stmts(body, vars),
+        IrStmt::Expr(e) => match e {
+            IrExpr::Call { func, args } if func == "putb" => match args.first() {
+                Some(a) => expr_range(a, vars).is_some(),
+                None => true,
+            },
+            IrExpr::Call { func, args } if func == "exec" => match args.first() {
+                // `putb $r` lowers to exec("putb", [split(getVar("r"))])
+                Some(IrExpr::Str(cmd, _)) if cmd == "putb" => {
+                    match args.get(1) {
+                        Some(IrExpr::Array(items)) => {
+                            for item in items {
+                                if expr_range(&unwrap_split(item), vars).is_none() {
+                                    return false;
+                                }
+                            }
+                            true
+                        }
+                        Some(other) => expr_range(&unwrap_split(other), vars).is_some(),
+                        None => true,
+                    }
+                }
+                _ => false, // any other exec → fail closed
+            },
+            IrExpr::Call { func, args } if func == "setVar" || func == "assign" => {
+                match args.first() {
+                    Some(IrExpr::Str(name, _)) => {
+                        if args.len() >= 3 {
+                            // assign("name", op, rhs) — read-modify-write
+                            if let Some(IrExpr::Str(op, _)) = args.get(1) {
+                                let cur = vars.get(name).copied().flatten();
+                                let rhs = expr_range(&args[2], vars);
+                                let next = match op.as_str() {
+                                    "=" => rhs,
+                                    "+=" => Range::add(cur, rhs),
+                                    "-=" => Range::sub(cur, rhs),
+                                    "*=" => Range::mul(cur, rhs),
+                                    "/=" => Range::div(cur, rhs),
+                                    "%=" => Range::rem(cur, rhs),
+                                    _ => None,
+                                };
+                                match next {
+                                    Some(r) => {
+                                        vars.insert(name.clone(), Some(r));
+                                        true
+                                    }
+                                    None => false,
+                                }
+                            } else {
+                                false
+                            }
+                        } else if args.len() >= 2 {
+                            match expr_range(&args[1], vars) {
+                                Some(r) => {
+                                    vars.insert(name.clone(), Some(r));
+                                    true
+                                }
+                                None => false,
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            IrExpr::Call { func, args } if func == "test" => test_ok(e, vars),
+            IrExpr::Call { func, .. } if func == "arith" => expr_range(e, vars).is_some(),
+            _ => false,
+        },
+        // loops, functions, case, pipelines, subshells, redirects,
+        // files, control flow — fail closed (unprovable)
+        IrStmt::While { .. }
+        | IrStmt::DoWhile { .. }
+        | IrStmt::For { .. }
+        | IrStmt::ForInit { .. }
+        | IrStmt::Case { .. }
+        | IrStmt::Function { .. }
+        | IrStmt::Subshell(_)
+        | IrStmt::Background(_)
+        | IrStmt::Pipeline { .. }
+        | IrStmt::Redirect { .. }
+        | IrStmt::Exec { .. }
+        | IrStmt::Output { .. }
+        | IrStmt::Require(_)
+        | IrStmt::WriteFile { .. }
+        | IrStmt::Return(_)
+        | IrStmt::Exit(_)
+        | IrStmt::Die { .. }
+        | IrStmt::Warn { .. }
+        | IrStmt::Try { .. }
+        | IrStmt::SetChildError(_)
+        | IrStmt::Label(_)
+        | IrStmt::Goto(_)
+        | IrStmt::RawText(_)
+        | IrStmt::DeclareArray { .. }
+        | IrStmt::Continue
+        | IrStmt::Break => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3239,7 +4335,7 @@ mod tests {
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
         );
         assert!(shader.contains("#version 300 es"));
-        assert!(shader.contains("g_x = (5);"));
+        assert!(shader.contains("g_x = 5;"));
         assert!(shader.contains("putCh(10);"));
     }
 
@@ -3254,8 +4350,8 @@ mod tests {
               ]}
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
         );
-        assert!(shader.contains("while ((g_i < (3)))"));
-        assert!(shader.contains("g_i = ((g_i) + ((1)));"));
+        assert!(shader.contains("while ((g_i < 3))"));
+        assert!(shader.contains("g_i = (g_i + 1);"));
     }
 
     #[test]
@@ -3306,6 +4402,77 @@ mod tests {
         assert!(!before_main.contains("g_x"), "g_x declared before main");
     }
 
+    // ── mediump gate (ES 1.00 mandatory fragment precision) ─────────
+
+    /// A frag program: vcolor → small arithmetic → putb. With max_view
+    /// it must prove mediump int.
+    const MEDIUMP_OK_PROG: &str = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
+      {"type":"Assign","targets":[{"var":"r","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Var","name":"vcolor_r"}}},
+      {"type":"Assign","targets":[{"var":"r","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Bin","op":"*","lhs":{"type":"Var","name":"r"},"rhs":{"type":"Num","value":90}}}},
+      {"type":"Assign","targets":[{"var":"r","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Bin","op":"/","lhs":{"type":"Var","name":"r"},"rhs":{"type":"Num","value":100}}}},
+      {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"putb","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"split","purity":"Emulable","args":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"r","style":"DoubleQuoted"}]}]}]}]}}
+    ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#;
+
+    #[test]
+    fn mediump_emitted_when_provable() {
+        let shader = render_opts(
+            MEDIUMP_OK_PROG,
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 0, max_view: 800 },
+        );
+        assert!(shader.contains("precision mediump int;"), "mediump int not proven");
+        assert!(shader.contains("precision mediump float;"), "mediump float not proven");
+    }
+
+    #[test]
+    fn mediump_refused_on_overflow() {
+        // r*tex_r with both 0..255 → 65025 > 32767 → must stay highp int
+        let prog = MEDIUMP_OK_PROG.replace(
+            "\"rhs\":{\"type\":\"Num\",\"value\":90}",
+            "\"rhs\":{\"type\":\"Var\",\"name\":\"tex_r\"}",
+        );
+        let shader = render_opts(
+            &prog,
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 800 },
+        );
+        assert!(shader.contains("precision highp int;"), "overflow must refuse mediump int");
+        assert!(shader.contains("precision mediump float;"), "float side stays provable");
+    }
+
+    #[test]
+    fn mediump_refused_without_max_view() {
+        let shader = render_opts(
+            MEDIUMP_OK_PROG,
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 0, max_view: 0 },
+        );
+        assert!(shader.contains("precision highp int;"), "max_view=0 must refuse mediump");
+        assert!(shader.contains("precision highp float;"));
+    }
+
+    #[test]
+    fn mediump_refused_on_big_literal() {
+        // x = 100000 → the literal itself exceeds mediump int
+        let prog = MEDIUMP_OK_PROG.replace(
+            "{\"type\":\"Var\",\"name\":\"vcolor_r\"}",
+            "{\"type\":\"Num\",\"value\":100000}",
+        );
+        let shader = render_opts(
+            &prog,
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 0, max_view: 800 },
+        );
+        assert!(shader.contains("precision highp int;"), "big literal must refuse mediump");
+    }
+
+    #[test]
+    fn mediump_float_requires_small_viewport() {
+        // max_view > 2048 → gl_FragCoord is not exact in mediump float
+        let shader = render_opts(
+            MEDIUMP_OK_PROG,
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 0, max_view: 4096 },
+        );
+        assert!(shader.contains("precision highp float;"), "4096-wide canvas must keep highp float");
+        assert!(shader.contains("precision mediump int;"), "int side may still be proven");
+    }
+
     #[test]
     fn render_fragment_is_lean() {
         // the es100+color_out render fragment (the sh2glsl/wasm path):
@@ -3315,7 +4482,7 @@ mod tests {
             r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
               {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
-            ShGlslOptions { es100: true, color_out: true, tex_size: 16 },
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 0 },
         );
         assert!(!shader.contains("OUT_CAP"), "OUT_CAP in render fragment");
         assert!(!shader.contains("out_len"), "out_len in render fragment");
@@ -3323,7 +4490,7 @@ mod tests {
         assert!(!shader.contains("g_fit"), "g_fit in render fragment");
         assert!(!shader.contains("s_scratch"), "s_scratch in render fragment");
         assert!(shader.contains("int out_buf[4];"), "out_buf not sized for the 4 colour slots");
-        assert!(shader.contains("out_buf[0] = (255);"), "putb write missing");
+        assert!(shader.contains("out_buf[0] = 255;"), "putb write missing");
     }
 
     #[test]
@@ -3334,10 +4501,157 @@ mod tests {
             r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
               {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
-            ShGlslOptions { es100: false, color_out: true, tex_size: 0 },
+            ShGlslOptions { es100: false, color_out: true, vert_out: false, tex_size: 0, max_view: 0 },
         );
         assert!(shader.contains("void putCh(int c)"), "putCh helper missing");
         assert!(shader.contains("const int OUT_CAP"), "OUT_CAP missing for putCh");
         assert!(shader.contains("int out_len = 0;"), "out_len missing for putCh");
+    }
+
+    #[test]
+    fn bridges_use_gated() {
+        // a program referencing only frag_x gets NO vColor varying, no
+        // texture uniforms, no texture2D seeds — the texture machinery
+        // must not be emitted for a texture-less fragment.
+        let shader = render_opts(
+            r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
+              {"type":"Assign","targets":[{"var":"fx","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Var","name":"frag_x"}}},
+              {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
+            ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 0 },
+        );
+        assert!(shader.contains("g_frag_x = int(gl_FragCoord.x);"), "frag_x seed missing");
+        assert!(!shader.contains("vColor"), "vColor declared unused");
+        assert!(!shader.contains("uTex"), "uTex declared unused");
+        assert!(!shader.contains("uCrack"), "uCrack declared unused");
+        assert!(!shader.contains("uDamage"), "uDamage declared unused");
+        assert!(!shader.contains("texture2D"), "texture2D emitted unused");
+        assert!(!shader.contains("g_uv_x"), "uv seed emitted unused");
+        assert!(!shader.contains("g_tex_r"), "tex seed emitted unused");
+    }
+
+    #[test]
+    fn bridges_tex_group_dependency() {
+        // referencing tex_r must pull in vUv + the uv seeds (the sample
+        // coordinate reads them) but NOT the crack/damage machinery.
+        let shader = render_opts(
+            r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
+              {"type":"Assign","targets":[{"var":"t","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Var","name":"tex_r"}}},
+              {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
+            ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 0 },
+        );
+        assert!(shader.contains("varying vec2 vUv;"), "vUv missing for tex bridge");
+        assert!(shader.contains("uniform sampler2D uTex;"), "uTex missing for tex bridge");
+        assert!(shader.contains("int g_uv_x;"), "uv_x not declared (the tex seeds write it)");
+        assert!(shader.contains("int g_uv_y;"), "uv_y not declared (the tex seeds write it)");
+        assert!(shader.contains("g_uv_x = int(vUv.x * 16.0);"), "uv seed missing");
+        assert!(shader.contains("vec4 _tex = texture2D(uTex"), "uTex sample missing");
+        assert!(shader.contains("g_tex_r = int(_tex.r * 255.0);"), "tex_r seed missing");
+        assert!(!shader.contains("g_tex_g"), "tex_g seeded unused");
+        assert!(!shader.contains("uCrack"), "uCrack declared unused");
+        assert!(!shader.contains("uDamage"), "uDamage declared unused");
+    }
+
+    // ── render vertex mode (vert_out) ──────────────────────────────
+
+    /// render a BASH program with options (the same pipeline as the
+    /// `sh2glsl` binary: parse_commands_from_text → ast_to_ir_raw).
+    fn render_bash_opts(src: &str, opts: ShGlslOptions) -> String {
+        let cmds = crate::parser::commands::parse_commands_from_text(src).expect("parse");
+        let prog = crate::shir::ast_to_ir_raw(&cmds);
+        shir_to_glsl_opts(&prog, &opts)
+    }
+
+    #[test]
+    fn vertex_mode_emits_program_and_bridges() {
+        // the real MIMEcroft vertex program: object→world position
+        // (float bc), camera-relative delta, bc-trig rotation, and the
+        // vp_*/vc_*/vu_* outputs.
+        let shader = render_bash_opts(
+            r#"
+wx=$(echo "scale=4; $ap_x * $usc_x / 1000000.0 + $uop_x / 1000.0" | bc)
+rad=$(echo "scale=8; $ucy_m * 3.14159265 / 180000.0" | bc)
+c=$(echo "scale=6; c($rad) + 0.0" | bc)
+s=$(echo "scale=6; s($rad) + 0.0" | bc)
+dx=$(echo "scale=4; $wx - $cx + 0.0" | bc)
+dz=$(echo "scale=4; $wz - $cz + 0.0" | bc)
+relx=$(echo "scale=4; $dx * $c + $dz * $s + 0.0" | bc)
+relz=$(echo "scale=4; 0 - $dx * $s + $dz * $c + 0.0" | bc)
+w=$(echo "scale=4; 0 - $relz + 0.0" | bc)
+vp_x=$(echo "scale=4; $relx * 0.9" | bc)
+vp_z=$(echo "scale=4; $w * $w / 64.0" | bc)
+vp_w=$w
+vc_r=$((ash_r * ublk_r / 1000))
+vu_u=$auv_u
+"#,
+            ShGlslOptions { es100: true, color_out: false, vert_out: true, tex_size: 16, max_view: 0 },
+        );
+        // header: attributes/uniforms/varyings
+        assert!(shader.contains("attribute vec3 aPosition;"), "aPosition missing");
+        assert!(shader.contains("attribute vec3 aShade;"), "aShade missing");
+        assert!(shader.contains("attribute vec2 aUv;"), "aUv missing");
+        assert!(shader.contains("uniform float uCamYaw;"), "uCamYaw missing");
+        assert!(shader.contains("uniform vec3 uObjPos;"), "uObjPos missing");
+        assert!(shader.contains("uniform vec3 uScale;"), "uScale missing");
+        assert!(shader.contains("uniform vec3 uBlockColor;"), "uBlockColor missing");
+        assert!(shader.contains("varying vec4 vColor;"), "vColor missing");
+        assert!(shader.contains("varying vec2 vUv;"), "vUv missing");
+        // seeds ×1000
+        assert!(shader.contains("g_ap_x = int(aPosition.x * 1000.0);"), "ap_x seed");
+        assert!(shader.contains("g_auv_u = int(aUv.x * 1000.0);"), "auv_u seed");
+        assert!(shader.contains("g_ucy_m = int(uCamYaw * 1000.0);"), "ucy_m seed");
+        assert!(shader.contains("g_ublk_r = int(uBlockColor.r * 1000.0);"), "ublk_r seed");
+        // the float bc captures: locals are floats (the pass-1 verdict)
+        assert!(shader.contains("float g_vp_x;"), "vp_x not a float local");
+        assert!(shader.contains("float g_vp_w;"), "vp_w not a float local");
+        assert!(shader.contains("float g_c;"), "cos var not a float local");
+        assert!(shader.contains("float g_relx;"), "relx not a float local");
+        // the trig: c($rad) → cos(g_rad) — and CHAINED float math
+        // reads the float var directly (no float(int()) truncation)
+        assert!(shader.contains("cos(g_rad)"), "bc cos emit");
+        assert!(shader.contains("sin(g_rad)"), "bc sin emit");
+        assert!(!shader.contains("int(g_rad)"), "float var truncated through int()");
+        assert!(shader.contains("g_dx * g_c") && shader.contains("g_dz * g_s"), "chained float math");
+        // float-var copies: vp_x=$relx / vp_w=$w stay direct float copies
+        assert!(shader.contains("g_vp_x = (g_relx * (0.9));"), "vp_x from relx");
+        assert!(shader.contains("g_vp_w = g_w;"), "float copy vp_w");
+        // int outputs stay int (no cat/itos string machinery)
+        assert!(shader.contains("g_ash_r * g_ublk_r") && shader.contains("g_vc_r"), "vc_r int math");
+        assert!(shader.contains("g_vu_u = g_auv_u;"), "vu_u int copy");
+        // the end-of-main emission
+        assert!(shader.contains("gl_Position = vec4(g_vp_x, g_vp_y, g_vp_z, g_vp_w);"), "gl_Position");
+        assert!(shader.contains("vColor = vec4(float(g_vc_r) / 1000.0, float(g_vc_g) / 1000.0, float(g_vc_b) / 1000.0, float(g_vc_a) / 1000.0);"), "vColor");
+        assert!(shader.contains("vUv = vec2(float(g_vu_u) / 1000.0, float(g_vu_v) / 1000.0);"), "vUv");
+        // no fragment machinery
+        assert!(!shader.contains("gl_FragColor"), "fragment output in vertex mode");
+        assert!(!shader.contains("out_buf"), "out_buf in vertex mode");
+        assert!(!shader.contains("u_mode"), "u_mode in vertex mode");
+        assert!(!shader.contains("texture2D"), "texture2D in vertex mode");
+        assert!(!shader.contains("cat("), "string machinery in vertex mode");
+        assert!(!shader.contains("itos"), "itos in vertex mode");
+        // highp is REQUIRED in ES 1.00 vertex shaders (mediump gate is
+        // a fragment-only concern — gl_Position math keeps precision)
+        assert!(shader.contains("precision highp float;"), "vertex not highp float");
+        assert!(shader.contains("precision highp int;"), "vertex not highp int");
+        assert!(!shader.contains("precision mediump float"), "vertex downgraded to mediump");
+        // clean compile marker
+        assert!(shader.contains("TODO(unsupported): 0 construct(s)"), "unsupported constructs");
+    }
+
+    #[test]
+    fn vertex_mode_bridges_use_gated() {
+        // a program referencing ONLY ucy_m + the outputs gets no
+        // attribute declarations and no unused seeds/uniforms.
+        let shader = render_bash_opts(
+            "vp_x=$ucy_m\n",
+            ShGlslOptions { es100: true, color_out: false, vert_out: true, tex_size: 0, max_view: 0 },
+        );
+        assert!(shader.contains("uniform float uCamYaw;"), "uCamYaw missing");
+        assert!(shader.contains("g_ucy_m = int(uCamYaw * 1000.0);"), "ucy_m seed");
+        assert!(!shader.contains("attribute"), "attributes declared unused");
+        assert!(!shader.contains("uObjPos"), "uObjPos declared unused");
+        assert!(!shader.contains("uOverlay"), "uOverlay declared unused");
+        assert!(!shader.contains("uCamPos"), "uCamPos declared unused");
     }
 }

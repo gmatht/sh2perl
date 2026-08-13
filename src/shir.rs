@@ -303,6 +303,16 @@ static ARITH_POISON_DEPTH: Mutex<usize> = Mutex::new(0);
 /// runtime's `emit` when fd 1 is the default stdout, so the native echo
 /// lowering (see `try_native_echo`) checks this depth before firing.
 static ECHO_SINK_DEPTH: Mutex<usize> = Mutex::new(0);
+/// Plan 4 test-status elision depth: >0 while lowering a `[ ]`-test
+/// whose lastExit write is provably unread (a bare `[ ]` statement or a
+/// dead if/while condition — see [`compute_test_cond_deadness`] and the
+/// `test` statement/cond emission): the test arm emits the bare boolean
+/// (`try_native_test_unstatused`) instead of the
+/// `(sh2._g = t, sh2.lastExit = …, sh2._g)` status protocol. Only the
+/// value-consuming positions (statement/if/while cond at AND_OR_DEPTH
+/// 0) raise it; `&&`/`||` chains keep the statused form (the links
+/// branch on lastExit).
+static TEST_UNSTATUSED_DEPTH: Mutex<usize> = Mutex::new(0);
 /// Subshell/background statement sites whose body provably runs with the
 /// DEFAULT stdout sink (see [`native_echo_sink_sites`]): their arrows
 /// lower WITHOUT the sink-depth bump (the `arrow_native_echo` form), so
@@ -391,6 +401,27 @@ static MAY_ERREXIT: Mutex<Option<bool>> = Mutex::new(None);
 static LASTEXIT_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
 fn lastexit_write_is_dead(stmt: &IrStmt) -> bool {
     LASTEXIT_DEAD
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| {
+            m.get(&(stmt as *const IrStmt as usize))
+                .copied()
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// Plan 4 extension: `test`-CONDITION deadness — per If/While statement,
+/// the `[ ]` condition's status write (the `(sh2._g = t, sh2.lastExit =
+/// …, sh2._g)` seq) is provably unread, so the emitter drops the status
+/// protocol and emits the bare boolean condition. Keyed by statement
+/// pointer like [`LASTEXIT_DEAD`]; computed in
+/// [`compute_lastexit_deadness`] (which owns the live set). Unset →
+/// conservative (statused).
+static TEST_COND_DEAD: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+fn test_cond_write_is_dead(stmt: &IrStmt) -> bool {
+    TEST_COND_DEAD
         .lock()
         .unwrap()
         .as_ref()
@@ -724,6 +755,19 @@ fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMa
         if is_native_echo_stmt(stmt) && !live.contains(&(stmt as *const IrStmt as usize)) {
             dead.insert(stmt as *const IrStmt as usize, true);
         }
+        // A bare `[ ]`-test STATEMENT (`IrStmt::Expr(Call{func:"test"})`
+        // — the `[ ]` lowering; the `[[ ]]` tag form carries the extra
+        // Str arg) whose status write is unread: the native lowering's
+        // `(sh2._g = t, sh2.lastExit = …, sh2._g)` seq collapses to the
+        // bare boolean (the statement's only effect is the status — the
+        // value is discarded). The scan already treats the test as a
+        // writer (`ir_stmt_writes_lastexit`); a `$?` read anywhere before
+        // the next writer keeps it live.
+        if let IrStmt::Expr(IrExpr::Call { func, .. }) = stmt {
+            if func == "test" && !live.contains(&(stmt as *const IrStmt as usize)) {
+                dead.insert(stmt as *const IrStmt as usize, true);
+            }
+        }
         // Plan 4 for if-statements: an `if c; then ...; fi` with NO else
         // synthesizes `sh2.lastExit = 0` on the false path (bash: a false
         // condition with no else leaves `$?` = 0). When the if's status is
@@ -786,14 +830,124 @@ fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMa
 /// EXIT trap handlers run under REAL bash via spawnSync (they see bash's
 /// own status, not sh2.lastExit), which is why `_finish` captures the code
 /// BEFORE running the traps.
+/// Backward-scan `stmts` and report whether a `$?`-reader chain reaches
+/// the TOP of the block unshadowed — i.e. whether a lastExit write
+/// PRECEDING the block (a `[ ]` condition's) would be observed from
+/// within (an arm-internal reader before the first arm writer, or the
+/// block's consumer when the block has no writer of its own — the
+/// consumer then observes the cond's write as the block's final status).
+/// Mirrors `scan_lastexit_liveness`'s read/write evolution exactly (the
+/// same writer/reader predicates — the `live` inserts are irrelevant
+/// here).
+fn lastexit_scan_top_read(stmts: &[IrStmt], end_live: bool) -> bool {
+    let mut read_pending = end_live;
+    for stmt in stmts.iter().rev() {
+        if ir_stmt_writes_lastexit(stmt) {
+            read_pending = false;
+        }
+        if ir_stmt_reads_status(stmt) {
+            read_pending = true;
+        }
+    }
+    read_pending
+}
+
+/// Plan 4 for `[ ]`-test CONDITIONS (the if/while lowering — the
+/// mimecroft hot path's `[ "$gv" -eq "$AIR" ]` per-block air test and
+/// `[ "$rf_x" -lt "$MAP_W" ]` loop guards): a condition's status write
+/// is DEAD iff no reader can observe it. Observation happens (a) from an
+/// arm/body statement — a `$?` read before the first arm writer (the
+/// arm's backward scan ends read-pending), or (b) from the statement's
+/// own consumer — when the run arm has NO lastExit writer of its own,
+/// the consumer observes the cond's write as the arm's final status
+/// (the same scan with `end_live = self_live` — a writer-free arm passes
+/// the consumer's read through to the top). Only If/While: DoWhile never
+/// reaches the ESTree emitter (the renderer's catch-all refuses it); the
+/// cond must be a direct `test` Call (a `!`/`&&`/`||`-wrapped cond keeps
+/// the statused form — its value/status flow is chain-shaped).
+fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMap<usize, bool> {
+    fn mark(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMap<usize, bool>) {
+        for stmt in stmts {
+            let self_live = live.contains(&(stmt as *const IrStmt as usize));
+            match stmt {
+                IrStmt::If {
+                    cond,
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    if matches!(cond, IrExpr::Call { func, .. } if func == "test") {
+                        let mut top = lastexit_scan_top_read(then, self_live);
+                        for (_, arm) in elsifs {
+                            top |= lastexit_scan_top_read(arm, self_live);
+                        }
+                        top |= lastexit_scan_top_read(else_, self_live);
+                        if !top {
+                            dead.insert(stmt as *const IrStmt as usize, true);
+                        }
+                    }
+                }
+                IrStmt::While { cond, body, .. } => {
+                    if matches!(cond, IrExpr::Call { func, .. } if func == "test") {
+                        if !lastexit_scan_top_read(body, self_live) {
+                            dead.insert(stmt as *const IrStmt as usize, true);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            match stmt {
+                IrStmt::While { body, .. }
+                | IrStmt::For { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => mark(body, live, dead),
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    mark(then, live, dead);
+                    for (_, arm) in elsifs {
+                        mark(arm, live, dead);
+                    }
+                    mark(else_, live, dead);
+                }
+                IrStmt::Redirect { inner, .. } => mark(inner, live, dead),
+                IrStmt::Function {
+                    body,
+                    named_blocks,
+                    ..
+                } => {
+                    mark(body, live, dead);
+                    for (_, nb) in named_blocks {
+                        mark(nb, live, dead);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut dead = HashMap::new();
+    mark(stmts, live, &mut dead);
+    dead
+}
+
 fn compute_lastexit_deadness(prog: &IrProgram, errexit: bool) -> HashMap<usize, bool> {
     let mut dead = HashMap::new();
     if errexit {
+        // under a possible `set -e` no write is droppable (the guard
+        // consumes the statement's value) — same for the test conds
+        *TEST_COND_DEAD.lock().unwrap() = Some(HashMap::new());
         return dead;
     }
     let mut live: HashSet<usize> = HashSet::new();
     walk_lastexit_liveness(&prog.stmts, true, &mut live);
     mark_lastexit_dead(&prog.stmts, &live, &mut dead);
+    *TEST_COND_DEAD.lock().unwrap() = Some(compute_test_cond_deadness(&prog.stmts, &live));
     dead
 }
 
@@ -4542,6 +4696,289 @@ use std::collections::{HashMap, HashSet};
         })
         .collect()
 }
+
+/// Constant folding for the estree path (core request
+/// estree-20260813-182434-const-fold-arith): top-level single-site
+/// assignments whose RHS folds to an integer seed a const pool; pure-int
+/// `Arith` reads of pooled names then fold to literals — a whole
+/// expression folds to `Int(n)`, a partial fold sinks the pooled
+/// products/subexpressions to `Num(n)` (`idx = y * CELLS + x` with
+/// `CELLS` pooled emits `y * 256 + x`). Runs on the `shir_to_estree`
+/// clone (BOTH the shell-parse and the A1-ingest paths — the mimecroft
+/// A1 contract's hot index arithmetic), so the `--shir` A1 export bytes
+/// are untouched and the frontends' byte-identical oracles stay put.
+///
+/// Soundness rules (each conservative alone):
+/// - the pool is seeded ONLY from unconditional top-level `Assign`s, in
+///   statement order — a read BEFORE the site (or inside a conditional /
+///   loop body before the site) never sees the value (the order walk
+///   folds with the pool as-of that point), and nested-body assignments
+///   never propagate out (a conditional/loop site may not have run);
+/// - only [`analyze_var_const`] `Const` verdicts seed — a single static
+///   site, no runtime/arith/index/dynamic writes can intervene;
+/// - only `+ - * / %` over `Num`/`Var`/`Ident` leaves fold (the exact
+///   [`arith_const`] semantics — no NaN-poison ops, no side-effect nodes
+///   (Assign/IncDec/Cond/Index/Cast/Sizeof), no `/0`);
+/// - values beyond ±2^53 never fold (JS Number precision — the
+///   un-folded emission is already lossy there, but the fold must not
+///   CHANGE the emitted value); the whole pass is skipped under
+///   `--true64` (the BigInt machinery owns the wide values).
+pub fn const_fold_arith(prog: &mut IrProgram) {
+    // the single-site const verdicts (pre-fold shapes)
+    let consts: std::collections::HashSet<String> = analyze_var_const(prog)
+        .into_iter()
+        .filter(|(_, k)| matches!(k, crate::ir::VarKind::Const))
+        .map(|(n, _)| n)
+        .collect();
+    if consts.is_empty() {
+        return;
+    }
+    const FOLD_MAX: i128 = 9007199254740992; // 2^53 — exactly representable
+    fn in_range(v: i128) -> bool {
+        v.abs() <= FOLD_MAX
+    }
+    /// Partial fold of an arith AST: pure-int subtrees (Num/Var/Ident
+    /// leaves with the pooled value) collapse to `Num(folded)`. Returns
+    /// the subtree's value when it is fully folded (None otherwise).
+    fn fold_arith(a: &mut ArithAst, pool: &HashMap<String, i128>) -> Option<i128> {
+        match a {
+            ArithAst::Num(n) => Some(*n as i128),
+            ArithAst::Var(name) | ArithAst::Ident(name) => pool.get(name).copied().filter(|&v| in_range(v)),
+            ArithAst::Bin { op, lhs, rhs } => {
+                let l = fold_arith(lhs, pool);
+                let r = fold_arith(rhs, pool);
+                let v = match (l, r) {
+                    (Some(l), Some(r)) => match op.as_str() {
+                        "+" => l.checked_add(r),
+                        "-" => l.checked_sub(r),
+                        "*" => l.checked_mul(r),
+                        "/" => (r != 0).then(|| l.checked_div(r)).flatten(),
+                        "%" => (r != 0).then(|| l.checked_rem(r)).flatten(),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(v) = v {
+                    if in_range(v) {
+                        *a = ArithAst::Num(v as i64);
+                        return Some(v);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    fn fold_expr(e: &mut IrExpr, pool: &mut HashMap<String, i128>) {
+        match e {
+            IrExpr::Arith(a) => {
+                fold_arith(a, pool);
+                if let Some(v) = arith_const(a) {
+                    if in_range(v) {
+                        *e = IrExpr::Int(v as i64);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                fold_expr(lhs, pool);
+                fold_expr(rhs, pool);
+            }
+            IrExpr::Ternary {
+                cond,
+                then,
+                else_,
+                ..
+            } => {
+                fold_expr(cond, pool);
+                fold_expr(then, pool);
+                fold_expr(else_, pool);
+            }
+            IrExpr::Index { key, .. } | IrExpr::Capture { expr: key, .. } => {
+                fold_expr(key, pool);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ir::InterpPart::Expr(x) = p {
+                        fold_expr(x, pool);
+                    }
+                }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args {
+                    fold_expr(a, pool);
+                }
+            }
+            IrExpr::MethodCall { obj, args, .. } => {
+                fold_expr(obj, pool);
+                for a in args {
+                    fold_expr(a, pool);
+                }
+            }
+            IrExpr::Array(elems) => {
+                for el in elems {
+                    fold_expr(el, pool);
+                }
+            }
+            IrExpr::Object(props) => {
+                for (_, v) in props {
+                    fold_expr(v, pool);
+                }
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                fold_expr(expr, pool);
+                fold_expr(default, pool);
+            }
+            IrExpr::Arrow(stmts) => fold_stmts(stmts, pool, false),
+            _ => {}
+        }
+    }
+    /// Order-preserving statement walk: `seed` = the walk is at an
+    /// unconditional level whose assignments may enter the pool (only the
+    /// top level — a conditional/loop/function body's sites may not have
+    /// run, so their values never propagate out).
+    fn fold_stmts(stmts: &mut [IrStmt], pool: &mut HashMap<String, i128>, seed: bool) {
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                IrStmt::Assign { targets, expr } => {
+                    fold_expr(expr, pool);
+                    if seed
+                        && targets.len() == 1
+                        && targets[0].indices.is_empty()
+                        && !targets[0].var.contains('[')
+                    {
+                        if let Some(v) = const_value(expr) {
+                            if in_range(v) {
+                                pool.insert(targets[0].var.clone(), v);
+                            }
+                        }
+                    }
+                }
+                IrStmt::If {
+                    cond,
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    fold_expr(cond, pool);
+                    fold_stmts(then, pool, false);
+                    for (c, b) in elsifs {
+                        fold_expr(c, pool);
+                        fold_stmts(b, pool, false);
+                    }
+                    fold_stmts(else_, pool, false);
+                }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    fold_expr(cond, pool);
+                    fold_stmts(body, pool, false);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    fold_expr(iter, pool);
+                    fold_stmts(body, pool, false);
+                }
+                IrStmt::ForInit {
+                    init,
+                    cond,
+                    step,
+                    body,
+                    ..
+                } => {
+                    fold_stmts(init, pool, false);
+                    fold_expr(cond, pool);
+                    fold_stmts(step, pool, false);
+                    fold_stmts(body, pool, false);
+                }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                    ..
+                } => {
+                    fold_stmts(body, pool, false);
+                    for ex in excepts {
+                        if let Some(m) = &mut ex.match_expr {
+                            fold_expr(m, pool);
+                        }
+                        fold_stmts(&mut ex.body, pool, false);
+                    }
+                    fold_stmts(else_body, pool, false);
+                    fold_stmts(finally_body, pool, false);
+                }
+                IrStmt::Exec {
+                    cmd,
+                    args,
+                    env,
+                    ..
+                } => {
+                    fold_expr(cmd, pool);
+                    for a in args {
+                        fold_expr(a, pool);
+                    }
+                    for (_, v) in env {
+                        fold_expr(v, pool);
+                    }
+                }
+                IrStmt::Expr(e) => fold_expr(e, pool),
+                IrStmt::Declare { init, .. } => {
+                    if let Some(i) = init {
+                        fold_expr(i, pool);
+                    }
+                }
+                IrStmt::DeclareArray { elements, .. } => {
+                    for el in elements {
+                        fold_expr(el, pool);
+                    }
+                }
+                IrStmt::Output { value, .. } => fold_expr(value, pool),
+                IrStmt::WriteFile { path, content, .. } => {
+                    fold_expr(path, pool);
+                    fold_expr(content, pool);
+                }
+                IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => fold_expr(e, pool),
+                IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => fold_expr(expr, pool),
+                IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
+                    fold_stmts(b, pool, false)
+                }
+                IrStmt::Redirect { inner, redirects } => {
+                    fold_stmts(inner, pool, false);
+                    for r in redirects {
+                        fold_expr(&mut r.target, pool);
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        fold_stmts(st, pool, false);
+                    }
+                }
+                IrStmt::Case {
+                    discriminant,
+                    clauses,
+                    ..
+                } => {
+                    fold_expr(discriminant, pool);
+                    for c in clauses {
+                        fold_stmts(&mut c.body, pool, false);
+                    }
+                }
+                IrStmt::Function {
+                    body,
+                    named_blocks,
+                    ..
+                } => {
+                    fold_stmts(body, pool, false);
+                    for (_, nb) in named_blocks {
+                        fold_stmts(nb, pool, false);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut pool: HashMap<String, i128> = HashMap::new();
+    fold_stmts(&mut prog.stmts, &mut pool, true);
+}
+
 
 // ── Integer range analysis (spike; M8-adjacent) ──────────────────────
 // Refines the A2 `Int` verdict into a WIDTH (u32/i32/i64) by tracking a
@@ -11723,6 +12160,15 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // strip produces; double-strip is a no-op).
     let mut stripped = prog.clone();
     crate::shir_passes::strip_cfor(&mut stripped);
+    // Const-pool arith fold (core request estree-20260813-182434-const-fold-arith):
+    // top-level single-site const assignments seed a pool; pure-int arith
+    // reads of pooled names fold to literals (the mimecroft `CELLS`/
+    // `MAP_W` index products). On the clone — the A1 export bytes are
+    // untouched. Skipped under `--true64` (the BigInt machinery owns the
+    // wide values; the fold's ±2^53 envelope would fight it).
+    if !true64_enabled() {
+        crate::shir::const_fold_arith(&mut stripped);
+    }
     let prog = &stripped;
     // `--true64`: bash arithmetic is true 64-bit. Off by default. When
     // on, out-of-±2^53 numeric vars are homed in BigInt64Array slots
@@ -14168,6 +14614,21 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     return Some(Stmt::ExpressionStatement { expression: write });
                 }
             }
+            // Plan 4: a bare `[ ]`-TEST statement whose status write is
+            // provably unread (mark_lastexit_dead) — the test arm would
+            // emit the `(sh2._g = t, sh2.lastExit = …, sh2._g)` status
+            // protocol; drop it to the bare boolean (the statement's
+            // only effect is the status; a non-native test keeps the
+            // runtime `sh2.test` call, which records internally —
+            // harmless either way).
+            if let IrExpr::Call { func, .. } = e {
+                if func == "test" && lastexit_write_is_dead(stmt) {
+                    *TEST_UNSTATUSED_DEPTH.lock().unwrap() += 1;
+                    let lowered = expr_to_estree(e);
+                    *TEST_UNSTATUSED_DEPTH.lock().unwrap() -= 1;
+                    return Some(Stmt::ExpressionStatement { expression: lowered });
+                }
+            }
             let lowered = expr_to_estree(e);
             Stmt::ExpressionStatement {
                 expression: if sh2_callee_name(&lowered) == Some("pipeline") {
@@ -14469,7 +14930,22 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 })
             };
             Stmt::IfStatement {
-                test: expr_to_estree(cond),
+                test: {
+                    // Plan 4: a `[ ]`-test condition whose status write
+                    // is provably unread (compute_test_cond_deadness) —
+                    // the bare boolean condition, no `_g`/lastExit seq
+                    // (the `$?` protocol is byte-identical where a reader
+                    // exists — the analysis only drops unobserved
+                    // writes).
+                    if test_cond_write_is_dead(stmt) {
+                        *TEST_UNSTATUSED_DEPTH.lock().unwrap() += 1;
+                        let c = expr_to_estree(cond);
+                        *TEST_UNSTATUSED_DEPTH.lock().unwrap() -= 1;
+                        c
+                    } else {
+                        expr_to_estree(cond)
+                    }
+                },
                 consequent,
                 alternate,
             }
@@ -14765,7 +15241,23 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // ESTree: any AwaitExpression inside disqualifies (the runtime
             // call is pure CPU, so no *Sync blocking-I/O concern — the gate
             // whitelists whileLoopSync explicitly).
-            let cond_e = expr_to_estree(cond);
+            let cond_e = {
+                // Plan 4: a `[ ]`-test loop guard whose status write is
+                // provably unread (compute_test_cond_deadness) — the
+                // bare boolean condition (the per-iteration status
+                // writes are discarded by the loop's own tracking/status
+                // handling; a writer-free body with a live consumer
+                // keeps the statused form — the analysis's arm scan
+                // captures it).
+                if test_cond_write_is_dead(stmt) {
+                    *TEST_UNSTATUSED_DEPTH.lock().unwrap() += 1;
+                    let c = expr_to_estree(cond);
+                    *TEST_UNSTATUSED_DEPTH.lock().unwrap() -= 1;
+                    c
+                } else {
+                    expr_to_estree(cond)
+                }
+            };
             let body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
             if !expr_has_await(&cond_e) && !stmts_have_await(&body_stmts) {
                 // Native loop (the ladder's top rung): a plain JS `while`
@@ -28520,7 +29012,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 };
                 if let Some(sv) = sv {
                     if *AND_OR_DEPTH.lock().unwrap() == 0 {
-                        if let Some(native) = try_native_test(sv) {
+                        if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+                            // Plan 4: the test's status write is provably
+                            // unread (a bare `[ ]` statement or a dead
+                            // if/while condition — see
+                            // [`compute_test_cond_deadness`]): the bare
+                            // boolean, no `_g` temp / lastExit write (the
+                            // protocol exists solely to record `$?`).
+                            if let Some(native) = try_native_test_unstatused(sv) {
+                                return native;
+                            }
+                        } else if let Some(native) = try_native_test(sv) {
                             return native;
                         }
                     } else if let Some(native) = try_native_test(sv) {
