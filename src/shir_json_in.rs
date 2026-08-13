@@ -40,6 +40,7 @@ const KNOWN_STMT: &[&str] = &[
     "Subshell",
     "Background",
     "Block",
+    "Select",
     "Expr",
     "Label",
     "Goto",
@@ -60,6 +61,8 @@ const KNOWN_EXPR: &[&str] = &[
     "Range",
     "RawExpr",
     "Arrow",
+    "ArrayComp",
+    "Lambda",
     "Array",
     "Arith",
     "Bool",
@@ -662,6 +665,62 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
             IrStmt::Background(body)
         }
+        // Go-style select over channel comm clauses (core requests
+        // go-sh-commclause / go-sh-recvstmt). Each clause:
+        //   {"comm": "recv"|"send"|"default", "target": str|null,
+        //    "ch": expr|null, "value": expr|null, "body": [stmt]}
+        // Unknown comm kinds REFUSE (the renderer dispatches on exactly
+        // recv/send/default and a stray kind would silently miscompile).
+        "Select" => {
+            let clauses = arr(o.get("clauses"), &format!("{where_}.clauses"))?
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let co = require_obj(c, &format!("{where_}.clauses[{i}]"))?;
+                    let comm = req_str(co, "comm", &format!("{where_}.clauses[{i}].comm"))?
+                        .to_string();
+                    if !matches!(comm.as_str(), "recv" | "send" | "default") {
+                        return Err(format!(
+                            "{where_}.clauses[{i}].comm: {comm:?} not in recv/send/default"
+                        ));
+                    }
+                    let target = match co.get("target") {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(
+                            x.as_str()
+                                .ok_or_else(|| {
+                                    format!("{where_}.clauses[{i}].target: not a string")
+                                })?
+                                .to_string(),
+                        ),
+                    };
+                    let ch = match co.get("ch") {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(expr_from(
+                            x,
+                            &format!("{where_}.clauses[{i}].ch"),
+                        )?),
+                    };
+                    let value = match co.get("value") {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(expr_from(
+                            x,
+                            &format!("{where_}.clauses[{i}].value"),
+                        )?),
+                    };
+                    let body =
+                        stmts_from(co.get("body"), &format!("{where_}.clauses[{i}].body"))?;
+                    Ok(SelectClause {
+                        comm,
+                        target,
+                        ch,
+                        value,
+                        body,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            IrStmt::Select { clauses }
+        }
         "Block" => {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
             IrStmt::Block(body)
@@ -857,6 +916,30 @@ fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
         "Arrow" => {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
             IrExpr::Arrow(body)
+        }
+        // Comprehension expr (core request py-sh-go-comp-if): var/iter/
+        // elem + the optional comp_if filter (`cond`, null = no filter).
+        "ArrayComp" => {
+            let var = req_str(o, "var", where_)?.to_string();
+            let iter = expr_from(req(o, "iter", where_)?, &format!("{where_}.iter"))?;
+            let elem = expr_from(req(o, "elem", where_)?, &format!("{where_}.elem"))?;
+            let cond = match o.get("cond") {
+                None | Some(Value::Null) => None,
+                Some(x) => Some(expr_from(x, &format!("{where_}.cond"))?),
+            };
+            IrExpr::ArrayComp {
+                var,
+                iter: Box::new(iter),
+                elem: Box::new(elem),
+                cond: cond.map(Box::new),
+            }
+        }
+        // Parameterized function-literal expr (core request
+        // py-sh-go-lambdef): the sibling of `Arrow` with explicit params.
+        "Lambda" => {
+            let params = str_array(o.get("params"), &format!("{where_}.params"))?;
+            let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
+            IrExpr::Lambda { params, body }
         }
         "Array" => {
             let elements = exprs_from(o.get("elements"), &format!("{where_}.elements"))?;

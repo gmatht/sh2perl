@@ -176,6 +176,17 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                 IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
                     walk(body, names);
                 }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        if let Some(ch) = &c.ch {
+                            expr_names(ch, names);
+                        }
+                        if let Some(v) = &c.value {
+                            expr_names(v, names);
+                        }
+                        walk(&c.body, names);
+                    }
+                }
                 IrStmt::Exec {
                     cmd,
                     args,
@@ -384,6 +395,11 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                 IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
                     walk(body)
                 }
+                IrStmt::Select { clauses } => clauses.iter().any(|c| {
+                    walk(&c.body)
+                        || c.ch.as_ref().is_some_and(expr_uses_arr)
+                        || c.value.as_ref().is_some_and(expr_uses_arr)
+                }),
                 IrStmt::Exec {
                     cmd,
                     args,
@@ -1178,6 +1194,8 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         }
         // sh has no try/except — refuse (the gate reports it as a FAIL)
         IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
+        // sh has no select-on-channels — refuse loudly
+        IrStmt::Select { .. } => Err("select has no sh rendering".into()),
         IrStmt::Return(e) => {
             indent(out, d);
             out.push_str("return");
@@ -1932,6 +1950,23 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
                 IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
                     if walk(body) {
                         return true;
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        if walk(&c.body) {
+                            return true;
+                        }
+                        if let Some(ch) = &c.ch {
+                            if has_grep_p(ch) {
+                                return true;
+                            }
+                        }
+                        if let Some(v) = &c.value {
+                            if has_grep_p(v) {
+                                return true;
+                            }
+                        }
                     }
                 }
                 IrStmt::For { iter, body, .. } => {
@@ -4386,6 +4421,8 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
         IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => Ok(String::new()),
         // sh has no try/except — refuse (the gate reports it as a FAIL)
         IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
+        // sh has no select-on-channels — refuse loudly
+        IrStmt::Select { .. } => Err("select has no sh rendering".into()),
     }
 }
 

@@ -3166,6 +3166,7 @@ impl Render {
             IrStmt::Die { .. } => self.mark_todo("die"),
             IrStmt::Warn { .. } => self.mark_todo("warn"),
             IrStmt::Try { .. } => self.mark_todo("try"),
+            IrStmt::Select { .. } => self.mark_todo("select"),
             IrStmt::Output {
                 value,
                 newline,
@@ -4401,6 +4402,7 @@ fn walk_stmt(s: &IrStmt, vars: &mut std::collections::HashMap<String, Option<Ran
         | IrStmt::Die { .. }
         | IrStmt::Warn { .. }
         | IrStmt::Try { .. }
+        | IrStmt::Select { .. }
         | IrStmt::SetChildError(_)
         | IrStmt::Label(_)
         | IrStmt::Goto(_)

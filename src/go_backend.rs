@@ -753,6 +753,14 @@ impl Render {
                 self.mark_todo("Arrow");
                 "nil".into()
             }
+            IrExpr::ArrayComp { .. } => {
+                self.mark_todo("ArrayComp expr");
+                "nil".into()
+            }
+            IrExpr::Lambda { .. } => {
+                self.mark_todo("Lambda expr");
+                "nil".into()
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr_any(i)).collect();
                 format!("[]any{{{}}}", elems.join(", "))
@@ -1822,6 +1830,8 @@ impl Render {
             // try/except has no shell text — a bash -c fallback cannot
             // express it
             IrStmt::Try { .. } => None,
+            // select over channels has no shell text either
+            IrStmt::Select { .. } => None,
             IrStmt::Assign { targets, expr } => {
                 let t = targets.first()?;
                 // array assignment `arr=(a b c)`
@@ -2811,6 +2821,9 @@ impl Render {
             }
             IrStmt::Try { .. } => {
                 self.mark_todo("try");
+            }
+            IrStmt::Select { .. } => {
+                self.mark_todo("select");
             }
             IrStmt::Exec { .. }
             | IrStmt::Require(_)

@@ -4401,6 +4401,18 @@ use std::collections::{HashMap, HashSet};
                     walk_stmt(s, acc, multi_run);
                 }
             }
+            IrExpr::ArrayComp { iter, elem, cond, .. } => {
+                walk_expr(iter, acc, multi_run);
+                walk_expr(elem, acc, multi_run);
+                if let Some(c) = cond {
+                    walk_expr(c, acc, multi_run);
+                }
+            }
+            IrExpr::Lambda { body, .. } => {
+                for s in body {
+                    walk_stmt(s, acc, multi_run);
+                }
+            }
             IrExpr::Call { func, args } => {
                 if func == "setVar" {
                     if let [IrExpr::Str(name, _), _] = args.as_slice() {
@@ -4581,6 +4593,20 @@ use std::collections::{HashMap, HashSet};
             IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
                 for s in body {
                     walk_stmt(s, acc, multi_run);
+                }
+            }
+            // Select comm clauses: walk the channel/value exprs + bodies.
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    if let Some(ch) = &c.ch {
+                        walk_expr(ch, acc, multi_run);
+                    }
+                    if let Some(v) = &c.value {
+                        walk_expr(v, acc, multi_run);
+                    }
+                    for s in &c.body {
+                        walk_stmt(s, acc, multi_run);
+                    }
                 }
             }
             IrStmt::Redirect { inner, redirects } => {
@@ -5696,6 +5722,14 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         IrStmt::Block(stmts) => {
             for s in stmts {
                 walk_stmt_ranges(s, state);
+            }
+        }
+        // Select comm clause bodies may hold range-tracking statements.
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                for s in &c.body {
+                    walk_stmt_ranges(s, state);
+                }
             }
         }
         IrStmt::Redirect { inner, .. } => {
@@ -13458,6 +13492,11 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
             IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Return(None) | IrStmt::Exit(None) => {
                 false
             }
+            IrStmt::Select { clauses } => clauses.iter().any(|c| {
+                scan_stmts(&c.body)
+                    || c.ch.as_ref().is_some_and(scan_expr)
+                    || c.value.as_ref().is_some_and(scan_expr)
+            }),
         }
     }
     scan_stmts(&prog.stmts)
@@ -13650,6 +13689,17 @@ fn ir_nocase_shopt_mask(prog: &IrProgram) -> u8 {
             | IrStmt::RawText(_)
             | IrStmt::Return(None)
             | IrStmt::Exit(None) => {}
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    scan_stmts(&c.body, mask);
+                    if let Some(ch) = &c.ch {
+                        scan_expr(ch, mask);
+                    }
+                    if let Some(v) = &c.value {
+                        scan_expr(v, mask);
+                    }
+                }
+            }
         }
     }
     let mut mask = 0u8;
@@ -16119,6 +16169,52 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
         IrStmt::Block(stmts) => Stmt::BlockStatement {
             body: stmts.iter().filter_map(stmt_to_estree).collect(),
         },
+        // Go-style select over channel comm clauses (core requests
+        // go-sh-commclause / go-sh-recvstmt). The runtime's `sh2.select`
+        // helper emulates the semantics as a round-robin NON-BLOCKING
+        // poll of the channel FIFOs: the first ready recv clause (FIFO
+        // non-empty) / send clause (FIFO open) wins, its body runs with
+        // the recv target bound / the send value pushed; when no comm
+        // clause is ready the `default` body runs (Go semantics — a
+        // select with no ready clause and no default BLOCKS, which a
+        // non-blocking poll cannot express; v1 keeps the non-blocking
+        // poll, matching every corpus-reachable default-clause form).
+        // The clause bodies are sink-ambiguous arrows (they may run under
+        // any stdout sink), so they lower under the sink-depth discipline
+        // like subshell/background bodies.
+        IrStmt::Select { clauses } => Stmt::ExpressionStatement {
+            expression: await_call(
+                "select",
+                vec![array(
+                    clauses
+                        .iter()
+                        .map(|c| {
+                            let mut props: Vec<(String, Expr)> =
+                                vec![("comm".to_string(), str_lit(&c.comm))];
+                            if let Some(t) = &c.target {
+                                props.push(("target".to_string(), str_lit(t)));
+                            }
+                            if let Some(ch) = &c.ch {
+                                props.push(("ch".to_string(), expr_to_estree(ch)));
+                            }
+                            if let Some(v) = &c.value {
+                                props.push(("value".to_string(), expr_to_estree(v)));
+                            }
+                            props.push((
+                                "body".to_string(),
+                                arrow_sink(vec![], IrExpr::Arrow(c.body.clone())),
+                            ));
+                            Expr::ObjectExpression {
+                                properties: props
+                                    .into_iter()
+                                    .map(|(k, v)| prop(&k, v))
+                                    .collect(),
+                            }
+                        })
+                        .collect(),
+                )],
+            ),
+        },
         IrStmt::Redirect { inner, redirects } => {
             // `echo args > file` / `echo args >> file`: a native
             // fs.writeFile replaces the redirect+builtin pair (see
@@ -16955,6 +17051,36 @@ fn exec_arg_is_array_valued(e: &IrExpr) -> bool {
                         ) && !matches!(
                             args.get(1).and_then(static_str),
                             Some(n) if n.starts_with('#')
+                        ))
+                        // ARRAY-VALUED SUBRANGE (core request
+                        // py-sh-go-star-expr): the offset forms
+                        // `${arr[@]:off[:len]}` — a `[@]`-suffixed name
+                        // (the runtime's am branch ALWAYS returns an
+                        // array, even for unset names) or a plain name
+                        // with a NUMERIC offset (the runtime's arrays-map
+                        // branch returns `[...slice]` when the name IS an
+                        // array, and the plain STRING slice otherwise —
+                        // the arg flattener splices arrays and keeps
+                        // strings as one word, so emitting the call bare
+                        // is faithful for both). `#`-prefixed names are
+                        // the scalar length and never qualify.
+                        || (matches!(
+                            args.get(1).and_then(static_str),
+                            Some(n) if n.ends_with("[@]") || n.ends_with("[*]")
+                        ) && !matches!(
+                            args.get(2).and_then(static_str),
+                            Some(a) if a == "@" || a == "*"
+                        ))
+                        || (matches!(
+                            args.get(1).and_then(static_str),
+                            Some(n)
+                                if !n.starts_with('#')
+                                    && !n.starts_with('!')
+                                    && n != "@"
+                                    && n != "*"
+                        ) && !matches!(
+                            args.get(2).and_then(static_str),
+                            Some(a) if a == "@" || a == "*"
                         )))
             }
             _ => false,
@@ -25226,6 +25352,52 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
                 if is_plain_ident(base) {
                     if let Some(o) = off_arg.and_then(int_of) {
                         let items = sh2_call("arrayItems", vec![str_lit(base)]);
+                        // Optional 5th arg — the step (core request
+                        // py-sh-go-sliceop): the elements are
+                        // off, off+step, off+2step, … < off+len. A
+                        // literal int step lowers to the native filter;
+                        // anything else keeps the runtime param (which
+                        // applies the same filter).
+                        if let Some(step) = args.get(4).and_then(static_str) {
+                            if step.trim().is_empty() {
+                                // `a[1:6:]` — empty step = 1 (identical
+                                // to the 4-arg form).
+                            } else if let Some(s) = int_of(&step) {
+                                let sl = match len_arg {
+                                    Some(l) if !l.trim().is_empty() => {
+                                        let l = int_of(l)?;
+                                        method(items, "slice", vec![int_lit(o), int_lit(o + l)])
+                                    }
+                                    _ => method(items, "slice", vec![int_lit(o)]),
+                                };
+                                let step = s;
+                                return Some(method(
+                                    sl,
+                                    "filter",
+                                    vec![Expr::ArrowFunctionExpression {
+                                        params: vec![
+                                            Expr::Identifier { name: "_".to_string() },
+                                            Expr::Identifier { name: "i".to_string() },
+                                        ],
+                                        body: ArrowBody::Expr(Box::new(Expr::BinaryExpression {
+                                            operator: "===".to_string(),
+                                            left: Box::new(Expr::BinaryExpression {
+                                                operator: "%".to_string(),
+                                                left: Box::new(Expr::Identifier {
+                                                    name: "i".to_string(),
+                                                }),
+                                                right: Box::new(int_lit_expr(step)),
+                                            }),
+                                            right: Box::new(int_lit_expr(0)),
+                                        })),
+                                        expression: true,
+                                        r#async: false,
+                                    }],
+                                ));
+                            } else {
+                                return None;
+                            }
+                        }
                         return match len_arg {
                             Some(l) if !l.trim().is_empty() => {
                                 let l = int_of(l)?;
@@ -25250,6 +25422,47 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
             if is_plain_ident(name) && assume_array_slice() && array_only_written(name) {
                 if let (Some(o), Some(len)) = (off_arg.and_then(int_of), len_arg) {
                     let items = sh2_call("arrayItems", vec![str_lit(name)]);
+                    // Optional 5th arg — the step (core request
+                    // py-sh-go-sliceop); see the `[@]`-suffix branch.
+                    if let Some(step) = args.get(4).and_then(static_str) {
+                        if step.trim().is_empty() {
+                            // `a[1:6:]` — empty step = 1 (identical
+                            // to the 4-arg form).
+                        } else if let Some(s) = int_of(&step) {
+                            let sl = if len.trim().is_empty() {
+                                method(items, "slice", vec![int_lit(o)])
+                            } else {
+                                let l = int_of(len)?;
+                                method(items, "slice", vec![int_lit(o), int_lit(o + l)])
+                            };
+                            let step = s;
+                            return Some(method(
+                                sl,
+                                "filter",
+                                vec![Expr::ArrowFunctionExpression {
+                                    params: vec![
+                                        Expr::Identifier { name: "_".to_string() },
+                                        Expr::Identifier { name: "i".to_string() },
+                                    ],
+                                    body: ArrowBody::Expr(Box::new(Expr::BinaryExpression {
+                                        operator: "===".to_string(),
+                                        left: Box::new(Expr::BinaryExpression {
+                                            operator: "%".to_string(),
+                                            left: Box::new(Expr::Identifier {
+                                                name: "i".to_string(),
+                                            }),
+                                            right: Box::new(int_lit_expr(step)),
+                                        }),
+                                        right: Box::new(int_lit_expr(0)),
+                                    })),
+                                    expression: true,
+                                    r#async: false,
+                                }],
+                            ));
+                        } else {
+                            return None;
+                        }
+                    }
                     return if len.trim().is_empty() {
                         Some(method(items, "slice", vec![int_lit(o)]))
                     } else {
@@ -26857,6 +27070,25 @@ fn collect_never_written(prog: &IrProgram) -> Option<HashSet<String>> {
                     walk_stmt(st, written, blocked);
                 }
             }
+            // The ArrayComp loop var is bound (setVar) per iteration, so
+            // reads of it are never the never-written "" fold.
+            IrExpr::ArrayComp { var, iter, elem, cond, .. } => {
+                mark_word(var, written);
+                walk_expr(iter, written, blocked);
+                walk_expr(elem, written, blocked);
+                if let Some(c) = cond {
+                    walk_expr(c, written, blocked);
+                }
+            }
+            // Lambda params bind at call time (the setVar prologue).
+            IrExpr::Lambda { params, body, .. } => {
+                for p in params {
+                    mark_word(p, written);
+                }
+                for st in body {
+                    walk_stmt(st, written, blocked);
+                }
+            }
             IrExpr::Call { func, args } => {
                 match func.as_str() {
                     "setVar" | "setArray" | "setArrayAppend" => {
@@ -27015,6 +27247,24 @@ fn collect_never_written(prog: &IrProgram) -> Option<HashSet<String>> {
             | IrStmt::Background(body) => {
                 for b in body {
                     walk_stmt(b, written, blocked);
+                }
+            }
+            // A Select recv clause binds its target var at runtime
+            // (core requests go-sh-commclause / go-sh-recvstmt).
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    if let Some(t) = &c.target {
+                        mark_word(t, written);
+                    }
+                    if let Some(ch) = &c.ch {
+                        walk_expr(ch, written, blocked);
+                    }
+                    if let Some(v) = &c.value {
+                        walk_expr(v, written, blocked);
+                    }
+                    for b in &c.body {
+                        walk_stmt(b, written, blocked);
+                    }
                 }
             }
             IrStmt::If {
@@ -30099,6 +30349,150 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             ..
         } => not_native(expr_to_estree(lhs)),
         IrExpr::Arrow(stmts) => arrow(vec![], IrExpr::Arrow(stmts.clone())),
+        // Parameterized function-literal expr (core request
+        // py-sh-go-lambdef): a JS ArrowFunctionExpression with the A1
+        // param names, whose body binds each param into the runtime
+        // store on entry (`sh2.setVar(p, p)` — the body statements read
+        // params through the store via getVar, the same channel every
+        // other runtime value uses). The setVar prologue makes the body
+        // a block arrow (never the single-expr fold). Async by default
+        // (like every `arrow`); the call site (a whitelisted
+        // function-value call form, e.g. callDirect/fnCall) awaits it.
+        IrExpr::Lambda { params, body } => {
+            let mut stmts: Vec<IrStmt> = params
+                .iter()
+                .map(|p| {
+                    IrStmt::Expr(IrExpr::Call {
+                        func: "setVar".to_string(),
+                        args: vec![
+                            IrExpr::Str(p.clone(), StrStyle::DoubleQuoted),
+                            IrExpr::Ident(p.clone()),
+                        ],
+                    })
+                })
+                .collect();
+            stmts.extend(body.iter().cloned());
+            arrow_body_async(
+                params
+                    .iter()
+                    .map(|p| Expr::Identifier { name: p.clone() })
+                    .collect(),
+                IrExpr::Arrow(stmts),
+                true,
+            )
+        }
+        // Comprehension expr (core request py-sh-go-comp-if): an IIFE
+        // loop building the result array — iterate the (array-valued)
+        // iter expr, bind each item to the loop var in the store, SKIP
+        // items failing the optional cond (the comp_if filter), push
+        // elem per surviving item, return the array. Async when any part
+        // awaits (then the whole IIFE is awaited); the sync form is a
+        // plain arrow call. `cond`/`elem` read the loop var through the
+        // store exactly like any other runtime value.
+        IrExpr::ArrayComp { var, iter, elem, cond } => {
+            let it = expr_to_estree(iter);
+            let el = expr_to_estree(elem);
+            let cd = cond.as_ref().map(|c| expr_to_estree(c));
+            let has_await =
+                expr_has_await(&it) || expr_has_await(&el) || cd.as_ref().is_some_and(expr_has_await);
+            let loop_var = "__ac".to_string();
+            let mut body_stmts: Vec<Stmt> = vec![Stmt::ExpressionStatement {
+                expression: sh2_call(
+                    "setVar",
+                    vec![str_lit(var), Expr::Identifier {
+                        name: loop_var.clone(),
+                    }],
+                ),
+            }];
+            if let Some(c) = cd {
+                body_stmts.push(Stmt::IfStatement {
+                    test: c,
+                    consequent: Box::new(Stmt::BlockStatement {
+                        body: vec![Stmt::ExpressionStatement {
+                            expression: Expr::CallExpression {
+                                callee: Box::new(Expr::MemberExpression {
+                                    object: Box::new(Expr::Identifier {
+                                        name: "__out".to_string(),
+                                    }),
+                                    property: Box::new(Expr::Identifier {
+                                        name: "push".to_string(),
+                                    }),
+                                    computed: false,
+                                    optional: false,
+                                }),
+                                arguments: vec![el],
+                                optional: false,
+                            },
+                        }],
+                    }),
+                    alternate: None,
+                });
+            } else {
+                body_stmts.push(Stmt::ExpressionStatement {
+                    expression: Expr::CallExpression {
+                        callee: Box::new(Expr::MemberExpression {
+                            object: Box::new(Expr::Identifier {
+                                name: "__out".to_string(),
+                            }),
+                            property: Box::new(Expr::Identifier {
+                                name: "push".to_string(),
+                            }),
+                            computed: false,
+                            optional: false,
+                        }),
+                        arguments: vec![el],
+                        optional: false,
+                    },
+                });
+            }
+            let iife = Expr::CallExpression {
+                callee: Box::new(Expr::ArrowFunctionExpression {
+                    params: vec![],
+                    body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
+                        body: vec![
+                            Stmt::VariableDeclaration {
+                                kind: "const",
+                                declarations: vec![VariableDeclarator {
+                                    type_: "VariableDeclarator",
+                                    id: Expr::Identifier {
+                                        name: "__out".to_string(),
+                                    },
+                                    init: Some(Expr::ArrayExpression { elements: vec![] }),
+                                }],
+                            },
+                            Stmt::ForOfStatement {
+                                left: Box::new(Stmt::VariableDeclaration {
+                                    kind: "let",
+                                    declarations: vec![VariableDeclarator {
+                                        type_: "VariableDeclarator",
+                                        id: Expr::Identifier {
+                                            name: loop_var.clone(),
+                                        },
+                                        init: None,
+                                    }],
+                                }),
+                                right: it,
+                                body: Box::new(Stmt::BlockStatement { body: body_stmts }),
+                            },
+                            Stmt::ReturnStatement {
+                                argument: Some(Expr::Identifier {
+                                    name: "__out".to_string(),
+                                }),
+                            },
+                        ],
+                    })),
+                    expression: false,
+                    r#async: has_await,
+                }),
+                arguments: vec![],
+                optional: false,
+            };
+            if has_await {
+                await_expr(iife)
+            } else {
+                iife
+            }
+        }
         IrExpr::Arith(a) => {
             let inner = arith_to_estree_wrapped(a);
             // `$(( ... ))` whose expression contains NO `/` or `%` cannot

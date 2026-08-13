@@ -129,7 +129,13 @@ pub extern "C" fn debashc_to_glsl(input: *const u8, input_len: usize) -> *mut u8
             let prog = ast_to_ir_raw(&commands);
             let glsl = shir_to_glsl_opts(
                 &prog,
-                &ShGlslOptions { es100: true, color_out: true, tex_size: 16 },
+                &ShGlslOptions {
+                    es100: true,
+                    color_out: true,
+                    tex_size: 16,
+                    max_view: 800, // the sh2runtime device canvas is 800×600
+                    ..Default::default()
+                },
             );
             alloc_string(&ok_json(&glsl))
         }
