@@ -598,6 +598,10 @@ impl Render {
                 self.mark_todo("Lambda expr");
                 "String::new()".into()
             }
+            IrExpr::Splice(_) => {
+                self.mark_todo("Splice expr");
+                "String::new()".into()
+            }
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "String::new()".into()
@@ -1238,6 +1242,7 @@ impl Render {
             }
             IrStmt::Try { .. } => self.mark_todo("try"),
             IrStmt::Select { .. } => self.mark_todo("select"),
+            IrStmt::Asm { .. } => self.mark_todo("asm"),
             IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
             IrStmt::Continue => self.emit("continue;"),
             IrStmt::Break => self.emit("break;"),

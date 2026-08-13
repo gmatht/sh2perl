@@ -187,6 +187,11 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                         walk(&c.body, names);
                     }
                 }
+                IrStmt::Asm { outputs, inputs, .. } => {
+                    for (_, e) in outputs.iter().chain(inputs.iter()) {
+                        expr_names(e, names);
+                    }
+                }
                 IrStmt::Exec {
                     cmd,
                     args,
@@ -400,6 +405,10 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                         || c.ch.as_ref().is_some_and(expr_uses_arr)
                         || c.value.as_ref().is_some_and(expr_uses_arr)
                 }),
+                IrStmt::Asm { outputs, inputs, .. } => outputs
+                    .iter()
+                    .chain(inputs.iter())
+                    .any(|(_, e)| expr_uses_arr(e)),
                 IrStmt::Exec {
                     cmd,
                     args,
@@ -1196,6 +1205,8 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
         // sh has no select-on-channels — refuse loudly
         IrStmt::Select { .. } => Err("select has no sh rendering".into()),
+        // inline asm has no sh rendering — refuse loudly
+        IrStmt::Asm { .. } => Err("inline asm has no sh rendering".into()),
         IrStmt::Return(e) => {
             indent(out, d);
             out.push_str("return");
@@ -1352,6 +1363,21 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
 /// `var=value` for a statement-level assignment. Handles the sh2.* RHS
 /// forms (capture, pipeline, arith, setArray, assign) natively.
 fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<String, String> {
+    // `((i++))` / `((i--))` — the arith-statement shape (triage-sh
+    // t29_increment): the estree renderer emits the IncDec BARE when the
+    // single target is the SAME var the arith mutates (the assignment
+    // wrapper would clobber the side effect with the expression's value
+    // — `x=$((x++))` assigns the OLD value back). The statement's value
+    // is discarded, so `: $((...))` keeps exactly the increment (the `:`
+    // swallows the expansion result — a bare `$((...))` line would try
+    // to RUN the value as a command: "1: not found").
+    if targets.len() == 1
+        && targets[0].indices.is_empty()
+        && matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == &targets[0].var))
+    {
+        let IrExpr::Arith(a) = expr else { unreachable!() };
+        return Ok(format!(": $(({}))", arith_to_sh(a)));
+    }
     // `arr=(a b c)` — the A1 is Assign{var: arr, expr: setArray(...)}. The
     // setArray lowering IS the assignment (`arr_0=a; arr_1=b; ...`) — the
     // `name=` prefix would corrupt it into `arr=arr_0=a`.
@@ -1812,6 +1838,30 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 line.push(' ');
                 line.push_str(&pat);
                 Ok(format!("$({line})"))
+            }
+            // `regexMatch(Regex(pattern, flags), value)` — the fish
+            // `string match -rq` cond lift (triage-sh t81_regex_match):
+            // ERE search semantics, status 0 iff any match — the same
+            // decision as the `=~` arm's grep -E pipeline, minus the
+            // test-string round trip. flags: only fish's `-i`
+            // (ignore-case) is emitted by the frontend; anything else
+            // refuses loudly (the estree reference would differ).
+            "regexMatch" => {
+                let (pattern, flags) = match arg(args, 0)? {
+                    IrExpr::Regex { pattern, flags } => (pattern.clone(), flags.clone()),
+                    other => {
+                        return Err(format!("regexMatch: arg 0 not Regex: {other:?}"));
+                    }
+                };
+                if flags.chars().any(|c| c != 'i') {
+                    return Err(format!("regexMatch: unsupported flags {flags:?}"));
+                }
+                let value = word_to_sh(arg(args, 1)?)?;
+                let pat = pattern.replace('\'', "'\\\\''");
+                let i_flag = if flags.contains('i') { "i" } else { "" };
+                Ok(format!(
+                    "printf '%s\\n' {value} | grep -E{i_flag}q '{pat}'"
+                ))
             }
             "setVar" => {
                 // the runtime's plain store write — re-emit as a shell
@@ -4423,6 +4473,8 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
         IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
         // sh has no select-on-channels — refuse loudly
         IrStmt::Select { .. } => Err("select has no sh rendering".into()),
+        // inline asm has no sh rendering — refuse loudly
+        IrStmt::Asm { .. } => Err("inline asm has no sh rendering".into()),
     }
 }
 

@@ -419,6 +419,14 @@ pub enum IrExpr {
     Ident(String),
     /// Object literal (ESTree-path only — e.g. redirect specs, env maps).
     Object(Vec<(String, IrExpr)>),
+    /// Starred-expression splice marker (Python `star_expr` / the
+    /// `argument` rule's `'*' test`; ESTree-path only — core request
+    /// py-sh-go-star-expr): the wrapped expr's ELEMENTS are spliced into
+    /// the enclosing list, not nested as one item. Valid ONLY as an
+    /// `Array` element or a `Call` argument — the ESTree renderer emits a
+    /// JS SpreadElement (`[...x]` / `f(...x)`); the runtime store's array
+    /// values are native JS arrays, so the spread is the exact splice.
+    Splice(Box<IrExpr>),
 }
 
 // ── Assignment target ────────────────────────────────────────────────
@@ -669,6 +677,26 @@ pub enum IrStmt {
     /// go-sh-recvstmt). The Perl generator never emits it; renderers that
     /// cannot express it must refuse loudly.
     Select { clauses: Vec<SelectClause> },
+    /// Inline-assembly statement — the C `asm` family (asmDefinition /
+    /// asmArgument / asmOperand / asmClobbers / asmQualifier; core
+    /// requests c-sh-go-asm / c-sh-go-asmargument /
+    /// c-sh-go-asmqualifier). ESTree-path only: JS cannot execute machine
+    /// code, so the renderer lowers it to a NO-OP carrying the template
+    /// (faithful only for effect-free asm — empty outputs; an asm with
+    /// output operands has observable writes the no-op drops, flagged in
+    /// the emitted text, refuse > guess). `volatile` is the asmQualifier
+    /// (a compiler hint, no runtime meaning); the `inline`/`goto`
+    /// qualifiers carry no runtime meaning either (the frontend must
+    /// refuse `goto` — it changes the operand grammar to labels — never
+    /// silently drop it). `outputs`/`inputs` are (constraint, operand
+    /// expr) pairs; `clobbers` is the asmClobbers list.
+    Asm {
+        template: String,
+        volatile: bool,
+        outputs: Vec<(String, IrExpr)>,
+        inputs: Vec<(String, IrExpr)>,
+        clobbers: Vec<String>,
+    },
     /// Plain block group `{ a; b; }` (no copy semantics — unlike Subshell).
     Block(Vec<IrStmt>),
     /// Evaluate an expression as a statement (ESTree-path pipelines,
@@ -1087,6 +1115,13 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::Select { .. } => {
             emit_indent(out, indent);
             out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (select)\\n\";\n");
+        }
+        // Inline assembly — ESTree-path only (JS cannot execute machine
+        // code either; the estree renderer lowers it to a no-op comment).
+        // The Perl generator refuses loudly (refuse > guess).
+        IrStmt::Asm { .. } => {
+            emit_indent(out, indent);
+            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (asm)\\n\";\n");
         }
         IrStmt::Case {
             discriminant,
@@ -4550,6 +4585,10 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             // ESTree-path-only lambda — refuse loudly (see ArrayComp).
             "die \"debashc: shIR construct not yet supported by the Perl backend (Lambda)\";".to_string()
         }
+        IrExpr::Splice(_) => {
+            // ESTree-path-only splice marker — refuse loudly (see ArrayComp).
+            "die \"debashc: shIR construct not yet supported by the Perl backend (Splice)\";".to_string()
+        }
         IrExpr::Array(elements) => {
             // General expression position: parenthesized list (for-iter,
             // list contexts). Exec-word position uses render_word instead.
@@ -4829,6 +4868,32 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     format!("({})", items.join(", "))
                 }
                 "test" => render_test_call(args),
+                // `regexMatch(Regex(pattern, flags), value)` — the fish
+                // `string match -rq` cond lift (triage-perl
+                // t81_regex_match): Perl's native regex is the exact ERE
+                // search decision (status 0 iff any match). flags: only
+                // fish's `-i` (ignore-case) is emitted by the frontend.
+                "regexMatch" => match args.first() {
+                    Some(IrExpr::Regex { pattern, flags }) => {
+                        if flags.chars().any(|c| c != 'i') {
+                            eprintln!("debashc: regexMatch flags {:?} unsupported", flags);
+                            "0".to_string()
+                        } else {
+                            let v = args
+                                .get(1)
+                                .map(|a| ir_expr_to_perl(a))
+                                .unwrap_or_else(|| "''".to_string());
+                            let fl = if flags.contains('i') { "i" } else { "" };
+                            let pat =
+                                pattern.replace('{', "\\{").replace('}', "\\}");
+                            format!("(({v}) =~ m{{{pat}}}{fl})")
+                        }
+                    }
+                    other => {
+                        eprintln!("debashc: regexMatch arg 0 not Regex: {other:?}");
+                        "0".to_string()
+                    }
+                },
                 // (( arith )) as a condition — the `let` builtin form.
                 "exec" if args.first().and_then(call_arg_str).as_deref() == Some("let") => {
                     let words = exec_word_args(args);
@@ -5198,6 +5263,10 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
                 || c.ch.as_ref().is_some_and(expr_refers_to_main_exit)
                 || c.value.as_ref().is_some_and(expr_refers_to_main_exit)
         }),
+        IrStmt::Asm { outputs, inputs, .. } => outputs
+            .iter()
+            .chain(inputs.iter())
+            .any(|(_, e)| expr_refers_to_main_exit(e)),
         IrStmt::Block(stmts) => stmts.iter().any(stmt_refers_to_main_exit),
         IrStmt::Try {
             body,
@@ -5278,6 +5347,7 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
                 || cond.as_ref().is_some_and(|c| expr_refers_to_main_exit(c))
         }
         IrExpr::Lambda { body, .. } => body.iter().any(stmt_refers_to_main_exit),
+        IrExpr::Splice(e) => expr_refers_to_main_exit(e),
         IrExpr::Array(elems) => elems.iter().any(expr_refers_to_main_exit),
         IrExpr::Arith(_) => false,
         IrExpr::Bool(_) => false,
@@ -5361,6 +5431,12 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
                 for s in &c.body {
                     collect_vars_in_stmt(s, vars);
                 }
+            }
+        }
+        // inline asm operand exprs may read/write store vars
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, e) in outputs.iter().chain(inputs.iter()) {
+                collect_vars_in_expr(e, vars);
             }
         }
         IrStmt::Block(stmts) => {
@@ -5499,6 +5575,7 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
                 vars.insert(cap);
             }
         }
+        IrExpr::Splice(e) => collect_vars_in_expr(e, vars),
         IrExpr::Arrow(body) => {
             for stmt in body {
                 collect_vars_in_stmt(stmt, vars);

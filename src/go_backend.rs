@@ -761,6 +761,10 @@ impl Render {
                 self.mark_todo("Lambda expr");
                 "nil".into()
             }
+            IrExpr::Splice(_) => {
+                self.mark_todo("Splice expr");
+                "nil".into()
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr_any(i)).collect();
                 format!("[]any{{{}}}", elems.join(", "))
@@ -1832,6 +1836,8 @@ impl Render {
             IrStmt::Try { .. } => None,
             // select over channels has no shell text either
             IrStmt::Select { .. } => None,
+            // inline asm has no shell text either (JS no-op only)
+            IrStmt::Asm { .. } => None,
             IrStmt::Assign { targets, expr } => {
                 let t = targets.first()?;
                 // array assignment `arr=(a b c)`
@@ -2824,6 +2830,9 @@ impl Render {
             }
             IrStmt::Select { .. } => {
                 self.mark_todo("select");
+            }
+            IrStmt::Asm { .. } => {
+                self.mark_todo("asm");
             }
             IrStmt::Exec { .. }
             | IrStmt::Require(_)

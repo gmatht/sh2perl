@@ -280,6 +280,11 @@ fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
                 }
             }
         }
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, e) in outputs.iter().chain(inputs.iter()) {
+                walk_expr(e, counts);
+            }
+        }
         IrStmt::Require(_) => {
             // `require` is a bare string; no IrExpr children.
         }
@@ -359,6 +364,7 @@ fn walk_expr(expr: &IrExpr, counts: &mut HashMap<String, usize>) {
                 walk_stmt(s, counts);
             }
         }
+        IrExpr::Splice(e) => walk_expr(e, counts),
         IrExpr::Capture { expr, .. } => walk_expr(expr, counts),
         IrExpr::Range { .. } => {}
         IrExpr::Arith(a) => walk_arith(a, counts),

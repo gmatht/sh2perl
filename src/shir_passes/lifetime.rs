@@ -336,6 +336,20 @@ fn walk_stmt(
                 }
             }
         }
+        // Inline asm (core requests c-sh-go-asm family): OUTPUT operand
+        // targets are store writes (access them like assignment targets);
+        // input operand exprs are plain reads.
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, t) in outputs {
+                if let IrExpr::Var(name, _) = t {
+                    access(name, p, first, last, escapes, in_closure);
+                }
+                walk_expr(t, p, first, last, escapes, in_closure);
+            }
+            for (_, e) in inputs {
+                walk_expr(e, p, first, last, escapes, in_closure);
+            }
+        }
         IrStmt::Try {
             body,
             excepts,
@@ -490,6 +504,7 @@ fn walk_expr(
                 walk_expr(c, pos, first, last, escapes, in_closure);
             }
         }
+        IrExpr::Splice(e) => walk_expr(e, pos, first, last, escapes, in_closure),
         IrExpr::Lambda { body, .. } => {
             // a closure: every access inside escapes (like Arrow)
             let mut p = pos;
@@ -770,6 +785,20 @@ fn mark_stmt_vars_escape(
                 if let Some(v) = &c.value {
                     mark_vars_escape(v, first, escapes);
                 }
+            }
+        }
+        // Inline asm: output target vars escape (the asm writes them);
+        // operand exprs may carry retained values.
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, t) in outputs {
+                if let IrExpr::Var(name, _) = t {
+                    first.entry(name.clone()).or_insert(0);
+                    escapes.insert(name.clone());
+                }
+                mark_vars_escape(t, first, escapes);
+            }
+            for (_, e) in inputs {
+                mark_vars_escape(e, first, escapes);
             }
         }
         IrStmt::Try {

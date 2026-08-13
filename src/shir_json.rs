@@ -307,6 +307,24 @@ fn stmt_json(s: &IrStmt) -> Value {
                 "body": stmts_json(&c.body),
             })).collect::<Vec<_>>(),
         }),
+        // Inline assembly (core requests c-sh-go-asm / asmargument /
+        // asmqualifier): the raw template + operand bindings + clobbers.
+        // outputs/inputs serialize the constraint string + the lowered
+        // operand expr (the existing value-node serialization). The
+        // deserializer also accepts a plain store-name STRING in place of
+        // the value node (the request's minimal shape).
+        IrStmt::Asm { template, volatile, outputs, inputs, clobbers } => json!({
+            "type": "Asm",
+            "template": template,
+            "volatile": volatile,
+            "outputs": outputs.iter().map(|(c, t)| json!({
+                "constraint": c, "target": expr_json(t),
+            })).collect::<Vec<_>>(),
+            "inputs": inputs.iter().map(|(c, e)| json!({
+                "constraint": c, "expr": expr_json(e),
+            })).collect::<Vec<_>>(),
+            "clobbers": clobbers,
+        }),
         IrStmt::Expr(e) => json!({ "type": "Expr", "expr": expr_json(e) }),
         IrStmt::Label(name) => json!({ "type": "Label", "name": name }),
         IrStmt::Goto(name) => json!({ "type": "Goto", "name": name }),
@@ -398,6 +416,10 @@ fn expr_json(e: &IrExpr) -> Value {
         IrExpr::Bool(b) => json!({ "type": "Bool", "value": b }),
         IrExpr::Json(v) => json!({ "type": "Json", "value": v }),
         IrExpr::Ident(name) => json!({ "type": "Ident", "name": name }),
+        // Starred-expression splice (core request py-sh-go-star-expr):
+        // `[*a]` / `f(*a)` — the wrapped expr's elements splice into the
+        // enclosing Array/Call (the estree renderer emits a JS spread).
+        IrExpr::Splice(e) => json!({ "type": "Splice", "expr": expr_json(e) }),
         IrExpr::Object(props) => json!({
             "type": "Object",
             "properties": props.iter().map(|(k, v)| json!({"key": k, "value": expr_json(v)})).collect::<Vec<_>>(),

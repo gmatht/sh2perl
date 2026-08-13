@@ -3691,11 +3691,14 @@ mod tests {
         assert!(!json.contains("\"name\":\"builtin\""));
         assert!(!json.contains("unsupported"));
         // non-echo bodies keep the runtime redirect — `ls` is a sync
-        // builtin, so the await-free redirect dispatches to the sync twin
-        // redirectSync (the *Sync family; the async `redirect` only when a
-        // body/target awaits)
+        // builtin, but a FILE target needs the async fs bridge, so the
+        // redirect stays on the async `redirect` path (the sync twin
+        // redirectSync handles ONLY fd-dup `&N` targets — the runtime's
+        // sync twin would throw "redirection needs the async redirect
+        // bridge" for a file path; see redirect_specs_sync_ok)
         let json2 = to_json("ls > out.txt");
-        assert!(json2.contains("\"name\":\"redirectSync\""));
+        assert!(json2.contains("\"name\":\"redirect\""));
+        assert!(!json2.contains("\"name\":\"redirectSync\""));
         // Property keys serialize as {key: Identifier{name}, value: Literal}.
         assert!(json2.contains("\"name\":\"mode\""));
         assert!(json2.contains("\"value\":\"w\""));
@@ -4246,10 +4249,11 @@ mod tests {
         // whitespace IFS).
         let json = to_json("IFS=, read a b c <<< \"1,2,3\"");
         // the redirect wraps the env-carrying read (the env stays on the
-        // command; the no-op `true` split is gone) — the await-free body
-        // + literal herestring target dispatch to the sync twin
-        // redirectSync
-        assert!(json.contains("\"name\":\"redirectSync\""));
+        // command; the no-op `true` split is gone) — a herestring target
+        // needs the async fs bridge (the sync twin handles only fd-dup
+        // `&N` targets), so the redirect stays on the async path
+        assert!(json.contains("\"name\":\"redirect\""));
+        assert!(!json.contains("\"name\":\"redirectSync\""));
         assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("\"value\":\"read\""));
         // the env object's property key is an Identifier (prop() renders
@@ -4304,9 +4308,11 @@ mod tests {
         let json2 = to_json("mapfile -t lines < <(printf 'x\\ny\\n')");
         assert!(!json2.contains("\"name\":\"unsupported\""));
         assert!(!json2.contains("\"value\":\"unsupported\""));
-        // the producer + mapfile body are both sync builtins → the
-        // await-free redirect dispatches to the sync twin redirectSync
-        assert!(json2.contains("\"name\":\"redirectSync\""));
+        // the producer + mapfile body are both sync builtins, but the
+        // process-substitution fd-0 target is NOT an fd-dup — the async
+        // `redirect` path (the sync twin handles only `&N` targets)
+        assert!(json2.contains("\"name\":\"redirect\""));
+        assert!(!json2.contains("\"name\":\"redirectSync\""));
         assert!(json2.contains("\"name\":\"builtin\""));
     }
 }

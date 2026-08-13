@@ -358,6 +358,31 @@ fn redirect_call_touches_fd1(args: &[IrExpr]) -> bool {
         _ => true,
     })
 }
+/// Whether every redirect spec is an fd-dup (`&N` target) — the ONLY
+/// targets the runtime's sync `redirectSync` twin accepts. File paths,
+/// heredocs/herestrings and dynamic targets need the async fs bridge, so
+/// a redirect carrying any of them must stay on the async `redirect`
+/// path (the sync twin would throw "redirection needs the async
+/// redirect bridge" at runtime).
+fn redirect_specs_sync_ok(specs: &[(i64, &str, &IrExpr)]) -> bool {
+    specs
+        .iter()
+        .all(|(_, _, t)| matches!(t, IrExpr::Str(s, _) if s.starts_with('&')))
+}
+
+/// The expr-position `redirect` CALL form: the same verdict over the
+/// spec OBJECTS (see [`redirect_specs_sync_ok`]).
+fn redirect_call_sync_ok(args: &[IrExpr]) -> bool {
+    let [_, IrExpr::Array(spec_objs)] = args else {
+        return false;
+    };
+    spec_objs.iter().all(|so| match so {
+        IrExpr::Object(props) => props.iter().any(|(k, v)| {
+            k == "target" && matches!(v, IrExpr::Str(s, _) if s.starts_with('&'))
+        }),
+        _ => false,
+    })
+}
 /// Whether the program contains a PERSISTENT fd-1 redirect (a bare
 /// `exec >file` / `exec 1>&2` / `exec 1>&-` — the runtime keeps those in
 /// the fd table after the redirect call). Native top-level `echo` writes
@@ -4413,6 +4438,7 @@ use std::collections::{HashMap, HashSet};
                     walk_stmt(s, acc, multi_run);
                 }
             }
+            IrExpr::Splice(e) => walk_expr(e, acc, multi_run),
             IrExpr::Call { func, args } => {
                 if func == "setVar" {
                     if let [IrExpr::Str(name, _), _] = args.as_slice() {
@@ -4511,6 +4537,14 @@ use std::collections::{HashMap, HashSet};
     fn walk_stmt(st: &IrStmt, acc: &mut Acc, multi_run: bool) {
         match st {
             IrStmt::Label(_) | IrStmt::Goto(_) => {}
+            // inline asm: the operand exprs may read/write store vars;
+            // walk them like an assignment's value side (core requests
+            // c-sh-go-asm / asmargument / asmqualifier)
+            IrStmt::Asm { outputs, inputs, .. } => {
+                for (_, e) in outputs.iter().chain(inputs.iter()) {
+                    walk_expr(e, acc, multi_run);
+                }
+            }
             IrStmt::Assign { targets, expr } => {
                 for t in targets {
                     // array-element writes arrive either with a non-empty
@@ -5706,6 +5740,8 @@ fn loop_fixpoint(
 fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
     match s {
         IrStmt::Label(_) | IrStmt::Goto(_) => {}
+        // inline asm operands are runtime exprs — no static range
+        IrStmt::Asm { .. } => {}
         IrStmt::Assign { targets, expr } if targets.len() == 1 && targets[0].indices.is_empty() => {
             let name = targets[0].var.clone();
             state.insert(name, ir_range(expr, state));
@@ -12531,11 +12567,6 @@ fn top_stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
 }
 
 fn top_stmt_to_estree_inner(stmt: &IrStmt) -> Option<Stmt> {
-    if let IrStmt::Assign { targets, expr } = stmt {
-        if matches!(expr, IrExpr::Call { func, .. } if func == "setArray") {
-            eprintln!("DBG top assign setArray target={}", targets[0].var);
-        }
-    }
     let s = stmt_to_estree(stmt)?;
     // No `set -e` anywhere → the runtime's errexit flag can never turn on,
     // so `sh2.guard(v)` would be an identity call on every statement.
@@ -13422,6 +13453,8 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
     fn scan_stmt(s: &IrStmt) -> bool {
         match s {
             IrStmt::Label(_) | IrStmt::Goto(_) => false,
+            // inline asm operands never carry shopt set-calls
+            IrStmt::Asm { .. } => false,
             IrStmt::Expr(e) => scan_expr(e),
             IrStmt::Output { value, .. } => scan_expr(value),
             IrStmt::WriteFile { path, content, .. } => scan_expr(path) || scan_expr(content),
@@ -13593,6 +13626,8 @@ fn ir_nocase_shopt_mask(prog: &IrProgram) -> u8 {
     fn scan_stmt(s: &IrStmt, mask: &mut u8) {
         match s {
             IrStmt::Label(_) | IrStmt::Goto(_) => {}
+            // inline asm operands never carry shopt set-calls
+            IrStmt::Asm { .. } => {}
             IrStmt::Expr(e) => scan_expr(e, mask),
             IrStmt::Output { value, .. } => scan_expr(value, mask),
             IrStmt::WriteFile { path, content, .. } => {
@@ -16215,6 +16250,43 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 )],
             ),
         },
+        // Inline assembly (core requests c-sh-go-asm / asmargument /
+        // asmqualifier): JS cannot execute machine code. The faithful
+        // lowering is a NO-OP carrying the template — exact ONLY for
+        // effect-free asm (empty outputs; the executed-stdout oracle can
+        // only exercise `asm("nop")`-style forms). An asm with OUTPUT
+        // operands has observable writes the no-op would drop — the
+        // emitted text flags the drop (refuse > guess; the coverage
+        // question stays honest). Input operands are reads (no state
+        // effect when dropped); clobbers name machine state the JS model
+        // does not have.
+        IrStmt::Asm {
+            template,
+            volatile: _,
+            outputs,
+            inputs,
+            clobbers,
+        } => {
+            let mut text = format!("asm: {template}");
+            if !outputs.is_empty() {
+                text.push_str(" [OUTPUT OPERANDS DROPPED — JS cannot execute machine code]");
+            }
+            if !inputs.is_empty() {
+                text.push_str(" [INPUT OPERANDS DROPPED — JS cannot execute machine code]");
+            }
+            if !clobbers.is_empty() {
+                text.push_str(" [clobbers: ");
+                text.push_str(&clobbers.join(", "));
+                text.push(']');
+            }
+            Stmt::ExpressionStatement {
+                expression: Expr::Literal {
+                    value: serde_json::Value::String(text),
+                    raw: None,
+                    regex: None,
+                },
+            }
+        }
         IrStmt::Redirect { inner, redirects } => {
             // `echo args > file` / `echo args >> file`: a native
             // fs.writeFile replaces the redirect+builtin pair (see
@@ -16270,13 +16342,18 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     .map(|r| redirect_spec_to_estree(r, persist))
                     .collect(),
             );
-            let call = if expr_has_await(&body) || expr_has_await(&specs) {
+            let call = if expr_has_await(&body)
+                || expr_has_await(&specs)
+                || !redirect_specs_sync_ok(&redirect_specs)
+            {
                 await_call("redirect", vec![body, specs])
             } else {
                 // *Sync twin (see the generic call arm): an await-free
                 // body AND literal (await-free) redirect targets run
                 // through the sync runtime twin — the same spec
                 // install/restore/persist logic, no per-call promise.
+                // ONLY fd-dup (`&N`) specs qualify: file targets need
+                // the async fs bridge (redirect_specs_sync_ok).
                 sh2_call("redirectSync", vec![sync_arrow_flip(body), specs])
             };
             Stmt::ExpressionStatement { expression: call }
@@ -28365,6 +28442,16 @@ fn store_var_read(name: &str) -> Expr {
     if let Some(special) = native_special_var(name) {
         return special;
     }
+    // `$EPOCHREALTIME` / `$EPOCHSECONDS` (core request
+    // estree-20260813-233001-epochrealtime-regression): bash resolves
+    // these as runtime state, NOT program variables — the read must
+    // reach the runtime's getVar special arm (`Date.now()`-based), so it
+    // never folds under never_written_read (the name has no in-script
+    // write) and never becomes a native `vars.n ?? env.n ?? ''` read
+    // (the store would answer "" — the browser env has no such name).
+    if matches!(name, "EPOCHREALTIME" | "EPOCHSECONDS") {
+        return sh2_call("getVar", vec![str_lit(name)]);
+    }
     if never_written_read(name) {
         return str_lit("");
     }
@@ -28616,6 +28703,17 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             }
         }
         IrExpr::Ident(name) => Expr::Identifier { name: name.clone() },
+        // Starred-expression splice (core request py-sh-go-star-expr): the
+        // wrapped expr's ELEMENTS splice into the enclosing Array/Call — a
+        // JS SpreadElement (`[...x]` / `f(...x)`). The runtime store's
+        // array values are native JS arrays, so the spread is the exact
+        // Python splice (a copy of the elements, not a nested item). Valid
+        // only as an Array element / Call argument (SpreadElement is
+        // illegal elsewhere in ESTree — a frontend that emits Splice in
+        // another position gets a babel generator error, refuse > guess).
+        IrExpr::Splice(e) => Expr::SpreadElement {
+            argument: Box::new(expr_to_estree(e)),
+        },
         // A numeric-range iterable (`seq_range_for`'s bare `Range`
         // For.iter shape): the ESTree surface has no range literal, so
         // render the materialized string list. The native ForStatement
@@ -28919,6 +29017,13 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     }
                     if let Some(native) = native_special_var(name) {
                         return native;
+                    }
+                    // bash runtime specials with no native twin (core
+                    // request estree-20260813-233001-epochrealtime-regression):
+                    // the read must reach the runtime's getVar arm — never
+                    // the never-written fold, never the vars/env store.
+                    if matches!(name.as_str(), "EPOCHREALTIME" | "EPOCHSECONDS") {
+                        return sh2_call("getVar", vec![str_lit(name)]);
                     }
                     if never_written_read(name) {
                         return str_lit("");
@@ -30291,6 +30396,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 // async arrow would only allocate a discarded promise.
                 if SYNC_TWIN_CALLS.contains(&callee_name)
                     && mapped_args.iter().all(|a| !expr_has_await(a))
+                    && (callee_name != "redirect" || redirect_call_sync_ok(args))
                 {
                     sh2_call(
                         &format!("{callee_name}Sync"),
