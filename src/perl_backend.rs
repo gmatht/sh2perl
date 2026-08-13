@@ -284,17 +284,21 @@ impl Render {
                     match p {
                         InterpPart::Lit(s) => lit.push_str(s),
                         InterpPart::Expr(x) => {
+                            // nested `$(...)` — reconstruct at the shell
+                            // level; a capture inside a quoted word stays
+                            // quoted so sh doesn't word-split its output
                             if let IrExpr::Call { func, args } = x.as_ref() {
-                                if func == "getVar" {
-                                    if let Some(name) = Self::str_arg(args, 0) {
+                                if func == "capture" || func == "captureWords" {
+                                    if let Some(inner) = self.shell_cmd_call(func, args) {
                                         if !lit.is_empty() {
-                                            out.push_str(&shell_squote(&lit));
+                                            let mut seg = String::from("\"");
+                                            seg.push_str(&sh_dq_escape(&lit));
                                             lit.clear();
-                                        }
-                                        if self.sh_owned {
-                                            out.push_str(&self.shell_var_ref(&name));
+                                            seg.push_str(&inner);
+                                            seg.push('"');
+                                            out.push_str(&seg);
                                         } else {
-                                            out.push_str(&self.var_ref(&name));
+                                            out.push_str(&inner);
                                         }
                                         continue;
                                     }
@@ -304,11 +308,14 @@ impl Render {
                                 out.push_str(&shell_squote(&lit));
                                 lit.clear();
                             }
-                            // nested `$(...)` — reconstruct at the shell level
                             if let IrExpr::Call { func, args } = x.as_ref() {
-                                if func == "capture" || func == "captureWords" {
-                                    if let Some(inner) = self.shell_cmd_call(func, args) {
-                                        out.push_str(&inner);
+                                if func == "getVar" {
+                                    if let Some(name) = Self::str_arg(args, 0) {
+                                        if self.sh_owned {
+                                            out.push_str(&self.shell_var_ref(&name));
+                                        } else {
+                                            out.push_str(&self.var_ref(&name));
+                                        }
                                         continue;
                                     }
                                 }
@@ -520,7 +527,7 @@ impl Render {
                         words.push(self.shell_word(w));
                     }
                 }
-                // command-scoped env: `IFS=: cmd` — sh supports the prefix
+                // env-prefix
                 let env_prefix: String = match args.get(2) {
                     Some(IrExpr::Object(pairs)) => pairs
                         .iter()
@@ -529,7 +536,53 @@ impl Render {
                         .join(" "),
                     _ => String::new(),
                 };
-                let cmd = words.join(" ");
+                let cmd_str = Self::str_arg(args, 0).unwrap_or_default();
+                let mut cmd = words.join(" ");
+                // dash's echo lacks -e/-n — reconstruct via printf (`%b`
+                // interprets backslash escapes like bash echo -e)
+                if cmd_str == "echo" {
+                        let mut rest: Vec<String> = Vec::new();
+                        let mut esc = false;
+                        let mut nl = true;
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            for w in items {
+                                if let IrExpr::Str(s, _) = w {
+                                    if s == "-e" && !esc {
+                                        esc = true;
+                                        continue;
+                                    }
+                                    if s == "-n" && nl {
+                                        nl = false;
+                                        continue;
+                                    }
+                                    if s.starts_with('-') && s.len() > 1
+                                        && s[1..].chars().all(|c| c == 'e' || c == 'n')
+                                    {
+                                        if s.contains('e') {
+                                            esc = true;
+                                        }
+                                        if s.contains('n') {
+                                            nl = false;
+                                        }
+                                        continue;
+                                    }
+                                }
+                                rest.push(self.shell_word(w));
+                            }
+                        }
+                        if esc || !nl {
+                            let fmt = match (esc, nl) {
+                                (true, true) => "%b\\n",
+                                (true, false) => "%b",
+                                (false, false) => "%s",
+                                (false, true) => "%s\\n",
+                            };
+                            let mut p: Vec<String> =
+                                vec![shell_squote("printf"), shell_squote(fmt)];
+                            p.extend(rest);
+                            cmd = p.join(" ");
+                        }
+                    }
                 Some(if env_prefix.is_empty() {
                     cmd
                 } else {
@@ -793,16 +846,26 @@ impl Render {
 
     /// qx body where `$var` refs interpolate at the PERL level (the
     /// variable's perl value, matching bash's variable). Only the `{`/`}`
-    /// qx delimiters are escaped; literal `$`s are already perl-escaped by
-    /// `shell_squote` (`\$` → perl passes `$`).
+    /// qx delimiters are escaped (plus `$(` — perl's real-gid variable —
+    /// so nested shell cmdsubs survive); literal `$`s are already
+    /// perl-escaped by `shell_squote` (`\$` → perl passes `$`).
     fn qx_raw(&mut self, cmd: &str) -> String {
+        let chars: Vec<char> = cmd.chars().collect();
         let mut out = String::new();
-        for c in cmd.chars() {
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
             match c {
+                '$' if i + 1 < chars.len() && chars[i + 1] == '(' => {
+                    out.push_str("\\$(");
+                    i += 2;
+                    continue;
+                }
                 '{' => out.push_str("\\{"),
                 '}' => out.push_str("\\}"),
                 c => out.push(c),
             }
+            i += 1;
         }
         format!("qx{{{out}}}")
     }
@@ -941,7 +1004,7 @@ impl Render {
             IrExpr::Call { func, .. }
                 if matches!(
                     func.as_str(),
-                    "capture" | "captureWords" | "pipeline" | "redirect" | "and" | "or"
+                    "capture" | "captureWords" | "pipeline" | "and" | "or"
                 ) =>
             {
                 // a qx/pipeline runs the command and sets $? — bash tests
@@ -1397,23 +1460,28 @@ impl Render {
                 }
             },
             "redirect" => {
-                // expr-position redirect: run the reconstructed command via
-                // qx (output to the redirect target), truthy on exit 0
+                // expr-position redirect: NATIVE fd redirection around the
+                // natively rendered body (system children inherit the
+                // redirected fd; stdout passes through unless redirected),
+                // truthy on exit 0
                 let Some(IrExpr::Arrow(stmts)) = args.first() else {
                     self.mark_todo("redirect arg");
                     return "0".into();
                 };
-                let cmd = self.shell_cmd(stmts, "; ");
-                let (pre, suf) = args
+                let specs = args
                     .get(1)
-                    .map(|s| self.shell_redirs_expr(s))
+                    .map(|s| self.mini_redirs_from_expr(s))
                     .unwrap_or_default();
-                let full = if pre.is_empty() {
-                    format!("{cmd}{suf}")
-                } else {
-                    format!("{} | {cmd}{suf}", pre.join(" | "))
-                };
-                format!("do {{ my $__o = {}; ($? == 0) }}", self.shell_qx(&full))
+                let mut inner = Vec::new();
+                std::mem::swap(&mut self.out, &mut inner);
+                let saved = self.depth;
+                self.depth = 0;
+                self.native_redirect(stmts, &specs);
+                self.emit("($? == 0)");
+                let body = self.out.join("\n");
+                self.out = inner;
+                self.depth = saved;
+                format!("do {{\n{}\n}}", indent_block(&body, 1))
             }
             "block" | "subshell" => match args.first() {
                 Some(IrExpr::Arrow(stmts)) => self.arrow_expr(stmts),
@@ -1606,6 +1674,28 @@ impl Render {
             }
             "true" => "0".to_string(),
             "false" => "256".to_string(),
+            "cd" => {
+                // chdir must affect the perl process — native, 0 on success
+                match words.first() {
+                    Some(dir) => format!("(chdir({}) ? 0 : 256)", self.expr(dir)),
+                    None => "(chdir($ENV{HOME} // '.') ? 0 : 256)".to_string(),
+                }
+            }
+            "exit" => match words.first() {
+                Some(code) => format!("do {{ exit {}; }}", self.expr(code)),
+                None => "do { exit 0; }".to_string(),
+            },
+            "echo" => {
+                // `if echo x; then` — echo always succeeds
+                let mut ws: Vec<IrExpr> = words.clone();
+                if let Some(IrExpr::Str(s, _)) = ws.first() {
+                    if s == "-n" || s == "-e" {
+                        ws.remove(0);
+                    }
+                }
+                let parts: Vec<String> = ws.iter().map(|w| self.expr(w)).collect();
+                format!("do {{ print join(' ', {}), \"\\n\"; 0 }}", parts.join(", "))
+            }
             _ => {
                 if self.funcs.contains(&cmd) {
                     let a: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
@@ -1951,6 +2041,19 @@ impl Render {
                     if let IrExpr::Str(s, _) = w {
                         if s.contains('\\') {
                             p = Self::perl_str(&s.replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\"));
+                        }
+                    } else if let IrExpr::Interpolate(parts2) = w {
+                        if parts2.iter().all(|p| matches!(p, InterpPart::Lit(_))) {
+                            let s: String = parts2
+                                .iter()
+                                .map(|p| match p {
+                                    InterpPart::Lit(s) => s.clone(),
+                                    _ => String::new(),
+                                })
+                                .collect();
+                            if s.contains('\\') {
+                                p = Self::perl_str(&s.replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\"));
+                            }
                         }
                     }
                     parts.push(p);
@@ -3420,6 +3523,23 @@ fn ident(name: &str) -> String {
     let first = out.chars().next().unwrap();
     if first.is_ascii_digit() {
         out.insert(0, '_');
+    }
+    out
+}
+
+/// Shell double-quote text for a reconstructed command (escapes for sh
+/// INSIDE `"..."`; the text later passes through the perl qx layer which
+/// un-escapes `\$` → `$` etc. for the sh child).
+fn sh_dq_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '$' => out.push_str("\\$"),
+            '`' => out.push_str("\\`"),
+            c => out.push(c),
+        }
     }
     out
 }
