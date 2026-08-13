@@ -12196,12 +12196,17 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 || string_ctx.contains(name)
                 || is_reserved_var(name)
                 || is_js_keyword(name)
-                || name.contains('[')
-                || name.contains(']')
+                || !is_ident(name)
             {
                 // names with a subscript (`map[answer]` — the parser keeps
                 // the whole bracket string as the var name) are array
-                // writes: never liftable (a `let map[answer]` is invalid JS)
+                // writes: never liftable (a `let map[answer]` is invalid
+                // JS). Dotted member keys (`s.X` — go-sh structType, core
+                // request go-sh-structtype-20260814-054454) are the same:
+                // a store-name string, never a JS identifier (a lifted
+                // `let s.X` would be a syntax error) — member reads/writes
+                // stay on the runtime store (`sh2.getVar("s.X")` /
+                // `sh2.setVar("s.X", …)`).
                 continue;
             }
             let all_numeric = exprs.iter().all(|e| match e {
@@ -26810,6 +26815,12 @@ fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
                 if LOCAL_ENV_OBSERVABLE.contains(&c.as_str()) {
                     continue;
                 }
+                // a dotted member key (`s.X` — go-sh structType) can never
+                // become a native `let` binding (invalid JS identifier);
+                // keep it store-bound like every other non-ident name.
+                if !is_plain_ident(c) {
+                    continue;
+                }
                 if excluded.contains(c) || string_ctx.contains(c) {
                     continue;
                 }
@@ -26992,9 +27003,12 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
                 || string_ctx.contains(name)
                 || is_reserved_var(name)
                 || is_js_keyword(name)
-                || name.contains('[')
-                || name.contains(']')
+                || !is_plain_ident(name)
             {
+                // subscripts (`map[answer]`) and dotted member keys
+                // (`s.X` — go-sh structType) are store-name strings, never
+                // JS identifiers: not liftable (mirror of the numeric-lift
+                // twin's guard; a `let s.X` would be a syntax error).
                 continue;
             }
             let all_string = exprs.iter().all(|e| match e {
@@ -32974,5 +32988,68 @@ mod length_analysis_tests {
             "LENGTH TALLY: files={} vars={} bounded={} unbounded={} total_len={} files_with_bounds={}",
             files, total_vars, total_bounded, total_unbounded, total_len, files_with_bounds
         );
+    }
+}
+
+#[cfg(test)]
+mod struct_member_tests {
+    use super::*;
+
+    /// Dotted member keys (`s.X` — go-sh structType, core request
+    /// go-sh-structtype-20260814-054454): a struct member read/write
+    /// lowers to the runtime STORE (`sh2.setVar("s.X", …)` /
+    /// `sh2.getVar("s.X")`), NEVER a native JS binding — the lift
+    /// analyses (numeric/string/local) must refuse non-ident names
+    /// (a `let s.X = 0` declaration would be a JS syntax error, and
+    /// the bare `$s.X` text form would expand `$s` + literal `.X`).
+    /// End-to-end: A1 ingress → shIR → ESTree.
+    #[test]
+    fn dotted_member_keys_stay_store_bound() {
+        let a1 = r#"{
+          "contract_version": 1,
+          "imports": [], "requires": [],
+          "stmts": [
+            {"type": "Assign", "targets": [{"var": "s.X", "sigil": null, "indices": []}],
+             "expr": {"type": "Int", "value": 5}},
+            {"type": "Assign", "targets": [{"var": "s.Name", "sigil": null, "indices": []}],
+             "expr": {"type": "Str", "value": "alice", "style": "DoubleQuoted"}},
+            {"type": "Assign", "targets": [{"var": "s.X", "sigil": null, "indices": []}],
+             "expr": {"type": "Int", "value": 7}},
+            {"type": "Expr", "expr": {"type": "Call", "func": "exec", "args": [
+              {"type": "Str", "value": "echo", "style": "DoubleQuoted"},
+              {"type": "Array", "elements": [
+                {"type": "Call", "func": "getVar",
+                 "args": [{"type": "Str", "value": "s.X", "style": "DoubleQuoted"}],
+                 "purity": "Emulable"}
+              ]}
+            ], "purity": "Emulable"}}
+          ],
+          "subs": [], "type": "Program", "var_types": []
+        }"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(a1).expect("ingress accepts dotted member keys");
+        let json = serde_json::to_string(&shir_to_estree(&prog)).unwrap();
+        // no native binding may carry the dotted name (invalid JS)
+        assert!(
+            !json.contains("\"name\":\"s.X\"") && !json.contains("\"name\":\"s.Name\""),
+            "dotted member key lifted to a native binding: {json}"
+        );
+        // writes/reads stay on the runtime store, keyed by the member name
+        assert!(json.contains("\"name\":\"setVar\""), "{json}");
+        assert!(json.contains("\"value\":\"s.X\""), "{json}");
+        assert!(json.contains("\"name\":\"getVar\""), "{json}");
+        assert!(!json.contains("\"value\":\"s.X\"},\"raw\":null"), "{json}");
+        // plain names still lift natively (the guard is name-shape, not blanket)
+        let plain = r#"{
+          "contract_version": 1,
+          "imports": [], "requires": [],
+          "stmts": [
+            {"type": "Assign", "targets": [{"var": "x", "sigil": null, "indices": []}],
+             "expr": {"type": "Int", "value": 5}}
+          ],
+          "subs": [], "type": "Program", "var_types": []
+        }"#;
+        let prog2 = crate::shir_json_in::shir_json_to_ir(plain).expect("ingress");
+        let json2 = serde_json::to_string(&shir_to_estree(&prog2)).unwrap();
+        assert!(json2.contains("\"name\":\"x\""), "plain name should lift: {json2}");
     }
 }
