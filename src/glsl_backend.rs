@@ -4123,6 +4123,89 @@ fn test_ok(cond: &IrExpr, vars: &std::collections::HashMap<String, Option<Range>
     }
 }
 
+/// Guard-aware refinement: a numeric single-var test (`"$x" -gt 40`)
+/// tightens the var's range inside the taken / not-taken branch. Returns
+/// (then, else) as (name, refined range); None side = no refinement.
+/// This is what makes the vignette's clamp chain provable: inside
+/// `if [ "$edge" -gt 150 ]` edge ≥ 151, so after the `dim>40` cap the
+/// range is [1, 40] and `r - r*dim/255` stays within ±2^15.
+fn test_refine(
+    cond: &IrExpr,
+    vars: &std::collections::HashMap<String, Option<Range>>,
+) -> (
+    Option<(String, Range)>,
+    Option<(String, Range)>,
+) {
+    let text = match cond {
+        IrExpr::Call { func, args } if func == "test" => match args.first() {
+            Some(IrExpr::Str(t, _)) => t.as_str(),
+            _ => return (None, None),
+        },
+        _ => return (None, None),
+    };
+    fn strip(t: &str) -> &str {
+        let t = t.trim();
+        t.strip_prefix('"')
+            .and_then(|x| x.strip_suffix('"'))
+            .unwrap_or(t)
+    }
+    let var_of = |t: &str| -> Option<String> {
+        let t = strip(t);
+        let t = t.strip_prefix('$')?;
+        let name = t
+            .strip_prefix('{')
+            .and_then(|x| x.strip_suffix('}'))
+            .unwrap_or(t);
+        if name.is_empty() || is_positional(name) {
+            return None;
+        }
+        Some(name.to_string())
+    };
+    let num_of = |t: &str| -> Option<i64> { strip(t).parse().ok() };
+    let toks = test_tokenize(text);
+    let [a, op, b] = toks.as_slice() else {
+        return (None, None);
+    };
+    let refine_for = |name: &str,
+                      op: &str,
+                      n: i64,
+                      flipped: bool|
+     -> (Option<(String, Range)>, Option<(String, Range)>) {
+        let cur = match vars.get(name).copied().flatten() {
+            Some(r) => r,
+            None => return (None, None),
+        };
+        let n = n as i128;
+        // normalise: op is always "var op N"
+        let (then_r, else_r): (Range, Option<Range>) = match (flipped, op) {
+            (false, "-gt") => (Range { lo: n + 1, hi: cur.hi }, Some(Range { lo: cur.lo, hi: n })),
+            (false, "-ge") => (Range { lo: n, hi: cur.hi }, Some(Range { lo: cur.lo, hi: n - 1 })),
+            (false, "-lt") => (Range { lo: cur.lo, hi: n - 1 }, Some(Range { lo: n, hi: cur.hi })),
+            (false, "-le") => (Range { lo: cur.lo, hi: n }, Some(Range { lo: n + 1, hi: cur.hi })),
+            (false, "-eq") => (Range { lo: n, hi: n }, None),
+            (false, "-ne") => (Range { lo: cur.lo, hi: cur.hi }, Some(Range { lo: n, hi: n })),
+            (true, "-gt") => (Range { lo: cur.lo, hi: n - 1 }, Some(Range { lo: n, hi: cur.hi })),
+            (true, "-ge") => (Range { lo: cur.lo, hi: n }, Some(Range { lo: n + 1, hi: cur.hi })),
+            (true, "-lt") => (Range { lo: n + 1, hi: cur.hi }, Some(Range { lo: cur.lo, hi: n })),
+            (true, "-le") => (Range { lo: n, hi: cur.hi }, Some(Range { lo: cur.lo, hi: n - 1 })),
+            (true, "-eq") => (Range { lo: n, hi: n }, None),
+            (true, "-ne") => (Range { lo: cur.lo, hi: cur.hi }, Some(Range { lo: n, hi: n })),
+            _ => return (None, None),
+        };
+        (
+            Some((name.to_string(), then_r)),
+            else_r.map(|r| (name.to_string(), r)),
+        )
+    };
+    if let (Some(name), Some(n)) = (var_of(a), num_of(b)) {
+        return refine_for(&name, op, n, false);
+    }
+    if let (Some(n), Some(name)) = (num_of(a), var_of(b)) {
+        return refine_for(&name, op, n, true);
+    }
+    (None, None)
+}
+
 fn walk_stmts(stmts: &[IrStmt], vars: &mut std::collections::HashMap<String, Option<Range>>) -> bool {
     for s in stmts {
         if !walk_stmt(s, vars) {
@@ -4172,8 +4255,12 @@ fn walk_stmt(s: &IrStmt, vars: &mut std::collections::HashMap<String, Option<Ran
             if !test_ok(cond, vars) {
                 return false;
             }
+            let (t_ref, e_ref) = test_refine(cond, vars);
             let mut branches: Vec<std::collections::HashMap<String, Option<Range>>> = Vec::new();
             let mut t = vars.clone();
+            if let Some((name, r)) = &t_ref {
+                t.insert(name.clone(), Some(*r));
+            }
             if !walk_stmts(then, &mut t) {
                 return false;
             }
@@ -4182,13 +4269,20 @@ fn walk_stmt(s: &IrStmt, vars: &mut std::collections::HashMap<String, Option<Ran
                 if !test_ok(e, vars) {
                     return false;
                 }
+                let (et_ref, _) = test_refine(e, vars);
                 let mut b = vars.clone();
+                if let Some((name, r)) = &et_ref {
+                    b.insert(name.clone(), Some(*r));
+                }
                 if !walk_stmts(body, &mut b) {
                     return false;
                 }
                 branches.push(b);
             }
             let mut el = vars.clone();
+            if let Some((name, r)) = &e_ref {
+                el.insert(name.clone(), Some(*r));
+            }
             if !walk_stmts(else_, &mut el) {
                 return false;
             }
