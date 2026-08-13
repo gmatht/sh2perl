@@ -1551,6 +1551,50 @@ mod tests {
         assert_eq!(json, json2, "ForInit round-trip drift");
     }
 
+    /// The bat-sh-go `for /f` loop shape (core-request cluster
+    /// triage-perl-20260814-044426/044427: t12_forf.bat / t24_forf2.bat)
+    /// round-trips through the A1 JSON: the lowered `while read` cond is
+    /// an `exec("read", [args, {IFS: ","}])` Call whose trailing Object
+    /// argument carries the delimiter set (the estree reference renders
+    /// `sh2.builtin("read", ..., {IFS})` and tokenizes on it; a backend
+    /// that ignores the Object falls back to whitespace splitting and
+    /// diverges). The Object arg survives emit → ingress → emit
+    /// byte-identically.
+    #[test]
+    fn read_with_ifs_object_arg_roundtrip() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+        {"type":"While","cond":{"type":"Call","func":"exec","purity":"Emulable","args":[
+          {"type":"Str","value":"read","style":"DoubleQuoted"},
+          {"type":"Array","elements":[
+            {"type":"Str","value":"-r","style":"DoubleQuoted"},
+            {"type":"Str","value":"a","style":"DoubleQuoted"},
+            {"type":"Str","value":"__frest","style":"DoubleQuoted"}
+          ]},
+          {"type":"Object","properties":[
+            {"key":"IFS","value":{"type":"Str","value":",","style":"DoubleQuoted"}}
+          ]}
+        ]},"body":[
+          {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[
+            {"type":"Str","value":"echo","style":"DoubleQuoted"},
+            {"type":"Array","elements":[{"type":"Str","value":"item","style":"DoubleQuoted"}]}
+          ]}}
+        ]}
+      ]}"#;
+        let prog1 = shir_json_to_ir(src).expect("ingress accepts the read-with-IFS shape");
+        let json1 = shir_to_shir_json(&prog1);
+        let prog2 = shir_json_to_ir(&json1).expect("re-ingress");
+        assert_eq!(json1, shir_to_shir_json(&prog2), "read-with-IFS round-trips");
+        assert!(json1.contains("\"key\":\"IFS\""), "IFS key serialized: {json1}");
+        assert!(json1.contains("\"value\":\",\""), "IFS value serialized: {json1}");
+        // the estree reference renders the Object arg (not a whitespace
+        // fallback): the builtin read gets the delimiter set
+        let estree = crate::shir::shir_to_estree_json(&prog1).expect("render");
+        assert!(
+            estree.contains("\"name\":\"IFS\"") && estree.contains("\"value\":\",\""),
+            "estree keeps the IFS delimiter: {estree}"
+        );
+    }
+
     #[test]
     fn c_sizeof_constants() {
         use crate::ir::IrType;
