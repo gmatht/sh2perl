@@ -78,6 +78,8 @@ pub struct Render {
     float_vars: BTreeSet<String>, // vars assigned from a float bc capture → GLSL float
     used_str: bool,   // the program uses strings/scratch (the ES-3.00-only runtime)
     used_putb: bool,  // the program emits output bytes (putb)
+    used_pa: bool,    // function params / positionals in fn (the g_pa array)
+    used_fit: bool,   // string for-loops over array literals (the g_fit array)
     used_ipow: bool,  // arithmetic ** (pow)
     used_isqrt: bool, // arithmetic sqrt
     putb_pos: usize,  // ES 1.00: the fixed out_buf slot for the next putb
@@ -195,6 +197,24 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
     r.emit("");
     r.emit("void main() {");
     r.depth += 1;
+    // scalar program vars are main() locals when there are no user
+    // functions (see emit_globals) — declare them before the bridge
+    // seeding so every assignment below is a plain local write.
+    if r.fns.is_empty() {
+        let locals: Vec<String> = r.vars.iter().map(|n| r.ident(n)).collect();
+        for n in locals {
+            if r.float_vars.contains(&n) {
+                r.emit(&format!("float {n};"));
+            } else if r.is_num_ident(&n) {
+                r.emit(&format!("int {n};"));
+            } else {
+                r.emit(&format!("ivec2 {n};"));
+            }
+        }
+        if !r.vars.is_empty() {
+            r.emit("");
+        }
+    }
     if r.opts.color_out {
         // input bridges — bash reads these as ints
         r.emit("g_frag_x = int(gl_FragCoord.x);");
@@ -259,7 +279,12 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
     }
     r.emit("precision highp float;");
     r.emit("precision highp int;");
-    r.emit(&format!("const int OUT_CAP = {OUT_CAP};"));
+    if r.used_str || !r.opts.color_out || (r.used_putb && !r.opts.es100) {
+        // OUT_CAP is referenced by the putCh guard (string runtime / ES
+        // 3.00 putb) and the ES 3.00 u_mode readback; a pure ES 1.00
+        // render fragment (putb at fixed slots) never needs it.
+        r.emit(&format!("const int OUT_CAP = {OUT_CAP};"));
+    }
     r.emit("");
     r.emit_table();
     r.emit_globals();
@@ -288,6 +313,8 @@ impl Default for Render {
             float_vars: BTreeSet::new(),
             used_str: false,
             used_putb: false,
+            used_pa: false,
+            used_fit: false,
             used_ipow: false,
             used_isqrt: false,
             putb_pos: 0,
@@ -408,25 +435,50 @@ impl Render {
                 self.emit(&format!("int {n}_n;"));
             }
         }
-        for n in vars {
-            if self.float_vars.contains(&n) {
-                self.emit(&format!("float {n};"));
-            } else if self.is_num_ident(&n) {
-                self.emit(&format!("int {n};"));
-            } else {
-                self.emit(&format!("ivec2 {n};"));
+        // Scalar vars are file-scope globals ONLY when user functions
+        // exist (they may read/write them from their own scope). With no
+        // functions every read/write happens inside main(), so they are
+        // declared as main() locals instead (see shir_to_glsl_opts): the
+        // GLSL compiler gets real registers and the shader carries no
+        // mutable global state. Arrays stay global — ES 1.00 restricts
+        // dynamic indexing of local arrays.
+        if !self.fns.is_empty() {
+            for n in vars {
+                if self.float_vars.contains(&n) {
+                    self.emit(&format!("float {n};"));
+                } else if self.is_num_ident(&n) {
+                    self.emit(&format!("int {n};"));
+                } else {
+                    self.emit(&format!("ivec2 {n};"));
+                }
             }
         }
         if self.used_str {
             self.emit(&format!("int s_scratch[{SCRATCH_CAP}];"));
             self.emit("int s_spos = 0;");
         }
-        self.emit(&format!("int out_buf[{OUT_CAP}];"));
-        self.emit("int out_len = 0;");
-        self.emit(&format!("ivec2 g_pa[{PARAM_CAP}];"));
-        self.emit("int g_pa_n = 0;");
-        self.emit(&format!("ivec2 g_fit[{FIT_CAP}];"));
-        self.emit("int g_fit_n = 0;");
+        // The output byte buffer. The dynamic writer is putCh (the
+        // OUT_CAP guard + out_len counter); it is live when the string
+        // runtime is (putStr/printf/echo) or when ES 3.00 putb lowers to
+        // it. A pure ES 1.00 render fragment writes putb bytes at FIXED
+        // const slots and the colour line reads back 0..3 — a 4-slot (or
+        // putb-sized) buffer is enough, with no counter and no cap const.
+        let dyn_out = self.used_str || (self.used_putb && !self.opts.es100);
+        if !self.opts.color_out || dyn_out {
+            self.emit(&format!("int out_buf[{OUT_CAP}];"));
+            self.emit("int out_len = 0;");
+        } else {
+            let cap = std::cmp::max(4, self.putb_pos);
+            self.emit(&format!("int out_buf[{cap}];"));
+        }
+        if self.used_pa {
+            self.emit(&format!("ivec2 g_pa[{PARAM_CAP}];"));
+            self.emit("int g_pa_n = 0;");
+        }
+        if self.used_fit {
+            self.emit(&format!("ivec2 g_fit[{FIT_CAP}];"));
+            self.emit("int g_fit_n = 0;");
+        }
     }
 
     /// like `is_num(name)` but for an already-mangled `g_` ident
@@ -439,6 +491,12 @@ impl Render {
     fn emit_helpers(&mut self) {
         // the string/scratch runtime — only when the program uses it
         if !self.used_str {
+            // ES 3.00 `putb` lowers to putCh — keep that one helper
+            // (its out_len/OUT_CAP deps are emitted by emit_globals).
+            if self.used_putb && !self.opts.es100 {
+                self.emit("void putCh(int c) { if (out_len < OUT_CAP) out_buf[out_len++] = c; }");
+                self.emit("");
+            }
             return;
         }
         self.emit("int s2i(ivec2 s) {");
@@ -1351,6 +1409,7 @@ impl Render {
                 Some("/* TODO($?) */ 0".to_string())
             }
             "#" => Some(if self.in_fn {
+                self.used_pa = true;
                 "g_pa_n".to_string()
             } else {
                 "0".to_string()
@@ -1370,6 +1429,7 @@ impl Render {
                 Some("/* TODO($special) */ ivec2(0, 0)".to_string())
             }
             "#" => Some(if self.in_fn {
+                self.used_pa = true;
                 "itos(g_pa_n)".to_string()
             } else {
                 "ivec2(0, 0)".to_string()
@@ -1380,8 +1440,9 @@ impl Render {
 
     fn positional_num(&mut self, name: &str) -> String {
         if self.in_fn {
-            let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
-            format!("s2i(g_pa[{}])", i.min(PARAM_CAP - 1))
+            self.used_pa = true;
+            let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1).min(PARAM_CAP - 1);
+            format!("s2i(g_pa[{i}])")
         } else {
             "0".to_string() // no argv on the GPU
         }
@@ -1389,8 +1450,9 @@ impl Render {
 
     fn positional_str(&mut self, name: &str) -> String {
         if self.in_fn {
-            let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1);
-            format!("g_pa[{}]", i.min(PARAM_CAP - 1))
+            self.used_pa = true;
+            let i = name.parse::<usize>().unwrap_or(1).saturating_sub(1).min(PARAM_CAP - 1);
+            format!("g_pa[{i}]")
         } else {
             "ivec2(0, 0)".to_string() // no argv on the GPU
         }
@@ -1408,7 +1470,7 @@ impl Render {
                     format!("({n})")
                 }
             }
-            ArithAst::Var(name) => {
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
                 if self.is_num(name) {
                     self.ident(name)
                 } else {
@@ -2701,6 +2763,7 @@ impl Render {
             name if self.fns.contains(name) => {
                 let items = self.exec_items(&args[1..]);
                 let k = items.len();
+                self.used_pa = true;
                 self.emit("{");
                 self.depth += 1;
                 self.emit(&format!("g_pa_n = {k};"));
@@ -2969,6 +3032,7 @@ impl Render {
                     self.emit("}");
                 } else {
                     // string loop var: materialize the items, iterate
+                    self.used_fit = true;
                     self.emit("{");
                     self.depth += 1;
                     self.emit(&format!("g_fit_n = {};", items.len()));
@@ -3202,5 +3266,78 @@ mod tests {
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
         );
         assert!(shader.contains("TODO(unsupported): exec ls"));
+    }
+
+    // ── shIR transform: dead runtime DCE + scalar promotion ──────
+
+    fn render_opts(src: &str, opts: ShGlslOptions) -> String {
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("shir json");
+        shir_to_glsl_opts(&prog, &opts)
+    }
+
+    #[test]
+    fn dce_runtime_arrays() {
+        // no user functions, no string for-loops → g_pa/g_fit must not
+        // be emitted at all (previously always present).
+        let shader = render(
+            r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
+              {"type":"Assign","targets":[{"var":"x","indices":[],"sigil":null}],"expr":{"type":"Str","value":"5","style":"DoubleQuoted"}},
+              {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"hi","style":"DoubleQuoted"}]}]}}
+            ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
+        );
+        assert!(!shader.contains("g_pa"), "g_pa emitted with no functions");
+        assert!(!shader.contains("g_fit"), "g_fit emitted with no string for-loops");
+    }
+
+    #[test]
+    fn scalars_promoted_to_main_locals() {
+        let shader = render(
+            r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
+              {"type":"Assign","targets":[{"var":"x","indices":[],"sigil":null}],"expr":{"type":"Str","value":"5","style":"DoubleQuoted"}}
+            ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
+        );
+        // declared inside main(), not at file scope
+        let main_idx = shader.find("void main() {").expect("main");
+        let gx = shader.find("int g_x;").expect("g_x decl");
+        assert!(gx > main_idx, "g_x must be a main() local");
+        assert_eq!(shader.matches("int g_x;").count(), 1, "g_x must not also be a file-scope global");
+        // and no file-scope declaration before main
+        let before_main = &shader[..main_idx];
+        assert!(!before_main.contains("g_x"), "g_x declared before main");
+    }
+
+    #[test]
+    fn render_fragment_is_lean() {
+        // the es100+color_out render fragment (the sh2glsl/wasm path):
+        // putb writes fixed slots → 4-byte out_buf, no OUT_CAP, no
+        // out_len, no g_pa/g_fit, no string runtime.
+        let shader = render_opts(
+            r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
+              {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
+            ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
+            ShGlslOptions { es100: true, color_out: true, tex_size: 16 },
+        );
+        assert!(!shader.contains("OUT_CAP"), "OUT_CAP in render fragment");
+        assert!(!shader.contains("out_len"), "out_len in render fragment");
+        assert!(!shader.contains("g_pa"), "g_pa in render fragment");
+        assert!(!shader.contains("g_fit"), "g_fit in render fragment");
+        assert!(!shader.contains("s_scratch"), "s_scratch in render fragment");
+        assert!(shader.contains("int out_buf[4];"), "out_buf not sized for the 4 colour slots");
+        assert!(shader.contains("out_buf[0] = (255);"), "putb write missing");
+    }
+
+    #[test]
+    fn es3_putb_keeps_putch() {
+        // es3+color_out putb lowers to putCh — the helper must survive
+        // even with no string runtime (latent bug fix).
+        let shader = render_opts(
+            r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
+              {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
+            ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
+            ShGlslOptions { es100: false, color_out: true, tex_size: 0 },
+        );
+        assert!(shader.contains("void putCh(int c)"), "putCh helper missing");
+        assert!(shader.contains("const int OUT_CAP"), "OUT_CAP missing for putCh");
+        assert!(shader.contains("int out_len = 0;"), "out_len missing for putCh");
     }
 }

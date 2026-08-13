@@ -500,7 +500,7 @@ fn walk_arith(
     in_closure: bool,
 ) {
     match a {
-        ArithAst::Var(name) => access(name, pos, first, last, escapes, in_closure),
+        ArithAst::Var(name) | ArithAst::Ident(name) => access(name, pos, first, last, escapes, in_closure),
         ArithAst::Index { var, key } => {
             access(var, pos, first, last, escapes, in_closure);
             walk_arith(key, pos, first, last, escapes, in_closure);
@@ -760,7 +760,7 @@ fn mark_arith_vars_escape(
     escapes: &mut HashSet<String>,
 ) {
     match a {
-        ArithAst::Var(name) => {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
             first.entry(name.clone()).or_insert(0);
             escapes.insert(name.clone());
         }

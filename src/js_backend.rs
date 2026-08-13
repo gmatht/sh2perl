@@ -275,7 +275,7 @@ impl Render {
             // non-Int-typed var must be coerced (mirrors the core's
             // `Number(x) || 0` lowering); Int-typed vars are already
             // native JS numbers.
-            ArithAst::Var(name) => {
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
                 if self.is_num(name) {
                     self.js_ident(name)
                 } else {
@@ -960,7 +960,7 @@ fn collect_vars_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
 fn collect_vars_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
     match a {
         ArithAst::Num(_) => {}
-        ArithAst::Var(name) => {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
             out.insert(name.clone());
         }
         ArithAst::Index { var, key } => {

@@ -343,7 +343,7 @@ fn walk_expr(expr: &IrExpr, counts: &mut HashMap<String, usize>) {
 fn walk_arith(a: &crate::ir::ArithAst, counts: &mut HashMap<String, usize>) {
     use crate::ir::ArithAst;
     match a {
-        ArithAst::Num(_) | ArithAst::Var(_) => {}
+        ArithAst::Num(_) | ArithAst::Var(_) | ArithAst::Ident(_) => {}
         ArithAst::Index { key, .. } => walk_arith(key, counts),
         ArithAst::Bin { lhs, rhs, .. } => {
             walk_arith(lhs, counts);

@@ -272,6 +272,16 @@ pub enum InterpPart {
 pub enum ArithAst {
     Num(i64),
     Var(String),
+    /// Bare-identifier arith read (core request
+    /// zsh-sh-go-20260813-155123): the A1 export rewrites reads of a
+    /// NUMERIC-LIFTED loop variable inside the loop body to this node
+    /// (`{"type":"Ident","name":…}`) — the estree renderer derives a
+    /// bare `Identifier` from a lifted `Var` read, so the A1 carries the
+    /// node the backends actually render. Not produced by the shell
+    /// parser (source text always parses to `Var`); only the A1 export
+    /// rewrite and the deserializer construct it. Every backend renders
+    /// it exactly like `Var` (the lift verdict decides the read shape).
+    Ident(String),
     Index {
         var: String,
         key: Box<ArithAst>,
@@ -1976,6 +1986,7 @@ fn arith_ast_to_perl(ast: &ArithAst) -> String {
     match ast {
         ArithAst::Num(n) => n.to_string(),
         ArithAst::Var(name) => var_read(name),
+        ArithAst::Ident(name) => var_read(name),
         ArithAst::Index { var, key } => {
             format!("${{{}}}[{}]", var, arith_ast_to_perl(key))
         }
@@ -3682,6 +3693,11 @@ fn collect_read_vars_expr(e: &IrExpr, out: &mut Vec<(String, Sigil)>) {
 fn collect_read_vars_arith(ast: &ArithAst, out: &mut Vec<(String, Sigil)>) {
     match ast {
         ArithAst::Var(name) => {
+            if var_is_declarable(name) && !out.iter().any(|(n, _)| n == name) {
+                out.push((name.clone(), Sigil::Scalar));
+            }
+        }
+        ArithAst::Ident(name) => {
             if var_is_declarable(name) && !out.iter().any(|(n, _)| n == name) {
                 out.push((name.clone(), Sigil::Scalar));
             }

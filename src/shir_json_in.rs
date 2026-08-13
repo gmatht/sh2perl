@@ -68,7 +68,7 @@ const KNOWN_EXPR: &[&str] = &[
     "Object",
 ];
 const KNOWN_ARITH: &[&str] = &[
-    "Num", "Var", "Index", "Bin", "Un", "Cond", "Assign", "IncDec", "Sizeof", "Cast",
+    "Num", "Var", "Ident", "Index", "Bin", "Un", "Cond", "Assign", "IncDec", "Sizeof", "Cast",
 ];
 
 pub fn shir_json_to_ir(json: &str) -> Result<IrProgram, String> {
@@ -931,6 +931,13 @@ fn arith_from(v: &Value, where_: &str) -> Result<ArithAst, String> {
         "Var" => {
             let name = req_str(o, "name", where_)?.to_string();
             ArithAst::Var(name)
+        }
+        // A1 bare-identifier arith read (core request zsh-sh-go-20260813-
+        // 155123): the export emits it for lifted loop-var reads; every
+        // backend renders it like Var.
+        "Ident" => {
+            let name = req_str(o, "name", where_)?.to_string();
+            ArithAst::Ident(name)
         }
         "Index" => {
             let var = req_str(o, "var", where_)?.to_string();

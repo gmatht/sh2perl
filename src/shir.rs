@@ -82,6 +82,7 @@ pub fn arith_mentions_true64(a: &ArithAst) -> bool {
     fn mentions(a: &ArithAst) -> bool {
         match a {
             ArithAst::Var(n) => slot_var_index(n).is_some() || true64_int_var(n),
+            ArithAst::Ident(n) => slot_var_index(n).is_some() || true64_int_var(n),
             ArithAst::Index { key, .. } => mentions(key),
             ArithAst::Bin { lhs, rhs, .. } => mentions(lhs) || mentions(rhs),
             ArithAst::Un { arg, .. } => mentions(arg),
@@ -101,6 +102,7 @@ pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
     fn mentions(a: &ArithAst) -> bool {
         match a {
             ArithAst::Var(n) => slot_var_index(n).is_some() || true64_int_var(n),
+            ArithAst::Ident(n) => slot_var_index(n).is_some() || true64_int_var(n),
             ArithAst::Index { key, .. } => mentions(key),
             ArithAst::Bin { lhs, rhs, .. } => mentions(lhs) || mentions(rhs),
             ArithAst::Un { arg, .. } => mentions(arg),
@@ -122,6 +124,17 @@ pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
                 };
             }
             ArithAst::Var(n) => {
+                if slot_var_index(n).is_none() {
+                    *a = ArithAst::Cast {
+                        ty: IrType::Int64,
+                        arg: Box::new(std::mem::replace(a, ArithAst::Num(0))),
+                    };
+                }
+            }
+            // an Ident read is a lifted binding — the same BigInt wrap as
+            // a non-slot Var (the A1 export only emits Ident for lifted
+            // vars, and a lifted var is never slot-homed).
+            ArithAst::Ident(n) => {
                 if slot_var_index(n).is_none() {
                     *a = ArithAst::Cast {
                         ty: IrType::Int64,
@@ -3455,6 +3468,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
     fn arith_count_reads(a: &ArithAst, v: &str) -> usize {
         match a {
             ArithAst::Var(n) => (n == v) as usize,
+            ArithAst::Ident(n) => (n == v) as usize,
             ArithAst::Num(_) => 0,
             ArithAst::Index { var, key, .. } => (var == v) as usize + arith_count_reads(key, v),
             ArithAst::Bin { lhs, rhs, .. } => arith_count_reads(lhs, v) + arith_count_reads(rhs, v),
@@ -4306,7 +4320,7 @@ use std::collections::{HashMap, HashSet};
 
     fn walk_arith(a: &ArithAst, acc: &mut Acc, multi_run: bool) {
         match a {
-            ArithAst::Num(_) | ArithAst::Var(_) => {}
+            ArithAst::Num(_) | ArithAst::Var(_) | ArithAst::Ident(_) => {}
             ArithAst::Index { key, .. } => walk_arith(key, acc, multi_run),
             ArithAst::Bin { lhs, rhs, .. } => {
                 walk_arith(lhs, acc, multi_run);
@@ -7873,6 +7887,14 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 arith_var_read(name)
             }
         }
+        // An A1 `Ident` arith read (core request zsh-sh-go-20260813-
+        // 155123): the export emits it for LIFTED vars, whose reads the
+        // `Var` arm derives to a bare `Identifier` — emit the
+        // identifier directly (the runtime binding exists by the lift's
+        // invariant). A non-lifted Ident would be a ReferenceError —
+        // frontends must only emit it for lifted bindings (the same
+        // rule as IrExpr::Ident).
+        ArithAst::Ident(name) => Expr::Identifier { name: name.clone() },
         // `x = v` / `x += v` — the assigned VALUE is the expression's
         // value (bash semantics). Lifted numeric vars write the native
         // binding directly (JS compound assignment); store vars write via
@@ -8813,7 +8835,7 @@ fn collect_for_iters(prog: &IrProgram) -> HashMap<String, IrExpr> {
 ///
 /// Returns the lift sets MINUS the dropped vars; fills [`LOOP_PERSIST`]
 /// with the For-statement pointers that need the persist machinery.
-fn analyze_loop_var_refs(
+pub(crate) fn analyze_loop_var_refs(
     prog: &IrProgram,
     num: &HashSet<String>,
     str: &HashSet<String>,
@@ -10902,7 +10924,7 @@ fn collect_arith_ref_set_vars(prog: &IrProgram) -> HashSet<String> {
 /// be lifted to a native JS number binding: reads are bare `x`, writes are
 /// `x = <expr>`, `let x = 0` at program top. Everything else keeps the
 /// runtime store (exact current behavior).
-fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
+pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
     let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
     let mut excluded: HashSet<String> = HashSet::new();
     let mut string_ctx: HashSet<String> = HashSet::new();
@@ -25469,6 +25491,7 @@ fn lift_arith_mentions(a: &ArithAst, name: &str) -> bool {
     match a {
         ArithAst::Num(_) => false,
         ArithAst::Var(v) => v == name,
+        ArithAst::Ident(v) => v == name,
         ArithAst::Index { var, key } => var == name || lift_arith_mentions(key, name),
         ArithAst::Bin { lhs, rhs, .. } => {
             lift_arith_mentions(lhs, name) || lift_arith_mentions(rhs, name)
@@ -25880,7 +25903,7 @@ fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
     out
 }
 
-fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<String> {
+pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<String> {
     let mut assigns: HashMap<String, Vec<IrExpr>> = HashMap::new();
     let mut excluded: HashSet<String> = HashSet::new();
     let mut string_ctx: HashSet<String> = HashSet::new();
