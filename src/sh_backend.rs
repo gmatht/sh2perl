@@ -4605,4 +4605,31 @@ mod tests {
         assert!(sh.contains("grep_p() {"), "polyfill prologue: {sh}");
         assert!(sh.contains("grep_p '\\bbar\\b' f"), "call: {sh}");
     }
+
+    /// `((x++))` as a statement — the zsh-sh-go t29_increment A1 shape
+    /// (triage-sh-20260814-032146): Assign with a single target whose
+    /// expr is an Arith IncDec on the SAME var (the estree renderer
+    /// emits the IncDec bare). The statement's value is discarded, so
+    /// the sh renderer lowers it to `: $((x++))` — the `:` swallows the
+    /// expansion result (a bare `$((...))` line would try to RUN the
+    /// value as a command: "1: not found").
+    #[test]
+    fn incdec_assign_emits_colon_arith() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[{"name":"x","type":"Int"}],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"x","sigil":null,"indices":[]}],"expr":{"type":"Str","value":"1","style":"DoubleQuoted"}},
+            {"type":"Block","body":[{"type":"Assign","targets":[{"var":"x","sigil":null,"indices":[]}],"expr":{"type":"Arith","ast":{"type":"IncDec","var":"x","delta":1,"prefix":false}}}]},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"split","purity":"PureCpu","args":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"x","style":"DoubleQuoted"}]}]}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("t29 A1 ingress");
+        let sh = shir_to_sh(&prog).expect("t29 A1 render");
+        // arith_to_sh renders the postfix IncDec as `((x = x + 1) - 1)`
+        // (the old value, with the increment applied); the statement
+        // form must wrap it in `: $(( ... ))` — never a bare `$((...))`
+        // line (that would RUN the value as a command) and never an
+        // `x=$((x++))` assign (that would clobber the side effect).
+        assert!(
+            sh.contains(": $((((x = x + 1) - 1)))"),
+            "IncDec statement: {sh}"
+        );
+    }
 }
