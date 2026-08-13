@@ -254,9 +254,27 @@ fn stmt_json(s: &IrStmt) -> Value {
             "type": "Redirect", "inner": stmts_json(inner),
             "redirects": redirects.iter().map(redirect_json).collect::<Vec<_>>(),
         }),
-        IrStmt::Function { name, body } => json!({
-            "type": "Function", "name": name, "body": stmts_json(body),
-        }),
+        IrStmt::Function {
+            name,
+            body,
+            named_blocks,
+        } => {
+            // `named_blocks` is emitted ONLY when non-empty: bash
+            // functions never have them, so every existing emit (and
+            // the frontends' byte-identical oracles) stays byte-identical.
+            let mut m = serde_json::Map::new();
+            m.insert("type".to_string(), json!("Function"));
+            m.insert("name".to_string(), json!(name));
+            m.insert("body".to_string(), json!(stmts_json(body)));
+            if !named_blocks.is_empty() {
+                let blocks: serde_json::Map<String, serde_json::Value> = named_blocks
+                    .iter()
+                    .map(|(k, v)| (k.clone(), json!(stmts_json(v))))
+                    .collect();
+                m.insert("named_blocks".to_string(), serde_json::Value::Object(blocks));
+            }
+            serde_json::Value::Object(m)
+        }
         IrStmt::Subshell(body) => json!({ "type": "Subshell", "body": stmts_json(body) }),
         IrStmt::Background(body) => json!({ "type": "Background", "body": stmts_json(body) }),
         IrStmt::Block(body) => json!({ "type": "Block", "body": stmts_json(body) }),

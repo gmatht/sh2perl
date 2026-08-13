@@ -668,7 +668,7 @@ impl Render {
                 }
                 None => self.emit("return;"),
             },
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 let fname = self.js_ident(name);
                 self.emit(&format!("function {fname}(..._args) {{"));
                 self.depth += 1;

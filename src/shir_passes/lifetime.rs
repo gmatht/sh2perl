@@ -309,7 +309,7 @@ fn walk_stmt(
                 walk_expr(&r.target, p, first, last, escapes, in_closure);
             }
         }
-        IrStmt::Function { name, body } => {
+        IrStmt::Function { name, body, .. } => {
             // the function name is defined (callable)
             access(name, p, first, last, escapes, in_closure);
             // body: a function may run 0..N times; accesses count
@@ -716,7 +716,7 @@ fn mark_stmt_vars_escape(
                 mark_vars_escape(&r.target, first, escapes);
             }
         }
-        IrStmt::Function { name, body } => {
+        IrStmt::Function { name, body, .. } => {
             first.entry(name.clone()).or_insert(0);
             escapes.insert(name.clone());
             mark_stmts_vars_escape(body, first, escapes);

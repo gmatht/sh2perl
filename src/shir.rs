@@ -544,7 +544,18 @@ fn ir_stmt_reads_status(stmt: &IrStmt) -> bool {
         IrStmt::Exit(opt) => opt.as_ref().map(ir_expr_reads_status).unwrap_or(true),
         // subshell/background bodies may read the inherited status
         IrStmt::Subshell(body) | IrStmt::Background(body) => ir_stmts_read_status(body),
-        IrStmt::Function { body, .. } => ir_stmts_read_status(body),
+        IrStmt::Function {
+            body,
+            named_blocks,
+            ..
+        } => {
+            // named blocks run inside the function (begin/process/end
+            // wrappers) — their $? reads keep writers alive too
+            ir_stmts_read_status(body)
+                || named_blocks
+                    .iter()
+                    .any(|(_, b)| ir_stmts_read_status(b))
+        }
         IrStmt::Redirect { inner, redirects } => {
             ir_stmts_read_status(inner)
                 || redirects.iter().any(|r| match r {
@@ -632,8 +643,17 @@ fn walk_lastexit_liveness(stmts: &[IrStmt], end_live: bool, live: &mut HashSet<u
             IrStmt::Redirect { inner, .. } => walk_lastexit_liveness(inner, self_live, live),
             // a called function's status is recorded by fnCall — treat as
             // live (conservative; refining to call-site liveness is a
-            // future plan entry)
-            IrStmt::Function { body, .. } => walk_lastexit_liveness(body, true, live),
+            // future plan entry); named blocks run inside the function
+            IrStmt::Function {
+                body,
+                named_blocks,
+                ..
+            } => {
+                walk_lastexit_liveness(body, true, live);
+                for (_, nb) in named_blocks {
+                    walk_lastexit_liveness(nb, true, live);
+                }
+            }
             _ => {}
         }
     }
@@ -725,7 +745,16 @@ fn mark_lastexit_dead(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMa
                 mark_lastexit_dead(else_, live, dead);
             }
             IrStmt::Redirect { inner, .. } => mark_lastexit_dead(inner, live, dead),
-            IrStmt::Function { body, .. } => mark_lastexit_dead(body, live, dead),
+            IrStmt::Function {
+                body,
+                named_blocks,
+                ..
+            } => {
+                mark_lastexit_dead(body, live, dead);
+                for (_, nb) in named_blocks {
+                    mark_lastexit_dead(nb, live, dead);
+                }
+            }
             _ => {}
         }
     }
@@ -989,9 +1018,20 @@ fn compute_async_region_loops(prog: &IrProgram) -> HashSet<usize> {
                 }
             }
             // function bodies: the function may be called from a producer
-            IrStmt::Function { body, .. } => {
+            IrStmt::Function {
+                body,
+                named_blocks,
+                ..
+            } => {
                 for b in body {
                     stmt_walk(b, true, out);
+                }
+                // named blocks run inside the function — same producer
+                // reachability
+                for (_, nb) in named_blocks {
+                    for b in nb {
+                        stmt_walk(b, true, out);
+                    }
                 }
             }
             IrStmt::Block(body) => {
@@ -1152,10 +1192,23 @@ fn mark_loop_status_deadness(st: &IrStmt, live: &HashSet<usize>, dead: &mut Hash
         }
         IrStmt::Block(body)
         | IrStmt::Subshell(body)
-        | IrStmt::Background(body)
-        | IrStmt::Function { body, .. } => {
+        | IrStmt::Background(body) => {
             for b in body {
                 mark_loop_status_deadness(b, live, dead);
+            }
+        }
+        IrStmt::Function {
+            body,
+            named_blocks,
+            ..
+        } => {
+            for b in body {
+                mark_loop_status_deadness(b, live, dead);
+            }
+            for (_, nb) in named_blocks {
+                for b in nb {
+                    mark_loop_status_deadness(b, live, dead);
+                }
             }
         }
         IrStmt::Redirect { inner, .. } => {
@@ -1322,6 +1375,83 @@ fn native_echo_fn(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Recursive IrStmt walk collecting every function name whose definition
+/// carries PowerShell-style named blocks (core-request
+/// powershell-sh-go). Such functions are EXCLUDED from the sync-call
+/// fixpoint: their define arrow is always ASYNC (the per-input-item
+/// process loop wrapper — see the `IrStmt::Function` emission arm), so a
+/// sync call site would call the arrow without awaiting it and drop the
+/// promise-returned status/return value.
+fn collect_named_block_fns(stmts: &[IrStmt], out: &mut HashSet<String>) {
+    fn walk_stmts(stmts: &[IrStmt], out: &mut HashSet<String>) {
+        for st in stmts {
+            match st {
+                IrStmt::Function {
+                    name,
+                    body,
+                    named_blocks,
+                    ..
+                } => {
+                    if !named_blocks.is_empty() {
+                        out.insert(name.clone());
+                    }
+                    walk_stmts(body, out);
+                    for (_, nb) in named_blocks {
+                        walk_stmts(nb, out);
+                    }
+                }
+                IrStmt::While { body, .. }
+                | IrStmt::DoWhile { body, .. }
+                | IrStmt::Block(body)
+                | IrStmt::Subshell(body)
+                | IrStmt::Background(body) => walk_stmts(body, out),
+                IrStmt::If {
+                    then,
+                    elsifs,
+                    else_,
+                    ..
+                } => {
+                    walk_stmts(then, out);
+                    for (_, b) in elsifs {
+                        walk_stmts(b, out);
+                    }
+                    walk_stmts(else_, out);
+                }
+                IrStmt::For { body, .. } => walk_stmts(body, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for stage in stages {
+                        walk_stmts(stage, out);
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => walk_stmts(inner, out),
+                IrStmt::Case {
+                    clauses, ..
+                } => {
+                    for c in clauses {
+                        walk_stmts(&c.body, out);
+                    }
+                }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                    ..
+                } => {
+                    walk_stmts(body, out);
+                    for e in excepts {
+                        walk_stmts(&e.body, out);
+                    }
+                    walk_stmts(else_body, out);
+                    walk_stmts(finally_body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    walk_stmts(stmts, out);
+}
+
 /// Recursive IrStmt walk collecting every `IrStmt::Function` name — a
 /// same-named script function shadows a builtin anywhere in the program
 /// (definitions inside bodies/arrows count).
@@ -1329,9 +1459,17 @@ fn collect_program_functions(stmts: &[IrStmt], out: &mut HashSet<String>) {
     fn walk_stmts(stmts: &[IrStmt], out: &mut HashSet<String>) {
         for st in stmts {
             match st {
-                IrStmt::Function { name, body } => {
+                IrStmt::Function {
+                    name,
+                    body,
+                    named_blocks,
+                    ..
+                } => {
                     out.insert(name.clone());
                     walk_stmts(body, out);
+                    for (_, nb) in named_blocks {
+                        walk_stmts(nb, out);
+                    }
                 }
                 IrStmt::While { body, .. }
                 | IrStmt::DoWhile { body, .. }
@@ -1418,9 +1556,17 @@ fn collect_fn_bodies<'a>(stmts: &'a [IrStmt], out: &mut HashMap<String, Vec<&'a 
     fn walk_stmts<'a>(stmts: &'a [IrStmt], out: &mut HashMap<String, Vec<&'a [IrStmt]>>) {
         for st in stmts {
             match st {
-                IrStmt::Function { name, body } => {
+                IrStmt::Function {
+                    name,
+                    body,
+                    named_blocks,
+                    ..
+                } => {
                     out.entry(name.clone()).or_default().push(body);
                     walk_stmts(body, out);
+                    for (_, nb) in named_blocks {
+                        walk_stmts(nb, out);
+                    }
                 }
                 IrStmt::While { body, .. }
                 | IrStmt::DoWhile { body, .. }
@@ -1573,8 +1719,17 @@ fn collect_fn_calls(stmts: &[IrStmt], functions: &HashSet<String>, out: &mut Has
                         walk_stmts(&c.body, functions, out);
                     }
                 }
-                IrStmt::Function { body, .. }
-                | IrStmt::Block(body)
+                IrStmt::Function {
+                    body,
+                    named_blocks,
+                    ..
+                } => {
+                    walk_stmts(body, functions, out);
+                    for (_, nb) in named_blocks {
+                        walk_stmts(nb, functions, out);
+                    }
+                }
+                IrStmt::Block(body)
                 | IrStmt::Subshell(body)
                 | IrStmt::Background(body) => walk_stmts(body, functions, out),
                 IrStmt::Assign { expr, .. } => walk_expr(expr, functions, out),
@@ -2007,13 +2162,24 @@ fn native_echo_sink_sites(prog: &IrProgram, native_echo_fns: &HashSet<String>) -
                     stmt_walk(b, swapped, native_echo_fns, sites);
                 }
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function {
+                name,
+                body,
+                named_blocks,
+                ..
+            } => {
                 // the define arrow's bump depends ONLY on the name's
                 // native-echo verdict (the definition site does not
-                // matter) — replace the flag
+                // matter) — replace the flag; named blocks lower inside
+                // the same arrow
                 let sw = !native_echo_fns.contains(name);
                 for b in body {
                     stmt_walk(b, sw, native_echo_fns, sites);
+                }
+                for (_, nb) in named_blocks {
+                    for b in nb {
+                        stmt_walk(b, sw, native_echo_fns, sites);
+                    }
                 }
             }
             IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
@@ -2221,9 +2387,22 @@ fn fn_call_sync_set(
     }
     *SYNC_FN_CALLS.lock().unwrap() = None;
     let mut sync: HashSet<String> = bodies.keys().cloned().collect();
+    // Named-block functions (PowerShell begin/process/end wrappers) are
+    // never sync: their define arrow is always async (the per-input-item
+    // process loop wrapper — see the `IrStmt::Function` emission arm), so
+    // a sync call site would call the arrow without awaiting it and drop
+    // the promise-returned status/return value. Removing them from the
+    // INITIAL set lets the fixpoint below also drop their callers (the
+    // `all_called_sync` check) — the caller's arrow then stays on the
+    // async path and awaits the named-block call correctly.
+    let mut named_block_fns: HashSet<String> = HashSet::new();
+    collect_named_block_fns(&prog.stmts, &mut named_block_fns);
+    for f in &named_block_fns {
+        sync.remove(f);
+        opt_free.insert(f.clone(), false);
+    }
     loop {
-        let mut changed = false;
-        for f in sync.clone() {
+        let mut changed = false;        for f in sync.clone() {
             if !opt_free.get(&f).copied().unwrap_or(false) {
                 sync.remove(&f);
                 changed = true;
@@ -5398,6 +5577,7 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
         Command::Function(f) => IrStmt::Function {
             name: f.name.clone(),
             body: body_stmts(&Command::Block(f.body.clone())),
+            named_blocks: vec![],
         },
         Command::Subshell(c) => IrStmt::Subshell(command_arrow_stmts(c)),
         Command::Background(c) => IrStmt::Background(command_arrow_stmts(c)),
@@ -14951,7 +15131,11 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 call
             }
         }
-        IrStmt::Function { name, body } => {
+        IrStmt::Function {
+            name,
+            body,
+            named_blocks,
+        } => {
             // Per-function `local` native lift (see [`local_lift_analysis`]):
             // push the function's frame so the body's `local` decls lower
             // to native `let` bindings (first decl) / assignments (later),
@@ -14978,7 +15162,15 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // run `sh2.callDirect(__fn_f, args)` — no Map lookup, no arg
             // flatten, no positional save/restore (the body is
             // positional-free by construction).
-            let arrow = if fn_call_is_sync(name) {
+            let arrow = if !named_blocks.is_empty() {
+                // PowerShell named-block function (core-request
+                // powershell-sh-go): the define arrow wraps the blocks in
+                // their PowerShell execution order (dynamicparam, begin,
+                // process per input item, end, body, clean). Always async
+                // — `fn_call_sync_set` excludes named-block functions
+                // from the sync set, so call sites await the arrow.
+                named_block_arrow(body, named_blocks)
+            } else if fn_call_is_sync(name) {
                 if native_echo_fn(name) {
                     // eligible: the body may lower echo/printf
                     // to native writes — no sink-depth bump
@@ -25120,12 +25312,21 @@ fn lift_stmt_mentions_deep(st: &IrStmt, name: &str, descend_fns: bool) -> bool {
                     .iter()
                     .any(|b| lift_stmt_mentions_deep(b, name, descend_fns))
         }
-        IrStmt::Function { name: fname, body } => {
+        IrStmt::Function {
+            name: fname,
+            body,
+            named_blocks,
+            ..
+        } => {
             fname == name
                 || (descend_fns
-                    && body
+                    && (body
                         .iter()
-                        .any(|b| lift_stmt_mentions_deep(b, name, descend_fns)))
+                        .any(|b| lift_stmt_mentions_deep(b, name, descend_fns))
+                        || named_blocks.iter().any(|(_, nb)| {
+                            nb.iter()
+                                .any(|b| lift_stmt_mentions_deep(b, name, descend_fns))
+                        })))
         }
         IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => body
             .iter()
@@ -25257,10 +25458,21 @@ fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
     }
     let mut out: HashMap<String, HashSet<String>> = HashMap::new();
     for stmt in &prog.stmts {
-        if let IrStmt::Function { name, body } = stmt {
+        if let IrStmt::Function {
+            name,
+            body,
+            named_blocks,
+            ..
+        } = stmt
+        {
             // 1. candidate names: pure-value decls anywhere in the body
+            //    (named blocks too — they lower inside the define arrow)
+            let body_all: Vec<&IrStmt> = body
+                .iter()
+                .chain(named_blocks.iter().flat_map(|(_, nb)| nb.iter()))
+                .collect();
             let mut candidates: HashSet<String> = HashSet::new();
-            for b in body {
+            for b in &body_all {
                 let args: Option<&[IrExpr]> = match b {
                     IrStmt::Declare {
                         vars,
@@ -25317,7 +25529,7 @@ fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
             // 2. walker exclusion sets (per function body)
             let mut excluded: HashSet<String> = HashSet::new();
             let mut string_ctx: HashSet<String> = HashSet::new();
-            for b in body {
+            for b in &body_all {
                 lift_walk_stmt(b, &mut excluded, &mut string_ctx, false);
             }
             let mut lift: HashSet<String> = HashSet::new();
@@ -25330,7 +25542,7 @@ fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
                 }
                 // 3. first mention must be the first decl, at top level
                 let mut seen_decl = false;
-                for b in body {
+                for b in &body_all {
                     if seen_decl {
                         break;
                     }
@@ -25346,7 +25558,7 @@ fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
                     continue;
                 }
                 // 4. no mention inside nested function bodies
-                for b in body {
+                for b in &body_all {
                     if let IrStmt::Function { body: fbody, .. } = b {
                         if fbody.iter().any(|s| lift_stmt_mentions_deep(s, &c, true)) {
                             continue 'cand;
@@ -28960,6 +29172,97 @@ fn array(elements: Vec<Expr>) -> Expr {
 
 fn arrow(params: Vec<Expr>, body: IrExpr) -> Expr {
     arrow_body(params, body)
+}
+
+/// PowerShell named-block define arrow (core-request
+/// powershell-sh-go): `function foo { begin {…} process {…} end {…} }`
+/// lowers to `sh2.define("foo", async () => { … })` with the blocks in
+/// their PowerShell execution order:
+///
+/// ```text
+///   dynamicparam → begin → (process, once PER pipeline input item)
+///     → end → body → clean
+/// ```
+///
+/// `body` (the A1 `Function.body` field) is PowerShell's IMPLICIT end
+/// block — statements outside the named blocks — so it runs in the end
+/// phase right after the explicit `end` block (source order), and
+/// `clean` (PS 7.3's finally-like block) runs last. A function invoked
+/// with NO pipeline input runs process ZERO times (PowerShell
+/// semantics: begin once, end once).
+///
+/// The per-input-item process loop is the v1 TEXT approximation from
+/// the request: pipeline input items are the LINES of the program's
+/// stdin, materialized lazily at first call by the runtime helper
+/// `sh2.pipelineInputLines()` (see harness/sh2-namespace.mjs). Only
+/// emitted when a function HAS a process block — no corpus program
+/// touches it.
+///
+/// Always ASYNC: `fn_call_sync_set` excludes named-block functions
+/// from the sync set (the wrapper may contain awaits; a sync call site
+/// would drop the arrow's promise-returned status). Sink discipline:
+/// the whole wrapper lowers under one ECHO_SINK_DEPTH bump (a function
+/// body may run under ANY stdout sink at runtime) and inside the
+/// caller's FUNCTION_STACK push (the per-function `local` lift), so
+/// the block statements lower exactly like a plain define-arrow body.
+fn named_block_arrow(body: &[IrStmt], named_blocks: &[(String, Vec<IrStmt>)]) -> Expr {
+    fn lower(stmts: &[IrStmt], out: &mut Vec<Stmt>) {
+        for s in stmts {
+            match stmt_to_estree(s) {
+                Some(Stmt::BlockStatement { body: b }) if local_decl_block(&b) => out.extend(b),
+                Some(s) => out.push(s),
+                None => {}
+            }
+        }
+    }
+    // name → stmts, so the blocks emit in the fixed PowerShell order
+    // regardless of the JSON key order (the frontend emits a sorted map)
+    let mut blocks: std::collections::HashMap<&str, &[IrStmt]> =
+        std::collections::HashMap::new();
+    for (bname, bstmts) in named_blocks {
+        blocks.insert(bname.as_str(), bstmts.as_slice());
+    }
+    let mut wrapper: Vec<Stmt> = Vec::new();
+    *ECHO_SINK_DEPTH.lock().unwrap() += 1;
+    if let Some(b) = blocks.get("dynamicparam") {
+        lower(b, &mut wrapper);
+    }
+    if let Some(b) = blocks.get("begin") {
+        lower(b, &mut wrapper);
+    }
+    if let Some(pb) = blocks.get("process") {
+        // once per pipeline input item (v1: one per line of stdin)
+        let mut pb_stmts: Vec<Stmt> = Vec::new();
+        lower(pb, &mut pb_stmts);
+        wrapper.push(Stmt::ForOfStatement {
+            left: Box::new(Stmt::VariableDeclaration {
+                kind: "let",
+                declarations: vec![VariableDeclarator {
+                    type_: "VariableDeclarator",
+                    id: Expr::Identifier {
+                        name: "__ps_line".to_string(),
+                    },
+                    init: None,
+                }],
+            }),
+            right: sh2_call("pipelineInputLines", vec![]),
+            body: Box::new(Stmt::BlockStatement { body: pb_stmts }),
+        });
+    }
+    if let Some(b) = blocks.get("end") {
+        lower(b, &mut wrapper);
+    }
+    lower(body, &mut wrapper);
+    if let Some(b) = blocks.get("clean") {
+        lower(b, &mut wrapper);
+    }
+    *ECHO_SINK_DEPTH.lock().unwrap() -= 1;
+    Expr::ArrowFunctionExpression {
+        params: vec![],
+        body: ArrowBody::Block(Box::new(Stmt::BlockStatement { body: wrapper })),
+        expression: false,
+        r#async: true,
+    }
 }
 
 /// Arrow whose body runs under a runtime-swapped stdout sink or may later

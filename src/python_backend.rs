@@ -618,7 +618,7 @@ impl Render {
                     .unwrap_or_else(|| "0".into());
                 self.emit(&format!("sys.exit({code})"));
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 let n = self.py_ident(name);
                 self.emit(&format!("def {n}():"));
                 self.in_function += 1;
@@ -808,7 +808,7 @@ fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     collect_vars_expr(x, out);
                 }
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 out.insert(name.clone());
                 collect_vars(body, out);
             }
