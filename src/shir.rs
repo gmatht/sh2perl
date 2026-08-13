@@ -4769,7 +4769,7 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
             _ => None,
         }
     }
-    fn fold_expr(e: &mut IrExpr, pool: &mut HashMap<String, i128>) {
+    fn fold_expr(e: &mut IrExpr, pool: &mut HashMap<String, i128>, consts: &HashSet<String>) {
         match e {
             IrExpr::Arith(a) => {
                 fold_arith(a, pool);
@@ -4780,8 +4780,8 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
                 }
             }
             IrExpr::BinOp { lhs, rhs, .. } => {
-                fold_expr(lhs, pool);
-                fold_expr(rhs, pool);
+                fold_expr(lhs, pool, consts);
+                fold_expr(rhs, pool, consts);
             }
             IrExpr::Ternary {
                 cond,
@@ -4789,46 +4789,46 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
                 else_,
                 ..
             } => {
-                fold_expr(cond, pool);
-                fold_expr(then, pool);
-                fold_expr(else_, pool);
+                fold_expr(cond, pool, consts);
+                fold_expr(then, pool, consts);
+                fold_expr(else_, pool, consts);
             }
             IrExpr::Index { key, .. } | IrExpr::Capture { expr: key, .. } => {
-                fold_expr(key, pool);
+                fold_expr(key, pool, consts);
             }
             IrExpr::Interpolate(parts) => {
                 for p in parts {
                     if let crate::ir::InterpPart::Expr(x) = p {
-                        fold_expr(x, pool);
+                        fold_expr(x, pool, consts);
                     }
                 }
             }
             IrExpr::Call { args, .. } => {
                 for a in args {
-                    fold_expr(a, pool);
+                    fold_expr(a, pool, consts);
                 }
             }
             IrExpr::MethodCall { obj, args, .. } => {
-                fold_expr(obj, pool);
+                fold_expr(obj, pool, consts);
                 for a in args {
-                    fold_expr(a, pool);
+                    fold_expr(a, pool, consts);
                 }
             }
             IrExpr::Array(elems) => {
                 for el in elems {
-                    fold_expr(el, pool);
+                    fold_expr(el, pool, consts);
                 }
             }
             IrExpr::Object(props) => {
                 for (_, v) in props {
-                    fold_expr(v, pool);
+                    fold_expr(v, pool, consts);
                 }
             }
             IrExpr::DefinedOr { expr, default } => {
-                fold_expr(expr, pool);
-                fold_expr(default, pool);
+                fold_expr(expr, pool, consts);
+                fold_expr(default, pool, consts);
             }
-            IrExpr::Arrow(stmts) => fold_stmts(stmts, pool, false),
+            IrExpr::Arrow(stmts) => fold_stmts(stmts, pool, false, consts),
             _ => {}
         }
     }
@@ -4836,15 +4836,21 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
     /// unconditional level whose assignments may enter the pool (only the
     /// top level — a conditional/loop/function body's sites may not have
     /// run, so their values never propagate out).
-    fn fold_stmts(stmts: &mut [IrStmt], pool: &mut HashMap<String, i128>, seed: bool) {
+    fn fold_stmts(
+        stmts: &mut [IrStmt],
+        pool: &mut HashMap<String, i128>,
+        seed: bool,
+        consts: &HashSet<String>,
+    ) {
         for stmt in stmts.iter_mut() {
             match stmt {
                 IrStmt::Assign { targets, expr } => {
-                    fold_expr(expr, pool);
+                    fold_expr(expr, pool, consts);
                     if seed
                         && targets.len() == 1
                         && targets[0].indices.is_empty()
                         && !targets[0].var.contains('[')
+                        && consts.contains(&targets[0].var)
                     {
                         if let Some(v) = const_value(expr) {
                             if in_range(v) {
@@ -4860,21 +4866,21 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
                     else_,
                     ..
                 } => {
-                    fold_expr(cond, pool);
-                    fold_stmts(then, pool, false);
+                    fold_expr(cond, pool, consts);
+                    fold_stmts(then, pool, false, consts);
                     for (c, b) in elsifs {
-                        fold_expr(c, pool);
-                        fold_stmts(b, pool, false);
+                        fold_expr(c, pool, consts);
+                        fold_stmts(b, pool, false, consts);
                     }
-                    fold_stmts(else_, pool, false);
+                    fold_stmts(else_, pool, false, consts);
                 }
                 IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
-                    fold_expr(cond, pool);
-                    fold_stmts(body, pool, false);
+                    fold_expr(cond, pool, consts);
+                    fold_stmts(body, pool, false, consts);
                 }
                 IrStmt::For { iter, body, .. } => {
-                    fold_expr(iter, pool);
-                    fold_stmts(body, pool, false);
+                    fold_expr(iter, pool, consts);
+                    fold_stmts(body, pool, false, consts);
                 }
                 IrStmt::ForInit {
                     init,
@@ -4883,10 +4889,10 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
                     body,
                     ..
                 } => {
-                    fold_stmts(init, pool, false);
-                    fold_expr(cond, pool);
-                    fold_stmts(step, pool, false);
-                    fold_stmts(body, pool, false);
+                    fold_stmts(init, pool, false, consts);
+                    fold_expr(cond, pool, consts);
+                    fold_stmts(step, pool, false, consts);
+                    fold_stmts(body, pool, false, consts);
                 }
                 IrStmt::Try {
                     body,
@@ -4895,15 +4901,15 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
                     finally_body,
                     ..
                 } => {
-                    fold_stmts(body, pool, false);
+                    fold_stmts(body, pool, false, consts);
                     for ex in excepts {
                         if let Some(m) = &mut ex.match_expr {
-                            fold_expr(m, pool);
+                            fold_expr(m, pool, consts);
                         }
-                        fold_stmts(&mut ex.body, pool, false);
+                        fold_stmts(&mut ex.body, pool, false, consts);
                     }
-                    fold_stmts(else_body, pool, false);
-                    fold_stmts(finally_body, pool, false);
+                    fold_stmts(else_body, pool, false, consts);
+                    fold_stmts(finally_body, pool, false, consts);
                 }
                 IrStmt::Exec {
                     cmd,
@@ -4911,44 +4917,44 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
                     env,
                     ..
                 } => {
-                    fold_expr(cmd, pool);
+                    fold_expr(cmd, pool, consts);
                     for a in args {
-                        fold_expr(a, pool);
+                        fold_expr(a, pool, consts);
                     }
                     for (_, v) in env {
-                        fold_expr(v, pool);
+                        fold_expr(v, pool, consts);
                     }
                 }
-                IrStmt::Expr(e) => fold_expr(e, pool),
+                IrStmt::Expr(e) => fold_expr(e, pool, consts),
                 IrStmt::Declare { init, .. } => {
                     if let Some(i) = init {
-                        fold_expr(i, pool);
+                        fold_expr(i, pool, consts);
                     }
                 }
                 IrStmt::DeclareArray { elements, .. } => {
                     for el in elements {
-                        fold_expr(el, pool);
+                        fold_expr(el, pool, consts);
                     }
                 }
-                IrStmt::Output { value, .. } => fold_expr(value, pool),
+                IrStmt::Output { value, .. } => fold_expr(value, pool, consts),
                 IrStmt::WriteFile { path, content, .. } => {
-                    fold_expr(path, pool);
-                    fold_expr(content, pool);
+                    fold_expr(path, pool, consts);
+                    fold_expr(content, pool, consts);
                 }
-                IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => fold_expr(e, pool),
-                IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => fold_expr(expr, pool),
+                IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => fold_expr(e, pool, consts),
+                IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => fold_expr(expr, pool, consts),
                 IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => {
-                    fold_stmts(b, pool, false)
+                    fold_stmts(b, pool, false, consts)
                 }
                 IrStmt::Redirect { inner, redirects } => {
-                    fold_stmts(inner, pool, false);
+                    fold_stmts(inner, pool, false, consts);
                     for r in redirects {
-                        fold_expr(&mut r.target, pool);
+                        fold_expr(&mut r.target, pool, consts);
                     }
                 }
                 IrStmt::Pipeline { stages, .. } => {
                     for st in stages {
-                        fold_stmts(st, pool, false);
+                        fold_stmts(st, pool, false, consts);
                     }
                 }
                 IrStmt::Case {
@@ -4956,9 +4962,9 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
                     clauses,
                     ..
                 } => {
-                    fold_expr(discriminant, pool);
+                    fold_expr(discriminant, pool, consts);
                     for c in clauses {
-                        fold_stmts(&mut c.body, pool, false);
+                        fold_stmts(&mut c.body, pool, false, consts);
                     }
                 }
                 IrStmt::Function {
@@ -4966,9 +4972,9 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
                     named_blocks,
                     ..
                 } => {
-                    fold_stmts(body, pool, false);
+                    fold_stmts(body, pool, false, consts);
                     for (_, nb) in named_blocks {
-                        fold_stmts(nb, pool, false);
+                        fold_stmts(nb, pool, false, consts);
                     }
                 }
                 _ => {}
@@ -4976,7 +4982,7 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
         }
     }
     let mut pool: HashMap<String, i128> = HashMap::new();
-    fold_stmts(&mut prog.stmts, &mut pool, true);
+    fold_stmts(&mut prog.stmts, &mut pool, true, &consts);
 }
 
 
@@ -12491,6 +12497,11 @@ fn top_stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
 }
 
 fn top_stmt_to_estree_inner(stmt: &IrStmt) -> Option<Stmt> {
+    if let IrStmt::Assign { targets, expr } = stmt {
+        if matches!(expr, IrExpr::Call { func, .. } if func == "setArray") {
+            eprintln!("DBG top assign setArray target={}", targets[0].var);
+        }
+    }
     let s = stmt_to_estree(stmt)?;
     // No `set -e` anywhere → the runtime's errexit flag can never turn on,
     // so `sh2.guard(v)` would be an identity call on every statement.
@@ -24007,6 +24018,85 @@ fn split_test_param(inner: &str) -> Option<(String, String, String, String)> {
     Some((name, op.to_string(), a, b))
 }
 
+/// The native key expression for an `sh2.arrayIndex("arr", KEY)` call /
+/// `${arr[KEY]}` text whose KEY contains a LIFTED `$ref` — the runtime
+/// evalArith's the key against the STORE, where a lifted binding is not
+/// present (it reads `""` → index 0 → every read returns element 0).
+/// Lifted refs inline as their native binding identifier; store-bound
+/// refs read the store (the exact value the runtime's getVar yields);
+/// literal runs stay string literals — concatenated in key order. Returns
+/// `None` when nothing is stale (no refs, or every ref is store-bound):
+/// the caller keeps the literal text and the runtime resolves it exactly.
+fn array_index_key_expr(key: &str) -> Option<Expr> {
+    let bytes = key.as_bytes();
+    let mut parts: Vec<(bool, String)> = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            lit.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let rest = &key[i + 1..];
+        if rest.is_empty() {
+            return None;
+        }
+        let (v, consumed) = if rest.starts_with('{') {
+            let r2 = &rest[1..];
+            let n = r2
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
+            if n == 0 || n >= r2.len() || r2.as_bytes()[n] != b'}' {
+                return None;
+            }
+            (r2[..n].to_string(), n + 2)
+        } else {
+            let n = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
+            if n == 0 {
+                return None;
+            }
+            (rest[..n].to_string(), n)
+        };
+        if !lit.is_empty() {
+            parts.push((false, std::mem::take(&mut lit)));
+        }
+        parts.push((true, v));
+        i += 1 + consumed;
+    }
+    if !lit.is_empty() {
+        parts.push((false, lit));
+    }
+    if !parts.iter().any(|(is_ref, v)| *is_ref && is_lifted(v)) {
+        return None; // nothing stale — the runtime resolves the key
+    }
+    let mut concat: Option<Expr> = None;
+    for (is_ref, part) in &parts {
+        let pe: Expr = if *is_ref {
+            if is_lifted(part) {
+                Expr::Identifier { name: part.clone() }
+            } else {
+                store_var_read(part)
+            }
+        } else {
+            str_lit(part)
+        };
+        concat = Some(match concat {
+            None => pe,
+            Some(prev) => Expr::BinaryExpression {
+                operator: "+".to_string(),
+                left: Box::new(prev),
+                right: Box::new(pe),
+            },
+        });
+    }
+    concat
+}
+
 fn test_str_to_estree(s: &str) -> Option<Expr> {
     let bytes = s.as_bytes();
     let mut quasis: Vec<String> = Vec::new();
@@ -24127,6 +24217,42 @@ fn test_str_to_estree(s: &str) -> Option<Expr> {
                         });
                         exprs.push(native);
                         changed = true;
+                    } else {
+                        lit.push_str(&s[i..end]);
+                    }
+                } else if let Some((base, parts)) = baked_subscript_read(inner) {
+                    // `${arr[$k]}` — an array-subscript read inside
+                    // runtime-evaluated test text. The runtime expands the
+                    // key from the STORE, which is stale for a LIFTED key
+                    // ref (the native binding is not in the store → `""`
+                    // → index 0 → every read returns element 0 — the A1
+                    // function-local-lift bug). Inline the native key as
+                    // an arrayIndex call (the base stays store-backed —
+                    // [`lower_native_arrays`] never makes a
+                    // runtime-text-read array native). A store-bound /
+                    // literal-only key keeps the literal text (the
+                    // runtime resolves it exactly).
+                    if parts.iter().any(|(is_ref, v)| *is_ref && is_lifted(v)) {
+                        let key_text: String = parts
+                            .iter()
+                            .map(|(is_ref, v)| {
+                                if *is_ref {
+                                    format!("${v}")
+                                } else {
+                                    v.clone()
+                                }
+                            })
+                            .collect();
+                        if let Some(key) = array_index_key_expr(&key_text) {
+                            quasis.push(std::mem::take(&mut lit));
+                            exprs.push(sh2_call(
+                                "arrayIndex",
+                                vec![str_lit(base), key],
+                            ));
+                            changed = true;
+                        } else {
+                            lit.push_str(&s[i..end]);
+                        }
                     } else {
                         lit.push_str(&s[i..end]);
                     }
@@ -28498,6 +28624,25 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 }
                 let out = if matches!(func.as_str(), "setArray" | "setArrayAppend") {
                     args.iter().map(array_elt_to_estree).collect()
+                } else if func == "arrayIndex" {
+                    // A1-frontend array reads: `sh2.arrayIndex("map",
+                    // "$gi")` — the runtime resolves the key text's
+                    // `$refs` from the STORE, which is stale for a LIFTED
+                    // key (the native binding is not in the store → `""`
+                    // → index 0 → every read returns element 0 — the A1
+                    // param/lifted-local array-key bugs). Inline a native
+                    // key when any ref is lifted (see
+                    // [`array_index_key_expr`]); store-bound keys keep the
+                    // literal text (the runtime resolves them exactly).
+                    if let [IrExpr::Str(base, _), IrExpr::Str(key, _)] = args.as_slice() {
+                        if let Some(k) = array_index_key_expr(key) {
+                            vec![str_lit(base), k]
+                        } else {
+                            args.iter().map(expr_to_estree).collect()
+                        }
+                    } else {
+                        args.iter().map(expr_to_estree).collect()
+                    }
                 } else {
                     args.iter().map(expr_to_estree).collect()
                 };
@@ -30017,6 +30162,11 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 right: Box::new(r),
             }
         }
+        // The A1 `Regex` expr node (core request fish-sh-go-20260813-192709):
+        // the fish `string match -r` lowering and the bash `=~` family share
+        // the same ESTree shape — a `Literal` with the `regex` property
+        // (printed `/pattern/flags`, executed as a native RegExp).
+        IrExpr::Regex { pattern, flags } => regex_lit_flags(pattern, flags),
         other => unreachable!("Perl-only IR expression reached the ESTree renderer: {other:?}"),
     }
 }

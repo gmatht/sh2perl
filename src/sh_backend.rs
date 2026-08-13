@@ -1795,6 +1795,14 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 line.push_str(&pat);
                 Ok(format!("$({line})"))
             }
+            "setVar" => {
+                // the runtime's plain store write — re-emit as a shell
+                // assignment (the A1 store protocol the perl/posix
+                // frontends emit for return values / locals)
+                let name = raw_arg(args, 0)?;
+                let value = word_to_sh(arg(args, 1)?)?;
+                Ok(format!("{name}={value}"))
+            }
             other => Err(format!("command call not renderable: {other:?}")),
         },
         IrExpr::BinOp {
@@ -1812,6 +1820,10 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             lhs,
             ..
         } => Ok(format!("! {}", cmd_to_sh(lhs)?)),
+        // a statement-position arith (`((n++))` — the perl frontend's
+        // increment statements): the arithmetic command, whose exit
+        // status is the value != 0 (bash `(( ))` semantics)
+        IrExpr::Arith(a) => Ok(format!("(( {} ))", arith_to_sh(a))),
         other => Err(format!("command expression not renderable: {other:?}")),
     }
 }
@@ -4459,6 +4471,9 @@ fn str_arg(e: &IrExpr) -> Result<String, String> {
         IrExpr::Str(s, _) => Ok(s.clone()),
         IrExpr::Int(i) => Ok(i.to_string()),
         IrExpr::Ident(s) => Ok(s.clone()),
+        // numeric arith in an exec-word position renders as the plain
+        // arithmetic result (perl-frontend slice offsets / indices)
+        IrExpr::Arith(a) => Ok(arith_to_sh(a)),
         other => Err(format!("expected Str argument, got {other:?}")),
     }
 }
