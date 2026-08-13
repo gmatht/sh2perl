@@ -1933,7 +1933,18 @@ impl Render {
                         self.emit("_sh_addraw(\"; done\");");
                     }
                 }
-                IrStmt::Assign { targets, expr } => {
+                IrStmt::Assign { targets, expr, asm, .. } => {
+                    // Declarator-position asm label (core request
+                    // c-sh-go-toplevelasmargument-20260814-042952) — no C
+                    // rendering in this tree (the backend worktree owns
+                    // the asm-aware renderer); refuse loudly.
+                    if let Some(spec) = asm {
+                        self.emit(&format!(
+                            "// TODO(unsupported): asm label '{}' on an assign",
+                            spec.template
+                        ));
+                        return;
+                    }
                     // shell text form: NAME=$(( ... )) / NAME='value'
                     if let Some(t) = targets.first() {
                         if t.indices.is_empty() {
@@ -4731,7 +4742,7 @@ impl Render {
                 let x = self.expr(e);
                 self.emit(&format!("{x};"));
             }
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 let Some(t) = targets.first() else {
                     self.mark_todo("multi-target assign");
                     return;
@@ -5896,7 +5907,7 @@ fn const_assign_rhs(
     let mut out = HashMap::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for s in stmts {
-        if let IrStmt::Assign { targets, expr } = s {
+        if let IrStmt::Assign { targets, expr, .. } = s {
             for t in targets {
                 if t.indices.is_empty()
                     && const_vars.get(&t.var) == Some(&VarKind::Const)
@@ -6087,7 +6098,7 @@ fn mark_seq_loop_vars(s: &IrStmt, var_types: &mut HashMap<String, IrType>) {
 fn collect_assoc_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if !t.indices.is_empty() {
                         if let IrExpr::Str(k, _) = &t.indices[0] {
@@ -6301,7 +6312,7 @@ fn collect_assoc_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
 fn collect_array_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if !t.indices.is_empty() {
                         out.insert(t.var.clone());
@@ -6635,7 +6646,7 @@ fn collect_declare_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
                 }
@@ -6879,7 +6890,7 @@ fn collect_vars_full(
 ) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
                 }
@@ -6936,7 +6947,7 @@ fn collect_vars_full(
 fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
                 }

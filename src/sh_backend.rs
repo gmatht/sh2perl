@@ -993,7 +993,18 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push('\n');
             Ok(())
         }
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, asm, .. } => {
+            // Declarator-position asm label (core request
+            // c-sh-go-toplevelasmargument-20260814-042952): the label
+            // only renames the object-file symbol — no sh rendering —
+            // refuse loudly (refuse > guess; same contract as the Asm
+            // statement).
+            if let Some(spec) = asm {
+                return Err(format!(
+                    "asm label '{}' on an assign has no sh rendering",
+                    spec.template
+                ));
+            }
             indent(out, d);
             out.push_str(&assign_to_sh(targets, expr)?);
             out.push('\n');
@@ -4300,7 +4311,7 @@ fn stmts_inline(stmts: &[IrStmt]) -> Result<String, String> {
 fn stmt_inline(st: &IrStmt) -> Result<String, String> {
     match st {
         IrStmt::Expr(e) => cmd_to_sh(e),
-        IrStmt::Assign { targets, expr } => assign_to_sh(targets, expr),
+        IrStmt::Assign { targets, expr, .. } => assign_to_sh(targets, expr),
         IrStmt::If {
             cond,
             then,

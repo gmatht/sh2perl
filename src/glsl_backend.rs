@@ -1040,7 +1040,7 @@ impl Render {
     // ── pass 1: collect names and string literals ───────────────────
     fn collect_stmt(&mut self, s: &IrStmt) {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if t.indices.is_empty() {
                         // `arr=(...)` with a setArray value is an ARRAY
@@ -2924,7 +2924,17 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => self.expr_stmt(e),
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, asm, .. } => {
+                // Declarator-position asm label (core request
+                // c-sh-go-toplevelasmargument-20260814-042952) — no GLSL
+                // rendering; refuse loudly (refuse > guess).
+                if let Some(spec) = asm {
+                    self.emit(&format!(
+                        "// TODO(unsupported): asm label '{}' on an assign",
+                        spec.template
+                    ));
+                    return;
+                }
                 // `arr=(...)` / `arr+=(...)` may surface as Assign with a
                 // setArray/setArrayAppend call value — lower like
                 // DeclareArray (append is a sketch TODO, still compiles).
@@ -4222,7 +4232,7 @@ fn walk_stmts(stmts: &[IrStmt], vars: &mut std::collections::HashMap<String, Opt
 
 fn walk_stmt(s: &IrStmt, vars: &mut std::collections::HashMap<String, Option<Range>>) -> bool {
     match s {
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, .. } => {
             let r = expr_range(expr, vars);
             if r.is_none() {
                 return false;

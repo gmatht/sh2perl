@@ -499,6 +499,22 @@ pub struct IrRedirect {
     pub interpolate: bool,
 }
 
+/// GCC asm spec — the shared operand/clobber shape of the `Asm`
+/// statement and the declarator-position `Assign.asm` label (core
+/// request c-sh-go-toplevelasmargument-20260814-042952). For the
+/// declarator form gcc only accepts a bare template (`asm("myx")` —
+/// operands at file scope are a syntax error), so outputs/inputs/
+/// clobbers are always empty there; the field keeps the full shape for
+/// uniformity with the `Asm` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsmSpec {
+    pub template: String,
+    pub volatile: bool,
+    pub outputs: Vec<(String, IrExpr)>,
+    pub inputs: Vec<(String, IrExpr)>,
+    pub clobbers: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum IrStmt {
     /// Output: print/say with optional trailing newline
@@ -524,6 +540,15 @@ pub enum IrStmt {
     Assign {
         targets: Vec<AssignTarget>,
         expr: IrExpr,
+        /// Optional GCC asm-label spec on a DECLARATION-position assign
+        /// (`int x asm("myx") = 7;` — the `toplevelAsmArgument` of
+        /// `asmDefinition`; core request
+        /// c-sh-go-toplevelasmargument-20260814-042952). The label only
+        /// renames the SYMBOL in the object file — no runtime semantics
+        /// in any A1 backend model — so the estree renderer lowers it to
+        /// a no-op comment (oracle-faithful) and the other backends
+        /// refuse loudly (refuse > guess).
+        asm: Option<AsmSpec>,
     },
     /// Variable declaration
     Declare {
@@ -678,9 +703,9 @@ pub enum IrStmt {
     /// cannot express it must refuse loudly.
     Select { clauses: Vec<SelectClause> },
     /// Inline-assembly statement — the C `asm` family (asmDefinition /
-    /// asmArgument / asmOperand / asmClobbers / asmQualifier; core
-    /// requests c-sh-go-asm / c-sh-go-asmargument /
-    /// c-sh-go-asmqualifier). ESTree-path only: JS cannot execute machine
+/// asmArgument / asmOperand / asmClobbers / asmQualifier; core
+/// requests c-sh-go-asm / c-sh-go-asmargument /
+/// c-sh-go-asmqualifier). ESTree-path only: JS cannot execute machine
     /// code, so the renderer lowers it to a NO-OP carrying the template
     /// (faithful only for effect-free asm — empty outputs; an asm with
     /// output operands has observable writes the no-op drops, flagged in
@@ -1486,6 +1511,15 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         }
                     }
                 },
+                // Statement-position arithmetic (`((n++))` — triage-perl
+                // t02_control; the arith_forms let-lift emits the IncDec
+                // bare). The expression VALUE is discarded — only the side
+                // effect matters — so postfix/prefix agree (arith_ast_to_perl
+                // renders both as `($n += 1)` / `($n -= 1)`).
+                IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { .. }) => {
+                    emit_indent(out, indent);
+                    out.push_str(&format!("{};\n", arith_ast_to_perl(a)));
+                }
                 // Non-Call expressions: bare `&&`/`||` chains of execs,
                 // redirects, pipelines — run the reconstructed shell command.
                 other_expr => {
@@ -1560,8 +1594,26 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str("close $__fh;\n");
         }
 
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign {
+            targets,
+            expr,
+            asm,
+            ..
+        } => {
             let rhs = ir_expr_to_perl(expr);
+            // Declarator-position asm label (`int x asm("myx") = 7;` —
+            // core request c-sh-go-toplevelasmargument-20260814-042952):
+            // the Perl model has no object-file symbols, and silently
+            // dropping the label would hide the C construct — refuse
+            // loudly (refuse > guess; same contract as the Asm stmt).
+            if let Some(spec) = asm {
+                emit_indent(out, indent);
+                out.push_str(&format!(
+                    "die \"debashc: shIR construct not yet supported by the Perl backend (asm label '{}')\\n\";\n",
+                    spec.template
+                ));
+                return;
+            }
             // Detect Capture { native: false } on the RHS — emit the
             // two-statement clean form instead of embedding a do-block.
             if targets.len() == 1 && targets[0].indices.is_empty() {
@@ -5054,6 +5106,22 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         "0".to_string()
                     }
                 },
+                // Substring containment (the grep-lift `contains` and the
+                // perl-sh-go index() form; triage-perl t60_contains):
+                // `index($hay, $needle) >= 0` is perl's exact substring
+                // decision (index returns -1 when absent), matching the
+                // estree runtime's contains (String.includes).
+                "contains" => {
+                    let hay = args
+                        .first()
+                        .map(render_word)
+                        .unwrap_or_else(|| "''".to_string());
+                    let needle = args
+                        .get(1)
+                        .map(render_word)
+                        .unwrap_or_else(|| "''".to_string());
+                    format!("(index({hay}, {needle}) >= 0)")
+                }
                 // (( arith )) as a condition — the `let` builtin form.
                 "exec" if args.first().and_then(call_arg_str).as_deref() == Some("let") => {
                     let words = exec_word_args(args);
@@ -5443,7 +5511,7 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
                 || finally_body.iter().any(stmt_refers_to_main_exit)
         }
         IrStmt::Expr(e) => expr_refers_to_main_exit(e),
-        IrStmt::Assign { targets, expr: _ } => targets.iter().any(|t| t.var == "main_exit_code"),
+        IrStmt::Assign { targets, expr: _, .. } => targets.iter().any(|t| t.var == "main_exit_code"),
         IrStmt::Output { value, .. }
         | IrStmt::SetChildError(value)
         | IrStmt::Return(Some(value)) => expr_refers_to_main_exit(value),
@@ -5544,7 +5612,12 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
 /// Check whether an `IrStmt::Assign` is a no-op self-assignment
 /// (e.g. `$x = $x;` or `($x) = ($x);`).
 fn is_self_assignment(stmt: &IrStmt) -> bool {
-    if let IrStmt::Assign { targets, expr } = stmt {
+    if let IrStmt::Assign { targets, expr, asm, .. } = stmt {
+        // an asm-labeled declaration is a SYMBOL declaration — never a
+        // removable self-assign (the label would be dropped with it)
+        if asm.is_some() {
+            return false;
+        }
         if targets.len() == 1 && targets[0].indices.is_empty() {
             // Single target: `$x = expr`. Check if expr is just `$x`.
             if let IrExpr::Var(name, _) = expr {
@@ -5634,7 +5707,7 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
             collect_vars_in_expr(path, vars);
             collect_vars_in_expr(content, vars);
         }
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, .. } => {
             for t in targets {
                 vars.insert(t.var.clone());
                 for idx in &t.indices {
@@ -5954,9 +6027,16 @@ fn fold_arith_const(expr: &str) -> Option<i64> {
 fn fold_stmt(s: &IrStmt) -> IrStmt {
     match s {
         IrStmt::Expr(e) => IrStmt::Expr(fold_expr(e)),
-        IrStmt::Assign { targets, expr } => IrStmt::Assign {
+        // keep the declarator asm label through folding (the renderers
+        // see it; the estree no-op and the refuse arms depend on it)
+        IrStmt::Assign {
+            targets,
+            expr,
+            asm,
+        } => IrStmt::Assign {
             targets: targets.clone(),
             expr: fold_expr(expr),
+            asm: asm.clone(),
         },
         other => other.clone(),
     }
@@ -6298,6 +6378,64 @@ mod tests {
         assert!(
             !perl.contains("$ENV{tmpf}"),
             "no stale ENV read: {perl}"
+        );
+    }
+
+    /// Statement-position IncDec (triage-perl-20260814-040324,
+    /// t02_control): the arith_forms let-lift emits `n++` as a BARE
+    /// Expr(Arith(IncDec)) statement; the perl renderer must emit the
+    /// increment (the value is discarded), not the old refusal die.
+    #[test]
+    fn incdec_stmt_renders_increment() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"While","cond":{"type":"Call","func":"test","args":[{"type":"Str","value":"\"$n\" -lt \"3\"","style":"DoubleQuoted"}]},"body":[
+                {"type":"Expr","expr":{"type":"Arith","ast":{"type":"IncDec","var":"n","delta":1,"prefix":false}}}
+            ]}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("incdec A1 ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(
+            perl.contains("($n += 1);"),
+            "statement IncDec renders the increment: {perl}"
+        );
+        assert!(
+            !perl.contains("not yet supported"),
+            "no refusal die: {perl}"
+        );
+    }
+
+    /// The `contains` call (triage-perl-20260814-040329, t60_contains;
+    /// the perl-sh-go index() form and the grep-lift): renders as perl's
+    /// native substring decision — never a bare undefined-sub call.
+    #[test]
+    fn contains_call_renders_index() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"If","cond":{"type":"Call","func":"contains","args":[{"type":"Call","func":"getVar","args":[{"type":"Str","value":"s","style":"DoubleQuoted"}]},{"type":"Str","value":"world","style":"DoubleQuoted"}]},"elsifs":[],"then":[{"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"yes","style":"DoubleQuoted"}]}]}}],"else":[]}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("contains A1 ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(
+            perl.contains("(index($s, \"world\") >= 0)"),
+            "contains renders index(): {perl}"
+        );
+        assert!(
+            !perl.contains("contains("),
+            "no bare contains() sub call: {perl}"
+        );
+    }
+
+    /// Declarator-position asm label (core request
+    /// c-sh-go-toplevelasmargument-20260814-042952): the perl renderer
+    /// refuses loudly (refuse > guess — the label names an object-file
+    /// symbol the perl model does not have).
+    #[test]
+    fn assign_asm_label_perl_refuses() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[{"type":"Assign","targets":[{"var":"x","sigil":null,"indices":[]}],"expr":{"type":"Int","value":7},"asm":{"template":"myx","volatile":false,"outputs":[],"inputs":[],"clobbers":[]}}]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("assign-asm ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(
+            perl.contains("asm label 'myx'"),
+            "perl refuses the asm label: {perl}"
         );
     }
 }

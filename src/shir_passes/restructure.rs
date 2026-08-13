@@ -62,6 +62,7 @@ fn assign_stmt(name: &str, value: IrExpr) -> IrStmt {
             indices: vec![],
         }],
         expr: value,
+        asm: None,
     }
 }
 fn break_stmt() -> IrStmt {
