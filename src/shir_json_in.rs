@@ -1451,6 +1451,80 @@ mod tests {
         }
     }
 
+    /// The rich C-style for (ForInit) round-trips through the A1 JSON
+    /// (core-request cluster triage-{c,java,js,perl,python,sh}-20260814-
+    /// 035542: cpp-sh-go t05_arith_loop.cc emitted `ForInit` and the
+    /// pre-sync backend cores rejected it with `unknown stmt type
+    /// "ForInit"`). init/cond/step/body all survive, the serialized form
+    /// is byte-identical on re-serialization, and the ingest handles the
+    /// frontend-typed var_types objects alongside it.
+    #[test]
+    fn for_init_roundtrip() {
+        use crate::ir::{ArithAst, AssignTarget, IrExpr, IrProgram, IrStmt, IrType};
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::ForInit {
+                init: vec![IrStmt::Assign {
+                    targets: vec![AssignTarget {
+                        var: "i".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Arith(Box::new(ArithAst::Num(0))),
+                }],
+                cond: IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "Lt".to_string(),
+                    lhs: Box::new(ArithAst::Var("i".to_string())),
+                    rhs: Box::new(ArithAst::Num(3)),
+                })),
+                step: vec![IrStmt::Expr(IrExpr::Arith(Box::new(ArithAst::IncDec {
+                    var: "i".to_string(),
+                    delta: 1,
+                    prefix: false,
+                })))],
+                body: vec![IrStmt::Expr(IrExpr::Ident("echo_i".to_string()))],
+            }],
+            subs: vec![],
+            // the cpp-sh-go t05 shape: frontend-typed vars next to ForInit
+            var_types: vec![
+                ("i".to_string(), IrType::Int32),
+                ("sum".to_string(), IrType::Int32),
+            ],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json.contains("\"type\":\"ForInit\""), "json: {json}");
+        assert!(json.contains("\"kind\":\"Int32\""), "json: {json}");
+        let prog2 = shir_json_to_ir(&json).expect("deser ForInit");
+        assert!(
+            matches!(
+                prog2.stmts.first(),
+                Some(IrStmt::ForInit { cond, step, body, .. })
+                    if step.len() == 1
+                        && body.len() == 1
+                        && matches!(cond, IrExpr::Arith(a)
+                            if matches!(a.as_ref(), ArithAst::Bin { op, .. } if op == "Lt"))
+            ),
+            "ForInit node lost in round-trip"
+        );
+        assert_eq!(
+            prog2.var_types,
+            vec![
+                ("i".to_string(), IrType::Int32),
+                ("sum".to_string(), IrType::Int32)
+            ],
+            "typed var_types round-trip"
+        );
+        let json2 = crate::shir_json::shir_to_shir_json_raw(&prog2);
+        assert_eq!(json, json2, "ForInit round-trip drift");
+    }
+
     #[test]
     fn c_sizeof_constants() {
         use crate::ir::IrType;
