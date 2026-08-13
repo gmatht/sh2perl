@@ -391,6 +391,24 @@ pub enum IrExpr {
     Arrow(Vec<IrStmt>),
     /// Array literal (ESTree-path only — e.g. for-items, brace groups).
     Array(Vec<IrExpr>),
+    /// Comprehension expression (Python list comprehension; ESTree-path
+    /// only — core request py-sh-go-comp-if). Evaluates to a NEW array
+    /// built by iterating `iter`, binding each item to `var` in the
+    /// runtime store, evaluating `elem` per item, and SKIPPING items for
+    /// which `cond` (the comp_if filter; None = no filter) is falsy.
+    ArrayComp {
+        var: String,
+        iter: Box<IrExpr>,
+        elem: Box<IrExpr>,
+        cond: Option<Box<IrExpr>>,
+    },
+    /// Parameterized function-literal expression (Python `lambda`;
+    /// ESTree-path only — core request py-sh-go-lambdef). Sibling of the
+    /// zero-parameter `Arrow` thunk: carries explicit parameter names and
+    /// a statement body; the ESTree renderer emits a JS
+    /// ArrowFunctionExpression with params and binds each param into the
+    /// runtime store at call time. The Perl generator never emits it.
+    Lambda { params: Vec<String>, body: Vec<IrStmt> },
     /// Parsed arithmetic (neutral AST) — ESTree path renders native JS.
     Arith(Box<ArithAst>),
     /// Boolean literal (ESTree-path only — e.g. shopt enable flags).
@@ -439,6 +457,27 @@ pub struct TryExcept {
     pub match_expr: Option<IrExpr>,
     /// Optional binding name for the caught exception (None = not bound).
     pub as_name: Option<String>,
+    pub body: Vec<IrStmt>,
+}
+
+/// One `select` communication clause (Go `commClause`; ESTree-path only
+/// — core request go-sh-commclause / go-sh-recvstmt). Carries the comm
+/// kind ("recv" | "send" | "default"), the channel expression, and the
+/// clause body; `recv` clauses may bind the received value to a target
+/// var, `send` clauses carry the value to send. The ESTree renderer
+/// lowers the whole `Select` to a non-blocking round-robin poll of the
+/// channel FIFOs (the runtime emulates Go select semantics; bash has no
+/// native select-on-channels).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectClause {
+    /// "recv" | "send" | "default".
+    pub comm: String,
+    /// recv: optional target var for the received value (None = bare `<-ch`).
+    pub target: Option<String>,
+    /// recv/send: the channel expression (None for default).
+    pub ch: Option<IrExpr>,
+    /// send: the value expression to push (None for recv/default).
+    pub value: Option<IrExpr>,
     pub body: Vec<IrStmt>,
 }
 
@@ -625,6 +664,11 @@ pub enum IrStmt {
     Subshell(Vec<IrStmt>),
     /// Background — run asynchronously.
     Background(Vec<IrStmt>),
+    /// Go-style `select` over channel communication clauses
+    /// (ESTree-path only — core requests go-sh-commclause /
+    /// go-sh-recvstmt). The Perl generator never emits it; renderers that
+    /// cannot express it must refuse loudly.
+    Select { clauses: Vec<SelectClause> },
     /// Plain block group `{ a; b; }` (no copy semantics — unlike Subshell).
     Block(Vec<IrStmt>),
     /// Evaluate an expression as a statement (ESTree-path pipelines,
@@ -1037,6 +1081,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::Try { .. } => {
             emit_indent(out, indent);
             out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (try)\\n\";\n");
+        }
+        // Go-style select over channel comm clauses — ESTree-path only;
+        // the Perl generator never emits it. Refuse loudly.
+        IrStmt::Select { .. } => {
+            emit_indent(out, indent);
+            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (select)\\n\";\n");
         }
         IrStmt::Case {
             discriminant,
@@ -4490,6 +4540,16 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             }
             format!("sub {{ {}\n}}", body.trim_end_matches('\n'))
         }
+        IrExpr::ArrayComp { .. } => {
+            // ESTree-path-only comprehension — the Perl generator never
+            // emits it. Refuse loudly (a sub returning 0 would silently
+            // miscompile).
+            "die \"debashc: shIR construct not yet supported by the Perl backend (ArrayComp)\";".to_string()
+        }
+        IrExpr::Lambda { .. } => {
+            // ESTree-path-only lambda — refuse loudly (see ArrayComp).
+            "die \"debashc: shIR construct not yet supported by the Perl backend (Lambda)\";".to_string()
+        }
         IrExpr::Array(elements) => {
             // General expression position: parenthesized list (for-iter,
             // list contexts). Exec-word position uses render_word instead.
@@ -5133,6 +5193,11 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
         | IrStmt::Function { .. }
         | IrStmt::Subshell(_)
         | IrStmt::Background(_) => false,
+        IrStmt::Select { clauses } => clauses.iter().any(|c| {
+            c.body.iter().any(stmt_refers_to_main_exit)
+                || c.ch.as_ref().is_some_and(expr_refers_to_main_exit)
+                || c.value.as_ref().is_some_and(expr_refers_to_main_exit)
+        }),
         IrStmt::Block(stmts) => stmts.iter().any(stmt_refers_to_main_exit),
         IrStmt::Try {
             body,
@@ -5207,6 +5272,12 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
         IrExpr::Var(name, _) => name == "main_exit_code",
         IrExpr::RawExpr(t) => t.contains("main_exit_code"),
         IrExpr::Arrow(_) => false,
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            expr_refers_to_main_exit(iter)
+                || expr_refers_to_main_exit(elem)
+                || cond.as_ref().is_some_and(|c| expr_refers_to_main_exit(c))
+        }
+        IrExpr::Lambda { body, .. } => body.iter().any(stmt_refers_to_main_exit),
         IrExpr::Array(elems) => elems.iter().any(expr_refers_to_main_exit),
         IrExpr::Arith(_) => false,
         IrExpr::Bool(_) => false,
@@ -5278,6 +5349,20 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
         | IrStmt::Function { .. }
         | IrStmt::Subshell(_)
         | IrStmt::Background(_) => {}
+        // Select comm clauses may carry channel/value exprs + bodies.
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                if let Some(ch) = &c.ch {
+                    collect_vars_in_expr(ch, vars);
+                }
+                if let Some(v) = &c.value {
+                    collect_vars_in_expr(v, vars);
+                }
+                for s in &c.body {
+                    collect_vars_in_stmt(s, vars);
+                }
+            }
+        }
         IrStmt::Block(stmts) => {
             for st in stmts {
                 collect_vars_in_stmt(st, vars);
@@ -5415,6 +5500,18 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
             }
         }
         IrExpr::Arrow(body) => {
+            for stmt in body {
+                collect_vars_in_stmt(stmt, vars);
+            }
+        }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            collect_vars_in_expr(iter, vars);
+            collect_vars_in_expr(elem, vars);
+            if let Some(c) = cond {
+                collect_vars_in_expr(c, vars);
+            }
+        }
+        IrExpr::Lambda { body, .. } => {
             for stmt in body {
                 collect_vars_in_stmt(stmt, vars);
             }

@@ -323,6 +323,19 @@ fn walk_stmt(
             walk_stmts(body, pos, first, last, escapes, in_closure, true);
         }
         IrStmt::Block(body) => walk_stmts(body, pos, first, last, escapes, in_closure, copied),
+        // Select comm clauses: bodies may run when a clause is ready
+        // (over-approx like Block); channel/value exprs are plain reads.
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                walk_stmts(&c.body, pos, first, last, escapes, in_closure, copied);
+                if let Some(ch) = &c.ch {
+                    walk_expr(ch, *pos, first, last, escapes, in_closure);
+                }
+                if let Some(v) = &c.value {
+                    walk_expr(v, *pos, first, last, escapes, in_closure);
+                }
+            }
+        }
         IrStmt::Try {
             body,
             excepts,
@@ -470,6 +483,18 @@ fn walk_expr(
             let mut p = pos;
             walk_stmts(body, &mut p, first, last, escapes, true, false);
         }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            walk_expr(iter, pos, first, last, escapes, in_closure);
+            walk_expr(elem, pos, first, last, escapes, in_closure);
+            if let Some(c) = cond {
+                walk_expr(c, pos, first, last, escapes, in_closure);
+            }
+        }
+        IrExpr::Lambda { body, .. } => {
+            // a closure: every access inside escapes (like Arrow)
+            let mut p = pos;
+            walk_stmts(body, &mut p, first, last, escapes, true, false);
+        }
         IrExpr::Array(items) => {
             for i in items {
                 walk_expr(i, pos, first, last, escapes, in_closure);
@@ -583,6 +608,18 @@ fn mark_vars_escape(e: &IrExpr, first: &mut HashMap<String, usize>, escapes: &mu
         IrExpr::Arrow(body) => {
             // a closure stores its whole environment — everything it
             // accesses is retained
+            for st in body {
+                mark_stmt_vars_escape(st, first, escapes);
+            }
+        }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            mark_vars_escape(iter, first, escapes);
+            mark_vars_escape(elem, first, escapes);
+            if let Some(c) = cond {
+                mark_vars_escape(c, first, escapes);
+            }
+        }
+        IrExpr::Lambda { body, .. } => {
             for st in body {
                 mark_stmt_vars_escape(st, first, escapes);
             }
@@ -723,6 +760,17 @@ fn mark_stmt_vars_escape(
         }
         IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
             mark_stmts_vars_escape(body, first, escapes);
+        }
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                mark_stmts_vars_escape(&c.body, first, escapes);
+                if let Some(ch) = &c.ch {
+                    mark_vars_escape(ch, first, escapes);
+                }
+                if let Some(v) = &c.value {
+                    mark_vars_escape(v, first, escapes);
+                }
+            }
         }
         IrStmt::Try {
             body,

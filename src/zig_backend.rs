@@ -524,6 +524,14 @@ impl Render {
                 self.mark_todo("Arrow");
                 "\"\"".into()
             }
+            IrExpr::ArrayComp { .. } => {
+                self.mark_todo("ArrayComp expr");
+                "\"\"".into()
+            }
+            IrExpr::Lambda { .. } => {
+                self.mark_todo("Lambda expr");
+                "\"\"".into()
+            }
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "\"\"".into()
@@ -679,6 +687,14 @@ impl Render {
             }
             IrExpr::Arrow(_) => {
                 self.mark_todo("Arrow");
+                "false".into()
+            }
+            IrExpr::ArrayComp { .. } => {
+                self.mark_todo("ArrayComp expr");
+                "false".into()
+            }
+            IrExpr::Lambda { .. } => {
+                self.mark_todo("Lambda expr");
                 "false".into()
             }
             IrExpr::Array(_) => {
@@ -1450,6 +1466,7 @@ impl Render {
                 self.mark_todo(&format!("stmt {:?}", s));
             }
             IrStmt::Try { .. } => self.mark_todo("try"),
+            IrStmt::Select { .. } => self.mark_todo("select"),
             IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
             IrStmt::Continue => self.emit("continue;"),
             IrStmt::Break => self.emit("break;"),

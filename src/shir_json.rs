@@ -293,6 +293,20 @@ fn stmt_json(s: &IrStmt) -> Value {
         IrStmt::Subshell(body) => json!({ "type": "Subshell", "body": stmts_json(body) }),
         IrStmt::Background(body) => json!({ "type": "Background", "body": stmts_json(body) }),
         IrStmt::Block(body) => json!({ "type": "Block", "body": stmts_json(body) }),
+        // Go-style select over channel comm clauses (core requests
+        // go-sh-commclause / go-sh-recvstmt). Each clause serializes its
+        // comm kind plus the optional channel expr / recv target var /
+        // send value expr (None fields serialize as null).
+        IrStmt::Select { clauses } => json!({
+            "type": "Select",
+            "clauses": clauses.iter().map(|c| json!({
+                "comm": c.comm,
+                "target": c.target,
+                "ch": c.ch.as_ref().map(expr_json),
+                "value": c.value.as_ref().map(expr_json),
+                "body": stmts_json(&c.body),
+            })).collect::<Vec<_>>(),
+        }),
         IrStmt::Expr(e) => json!({ "type": "Expr", "expr": expr_json(e) }),
         IrStmt::Label(name) => json!({ "type": "Label", "name": name }),
         IrStmt::Goto(name) => json!({ "type": "Goto", "name": name }),
@@ -365,6 +379,18 @@ fn expr_json(e: &IrExpr) -> Value {
         }),
         IrExpr::RawExpr(t) => json!({ "type": "RawExpr", "text": t }),
         IrExpr::Arrow(body) => json!({ "type": "Arrow", "body": stmts_json(body) }),
+        // Comprehension expr (core request py-sh-go-comp-if): var/iter/
+        // elem + the optional comp_if filter (`cond`, null = no filter).
+        IrExpr::ArrayComp { var, iter, elem, cond } => json!({
+            "type": "ArrayComp", "var": var, "iter": expr_json(iter),
+            "elem": expr_json(elem),
+            "cond": cond.as_ref().map(|c| expr_json(c)),
+        }),
+        // Parameterized function-literal expr (core request
+        // py-sh-go-lambdef): the sibling of `Arrow` with explicit params.
+        IrExpr::Lambda { params, body } => json!({
+            "type": "Lambda", "params": params, "body": stmts_json(body),
+        }),
         IrExpr::Array(items) => json!({
             "type": "Array", "elements": items.iter().map(expr_json).collect::<Vec<_>>(),
         }),
@@ -487,7 +513,12 @@ fn call_purity(func: &str, args: &[IrExpr]) -> &'static str {
         "getVar" | "setVar" | "setLastExit" | "assign" | "test" | "grepText" | "listVar"
         | "setArray" | "setArrayAppend" | "arrayItems" | "arrayKeys" | "arrayLen"
         | "arrayIndex" | "fnCall" | "fnValue" | "define" | "forLoop" | "whileLoop" | "block" | "shopt"
-        | "builtin" | "bcSqrt" | "ternary" | "arrayStore" | "memAdvance" | "memTest" | "line" => "Emulable",
+        | "builtin" | "bcSqrt" | "ternary" | "arrayStore" | "memAdvance" | "memTest" | "line"
+        // channel/select vocabulary (core requests go-sh-commclause /
+        // go-sh-recvstmt): FIFO channels + blocking recv/send + the
+        // round-robin select poll — all implementable in the runtime
+        // (arrays), no process spawn.
+        | "makeChan" | "recv" | "send" | "select" => "Emulable",
         // Fs: file I/O, no process spawn
         _ if func.starts_with("fs.") => "Fs",
         // Spawn: must fork/exec or connect processes

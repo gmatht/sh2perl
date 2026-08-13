@@ -267,6 +267,19 @@ fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
             }
         }
         IrStmt::Expr(e) => walk_expr(e, counts),
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                if let Some(ch) = &c.ch {
+                    walk_expr(ch, counts);
+                }
+                if let Some(v) = &c.value {
+                    walk_expr(v, counts);
+                }
+                for s in &c.body {
+                    walk_stmt(s, counts);
+                }
+            }
+        }
         IrStmt::Require(_) => {
             // `require` is a bare string; no IrExpr children.
         }
@@ -330,6 +343,18 @@ fn walk_expr(expr: &IrExpr, counts: &mut HashMap<String, usize>) {
             }
         }
         IrExpr::Arrow(body) => {
+            for s in body {
+                walk_stmt(s, counts);
+            }
+        }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            walk_expr(iter, counts);
+            walk_expr(elem, counts);
+            if let Some(c) = cond {
+                walk_expr(c, counts);
+            }
+        }
+        IrExpr::Lambda { body, .. } => {
             for s in body {
                 walk_stmt(s, counts);
             }

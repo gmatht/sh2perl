@@ -439,6 +439,14 @@ impl Render {
                 self.depth = saved;
                 format!("do {{\n{}\n}}", indent_block(&body, 1))
             }
+            IrExpr::ArrayComp { .. } => {
+                self.mark_todo("ArrayComp expr");
+                "0".to_string()
+            }
+            IrExpr::Lambda { .. } => {
+                self.mark_todo("Lambda expr");
+                "0".to_string()
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr(i)).collect();
                 format!("({})", elems.join(", "))
@@ -2090,6 +2098,7 @@ impl Render {
             IrStmt::Continue => self.emit("next;"),
             IrStmt::Break => self.emit("last;"),
             IrStmt::Try { .. } => self.mark_todo("try"),
+            IrStmt::Select { .. } => self.mark_todo("select"),
         }
     }
 
