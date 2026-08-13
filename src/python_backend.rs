@@ -212,7 +212,7 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) => self.py_ident(name),
+            ArithAst::Var(name) | ArithAst::Ident(name) => self.py_ident(name),
             ArithAst::Index { .. } => {
                 self.mark_todo("arith Index");
                 "0".into()

@@ -813,7 +813,7 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) => {
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     self.need_toint = true;

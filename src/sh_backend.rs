@@ -4101,7 +4101,7 @@ fn cstyle_for_to_sh(arith: &str, body: &str) -> String {
 fn arith_to_sh(a: &ArithAst) -> String {
     match a {
         ArithAst::Num(n) => n.to_string(),
-        ArithAst::Var(name) => {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
             if NUM_VARS.lock().unwrap().contains(name) {
                 // known-numeric var: bare read (dash rejects quoted
                 // expansions inside $(( )); the analysis guarantees the

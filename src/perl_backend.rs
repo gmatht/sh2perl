@@ -534,7 +534,7 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) => self.var_ref(name),
+            ArithAst::Var(name) | ArithAst::Ident(name) => self.var_ref(name),
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
                 self.arrays.insert(var.clone());

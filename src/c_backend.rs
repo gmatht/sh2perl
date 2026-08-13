@@ -979,7 +979,7 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) => {
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
                 if self.is_num(name) {
                     self.c_ident(name)
                 } else {
@@ -6004,7 +6004,7 @@ fn collect_const_reads_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
 
 fn collect_const_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
     match a {
-        ArithAst::Var(name) => {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
             out.insert(name.clone());
         }
         ArithAst::Index { var, key } => {
@@ -6838,7 +6838,7 @@ fn collect_store_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
 
 fn collect_store_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
     match a {
-        ArithAst::Var(name) => {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
             out.insert(name.clone());
         }
         ArithAst::Index { var, key } => {
@@ -7146,7 +7146,7 @@ fn is_ident(s: &str) -> bool {
 fn arith_leaves_at_width(a: &ArithAst, r: &Render, w: Width, has_var: &mut bool) -> bool {
     match a {
         ArithAst::Num(_) => true,
-        ArithAst::Var(name) => {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
             *has_var = true;
             // genuinely numeric (a string var's width default I64 must not
             // match; its rendered type is `char*`)
@@ -7543,7 +7543,7 @@ fn arith_range_local(
 /// target is excluded — its RHS vars are included).
 fn arith_vars(a: &ArithAst, out: &mut Vec<String>) {
     match a {
-        ArithAst::Var(n) => out.push(n.clone()),
+        ArithAst::Var(n) | ArithAst::Ident(n) => out.push(n.clone()),
         ArithAst::Index { var, key } => {
             out.push(var.clone());
             arith_vars(key, out);
@@ -7573,7 +7573,7 @@ fn arith_vars(a: &ArithAst, out: &mut Vec<String>) {
 fn arith_shell(a: &ArithAst) -> String {
     match a {
         ArithAst::Num(n) => n.to_string(),
-        ArithAst::Var(name) => format!("${{{name}}}"),
+        ArithAst::Var(name) | ArithAst::Ident(name) => format!("${{{name}}}"),
         ArithAst::Index { var, key } => format!("${{{var}[{}]}}", arith_shell(key)),
         ArithAst::Bin { op, lhs, rhs } => {
             format!("({} {} {})", arith_shell(lhs), op, arith_shell(rhs))

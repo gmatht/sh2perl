@@ -46,6 +46,21 @@ pub fn shir_to_shir_json(prog: &IrProgram) -> String {
     if prog.var_bash_env.is_empty() {
         prog.var_bash_env = crate::shir::analyze_var_bash_env(&prog);
     }
+    // A1 `Ident` arith reads (core request zsh-sh-go-20260813-155123):
+    // in-body arith reads of a NUMERIC-LIFTED `for` loop variable are
+    // exported as `{"type":"Ident","name":…}` — the estree renderer
+    // derives a bare `Identifier` from a lifted `Var` read, so the A1
+    // carries the node the backends actually render. Gate: the SAME
+    // lift verdicts the estree renderer computes (numeric_lift_vars +
+    // string_lift_vars + analyze_loop_var_refs), so every backend's
+    // output is unchanged (Ident renders like a lifted Var read
+    // everywhere; the estree arm emits the identifier directly).
+    let numeric = crate::shir::numeric_lift_vars(&prog);
+    let string = crate::shir::string_lift_vars(&prog, &numeric);
+    let (num, str) = crate::shir::analyze_loop_var_refs(&prog, &numeric, &string);
+    let lifted: std::collections::HashSet<String> =
+        num.union(&str).cloned().collect();
+    rewrite_loop_var_idents(&mut prog.stmts, &lifted);
     // shIR markup: mark loops provably run at least once (`"runs": true`)
     // so every backend consuming the A1 contract knows the body always
     // runs (the estree backend uses it to skip its ran/last tracking).
@@ -368,6 +383,7 @@ fn arith_json(a: &ArithAst) -> Value {
     match a {
         ArithAst::Num(n) => json!({ "type": "Num", "value": n }),
         ArithAst::Var(name) => json!({ "type": "Var", "name": name }),
+        ArithAst::Ident(name) => json!({ "type": "Ident", "name": name }),
         ArithAst::Index { var, key } => json!({
             "type": "Index", "var": var, "key": arith_json(key),
         }),
@@ -503,5 +519,277 @@ fn exec_purity(cmd: &IrExpr, capture: &Option<String>) -> &'static str {
     match name {
         Some(n) if crate::shir::SYNC_BUILTINS.contains(&n) && capture.is_none() => "Emulable",
         _ => "Spawn",
+    }
+}
+
+// ── A1 `Ident` arith reads (core request zsh-sh-go-20260813-155123) ──
+
+/// Rewrite `ArithAst::Var(var)` → `ArithAst::Ident(var)` inside the
+/// body of every `IrStmt::For` whose loop variable is numeric-lifted.
+/// The rewrite is export-only (the renderers consume the pre-rewrite
+/// IR from `ast_to_ir`; the ingested A1 carries the nodes itself).
+fn rewrite_loop_var_idents(stmts: &mut [IrStmt], lifted: &std::collections::HashSet<String>) {
+    for s in stmts.iter_mut() {
+        if let IrStmt::For { var, body, .. } = s {
+            if lifted.contains(var) {
+                let v = var.clone();
+                for b in body.iter_mut() {
+                    rewrite_stmt_arith_ident(b, &v);
+                }
+                continue;
+            }
+        }
+        // recurse into statement containers (a nested For inside an
+        // If/While/Block/Case/... body gets its own rewrite)
+        match s {
+            IrStmt::Block(b)
+            | IrStmt::Subshell(b)
+            | IrStmt::Background(b) => rewrite_loop_var_idents(b, lifted),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                rewrite_loop_var_idents(then, lifted);
+                for (_, b) in elsifs.iter_mut() {
+                    rewrite_loop_var_idents(b, lifted);
+                }
+                rewrite_loop_var_idents(else_, lifted);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                rewrite_loop_var_idents(body, lifted);
+            }
+            IrStmt::ForInit { init, step, body, .. } => {
+                rewrite_loop_var_idents(init, lifted);
+                rewrite_loop_var_idents(step, lifted);
+                rewrite_loop_var_idents(body, lifted);
+            }
+            IrStmt::Function { body, .. } => rewrite_loop_var_idents(body, lifted),
+            IrStmt::Redirect { inner, .. } => rewrite_loop_var_idents(inner, lifted),
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                rewrite_loop_var_idents(body, lifted);
+                for e in excepts.iter_mut() {
+                    rewrite_loop_var_idents(&mut e.body, lifted);
+                }
+                rewrite_loop_var_idents(else_body, lifted);
+                rewrite_loop_var_idents(finally_body, lifted);
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses.iter_mut() {
+                    rewrite_loop_var_idents(&mut c.body, lifted);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages.iter_mut() {
+                    rewrite_loop_var_idents(stage, lifted);
+                }
+            }
+            IrStmt::Expr(e) | IrStmt::Assign { expr: e, .. } => {
+                rewrite_expr_arith_ident(e, &None)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Rewrite `ArithAst::Var(var)` → `ArithAst::Ident(var)` throughout a
+/// statement (recursing into expression arrows).
+fn rewrite_stmt_arith_ident(stmt: &mut IrStmt, var: &str) {
+    match stmt {
+        IrStmt::Expr(e) => rewrite_expr_arith_ident(e, &Some(var.to_string())),
+        IrStmt::Assign { expr, .. } => rewrite_expr_arith_ident(expr, &Some(var.to_string())),
+        IrStmt::Declare { init, .. } => {
+            if let Some(i) = init {
+                rewrite_expr_arith_ident(i, &Some(var.to_string()));
+            }
+        }
+        IrStmt::Output { value, .. } => rewrite_expr_arith_ident(value, &Some(var.to_string())),
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+        } => {
+            rewrite_expr_arith_ident(cond, &Some(var.to_string()));
+            for s in then.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+            for (_, b) in elsifs.iter_mut() {
+                for s in b.iter_mut() {
+                    rewrite_stmt_arith_ident(s, var);
+                }
+            }
+            for s in else_.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+        }
+        IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+            rewrite_expr_arith_ident(cond, &Some(var.to_string()));
+            for s in body.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+        }
+        IrStmt::For { iter, body, .. } => {
+            rewrite_expr_arith_ident(iter, &Some(var.to_string()));
+            for s in body.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+        }
+        IrStmt::ForInit { init, cond, step, body } => {
+            for s in init.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+            rewrite_expr_arith_ident(cond, &Some(var.to_string()));
+            for s in step.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+            for s in body.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+        }
+        IrStmt::Block(b)
+        | IrStmt::Subshell(b)
+        | IrStmt::Background(b)
+        | IrStmt::Function { body: b, .. } => {
+            for s in b.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+        }
+        IrStmt::Redirect { inner, redirects } => {
+            for s in inner.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+            for r in redirects.iter_mut() {
+                rewrite_expr_arith_ident(&mut r.target, &Some(var.to_string()));
+            }
+        }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            for s in body.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+            for e in excepts.iter_mut() {
+                for s in e.body.iter_mut() {
+                    rewrite_stmt_arith_ident(s, var);
+                }
+            }
+            for s in else_body.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+            for s in finally_body.iter_mut() {
+                rewrite_stmt_arith_ident(s, var);
+            }
+        }
+        IrStmt::Case { discriminant, clauses } => {
+            rewrite_expr_arith_ident(discriminant, &Some(var.to_string()));
+            for c in clauses.iter_mut() {
+                for s in c.body.iter_mut() {
+                    rewrite_stmt_arith_ident(s, var);
+                }
+            }
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            for stage in stages.iter_mut() {
+                for s in stage.iter_mut() {
+                    rewrite_stmt_arith_ident(s, var);
+                }
+            }
+        }
+        IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) | IrStmt::SetChildError(e) => {
+            rewrite_expr_arith_ident(e, &Some(var.to_string()));
+        }
+        IrStmt::Exec { cmd, args, env, .. } => {
+            rewrite_expr_arith_ident(cmd, &Some(var.to_string()));
+            for a in args.iter_mut() {
+                rewrite_expr_arith_ident(a, &Some(var.to_string()));
+            }
+            for (_, v) in env.iter_mut() {
+                rewrite_expr_arith_ident(v, &Some(var.to_string()));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite `ArithAst::Var(var)` → `ArithAst::Ident(var)` throughout an
+/// expression. `var` is None in the generic driver (no rewrite — only
+/// the structural walk for nested `IrStmt::For` handling is needed).
+fn rewrite_expr_arith_ident(e: &mut IrExpr, var: &Option<String>) {
+    match e {
+        IrExpr::Arith(a) => {
+            if let Some(v) = var {
+                rewrite_arith_ident(a, v);
+            }
+        }
+        IrExpr::Arrow(stmts) => {
+            if let Some(v) = var {
+                for s in stmts.iter_mut() {
+                    rewrite_stmt_arith_ident(s, v);
+                }
+            }
+        }
+        IrExpr::Call { args, .. } | IrExpr::MethodCall { args, .. } => {
+            for a in args.iter_mut() {
+                rewrite_expr_arith_ident(a, var);
+            }
+        }
+        IrExpr::Array(items) => {
+            for a in items.iter_mut() {
+                rewrite_expr_arith_ident(a, var);
+            }
+        }
+        IrExpr::Object(props) => {
+            for (_, v) in props.iter_mut() {
+                rewrite_expr_arith_ident(v, var);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            rewrite_expr_arith_ident(lhs, var);
+            rewrite_expr_arith_ident(rhs, var);
+        }
+        IrExpr::Ternary {
+            cond, then, else_, ..
+        } => {
+            rewrite_expr_arith_ident(cond, var);
+            rewrite_expr_arith_ident(then, var);
+            rewrite_expr_arith_ident(else_, var);
+        }
+        IrExpr::DefinedOr { expr, default, .. } => {
+            rewrite_expr_arith_ident(expr, var);
+            rewrite_expr_arith_ident(default, var);
+        }
+        IrExpr::Index { key, .. } => rewrite_expr_arith_ident(key, var),
+        IrExpr::Capture { expr, .. } => rewrite_expr_arith_ident(expr, var),
+        _ => {}
+    }
+}
+
+/// Rewrite `ArithAst::Var(var)` → `ArithAst::Ident(var)` in an arith
+/// tree (reads only — Assign/IncDec TARGETS keep their var name; the
+/// node's `name` field is the read).
+fn rewrite_arith_ident(a: &mut ArithAst, var: &str) {
+    match a {
+        ArithAst::Var(n) if n == var => *a = ArithAst::Ident(n.clone()),
+        ArithAst::Index { key, .. } => rewrite_arith_ident(key, var),
+        ArithAst::Bin { lhs, rhs, .. } => {
+            rewrite_arith_ident(lhs, var);
+            rewrite_arith_ident(rhs, var);
+        }
+        ArithAst::Un { arg, .. } => rewrite_arith_ident(arg, var),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => {
+            rewrite_arith_ident(test, var);
+            rewrite_arith_ident(then, var);
+            rewrite_arith_ident(else_, var);
+        }
+        ArithAst::Assign { rhs, .. } => rewrite_arith_ident(rhs, var),
+        ArithAst::Cast { arg, .. } => rewrite_arith_ident(arg, var),
+        _ => {}
     }
 }
