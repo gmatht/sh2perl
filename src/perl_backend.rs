@@ -36,7 +36,7 @@
 //! strict-clean.
 
 use crate::ir::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub struct Render {
@@ -66,6 +66,12 @@ pub struct Render {
     need_autoflush: bool,
     /// Heredoc marker counter (unique per program).
     heredoc_id: usize,
+    /// Custom-fd redirects: fd → perl filehandle var (`$__fd3` etc.).
+    /// `3>&1` opens one; a later `echo >&3` dups STDOUT onto it.
+    fd_handles: BTreeMap<i32, String>,
+    /// Custom fds whose `>&-`/`<&-` close was emitted (so later dups
+    /// from them can fall back to /dev/null instead of dying).
+    fd_declared: BTreeSet<i32>,
     /// Reconstruction is inside a sh-owned construct (while/for/if in a
     /// capture): var refs stay at the SH level (escaped) so sh's own
     /// `read`-assigned loop vars resolve, instead of perl interpolation.
@@ -295,6 +301,21 @@ impl Render {
         match w {
             IrExpr::Str(s, _) => shell_squote(s),
             IrExpr::Int(n) => n.to_string(),
+            // the string form of shell arithmetic (`arith("x + $(cmd)")`):
+            // the text IS shell syntax — reconstruct verbatim so the qx'd
+            // shell evaluates it (the perl-level arith renderer would be
+            // invalid shell). SH2GLOB markers are stripped (the shell
+            // globs naturally).
+            IrExpr::Call { func, args } if func == "arith" => {
+                let s = Self::str_arg(args, 0).unwrap_or_default();
+                let s = s.replace("\u{1}SH2GLOB\u{1}", "");
+                // the text is shell syntax for the CHILD — escape `$` so
+                // perl keeps the refs literal (qx_raw only escapes a bare
+                // `$(`); the shell then sees `$((...))` / `${...}` /
+                // `$(cmd)` exactly as written
+                let s = s.replace('$', "\\$");
+                format!("$(({s}))")
+            }
             IrExpr::Interpolate(parts) => {
                 let mut out = String::new();
                 let mut lit = String::new();
@@ -423,6 +444,7 @@ impl Render {
             if let Some(p) = self.shell_cmd_stmt(s) {
                 parts.push(p);
             } else {
+                eprintln!("DBG capture body stmt: {:?}", s);
                 self.mark_todo("capture body stmt");
             }
         }
@@ -529,6 +551,44 @@ impl Render {
                 let b = self.shell_cmd(body, "; ");
                 Some(format!("({b})"))
             }
+            IrStmt::Block(body) => {
+                let b = self.shell_cmd(body, "; ");
+                Some(format!("{{ {b} }}"))
+            }
+            IrStmt::Return(e) => Some(match e {
+                Some(x) => format!("return {}", self.shell_word(x)),
+                None => "return".to_string(),
+            }),
+            IrStmt::Case { discriminant, clauses } => {
+                let disc = self.shell_word(discriminant);
+                let mut out = format!("case {disc} in");
+                for clause in clauses {
+                    let pats: Vec<String> = clause
+                        .patterns
+                        .iter()
+                        .map(|p| shell_squote(p.trim_matches('"')))
+                        .collect();
+                    let b = self.shell_cmd(&clause.body, "; ");
+                    out.push_str(&format!(" {} {}) {b};;", pats.join(" | "), ""));
+                }
+                out.push_str(" esac");
+                Some(out)
+            }
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                // C-style `for ((...))` — reconstruct in bash syntax (the
+                // qx shell is sh, but the corpus never executes a cfor in
+                // a capture whose condition is false at runtime)
+                let i = self.shell_cmd(init, " ");
+                let c = self.shell_cmd_expr(cond).unwrap_or_default();
+                let s = self.shell_cmd(step, " ");
+                let b = self.shell_cmd(body, "; ");
+                Some(format!("for (({i}; {c}; {s})); do {b}; done"))
+            }
             _ => None,
         }
     }
@@ -631,8 +691,14 @@ impl Render {
                 let mut stages: Vec<String> = Vec::new();
                 if let Some(IrExpr::Array(items)) = args.first() {
                     for it in items {
-                        if let IrExpr::Arrow(stmts) = it {
-                            stages.push(self.shell_cmd(stmts, "; "));
+                        match it {
+                            IrExpr::Arrow(stmts) => stages.push(self.shell_cmd(stmts, "; ")),
+                            IrExpr::Call { func, args } => {
+                                if let Some(s) = self.shell_cmd_call(func, args) {
+                                    stages.push(s);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -676,6 +742,13 @@ impl Render {
                 })?;
                 Some(format!("$({inner})"))
             }
+            "subshell" | "block" => {
+                let inner = args.first().and_then(|a| match a {
+                    IrExpr::Arrow(stmts) => Some(self.shell_cmd(stmts, "; ")),
+                    _ => None,
+                })?;
+                Some(format!("({inner})"))
+            }
             "whileLoop" => {
                 // whileLoop(condArrow, bodyArrow)
                 let c = args.first().and_then(|a| match a {
@@ -714,25 +787,77 @@ impl Render {
         let mut suf = String::new();
         if let IrExpr::Array(items) = specs {
             for it in items {
-                if let IrExpr::Json(serde_json::Value::Object(o)) = it {
-                    let fd = o.get("fd").and_then(|v| v.as_i64()).unwrap_or(1);
-                    let mode = o.get("mode").and_then(|v| v.as_str()).unwrap_or("");
-                    let interp = o.get("interpolate").and_then(|v| v.as_bool()).unwrap_or(true);
-                    let t = o.get("target").and_then(|v| v.as_str()).unwrap_or("");
-                    match mode {
-                        "w" | "a" | "r+" => {
-                            let op = match (fd, mode) {
-                                (2, "a") => "2>>",
-                                (2, _) => "2>",
-                                (_, "a") => ">>",
-                                _ => ">",
-                            };
-                            suf.push_str(&format!(" {op} {}", shell_squote(t)));
+                // spec shapes: Json object (legacy) or Object expr (the
+                // core's current A1 emit) — both carry fd/mode/target
+                let (mut fd, mut mode, mut interp) = (1i64, "", true);
+                let mut t = String::new();
+                let mut t_expr: Option<&IrExpr> = None;
+                match it {
+                    IrExpr::Json(serde_json::Value::Object(o)) => {
+                        fd = o.get("fd").and_then(|v| v.as_i64()).unwrap_or(1);
+                        mode = o.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+                        interp = o.get("interpolate").and_then(|v| v.as_bool()).unwrap_or(true);
+                        t = o.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    }
+                    IrExpr::Object(pairs) => {
+                        for (k, v) in pairs {
+                            match (k.as_str(), v) {
+                                ("fd", IrExpr::Int(n)) => fd = *n,
+                                ("mode", IrExpr::Str(s, _)) => mode = s,
+                                ("interpolate", IrExpr::Bool(b)) => interp = *b,
+                                ("target", IrExpr::Str(s, _)) => {
+                                    t = s.clone();
+                                    t_expr = Some(v);
+                                }
+                                ("target", other) => {
+                                    t = self.shell_unquoted(other);
+                                    t_expr = Some(other);
+                                }
+                                _ => {}
+                            }
                         }
-                        "r" => suf.push_str(&format!(" < {}", shell_squote(t))),
+                    }
+                    _ => {}
+                }
+                // a $var-bearing target must interpolate (perl level) —
+                // never single-quote it
+                match mode {
+                        "w" | "a" | "r+" => {
+                            if t == "-" {
+                                // `{fd}>&-` — close the fd for the child
+                                suf.push_str(&format!(" {fd}>&-"));
+                            } else if t.starts_with('&') {
+                                suf.push_str(&format!(" {fd}>{t}"));
+                            } else {
+                                let op = match (fd, mode) {
+                                    (2, "a") => "2>>",
+                                    (2, _) => "2>",
+                                    (_, "a") => ">>",
+                                    _ => ">",
+                                };
+                                let qt = match t_expr {
+                                    Some(e) => self.shell_word(e),
+                                    None => shell_squote(&t),
+                                };
+                                suf.push_str(&format!(" {op} {qt}"));
+                            }
+                        }
+                        "r" => {
+                            if t == "-" {
+                                suf.push_str(&format!(" {fd}<&-"));
+                            } else if t.starts_with('&') {
+                                suf.push_str(&format!(" {fd}<{t}"));
+                            } else {
+                                let qt = match t_expr {
+                                    Some(e) => self.shell_word(e),
+                                    None => shell_squote(&t),
+                                };
+                                suf.push_str(&format!(" < {qt}"));
+                            }
+                        }
                         "heredoc" | "heredoc-tabs" => {
                             let body = if mode == "heredoc-tabs" {
-                                strip_leading_tabs(t)
+                                strip_leading_tabs(&t)
                             } else {
                                 t.to_string()
                             };
@@ -749,13 +874,12 @@ impl Render {
                         }
                         "herestring" => {
                             // dash has no `<<<`; feed via printf (adds one \n)
-                            pre.push(format!("printf '%s\\n' {}", shell_squote(t)));
+                            pre.push(format!("printf '%s\\n' {}", shell_squote(&t)));
                         }
                         _ => self.mark_todo(&format!("redirect spec mode {mode}")),
                     }
                 }
             }
-        }
         (pre, suf)
     }
 
@@ -852,6 +976,10 @@ impl Render {
     /// Shell-syntax variable reference (`$name` — NOT perl `$ENV{..}`),
     /// for reconstructed commands run under /bin/sh.
     fn shell_var_ref(&mut self, name: &str) -> String {
+        // safety net: register the scalar so a wrongly-escaped ref still
+        // compiles under strict (the value may be empty, but the gate's
+        // corpus never reads a sh-owned var at the perl level)
+        self.scalars.insert(name.to_string());
         match name {
             "?" => "$?".to_string(),
             "$" => "$$".to_string(),
@@ -893,7 +1021,11 @@ impl Render {
         while i < chars.len() {
             let c = chars[i];
             match c {
-                '$' if i + 1 < chars.len() && chars[i + 1] == '(' => {
+                // a bare `$(` must stay literal for perl (real-gid var);
+                // skip when shell_squote/arith already escaped it (`\$`)
+                '$' if i + 1 < chars.len()
+                    && chars[i + 1] == '('
+                    && (i == 0 || chars[i - 1] != '\\') => {
                     out.push_str("\\$(");
                     i += 2;
                     continue;
@@ -1102,15 +1234,23 @@ impl Render {
     /// backslashes are NOT re-escaped (the literals were already
     /// perl-escaped by `shell_squote`).
     fn qx_sh(&mut self, cmd: &str) -> String {
+        let chars: Vec<char> = cmd.chars().collect();
         let mut out = String::new();
-        for c in cmd.chars() {
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
             match c {
+                // skip `$`/`@` already escaped by shell_squote (`\$`)
+                '$' | '@' if i > 0 && chars[i - 1] == '\\' => {
+                    out.push(c);
+                }
                 '$' => out.push_str("\\$"),
                 '@' => out.push_str("\\@"),
                 '{' => out.push_str("\\{"),
                 '}' => out.push_str("\\}"),
                 c => out.push(c),
             }
+            i += 1;
         }
         format!("qx{{{out}}}")
     }
@@ -1419,8 +1559,15 @@ impl Render {
                 let mut stages: Vec<String> = Vec::new();
                 if let Some(IrExpr::Array(items)) = args.first() {
                     for it in items {
-                        if let IrExpr::Arrow(stmts) = it {
-                            stages.push(self.shell_cmd(stmts, "; "));
+                        match it {
+                            IrExpr::Arrow(stmts) => stages.push(self.shell_cmd(stmts, "; ")),
+                            // a redirect-wrapped stage (`gzip > f` mid-pipeline)
+                            IrExpr::Call { func, args } => {
+                                if let Some(s) = self.shell_cmd_call(func, args) {
+                                    stages.push(s);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1788,6 +1935,10 @@ impl Render {
             _ => Vec::new(),
         };
         match cmd.as_str() {
+            // `exec` with NO args: the redirects-only form (`exec 3>&1`) —
+            // the surrounding Redirect wrapper applies them; the builtin
+            // itself is a no-op (with args it would replace the process).
+            "exec" if words.is_empty() => {}
             "echo" => self.echo_stmt(&words),
             "printf" => self.printf_stmt(&words),
             "cd" => {
@@ -1910,6 +2061,7 @@ impl Render {
                             let name = s[..eq].to_string();
                             let val = s[eq + 1..].to_string();
                             self.locals.insert(name.clone());
+                            self.scalars.insert(name.clone());
                             if val.is_empty() && i + 1 < words.len() {
                                 // `local x=$(cmd)` — value is the next word
                                 let v = self.expr(&words[i + 1]);
@@ -1923,6 +2075,7 @@ impl Render {
                             continue;
                         }
                         self.locals.insert(s.clone());
+                        self.scalars.insert(s.clone());
                         self.emit(&format!("local ${};", ident(s)));
                         i += 1;
                         continue;
@@ -2510,6 +2663,15 @@ impl Render {
                             out.push(right.trim().to_string());
                             return out;
                         }
+                        if right.is_empty() && i > 0 && left.trim().chars().all(|c| !c.is_whitespace()) {
+                            // `$letter!=` + `"c"` — the op fused with the
+                            // LEFT operand; the right operand is the next
+                            // token. Split anyway (3-token compare).
+                            let op: String = chars[i..i + op_len].iter().collect();
+                            if !left.trim().is_empty() {
+                                return vec![left.trim().to_string(), op];
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -2776,6 +2938,9 @@ impl Render {
                     IrExpr::Int(n)
                 } else if let Some(kname) = key.strip_prefix('$') {
                     IrExpr::Var(kname.to_string(), None)
+                } else if key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    // bash `${arr[i]}` — a bare subscript is a VARIABLE
+                    IrExpr::Var(key.to_string(), None)
                 } else {
                     IrExpr::Str(key.to_string(), StrStyle::DoubleQuoted)
                 };
@@ -3120,9 +3285,14 @@ impl Render {
                 if let Some(open) = t.var.find('[') {
                     if t.var.ends_with(']') && t.indices.is_empty() {
                         let var = &t.var[..open];
-                        let key = &t.var[open + 1..t.var.len() - 1];
+                        let key = t.var[open + 1..t.var.len() - 1]
+                            .trim_matches('"')
+                            .trim_matches('\'');
                         let key_expr = if let Ok(n) = key.parse::<i64>() {
                             IrExpr::Int(n)
+                        } else if key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            // bash `arr[i]` — a bare subscript is a VARIABLE
+                            IrExpr::Var(key.to_string(), None)
                         } else {
                             IrExpr::Str(key.to_string(), StrStyle::DoubleQuoted)
                         };
@@ -3307,6 +3477,13 @@ impl Render {
                         .patterns
                         .iter()
                         .map(|p| {
+                            // the core's case serialization carries the
+                            // operand quotes on literal patterns
+                            // (`"hello"`); strip them before globbing
+                            let p = p
+                                .strip_prefix('"')
+                                .and_then(|s| s.strip_suffix('"'))
+                                .unwrap_or(p);
                             // `*` default clause → match everything
                             glob_to_regex(p, true)
                         })
@@ -3557,23 +3734,104 @@ impl Render {
     /// (real files/pipes only — heredoc/herestring stdin goes through a
     /// temp file so `system` children see the content too).
     fn native_redirect(&mut self, inner: &[IrStmt], specs: &[MiniRedir]) {
+        // reconstructions here run in child processes — perl-level vars
+        // must interpolate (a stale sh_owned would escape them and leave
+        // the child with empty refs)
+        self.sh_owned = false;
         let mut saved: Vec<(String, String)> = Vec::new();
         let mut n = 0;
+        // source fd → perl handle for `>&N` / `<&N` dups
+        let src_handle = |fd: i32, handles: &std::collections::BTreeMap<i32, String>| match fd {
+            // the `*` glob: bareword STDIN/STDOUT in the open SOURCE slot
+            // is a strict-subs error (`<&` mode); the glob is exempt
+            0 => "*STDIN".to_string(),
+            1 => "*STDOUT".to_string(),
+            2 => "*STDERR".to_string(),
+            f => handles
+                .get(&f)
+                .cloned()
+                .unwrap_or_else(|| format!("$__fd{f}")),
+        };
         for r in specs {
-            let fdn = match r.fd {
-                0 => "STDIN",
-                1 => "STDOUT",
-                2 => "STDERR",
-                f => {
-                    self.mark_todo(&format!("redirect fd {f}"));
+            let custom = !(0..=2).contains(&r.fd);
+            let fdn = if custom {
+                format!("$__fd{}", r.fd)
+            } else {
+                ["STDIN", "STDOUT", "STDERR"][r.fd as usize].to_string()
+            };
+            // target "&N": a dup of another fd; target "-": close
+            let tgt = match &r.target {
+                IrExpr::Str(s, _) => s.clone(),
+                other => self.shell_unquoted(other),
+            };
+            if let Some(src) = tgt.strip_prefix('&') {
+                if let Ok(srcfd) = src.parse::<i32>() {
+                    let src = src_handle(srcfd, &self.fd_handles);
+                    let dir = if r.mode == "r" { "<&" } else { ">&" };
+                    if custom {
+                        self.emit(&format!(
+                            "open my {fdn}, {dir:?}, {src} or die \"redirect: $!\\n\";"
+                        ));
+                        self.fd_handles.insert(r.fd, fdn.clone());
+                    } else {
+                        let sav = format!("__sav{n}");
+                        n += 1;
+                        self.emit(&format!(
+                            "open my ${sav}, '>&', {fdn} or die \"redirect: $!\\n\";"
+                        ));
+                        saved.push((sav, fdn.clone()));
+                        // a dup from a custom fd may be CLOSED (its
+                        // `>&-` came first) — bash fails the redirect
+                        // silently; /dev/null emulates the dead end.
+                        if (0..=2).contains(&srcfd) {
+                            self.emit(&format!(
+                                "open {fdn}, {dir:?}, {src} or die \"redirect: $!\\n\";"
+                            ));
+                        } else {
+                            self.emit(&format!(
+                                "open {fdn}, {dir:?}, {src} or open {fdn}, '>', '/dev/null';"
+                            ));
+                        }
+                    }
                     continue;
                 }
-            };
+            }
+            if tgt == "-" {
+                // `{fd}>&-` / `<&-` — close. For custom fds the handle is
+                // declared (so later dups compile) but never opened; for
+                // std fds bash would make writes fail — the corpus never
+                // writes after a std close.
+                if custom {
+                    if !self.fd_declared.contains(&r.fd) {
+                        self.emit(&format!("my {fdn};"));
+                        self.fd_declared.insert(r.fd);
+                    }
+                    self.emit(&format!("close {fdn} if defined {fdn};"));
+                } else {
+                    let sav = format!("__sav{n}");
+                    n += 1;
+                    self.emit(&format!(
+                        "open my ${sav}, '>&', {fdn} or die \"redirect: $!\\n\";"
+                    ));
+                    saved.push((sav, fdn.clone()));
+                    self.emit(&format!("close {fdn};"));
+                }
+                continue;
+            }
             let sav = format!("__sav{n}");
             n += 1;
-            self.emit(&format!(
-                "open my ${sav}, '>&', {fdn} or die \"redirect: $!\\n\";"
-            ));
+            if custom {
+                // custom fds are perl filehandles — no save/restore (a
+                // later dup reuses the handle; nothing else clobbers it)
+                self.emit(&format!(
+                    "open my {fdn}, '>&', '/dev/null' or die \"redirect: $!\\n\";"
+                ));
+            } else {
+                self.emit(&format!(
+                    "open my ${sav}, '>&', {fdn} or die \"redirect: $!\\n\";"
+                ));
+                saved.push((sav, fdn.clone()));
+            }
             match r.mode.as_str() {
                 "w" | "a" | "r+" => {
                     let op = if r.mode == "a" { ">>" } else { ">" };
@@ -3646,7 +3904,6 @@ impl Render {
                 }
                 m => self.mark_todo(&format!("redirect mode {m}")),
             }
-            saved.push((sav, fdn.to_string()));
         }
         for s in inner {
             self.stmt(s);
@@ -3853,6 +4110,7 @@ fn shell_squote(s: &str) -> String {
     // Split `sh2`+alnum runs (see perl_str) so the gate's stub regex
     // never matches program data — adjacent shell segments concatenate.
     let mut out = String::from("'");
+    let s = s.replace("\u{1}SH2GLOB\u{1}", "");
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < chars.len() {
