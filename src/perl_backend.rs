@@ -56,9 +56,30 @@ pub struct Render {
     loop_vars: BTreeSet<String>,
     /// User-defined function names (exec("foo") with a known foo → sub call).
     funcs: BTreeSet<String>,
+    /// Vars ever `local`'d: hoisted as `our` (package vars) so `local`
+    /// (dynamic scoping, matching bash) works instead of `my` (lexical).
+    locals: BTreeSet<String>,
     need_say: bool,
     need_basename: bool,
+    /// Subshell/background rendering forks: both sides must autoflush so
+    /// the child's `exit` doesn't duplicate buffered parent output.
+    need_autoflush: bool,
+    /// Heredoc marker counter (unique per program).
+    heredoc_id: usize,
+    /// Reconstruction is inside a sh-owned construct (while/for/if in a
+    /// capture): var refs stay at the SH level (escaped) so sh's own
+    /// `read`-assigned loop vars resolve, instead of perl interpolation.
+    sh_owned: bool,
     todo: usize,
+}
+
+/// One redirection spec in the native (statement) rendering path — the
+/// union of the typed `IrRedirect` and the `redirect`-call Json form.
+struct MiniRedir {
+    fd: i32,
+    mode: String,
+    target: IrExpr,
+    interp: bool,
 }
 
 /// Render an `IrProgram` to Perl source.
@@ -92,6 +113,10 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     if r.need_basename {
         r.emit("use File::Basename qw(basename dirname);");
     }
+    if r.need_autoflush {
+        r.emit("STDOUT->autoflush(1);");
+        r.emit("STDERR->autoflush(1);");
+    }
     for import in &prog.imports {
         r.emit(&format!("use {};", import));
     }
@@ -112,7 +137,12 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         .collect();
     let hashes: Vec<String> = r.hashes.iter().cloned().collect();
     for v in &scalars {
-        r.emit(&format!("my ${};", ident(v)));
+        if r.locals.contains(v) {
+            // `local` needs a package var (dynamic scope): `our` not `my`.
+            r.emit(&format!("our ${};", ident(v)));
+        } else {
+            r.emit(&format!("my ${};", ident(v)));
+        }
     }
     for v in &arrays {
         r.emit(&format!("my @{};", ident(v)));
@@ -261,7 +291,11 @@ impl Render {
                                             out.push_str(&shell_squote(&lit));
                                             lit.clear();
                                         }
-                                        out.push_str(&self.var_ref(&name));
+                                        if self.sh_owned {
+                                            out.push_str(&self.shell_var_ref(&name));
+                                        } else {
+                                            out.push_str(&self.var_ref(&name));
+                                        }
                                         continue;
                                     }
                                 }
@@ -269,6 +303,15 @@ impl Render {
                             if !lit.is_empty() {
                                 out.push_str(&shell_squote(&lit));
                                 lit.clear();
+                            }
+                            // nested `$(...)` — reconstruct at the shell level
+                            if let IrExpr::Call { func, args } = x.as_ref() {
+                                if func == "capture" || func == "captureWords" {
+                                    if let Some(inner) = self.shell_cmd_call(func, args) {
+                                        out.push_str(&inner);
+                                        continue;
+                                    }
+                                }
                             }
                             out.push_str("$(");
                             out.push_str(&self.expr(x));
@@ -285,6 +328,39 @@ impl Render {
                     out
                 }
             }
+            IrExpr::Call { func, args } if func == "capture" || func == "captureWords" => {
+                if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                    let inner = self.shell_cmd(stmts, "; ");
+                    return format!("$({inner})");
+                }
+                self.mark_todo("capture word");
+                "''".to_string()
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                if let Some(name) = Self::str_arg(args, 0) {
+                    if self.sh_owned {
+                        return self.shell_var_ref(&name);
+                    }
+                    return self.var_ref(&name);
+                }
+                "''".to_string()
+            }
+            IrExpr::Call { func, args } if func == "split" => {
+                // unquoted expansion: the shell word-splits at runtime —
+                // emit the bare var reference (no quotes)
+                if let Some(IrExpr::Call { func: g, args: ga }) = args.first() {
+                    if g == "getVar" {
+                        if let Some(name) = Self::str_arg(ga, 0) {
+                            if self.sh_owned {
+                                return self.shell_var_ref(&name);
+                            }
+                            return self.var_ref(&name);
+                        }
+                    }
+                }
+                self.mark_todo("split word");
+                "''".to_string()
+            }
             IrExpr::Var(name, sigil) => match sigil {
                 Some(Sigil::Array) => format!("@{}", ident(name)),
                 _ => self.var_ref(name),
@@ -300,30 +376,403 @@ impl Render {
     fn shell_cmd(&mut self, stmts: &[IrStmt], sep: &str) -> String {
         let mut parts: Vec<String> = Vec::new();
         for s in stmts {
-            match s {
-                IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
-                    let mut words: Vec<String> = Vec::new();
-                    if let Some(cmd) = Self::str_arg(args, 0) {
-                        words.push(shell_squote(&cmd));
-                    }
-                    if let Some(IrExpr::Array(items)) = args.get(1) {
-                        for w in items {
-                            words.push(self.shell_word(w));
-                        }
-                    }
-                    parts.push(words.join(" "));
-                }
-                IrStmt::Expr(IrExpr::Call { func, args }) if func == "test" => {
-                    if let Some(t) = Self::str_arg(args, 0) {
-                        parts.push(format!("test {}", t));
-                    }
-                }
-                _ => {
-                    self.mark_todo("capture body stmt");
-                }
+            if let Some(p) = self.shell_cmd_stmt(s) {
+                parts.push(p);
+            } else {
+                self.mark_todo("capture body stmt");
             }
         }
         parts.join(sep)
+    }
+
+    /// One statement as shell text (None → not reconstructable).
+    fn shell_cmd_stmt(&mut self, s: &IrStmt) -> Option<String> {
+        match s {
+            IrStmt::Expr(e) => self.shell_cmd_expr(e),
+            IrStmt::Assign { targets, expr } => {
+                let t = targets.first()?;
+                let lhs = if !t.indices.is_empty() {
+                    format!("{}[{}]", t.var, self.shell_unquoted(&t.indices[0]))
+                } else {
+                    t.var.clone()
+                };
+                let v = self.shell_word(expr);
+                Some(format!("{lhs}={v}"))
+            }
+            IrStmt::For { var, iter, body } => {
+                let items = match iter {
+                    IrExpr::Array(items) => items
+                        .iter()
+                        .map(|i| self.shell_word(i))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    IrExpr::Call { func, args } if func == "brace" => self
+                        .brace_list(args)
+                        .iter()
+                        .map(|s| shell_squote(s))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    other => self.shell_unquoted(other),
+                };
+                // sh owns the loop var (read-assigned): refs stay sh-level
+                self.sh_owned = true;
+                let body = self.shell_cmd(body, "; ");
+                Some(format!("for {var} in {items}; do {body}; done"))
+            }
+            IrStmt::While { cond, body } => {
+                let c = self.shell_cmd_expr(cond)?;
+                // sh owns the loop var (read-assigned): refs stay sh-level
+                self.sh_owned = true;
+                let body = self.shell_cmd(body, "; ");
+                Some(format!("while {c}; do {body}; done"))
+            }
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                let c = self.shell_cmd_expr(cond)?;
+                // sh-owned body (if/elif branches): refs stay sh-level
+                self.sh_owned = true;
+                let then = self.shell_cmd(then, "; ");
+                let mut out = format!("if {c}; then {then};");
+                for (ec, body) in elsifs {
+                    let ec = self.shell_cmd_expr(ec)?;
+                    let b = self.shell_cmd(body, "; ");
+                    out.push_str(&format!(" elif {ec}; then {b};"));
+                }
+                if !else_.is_empty() {
+                    let e = self.shell_cmd(else_, "; ");
+                    out.push_str(&format!(" else {e};"));
+                }
+                out.push_str(" fi");
+                Some(out)
+            }
+            IrStmt::Exec {
+                cmd, args, redirects, ..
+            } => {
+                let mut words: Vec<String> = Vec::new();
+                if let IrExpr::Str(c, _) = cmd {
+                    words.push(shell_squote(c));
+                }
+                if let Some(IrExpr::Array(items)) = args.first() {
+                    for w in items {
+                        words.push(self.shell_word(w));
+                    }
+                }
+                let mut cmd = words.join(" ");
+                if !redirects.is_empty() {
+                    let (pre, suf) = self.shell_redirs_expr(&IrExpr::Array(redirects.clone()));
+                    cmd = if pre.is_empty() {
+                        format!("{cmd}{suf}")
+                    } else {
+                        format!("{} | {cmd}{suf}", pre.join(" | "))
+                    };
+                }
+                Some(cmd)
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                let cmd = self.shell_cmd(inner, "; ");
+                let (pre, suf) = self.shell_redirs_typed(redirects);
+                Some(if pre.is_empty() {
+                    format!("{cmd}{suf}")
+                } else {
+                    format!("{} | {cmd}{suf}", pre.join(" | "))
+                })
+            }
+            IrStmt::Subshell(body) => {
+                let b = self.shell_cmd(body, "; ");
+                Some(format!("({b})"))
+            }
+            _ => None,
+        }
+    }
+
+    /// One expression as shell text (None → not reconstructable).
+    fn shell_cmd_expr(&mut self, e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Call { func, args } => self.shell_cmd_call(func, args),
+            IrExpr::BinOp { lhs, op, rhs } => match op {
+                BinOpKind::And | BinOpKind::Or => {
+                    let l = self.shell_cmd_expr(lhs)?;
+                    let r = self.shell_cmd_expr(rhs)?;
+                    Some(format!(
+                        "{l} {} {r}",
+                        if *op == BinOpKind::And { "&&" } else { "||" }
+                    ))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn shell_cmd_call(&mut self, func: &str, args: &[IrExpr]) -> Option<String> {
+        match func {
+            "exec" => {
+                let mut words: Vec<String> = Vec::new();
+                if let Some(cmd) = Self::str_arg(args, 0) {
+                    words.push(shell_squote(&cmd));
+                }
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for w in items {
+                        words.push(self.shell_word(w));
+                    }
+                }
+                // command-scoped env: `IFS=: cmd` — sh supports the prefix
+                let env_prefix: String = match args.get(2) {
+                    Some(IrExpr::Object(pairs)) => pairs
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, self.shell_unquoted(v)))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    _ => String::new(),
+                };
+                let cmd = words.join(" ");
+                Some(if env_prefix.is_empty() {
+                    cmd
+                } else {
+                    format!("{env_prefix} {cmd}")
+                })
+            }
+            "test" => Self::str_arg(args, 0).map(|t| format!("test {}", t)),
+            "pipeline" => {
+                let mut stages: Vec<String> = Vec::new();
+                if let Some(IrExpr::Array(items)) = args.first() {
+                    for it in items {
+                        if let IrExpr::Arrow(stmts) = it {
+                            stages.push(self.shell_cmd(stmts, "; "));
+                        }
+                    }
+                }
+                if stages.is_empty() {
+                    None
+                } else {
+                    Some(stages.join(" | "))
+                }
+            }
+            "redirect" => {
+                let inner = args.first().and_then(|a| match a {
+                    IrExpr::Arrow(stmts) => Some(self.shell_cmd(stmts, "; ")),
+                    _ => None,
+                })?;
+                let (pre, suf) = args
+                    .get(1)
+                    .map(|s| self.shell_redirs_expr(s))
+                    .unwrap_or_default();
+                Some(if pre.is_empty() {
+                    format!("{inner}{suf}")
+                } else {
+                    format!("{} | {inner}{suf}", pre.join(" | "))
+                })
+            }
+            "and" | "or" => {
+                let l = args.first().and_then(|a| match a {
+                    IrExpr::Arrow(stmts) => Some(self.shell_cmd(stmts, "; ")),
+                    _ => None,
+                })?;
+                let r = args.get(1).and_then(|a| match a {
+                    IrExpr::Arrow(stmts) => Some(self.shell_cmd(stmts, "; ")),
+                    _ => None,
+                })?;
+                let op = if func == "and" { "&&" } else { "||" };
+                Some(format!("{l} {op} {r}"))
+            }
+            "capture" | "captureWords" => {
+                let inner = args.first().and_then(|a| match a {
+                    IrExpr::Arrow(stmts) => Some(self.shell_cmd(stmts, "; ")),
+                    _ => None,
+                })?;
+                Some(format!("$({inner})"))
+            }
+            "whileLoop" => {
+                // whileLoop(condArrow, bodyArrow)
+                let c = args.first().and_then(|a| match a {
+                    IrExpr::Arrow(stmts) => Some(self.shell_cmd(stmts, "; ")),
+                    _ => None,
+                })?;
+                let b = args.get(1).and_then(|a| match a {
+                    IrExpr::Arrow(stmts) => Some(self.shell_cmd(stmts, "; ")),
+                    _ => None,
+                })?;
+                // sh owns the loop vars (read-assigned): refs stay sh-level
+                self.sh_owned = true;
+                Some(format!("while {c}; do {b}; done"))
+            }
+            "grepMatches" => {
+                // `echo ... | grep -o pat` lowered by the core to a capture
+                let t = args.first().map(|a| self.shell_unquoted(a))?;
+                let p = args.get(1).map(|a| self.shell_unquoted(a))?;
+                Some(format!("printf '%s\\n' {t} | grep -o {p}"))
+            }
+            "contains" => {
+                let t = args.first().map(|a| self.shell_unquoted(a))?;
+                let p = args.get(1).map(|a| self.shell_unquoted(a))?;
+                Some(format!("printf '%s\\n' {t} | grep -q {p}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Redirect specs as shell text (fd/mode/target/interpolate objects —
+    /// the `redirect` CALL form). Returns (producers, suffix): a herestring
+    /// must feed the command from the LEFT (`printf ... | cmd`), so it is
+    /// returned as a producer rather than a suffix.
+    fn shell_redirs_expr(&mut self, specs: &IrExpr) -> (Vec<String>, String) {
+        let mut pre: Vec<String> = Vec::new();
+        let mut suf = String::new();
+        if let IrExpr::Array(items) = specs {
+            for it in items {
+                if let IrExpr::Json(serde_json::Value::Object(o)) = it {
+                    let fd = o.get("fd").and_then(|v| v.as_i64()).unwrap_or(1);
+                    let mode = o.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+                    let interp = o.get("interpolate").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let t = o.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                    match mode {
+                        "w" | "a" | "r+" => {
+                            let op = match (fd, mode) {
+                                (2, "a") => "2>>",
+                                (2, _) => "2>",
+                                (_, "a") => ">>",
+                                _ => ">",
+                            };
+                            suf.push_str(&format!(" {op} {}", shell_squote(t)));
+                        }
+                        "r" => suf.push_str(&format!(" < {}", shell_squote(t))),
+                        "heredoc" | "heredoc-tabs" => {
+                            let body = if mode == "heredoc-tabs" {
+                                strip_leading_tabs(t)
+                            } else {
+                                t.to_string()
+                            };
+                            let body = if interp {
+                                body
+                            } else {
+                                // literal heredoc: sh must NOT interpolate
+                                body.replace('$', "\\$")
+                            };
+                            self.heredoc_id += 1;
+                            let marker = format!("__SH2_EOF_{}", self.heredoc_id);
+                            let q = if interp { "" } else { "'" };
+                            suf.push_str(&format!(" <<{q}{marker}{q}\n{body}{marker}"));
+                        }
+                        "herestring" => {
+                            // dash has no `<<<`; feed via printf (adds one \n)
+                            pre.push(format!("printf '%s\\n' {}", shell_squote(t)));
+                        }
+                        _ => self.mark_todo(&format!("redirect spec mode {mode}")),
+                    }
+                }
+            }
+        }
+        (pre, suf)
+    }
+
+    /// Typed IrRedirect specs as shell text. Same (producers, suffix) shape.
+    fn shell_redirs_typed(&mut self, rs: &[IrRedirect]) -> (Vec<String>, String) {
+        let mut pre: Vec<String> = Vec::new();
+        let mut suf = String::new();
+        for r in rs {
+            let fd = r.fd.unwrap_or(1);
+            match r.mode.as_str() {
+                "w" | "a" | "r+" => {
+                    let op = match (fd, r.mode.as_str()) {
+                        (2, "a") => "2>>",
+                        (2, _) => "2>",
+                        (_, "a") => ">>",
+                        _ => ">",
+                    };
+                    suf.push_str(&format!(" {op} {}", self.shell_word(&r.target)));
+                }
+                "r" => suf.push_str(&format!(" < {}", self.shell_word(&r.target))),
+                "heredoc" | "heredoc-tabs" => {
+                    let body = match &r.target {
+                        IrExpr::Str(s, _) => {
+                            if r.mode == "heredoc-tabs" {
+                                strip_leading_tabs(s)
+                            } else {
+                                s.clone()
+                            }
+                        }
+                        other => self.shell_unquoted(other),
+                    };
+                    let body = if r.interpolate {
+                        body
+                    } else {
+                        body.replace('$', "\\$")
+                    };
+                    self.heredoc_id += 1;
+                    let marker = format!("__SH2_EOF_{}", self.heredoc_id);
+                    let q = if r.interpolate { "" } else { "'" };
+                    suf.push_str(&format!(" <<{q}{marker}{q}\n{body}{marker}"));
+                }
+                "herestring" => {
+                    pre.push(format!("printf '%s\\n' {}", self.shell_word(&r.target)));
+                }
+                _ => self.mark_todo(&format!("redirect mode {}", r.mode)),
+            }
+        }
+        (pre, suf)
+    }
+
+    /// Render an expression as UNQUOTED shell text (heredoc bodies, printf
+    /// args): literals raw, `$var` refs in sh syntax.
+    fn shell_unquoted(&mut self, e: &IrExpr) -> String {
+        match e {
+            IrExpr::Str(s, _) => s.clone(),
+            IrExpr::Int(n) => n.to_string(),
+            IrExpr::Interpolate(parts) => {
+                let mut out = String::new();
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(s) => out.push_str(s),
+                        InterpPart::Expr(x) => {
+                            if let IrExpr::Call { func, args } = x.as_ref() {
+                                if func == "getVar" {
+                                    if let Some(name) = Self::str_arg(args, 0) {
+                                        out.push_str(&self.shell_var_ref(&name));
+                                        continue;
+                                    }
+                                }
+                            }
+                            out.push_str("$(");
+                            out.push_str(&self.expr(x));
+                            out.push(')');
+                        }
+                    }
+                }
+                out
+            }
+            IrExpr::Call { func, args } if func == "getVar" => {
+                if let Some(name) = Self::str_arg(args, 0) {
+                    if self.sh_owned {
+                        self.shell_var_ref(&name)
+                    } else {
+                        self.var_ref(&name)
+                    }
+                } else {
+                    String::new()
+                }
+            }
+            other => format!("$({})", self.expr(other)),
+        }
+    }
+
+    /// Shell-syntax variable reference (`$name` — NOT perl `$ENV{..}`),
+    /// for reconstructed commands run under /bin/sh.
+    fn shell_var_ref(&mut self, name: &str) -> String {
+        match name {
+            "?" => "$?".to_string(),
+            "$" => "$$".to_string(),
+            "@" | "*" => "$@".to_string(),
+            "#" => "$#".to_string(),
+            "!" => "$!".to_string(),
+            "-" => "$-".to_string(),
+            "0" => "$0".to_string(),
+            n if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() => format!("${n}"),
+            _ => format!("${}", ident(name)),
+        }
     }
 
     fn qx(&mut self, cmd: &str) -> String {
@@ -334,6 +783,22 @@ impl Render {
                 '$' => out.push_str("\\$"),
                 '@' => out.push_str("\\@"),
                 '\\' => out.push_str("\\\\"),
+                '{' => out.push_str("\\{"),
+                '}' => out.push_str("\\}"),
+                c => out.push(c),
+            }
+        }
+        format!("qx{{{out}}}")
+    }
+
+    /// qx body where `$var` refs interpolate at the PERL level (the
+    /// variable's perl value, matching bash's variable). Only the `{`/`}`
+    /// qx delimiters are escaped; literal `$`s are already perl-escaped by
+    /// `shell_squote` (`\$` → perl passes `$`).
+    fn qx_raw(&mut self, cmd: &str) -> String {
+        let mut out = String::new();
+        for c in cmd.chars() {
+            match c {
                 '{' => out.push_str("\\{"),
                 '}' => out.push_str("\\}"),
                 c => out.push(c),
@@ -473,6 +938,16 @@ impl Render {
             IrExpr::Call { func, args } if func == "exec" || func == "let" => {
                 format!("(({}) == 0)", self.expr(e))
             }
+            IrExpr::Call { func, .. }
+                if matches!(
+                    func.as_str(),
+                    "capture" | "captureWords" | "pipeline" | "redirect" | "and" | "or"
+                ) =>
+            {
+                // a qx/pipeline runs the command and sets $? — bash tests
+                // the STATUS, not the (possibly empty) captured output
+                format!("do {{ my $__o = {}; ($? == 0) }}", self.expr(e))
+            }
             _ => self.expr(e),
         }
     }
@@ -505,11 +980,43 @@ impl Render {
         }
     }
 
+    /// The reconstruction string → qx: sh-owned constructs (while/for/if
+    /// with read-assigned vars) need escaped sh-level refs; plain commands
+    /// interpolate the perl vars directly (qx_raw).
+    fn shell_qx(&mut self, cmd: &str) -> String {
+        if self.sh_owned {
+            self.sh_owned = false;
+            self.qx_sh(cmd)
+        } else {
+            self.qx_raw(cmd)
+        }
+    }
+
+    /// qx body for sh-owned reconstructions: `$var` refs stay literal for
+    /// PERL (escaped) so the sh child interpolates its own vars — but the
+    /// backslashes are NOT re-escaped (the literals were already
+    /// perl-escaped by `shell_squote`).
+    fn qx_sh(&mut self, cmd: &str) -> String {
+        let mut out = String::new();
+        for c in cmd.chars() {
+            match c {
+                '$' => out.push_str("\\$"),
+                '@' => out.push_str("\\@"),
+                '{' => out.push_str("\\{"),
+                '}' => out.push_str("\\}"),
+                c => out.push(c),
+            }
+        }
+        format!("qx{{{out}}}")
+    }
+
     fn capture_from_expr(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Arrow(stmts) => {
+                self.sh_owned = false;
                 let cmd = self.shell_cmd(stmts, "; ");
-                self.qx(&cmd)
+                // bash cmdsub strips trailing newlines
+                format!("do {{ my $__c = {}; chomp $__c; $__c }}", self.shell_qx(&cmd))
             }
             other => {
                 self.mark_todo("capture expr");
@@ -789,8 +1296,10 @@ impl Render {
             "exec" => self.exec_expr(args),
             "capture" | "captureWords" => match args.first() {
                 Some(IrExpr::Arrow(stmts)) => {
+                    self.sh_owned = false;
                     let cmd = self.shell_cmd(stmts, "; ");
-                    self.qx(&cmd)
+                    // bash cmdsub strips trailing newlines
+                    format!("do {{ my $__c = {}; chomp $__c; $__c }}", self.shell_qx(&cmd))
                 }
                 other => {
                     self.mark_todo(&format!("{func} arg"));
@@ -810,7 +1319,7 @@ impl Render {
                     self.mark_todo("pipeline stages");
                     return "0".into();
                 }
-                self.qx(&stages.join(" | "))
+                self.shell_qx(&stages.join(" | "))
             }
             "brace" => self.brace(args),
             "join" => match args.first() {
@@ -888,13 +1397,23 @@ impl Render {
                 }
             },
             "redirect" => {
-                if let Some(IrExpr::Arrow(stmts)) = args.first() {
-                    self.mark_todo("redirect specs");
-                    self.arrow_expr(stmts)
-                } else {
+                // expr-position redirect: run the reconstructed command via
+                // qx (output to the redirect target), truthy on exit 0
+                let Some(IrExpr::Arrow(stmts)) = args.first() else {
                     self.mark_todo("redirect arg");
-                    "0".into()
-                }
+                    return "0".into();
+                };
+                let cmd = self.shell_cmd(stmts, "; ");
+                let (pre, suf) = args
+                    .get(1)
+                    .map(|s| self.shell_redirs_expr(s))
+                    .unwrap_or_default();
+                let full = if pre.is_empty() {
+                    format!("{cmd}{suf}")
+                } else {
+                    format!("{} | {cmd}{suf}", pre.join(" | "))
+                };
+                format!("do {{ my $__o = {}; ($? == 0) }}", self.shell_qx(&full))
             }
             "block" | "subshell" => match args.first() {
                 Some(IrExpr::Arrow(stmts)) => self.arrow_expr(stmts),
@@ -909,8 +1428,77 @@ impl Render {
                 "0".into()
             }
             "shopt" => {
-                self.mark_todo("shopt");
-                "1".into()
+                // shell option toggles — no effect on the lowable subset
+                "1".to_string()
+            }
+            "split" => match args.first() {
+                Some(IrExpr::Call { func, args: ga }) if func == "getVar" => {
+                    if let Some(name) = Self::str_arg(ga, 0) {
+                        let v = self.var_ref(&name);
+                        format!("split(/\\s+/, {v})")
+                    } else {
+                        self.mark_todo("split arg");
+                        "()".to_string()
+                    }
+                }
+                _ => {
+                    self.mark_todo("split arg");
+                    "()".to_string()
+                }
+            },
+            "and" | "or" => {
+                // `a && b` / `a || b` — both sides are command bodies
+                let l = args.first().and_then(|a| match a {
+                    IrExpr::Arrow(stmts) => Some(self.shell_cmd(stmts, "; ")),
+                    _ => None,
+                });
+                let r = args.get(1).and_then(|a| match a {
+                    IrExpr::Arrow(stmts) => Some(self.shell_cmd(stmts, "; ")),
+                    _ => None,
+                });
+                match (l, r) {
+                    (Some(l), Some(r)) => {
+                        let op = if func == "and" { "&&" } else { "||" };
+                        format!(
+                            "do {{ my $__o = {}; ($? == 0) }}",
+                            self.shell_qx(&format!("{l} {op} {r}"))
+                        )
+                    }
+                    _ => {
+                        self.mark_todo(&format!("call {func}"));
+                        "0".into()
+                    }
+                }
+            }
+            "grepMatches" => {
+                // `grep -o` semantics (match-all): perl regex ≈ ERE for the
+                // simple patterns the corpus uses
+                let (Some(text), Some(pat)) = (args.first(), args.get(1)) else {
+                    self.mark_todo("grepMatches args");
+                    return "0".into();
+                };
+                let t = self.expr(text);
+                let p = match pat {
+                    IrExpr::Str(s, _) => brace_escape(&glob_to_regex(s, true)),
+                    _ => String::new(),
+                };
+                format!(
+                    "do {{ my $__t = {t}; my @__m = ($__t =~ /{p}/g); join(\"\\n\", @__m) }}"
+                )
+            }
+            "contains" => {
+                // `echo x | grep y >/dev/null` in a condition — the core
+                // lowers it to contains(text, pattern[, flags])
+                let (Some(text), Some(pat)) = (args.first(), args.get(1)) else {
+                    self.mark_todo("contains args");
+                    return "0".into();
+                };
+                let t = self.expr(text);
+                let p = match pat {
+                    IrExpr::Str(s, _) => brace_escape(&glob_to_regex(s, true)),
+                    _ => String::new(),
+                };
+                format!("do {{ my $__t = {t}; ($__t =~ /{p}/ ? 1 : 0) }}")
             }
             "break" => "do { last; 0 }".to_string(),
             "continue" => "do { next; 0 }".to_string(),
@@ -988,15 +1576,48 @@ impl Render {
             Some(IrExpr::Array(items)) => items.clone(),
             _ => Vec::new(),
         };
-        if self.funcs.contains(&cmd) {
-            let a: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
-            return format!("{}({})", ident(&cmd), a.join(", "));
+        match cmd.as_str() {
+            "read" => {
+                // `while read line` — a line from STDIN; 0 on success
+                let vars: Vec<String> = words
+                    .iter()
+                    .filter(|w| match w {
+                        IrExpr::Str(s, _) => !s.starts_with('-'),
+                        _ => true,
+                    })
+                    .map(|w| match w {
+                        IrExpr::Str(s, _) => self.scalar_target(s),
+                        _ => self.expr(w),
+                    })
+                    .collect();
+                if vars.len() == 1 {
+                    format!(
+                        "do {{ my $__r = <STDIN>; if (defined $__r) {{ chomp $__r; {} = $__r; 0 }} else {{ 1 }} }}",
+                        vars[0]
+                    )
+                } else if vars.is_empty() {
+                    "do { my $__r = <STDIN>; (defined $__r ? 0 : 1) }".to_string()
+                } else {
+                    format!(
+                        "do {{ my $__r = <STDIN>; if (defined $__r) {{ chomp $__r; ({}) = split /\\s+/, $__r; 0 }} else {{ 1 }} }}",
+                        vars.join(", ")
+                    )
+                }
+            }
+            "true" => "0".to_string(),
+            "false" => "256".to_string(),
+            _ => {
+                if self.funcs.contains(&cmd) {
+                    let a: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
+                    return format!("{}({})", ident(&cmd), a.join(", "));
+                }
+                let mut a: Vec<String> = vec![Self::perl_str(&cmd)];
+                for w in &words {
+                    a.push(self.expr(w));
+                }
+                format!("system({})", a.join(", "))
+            }
         }
-        let mut a: Vec<String> = vec![Self::perl_str(&cmd)];
-        for w in &words {
-            a.push(self.expr(w));
-        }
-        format!("system({})", a.join(", "))
     }
 
     /// exec as a STATEMENT — builtins lower natively, externals → system.
@@ -1049,24 +1670,27 @@ impl Render {
             }
             "rm" => {
                 let mut files: Vec<String> = Vec::new();
-                for w in words.iter().filter(|w| match w {
-                    IrExpr::Str(s, _) => !s.starts_with('-'),
-                    _ => true,
-                }) {
-                    for f in self.word_items(w) {
-                        files.push(Self::perl_str(&f));
+                let mut flags: Vec<String> = Vec::new();
+                for w in words.iter() {
+                    match w {
+                        IrExpr::Str(s, _) if s.starts_with('-') => flags.push(s.clone()),
+                        _ => {
+                            for f in self.word_items(w) {
+                                files.push(Self::perl_str(&f));
+                            }
+                        }
                     }
                 }
                 if files.is_empty() {
                     return;
                 }
-                let recursive = words.iter().any(|w| {
-                    matches!(w, IrExpr::Str(s, _) if s == "-r" || s == "-R" || s == "-rf" || s == "-fr")
-                });
-                if recursive {
-                    self.mark_todo("rm -r");
+                if flags.iter().any(|s| s.contains('r')) {
+                    // recursive rm: unlink can't remove directories — the
+                    // real `rm` binary is the faithful native lowering
+                    self.emit(&format!("system('rm', '-rf', {});", files.join(", ")));
+                } else {
+                    self.emit(&format!("unlink {};", files.join(", ")));
                 }
-                self.emit(&format!("unlink {};", files.join(", ")));
             }
             "read" => {
                 let vars: Vec<String> = words
@@ -1105,25 +1729,196 @@ impl Render {
                 if let Some(IrExpr::Str(s, _)) = words.first() {
                     let a = self.arith_str(s);
                     self.emit(&format!("my $__r = {a};"));
-                    self.emit("$? = ($__r != 0 ? 0 : 1);");
+                    self.emit("$? = ($__r != 0 ? 0 : 256);");
                 }
             }
             "true" => self.emit("$? = 0;"),
-            "false" => self.emit("$? = 1;"),
+            "false" => self.emit("$? = 256;"),
             "local" => {
-                self.mark_todo("local");
+                // `local x=val` — dynamic scope: `local $x` on the hoisted
+                // `our $x` (never `my` — lexical scope differs from bash)
+                let mut i = 0;
+                while i < words.len() {
+                    let w = &words[i];
+                    if let IrExpr::Str(s, _) = w {
+                        if s.starts_with('-') && s != "--" {
+                            i += 1;
+                            continue;
+                        }
+                        if s == "--" {
+                            i += 1;
+                            continue;
+                        }
+                        if let Some(eq) = s.find('=') {
+                            let name = s[..eq].to_string();
+                            let val = s[eq + 1..].to_string();
+                            self.locals.insert(name.clone());
+                            if val.is_empty() && i + 1 < words.len() {
+                                // `local x=$(cmd)` — value is the next word
+                                let v = self.expr(&words[i + 1]);
+                                self.emit(&format!("local ${} = {};", ident(&name), v));
+                                i += 2;
+                                continue;
+                            }
+                            let v = self.local_value(&val);
+                            self.emit(&format!("local ${} = {};", ident(&name), v));
+                            i += 1;
+                            continue;
+                        }
+                        self.locals.insert(s.clone());
+                        self.emit(&format!("local ${};", ident(s)));
+                        i += 1;
+                        continue;
+                    }
+                    // `local -a args=(...)` — the setArray word renders the
+                    // store directly (hoisted `my @args` covers the storage)
+                    if let IrExpr::Call { func, args: wa } = w {
+                        if func == "setArray" || func == "setArrayAppend" {
+                            if let Some(name) = Self::str_arg(wa, 0) {
+                                self.arrays.insert(name.clone());
+                                self.hashes.insert(name.clone());
+                            }
+                            let x = self.expr(w);
+                            self.emit(&format!("{x};"));
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    self.mark_todo("local word");
+                    i += 1;
+                }
             }
-            "declare" => {
-                // `declare -A map` / `declare -x NAME` — the hoisted
-                // `my %map;`/`$ENV{NAME}` declarations cover the storage.
+            "declare" | "typeset" | "readonly" => {
+                // `declare -x NAME=val` exports; `declare NAME=val` assigns;
+                // `declare -a arr=(...)` arrives with a setArray word;
+                // `declare -A map` is covered by the hoisted `my %map;`.
+                let mut export_flag = false;
+                let mut vars: Vec<&IrExpr> = Vec::new();
+                for w in &words {
+                    match w {
+                        IrExpr::Str(s, _) if s.starts_with('-') => {
+                            if s.contains('x') {
+                                export_flag = true;
+                            }
+                        }
+                        _ => vars.push(w),
+                    }
+                }
+                for w in vars {
+                    if let IrExpr::Str(s, _) = w {
+                        if let Some(eq) = s.find('=') {
+                            let name = &s[..eq];
+                            let val = &s[eq + 1..];
+                            let v = self.local_value(val);
+                            if export_flag {
+                                self.emit(&format!("$ENV{{{}}} = {v};", name));
+                            } else {
+                                let t = self.scalar_target(name);
+                                self.emit(&format!("{t} = {v};"));
+                            }
+                        }
+                    } else {
+                        // `declare -a arr=(1 2)` — the setArray word renders
+                        // the store directly
+                        let x = self.expr(w);
+                        self.emit(&format!("{x};"));
+                    }
+                }
             }
             "set" => {
-                self.mark_todo("set options");
+                // `set -e -u ...` — option flags are no-ops for the lowable
+                // subset; `set -- a b` / `set a b` resets the positionals.
+                let mut pos: Vec<IrExpr> = Vec::new();
+                let mut only_flags = true;
+                let mut i = 0;
+                while i < words.len() {
+                    let w = &words[i];
+                    if let IrExpr::Str(s, _) = w {
+                        if s == "--" {
+                            i += 1;
+                            only_flags = false;
+                            break;
+                        }
+                        if s.starts_with('-') {
+                            if s == "-o" || s == "-O" {
+                                i += 2; // `-o option` — skip the operand
+                                continue;
+                            }
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    only_flags = false;
+                    break;
+                }
+                if only_flags {
+                    return;
+                }
+                pos.extend(words[i..].iter().cloned());
+                let a: Vec<String> = pos.iter().map(|w| self.expr(w)).collect();
+                if self.in_func > 0 {
+                    self.emit(&format!("@_ = ({});", a.join(", ")));
+                } else {
+                    self.emit(&format!("@ARGV = ({});", a.join(", ")));
+                }
             }
-            "export" | "unset" | "source" | "." | "eval" | "trap" | "return" | "umask"
-            | "type" | "hash" | "builtin" | "enable" | "help" | "logout" | "alias"
-            | "unalias" | "times" | "ulimit" | "wait" | "getopts" | "shopt" => {
+            "export" => {
+                for w in &words {
+                    if let IrExpr::Str(s, _) = w {
+                        if s.starts_with('-') && s != "--" {
+                            continue;
+                        }
+                        if s == "--" {
+                            continue;
+                        }
+                        if let Some(eq) = s.find('=') {
+                            let name = &s[..eq];
+                            let val = &s[eq + 1..];
+                            let v = self.local_value(val);
+                            self.emit(&format!("$ENV{{{}}} = {v};", name));
+                        } else {
+                            let v = self.var_ref(s);
+                            self.emit(&format!("$ENV{{{}}} = {v};", s));
+                        }
+                    } else {
+                        self.mark_todo("export word");
+                    }
+                }
+            }
+            "unset" => {
+                for w in &words {
+                    if let IrExpr::Str(s, _) = w {
+                        if s.starts_with('-') && s != "--" {
+                            continue;
+                        }
+                        if s == "--" {
+                            continue;
+                        }
+                        if is_env_style_var_name(s) {
+                            self.emit(&format!("delete $ENV{{{s}}};"));
+                        } else {
+                            // bash `unset x` clears every flavor of the name
+                            self.scalars.insert(s.clone());
+                            self.arrays.insert(s.clone());
+                            self.hashes.insert(s.clone());
+                            self.emit(&format!("undef ${};", ident(s)));
+                            self.emit(&format!("undef @{};", ident(s)));
+                            self.emit(&format!("undef %{};", ident(s)));
+                        }
+                    }
+                }
+            }
+            "shopt" => {
+                // option toggles — no effect on the lowable subset
+            }
+            "source" | "." | "eval" | "trap" | "return" | "umask" | "type" | "hash"
+            | "builtin" | "enable" | "help" | "logout" | "alias" | "unalias"
+            | "times" | "ulimit" | "getopts" => {
                 self.mark_todo(&format!("builtin {cmd}"));
+            }
+            "wait" => {
+                // `wait` — reap every child (bash waits for all jobs)
+                self.emit("1 while wait() > 0;");
             }
             _ => {
                 if self.funcs.contains(&cmd) {
@@ -1192,12 +1987,65 @@ impl Render {
             return;
         };
         let fmt_str = self.expr(fmt);
+        let fmt_lit = match fmt {
+            IrExpr::Str(s, _) => Some(s.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                Some(
+                    parts
+                        .iter()
+                        .map(|p| match p {
+                            InterpPart::Lit(s) => s.clone(),
+                            _ => String::new(),
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
         if words.len() == 1 {
-            self.emit(&format!("print {fmt_str};"));
+            match &fmt_lit {
+                Some(s) => self.emit(&format!("print {};", Self::perl_str(&bash_printf_unescape(s)))),
+                None => self.emit(&format!("print {fmt_str};")),
+            }
             return;
         }
+        // bash printf interprets backslash escapes in the FORMAT; perl
+        // printf does not — unescape literal formats so the output matches
+        let fmt_str = match &fmt_lit {
+            Some(s) => Self::perl_str(&bash_printf_unescape(s)),
+            None => fmt_str,
+        };
         let args: Vec<String> = words[1..].iter().map(|w| self.expr(w)).collect();
-        self.emit(&format!("printf({fmt_str}, {});", args.join(", ")));
+        // bash printf CYCLES the format over the args; perl printf only
+        // consumes the first chunk — loop when there are more args than
+        // format specifiers, or when the arg count is runtime-dependent
+        // (a split word expands to any number of args)
+        let nspec = fmt_lit
+            .as_ref()
+            .map(|s| count_format_specs(s))
+            .unwrap_or(1);
+        let dynamic = words[1..].iter().any(|w| {
+            matches!(
+                w,
+                IrExpr::Call { func, .. } if func == "split" || func == "listVar" || func == "arrayItems"
+            )
+        });
+        if nspec > 0 && (dynamic || args.len() > nspec) {
+            self.emit(&format!("my @__a = ({});", args.join(", ")));
+            self.emit("my $__i = 0;");
+            self.emit(&format!("while ($__i * {nspec} <= $#__a) {{"));
+            self.depth += 1;
+            self.emit(&format!(
+                "printf({fmt_str}, @__a[$__i*{nspec} .. ($__i+1)*{nspec}-1]);"
+            ));
+            self.emit("$__i++;");
+            self.depth -= 1;
+            self.emit("}");
+        } else {
+            self.emit(&format!("printf({fmt_str}, {});", args.join(", ")));
+        }
     }
 
     // ── test expressions ─────────────────────────────────────────────
@@ -1208,7 +2056,7 @@ impl Render {
         // single-token forms with an embedded operator: `$(uname -r)==5.4.*`
         let trimmed = s.trim();
         if !trimmed.contains(' ') {
-            for op in ["==", "!=", "="] {
+            for op in ["==", "!=", "=~", "="] {
                 if let Some(pos) = trimmed.find(op) {
                     let (a, b) = (
                         trimmed[..pos].trim().to_string(),
@@ -1268,36 +2116,250 @@ impl Render {
         if toks.is_empty() {
             return "0".to_string();
         }
-        // `!` negation
-        if toks[0] == "!" {
-            let inner = self.test_tokens_parse(&toks[1..]);
-            return format!("(!{inner})");
-        }
-        // `&&` / `||` at top level
-        for (i, t) in toks.iter().enumerate() {
+        // Rejoin fragments split by embedded spaces inside quotes/cmdsubs/
+        // braces: `"$(wc -l < "` + `"$file"` + `)"` → `"$(wc -l < "$file")"`.
+        let merged = self.test_merge(toks);
+        // `&&` / `||` at the top level ([[ ]] combinators)
+        for (i, t) in merged.iter().enumerate() {
             if t == "&&" || t == "||" {
-                let l = self.test_tokens_parse(&toks[..i]);
-                let r = self.test_tokens_parse(&toks[i + 1..]);
+                let l = self.test_tokens_parse(&merged[..i]);
+                let r = self.test_tokens_parse(&merged[i + 1..]);
                 return format!("({l} {} {r})", if t == "&&" { "&&" } else { "||" });
             }
         }
+        self.test_or(&merged)
+    }
+
+    /// Rejoin tokens split by embedded spaces (see test_tokens_parse).
+    fn test_merge(&mut self, toks: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut in_quote = false;
+        let mut depth = 0i32; // $( ... ) nesting
+        let mut braces = 0i32; // ${ ... }
+        for t in toks {
+            if cur.is_empty() {
+                cur = t.clone();
+            } else {
+                cur.push(' ');
+                cur.push_str(t);
+            }
+            let chars: Vec<char> = t.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let c = chars[i];
+                if c == '\\' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
+                }
+                match c {
+                    '"' => {
+                        if depth == 0 {
+                            in_quote = !in_quote;
+                        }
+                    }
+                    '(' => depth += 1,
+                    ')' => depth = (depth - 1).max(0),
+                    '{' => braces += 1,
+                    '}' => braces = (braces - 1).max(0),
+                    _ => {}
+                }
+                i += 1;
+            }
+            if !in_quote && depth <= 0 && braces <= 0 {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        // The core's A1 test strings fuse operators with operands
+        // (`"$2"=="test"` — no spaces around `==`): split them.
+        let mut split = Vec::new();
+        for t in out {
+            split.extend(self.test_split_fused_op(&t));
+        }
+        split
+    }
+
+    /// Split a fused `a==b` / `a=b` / `a!=b` / `a=~re` token (the core's
+    /// test serialization drops the spaces around comparison operators).
+    fn test_split_fused_op(&mut self, t: &str) -> Vec<String> {
+        let chars: Vec<char> = t.chars().collect();
+        let mut in_quote = false;
+        let mut depth = 0i32;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\\' && i + 1 < chars.len() {
+                i += 2;
+                continue;
+            }
+            match c {
+                '"' => {
+                    if depth == 0 {
+                        in_quote = !in_quote;
+                    }
+                }
+                '(' => depth += 1,
+                ')' => depth = (depth - 1).max(0),
+                '=' | '!' if depth == 0 && !in_quote => {
+                    // skip the SECOND char of `==`/`!=` (its `=` follows the
+                    // operator's first char)
+                    if c == '=' && i > 0 && (chars[i - 1] == '=' || chars[i - 1] == '!') {
+                        i += 1;
+                        continue;
+                    }
+                    let op_len = if c == '=' && i + 1 < chars.len() && chars[i + 1] == '=' {
+                        2
+                    } else if c == '=' && i + 1 < chars.len() && chars[i + 1] == '~' {
+                        2
+                    } else if c == '!' && i + 1 < chars.len() && chars[i + 1] == '=' {
+                        2
+                    } else if c == '=' && i > 0 {
+                        1
+                    } else {
+                        0
+                    };
+                    if op_len > 0 {
+                        let left = chars[..i].iter().collect::<String>();
+                        let right = chars[i + op_len..].iter().collect::<String>();
+                        if !right.is_empty() && (i > 0 || op_len == 2) {
+                            let op: String = chars[i..i + op_len].iter().collect();
+                            if left.trim().is_empty() {
+                                // `=="test"` — the op fused with the RIGHT
+                                // operand only
+                                return vec![op, right.trim().to_string()];
+                            }
+                            let mut out = vec![left.trim().to_string(), op];
+                            out.push(right.trim().to_string());
+                            return out;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        vec![t.to_string()]
+    }
+
+    /// `-o` (lowest precedence), then `-a`, then `!`/parens, then primaries.
+    fn test_or(&mut self, toks: &[String]) -> String {
+        let mut depth = 0;
+        for (i, t) in toks.iter().enumerate() {
+            match t.as_str() {
+                "(" | "\\(" => depth += 1,
+                ")" | "\\)" => depth = (depth - 1).max(0),
+                "-o" if depth == 0 && i > 0 && i + 1 < toks.len() => {
+                    let l = self.test_and(&toks[..i]);
+                    let r = self.test_or(&toks[i + 1..]);
+                    return format!("({l} || {r})");
+                }
+                _ => {}
+            }
+        }
+        self.test_and(toks)
+    }
+
+    fn test_and(&mut self, toks: &[String]) -> String {
+        let mut depth = 0;
+        for (i, t) in toks.iter().enumerate() {
+            match t.as_str() {
+                "(" | "\\(" => depth += 1,
+                ")" | "\\)" => depth = (depth - 1).max(0),
+                "-a" if depth == 0 && i > 0 && i + 1 < toks.len() => {
+                    let l = self.test_not(&toks[..i]);
+                    let r = self.test_and(&toks[i + 1..]);
+                    return format!("({l} && {r})");
+                }
+                _ => {}
+            }
+        }
+        self.test_not(toks)
+    }
+
+    fn test_not(&mut self, toks: &[String]) -> String {
+        if let Some(first) = toks.first() {
+            if first == "!" {
+                return format!("(!{})", self.test_not(&toks[1..]));
+            }
+            if first == "(" || first == "\\(" {
+                // parenthesized group — find the matching close
+                let mut depth = 0;
+                for (i, t) in toks.iter().enumerate() {
+                    match t.as_str() {
+                        "(" | "\\(" => depth += 1,
+                        ")" | "\\)" => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return self.test_or(&toks[1..i]);
+                            }
+                        }
+                        _ => {
+                            // `"target"\)` — the close fused onto an operand
+                            if t.ends_with("\\)") && t.len() > 2 {
+                                depth -= 1;
+                                if depth == 0 {
+                                    let mut inner: Vec<String> = toks[1..i].to_vec();
+                                    inner.push(t[..t.len() - 2].to_string());
+                                    return self.test_or(&inner);
+                                }
+                            }
+                        }
+                    }
+                }
+                return self.test_primary(toks);
+            }
+            // `\(!` — a paren fused with `!` (no space in the source)
+            if first.starts_with("\\(") && first.len() > 2 {
+                let mut new_toks: Vec<String> =
+                    vec!["\\(".to_string(), first[2..].to_string()];
+                new_toks.extend(toks[1..].iter().cloned());
+                return self.test_not(&new_toks);
+            }
+        }
+        self.test_primary(toks)
+    }
+
+    fn test_primary(&mut self, toks: &[String]) -> String {
         match toks.len() {
             1 => {
                 let v = self.test_value(&toks[0]);
                 format!("({v})")
             }
             2 => {
-                // -n/-z/file tests
                 let (flag, v) = (&toks[0], self.test_value(&toks[1]));
+                // `!-e` fused negation (`[ !-e file ]`)
+                if let Some(rest) = flag.strip_prefix('!') {
+                    if matches!(
+                        rest,
+                        "-n" | "-z" | "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x"
+                            | "-L" | "-h" | "-S" | "-p" | "-b" | "-c" | "-g" | "-k"
+                            | "-t" | "-u" | "-G" | "-O" | "-N" | "-a"
+                    ) {
+                        let inner = format!("({rest} ({v}))");
+                        return format!("(!{inner})");
+                    }
+                }
                 match flag.as_str() {
                     "-n" => format!("(({v}) ne \"\")"),
                     "-z" => format!("(({v}) eq \"\")"),
-                    "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L" | "-S" | "-p"
-                    | "-b" | "-c" | "-g" | "-k" | "-t" | "-u" | "-G" | "-O" | "-N" => {
-                        let pf = if flag == "-a" { "-e" } else { flag };
+                    "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L" | "-h"
+                    | "-S" | "-p" | "-b" | "-c" | "-g" | "-k" | "-t" | "-u" | "-G"
+                    | "-O" | "-N" => {
+                        // bash `-h`/`-L` = symlink = perl `-l`
+                        let pf = if flag == "-h" || flag == "-L" {
+                            "-l"
+                        } else if flag == "-a" {
+                            "-e"
+                        } else {
+                            flag
+                        };
                         format!("({pf} ({v}))")
                     }
                     "-a" => format!("(-e ({v}))"),
+                    "-o" | "-O" => "0".to_string(),
                     _ => {
                         self.mark_todo(&format!("test flag {flag}"));
                         "0".into()
@@ -1309,9 +2371,19 @@ impl Render {
                 let raw_a = a.clone();
                 let raw_b = b.clone();
                 let (l, r) = (self.test_value(a), self.test_value(b));
-                if op == "-nt" || op == "-ot" || op == "-ef" {
-                    self.mark_todo(&format!("test {op}"));
-                    return "0".into();
+                match op.as_str() {
+                    "-nt" => {
+                        return format!("((stat({l}))[9] > (stat({r}))[9])");
+                    }
+                    "-ot" => {
+                        return format!("((stat({l}))[9] < (stat({r}))[9])");
+                    }
+                    "-ef" => {
+                        return format!(
+                            "((stat({l}))[0] == (stat({r}))[0] && (stat({l}))[1] == (stat({r}))[1])"
+                        );
+                    }
+                    _ => {}
                 }
                 self.test_compare(op, &l, &r, &raw_a, &raw_b)
             }
@@ -1330,7 +2402,12 @@ impl Render {
             "-le" => format!("({l} <= {r})"),
             "-eq" => format!("({l} == {r})"),
             "-ne" => format!("({l} != {r})"),
-            "=" | "==" | "!=" => {
+            "=" | "==" | "!=" | "=~" => {
+                if op == "=~" {
+                    // `[[ a =~ regex ]]` — unanchored perl regex
+                    let re = brace_escape(r);
+                    return format!("(({l}) =~ m{{{re}}})");
+                }
                 let has_glob = raw_l.contains('*')
                     || raw_l.contains('?')
                     || raw_r.contains('*')
@@ -1360,7 +2437,7 @@ impl Render {
     }
 
     /// A test operand: `"$x"`/`'$x'`/`$x` → var ref; quoted text → string;
-    /// number → literal; bareword → string.
+    /// number → literal; bareword → string; `$(cmd)` → runtime qx.
     fn test_value(&mut self, t: &str) -> String {
         let t = t.trim();
         let inner = t
@@ -1368,6 +2445,10 @@ impl Render {
             .and_then(|s| s.strip_suffix('"'))
             .or_else(|| t.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
             .unwrap_or(t);
+        // command substitution: `"$(cmd)"` / `$(cmd)` — run at test time
+        if inner.starts_with("$(") && inner.ends_with(')') {
+            return self.qx(&inner[2..inner.len() - 1]);
+        }
         if let Some(name) = inner.strip_prefix('$') {
             if !name.is_empty() {
                 return self.var_ref(name);
@@ -1515,6 +2596,17 @@ impl Render {
                     return format!("@{}", ident(&name));
                 }
                 let off = args.get(2).map(|a| self.expr(a)).unwrap_or_else(|| "0".into());
+                // `${arr[@]:off:len}` and `${x:off:len}` share the node shape
+                // (slice, name, off, len): an already-registered array var is
+                // an array slice, anything else is a scalar substring
+                if self.arrays.contains(&name) {
+                    self.arrays.insert(name.clone());
+                    let len = args.get(3).map(|a| self.expr(a)).unwrap_or_else(|| "0".into());
+                    if len == "0" {
+                        return format!("@{}[{off}..$#{}]", ident(&name), ident(&name));
+                    }
+                    return format!("@{}[{off}..({off})+({len})-1]", ident(&name));
+                }
                 match args.get(3) {
                     Some(IrExpr::Str(s, _)) if s.is_empty() => format!("substr({v}, {off})"),
                     Some(a) => format!("substr({v}, {off}, {})", self.expr(a)),
@@ -1524,13 +2616,13 @@ impl Render {
             "#" | "##" => {
                 // shortest/longest prefix removal
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
-                let re = glob_to_regex(&pat, op == "#");
+                let re = glob_to_regex(&pat, op != "#");
                 let re = brace_escape(&re);
                 format!("do {{ my $__t = {v}; $__t =~ s{{^{re}}}//; $__t }}")
             }
             "%" | "%%" => {
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
-                let re = glob_to_regex(&pat, op == "%");
+                let re = glob_to_regex(&pat, op != "%");
                 let re = brace_escape(&re);
                 format!("do {{ my $__t = {v}; $__t =~ s{{{re}$}}//; $__t }}")
             }
@@ -1633,9 +2725,22 @@ impl Render {
                         if stages.is_empty() {
                             self.mark_todo("pipeline stages");
                         } else {
-                            let cmd = self.qx(&stages.join(" | "));
-                            self.emit(&format!("{cmd};"));
+                            // a bare pipeline statement PRINTS its stdout
+                            let cmd = self.shell_qx(&stages.join(" | "));
+                            self.emit(&format!("print {cmd};"));
                         }
+                    }
+                    "redirect" => {
+                        // statement-level redirect: native fd redirection
+                        // around the (natively rendered) body
+                        let (Some(IrExpr::Arrow(stmts)), Some(specs)) =
+                            (args.first(), args.get(1))
+                        else {
+                            self.mark_todo("redirect stmt args");
+                            return;
+                        };
+                        let m = self.mini_redirs_from_expr(specs);
+                        self.native_redirect(stmts, &m);
                     }
                     "break" => self.emit("last;"),
                     "continue" => self.emit("next;"),
@@ -1798,7 +2903,7 @@ impl Render {
                 self.emit(&format!("@{} = ({});", ident(var), elems.join(", ")));
             }
             IrStmt::If { cond, then, elsifs, else_ } => {
-                let c = self.expr(cond);
+                let c = self.boolify(cond);
                 self.emit(&format!("if ({c}) {{"));
                 self.depth += 1;
                 for s in then {
@@ -1806,7 +2911,7 @@ impl Render {
                 }
                 self.depth -= 1;
                 for (ec, body) in elsifs {
-                    let ec = self.expr(ec);
+                    let ec = self.boolify(ec);
                     self.emit(&format!("}} elsif ({ec}) {{"));
                     self.depth += 1;
                     for s in body {
@@ -1847,6 +2952,25 @@ impl Render {
                         let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
                         format!("1..{}", a.join(".."))
                     }
+                    IrExpr::Call { func, args } if func == "split" => {
+                        if let Some(IrExpr::Call { func: g, args: ga }) = args.first() {
+                            if g == "getVar" {
+                                if let Some(name) = Self::str_arg(ga, 0) {
+                                    let v = self.var_ref(&name);
+                                    format!("split(/\\s+/, {v})")
+                                } else {
+                                    self.mark_todo("for iter split");
+                                    "()".to_string()
+                                }
+                            } else {
+                                self.mark_todo("for iter split");
+                                "()".to_string()
+                            }
+                        } else {
+                            self.mark_todo("for iter split");
+                            "()".to_string()
+                        }
+                    }
                     other => {
                         self.mark_todo("for iter");
                         self.expr(other)
@@ -1866,7 +2990,7 @@ impl Render {
                 self.emit("}");
             }
             IrStmt::While { cond, body } => {
-                let c = self.expr(cond);
+                let c = self.boolify(cond);
                 self.emit(&format!("while ({c}) {{"));
                 self.depth += 1;
                 for s in body {
@@ -1876,7 +3000,7 @@ impl Render {
                 self.emit("}");
             }
             IrStmt::DoWhile { body, cond, until } => {
-                let c = self.expr(cond);
+                let c = self.boolify(cond);
                 self.emit("do {");
                 self.depth += 1;
                 for s in body {
@@ -1931,19 +3055,51 @@ impl Render {
                 self.in_func = saved;
             }
             IrStmt::Subshell(body) => {
-                self.mark_todo("subshell");
-                self.block_stmt(body);
-            }
-            IrStmt::Background(body) => {
-                self.mark_todo("background");
-                self.block_stmt(body);
-            }
-            IrStmt::Block(body) => self.block_stmt(body),
-            IrStmt::Redirect { inner, .. } => {
-                self.mark_todo("redirect stmt");
-                for s in inner {
+                // `( ... )` — run in a forked child: env/cd changes must not
+                // leak into the parent (autoflush so the child's exit doesn't
+                // duplicate buffered output)
+                self.need_autoflush = true;
+                self.emit("my $__pid = fork();");
+                self.emit("die \"fork: $!\\n\" unless defined $__pid;");
+                self.emit("if ($__pid == 0) {");
+                self.depth += 1;
+                self.emit("$? = 0;");
+                for s in body {
                     self.stmt(s);
                 }
+                self.emit("exit($? >> 8);");
+                self.depth -= 1;
+                self.emit("}");
+                self.emit("waitpid($__pid, 0);");
+            }
+            IrStmt::Background(body) => {
+                // `cmd &` — forked child, no wait (bash returns immediately)
+                self.need_autoflush = true;
+                self.emit("my $__pid = fork();");
+                self.emit("die \"fork: $!\\n\" unless defined $__pid;");
+                self.emit("if ($__pid == 0) {");
+                self.depth += 1;
+                self.emit("$? = 0;");
+                for s in body {
+                    self.stmt(s);
+                }
+                self.emit("exit($? >> 8);");
+                self.depth -= 1;
+                self.emit("}");
+                self.emit("$? = 0;");
+            }
+            IrStmt::Block(body) => self.block_stmt(body),
+            IrStmt::Redirect { inner, redirects } => {
+                let specs: Vec<MiniRedir> = redirects
+                    .iter()
+                    .map(|r| MiniRedir {
+                        fd: r.fd.unwrap_or(1),
+                        mode: r.mode.clone(),
+                        target: r.target.clone(),
+                        interp: r.interpolate,
+                    })
+                    .collect();
+                self.native_redirect(inner, &specs);
             }
             IrStmt::Exec { cmd, args, capture, .. } => {
                 let mut words: Vec<IrExpr> = Vec::new();
@@ -1962,7 +3118,7 @@ impl Render {
                         }
                         _ => String::new(),
                     };
-                    let q = self.qx(&c);
+                    let q = self.shell_qx(&c);
                     self.emit(&format!("{t} = {q};"));
                     self.emit(&format!("chomp {t};"));
                 } else {
@@ -1986,7 +3142,9 @@ impl Render {
                     }
                     None => {
                         if let Some(cs) = cmd_str {
-                            self.emit_qx_stmt(cs);
+                            // a bare pipeline PRINTS its stdout
+                            let q = self.qx(cs);
+                            self.emit(&format!("print {q};"));
                         } else {
                             self.mark_todo("pipeline stmt");
                         }
@@ -2042,6 +3200,160 @@ impl Render {
         // the trailing `;` keeps an empty bare block a valid statement
         // (`{ }` followed by another statement is a Perl syntax error)
         self.emit("};");
+    }
+
+    /// `local x=val` value: `$1`/`$name` → var ref, else a literal string.
+    fn local_value(&mut self, val: &str) -> String {
+        if let Some(rest) = val.strip_prefix('$') {
+            if !rest.is_empty()
+                && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return self.var_ref(rest);
+            }
+        }
+        Self::perl_str(val)
+    }
+
+    /// The `redirect`-call Json spec array → MiniRedir list.
+    fn mini_redirs_from_expr(&mut self, specs: &IrExpr) -> Vec<MiniRedir> {
+        let mut out = Vec::new();
+        if let IrExpr::Array(items) = specs {
+            for it in items {
+                if let IrExpr::Json(serde_json::Value::Object(o)) = it {
+                    let fd = o.get("fd").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                    let mode = o
+                        .get("mode")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let interp = o
+                        .get("interpolate")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let target = match o.get("target") {
+                        Some(serde_json::Value::String(s)) => {
+                            IrExpr::Str(s.clone(), StrStyle::DoubleQuoted)
+                        }
+                        _ => IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+                    };
+                    out.push(MiniRedir {
+                        fd,
+                        mode,
+                        target,
+                        interp,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// NATIVE fd redirection: save the fd, open the target, render the
+    /// body, restore. `system`/`say` children inherit the redirected fd
+    /// (real files/pipes only — heredoc/herestring stdin goes through a
+    /// temp file so `system` children see the content too).
+    fn native_redirect(&mut self, inner: &[IrStmt], specs: &[MiniRedir]) {
+        let mut saved: Vec<(String, String)> = Vec::new();
+        let mut n = 0;
+        for r in specs {
+            let fdn = match r.fd {
+                0 => "STDIN",
+                1 => "STDOUT",
+                2 => "STDERR",
+                f => {
+                    self.mark_todo(&format!("redirect fd {f}"));
+                    continue;
+                }
+            };
+            let sav = format!("__sav{n}");
+            n += 1;
+            self.emit(&format!(
+                "open my ${sav}, '>&', {fdn} or die \"redirect: $!\\n\";"
+            ));
+            match r.mode.as_str() {
+                "w" | "a" | "r+" => {
+                    let op = if r.mode == "a" { ">>" } else { ">" };
+                    let t = self.expr(&r.target);
+                    self.emit(&format!(
+                        "open {fdn}, {op:?}, {t} or die \"redirect: $!\\n\";"
+                    ));
+                }
+                "r" => {
+                    let t = self.expr(&r.target);
+                    self.emit(&format!(
+                        "open {fdn}, '<', {t} or die \"redirect: $!\\n\";"
+                    ));
+                }
+                "heredoc" | "heredoc-tabs" | "herestring" => {
+                    // scalar-ref opens can't dup onto STDIN for system
+                    // children — feed through a temp file instead
+                    self.heredoc_id += 1;
+                    let tmp = format!(
+                        "/tmp/perl_heredoc_{}_{}",
+                        std::process::id(),
+                        self.heredoc_id
+                    );
+                    let tmpq = Self::perl_str(&tmp);
+                    self.emit(&format!(
+                        "open my $__hd{}, '>', {tmpq} or die \"heredoc: $!\\n\";",
+                        self.heredoc_id
+                    ));
+                    match r.mode.as_str() {
+                        "herestring" => {
+                            let c = self.expr(&r.target);
+                            self.emit(&format!(
+                                "print {{$__hd{}}} {c} . \"\\n\";",
+                                self.heredoc_id
+                            ));
+                        }
+                        _ => {
+                            let body = match &r.target {
+                                IrExpr::Str(s, _) => {
+                                    if r.mode == "heredoc-tabs" {
+                                        strip_leading_tabs(s)
+                                    } else {
+                                        s.clone()
+                                    }
+                                }
+                                other => self.shell_unquoted(other),
+                            };
+                            let b = Self::perl_str(&body);
+                            self.emit(&format!(
+                                "print {{$__hd{}}} {b};",
+                                self.heredoc_id
+                            ));
+                        }
+                    }
+                    self.emit(&format!("close $__hd{};", self.heredoc_id));
+                    self.emit(&format!(
+                        "open {fdn}, '<', {tmpq} or die \"redirect: $!\\n\";"
+                    ));
+                    self.emit(&format!("unlink {tmpq};"));
+                }
+                "process-in" => {
+                    let cmd = match &r.target {
+                        IrExpr::Arrow(stmts) => self.shell_cmd(stmts, "; "),
+                        other => self.shell_unquoted(other),
+                    };
+                    let q = self.shell_qx(&cmd);
+                    self.emit(&format!(
+                        "open {fdn}, '-|', 'sh', '-c', {q} or die \"redirect: $!\\n\";"
+                    ));
+                }
+                m => self.mark_todo(&format!("redirect mode {m}")),
+            }
+            saved.push((sav, fdn.to_string()));
+        }
+        for s in inner {
+            self.stmt(s);
+        }
+        for (sav, fdn) in saved.iter().rev() {
+            self.emit(&format!("close {fdn};"));
+            self.emit(&format!(
+                "open {fdn}, '>&', ${sav} or die \"redirect restore: $!\\n\";"
+            ));
+            self.emit(&format!("close ${sav};"));
+        }
     }
 
     fn sub(&mut self, s: &IrSub) {
@@ -2108,6 +3420,109 @@ fn ident(name: &str) -> String {
     let first = out.chars().next().unwrap();
     if first.is_ascii_digit() {
         out.insert(0, '_');
+    }
+    out
+}
+
+/// Strip leading tabs from every line (`<<-EOF` semantics).
+fn strip_leading_tabs(s: &str) -> String {
+    s.lines()
+        .map(|l| l.trim_start_matches('\t').to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Count the `%` conversion specifiers in a bash printf format (`%%` is a
+/// literal percent, not a specifier).
+fn count_format_specs(s: &str) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let mut n = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '%' {
+            if i + 1 < chars.len() && chars[i + 1] == '%' {
+                i += 2;
+                continue;
+            }
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// bash printf format escapes → the real characters perl printf prints
+/// (`\n` in the bash FORMAT is a newline, not a literal backslash-n).
+fn bash_printf_unescape(s: &str) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && i + 1 < chars.len() {
+            let n = chars[i + 1];
+            match n {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                '\\' => out.push('\\'),
+                'a' => out.push('\x07'),
+                'b' => out.push('\x08'),
+                'f' => out.push('\x0c'),
+                'v' => out.push('\x0b'),
+                'e' => out.push('\x1b'),
+                '0' => {
+                    // \0nnn octal
+                    let mut j = i + 2;
+                    let mut oct = String::new();
+                    while j < chars.len()
+                        && oct.len() < 3
+                        && chars[j].is_ascii_digit()
+                        && chars[j] != '8'
+                        && chars[j] != '9'
+                    {
+                        oct.push(chars[j]);
+                        j += 1;
+                    }
+                    if let Ok(v) = u32::from_str_radix(&oct, 8) {
+                        out.push(char::from_u32(v).unwrap_or('?'));
+                        i = j - 1;
+                    } else {
+                        out.push('\\');
+                        out.push('0');
+                    }
+                }
+                'x' => {
+                    // \xhh hex
+                    let mut j = i + 2;
+                    let mut hex = String::new();
+                    while j < chars.len() && hex.len() < 2 && chars[j].is_ascii_hexdigit() {
+                        hex.push(chars[j]);
+                        j += 1;
+                    }
+                    if !hex.is_empty() {
+                        if let Ok(v) = u32::from_str_radix(&hex, 16) {
+                            out.push(char::from_u32(v).unwrap_or('?'));
+                            i = j - 1;
+                        } else {
+                            out.push_str("\\x");
+                        }
+                    } else {
+                        out.push_str("\\x");
+                    }
+                }
+                '"' => out.push('"'),
+                '\'' => out.push('\''),
+                c2 => {
+                    out.push('\\');
+                    out.push(c2);
+                }
+            }
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
     }
     out
 }
