@@ -3865,10 +3865,16 @@ mod tests {
         assert!(!json.contains("\"name\":\"shopt\""));
         assert!(!json.contains("unsupported"));
         // the body is `echo $i` — a sync builtin call (no await) → the
-        // c-style loop lowers to the SYNC runtime twin.
+        // C-style loop lowers through the A1 ForInit to the NATIVE while
+        // machinery (core request zsh-sh-go-20260813-153215: the shell
+        // path now emits ForInit, the strip pass lowers it to
+        // init + while(cond){body; step}, and the while cond is the
+        // natively-lowered `let "i<3"` — a plain WhileStatement, no
+        // runtime loop call at all).
         let json2 = to_json("for ((i=0; i<3; i++)); do echo $i; done");
-        assert!(json2.contains("\"name\":\"cstyleForSync\""));
+        assert!(!json2.contains("\"name\":\"cstyleForSync\""));
         assert!(!json2.contains("\"name\":\"cstyleFor\""));
+        assert!(json2.contains("WhileStatement"));
         assert!(!json2.contains("unsupported"));
     }
 
