@@ -1167,6 +1167,54 @@ fn lit_str<'a>(e: &'a Expr) -> Option<&'a str> {
     }
 }
 
+/// Does runtime-expanded text `s` reference `name` (`$name` / `${name…}`)?
+/// The runtime resolves such refs from the STORE (test strings, exec
+/// args, arith texts are re-expanded at runtime), so a name referenced
+/// from a literal must keep its store binding — see the native-array
+/// fold's literal scan. Over-marking is safe; under-marking desyncs the
+/// store.
+fn bash_text_refs(s: &str, name: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let rest = &s[i + 1..];
+        if rest.starts_with('(') {
+            i += 1; // $(...) — command substitution, not a var ref
+            continue;
+        }
+        if rest.starts_with('{') {
+            let r2 = &rest[1..];
+            // ${#name} / ${!name} / ${name…} — strip a leading # / !
+            let r3 = r2
+                .strip_prefix('#')
+                .or_else(|| r2.strip_prefix('!'))
+                .unwrap_or(r2);
+            let n = r3
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
+                .count();
+            if n > 0 && &r3[..n] == name {
+                return true;
+            }
+            i += 1;
+            continue;
+        }
+        let n = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
+            .count();
+        if n > 0 && &rest[..n] == name {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// `"name[idx]"` → (name, idx) for a Literal getVar/setVar arg;
 /// `[@]`/`[*]` and bare `"name"` are whole-var (None).
 fn parse_var_arg_str(s: &str) -> Option<(&str, Option<&str>)> {
@@ -1503,6 +1551,35 @@ pub(crate) fn lower_native_arrays(prog: Program) -> Program {
                         &top_set_arrays,
                         &mut acc,
                     );
+                }
+            }
+            // Runtime-expanded TEXT (test strings, exec args, arith
+            // texts): the runtime resolves `$name` / `${name…}` refs from
+            // the STORE, which a native array never syncs — a name
+            // referenced from a literal must stay store-backed (the
+            // native fold would desync the store and the dead-decl drop
+            // would then remove the seed: `mx=(10 20 30)` + `if [
+            // "${mx[1]}" -eq 20 ]` compiled to `let mx = […]` only,
+            // dropped as unread, and the runtime expanded `${mx[1]}`
+            // against an unset store). Over-marking is safe (the fold
+            // simply does not fire); under-marking is the corruption.
+            if let Expr::Literal { value, .. } = e {
+                if let Some(s) = value.as_str() {
+                    for n in &top_set_arrays {
+                        if bash_text_refs(s, n) {
+                            acc.entry(n.clone()).or_default().writes = true;
+                        }
+                    }
+                }
+            }
+            if let Expr::TemplateLiteral { quasis, .. } = e {
+                for q in quasis {
+                    let s = q.value.cooked.as_deref().unwrap_or(&q.value.raw);
+                    for n in &top_set_arrays {
+                        if bash_text_refs(s, n) {
+                            acc.entry(n.clone()).or_default().writes = true;
+                        }
+                    }
                 }
             }
             if let Expr::Identifier { name } = e {
