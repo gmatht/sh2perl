@@ -196,6 +196,7 @@ fn build_assigns(items: &[IrExpr]) -> Option<Vec<IrStmt>> {
                 indices: vec![],
             }],
             expr: IrExpr::Arith(Box::new(ast)),
+            asm: None,
         });
     }
     Some(out)

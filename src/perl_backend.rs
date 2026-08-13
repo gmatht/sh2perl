@@ -1808,7 +1808,7 @@ impl Render {
                 self.emit(&format!("print {{$__fh}} {c};"));
                 self.emit("close $__fh;");
             }
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 let Some(t) = targets.first() else {
                     self.mark_todo("multi-target assign");
                     return;

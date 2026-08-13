@@ -351,7 +351,16 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
                 .map(|(i, t)| assign_target_from(t, &format!("{where_}.targets[{i}]")))
                 .collect::<Result<Vec<_>, String>>()?;
             let expr = expr_from(req(o, "expr", where_)?, &format!("{where_}.expr"))?;
-            IrStmt::Assign { targets, expr }
+            // Optional GCC asm-label spec on a DECLARATION-position assign
+            // (`int x asm("myx") = 7;` — core request
+            // c-sh-go-toplevelasmargument-20260814-042952; the `Asm`
+            // statement's spec shape, operand string-or-node form included).
+            let asm = match o.get("asm") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(m)) => Some(asm_spec_from(m, &format!("{where_}.asm"))?),
+                Some(_) => return Err(format!("{where_}.asm: not an object")),
+            };
+            IrStmt::Assign { targets, expr, asm }
         }
         "Declare" => {
             let vars = arr(o.get("vars"), &format!("{where_}.vars"))?
@@ -744,32 +753,13 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
         // or a plain store-name STRING (the request's minimal shape —
         // "reference variables by the store-name convention").
         "Asm" => {
-            let template = req_str(o, "template", where_)?.to_string();
-            let volatile = o.get("volatile").and_then(|x| x.as_bool()).unwrap_or(false);
-            let outputs =
-                asm_operands_from(o.get("outputs"), &format!("{where_}.outputs"), "target")?;
-            let inputs =
-                asm_operands_from(o.get("inputs"), &format!("{where_}.inputs"), "expr")?;
-            let clobbers = match o.get("clobbers") {
-                None | Some(Value::Null) => vec![],
-                Some(x) => {
-                    let a = arr(Some(x), &format!("{where_}.clobbers"))?;
-                    a.iter()
-                        .enumerate()
-                        .map(|(i, e)| {
-                            e.as_str()
-                                .map(String::from)
-                                .ok_or_else(|| format!("{where_}.clobbers[{i}]: not a string"))
-                        })
-                        .collect::<Result<Vec<_>, String>>()?
-                }
-            };
+            let spec = asm_spec_from(o, where_)?;
             IrStmt::Asm {
-                template,
-                volatile,
-                outputs,
-                inputs,
-                clobbers,
+                template: spec.template,
+                volatile: spec.volatile,
+                outputs: spec.outputs,
+                inputs: spec.inputs,
+                clobbers: spec.clobbers,
             }
         }
         "Block" => {
@@ -789,6 +779,40 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
             IrStmt::Goto(name)
         }
         _ => unreachable!("checked above"),
+    })
+}
+
+/// asm-spec deserializer — the shared shape of the `Asm` statement and
+/// the declarator-position `Assign.asm` field (core request
+/// c-sh-go-toplevelasmargument-20260814-042952). `outputs`/`inputs`
+/// entries carry the constraint string plus the operand: a value NODE
+/// (the serializer's shape) or a plain store-name STRING (the request's
+/// minimal shape).
+fn asm_spec_from(o: &serde_json::Map<String, Value>, where_: &str) -> Result<AsmSpec, String> {
+    let template = req_str(o, "template", where_)?.to_string();
+    let volatile = o.get("volatile").and_then(|x| x.as_bool()).unwrap_or(false);
+    let outputs = asm_operands_from(o.get("outputs"), &format!("{where_}.outputs"), "target")?;
+    let inputs = asm_operands_from(o.get("inputs"), &format!("{where_}.inputs"), "expr")?;
+    let clobbers = match o.get("clobbers") {
+        None | Some(Value::Null) => vec![],
+        Some(x) => {
+            let a = arr(Some(x), &format!("{where_}.clobbers"))?;
+            a.iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    e.as_str()
+                        .map(String::from)
+                        .ok_or_else(|| format!("{where_}.clobbers[{i}]: not a string"))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        }
+    };
+    Ok(AsmSpec {
+        template,
+        volatile,
+        outputs,
+        inputs,
+        clobbers,
     })
 }
 
@@ -1412,6 +1436,7 @@ mod tests {
                         ty,
                         arg: Box::new(ArithAst::Sizeof(ty)),
                     })),
+                    asm: None,
                 }],
                 subs: vec![],
                 var_types: vec![("x".to_string(), ty)],
@@ -1472,6 +1497,7 @@ mod tests {
                         indices: vec![],
                     }],
                     expr: IrExpr::Arith(Box::new(ArithAst::Num(0))),
+                    asm: None,
                 }],
                 cond: IrExpr::Arith(Box::new(ArithAst::Bin {
                     op: "Lt".to_string(),
@@ -1858,6 +1884,72 @@ mod tests {
             IrStmt::Asm { template, volatile: true, outputs, inputs, clobbers }
                 if template == "nop" && outputs[0].0 == "=r" && inputs[0].0 == "r"
                     && clobbers == &["cc".to_string()]
+        ));
+    }
+
+    /// The DECLARATOR-position asm label (core request
+    /// c-sh-go-toplevelasmargument-20260814-042952): the optional `asm`
+    /// field on `Assign` carries the same spec shape as the `Asm`
+    /// statement (template-only for the gcc-valid declarator form),
+    /// round-trips, and plain assigns serialize WITHOUT the field (the
+    /// A1 bytes of existing emits are unchanged).
+    #[test]
+    fn assign_asm_label_roundtrip() {
+        use crate::ir::{AsmSpec, IrExpr};
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "x".into(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Int(7),
+                    asm: Some(AsmSpec {
+                        template: "myx".into(),
+                        volatile: false,
+                        outputs: vec![],
+                        inputs: vec![],
+                        clobbers: vec![],
+                    }),
+                },
+                // a plain assign stays byte-identical (no `asm` key)
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "y".into(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Int(1),
+                    asm: None,
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json.contains("\"asm\":{\"clobbers\":[],\"inputs\":[],\"outputs\":[],\"template\":\"myx\""), "json: {json}");
+        // the plain assign must NOT carry the field
+        let assign2 = json.find("\"var\":\"y\"").map(|i| &json[i..]).unwrap_or("");
+        assert!(!assign2.contains("\"asm\""), "plain assign gained asm: {assign2}");
+        let prog2 = shir_json_to_ir(&json).expect("deser");
+        assert_eq!(prog2.stmts, prog.stmts, "Assign-asm round-trip");
+        // the minimal A1 shape (the request's failing case) ingresses and
+        // the asm rides the declaration
+        let min = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[{"type":"Assign","targets":[{"var":"x","sigil":null,"indices":[]}],"expr":{"type":"Int","value":7},"asm":{"template":"myx","volatile":false,"outputs":[],"inputs":[],"clobbers":[]}}]}"#;
+        let p2 = shir_json_to_ir(min).expect("minimal assign-asm deser");
+        assert!(matches!(
+            &p2.stmts[0],
+            IrStmt::Assign { asm: Some(spec), expr, .. }
+                if spec.template == "myx" && matches!(expr, IrExpr::Int(7))
         ));
     }
 

@@ -295,6 +295,7 @@ mod tests {
                         indices: vec![],
                     }],
                     expr: IrExpr::Int(5),
+                    asm: None,
                 },
                 IrStmt::Assign {
                     targets: vec![crate::ir::AssignTarget {
@@ -303,6 +304,7 @@ mod tests {
                         indices: vec![],
                     }],
                     expr: IrExpr::Int(1),
+                    asm: None,
                 },
                 IrStmt::Assign {
                     targets: vec![crate::ir::AssignTarget {
@@ -311,6 +313,7 @@ mod tests {
                         indices: vec![],
                     }],
                     expr: IrExpr::Int(2),
+                    asm: None,
                 },
                 IrStmt::While {
                     cond: IrExpr::Call {
@@ -324,6 +327,7 @@ mod tests {
                             indices: vec![],
                         }],
                         expr: IrExpr::Int(0),
+                        asm: None,
                     }],
                 },
             ],

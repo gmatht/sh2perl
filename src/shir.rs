@@ -653,7 +653,7 @@ fn is_native_let_stmt(stmt: &IrStmt) -> bool {
         // `((i++))` — the arith_forms transform's Assign(Arith(IncDec))
         // shape (mirror of the `let "i++"` exec): same status semantics,
         // same deadness treatment (the hot loop's bare `++i`).
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, .. } => {
             matches!(expr, IrExpr::Arith(a)
                 if matches!(&**a, ArithAst::IncDec { var, .. }
                     if targets.len() == 1 && targets[0].indices.is_empty()
@@ -1067,7 +1067,7 @@ fn loop_provably_runs_in(stmts: &[IrStmt], idx: usize) -> bool {
             let mut vals: HashMap<String, i128> = HashMap::new();
             for st in &stmts[..idx] {
                 match st {
-                    IrStmt::Assign { targets, expr }
+                    IrStmt::Assign { targets, expr, .. }
                         if targets.len() == 1 && targets[0].indices.is_empty() =>
                     {
                         match const_value(expr) {
@@ -3098,7 +3098,7 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
     ) {
         for st in stmts {
             match st {
-                IrStmt::Assign { targets, expr } => {
+                IrStmt::Assign { targets, expr, .. } => {
                     for t in targets {
                         if t.indices.is_empty() {
                             assigns.push((t.var.clone(), expr, trip));
@@ -4173,7 +4173,7 @@ pub fn analyze_var_nospace(prog: &IrProgram) -> Vec<(String, bool)> {
     fn walk<'a>(stmts: &'a [IrStmt], assigns: &mut Vec<(String, &'a IrExpr)>) {
         for st in stmts {
             match st {
-                IrStmt::Assign { targets, expr } => {
+                IrStmt::Assign { targets, expr, .. } => {
                     for t in targets {
                         if t.indices.is_empty() {
                             assigns.push((t.var.clone(), expr));
@@ -4545,7 +4545,7 @@ use std::collections::{HashMap, HashSet};
                     walk_expr(e, acc, multi_run);
                 }
             }
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     // array-element writes arrive either with a non-empty
                     // `indices` list or with the index baked into the name
@@ -4904,7 +4904,7 @@ pub fn const_fold_arith(prog: &mut IrProgram) {
     ) {
         for stmt in stmts.iter_mut() {
             match stmt {
-                IrStmt::Assign { targets, expr } => {
+                IrStmt::Assign { targets, expr, .. } => {
                     fold_expr(expr, pool, consts);
                     if seed
                         && targets.len() == 1
@@ -5108,7 +5108,7 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
     ) {
         for s in stmts {
             match s {
-                IrStmt::Assign { targets, expr } => {
+                IrStmt::Assign { targets, expr, .. } => {
                     if targets.len() == 1 && targets[0].indices.is_empty() {
                         let v = &targets[0].var;
                         if numeric.contains(v) || matches!(expr, IrExpr::Arith(_)) {
@@ -5527,7 +5527,7 @@ fn body_step_bounds(stmts: &[IrStmt], v: &str) -> Option<(i64, i64)> {
     let mut mx: Option<i64> = None;
     for s in stmts {
         let r: Option<(i64, i64)> = match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 if targets.iter().any(|t| t.indices.is_empty() && t.var == v) {
                     return plus_step(expr, v).map(|k| (k, k));
                 }
@@ -5742,7 +5742,7 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         IrStmt::Label(_) | IrStmt::Goto(_) => {}
         // inline asm operands are runtime exprs — no static range
         IrStmt::Asm { .. } => {}
-        IrStmt::Assign { targets, expr } if targets.len() == 1 && targets[0].indices.is_empty() => {
+        IrStmt::Assign { targets, expr, .. } if targets.len() == 1 && targets[0].indices.is_empty() => {
             let name = targets[0].var.clone();
             state.insert(name, ir_range(expr, state));
         }
@@ -6055,6 +6055,7 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
                 indices: vec![],
             }],
             expr: assignment_value_ir(a),
+            asm: None,
         },
         Command::If(if_stmt) => IrStmt::If {
             cond: command_to_test_ir(&if_stmt.condition),
@@ -6134,6 +6135,7 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
                         indices: vec![],
                     }],
                     expr: IrExpr::Arith(Box::new(ast)),
+                    asm: None,
                 })
             };
             let init = arith_assign(init_txt);
@@ -6750,6 +6752,33 @@ fn case_to_ir(c: &CaseStatement) -> IrStmt {
                 body: cl.body.iter().filter_map(stmt_for_command).collect(),
             })
             .collect(),
+    }
+}
+
+/// The `Asm`-family no-op comment — the shared lowering of the `Asm`
+/// statement and the declarator-position `Assign.asm` label (core
+/// request c-sh-go-toplevelasmargument-20260814-042952). JS cannot
+/// execute machine code; the comment carries the template so the
+/// coverage question stays honest.
+fn asm_noop_comment(spec: &AsmSpec) -> Stmt {
+    let mut text = format!("asm: {}", spec.template);
+    if !spec.outputs.is_empty() {
+        text.push_str(" [OUTPUT OPERANDS DROPPED — JS cannot execute machine code]");
+    }
+    if !spec.inputs.is_empty() {
+        text.push_str(" [INPUT OPERANDS DROPPED — JS cannot execute machine code]");
+    }
+    if !spec.clobbers.is_empty() {
+        text.push_str(" [clobbers: ");
+        text.push_str(&spec.clobbers.join(", "));
+        text.push(']');
+    }
+    Stmt::ExpressionStatement {
+        expression: Expr::Literal {
+            value: serde_json::Value::String(text),
+            raw: None,
+            regex: None,
+        },
     }
 }
 
@@ -9464,7 +9493,7 @@ pub(crate) fn analyze_loop_var_refs(
                     ref_stmt(b, &s2, external, in_copy, loops);
                 }
             }
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if !stack.contains(&t.var) {
                         external.insert(t.var.clone());
@@ -11302,7 +11331,7 @@ fn collect_arith_ref_set_vars(prog: &IrProgram) -> HashSet<String> {
     let mut out = HashSet::new();
     fn walk_stmt(st: &IrStmt, out: &mut HashSet<String>) {
         match st {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 let arith_text = matches!(expr, IrExpr::Call { func, args } if func == "arith"
                     && matches!(args.as_slice(), [IrExpr::Str(_, _)]));
                 if !arith_text {
@@ -11774,7 +11803,7 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
         in_copy: bool,
     ) {
         match st {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if t.indices.is_empty() {
                         if in_copy {
@@ -12032,7 +12061,7 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
     // WRITING a global is a global write in bash, so it counts)
     fn collect_assigns(st: &IrStmt, assigns: &mut HashMap<String, Vec<IrExpr>>) {
         match st {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if t.indices.is_empty() {
                         assigns.entry(t.var.clone()).or_default().push(expr.clone());
@@ -13458,7 +13487,7 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
             IrStmt::Expr(e) => scan_expr(e),
             IrStmt::Output { value, .. } => scan_expr(value),
             IrStmt::WriteFile { path, content, .. } => scan_expr(path) || scan_expr(content),
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 scan_expr(expr) || targets.iter().any(|t| t.indices.iter().any(scan_expr))
             }
             IrStmt::Declare { init, .. } => init.as_ref().is_some_and(scan_expr),
@@ -13634,7 +13663,7 @@ fn ir_nocase_shopt_mask(prog: &IrProgram) -> u8 {
                 scan_expr(path, mask);
                 scan_expr(content, mask);
             }
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 scan_expr(expr, mask);
                 targets
                     .iter()
@@ -14453,6 +14482,27 @@ fn flatten_for_iter(iter: &IrExpr) -> Expr {
 }
 
 fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
+    // Declarator-position asm label (`int x asm("myx") = 7;` — core
+    // request c-sh-go-toplevelasmargument-20260814-042952): the label
+    // only renames the object-file SYMBOL, which the JS model does not
+    // have — no runtime semantics — so the lowering is the assignment
+    // PLUS the Asm-style no-op comment carrying the template
+    // (oracle-faithful, same contract as the `Asm` statement).
+    if let IrStmt::Assign {
+        targets,
+        expr,
+        asm: Some(spec),
+    } = stmt
+    {
+        let assign = stmt_to_estree(&IrStmt::Assign {
+            targets: targets.clone(),
+            expr: expr.clone(),
+            asm: None,
+        })?;
+        return Some(Stmt::BlockStatement {
+            body: vec![asm_noop_comment(spec), assign],
+        });
+    }
     Some(match stmt {
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "break" => {
             // A bare `break` renders as an `sh2.break()` CALL (throws the
@@ -14734,7 +14784,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 },
             }
         }
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, .. } => {
             let target = &targets[0];
             // `((i++))` / `((i--))` — the arith_forms transform rewrites
             // the `let "i++"` exec as `Assign { targets: [i], expr:
@@ -15596,6 +15646,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             func: "Number".to_string(),
                             args: vec![IrExpr::Ident(js_var.clone())],
                         },
+                        asm: None,
                     });
                 }
             } else if !is_lifted(var) {
@@ -15607,6 +15658,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         indices: vec![],
                     }],
                     expr: IrExpr::Ident(js_var.clone()),
+                    asm: None,
                 });
             }
             // owned body (coercion + clones) for the async fallback
@@ -16266,27 +16318,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             outputs,
             inputs,
             clobbers,
-        } => {
-            let mut text = format!("asm: {template}");
-            if !outputs.is_empty() {
-                text.push_str(" [OUTPUT OPERANDS DROPPED — JS cannot execute machine code]");
-            }
-            if !inputs.is_empty() {
-                text.push_str(" [INPUT OPERANDS DROPPED — JS cannot execute machine code]");
-            }
-            if !clobbers.is_empty() {
-                text.push_str(" [clobbers: ");
-                text.push_str(&clobbers.join(", "));
-                text.push(']');
-            }
-            Stmt::ExpressionStatement {
-                expression: Expr::Literal {
-                    value: serde_json::Value::String(text),
-                    raw: None,
-                    regex: None,
-                },
-            }
-        }
+        } => asm_noop_comment(&AsmSpec {
+            template: template.clone(),
+            volatile: false,
+            outputs: outputs.clone(),
+            inputs: inputs.clone(),
+            clobbers: clobbers.clone(),
+        }),
         IrStmt::Redirect { inner, redirects } => {
             // `echo args > file` / `echo args >> file`: a native
             // fs.writeFile replaces the redirect+builtin pair (see
@@ -26127,7 +26165,7 @@ fn lift_walk_stmt(
     in_copy: bool,
 ) {
     match st {
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, .. } => {
             for t in targets {
                 if t.indices.is_empty() {
                     if in_copy {
@@ -26499,7 +26537,7 @@ fn lift_expr_mentions(e: &IrExpr, name: &str) -> bool {
 /// binding would shadow it for module-lifted names).
 fn lift_stmt_mentions_deep(st: &IrStmt, name: &str, descend_fns: bool) -> bool {
     match st {
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, .. } => {
             targets.iter().any(|t| t.var == name) || lift_expr_mentions(expr, name)
         }
         IrStmt::Exec {
@@ -26822,7 +26860,7 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
 
     fn collect_assigns(st: &IrStmt, assigns: &mut HashMap<String, Vec<IrExpr>>) {
         match st {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if t.indices.is_empty() {
                         assigns.entry(t.var.clone()).or_default().push(expr.clone());
@@ -27293,7 +27331,7 @@ fn collect_never_written(prog: &IrProgram) -> Option<HashSet<String>> {
     }
     fn walk_stmt(st: &IrStmt, written: &mut HashSet<String>, blocked: &mut bool) {
         match st {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     mark_word(&t.var, written);
                 }
@@ -27692,7 +27730,7 @@ fn collect_array_only_written(prog: &IrProgram) -> HashSet<String> {
     }
     fn walk_stmt(st: &IrStmt, array: &mut HashSet<String>, scalar: &mut HashSet<String>) {
         match st {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 // `primes=(2)` lowers to Assign { targets: [primes],
                 // expr: setArray(...) } — the expr walk marks the ARRAY
                 // write; don't double-mark the target as a scalar.
@@ -28178,7 +28216,7 @@ fn collect_native_store_access(prog: &IrProgram) -> (HashSet<String>, HashSet<St
         attr: &mut HashSet<String>,
     ) {
         match st {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if t.var.contains('[') {
                         mark_word(&t.var, arr);

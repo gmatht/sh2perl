@@ -494,6 +494,7 @@ mod tests {
                 indices: vec![],
             }],
             expr: IrExpr::Int(99),
+            asm: None,
         }];
         let mut st = seq_for(&["1", "3"], body);
         assert!(!transform_stmt(&mut st));
