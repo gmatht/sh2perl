@@ -323,6 +323,22 @@ fn walk_stmt(
             walk_stmts(body, pos, first, last, escapes, in_closure, true);
         }
         IrStmt::Block(body) => walk_stmts(body, pos, first, last, escapes, in_closure, copied),
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            walk_stmts(body, pos, first, last, escapes, in_closure, copied);
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    walk_expr(m, p, first, last, escapes, in_closure);
+                }
+                walk_stmts(&e.body, pos, first, last, escapes, in_closure, copied);
+            }
+            walk_stmts(else_body, pos, first, last, escapes, in_closure, copied);
+            walk_stmts(finally_body, pos, first, last, escapes, in_closure, copied);
+        }
         IrStmt::Expr(e) => walk_expr(e, p, first, last, escapes, in_closure),
     }
 }
@@ -707,6 +723,22 @@ fn mark_stmt_vars_escape(
         }
         IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
             mark_stmts_vars_escape(body, first, escapes);
+        }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            mark_stmts_vars_escape(body, first, escapes);
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    mark_vars_escape(m, first, escapes);
+                }
+                mark_stmts_vars_escape(&e.body, first, escapes);
+            }
+            mark_stmts_vars_escape(else_body, first, escapes);
+            mark_stmts_vars_escape(finally_body, first, escapes);
         }
         IrStmt::Expr(e) => mark_vars_escape(e, first, escapes),
     }

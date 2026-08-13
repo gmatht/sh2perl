@@ -421,6 +421,17 @@ pub struct IrCaseClause {
     pub body: Vec<IrStmt>,
 }
 
+/// One `except` clause of a `Try` statement (Python-style exception
+/// handling; ESTree-path only — the Perl generator never emits it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TryExcept {
+    /// Optional exception-class test expression (None = bare `except`).
+    pub match_expr: Option<IrExpr>,
+    /// Optional binding name for the caught exception (None = not bound).
+    pub as_name: Option<String>,
+    pub body: Vec<IrStmt>,
+}
+
 /// One redirection spec (fd, mode, target expression).
 #[derive(Debug, Clone, PartialEq)]
 pub struct IrRedirect {
@@ -477,6 +488,16 @@ pub enum IrStmt {
         then: Vec<IrStmt>,
         elsifs: Vec<(IrExpr, Vec<IrStmt>)>,
         else_: Vec<IrStmt>,
+    },
+    /// try/except/else/finally — Python-style exception handling
+    /// (ESTree-path only; frontends emit it, the estree backend renders
+    /// it as a JS try/catch/finally). The Perl generator never emits it;
+    /// renderers that cannot express it must refuse loudly.
+    Try {
+        body: Vec<IrStmt>,
+        excepts: Vec<TryExcept>,
+        else_body: Vec<IrStmt>,
+        finally_body: Vec<IrStmt>,
     },
     /// for loop (the shell foreach: `for i in a b c`)
     For {
@@ -975,6 +996,14 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
         IrStmt::Background(_) => {
             emit_indent(out, indent);
             out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (background)\\n\";\n");
+        }
+        // try/except/else/finally — ESTree-path only; the Perl generator
+        // never emits it. Refuse loudly (Perl eval could express it, but
+        // no generator produces it and guessing the exception convention
+        // would be wrong).
+        IrStmt::Try { .. } => {
+            emit_indent(out, indent);
+            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (try)\\n\";\n");
         }
         IrStmt::Case {
             discriminant,
@@ -5058,6 +5087,20 @@ fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
         | IrStmt::Subshell(_)
         | IrStmt::Background(_) => false,
         IrStmt::Block(stmts) => stmts.iter().any(stmt_refers_to_main_exit),
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            body.iter().any(stmt_refers_to_main_exit)
+                || excepts.iter().any(|e| {
+                    e.match_expr.as_ref().map(expr_refers_to_main_exit).unwrap_or(false)
+                        || e.body.iter().any(stmt_refers_to_main_exit)
+                })
+                || else_body.iter().any(stmt_refers_to_main_exit)
+                || finally_body.iter().any(stmt_refers_to_main_exit)
+        }
         IrStmt::Expr(e) => expr_refers_to_main_exit(e),
         IrStmt::Assign { targets, expr: _ } => targets.iter().any(|t| t.var == "main_exit_code"),
         IrStmt::Output { value, .. }
@@ -5190,6 +5233,30 @@ fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<Stri
         | IrStmt::Background(_) => {}
         IrStmt::Block(stmts) => {
             for st in stmts {
+                collect_vars_in_stmt(st, vars);
+            }
+        }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            for st in body {
+                collect_vars_in_stmt(st, vars);
+            }
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    collect_vars_in_expr(m, vars);
+                }
+                for st in &e.body {
+                    collect_vars_in_stmt(st, vars);
+                }
+            }
+            for st in else_body {
+                collect_vars_in_stmt(st, vars);
+            }
+            for st in finally_body {
                 collect_vars_in_stmt(st, vars);
             }
         }

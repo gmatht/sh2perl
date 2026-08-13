@@ -1819,6 +1819,9 @@ impl Render {
     fn cmd_text_stmt(&mut self, s: &IrStmt) -> Option<String> {
         match s {
             IrStmt::Expr(e) => self.cmd_text_expr(e),
+            // try/except has no shell text — a bash -c fallback cannot
+            // express it
+            IrStmt::Try { .. } => None,
             IrStmt::Assign { targets, expr } => {
                 let t = targets.first()?;
                 // array assignment `arr=(a b c)`
@@ -2805,6 +2808,9 @@ impl Render {
                 // the gate's bash reference exits before the background job
                 // finishes (stdout pipe), so the visible output matches
                 // when the job is skipped
+            }
+            IrStmt::Try { .. } => {
+                self.mark_todo("try");
             }
             IrStmt::Exec { .. }
             | IrStmt::Require(_)

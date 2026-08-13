@@ -225,6 +225,22 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                 | IrStmt::RawText(_)
                 | IrStmt::Label(_)
                 | IrStmt::Goto(_) => {}
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body, names);
+                    for e in excepts {
+                        if let Some(m) = &e.match_expr {
+                            expr_names(m, names);
+                        }
+                        walk(&e.body, names);
+                    }
+                    walk(else_body, names);
+                    walk(finally_body, names);
+                }
             }
         }
     }
@@ -398,6 +414,20 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                 | IrStmt::RawText(_)
                 | IrStmt::Label(_)
                 | IrStmt::Goto(_) => false,
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body)
+                        || excepts.iter().any(|e| {
+                            e.match_expr.as_ref().map(expr_uses_arr).unwrap_or(false)
+                                || walk(&e.body)
+                        })
+                        || walk(else_body)
+                        || walk(finally_body)
+                }
             };
             if hit {
                 return true;
@@ -1139,6 +1169,8 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("}\n");
             Ok(())
         }
+        // sh has no try/except — refuse (the gate reports it as a FAIL)
+        IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
         IrStmt::Return(e) => {
             indent(out, d);
             out.push_str("return");
@@ -4333,6 +4365,8 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             ))
         }
         IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => Ok(String::new()),
+        // sh has no try/except — refuse (the gate reports it as a FAIL)
+        IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
     }
 }
 

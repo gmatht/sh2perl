@@ -67,6 +67,27 @@ fn strip_stmt(s: &mut IrStmt) {
                 strip_stmt(st);
             }
         }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            for st in body.iter_mut() {
+                strip_stmt(st);
+            }
+            for e in excepts.iter_mut() {
+                for st in e.body.iter_mut() {
+                    strip_stmt(st);
+                }
+            }
+            for st in else_body.iter_mut() {
+                strip_stmt(st);
+            }
+            for st in finally_body.iter_mut() {
+                strip_stmt(st);
+            }
+        }
         IrStmt::If {
             then, elsifs, else_, ..
         } => {

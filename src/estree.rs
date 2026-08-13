@@ -45,6 +45,22 @@ pub enum Stmt {
         consequent: Box<Stmt>,
         alternate: Option<Box<Stmt>>,
     },
+    // Python-style try/except/else/finally (core request py-sh-go
+    // 20260813): the guarded block + catch clause(s) + optional
+    // finalizer. Standard ESTree: handler is a single CatchClause
+    // (multi-arm chains are an if/else-if ladder INSIDE it — see the
+    // lowering in shir.rs stmt_to_estree); the else suite lowers to a
+    // post-try guarded block (Python else runs only when the try body
+    // completed WITHOUT raising, and else-body exceptions must NOT be
+    // caught by this statement's arms).
+    TryStatement {
+        block: Box<Stmt>,
+        handler: Option<CatchClause>,
+        finalizer: Option<Box<Stmt>>,
+    },
+    ThrowStatement {
+        argument: Expr,
+    },
     SwitchStatement {
         discriminant: Expr,
         cases: Vec<SwitchCase>,
@@ -89,6 +105,18 @@ pub struct SwitchCase {
     pub type_: &'static str,
     pub test: Option<Expr>,
     pub consequent: Vec<Stmt>,
+}
+
+/// The single catch clause of a `TryStatement` (standard ESTree). The
+/// exception binding is a fixed generated identifier; `as`-bound names
+/// are written into the runtime store (sh2.setVar) so the handler's var
+/// reads see them.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatchClause {
+    #[serde(rename = "type")]
+    pub type_: &'static str,
+    pub param: Option<Box<Expr>>,
+    pub body: Box<Stmt>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -353,6 +381,38 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )
             }),
+        },
+        // try/catch/finally: the guard block, handler and finalizer
+        // share the enclosing context (a native break/continue/return
+        // inside them is illegal or bash-return-position exactly as in
+        // a plain block). The catch param is the fixed generated `e`
+        // binding — never rewritten.
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => Stmt::TryStatement {
+            block: Box::new(
+                fix_stmt(*block, in_arrow, in_func, false)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+            ),
+            handler: handler.map(|h| CatchClause {
+                type_: h.type_,
+                param: h.param,
+                body: Box::new(
+                    fix_stmt(*h.body, in_arrow, in_func, false)
+                        .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+                ),
+            }),
+            finalizer: finalizer.map(|f| {
+                Box::new(
+                    fix_stmt(*f, in_arrow, in_func, false)
+                        .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+                )
+            }),
+        },
+        Stmt::ThrowStatement { argument } => Stmt::ThrowStatement {
+            argument: fix_expr(argument, in_arrow, in_func),
         },
         Stmt::SwitchStatement {
             discriminant,
@@ -784,6 +844,19 @@ fn hoist_stmt(stmt: Stmt) -> Stmt {
         Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
             test,
             body: Box::new(hoist_stmt(*body)),
+        },
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => Stmt::TryStatement {
+            block: Box::new(hoist_stmt(*block)),
+            handler: handler.map(|h| CatchClause {
+                type_: h.type_,
+                param: h.param,
+                body: Box::new(hoist_stmt(*h.body)),
+            }),
+            finalizer: finalizer.map(|f| Box::new(hoist_stmt(*f))),
         },
         Stmt::ForStatement { init, test, update, body } => Stmt::ForStatement {
             init: Box::new(hoist_stmt(*init)),
@@ -1266,6 +1339,23 @@ fn walk_stmt_exprs(stmt: &Stmt, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
             walk_expr(test, in_fn, f);
             walk_stmt_exprs(body, in_fn, f);
         }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            walk_stmt_exprs(block, in_fn, f);
+            if let Some(h) = handler {
+                if let Some(p) = &h.param {
+                    walk_expr(p, in_fn, f);
+                }
+                walk_stmt_exprs(&h.body, in_fn, f);
+            }
+            if let Some(fin) = finalizer {
+                walk_stmt_exprs(fin, in_fn, f);
+            }
+        }
         Stmt::ForStatement { init, test, update, body, .. } => {
             walk_stmt_exprs(init, in_fn, f);
             walk_expr(test, in_fn, f);
@@ -1295,6 +1385,7 @@ fn walk_stmt_exprs(stmt: &Stmt, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
                 walk_expr(a, in_fn, f);
             }
         }
+        Stmt::ThrowStatement { argument } => walk_expr(argument, in_fn, f),
     }
 }
 
@@ -1566,6 +1657,19 @@ fn lower_stmt(stmt: Stmt, natives: &std::collections::HashSet<String>) -> Stmt {
             test: lower_expr(test, natives),
             body: Box::new(lower_stmt(*body, natives)),
         },
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => Stmt::TryStatement {
+            block: Box::new(lower_stmt(*block, natives)),
+            handler: handler.map(|h| CatchClause {
+                type_: h.type_,
+                param: h.param.map(|p| Box::new(lower_expr(*p, natives))),
+                body: Box::new(lower_stmt(*h.body, natives)),
+            }),
+            finalizer: finalizer.map(|f| Box::new(lower_stmt(*f, natives))),
+        },
         Stmt::ForStatement { init, test, update, body } => Stmt::ForStatement {
             init: Box::new(lower_stmt(*init, natives)),
             test: lower_expr(test, natives),
@@ -1592,6 +1696,9 @@ fn lower_stmt(stmt: Stmt, natives: &std::collections::HashSet<String>) -> Stmt {
         Stmt::ContinueStatement { label } => Stmt::ContinueStatement { label },
         Stmt::ReturnStatement { argument } => Stmt::ReturnStatement {
             argument: argument.map(|a| lower_expr(a, natives)),
+        },
+        Stmt::ThrowStatement { argument } => Stmt::ThrowStatement {
+            argument: lower_expr(argument, natives),
         },
     }
 }
@@ -1891,6 +1998,20 @@ fn drop_nested_flags(stmt: &mut Stmt) {
             drop_expr_flags(test);
             drop_stmt_flags(body);
         }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            drop_stmt_flags(block);
+            if let Some(h) = handler {
+                drop_stmt_flags(&mut h.body);
+            }
+            if let Some(f) = finalizer {
+                drop_stmt_flags(f);
+            }
+        }
+        Stmt::ThrowStatement { argument } => drop_expr_flags(argument),
         Stmt::ForStatement { init, test, update, body } => {
             drop_stmt_flags(init);
             drop_expr_flags(test);
@@ -4506,6 +4627,25 @@ fn stmt_read(st: &Stmt, name: &str, shadowed: bool) -> bool {
         Stmt::WhileStatement { test, body } => {
             expr_read(test, name, shadowed) || stmt_read(body, name, shadowed)
         }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            stmt_read(block, name, shadowed)
+                || handler.as_ref().map(|h| {
+                    let param_shadows = h
+                        .param
+                        .as_ref()
+                        .map(|p| expr_read(p, name, false))
+                        .unwrap_or(false);
+                    stmt_read(&h.body, name, shadowed || param_shadows)
+                }).unwrap_or(false)
+                || finalizer
+                    .as_ref()
+                    .map(|f| stmt_read(f, name, shadowed))
+                    .unwrap_or(false)
+        }
         Stmt::ForStatement { init, test, update, body } => {
             let declares = stmt_declares(init, name);
             stmt_read(init, name, shadowed)
@@ -4528,6 +4668,7 @@ fn stmt_read(st: &Stmt, name: &str, shadowed: bool) -> bool {
             .map(|a| expr_read(a, name, shadowed))
             .unwrap_or(false),
         Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => false,
+        Stmt::ThrowStatement { argument } => expr_read(argument, name, shadowed),
     }
 }
 
@@ -4538,6 +4679,9 @@ fn stmt_declares(st: &Stmt, name: &str) -> bool {
         }),
         Stmt::ForStatement { init, .. } => stmt_declares(init, name),
         Stmt::ForOfStatement { left, .. } => stmt_declares(left, name),
+        // The catch param shadows only INSIDE the handler (JS scoping) —
+        // it does not declare `name` for the enclosing list, so later
+        // statements' reads of a lifted `name` stay visible.
         _ => false,
     }
 }

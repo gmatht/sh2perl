@@ -145,6 +145,27 @@ fn stmt_json(s: &IrStmt) -> Value {
             "elsifs": elsifs.iter().map(|(c, b)| json!({"cond": expr_json(c), "body": stmts_json(b)})).collect::<Vec<_>>(),
             "else": stmts_json(else_),
         }),
+        // try/except/else/finally (core request py-sh-go 20260813): the
+        // guarded suite + except clauses (match: expr|null, as:
+        // string|null, body), else/finally as plain statement lists
+        // (empty arrays when absent).
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => json!({
+            "type": "Try",
+            "body": stmts_json(body),
+            "excepts": excepts.iter().map(|e| json!({
+                "type": "TryExcept",
+                "match": e.match_expr.as_ref().map(expr_json),
+                "as": e.as_name,
+                "body": stmts_json(&e.body),
+            })).collect::<Vec<_>>(),
+            "else": stmts_json(else_body),
+            "finally": stmts_json(finally_body),
+        }),
         IrStmt::For { var, iter, body } => json!({
             "type": "For", "var": var, "iter": expr_json(iter),
             "body": stmts_json(body),

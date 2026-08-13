@@ -192,6 +192,22 @@ pub fn wrap_true64_arith(prog: &mut IrProgram) {
                 | IrStmt::Background(body) => walk_stmts(body),
                 IrStmt::Redirect { inner, .. } => walk_stmts(inner),
                 IrStmt::Function { body, .. } => walk_stmts(body),
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk_stmts(body);
+                    for e in excepts.iter_mut() {
+                        if let Some(IrExpr::Arith(a)) = &mut e.match_expr {
+                            wrap_true64_arith_ast(a);
+                        }
+                        walk_stmts(&mut e.body);
+                    }
+                    walk_stmts(else_body);
+                    walk_stmts(finally_body);
+                }
                 _ => {}
             }
         }
@@ -1346,6 +1362,19 @@ fn collect_program_functions(stmts: &[IrStmt], out: &mut HashSet<String>) {
                         walk_stmts(&c.body, out);
                     }
                 }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk_stmts(body, out);
+                    for e in excepts {
+                        walk_stmts(&e.body, out);
+                    }
+                    walk_stmts(else_body, out);
+                    walk_stmts(finally_body, out);
+                }
                 IrStmt::Expr(e) => walk_expr(e, out),
                 _ => {}
             }
@@ -1761,6 +1790,30 @@ fn native_echo_fn_set(prog: &IrProgram, functions: &HashSet<String>) -> HashSet<
                 }
             }
             IrStmt::Assign { expr, .. } => expr_walk(expr, swapped, functions, bad, bad_all),
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for b in body {
+                    stmt_walk(b, swapped, functions, bad, bad_all);
+                }
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        expr_walk(m, swapped, functions, bad, bad_all);
+                    }
+                    for b in &e.body {
+                        stmt_walk(b, swapped, functions, bad, bad_all);
+                    }
+                }
+                for b in else_body {
+                    stmt_walk(b, swapped, functions, bad, bad_all);
+                }
+                for b in finally_body {
+                    stmt_walk(b, swapped, functions, bad, bad_all);
+                }
+            }
             _ => {}
         }
     }
@@ -2448,6 +2501,21 @@ fn estree_stmt_reads_positional(s: &Stmt) -> bool {
         Stmt::WhileStatement { test, body } => {
             estree_reads_positional(test) || estree_stmt_reads_positional(body)
         }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            estree_stmt_reads_positional(block)
+                || handler
+                    .as_ref()
+                    .map(|h| estree_stmt_reads_positional(&h.body))
+                    .unwrap_or(false)
+                || finalizer
+                    .as_ref()
+                    .map(|f| estree_stmt_reads_positional(f))
+                    .unwrap_or(false)
+        }
         Stmt::ForStatement {
             init,
             test,
@@ -2471,6 +2539,7 @@ fn estree_stmt_reads_positional(s: &Stmt) -> bool {
             .as_ref()
             .map(|a| estree_reads_positional(a))
             .unwrap_or(false),
+        Stmt::ThrowStatement { argument } => estree_reads_positional(argument),
     }
 }
 
@@ -2754,6 +2823,19 @@ pub fn analyze_string_lengths(prog: &IrProgram) -> Vec<(String, Option<u64>)> {
                 | IrStmt::Block(body)
                 | IrStmt::Redirect { inner: body, .. } => walk(body, assigns, trip, ranges),
                 IrStmt::Function { body, .. } => walk(body, assigns, trip, ranges),
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body, assigns, trip, ranges);
+                    for e in excepts {
+                        walk(&e.body, assigns, trip, ranges);
+                    }
+                    walk(else_body, assigns, trip, ranges);
+                    walk(finally_body, assigns, trip, ranges);
+                }
                 _ => {}
             }
         }
@@ -4204,6 +4286,30 @@ use std::collections::{HashMap, HashSet};
             }
             IrStmt::Return(None) | IrStmt::Exit(None) => {}
             IrStmt::Require(_) | IrStmt::RawText(_) => {}
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for s in body {
+                    walk_stmt(s, acc, multi_run);
+                }
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        walk_expr(m, acc, multi_run);
+                    }
+                    for s in &e.body {
+                        walk_stmt(s, acc, multi_run);
+                    }
+                }
+                for s in else_body {
+                    walk_stmt(s, acc, multi_run);
+                }
+                for s in finally_body {
+                    walk_stmt(s, acc, multi_run);
+                }
+            }
         }
     }
 
@@ -5028,6 +5134,38 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         }
         // Subshell / Background / Function: definitions or child scopes —
         // they cannot change the parent's ranges.
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            // An exception can exit at any point of the try body, so the
+            // observable post-state is a join of the pre-state and the
+            // walked state; the sub-lists are walked sequentially (an
+            // over-approximation — range analysis feeds --true64/
+            // string-length verdicts, where widening is safe).
+            let pre = state.clone();
+            for s in body {
+                walk_stmt_ranges(s, state);
+            }
+            for e in excepts {
+                for s in &e.body {
+                    walk_stmt_ranges(s, state);
+                }
+            }
+            for s in else_body {
+                walk_stmt_ranges(s, state);
+            }
+            for s in finally_body {
+                walk_stmt_ranges(s, state);
+            }
+            let mut post = state.clone();
+            for (k, v) in pre {
+                post.insert(k.clone(), join(v, post.get(&k).copied().flatten()));
+            }
+            *state = post;
+        }
         IrStmt::Subshell(_)
         | IrStmt::Background(_)
         | IrStmt::Function { .. }
@@ -8629,6 +8767,30 @@ fn analyze_loop_var_refs(
             }
             IrStmt::Expr(e) => ref_expr(e, stack, external, in_copy, loops),
             IrStmt::Output { value, .. } => ref_expr(value, stack, external, in_copy, loops),
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for b in body {
+                    ref_stmt(b, stack, external, in_copy, loops);
+                }
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        ref_expr(m, stack, external, in_copy, loops);
+                    }
+                    for b in &e.body {
+                        ref_stmt(b, stack, external, in_copy, loops);
+                    }
+                }
+                for b in else_body {
+                    ref_stmt(b, stack, external, in_copy, loops);
+                }
+                for b in finally_body {
+                    ref_stmt(b, stack, external, in_copy, loops);
+                }
+            }
             _ => {}
         }
     }
@@ -10260,6 +10422,27 @@ fn collect_arith_ref_set_vars(prog: &IrProgram) -> HashSet<String> {
             }
             IrStmt::Expr(e) => walk_expr(e, out),
             IrStmt::Output { value, .. } => walk_expr(value, out),
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for b in body {
+                    walk_stmt(b, out);
+                }
+                for e in excepts {
+                    for b in &e.body {
+                        walk_stmt(b, out);
+                    }
+                }
+                for b in else_body {
+                    walk_stmt(b, out);
+                }
+                for b in finally_body {
+                    walk_stmt(b, out);
+                }
+            }
             _ => {}
         }
     }
@@ -10873,6 +11056,30 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
             IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
                 walk_expr(expr, excluded, string_ctx, in_copy)
             }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for b in body {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        walk_expr(m, excluded, string_ctx, in_copy);
+                    }
+                    for b in &e.body {
+                        walk_stmt(b, excluded, string_ctx, in_copy);
+                    }
+                }
+                for b in else_body {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+                for b in finally_body {
+                    walk_stmt(b, excluded, string_ctx, in_copy);
+                }
+            }
             _ => {}
         }
     }
@@ -10955,6 +11162,27 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
             }
             IrStmt::Expr(e) => collect_expr_assigns(e, assigns),
             IrStmt::Output { value, .. } => collect_expr_assigns(value, assigns),
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for b in body {
+                    collect_assigns(b, assigns);
+                }
+                for e in excepts {
+                    for b in &e.body {
+                        collect_assigns(b, assigns);
+                    }
+                }
+                for b in else_body {
+                    collect_assigns(b, assigns);
+                }
+                for b in finally_body {
+                    collect_assigns(b, assigns);
+                }
+            }
             _ => {}
         }
     }
@@ -12323,6 +12551,17 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
             | IrStmt::Subshell(body)
             | IrStmt::Background(body)
             | IrStmt::Block(body) => scan_stmts(body),
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                scan_stmts(body)
+                    || excepts.iter().any(|e| scan_stmts(&e.body))
+                    || scan_stmts(else_body)
+                    || scan_stmts(finally_body)
+            }
             IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Return(None) | IrStmt::Exit(None) => {
                 false
             }
@@ -12500,6 +12739,19 @@ fn ir_nocase_shopt_mask(prog: &IrProgram) -> u8 {
             IrStmt::Block(body) => scan_stmts(body, mask),
             IrStmt::Function { body, .. } | IrStmt::Subshell(body) | IrStmt::Background(body) => {
                 scan_stmts(body, mask);
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                scan_stmts(body, mask);
+                for e in excepts {
+                    scan_stmts(&e.body, mask);
+                }
+                scan_stmts(else_body, mask);
+                scan_stmts(finally_body, mask);
             }
             IrStmt::Require(_)
             | IrStmt::RawText(_)
@@ -12997,6 +13249,28 @@ fn lowered_stmts_have_signals(stmts: &[Stmt]) -> bool {
             Stmt::VariableDeclaration { declarations, .. } => declarations
                 .iter()
                 .any(|d| d.init.as_ref().map(expr_has_signal).unwrap_or(false)),
+            Stmt::TryStatement {
+                block,
+                handler,
+                finalizer,
+            } => {
+                // A Try's catch rethrows non-Error values (the signal
+                // guard), so a signal source anywhere in the try subtree
+                // still propagates — the conservative scan must see it.
+                stmt_has_signal(block, false)
+                    || handler
+                        .as_ref()
+                        .map(|h| stmt_has_signal(&h.body, false))
+                        .unwrap_or(false)
+                    || finalizer
+                        .as_ref()
+                        .map(|f| stmt_has_signal(f, false))
+                        .unwrap_or(false)
+            }
+            // a plain throw is an exception, not a control signal — the
+            // runtime loops don't catch exceptions either, so it changes
+            // nothing for the native-loop eligibility
+            Stmt::ThrowStatement { .. } => false,
         }
     }
     fn expr_has_signal(e: &Expr) -> bool {
@@ -13762,6 +14036,217 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 test: expr_to_estree(cond),
                 consequent,
                 alternate,
+            }
+        }
+        // try/except/else/finally (core request py-sh-go 20260813) → a
+        // JS try/catch/finally. The guarded suite lowers to the try
+        // block; the except arms lower to an if/else-if ladder over
+        // `e instanceof <match>` INSIDE the single catch (a match-less
+        // arm is the ladder's terminal else; a ladder that matches
+        // nothing rethrows `e`). `as` binds the caught value into the
+        // runtime store (sh2.setVar — the store stringifies; the
+        // thrown-value convention is the runtime's `Error` objects, the
+        // request's default). The ladder is preceded by a signal guard:
+        // the runtime's BREAK/CONTINUE/RETURN control signals are NOT
+        // Error objects, and bash-level control flow must pass through a
+        // Try untouched (a bare `except:` must not swallow a `return`).
+        // Python `else` runs only when the try body completed WITHOUT
+        // raising — even a HANDLED exception skips it — and else-body
+        // exceptions are NOT caught by this statement's arms, so the
+        // else suite sits OUTSIDE the try/catch behind a completion flag
+        // (`__sh2else`, set as the try block's last statement). `finally`
+        // lowers to the JS finalizer.
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            let catch_param = Expr::Identifier {
+                name: "e".to_string(),
+            };
+            let try_body: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
+            let handler = if excepts.is_empty() {
+                None
+            } else {
+                let arms: Vec<(Option<IrExpr>, Vec<Stmt>)> = excepts
+                    .iter()
+                    .map(|e| {
+                        let mut b: Vec<Stmt> = Vec::new();
+                        if let Some(name) = &e.as_name {
+                            // the `as` binding: write the caught value
+                            // into the runtime store so the arm body's
+                            // var reads (sh2.getVar) see it
+                            b.push(Stmt::ExpressionStatement {
+                                expression: sh2_call(
+                                    "setVar",
+                                    vec![str_lit(name), catch_param.clone()],
+                                ),
+                            });
+                        }
+                        b.extend(e.body.iter().filter_map(stmt_to_estree));
+                        (e.match_expr.clone(), b)
+                    })
+                    .collect();
+                let last = arms.len() - 1;
+                let mut acc: Option<Stmt> = None;
+                for (i, (m, b)) in arms.into_iter().enumerate().rev() {
+                    let block = Stmt::BlockStatement { body: b };
+                    acc = Some(match m {
+                        Some(match_expr) => Stmt::IfStatement {
+                            test: Expr::BinaryExpression {
+                                operator: "instanceof".to_string(),
+                                left: Box::new(catch_param.clone()),
+                                right: Box::new(expr_to_estree(&match_expr)),
+                            },
+                            consequent: Box::new(block),
+                            alternate: Some(Box::new(if i == last {
+                                // last arm with a match: non-matching
+                                // exceptions rethrow
+                                Stmt::ThrowStatement {
+                                    argument: catch_param.clone(),
+                                }
+                            } else {
+                                acc.take().unwrap()
+                            })),
+                        },
+                        None => {
+                            // a match-less (bare) except is the ladder's
+                            // terminal else; arms after it are dead in
+                            // Python — nest them inside its block
+                            // (unreachable but still emitted)
+                            match acc.take() {
+                                Some(rest) => {
+                                    let mut b = block;
+                                    if let Stmt::BlockStatement { body } = &mut b {
+                                        body.push(rest);
+                                    }
+                                    b
+                                }
+                                None => block,
+                            }
+                        }
+                    });
+                }
+                let mut handler_body = vec![Stmt::IfStatement {
+                    test: Expr::UnaryExpression {
+                        operator: "!".to_string(),
+                        argument: Box::new(Expr::BinaryExpression {
+                            operator: "instanceof".to_string(),
+                            left: Box::new(catch_param.clone()),
+                            right: Box::new(Expr::Identifier {
+                                name: "Error".to_string(),
+                            }),
+                        }),
+                        prefix: true,
+                    },
+                    consequent: Box::new(Stmt::BlockStatement {
+                        body: vec![Stmt::ThrowStatement {
+                            argument: catch_param.clone(),
+                        }],
+                    }),
+                    alternate: None,
+                }];
+                handler_body.push(acc.take().unwrap());
+                Some(CatchClause {
+                    type_: "CatchClause",
+                    param: Some(Box::new(catch_param.clone())),
+                    body: Box::new(Stmt::BlockStatement {
+                        body: handler_body,
+                    }),
+                })
+            };
+            let finalizer = if finally_body.is_empty() {
+                None
+            } else {
+                Some(Box::new(Stmt::BlockStatement {
+                    body: finally_body.iter().filter_map(stmt_to_estree).collect(),
+                }))
+            };
+            if excepts.is_empty() && finalizer.is_none() {
+                // a bare try with no catch/finally is a JS SyntaxError;
+                // with no handler the try adds nothing — emit the suites
+                // plainly (else just follows the body)
+                let mut b = try_body;
+                b.extend(else_body.iter().filter_map(stmt_to_estree));
+                Stmt::BlockStatement { body: b }
+            } else if else_body.is_empty() {
+                Stmt::TryStatement {
+                    block: Box::new(Stmt::BlockStatement { body: try_body }),
+                    handler,
+                    finalizer,
+                }
+            } else if excepts.is_empty() {
+                // no arms to protect the else from: else-body exceptions
+                // propagate anyway (nothing catches them), so the plain
+                // sequential form is exact
+                Stmt::BlockStatement {
+                    body: vec![
+                        Stmt::TryStatement {
+                            block: Box::new(Stmt::BlockStatement {
+                                body: try_body,
+                            }),
+                            handler: None,
+                            finalizer,
+                        },
+                        Stmt::BlockStatement {
+                            body: else_body.iter().filter_map(stmt_to_estree).collect(),
+                        },
+                    ],
+                }
+            } else {
+                // completion flag: else runs only when the try body ran
+                // to completion (a handled exception still skips it —
+                // Python semantics)
+                let flag = "__sh2else";
+                let mut try_body = try_body;
+                try_body.push(Stmt::ExpressionStatement {
+                    expression: Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(Expr::Identifier {
+                            name: flag.to_string(),
+                        }),
+                        right: Box::new(Expr::Literal {
+                            value: serde_json::Value::from(true),
+                            raw: None,
+                            regex: None,
+                        }),
+                    },
+                });
+                Stmt::BlockStatement {
+                    body: vec![
+                        Stmt::VariableDeclaration {
+                            declarations: vec![VariableDeclarator {
+                                type_: "VariableDeclarator",
+                                id: Expr::Identifier {
+                                    name: flag.to_string(),
+                                },
+                                init: Some(Expr::Literal {
+                                    value: serde_json::Value::from(false),
+                                    raw: None,
+                                    regex: None,
+                                }),
+                            }],
+                            kind: "let",
+                        },
+                        Stmt::TryStatement {
+                            block: Box::new(Stmt::BlockStatement {
+                                body: try_body,
+                            }),
+                            handler,
+                            finalizer,
+                        },
+                        Stmt::IfStatement {
+                            test: Expr::Identifier {
+                                name: flag.to_string(),
+                            },
+                            consequent: Box::new(Stmt::BlockStatement {
+                                body: else_body.iter().filter_map(stmt_to_estree).collect(),
+                            }),
+                            alternate: None,
+                        },
+                    ],
+                }
             }
         }
         IrStmt::While { cond, body } => {
@@ -24961,6 +25446,27 @@ fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> HashSet<Stri
             }
             IrStmt::Expr(e) => collect_expr_assigns(e, assigns),
             IrStmt::Output { value, .. } => collect_expr_assigns(value, assigns),
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for b in body {
+                    collect_assigns(b, assigns);
+                }
+                for e in excepts {
+                    for b in &e.body {
+                        collect_assigns(b, assigns);
+                    }
+                }
+                for b in else_body {
+                    collect_assigns(b, assigns);
+                }
+                for b in finally_body {
+                    collect_assigns(b, assigns);
+                }
+            }
             _ => {}
         }
     }
@@ -25465,6 +25971,30 @@ fn collect_never_written(prog: &IrProgram) -> Option<HashSet<String>> {
             IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
                 walk_expr(expr, written, blocked)
             }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for st in body {
+                    walk_stmt(st, written, blocked);
+                }
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        walk_expr(m, written, blocked);
+                    }
+                    for st in &e.body {
+                        walk_stmt(st, written, blocked);
+                    }
+                }
+                for st in else_body {
+                    walk_stmt(st, written, blocked);
+                }
+                for st in finally_body {
+                    walk_stmt(st, written, blocked);
+                }
+            }
             _ => {}
         }
     }
@@ -25815,6 +26345,30 @@ fn collect_array_only_written(prog: &IrProgram) -> HashSet<String> {
             IrStmt::SetChildError(e) => walk_expr(e, array, scalar),
             IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
                 walk_expr(expr, array, scalar)
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for st in body {
+                    walk_stmt(st, array, scalar);
+                }
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        walk_expr(m, array, scalar);
+                    }
+                    for st in &e.body {
+                        walk_stmt(st, array, scalar);
+                    }
+                }
+                for st in else_body {
+                    walk_stmt(st, array, scalar);
+                }
+                for st in finally_body {
+                    walk_stmt(st, array, scalar);
+                }
             }
             _ => {}
         }
@@ -26254,6 +26808,30 @@ fn collect_native_store_access(prog: &IrProgram) -> (HashSet<String>, HashSet<St
             IrStmt::SetChildError(e) => walk_expr(e, arr, assoc, refs, attr),
             IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
                 walk_expr(expr, arr, assoc, refs, attr)
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for st in body {
+                    walk_stmt(st, arr, assoc, refs, attr);
+                }
+                for e in excepts {
+                    if let Some(m) = &e.match_expr {
+                        walk_expr(m, arr, assoc, refs, attr);
+                    }
+                    for st in &e.body {
+                        walk_stmt(st, arr, assoc, refs, attr);
+                    }
+                }
+                for st in else_body {
+                    walk_stmt(st, arr, assoc, refs, attr);
+                }
+                for st in finally_body {
+                    walk_stmt(st, arr, assoc, refs, attr);
+                }
             }
             _ => {}
         }
@@ -29823,6 +30401,31 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
                 argument.as_ref().map_or(true, |a| expr_ok(a, var))
             }
             Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => true,
+            Stmt::TryStatement {
+                block,
+                handler,
+                finalizer,
+            } => {
+                stmt_ok(block, var)
+                    && handler.as_ref().map_or(true, |h| {
+                        // the catch param shadows the native binding
+                        // inside the handler (JS lexical scope) — a param
+                        // named `var` disqualifies the getVar rewrite
+                        let param_blocks = h
+                            .param
+                            .as_ref()
+                            .map(|p| {
+                                matches!(
+                                    p.as_ref(),
+                                    Expr::Identifier { name } if name == var
+                                )
+                            })
+                            .unwrap_or(false);
+                        !param_blocks && stmt_ok(&h.body, var)
+                    })
+                    && finalizer.as_ref().map_or(true, |f| stmt_ok(f, var))
+            }
+            Stmt::ThrowStatement { argument } => expr_ok(argument, var),
         }
     }
     stmts.iter().all(|s| stmt_ok(s, var))
@@ -29978,6 +30581,20 @@ fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
                 }
             }
             Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            Stmt::TryStatement {
+                block,
+                handler,
+                finalizer,
+            } => {
+                stmt_rewrite(block, var, js_var);
+                if let Some(h) = handler {
+                    stmt_rewrite(&mut h.body, var, js_var);
+                }
+                if let Some(f) = finalizer {
+                    stmt_rewrite(f, var, js_var);
+                }
+            }
+            Stmt::ThrowStatement { argument } => expr_rewrite(argument, var, js_var),
         }
     }
     for s in stmts.iter_mut() {
@@ -30155,6 +30772,74 @@ mod range_analysis_tests {
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = ast_to_ir(&cmds);
         analyze_var_ranges(&prog)
+    }
+
+    /// The Try node lowers to a JS try/catch/finally (core request
+    /// py-sh-go 20260813): the guarded suite → the try block; except
+    /// arms → an `e instanceof <match>` if/else-if ladder inside the
+    /// catch (match-less arm = terminal else, nothing matched →
+    /// rethrow); the signal guard (`!(e instanceof Error)` → rethrow)
+    /// first; `as` → sh2.setVar; else → a post-try completion-flag
+    /// block; finally → the JS finalizer.
+    #[test]
+    fn try_stmt_lowers_to_js_try_catch() {
+        use crate::ir::{IrExpr, IrProgram, IrStmt, TryExcept};
+        let mk = |else_body: Vec<IrStmt>, finally_body: Vec<IrStmt>| IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::Try {
+                body: vec![IrStmt::Expr(IrExpr::Ident("guard".to_string()))],
+                excepts: vec![
+                    TryExcept {
+                        match_expr: Some(IrExpr::Ident("ValueError".to_string())),
+                        as_name: Some("e".to_string()),
+                        body: vec![],
+                    },
+                    TryExcept {
+                        match_expr: None,
+                        as_name: None,
+                        body: vec![],
+                    },
+                ],
+                else_body,
+                finally_body,
+            }],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        // bare try/except: TryStatement + CatchClause + instanceof ladder
+        // + signal guard + rethrow
+        let json = serde_json::to_string(&shir_to_estree(&mk(vec![], vec![]))).unwrap();
+        assert!(json.contains("\"type\":\"TryStatement\""), "{json}");
+        assert!(json.contains("\"type\":\"CatchClause\""), "{json}");
+        assert!(json.contains("\"operator\":\"instanceof\""), "{json}");
+        assert!(json.contains("\"name\":\"ValueError\""), "{json}");
+        assert!(json.contains("\"type\":\"ThrowStatement\""), "{json}");
+        assert!(json.contains("\"name\":\"setVar\""), "{json}");
+        // the catch param is the fixed `e` binding
+        assert!(json.contains("\"type\":\"CatchClause\",\"param\":{\"type\":\"Identifier\",\"name\":\"e\"}"), "{json}");
+        // else suite: a completion flag + post-try if (Python else runs
+        // only when the try body completed without raising)
+        let json = serde_json::to_string(&shir_to_estree(&mk(
+            vec![IrStmt::Expr(IrExpr::Ident("els".to_string()))],
+            vec![],
+        )))
+        .unwrap();
+        assert!(json.contains("\"name\":\"__sh2else\""), "{json}");
+        // finally: the JS finalizer
+        let json = serde_json::to_string(&shir_to_estree(&mk(
+            vec![],
+            vec![IrStmt::Expr(IrExpr::Ident("fin".to_string()))],
+        )))
+        .unwrap();
+        assert!(json.contains("\"finalizer\":{\"type\":\"BlockStatement\""), "{json}");
+        assert!(!json.contains("unsupported"), "{json}");
     }
 
     #[test]

@@ -366,6 +366,27 @@ fn rewrite_setvar_stmts(
                 rewrite_setvar_stmts(s, store, unsafe_v);
             }
         }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            for s in body.iter_mut() {
+                rewrite_setvar_stmts(s, store, unsafe_v);
+            }
+            for e in excepts.iter_mut() {
+                for s in e.body.iter_mut() {
+                    rewrite_setvar_stmts(s, store, unsafe_v);
+                }
+            }
+            for s in else_body.iter_mut() {
+                rewrite_setvar_stmts(s, store, unsafe_v);
+            }
+            for s in finally_body.iter_mut() {
+                rewrite_setvar_stmts(s, store, unsafe_v);
+            }
+        }
         _ => {}
     }
 }

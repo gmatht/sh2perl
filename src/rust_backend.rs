@@ -1228,6 +1228,7 @@ impl Render {
             | IrStmt::Goto(_) => {
                 self.mark_todo(&format!("stmt {:?}", s));
             }
+            IrStmt::Try { .. } => self.mark_todo("try"),
             IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
             IrStmt::Continue => self.emit("continue;"),
             IrStmt::Break => self.emit("break;"),
