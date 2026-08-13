@@ -535,110 +535,283 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
 "##);
     }
     if needs_cmp(&prog.stmts) {
-        out.push_str("\n");
-        out.push_str("# GNU cmp(1) polyfill (POSIX sh; -b/-n/-i supported; -l/-s/basic full).\n");
-        out.push_str("_pbyte() {\n");
-        out.push_str("    # $1 = single byte; print in cat -v form (printable or ^X).\n");
-        out.push_str("    n=$(printf '%d' \"'$1\")\n");
-        out.push_str("    if [ \"$n\" -ge 32 ] && [ \"$n\" -lt 127 ]; then printf '%s' \"$1\"\n");
-        out.push_str("    elif [ \"$n\" -lt 32 ]; then printf '^%c' \"$((n + 64))\"\n");
-        out.push_str("    elif [ \"$n\" -eq 127 ]; then printf '^?'\n");
-        out.push_str("    else printf 'M-^%c' \"$(((n - 128) + 64))\"\n");
-        out.push_str("    fi\n");
-        out.push_str("}\n");
-        out.push_str("_cmp() {\n");
-        out.push_str("    _s=0 _lf=0 _bf=0 _nlim=\"\" _sk1=0 _sk2=0 _lc=1 _i=0\n");
-        out.push_str("    # parse flags (stop at first non-flag arg)\n");
-        out.push_str("    while [ \"$#\" -gt 0 ]; do\n");
-        out.push_str("        case \"$1\" in\n");
-        out.push_str("            -l) _lf=1 ;;\n");
-        out.push_str("            -s) _s=1 ;;\n");
-        out.push_str("            -b) _bf=1 ;;\n");
-        out.push_str("            -n) _nlim=$2; shift ;;\n");
-        out.push_str("            -i)\n");
-        out.push_str("                _skrest=$2; shift\n");
-        out.push_str("                case \"$_skrest\" in\n");
-        out.push_str("                    *:*) _sk1=${_skrest%%:*}; _sk2=${_skrest#*:} ;;\n");
-        out.push_str("                    *) _sk1=$_skrest ;;\n");
-        out.push_str("                esac ;;\n");
-        out.push_str("            --) shift; break ;;\n");
-        out.push_str("            *) break ;;\n");
-        out.push_str("        esac\n");
-        out.push_str("        shift\n");
-        out.push_str("    done\n");
-        out.push_str("    [ \"$#\" -ge 2 ] || { echo \"cmp: missing operand\" >&2; return 2; }\n");
-        out.push_str("    _a=$1; _b=$2\n");
-        out.push_str("    if [ ! -f \"$_a\" ]; then echo \"cmp: \"$_a\": No such file\" >&2; return 2; fi\n");
-        out.push_str("    if [ ! -f \"$_b\" ]; then echo \"cmp: \"$_b\": No such file\" >&2; return 2; fi\n");
-        out.push_str("    _as=$(wc -c <\"$_a\"); _bs=$(wc -c <\"$_b\")\n");
-        out.push_str("    # adjust file sizes for the skipped prefix (the comparison range)\n");
-        out.push_str("    _as=$((_as - _sk1)); _bs=$((_bs - _sk2))\n");
-        out.push_str("    [ \"$_as\" -lt 0 ] && _as=0; [ \"$_bs\" -lt 0 ] && _bs=0\n");
-        out.push_str("    # compare up to the shorter of the two ranges, capped by -n\n");
-        out.push_str("    _n=$_as; [ \"$_bs\" -lt \"$_n\" ] && _n=$_bs\n");
-        out.push_str("    if [ -n \"$_nlim\" ] && [ \"$_nlim\" -lt \"$_n\" ]; then _n=$_nlim; fi\n");
-        out.push_str("    while [ \"$_i\" -lt \"$_n\" ]; do\n");
-        out.push_str("        _ab_b=$(dd if=\"$_a\" bs=1 skip=$((_sk1 + _i)) count=1 2>/dev/null)\n");
-        out.push_str("        _bb_b=$(dd if=\"$_b\" bs=1 skip=$((_sk2 + _i)) count=1 2>/dev/null)\n");
-        out.push_str("        if [ \"$_ab_b\" != \"$_bb_b\" ]; then\n");
-        out.push_str("            _ab_o=$(printf '%s' \"$_ab_b\" | od -A n -t o1 | tr -d ' \\n')\n");
-        out.push_str("            _bb_o=$(printf '%s' \"$_bb_b\" | od -A n -t o1 | tr -d ' \\n')\n");
-        out.push_str("            # reported byte/line: the 1-indexed position in the file\n");
-        out.push_str("            # whose offset at the differ is the smaller (the \"anchor\")\n");
-        out.push_str("            if [ \"$_sk1\" -le \"$_sk2\" ]; then\n");
-        out.push_str("                _rep=$((_sk1 + _i + 1))\n");
-        out.push_str("            else\n");
-        out.push_str("                _rep=$((_sk2 + _i + 1))\n");
-        out.push_str("            fi\n");
-        out.push_str("            if [ \"$_s\" -eq 0 ] && [ \"$_lf\" -eq 0 ]; then\n");
-        out.push_str("                if [ \"$_bf\" -ne 0 ]; then\n");
-        out.push_str("                    printf '%s %s differ: byte %d, line %d is %3o %s %3o %s\\n' \"$_a\" \"$_b\" \"$_rep\" \"$_lc\" \"0$_ab_o\" \"$(_pbyte \"$_ab_b\")\" \"0$_bb_o\" \"$(_pbyte \"$_bb_b\")\"\n");
-        out.push_str("                else\n");
-        out.push_str("                    printf '%s %s differ: byte %d, line %d\\n' \"$_a\" \"$_b\" \"$_rep\" \"$_lc\"\n");
-        out.push_str("                fi\n");
-        out.push_str("            fi\n");
-        out.push_str("            if [ \"$_lf\" -ne 0 ]; then\n");
-        out.push_str("                printf '%d %3o %3o\\n' \"$_rep\" \"0$_ab_o\" \"0$_bb_o\"\n");
-        out.push_str("            fi\n");
-        out.push_str("            return 1\n");
-        out.push_str("        fi\n");
-        out.push_str("        # newline: 012 octal from od (od pads to 3 digits: \" 012\")\n");
-        out.push_str("        [ \"$_ab_o\" = \"012\" ] && _lc=$((_lc + 1))\n");
-        out.push_str("        _i=$((_i + 1))\n");
-        out.push_str("    done\n");
-        out.push_str("    # if the comparison ranges differ in length (one file longer after skip)\n");
-        out.push_str("    if [ \"$_as\" -ne \"$_bs\" ]; then\n");
-        out.push_str("        if [ \"$_s\" -eq 0 ] && [ \"$_lf\" -eq 0 ]; then\n");
-        out.push_str("            # the differ is at EOF of the shorter file; report the byte\n");
-        out.push_str("            # at the position just past the shorter range\n");
-        out.push_str("            if [ \"$_as\" -lt \"$_bs\" ]; then\n");
-        out.push_str("                _rep=$((_sk1 + _as + 1))\n");
-        out.push_str("            else\n");
-        out.push_str("                _rep=$((_sk2 + _bs + 1))\n");
-        out.push_str("            fi\n");
-        out.push_str("            if [ \"$_bf\" -ne 0 ]; then\n");
-        out.push_str("                # one side is EOF; GNU prints \"differ: byte N, line M is XXX YYY\"\n");
-        out.push_str("                # where YYY is the EOF marker; the corpus empty-file case\n");
-        out.push_str("                # uses `cmp: EOF on FILE which is empty` to stderr (rc 1).\n");
-        out.push_str("                # We emit the same to stderr and rc 1.\n");
-        out.push_str("                printf '%s %s differ: byte %d, line %d\\n' \"$_a\" \"$_b\" \"$_rep\" \"$_lc\" >&2\n");
-        out.push_str("            else\n");
-        out.push_str("                printf '%s %s differ: byte %d, line %d\\n' \"$_a\" \"$_b\" \"$_rep\" \"$_lc\"\n");
-        out.push_str("            fi\n");
-        out.push_str("        fi\n");
-        out.push_str("        return 1\n");
-        out.push_str("    fi\n");
-        out.push_str("    return 0\n");
-        out.push_str("}\n");
-        out.push_str("\n");
+        out.push_str(
+            r#"
+# GNU cmp(1) polyfill (POSIX sh; -b/-l/-s/-n/-i/--; bisect first-diff,
+# stdin spooled into a variable, no temp files). Byte-identical to GNU
+# cmp 8.x on the corpus; runs under dash and busybox ash.
+_cmp_oct_char() {
+    awk -v d="$((0$1))" 'BEGIN {
+        if (d >= 32 && d <= 126) printf "%c", d
+        else if (d < 32) printf "^%c", d + 64
+        else if (d == 127) printf "^?"
+        else { d2 = d - 128
+               if (d2 < 32) printf "M-^%c", d2 + 64
+               else if (d2 == 127) printf "M-^?"
+               else printf "M-%c", d2 }
+    }'
+}
+_cmp() {
+    (
+        _b=0 _l=0 _s=0 _nlim=-1 _sk1=0 _sk2=0
+        OPTIND=1
+        while getopts "blsn:i:" _o; do
+            case "$_o" in
+                b) _b=1 ;;
+                l) _l=1 ;;
+                s) _s=1 ;;
+                n) _nlim=$OPTARG ;;
+                i)
+                    case "$OPTARG" in
+                        *:*) _sk1=${OPTARG%%:*}; _sk2=${OPTARG##*:} ;;
+                        *) _sk1=$OPTARG; _sk2=$OPTARG ;;
+                    esac
+                    ;;
+                *) echo "Usage: cmp [-b|-l|-s] [-n N] [-i N[:M]] [--] file1 file2" >&2
+                   exit 2 ;;
+            esac
+        done
+        shift $((OPTIND - 1))
+        [ "${1:-}" = "--" ] && shift
+        if [ "$_l" -eq 1 ] && [ "$_s" -eq 1 ]; then
+            echo "cmp: options -l and -s are incompatible" >&2
+            echo "Try 'cmp --help' for more information." >&2
+            exit 2
+        fi
+        if [ $# -eq 0 ]; then
+            echo "cmp: missing operand after 'cmp'" >&2
+            echo "Try 'cmp --help' for more information." >&2
+            exit 2
+        elif [ $# -eq 1 ]; then
+            _f1=$1; _f2=-
+        else
+            _f1=$1; _f2=$2
+        fi
+        for _f in "$_f1" "$_f2"; do
+            [ "$_f" = "-" ] && continue
+            if [ ! -e "$_f" ]; then
+                echo "cmp: $_f: No such file or directory" >&2
+                exit 2
+            fi
+            if [ -d "$_f" ]; then
+                echo "cmp: $_f: Is a directory" >&2
+                exit 2
+            fi
+            if [ ! -r "$_f" ]; then
+                echo "cmp: $_f: Permission denied" >&2
+                exit 2
+            fi
+        done
+        # stdin is a one-shot pipe, but the bisect needs re-reads, so spool
+        # it into a shell VARIABLE (exact byte-for-byte via a read loop;
+        # NUL bytes cannot be held and are dropped at the first one). Both
+        # `-` operands point at the same variable (`cmp - -` -> rc 0).
+        _tin=
+        if [ "$_f1" = "-" ] || [ "$_f2" = "-" ]; then
+            _cmp_partial=0
+            while :; do
+                if IFS= read -r _lin; then
+                    _tin="$_tin$_lin
+"
+                else
+                    if [ -z "${_lin:-}" ]; then break; fi
+                    _tin="$_tin$_lin
+"
+                    _cmp_partial=1
+                    break
+                fi
+            done
+            [ "$_cmp_partial" -eq 1 ] && _tin=${_tin%"
+"}
+        fi
+        # read source $1 (`-` = stdin var) at byte offset $2 (0-based),
+        # emitting up to $3 bytes. Files use tail's lseek; stdin re-pipes
+        # the variable (read-through).
+        _cmp_read() {
+            if [ "$1" = "-" ]; then
+                printf '%s' "$_tin" | tail -c +$(( $2 + 1 )) 2>/dev/null | head -c "$3" 2>/dev/null
+            else
+                tail -c +$(( $2 + 1 )) "$1" 2>/dev/null | head -c "$3" 2>/dev/null
+            fi
+        }
+        _cmp_size() {
+            if [ "$1" = "-" ]; then
+                printf '%s' "$_tin" | wc -c | tr -d ' '
+            else
+                wc -c < "$1" | tr -d ' '
+            fi
+        }
+        # sizes of the comparison ranges (after skip), and the length to
+        # compare = the shorter range capped by -n.
+        _sz1=$(_cmp_size "$_f1")
+        _sz2=$(_cmp_size "$_f2")
+        _sz1=$((_sz1 - _sk1)); _sz2=$((_sz2 - _sk2))
+        [ "$_sz1" -lt 0 ] && _sz1=0
+        [ "$_sz2" -lt 0 ] && _sz2=0
+        _n=$_sz1
+        [ "$_sz2" -lt "$_n" ] && _n=$_sz2
+        if [ "$_nlim" -ne -1 ] && [ "$_nlim" -lt "$_n" ]; then _n=$_nlim; fi
+        # first differing offset in [0, _n): binary search on the prefix
+        # cksum (the predicate "first k bytes are identical" is monotone).
+        _cmp_ffd() {
+            _ffd_lo=0
+            _ffd_hi=$1
+            while [ "$_ffd_hi" -gt "$_ffd_lo" ]; do
+                if [ $((_ffd_hi - _ffd_lo)) -eq 1 ]; then
+                    _ffd_h1=$(_cmp_read "$_f1" "$_sk1" "$_ffd_hi" | cksum | awk '{print $1}')
+                    _ffd_h2=$(_cmp_read "$_f2" "$_sk2" "$_ffd_hi" | cksum | awk '{print $1}')
+                    if [ "$_ffd_h1" = "$_ffd_h2" ]; then echo "$_ffd_hi"; else echo "$_ffd_lo"; fi
+                    return
+                fi
+                _ffd_mid=$((_ffd_lo + (_ffd_hi - _ffd_lo) / 2))
+                _ffd_h1=$(_cmp_read "$_f1" "$_sk1" "$_ffd_mid" | cksum | awk '{print $1}')
+                _ffd_h2=$(_cmp_read "$_f2" "$_sk2" "$_ffd_mid" | cksum | awk '{print $1}')
+                if [ "$_ffd_h1" = "$_ffd_h2" ]; then _ffd_lo=$_ffd_mid; else _ffd_hi=$_ffd_mid; fi
+            done
+            echo "$_ffd_lo"
+        }
+        # empty comparison range
+        if [ "$_n" -eq 0 ]; then
+            if [ "$_nlim" -ne -1 ]; then exit 0; fi
+            if [ "$_sz1" -eq 0 ] && [ "$_sz2" -eq 0 ]; then exit 0; fi
+            if [ "$_sz1" -lt "$_sz2" ]; then
+                [ "$_s" -eq 0 ] && echo "cmp: EOF on $_f1 which is empty" >&2
+            else
+                if [ "$_sz2" -eq 0 ]; then
+                    [ "$_s" -eq 0 ] && echo "cmp: EOF on $_f2 which is empty" >&2
+                else
+                    [ "$_s" -eq 0 ] && echo "cmp: EOF on $_f2" >&2
+                fi
+            fi
+            exit 1
+        fi
+        _df=$(_cmp_ffd "$_n")
+        if [ "$_df" -ge "$_n" ]; then
+            if [ "$_sz1" -eq "$_sz2" ]; then exit 0; fi
+            if [ "$_nlim" -ne -1 ] && [ "$_n" -eq "$_nlim" ]; then exit 0; fi
+            if [ "$_sz1" -gt "$_sz2" ]; then _sf=$_f2; _so=$_sz2
+            else _sf=$_f1; _so=$_sz1; fi
+            if [ "$_so" -eq 0 ]; then
+                [ "$_s" -eq 0 ] && echo "cmp: EOF on $_sf which is empty" >&2
+                exit 1
+            fi
+            if [ "$_nlim" -eq -1 ]; then
+                _eol=$(_cmp_read "$_f1" "$_sk1" "$_n" | tr -cd '\n' | wc -c | tr -d ' ')
+                _eol=$((_eol + 1))
+                if [ "$_s" -eq 0 ]; then
+                    if [ "$_l" -eq 1 ]; then
+                        echo "cmp: EOF on $_sf after byte $_n" >&2
+                    else
+                        echo "cmp: EOF on $_sf after byte $_n, in line $_eol" >&2
+                    fi
+                fi
+                exit 1
+            fi
+            _df=$_n
+            if [ "$_sz1" -gt "$_sz2" ]; then
+                _b1=$(_cmp_read "$_f1" $((_sk1 + _df)) 1 | od -An -to1 | tr -d ' \n')
+                _b2=
+            else
+                _b1=
+                _b2=$(_cmp_read "$_f2" $((_sk2 + _df)) 1 | od -An -to1 | tr -d ' \n')
+            fi
+            _b1set=1
+        fi
+        if [ "${_b1set:-0}" != 1 ]; then
+            _b1=$(_cmp_read "$_f1" $((_sk1 + _df)) 1 | od -An -to1 | tr -d ' \n')
+            _b2=$(_cmp_read "$_f2" $((_sk2 + _df)) 1 | od -An -to1 | tr -d ' \n')
+        fi
+        if [ -z "$_b1" ] && [ -z "$_b2" ]; then exit 0; fi
+        if [ -z "$_b1" ]; then
+            _eol=$(_cmp_read "$_f2" "$_sk2" "$_df" | tr -cd '\n' | wc -c | tr -d ' ')
+            _eol=$((_eol + 1))
+            if [ "$_s" -eq 0 ]; then
+                if [ "$_l" -eq 1 ]; then
+                    echo "cmp: EOF on $_f1 after byte $_n" >&2
+                else
+                    echo "cmp: EOF on $_f1 after byte $_n, in line $_eol" >&2
+                fi
+            fi
+            exit 1
+        fi
+        if [ -z "$_b2" ]; then
+            _eol=$(_cmp_read "$_f1" "$_sk1" "$_df" | tr -cd '\n' | wc -c | tr -d ' ')
+            _eol=$((_eol + 1))
+            if [ "$_s" -eq 0 ]; then
+                if [ "$_l" -eq 1 ]; then
+                    echo "cmp: EOF on $_f2 after byte $_n" >&2
+                else
+                    echo "cmp: EOF on $_f2 after byte $_n, in line $_eol" >&2
+                fi
+            fi
+            exit 1
+        fi
+        if [ "$_b1" = "$_b2" ]; then exit 0; fi
+        if [ "$_l" -eq 1 ]; then
+            if [ "$_sz1" -gt "$_n" ] || [ "$_sz2" -gt "$_n" ]; then
+                if [ "$_sz1" -gt "$_sz2" ]; then _ef=$_f2; _eo=$_sz2
+                else _ef=$_f1; _eo=$_sz1; fi
+                echo "cmp: EOF on $_ef after byte $_eo" >&2
+            fi
+            _blk=16384
+            _off=$_df
+            while [ "$_off" -lt "$_n" ]; do
+                _cur=$((_n - _off))
+                [ "$_cur" -gt "$_blk" ] && _cur=$_blk
+                _h1=$(_cmp_read "$_f1" $((_sk1 + _off)) "$_cur" | cksum | awk '{print $1}')
+                _h2=$(_cmp_read "$_f2" $((_sk2 + _off)) "$_cur" | cksum | awk '{print $1}')
+                if [ "$_h1" != "$_h2" ]; then
+                    {
+                        _cmp_read "$_f1" $((_sk1 + _off)) "$_cur" | od -An -to1 -v | tr -s ' ' '\n' | sed '/^$/d' | awk '{printf "1 %d %s\n", NR, $1}'
+                        printf '0 0 0\n'
+                        _cmp_read "$_f2" $((_sk2 + _off)) "$_cur" | od -An -to1 -v | tr -s ' ' '\n' | sed '/^$/d' | awk '{printf "2 %d %s\n", NR, $1}'
+                    } | awk -v base="$((_off + 1))" -v maxb="$_n" '
+                        $1 == 1 { a[$2] = $3; next }
+                        $1 == 2 { if (($2 in a) && a[$2] != $3) {
+                                      _w = length(sprintf("%d", maxb))
+                                      printf "%*d %3s %3s\n", _w, base + $2 - 1, a[$2]+0, $3+0 } }'
+                fi
+                _off=$((_off + _cur))
+            done
+            exit 1
+        fi
+        if [ "$_df" -gt 0 ]; then
+            _ln=$(_cmp_read "$_f1" "$_sk1" "$_df" | tr -cd '\n' | wc -c | tr -d ' ')
+            _ln=$((_ln + 1))
+        else
+            _ln=1
+        fi
+        _byte=$((_df + 1))
+        if [ "$_s" -eq 1 ]; then exit 1; fi
+        if [ "$_b" -eq 1 ]; then
+            _o1=$(printf '%o' "$((0$_b1))")
+            _o2=$(printf '%o' "$((0$_b2))")
+            _c1ch=$(_cmp_oct_char "$_b1")
+            _c2ch=$(_cmp_oct_char "$_b2")
+            printf '%s %s differ: byte %d, line %d is %3s %s %3s %s\n' \
+                "$_f1" "$_f2" "$_byte" "$_ln" "$_o1" "$_c1ch" "$_o2" "$_c2ch"
+        else
+            printf '%s %s differ: byte %d, line %d\n' "$_f1" "$_f2" "$_byte" "$_ln"
+        fi
+        exit 1
+    )
+}
+"#,
+        );
     }
-    out.push_str("_num() {\n");
-    out.push_str("    # bash coerces non-numeric arith values to 0; dash errors\n");
-    out.push_str("    case \"$1\" in\n");
-    out.push_str("        ''|'-'|*[!0-9-]*|-*[!0-9]*) echo 0 ;;\n");
-    out.push_str("        *) echo \"$1\" ;;\n");
-    out.push_str("    esac\n");
-    out.push_str("}\n\n");
+    // `_num()` is a polyfill: ONLY emit it when the program's arithmetic
+    // actually reads a bare variable (`$( _num "$x" )` — bash coerces
+    // non-numeric arith values to 0, dash errors). Emitting it unused is
+    // harmless, but stripping a USED one is broken — gate on usage.
+    if needs_num(&prog.stmts) {
+        out.push_str("_num() {\n");
+        out.push_str("    # bash coerces non-numeric arith values to 0; dash errors\n");
+        out.push_str("    case \"$1\" in\n");
+        out.push_str("        ''|'-'|*[!0-9-]*|-*[!0-9]*) echo 0 ;;\n");
+        out.push_str("        *) echo \"$1\" ;;\n");
+        out.push_str("    esac\n");
+        out.push_str("}\n\n");
+    }
     if needs_arr_helper(prog) {
         out.push_str(
             r#"
@@ -1753,6 +1926,82 @@ fn needs_cmp(stmts: &[IrStmt]) -> bool {
                     if has_cmp(iter) || walk(body) { return true; }
                 }
                 IrStmt::Assign { expr, .. } => { if has_cmp(expr) { return true; } }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
+/// does the program's arithmetic read a bare variable? (`$( _num "$x" )`.)
+/// Walks every arith expression anywhere in the program.
+fn needs_num(stmts: &[IrStmt]) -> bool {
+    fn arith_has_var(a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Num(_) => false,
+            ArithAst::Var(_) => true,
+            ArithAst::Index { key, .. } => arith_has_var(key),
+            ArithAst::Bin { lhs, rhs, .. } => arith_has_var(lhs) || arith_has_var(rhs),
+            ArithAst::Un { arg, .. } => arith_has_var(arg),
+            ArithAst::Cond { test, then, else_, .. } => {
+                arith_has_var(test) || arith_has_var(then) || arith_has_var(else_)
+            }
+            ArithAst::Assign { rhs, .. } => arith_has_var(rhs),
+            ArithAst::IncDec { var, .. } => true,
+        }
+    }
+    fn has_num(e: &IrExpr) -> bool {
+        if let IrExpr::Arith(a) = e {
+            if arith_has_var(a) {
+                return true;
+            }
+        }
+        match e {
+            IrExpr::Call { args, .. } => args.iter().any(has_num),
+            IrExpr::Array(es) => es.iter().any(has_num),
+            IrExpr::Object(es) => es.iter().any(|(_, v)| has_num(v)),
+            IrExpr::Arrow(stmts) => walk(stmts),
+            _ => false,
+        }
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            match st {
+                IrStmt::Expr(e) => {
+                    if has_num(e) {
+                        return true;
+                    }
+                }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    if has_num(cond) || walk(body) {
+                        return true;
+                    }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    if has_num(cond)
+                        || walk(then)
+                        || walk(else_)
+                        || elsifs.iter().any(|(c, b)| has_num(c) || walk(b))
+                    {
+                        return true;
+                    }
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    if has_num(iter) || walk(body) {
+                        return true;
+                    }
+                }
+                IrStmt::Assign { expr, .. } => {
+                    if has_num(expr) {
+                        return true;
+                    }
+                }
                 _ => {}
             }
         }
