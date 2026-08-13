@@ -14374,6 +14374,76 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         },
                     ],
                 }
+            } else if finalizer.is_some() {
+                // Python runs the else BEFORE the finally, but a JS
+                // finalizer executes when the whole TryStatement ends —
+                // i.e. before a post-try else block, which would give
+                // try → finally → else. Nest instead: the inner
+                // try/catch (completion flag set as its last statement)
+                // and the flag-gated else sit inside an outer try block
+                // whose finalizer is the JS finally. Ordering then
+                // matches Python on every path: no-exception →
+                // body, else, finally; caught → body(raise), ladder,
+                // finally (else skipped via the unset flag); else-body
+                // exceptions are NOT caught by this statement's arms
+                // (the else sits outside the inner try/catch) and still
+                // pass through the outer finalizer.
+                let flag = "__sh2else";
+                let mut try_body = try_body;
+                try_body.push(Stmt::ExpressionStatement {
+                    expression: Expr::AssignmentExpression {
+                        operator: "=".to_string(),
+                        left: Box::new(Expr::Identifier {
+                            name: flag.to_string(),
+                        }),
+                        right: Box::new(Expr::Literal {
+                            value: serde_json::Value::from(true),
+                            raw: None,
+                            regex: None,
+                        }),
+                    },
+                });
+                Stmt::TryStatement {
+                    block: Box::new(Stmt::BlockStatement {
+                        body: vec![
+                            Stmt::VariableDeclaration {
+                                declarations: vec![VariableDeclarator {
+                                    type_: "VariableDeclarator",
+                                    id: Expr::Identifier {
+                                        name: flag.to_string(),
+                                    },
+                                    init: Some(Expr::Literal {
+                                        value: serde_json::Value::from(false),
+                                        raw: None,
+                                        regex: None,
+                                    }),
+                                }],
+                                kind: "let",
+                            },
+                            Stmt::TryStatement {
+                                block: Box::new(Stmt::BlockStatement {
+                                    body: try_body,
+                                }),
+                                handler,
+                                finalizer: None,
+                            },
+                            Stmt::IfStatement {
+                                test: Expr::Identifier {
+                                    name: flag.to_string(),
+                                },
+                                consequent: Box::new(Stmt::BlockStatement {
+                                    body: else_body
+                                        .iter()
+                                        .filter_map(stmt_to_estree)
+                                        .collect(),
+                                }),
+                                alternate: None,
+                            },
+                        ],
+                    }),
+                    handler: None,
+                    finalizer,
+                }
             } else {
                 // completion flag: else runs only when the try body ran
                 // to completion (a handled exception still skips it —
@@ -14414,7 +14484,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                                 body: try_body,
                             }),
                             handler,
-                            finalizer,
+                            finalizer: None,
                         },
                         Stmt::IfStatement {
                             test: Expr::Identifier {
@@ -31143,6 +31213,27 @@ mod range_analysis_tests {
         .unwrap();
         assert!(json.contains("\"finalizer\":{\"type\":\"BlockStatement\""), "{json}");
         assert!(!json.contains("unsupported"), "{json}");
+        // else WITH finally: a JS finalizer would run before a post-try
+        // else block (try → finally → else); the lowering nests the inner
+        // try/catch + flag-gated else inside an outer try whose finalizer
+        // is the JS finally, so the else precedes the finalizer in the
+        // emitted JSON (core request py-sh-go-20260813-145247)
+        let json = serde_json::to_string(&shir_to_estree(&mk(
+            vec![IrStmt::Expr(IrExpr::Ident("els".to_string()))],
+            vec![IrStmt::Expr(IrExpr::Ident("fin".to_string()))],
+        )))
+        .unwrap();
+        assert_eq!(json.matches("\"type\":\"TryStatement\"").count(), 2, "{json}");
+        let flag_pos = json.find("\"name\":\"__sh2else\"").expect("flag");
+        let finalizer_pos = json.find("\"finalizer\":").expect("finalizer");
+        assert!(
+            flag_pos < finalizer_pos,
+            "else must precede finally: {json}"
+        );
+        // the outer statement has no handler (the ladder stays on the
+        // inner try); the inner try has no finalizer
+        assert!(json.contains("\"handler\":null,\"finalizer\":{\"type\":\"BlockStatement\""), "{json}");
+        assert!(json.contains("\"finalizer\":null},{\"type\":\"IfStatement\""), "{json}");
     }
 
     #[test]
