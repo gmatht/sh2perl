@@ -447,6 +447,10 @@ impl Render {
                 self.mark_todo("Lambda expr");
                 "0".to_string()
             }
+            IrExpr::Splice(_) => {
+                self.mark_todo("Splice expr");
+                "0".to_string()
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr(i)).collect();
                 format!("({})", elems.join(", "))
@@ -805,6 +809,51 @@ impl Render {
                 Some(s) => self.test(&s),
                 None => {
                     self.mark_todo("test arg");
+                    "0".into()
+                }
+            },
+            // `regexMatch(Regex(pattern, flags), value)` — the fish
+            // `string match -rq` cond lift (triage-perl
+            // t81_regex_match): Perl's native regex (`$v =~ /pat/i`)
+            // is the exact ERE search decision (status 0 iff any
+            // match). flags: only fish's `-i` (ignore-case) is emitted
+            // by the frontend; anything else refuses loudly.
+            "regexMatch" => match args.first() {
+                Some(IrExpr::Regex { pattern, flags }) => {
+                    if flags.chars().any(|c| c != 'i') {
+                        self.mark_todo(&format!("regexMatch flags {flags:?}"));
+                        return "0".into();
+                    }
+                    let value = args
+                        .get(1)
+                        .map(|v| self.expr(v))
+                        .unwrap_or_else(|| "''".to_string());
+                    // escape the m{} delimiter braces + interpolation
+                    // chars (`$`/`@` followed by an ident char would
+                    // interpolate in a Perl regex literal)
+                    let mut pat = String::new();
+                    let cs: Vec<char> = pattern.chars().collect();
+                    for (i, c) in cs.iter().enumerate() {
+                        match c {
+                            '{' | '}' => pat.push('\\'),
+                            '$' | '@' => {
+                                let next = cs.get(i + 1).copied();
+                                if next
+                                    .map(|n| n.is_ascii_alphanumeric() || n == '_')
+                                    .unwrap_or(false)
+                                {
+                                    pat.push('\\');
+                                }
+                            }
+                            _ => {}
+                        }
+                        pat.push(*c);
+                    }
+                    let fl = if flags.contains('i') { "i" } else { "" };
+                    format!("(({value}) =~ m{{{pat}}}{fl})")
+                }
+                other => {
+                    self.mark_todo(&format!("regexMatch arg {other:?}"));
                     "0".into()
                 }
             },
@@ -2099,6 +2148,7 @@ impl Render {
             IrStmt::Break => self.emit("last;"),
             IrStmt::Try { .. } => self.mark_todo("try"),
             IrStmt::Select { .. } => self.mark_todo("select"),
+            IrStmt::Asm { .. } => self.mark_todo("asm"),
         }
     }
 

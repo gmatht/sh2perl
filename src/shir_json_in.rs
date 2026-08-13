@@ -41,6 +41,7 @@ const KNOWN_STMT: &[&str] = &[
     "Background",
     "Block",
     "Select",
+    "Asm",
     "Expr",
     "Label",
     "Goto",
@@ -68,6 +69,7 @@ const KNOWN_EXPR: &[&str] = &[
     "Bool",
     "Json",
     "Ident",
+    "Splice",
     "Object",
 ];
 const KNOWN_ARITH: &[&str] = &[
@@ -621,6 +623,21 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
         "Function" => {
             let name = req_str(o, "name", where_)?.to_string();
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
+            // Go generic declarations (`func id[T any](...)`, core request
+            // go-sh-typeargs): an optional `typeParams` list of
+            // type-parameter strings. Same ERASURE contract as Call's
+            // `typeArgs`: validated (array of strings) and dropped at
+            // ingress — the runtime has no type system, and the frontend
+            // only lowers type-INDEPENDENT generic bodies (where erasure
+            // is behavior-preserving) as ordinary functions.
+            if let Some(tp) = o.get("typeParams") {
+                let a = arr(Some(tp), &format!("{where_}.typeParams"))?;
+                for (i, e) in a.iter().enumerate() {
+                    if !e.is_string() {
+                        return Err(format!("{where_}.typeParams[{i}]: not a string"));
+                    }
+                }
+            }
             // PowerShell named blocks (core-request powershell-sh-go): an
             // optional map `block_name -> stmt[]` (dynamicparam / begin /
             // process / end / clean). Absent = no named blocks (all
@@ -720,6 +737,40 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             IrStmt::Select { clauses }
+        }
+        // Inline assembly (core requests c-sh-go-asm / asmargument /
+        // asmqualifier). `outputs`/`inputs` entries carry the constraint
+        // string plus the operand: a value NODE (the serializer's shape)
+        // or a plain store-name STRING (the request's minimal shape —
+        // "reference variables by the store-name convention").
+        "Asm" => {
+            let template = req_str(o, "template", where_)?.to_string();
+            let volatile = o.get("volatile").and_then(|x| x.as_bool()).unwrap_or(false);
+            let outputs =
+                asm_operands_from(o.get("outputs"), &format!("{where_}.outputs"), "target")?;
+            let inputs =
+                asm_operands_from(o.get("inputs"), &format!("{where_}.inputs"), "expr")?;
+            let clobbers = match o.get("clobbers") {
+                None | Some(Value::Null) => vec![],
+                Some(x) => {
+                    let a = arr(Some(x), &format!("{where_}.clobbers"))?;
+                    a.iter()
+                        .enumerate()
+                        .map(|(i, e)| {
+                            e.as_str()
+                                .map(String::from)
+                                .ok_or_else(|| format!("{where_}.clobbers[{i}]: not a string"))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?
+                }
+            };
+            IrStmt::Asm {
+                template,
+                volatile,
+                outputs,
+                inputs,
+                clobbers,
+            }
         }
         "Block" => {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
@@ -825,6 +876,24 @@ fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
             let func = req_str(o, "func", where_)?.to_string();
             let args = exprs_from(o.get("args"), &format!("{where_}.args"))?;
             let _ = o.get("purity"); // recomputed by backend; ignored on ingress
+            // Go generic instantiation (`Name[TypeList]`, core request
+            // go-sh-typeargs): an optional `typeArgs` list of type-argument
+            // strings. The A1 store is an untyped runtime string/array
+            // model with no compile-time phase, so the ERASURE contract
+            // applies: type arguments have no runtime form — the
+            // deserializer validates the shape (array of strings) and
+            // drops them at ingress (identical to every renderer dropping
+            // them at emit). The frontend keeps refusing only
+            // type-DEPENDENT generic bodies (where erasure would change
+            // behavior); type-independent bodies lower as ordinary calls.
+            if let Some(ta) = o.get("typeArgs") {
+                let a = arr(Some(ta), &format!("{where_}.typeArgs"))?;
+                for (i, e) in a.iter().enumerate() {
+                    if !e.is_string() {
+                        return Err(format!("{where_}.typeArgs[{i}]: not a string"));
+                    }
+                }
+            }
             IrExpr::Call { func, args }
         }
         "MethodCall" => {
@@ -964,6 +1033,17 @@ fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
             let name = req_str(o, "name", where_)?.to_string();
             IrExpr::Ident(name)
         }
+        // Starred-expression splice (core request py-sh-go-star-expr):
+        // `[*a]` / `f(*a)` — the wrapped expr's ELEMENTS splice into the
+        // enclosing Array/Call. The ESTree renderer emits a JS spread
+        // (`[...x]` / `f(...x)`); the runtime store's array values are
+        // native JS arrays, so the spread is the exact splice. Valid only
+        // as an Array element / Call argument (the renderer emits
+        // SpreadElement, which is illegal elsewhere).
+        "Splice" => {
+            let e = expr_from(req(o, "expr", where_)?, &format!("{where_}.expr"))?;
+            IrExpr::Splice(Box::new(e))
+        }
         "Object" => {
             let properties = arr(o.get("properties"), &format!("{where_}.properties"))?
                 .iter()
@@ -991,6 +1071,38 @@ fn exprs_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrExpr>, String> {
             .iter()
             .enumerate()
             .map(|(i, e)| expr_from(e, &format!("{where_}[{i}]")))
+            .collect(),
+    }
+}
+
+/// asm operand lists (`outputs`/`inputs` of the `Asm` statement; core
+/// requests c-sh-go-asm / asmargument / asmqualifier): each entry is
+/// `{"constraint": <string>, <field>: <operand>}` where `<field>` is
+/// `"target"` for outputs and `"expr"` for inputs, and the operand is
+/// either a value NODE (the serializer's shape) or a plain store-name
+/// STRING (the request's minimal shape — "reference variables by the
+/// store-name convention", same as `Var`/`Assign`).
+fn asm_operands_from(
+    v: Option<&Value>,
+    where_: &str,
+    field: &str,
+) -> Result<Vec<(String, IrExpr)>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(x) => arr(Some(x), where_)?
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let eo = require_obj(e, &format!("{where_}[{i}]"))?;
+                let c =
+                    req_str(eo, "constraint", &format!("{where_}[{i}].constraint"))?.to_string();
+                let op = req(eo, field, &format!("{where_}[{i}].{field}"))?;
+                let expr = match op {
+                    Value::String(name) => IrExpr::Var(name.clone(), None),
+                    other => expr_from(other, &format!("{where_}[{i}].{field}"))?,
+                };
+                Ok((c, expr))
+            })
             .collect(),
     }
 }
@@ -1622,5 +1734,86 @@ mod tests {
         let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[{"type":"Function","name":"foo","body":[],"named_blocks":{"bogus":[]}}]}"#;
         let err = shir_json_to_ir(src).expect_err("unknown block name refuses");
         assert!(err.contains("unknown block name"), "{err}");
+    }
+
+    /// The inline-asm statement (core requests c-sh-go-asm /
+    /// asmargument / asmqualifier) round-trips: value-node operands
+    /// (serializer shape), plain-string operands (minimal request shape),
+    /// and the minimal template-only form.
+    #[test]
+    fn asm_stmt_roundtrip() {
+        use crate::ir::{IrExpr, IrStmt};
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Asm {
+                    template: "mov %1, %0".into(),
+                    volatile: true,
+                    outputs: vec![("=r".into(), IrExpr::Var("x".into(), None))],
+                    inputs: vec![("r".into(), IrExpr::Var("y".into(), None))],
+                    clobbers: vec!["cc".into()],
+                },
+                // minimal form: template only (the asmArgument minimal shape)
+                IrStmt::Asm {
+                    template: "nop".into(),
+                    volatile: false,
+                    outputs: vec![],
+                    inputs: vec![],
+                    clobbers: vec![],
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json.contains("\"type\":\"Asm\""), "json: {json}");
+        let prog2 = shir_json_to_ir(&json).expect("deser");
+        assert_eq!(prog2.stmts, prog.stmts, "Asm round-trip");
+        // the minimal STRING-operand shape ingresses too
+        let min = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[{"type":"Asm","template":"nop","volatile":true,"outputs":[{"constraint":"=r","target":"x"}],"inputs":[{"constraint":"r","expr":"y"}],"clobbers":["cc"]}]}"#;
+        let p2 = shir_json_to_ir(min).expect("minimal asm deser");
+        assert!(matches!(
+            &p2.stmts[0],
+            IrStmt::Asm { template, volatile: true, outputs, inputs, clobbers }
+                if template == "nop" && outputs[0].0 == "=r" && inputs[0].0 == "r"
+                    && clobbers == &["cc".to_string()]
+        ));
+    }
+
+    /// The starred-splice expr (core request py-sh-go-star-expr) and the
+    /// Go typeArgs/typeParams carriers (core request go-sh-typeargs)
+    /// ingress: Splice round-trips; typeArgs/typeParams are validated and
+    /// ERASED at ingress (the documented erasure contract).
+    #[test]
+    fn splice_and_typeargs_ingress() {
+        use crate::ir::IrExpr;
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"b","sigil":null,"indices":[]}],"expr":{"type":"Array","elements":[{"type":"Splice","expr":{"type":"Var","name":"a","sigil":null}}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"id","args":[{"type":"Str","value":"5","style":"DoubleQuoted"}],"typeArgs":["int"]}},
+            {"type":"Function","name":"id","body":[],"typeParams":["T"]}
+        ]}"#;
+        let prog = shir_json_to_ir(src).expect("splice/typeargs deser");
+        assert!(matches!(
+            &prog.stmts[0],
+            IrStmt::Assign { expr: IrExpr::Array(elems), .. }
+                if matches!(&elems[0], IrExpr::Splice(inner)
+                    if matches!(inner.as_ref(), IrExpr::Var(n, _) if n == "a"))
+        ), "splice node shape");
+        assert!(matches!(&prog.stmts[1], IrStmt::Expr(IrExpr::Call { func, .. }) if func == "id"));
+        // erasure: the re-serialized A1 carries no typeArgs/typeParams
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(!json.contains("typeArgs"), "typeArgs must be erased: {json}");
+        assert!(!json.contains("typeParams"), "typeParams must be erased: {json}");
+        // a non-string typeArgs entry refuses
+        let bad = src.replace("\"typeArgs\":[\"int\"]", "\"typeArgs\":[42]");
+        let err = shir_json_to_ir(&bad).expect_err("non-string typeArgs refuses");
+        assert!(err.contains("typeArgs"), "{err}");
     }
 }
