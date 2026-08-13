@@ -352,6 +352,25 @@ impl Render {
                 }
                 "''".to_string()
             }
+            IrExpr::Call { func, args } if func == "param" => {
+                if self.sh_owned {
+                    // sh-owned reconstruction: keep the expansion in sh
+                    // syntax so the qx'd shell applies it to ITS vars.
+                    let op = Self::str_arg(args, 0).unwrap_or_default();
+                    let name = Self::str_arg(args, 1).unwrap_or_default();
+                    let ref_name = self.shell_var_ref(&name);
+                    if op.is_empty() && args.len() == 2 {
+                        return format!("${{{}}}", ref_name.trim_start_matches('$'));
+                    }
+                    let def = args.get(2).map(|d| self.shell_word(d)).unwrap_or_default();
+                    format!("${{{}{}{}}}", ref_name.trim_start_matches('$'), op, def)
+                } else {
+                    // perl-level path: the shell process can't see the
+                    // perl vars — interpolate the COMPUTED value (the
+                    // same ternary the perl-level param() renders).
+                    format!("@{{[{}]}}", self.param(args))
+                }
+            }
             IrExpr::Call { func, args } if func == "split" => {
                 // unquoted expansion: the shell word-splits at runtime —
                 // emit the bare var reference (no quotes)
@@ -1722,7 +1741,18 @@ impl Render {
     /// exec as a STATEMENT — builtins lower natively, externals → system.
     fn exec_stmt(&mut self, args: &[IrExpr]) {
         let Some(cmd) = Self::str_arg(args, 0) else {
-            self.mark_todo("exec cmd");
+            // Non-literal command (e.g. `"$cmd" args`): the name is a
+            // runtime value — emit the system LIST form directly (no
+            // shell, matching the literal-word path below).
+            let words = match args.get(1) {
+                Some(IrExpr::Array(items)) => items.clone(),
+                _ => Vec::new(),
+            };
+            let mut a: Vec<String> = vec![self.expr(&args[0])];
+            for w in &words {
+                a.push(self.expr(w));
+            }
+            self.emit(&format!("system({});", a.join(", ")));
             return;
         };
         let words = match args.get(1) {
@@ -2010,7 +2040,82 @@ impl Render {
             "shopt" => {
                 // option toggles — no effect on the lowable subset
             }
-            "source" | "." | "eval" | "trap" | "return" | "umask" | "type" | "hash"
+            "eval" => {
+                // `eval <string>...` — bash concatenates the words with
+                // spaces and evaluates the result as shell code. The
+                // honest native lowering: hand the string to bash (the
+                // same interpreter bash's eval uses).
+                let parts: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
+                let joined = parts.join(" . \" \" . ");
+                self.emit(&format!("system('bash', '-c', {joined});"));
+            }
+            "trap" => {
+                // `trap 'handler' SIG...` — perl %SIG is the native
+                // signal table; EXIT/0 becomes an END block. The handler
+                // is shell code, run through bash.
+                let mut handler: Option<String> = None;
+                let mut ignore = false;
+                let mut reset = false;
+                for w in &words {
+                    if let IrExpr::Str(s, _) = w {
+                        if handler.is_none() && !reset && !ignore && !s.starts_with('-') {
+                            handler = Some(Self::perl_str(s));
+                            continue;
+                        }
+                        if s == "-" && handler.is_none() && !ignore {
+                            reset = true;
+                            continue;
+                        }
+                        if s.is_empty() && handler.is_none() && !reset {
+                            ignore = true;
+                            continue;
+                        }
+                        // a signal name
+                        let sig = s;
+                        if reset {
+                            self.emit(&format!("delete $SIG{{{sig}}};"));
+                        } else if ignore {
+                            self.emit(&format!("$SIG{{{sig}}} = 'IGNORE';"));
+                        } else if let Some(h) = &handler {
+                            if sig == "0" || sig == "EXIT" {
+                                self.emit(&format!("END {{ system('bash', '-c', {h}); }}"));
+                            } else {
+                                self.emit(&format!(
+                                    "$SIG{{{sig}}} = sub {{ system('bash', '-c', {h}); }};"
+                                ));
+                            }
+                        }
+                    } else if let Some(h) = &handler {
+                        // non-literal signal name (rare) — resolve at
+                        // runtime via %SIG with a symbolic key
+                        let sig = self.expr(w);
+                        self.emit(&format!(
+                            "$SIG{{$sig}} = sub {{ system('bash', '-c', {h}); }};"
+                        ));
+                    } else {
+                        handler = Some(self.expr(w));
+                    }
+                }
+            }
+            "source" | "." => {
+                // `. file args...` — run the file's commands. The honest
+                // native lowering: bash runs it (the sourced file is
+                // shell code; there is no perl equivalent).
+                let mut a: Vec<String> = Vec::new();
+                for w in &words {
+                    match w {
+                        IrExpr::Str(s, _) if s.starts_with('-') && s != "--" => {}
+                        IrExpr::Str(s, _) if s == "--" => {}
+                        _ => a.push(self.expr(w)),
+                    }
+                }
+                if a.is_empty() {
+                    self.mark_todo("builtin source (no file)");
+                } else {
+                    self.emit(&format!("system('bash', {});", a.join(", ")));
+                }
+            }
+            "source" | "." | "return" | "umask" | "type" | "hash"
             | "builtin" | "enable" | "help" | "logout" | "alias" | "unalias"
             | "times" | "ulimit" | "getopts" => {
                 self.mark_todo(&format!("builtin {cmd}"));
@@ -2592,12 +2697,22 @@ impl Render {
             );
         }
         if let Some(name) = inner.strip_prefix('$') {
+            // `${name}` — the curly-brace form arrives verbatim
+            let name = name
+                .strip_prefix('{')
+                .and_then(|n| n.strip_suffix('}'))
+                .unwrap_or(name);
             if !name.is_empty() {
                 return self.var_ref(name);
             }
         }
         if t.starts_with('$') && t.len() > 1 {
-            return self.var_ref(&t[1..]);
+            let name = &t[1..];
+            let name = name
+                .strip_prefix('{')
+                .and_then(|n| n.strip_suffix('}'))
+                .unwrap_or(name);
+            return self.var_ref(name);
         }
         if inner.parse::<i64>().is_ok() {
             return inner.to_string();
