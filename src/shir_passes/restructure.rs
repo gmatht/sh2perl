@@ -129,6 +129,19 @@ fn restructure_children(s: &mut IrStmt, n: &mut usize) {
                 restructure_stmts(stage, n);
             }
         }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            restructure_stmts(body, n);
+            for e in excepts.iter_mut() {
+                restructure_stmts(&mut e.body, n);
+            }
+            restructure_stmts(else_body, n);
+            restructure_stmts(finally_body, n);
+        }
         _ => {}
     }
 }

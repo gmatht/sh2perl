@@ -18,6 +18,7 @@ const KNOWN_STMT: &[&str] = &[
     "Declare",
     "DeclareArray",
     "If",
+    "Try",
     "For",
     "ForInit",
     "Continue",
@@ -396,6 +397,58 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
                 then,
                 elsifs,
                 else_,
+            }
+        }
+        // try/except/else/finally (core request py-sh-go 20260813).
+        // excepts entries: {"type":"TryExcept","match":<expr|null>,
+        // "as":<string|null>,"body":[<stmt>...]}; else/finally are
+        // plain statement lists ([] when absent).
+        "Try" => {
+            let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
+            let excepts = arr(o.get("excepts"), &format!("{where_}.excepts"))?
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let eo = require_obj(e, &format!("{where_}.excepts[{i}]"))?;
+                    let t = req_str(eo, "type", &format!("{where_}.excepts[{i}]"))?;
+                    if t != "TryExcept" {
+                        return Err(format!(
+                            "{where_}.excepts[{i}].type: {t:?} != TryExcept"
+                        ));
+                    }
+                    let match_expr = match eo.get("match") {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(expr_from(
+                            x,
+                            &format!("{where_}.excepts[{i}].match"),
+                        )?),
+                    };
+                    let as_name = match eo.get("as") {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(
+                            x.as_str()
+                                .ok_or_else(|| {
+                                    format!("{where_}.excepts[{i}].as: not a string")
+                                })?
+                                .to_string(),
+                        ),
+                    };
+                    let body =
+                        stmts_from(eo.get("body"), &format!("{where_}.excepts[{i}].body"))?;
+                    Ok(TryExcept {
+                        match_expr,
+                        as_name,
+                        body,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let else_body = stmts_from(o.get("else"), &format!("{where_}.else"))?;
+            let finally_body = stmts_from(o.get("finally"), &format!("{where_}.finally"))?;
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
             }
         }
         "For" => {
@@ -1278,6 +1331,67 @@ mod tests {
     // meant to prevent. Errors skip (parse/ingress failures are not the
     // concern of this test; we only assert the serializer/deserializer
     // round-trip on examples that BOTH sides accept).
+    /// The Try node round-trips through the A1 JSON (core request
+    /// py-sh-go 20260813): `{"type":"Try", body, excepts
+    /// [{"type":"TryExcept", match: <expr|null>, as: <string|null>,
+    /// body}], else, finally}` — null match/as for a bare except, empty
+    /// arrays for absent else/finally. Deserialization re-serializes
+    /// byte-identically; a non-TryExcept except entry is rejected.
+    #[test]
+    fn try_stmt_roundtrip() {
+        use crate::ir::{IrExpr, IrProgram, IrStmt, TryExcept};
+        fn mk() -> IrProgram {
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts: vec![IrStmt::Try {
+                    body: vec![IrStmt::Expr(IrExpr::Ident("guard".to_string()))],
+                    excepts: vec![
+                        TryExcept {
+                            match_expr: Some(IrExpr::Ident("ValueError".to_string())),
+                            as_name: Some("e".to_string()),
+                            body: vec![IrStmt::Expr(IrExpr::Ident("arm1".to_string()))],
+                        },
+                        TryExcept {
+                            match_expr: None,
+                            as_name: None,
+                            body: vec![IrStmt::Expr(IrExpr::Ident("arm2".to_string()))],
+                        },
+                    ],
+                    else_body: vec![IrStmt::Expr(IrExpr::Ident("els".to_string()))],
+                    finally_body: vec![IrStmt::Expr(IrExpr::Ident("fin".to_string()))],
+                }],
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_bash_env: vec![],
+            }
+        }
+        let json = crate::shir_json::shir_to_shir_json_raw(&mk());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let t = &v["stmts"][0];
+        assert_eq!(t["type"], "Try", "json: {json}");
+        assert_eq!(t["excepts"][0]["type"], "TryExcept");
+        assert_eq!(t["excepts"][0]["match"]["type"], "Ident");
+        assert_eq!(t["excepts"][0]["as"], "e");
+        assert!(t["excepts"][1]["match"].is_null());
+        assert!(t["excepts"][1]["as"].is_null());
+        assert_eq!(t["else"], serde_json::json!([{"type": "Expr", "expr": {"type": "Ident", "name": "els"}}]));
+        assert_eq!(t["finally"], serde_json::json!([{"type": "Expr", "expr": {"type": "Ident", "name": "fin"}}]));
+        // byte-identical round-trip
+        let prog2 = shir_json_to_ir(&json).expect("deser");
+        let json2 = crate::shir_json::shir_to_shir_json_raw(&prog2);
+        assert_eq!(json, json2, "Try round-trip drift");
+        // a non-TryExcept except entry is rejected
+        let bad = json.replace("\"TryExcept\"", "\"TryOops\"");
+        let err = shir_json_to_ir(&bad).unwrap_err();
+        assert!(err.contains("TryOops"), "got: {err}");
+    }
+
     #[test]
     fn corpus_roundtrip_byte_equal() {
         use crate::ir::IrProgram;

@@ -242,6 +242,30 @@ fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
                 walk_stmt(s, counts);
             }
         }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            for s in body {
+                walk_stmt(s, counts);
+            }
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    walk_expr(m, counts);
+                }
+                for s in &e.body {
+                    walk_stmt(s, counts);
+                }
+            }
+            for s in else_body {
+                walk_stmt(s, counts);
+            }
+            for s in finally_body {
+                walk_stmt(s, counts);
+            }
+        }
         IrStmt::Expr(e) => walk_expr(e, counts),
         IrStmt::Require(_) => {
             // `require` is a bare string; no IrExpr children.
