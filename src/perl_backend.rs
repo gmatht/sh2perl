@@ -968,6 +968,11 @@ impl Render {
                 let elems: Vec<String> = items.iter().map(|i| self.expr(i)).collect();
                 format!("({})", elems.join(", "))
             }
+            IrExpr::ArrayComp { .. } | IrExpr::Lambda { .. } => {
+                // C-frontend constructs (never emitted by the shell path).
+                self.mark_todo("ArrayComp/Lambda expr");
+                "0".to_string()
+            }
             IrExpr::Arith(a) => self.arith(a),
             IrExpr::Bool(b) => {
                 if *b { "1".into() } else { "0".into() }
@@ -1093,7 +1098,11 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) => self.var_ref(name),
+            ArithAst::Var(name) | ArithAst::Ident(name) => self.var_ref(name),
+            // C-frontend nodes (never emitted by the shell path): sizeof
+            // is a compile-time constant; casts are identity (Perl IV).
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
                 self.arrays.insert(var.clone());
@@ -2206,7 +2215,11 @@ impl Render {
                 continue;
             }
             let mut j = i;
-            while j < chars.len() && !chars[j].is_whitespace() {
+            while j < chars.len()
+                && !chars[j].is_whitespace()
+                && chars[j] != '"'
+                && chars[j] != '\''
+            {
                 j += 1;
             }
             toks.push(chars[i..j].iter().collect());
@@ -2282,7 +2295,29 @@ impl Render {
         for t in out {
             split.extend(self.test_split_fused_op(&t));
         }
-        split
+        // Split paren tokens fused with operands (`\(!` / `"x"\)`) so
+        // the depth counters in test_or/test_and/test_not see the group
+        // markers — a fused opener/closer is invisible to `-o`/`-a`
+        // precedence scanning, which mis-splits the group.
+        let mut norm = Vec::new();
+        for t in split {
+            let mut rest = t.as_str();
+            if let Some(r) = rest.strip_prefix("\\(") {
+                if !r.is_empty() {
+                    norm.push("\\(".to_string());
+                    rest = r;
+                }
+            }
+            if let Some(r) = rest.strip_suffix("\\)") {
+                if !r.is_empty() {
+                    norm.push(r.to_string());
+                    norm.push("\\)".to_string());
+                    continue;
+                }
+            }
+            norm.push(rest.to_string());
+        }
+        norm
     }
 
     /// Split a fused `a==b` / `a=b` / `a!=b` / `a=~re` token (the core's
@@ -2548,9 +2583,13 @@ impl Render {
             .and_then(|s| s.strip_suffix('"'))
             .or_else(|| t.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
             .unwrap_or(t);
-        // command substitution: `"$(cmd)"` / `$(cmd)` — run at test time
+        // command substitution: `"$(cmd)"` / `$(cmd)` — run at test time;
+        // bash cmdsub strips trailing newlines
         if inner.starts_with("$(") && inner.ends_with(')') {
-            return self.qx(&inner[2..inner.len() - 1]);
+            return format!(
+                "do {{ my $__c = {}; chomp $__c; $__c }}",
+                self.qx(&inner[2..inner.len() - 1])
+            );
         }
         if let Some(name) = inner.strip_prefix('$') {
             if !name.is_empty() {
@@ -3144,7 +3183,7 @@ impl Render {
                     self.mark_todo("case clauses");
                 }
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 self.funcs.insert(name.clone());
                 let mut saved = self.in_func;
                 self.in_func += 1;
@@ -3290,6 +3329,21 @@ impl Render {
             }
             IrStmt::Require(m) => self.emit(&format!("require \"{m}\";")),
             IrStmt::RawText(t) => self.emit(t),
+            IrStmt::Label(name) | IrStmt::Goto(name) => {
+                let kind = if matches!(s, IrStmt::Label(_)) {
+                    "label"
+                } else {
+                    "goto"
+                };
+                self.mark_todo(&format!(
+                    "{kind} {name} not restructured by restructure_goto"
+                ));
+            }
+            IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
+            IrStmt::Continue => self.emit("next;"),
+            IrStmt::Break => self.emit("last;"),
+            IrStmt::Try { .. } => self.mark_todo("try"),
+            IrStmt::Select { .. } => self.mark_todo("select"),
         }
     }
 
@@ -3476,7 +3530,7 @@ impl Render {
     fn collect_funcs(&mut self, stmts: &[IrStmt]) {
         for s in stmts {
             match s {
-                IrStmt::Function { name, body } => {
+                IrStmt::Function { name, body, .. } => {
                     self.funcs.insert(name.clone());
                     self.collect_funcs(body);
                 }

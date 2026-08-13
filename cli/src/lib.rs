@@ -975,6 +975,13 @@ exit $main_exit_code;
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
+            // Shared-core normalization passes (mirroring the core's
+            // --shir-in-perl arm): cfor ForInit → while, goto/label →
+            // structured control, process substitution → temp files. The
+            // worktree renderer then lowers the normalized ShIR natively.
+            debashl::shir_passes::strip_cfor(&mut prog);
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
             // Worktree-local renderer (branch backend/perl): the full ShIR
             // vocabulary renders without panicking (unsupported constructs
             // become `# TODO(unsupported)` markers).

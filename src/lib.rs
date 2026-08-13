@@ -22,7 +22,6 @@ pub mod go_backend;
 pub mod java_backend;
 pub mod js_backend;
 pub mod mir_simple;
-pub mod perl_backend;
 pub mod python_backend;
 pub mod rust_backend;
 pub mod sh_backend;
