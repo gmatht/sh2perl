@@ -9140,6 +9140,43 @@ fn int_declare_names(args: &[IrExpr]) -> Option<Vec<String>> {
 ///   - the SPLIT form `local name="$1"` → `["name=", <expr>]` — the
 ///     value arrives as the next array element (already-expanded).
 fn declare_sources(args: &[IrExpr]) -> Option<Vec<(String, IrExpr)>> {
+    declare_sources_impl(args, false)
+}
+
+/// The DYNAMIC-VALUE widening of [`declare_sources`] — the per-function
+/// `local`-lift family (local_lift_analysis / try_native_local_decl_stmt
+/// / lift_stmt_is_pure_decl / stmt_is_local_decl / the walkers' pure_decl
+/// skips). Same parsing and same all-or-nothing refusal, plus the value
+/// shapes the runtime builtin already receives as PRE-EVALUATED native
+/// expressions — the local wrapper + store round-trip is pure overhead
+/// for them:
+///   - a one-word `IrExpr::Array` (the unquoted `$(...)` single-word
+///     forms: the native wc-count / pwd / bc-sqrt value arrays);
+///   - `capture`/`captureWords` and their *Sync twins (quoted `$(...)`
+///     and unquoted word-position captures — the value is the RAW
+///     capture text: bash does not word-split in assignment context,
+///     so the emission re-emits the capture twin for the binding);
+///   - `param` ops (`${2:-d}` / `${3//p/r}` — already natively lowered
+///     in the builtin arg);
+///   - `arith` texts and `IrExpr::Arith` ASTs (`$((x+y))`);
+///   - dynamic `Interpolate` values (`local z="literal $y"`);
+///   - the `$?` special (`local ec=$?` — the lastExit read).
+/// The name stays subject to every lift guard (walker exclusion sets,
+/// first-mention rule, no nested-function mentions), and the emission is
+/// the SAME value expression the builtin arg evaluated (the builtin's
+/// expandWord is the identity on the already-computed string — the only
+/// divergence is a latent runtime bug where a variable VALUE contains
+/// `$`/backtick text, which the native binding fixes toward bash).
+/// Same SH2_ASSUME_LOCAL_SCOPE gate: off → None, byte-identical to the
+/// pre-widening behavior.
+fn declare_sources_dyn(args: &[IrExpr]) -> Option<Vec<(String, IrExpr)>> {
+    declare_sources_impl(args, true)
+}
+
+fn declare_sources_impl(
+    args: &[IrExpr],
+    dyn_values: bool,
+) -> Option<Vec<(String, IrExpr)>> {
     if !assume_local_scope() {
         return None;
     }
@@ -9169,9 +9206,29 @@ fn declare_sources(args: &[IrExpr]) -> Option<Vec<(String, IrExpr)>> {
     // The split-form VALUE is already an IrExpr: an all-literal
     // Interpolate / Str (→ the raw text), or a getVar of a positional or
     // plain-var name (→ the same read the runtime's expandWord performs).
-    fn value_of(e: &IrExpr) -> Option<IrExpr> {
+    // `dyn_values` (the [`declare_sources_dyn`] widening) additionally
+    // accepts the pre-evaluated dynamic shapes above — every one emits
+    // to the exact expression the runtime builtin's arg evaluated.
+    fn value_of(e: &IrExpr, dyn_values: bool) -> Option<IrExpr> {
         match e {
-            IrExpr::Str(_, _) | IrExpr::Interpolate(_) => decl_value_source(&word_text(e)?),
+            // an all-literal Str / Interpolate is the raw TEXT (parsed
+            // by decl_value_source); a DYNAMIC Interpolate (a `$ref`
+            // part) is only accepted by the widening (the value is the
+            // pre-evaluated template — the exact builtin arg)
+            IrExpr::Str(_, _) => decl_value_source(&word_text(e)?),
+            IrExpr::Interpolate(parts) => {
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) {
+                    decl_value_source(&word_text(e)?)
+                } else if dyn_values {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            }
+            IrExpr::Array(elems) if elems.len() == 1 && dyn_values => {
+                value_of(&elems[0], dyn_values)
+            }
+            IrExpr::Arith(_) if dyn_values => Some(e.clone()),
             IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
                 // positional (`$1`..`$9`, `$@`, `$*` — the string-valued
                 // positionals; `$0` is argv0, `$#` the count — keep both
@@ -9181,10 +9238,41 @@ fn declare_sources(args: &[IrExpr]) -> Option<Vec<(String, IrExpr)>> {
                         && (matches!(n.as_str(), "@" | "*")
                             || n.as_bytes()[0].is_ascii_digit()))
                         && n != "0"
-                        || plain_ident(n) =>
+                        || plain_ident(n)
+                        || (dyn_values && n == "?") =>
                 {
                     Some(e.clone())
                 }
+                _ => None,
+            },
+            IrExpr::Call { func, args } if dyn_values => match func.as_str() {
+                // quoted `$(...)` captures — the runtime capture strips
+                // NULs + trailing newlines and returns the buffer string
+                "capture" | "captureSync" => {
+                    matches!(args.as_slice(), [IrExpr::Arrow(_)]).then(|| e.clone())
+                }
+                // unquoted `$(...)` — the runtime word-splits the exec
+                // ARG, but the assignment VALUE is the raw capture (bash
+                // does not word-split in assignment context); the
+                // emission re-emits the capture twin for the binding
+                "captureWords" | "captureWordsSync" => {
+                    matches!(args.as_slice(), [IrExpr::Arrow(_)]).then(|| e.clone())
+                }
+                // `${2:-d}` / `${3//p/r}` / `${x#pat}` ... — the param
+                // lowering (native or runtime) is the exact builtin arg
+                "param" => Some(e.clone()),
+                // `$(( ... ))` TEXT arithmetic (the runtime evalArith)
+                "arith" => Some(e.clone()),
+                // `$?` unquoted arrives split-wrapped (the parser's word
+                // marker); the value is provably spaceless (the split
+                // emission's no-space fast path yields the raw lastExit
+                // read — the exact builtin arg) — accept only that
+                // narrow shape, never a general split (a multi-word
+                // split is an array — the assignment value is the raw
+                // text)
+                "split" => (matches!(args.as_slice(), [IrExpr::Call { func: g, args: ga }]
+                    if g == "getVar" && matches!(ga.as_slice(), [IrExpr::Str(n, _)] if n == "?")))
+                    .then(|| e.clone()),
                 _ => None,
             },
             _ => None,
@@ -9206,7 +9294,7 @@ fn declare_sources(args: &[IrExpr]) -> Option<Vec<(String, IrExpr)>> {
         if let Some(rest) = sv.strip_suffix('=') {
             if plain_ident(rest) {
                 if let Some(next) = cargs.get(i + 1) {
-                    if let Some(src) = value_of(next) {
+                    if let Some(src) = value_of(next, dyn_values) {
                         out.push((rest.to_string(), src));
                         i += 2;
                         continue;
@@ -9376,11 +9464,77 @@ fn decl_source_to_estree(name: &str, src: &IrExpr) -> Expr {
                 str_lit(sv)
             }
         }
+        // The [`declare_sources_dyn`] widening's shapes (the per-function
+        // local lift): the value is emitted exactly as the runtime
+        // builtin's arg evaluated it — minus the wrapper the captureWords
+        // native forms add (a one-word array mirrors the runtime's
+        // `capture().split(/\s+/)` — the binding wants the word itself).
+        // The RUNTIME captureWords form (multi-word captures) re-emits as
+        // the CAPTURE twin: bash does NOT word-split `x=$(...)` in
+        // assignment context — `local x=$(printf 'p q\nr')` stores the
+        // raw "p q\nr" (the capture's NUL + trailing-newline strips
+        // only). The pre-widening builtin path FLATTENED the split array
+        // into separate args, silently dropping the tail (x=[first word],
+        // junk vars for the rest) — the corpus never exercised that
+        // shape, the lifted form matches bash.
+        IrExpr::Array(elems) if elems.len() == 1 => {
+            decl_source_to_estree(name, &elems[0])
+        }
+        IrExpr::Call { func, args } if func == "captureWords" || func == "captureWordsSync" => {
+            let v = expr_to_estree(src);
+            match v {
+                Expr::ArrayExpression { elements, .. } if elements.len() == 1 => {
+                    elements.into_iter().next().unwrap().unwrap()
+                }
+                _ => expr_to_estree(&IrExpr::Call {
+                    func: if func == "captureWordsSync" {
+                        "captureSync".to_string()
+                    } else {
+                        "capture".to_string()
+                    },
+                    args: args.clone(),
+                }),
+            }
+        }
+        // `$(( ... ))` values are NUMBERS — the binding holds the store's
+        // STRING (bash's value model; the builtin String()s the arg at
+        // store time). Numeric-lifted names keep the raw number (their
+        // reads coerce); string/local-lifted names get the canonical
+        // decimal string, so `${#x}` / case / comparisons see exactly
+        // what the store held. (`args` unused — the arith arm emits the
+        // text eval; the Arith AST arm the native expression.)
+        IrExpr::Arith(_) => {
+            if is_lifted_num(name) {
+                expr_to_estree(src)
+            } else {
+                Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "String".to_string(),
+                    }),
+                    arguments: vec![expr_to_estree(src)],
+                    optional: false,
+                }
+            }
+        }
+        IrExpr::Call { func, .. } if func == "arith" => {
+            if is_lifted_num(name) {
+                expr_to_estree(src)
+            } else {
+                Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "String".to_string(),
+                    }),
+                    arguments: vec![expr_to_estree(src)],
+                    optional: false,
+                }
+            }
+        }
         IrExpr::Call { func, args } if func == "getVar" => match args.as_slice() {
             [IrExpr::Str(n, _)] if is_lifted(n) => Expr::Identifier { name: n.clone() },
             // positional / special — the native read (`sh2.positional[i]
-            // ?? ""`, `.join(" ")`); a store var can never reach here
-            // (the fixpoint only accepts lifted or positional sources)
+            // ?? ""`, `.join(" ")`, `String(sh2.lastExit)`); a store
+            // var can never reach here (the fixpoint only accepts lifted
+            // or positional sources)
             _ => expr_to_estree(src),
         },
         _ => expr_to_estree(src),
@@ -9673,7 +9827,12 @@ fn try_native_export(args: &[IrExpr]) -> Option<Expr> {
 /// numbers); all other lifted names hold the STRING (bash's value model
 /// — `local v=01; echo $v` must print "01").
 fn try_native_local_decl_stmt(args: &[IrExpr]) -> Option<Vec<Stmt>> {
-    let pairs = declare_sources(args)?;
+    // The DYNAMIC-VALUE widening (declare_sources_dyn): the value shapes
+    // the runtime builtin receives pre-evaluated (captures, param ops,
+    // arith, dynamic interpolates, `$?`) lift exactly like the pure
+    // values — the `let`/assignment emission (decl_source_to_estree) is
+    // the same value expression the builtin arg evaluated.
+    let pairs = declare_sources_dyn(args)?;
     if !pairs.iter().all(|(n, _)| is_local_lifted(n)) {
         return None;
     }
@@ -10904,7 +11063,7 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                             // skip its marks too, unless the call sits in a subshell/background
                             // (COPY semantics — the name must stay store-bound there, mirror of
                             // the Assign-target exclusion).
-                            let pure_decl = !in_copy && declare_sources(args).is_some();
+                            let pure_decl = !in_copy && declare_sources_dyn(args).is_some();
                             if !(native_let || !intdecl.is_empty() || pure_decl) {
                                 // the decl words live inside the Array
                                 // wrapper at args[1] (`local -a arr` →
@@ -11135,7 +11294,7 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                         // skip its marks too, unless the call sits in a subshell/background
                         // (COPY semantics — the name must stay store-bound there, mirror of
                         // the Assign-target exclusion).
-                        let pure_decl = !in_copy && declare_sources(args).is_some();
+                        let pure_decl = !in_copy && declare_sources_dyn(args).is_some();
                         if !(native_let || !intdecl.is_empty() || pure_decl) {
                             // flatten the words wrapper (args[1]) and
                             // skip flag words (`-a`, `-i`...) — their
@@ -24858,7 +25017,7 @@ fn lift_walk_expr(
                         // skip its marks too, unless the call sits in a subshell/background
                         // (COPY semantics — the name must stay store-bound there, mirror of
                         // the Assign-target exclusion).
-                        let pure_decl = !in_copy && declare_sources(args).is_some();
+                        let pure_decl = !in_copy && declare_sources_dyn(args).is_some();
                         if !(native_let || !intdecl.is_empty() || pure_decl) {
                             // flatten the words wrapper (args[1]) and
                             // skip flag words (`-a`, `-i`, `-r`...) —
@@ -25077,7 +25236,7 @@ fn lift_walk_stmt(
                     // skip its marks too, unless the call sits in a subshell/background
                     // (COPY semantics — the name must stay store-bound there, mirror of
                     // the Assign-target exclusion).
-                    let pure_decl = !in_copy && declare_sources(args).is_some();
+                    let pure_decl = !in_copy && declare_sources_dyn(args).is_some();
                     if !(native_let || !intdecl.is_empty() || pure_decl) {
                         // flatten the words wrapper (args[1]) and skip
                         // flag words (`-a`, `-i`...) — their letters are
@@ -25224,7 +25383,7 @@ fn lift_stmt_is_pure_decl(st: &IrStmt, name: &str) -> bool {
         }
         _ => return false,
     };
-    declare_sources(args)
+    declare_sources_dyn(args)
         .map(|pairs| pairs.iter().any(|(n, _)| n == name))
         .unwrap_or(false)
 }
@@ -25587,7 +25746,7 @@ fn local_lift_analysis(prog: &IrProgram) -> HashMap<String, HashSet<String>> {
                     }
                     _ => {
                         if let Some(a) = args {
-                            if let Some(pairs) = declare_sources(a) {
+                            if let Some(pairs) = declare_sources_dyn(a) {
                                 for (n, _) in pairs {
                                     candidates.insert(n);
                                 }
@@ -29814,7 +29973,7 @@ fn stmt_is_local_decl(stmt: &IrStmt) -> bool {
         },
         _ => None,
     };
-    args.is_some_and(|a| declare_sources(a).is_some())
+    args.is_some_and(|a| declare_sources_dyn(a).is_some())
 }
 
 /// Is this a [`try_native_local_decl_stmt`] block (a `let` first + the

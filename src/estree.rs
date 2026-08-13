@@ -3185,6 +3185,37 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_value_local_decl_lifts_to_let() {
+        // The `declare_sources_dyn` widening: `local x=<dynamic value>`
+        // whose value the runtime builtin receives pre-evaluated lifts to
+        // a native `let` — no sh2.builtin("local") dispatch, no store
+        // round-trip. Shapes: `$(wc -c < f)` (single-word capture — the
+        // one-element array unwraps to the word), `$(echo a b c)`
+        // (multi-word capture — the RAW capture text, bash does not
+        // word-split in assignment context), `${2:-d}` param ops,
+        // `$((x+y))` arith (String-wrapped — the store's string model),
+        // `$?` (the lastExit read) and dynamic interpolates.
+        let json = to_json(
+            "f() { local sz=$(wc -c < \"$f\"); local mw=$(echo a b c); local p=\"${2:-d}\"; local ar=$((x + y)); local ec=$?; local z=\"lit $y\"; echo \"$sz $mw $p $ar $ec $z\"; }; f",
+        );
+        // NO builtin LOCAL dispatch (the echo inside the function stays a
+        // sink-bound builtin — that is not this family)
+        assert!(!json.contains("\"value\":\"local\""));
+        // the single-word wc capture unwraps to the native value
+        assert!(json.contains("\"name\":\"size\"") || json.contains("\"name\":\"sz\""));
+        // the multi-word capture folds to the raw text (the capture
+        // twin's echo fold — "a b c", the no-split assignment value)
+        assert!(json.contains("\"value\":\"a b c\""));
+        // the `$?` value is the native lastExit read
+        assert!(json.contains("\"name\":\"lastExit\""));
+        // the arith value is String-wrapped for the string binding
+        assert!(json.contains("\"name\":\"String\""));
+        // the dynamic interpolate is a template literal value
+        assert!(json.contains("\"type\":\"TemplateLiteral\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
     fn nocase_dynamic_literal_test_folds_when_invariant() {
         // `shopt -s nocasematch` + `shopt -u nocasematch` both present →
         // the shopt state is DYNAMIC, so runtime-dependent comparisons
