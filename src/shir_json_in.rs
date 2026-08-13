@@ -1816,4 +1816,76 @@ mod tests {
         let err = shir_json_to_ir(&bad).expect_err("non-string typeArgs refuses");
         assert!(err.contains("typeArgs"), "{err}");
     }
+
+    /// The A1 bare-identifier arith read (triage requests c/java/js/perl/
+    /// python-20260814-032148, zsh-sh-go t51_arith_loop): a Bin whose
+    /// lhs is {"type":"Ident","name":"i"} — the lifted loop-var read
+    /// the export emits. Every backend's ingress must accept it (render
+    /// like Var); the unknown-arith-type refusal must not fire.
+    #[test]
+    fn arith_ident_ingress() {
+        use crate::ir::{ArithAst, IrExpr, IrStmt};
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"For","var":"i","iter":{"type":"Array","elements":[{"type":"Str","value":"1","style":"DoubleQuoted"}]},"body":[{"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Arith","ast":{"type":"Bin","op":"*","lhs":{"type":"Ident","name":"i"},"rhs":{"type":"Num","value":2}}}]}]}}],"runs":true}
+        ]}"#;
+        let prog = shir_json_to_ir(src).expect("arith Ident ingress");
+        let IrStmt::For { body, .. } = &prog.stmts[0] else {
+            panic!("not a For");
+        };
+        let IrStmt::Expr(IrExpr::Call { args, .. }) = &body[0] else {
+            panic!("not a Call stmt");
+        };
+        let IrExpr::Array(elems) = &args[1] else {
+            panic!("not an Array arg");
+        };
+        let IrExpr::Arith(ast) = &elems[0] else {
+            panic!("not an Arith element");
+        };
+        assert!(
+            matches!(&**ast, ArithAst::Bin { lhs, op, .. }
+                if op == "*" && matches!(lhs.as_ref(), ArithAst::Ident(n) if n == "i")),
+            "Ident lhs shape: {ast:?}"
+        );
+        // the re-serialized A1 keeps the Ident node (byte-contract)
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json.contains("\"lhs\":{\"name\":\"i\",\"type\":\"Ident\"}"), "json: {json}");
+    }
+
+    /// The Go-style select/commClause cluster (core request
+    /// go-sh-commcase-20260814-031345): every clause shape (recv with
+    /// target/ch/body, send with ch/value, default) ingresses and
+    /// round-trips; unknown comm kinds refuse loudly.
+    #[test]
+    fn select_ingress() {
+        use crate::ir::{IrExpr, IrStmt};
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Select","clauses":[
+                {"comm":"recv","target":"v","ch":{"type":"Var","name":"ch","sigil":null},"body":[{"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Var","name":"v","sigil":null}]}]}}]},
+                {"comm":"send","ch":{"type":"Var","name":"ch","sigil":null},"value":{"type":"Int","value":7},"body":[]},
+                {"comm":"default","body":[]}
+            ]}
+        ]}"#;
+        let prog = shir_json_to_ir(src).expect("Select ingress");
+        let IrStmt::Select { clauses } = &prog.stmts[0] else {
+            panic!("not a Select");
+        };
+        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses[0].comm, "recv");
+        assert_eq!(clauses[0].target.as_deref(), Some("v"));
+        assert!(matches!(&clauses[0].ch, Some(IrExpr::Var(n, _)) if n == "ch"));
+        assert_eq!(clauses[0].body.len(), 1);
+        assert_eq!(clauses[1].comm, "send");
+        assert!(matches!(&clauses[1].value, Some(IrExpr::Int(7))));
+        assert_eq!(clauses[2].comm, "default");
+        assert!(clauses[2].ch.is_none() && clauses[2].value.is_none());
+        // round-trip: the re-serialized A1 carries the full clause shape
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json.contains("\"type\":\"Select\""), "json: {json}");
+        assert!(json.contains("\"comm\":\"recv\""), "json: {json}");
+        // unknown comm kinds refuse (the renderer dispatches on exactly
+        // recv/send/default)
+        let bad = src.replace("\"comm\":\"default\"", "\"comm\":\"bogus\"");
+        let err = shir_json_to_ir(&bad).expect_err("unknown comm refuses");
+        assert!(err.contains("not in recv/send/default"), "{err}");
+    }
 }
