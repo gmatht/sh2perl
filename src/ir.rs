@@ -1123,9 +1123,32 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 out.push_str(&format!("{} = ${};\n", var, save));
             }
         }
-        IrStmt::Background(_) => {
+        IrStmt::Background(body) => {
+            // `( cmd ) &` — bash background job (triage-perl
+            // t44_background py/posix-sh-go): fork a child to run the
+            // body; the parent continues immediately and the `wait`
+            // builtin reaps it. Autoflush BEFORE forking so the child
+            // never duplicates buffered parent output (fork copies the
+            // stdio buffer).
             emit_indent(out, indent);
-            out.push_str("die \"debashc: shIR construct not yet supported by the Perl backend (background)\\n\";\n");
+            out.push_str("$| = 1;\n");
+            static BG_SEQ: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let pid = format!(
+                "__sh2_bg{}",
+                BG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            emit_indent(out, indent);
+            out.push_str(&format!("my ${pid} = fork();\n"));
+            emit_indent(out, indent);
+            out.push_str(&format!("if (defined ${pid} && ${pid} == 0) {{\n"));
+            for s in body.iter() {
+                emit_stmt(out, s, indent + 1);
+            }
+            emit_indent(out, indent + 1);
+            out.push_str("exit $main_exit_code;\n");
+            emit_indent(out, indent);
+            out.push_str("}\n");
         }
         // try/except/else/finally — ESTree-path only; the Perl generator
         // never emits it. Refuse loudly (Perl eval could express it, but
@@ -1378,7 +1401,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         // (rewritten by shir_to_perl): a Perl sub call.
                         let name = args.first().and_then(call_arg_str).unwrap_or_default();
                         let words = exec_word_args(args);
-                        let rest: Vec<String> = words.iter().map(|w| render_word(w)).collect();
+                        let rest: Vec<String> = words.iter().map(|w| render_word_list(w)).collect();
                         emit_indent(out, indent);
                         out.push_str(&format!(
                             "{}({}); $main_exit_code = $CHILD_ERROR = 0;\n",
@@ -1635,7 +1658,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 Vec::new()
                             };
                             let items: Vec<String> =
-                                elems.iter().map(|e| render_word(*e)).collect();
+                                elems.iter().map(|e| render_word_list(*e)).collect();
                             emit_indent(out, indent);
                             out.push_str(&format!("@{} = ({});\n", var, items.join(", ")));
                             return;
@@ -2295,6 +2318,26 @@ fn render_word(e: &IrExpr) -> String {
     }
 }
 
+/// Render an exec word that may expand to MULTIPLE words (bash
+/// field-splitting; triage-perl t62_word_split): the A1 `split` marker
+/// (an unquoted `$var` read) lowers to Perl's list-context `split`, so
+/// the fields become separate args in LIST contexts (printf args, echo
+/// joins, array stores, for-iters). Every other word renders single via
+/// [`render_word`] — scalar contexts (bash -c text, redirects,
+/// interpolations) must keep the raw text; bash does the splitting
+/// itself there.
+fn render_word_list(e: &IrExpr) -> String {
+    match e {
+        IrExpr::Call { func, args } if func == "split" => {
+            let inner = args
+                .first()
+                .map(render_word)
+                .unwrap_or_else(|| "''".to_string());
+            format!("split(/\\s+/, {})", inner)
+        }
+        _ => render_word(e),
+    }
+}
 /// `${var…}` parameter expansion (Call param): op, var, value/pattern...
 fn render_param(args: &[IrExpr]) -> String {
     let op = args.first().and_then(call_arg_str).unwrap_or_default();
@@ -3496,6 +3539,16 @@ fn word_iter_to_perl(iter: &IrExpr) -> String {
         }
         IrExpr::Array(elems) if elems.len() == 1 => {
             if let IrExpr::Call { func, .. } = &elems[0] {
+                // `for w in $x` — the A1 wraps the unquoted read in a
+                // single-element Array (triage-perl t62_word_split); the
+                // split must stay a LIST here, never render_word's raw
+                // text (one iteration for the whole "a b").
+                if func == "split" {
+                    if let IrExpr::Call { args, .. } = &elems[0] {
+                        let inner = args.first().map(render_word).unwrap_or_default();
+                        return format!("split /\\s+/, {}", inner);
+                    }
+                }
                 if func == "capture" || func == "captureWords" {
                     if let Some(cmd) = capture_call_to_cmd(&elems[0]) {
                         return format!("split /\\s+/, {}", cmd_str_to_open_perl(&cmd));
@@ -3537,8 +3590,11 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
                 return;
             }
-            // The format word: keep backslashes intact — Perl's printf
-            // interprets \n/\t in the double-quoted format.
+            // The format word. bash's printf interprets backslash escapes
+            // (`\n`, `\t`, `\\`) IN the format; Perl's does not — decode
+            // them (the A1 Interpolate lit text carries the two-char bash
+            // sequence) so the emitted format prints the same bytes
+            // (triage-perl t62_word_split).
             let fmt = match &words[0] {
                 IrExpr::Str(s, _) => {
                     let mut f = String::from("\"");
@@ -3553,12 +3609,97 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                     f.push('"');
                     f
                 }
+                IrExpr::Interpolate(parts) => {
+                    let mut f = String::from("\"");
+                    for part in parts {
+                        match part {
+                            InterpPart::Lit(text) => {
+                                let mut cs = text.chars().peekable();
+                                while let Some(c) = cs.next() {
+                                    match c {
+                                        '\\' => match cs.peek() {
+                                            Some('n') => {
+                                                f.push_str("\\n");
+                                                cs.next();
+                                            }
+                                            Some('t') => {
+                                                f.push_str("\\t");
+                                                cs.next();
+                                            }
+                                            Some('r') => {
+                                                f.push_str("\\r");
+                                                cs.next();
+                                            }
+                                            Some('\\') => {
+                                                f.push_str("\\\\");
+                                                cs.next();
+                                            }
+                                            _ => f.push_str("\\\\"),
+                                        },
+                                        '"' => f.push_str("\\\""),
+                                        '$' => f.push_str("\\$"),
+                                        '@' => f.push_str("\\@"),
+                                        c => f.push(c),
+                                    }
+                                }
+                            }
+                            InterpPart::Expr(e) => {
+                                let w = render_word(e);
+                                f.push_str(&w.replace('\\', "\\\\"));
+                            }
+                        }
+                    }
+                    f.push('"');
+                    f
+                }
                 _ => render_word(words[0]),
             };
-            let rest: Vec<String> = words[1..].iter().map(|w| render_word(w)).collect();
+            let rest: Vec<String> = words[1..].iter().map(|w| render_word_list(w)).collect();
+            let has_split = words[1..]
+                .iter()
+                .any(|w| matches!(w, IrExpr::Call { func, .. } if func == "split"));
             emit_indent(out, indent);
             if rest.is_empty() {
                 out.push_str(&format!("printf({});\n", fmt));
+            } else if has_split {
+                // bash printf CYCLES the format over the whole arg list;
+                // Perl printf applies the format ONCE and discards extra
+                // args. Flatten the args (a split word expands to its
+                // fields in list context) and emit one printf per
+                // format-application, chunked by the placeholder count P
+                // (triage-perl t62_word_split: `printf "<%s>\\n" $x`
+                // with x="a b" → two lines).
+                static PA_SEQ: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let tmp = format!(
+                    "__sh2_pa{}",
+                    PA_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
+                // placeholder count in the (rendered) format: a `%` not
+                // followed by `%` is one conversion (%% is a literal %).
+                let p = words
+                    .first()
+                    .and_then(|w| call_arg_str(w))
+                    .map(|s| {
+                        let cs: Vec<char> = s.chars().collect();
+                        cs.iter()
+                            .enumerate()
+                            .filter(|(i, c)| **c == '%' && cs.get(i + 1) != Some(&'%'))
+                            .count()
+                            .max(1)
+                    })
+                    .unwrap_or(1);
+                out.push_str(&format!("my @{tmp} = ({});\n", rest.join(", ")));
+                out.push_str(&format!(
+                    "my ${tmp}_n = @{tmp} || 1;\n"
+                ));
+                out.push_str(&format!(
+                    "for (my ${tmp}_i = 0; ${tmp}_i < ${tmp}_n; ${tmp}_i += {p}) {{\n"
+                ));
+                out.push_str(&format!(
+                    "    printf({fmt}, @{tmp}[${tmp}_i .. (${tmp}_i + {p} - 1 < ${tmp}_n ? ${tmp}_i + {p} - 1 : ${tmp}_n - 1)], (\"\") x ((${tmp}_i + {p} > ${tmp}_n) ? ${tmp}_i + {p} - ${tmp}_n : 0));\n"
+                ));
+                out.push_str("}\n");
             } else {
                 out.push_str(&format!("printf({}, {});\n", fmt, rest.join(", ")));
             }
@@ -3696,6 +3837,23 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 t
             ));
         }
+        "wait" => {
+            // bash `wait` — reap the background children (triage-perl
+            // t44_background): bare `wait` waits for ALL children;
+            // `wait $pid` for the named ones. Perl's wait/waitpid block
+            // until the child exits, exactly like bash.
+            if words.is_empty() {
+                emit_indent(out, indent);
+                out.push_str("while (wait() != -1) {}\n");
+            } else {
+                for w in &words {
+                    emit_indent(out, indent);
+                    out.push_str(&format!("waitpid({}, 0);\n", render_word(w)));
+                }
+            }
+            emit_indent(out, indent);
+            out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+        }
         _ => {
             // External command — first try the AST Generator's in-Perl
             // emulation (verified-safe commands only: native Perl, no bash
@@ -3768,9 +3926,17 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
         ok(out);
         return;
     }
-    let parts: Vec<String> = args.iter().map(|w| render_word(w)).collect();
+    let parts: Vec<String> = args.iter().map(|w| render_word_list(w)).collect();
     let nl = if newline { ", \"\\n\"" } else { "" };
-    if parts.len() == 1 {
+    // Unquoted word-splitting drops empty words (bash IFS semantics);
+    // `grep { defined && length }` filters those out and avoids undef
+    // warnings on unset positional params. A split word expands to a LIST
+    // (triage-perl t62_word_split) and must take the join+grep path even
+    // when it is the ONLY word (`echo $x` — join re-inserts the spaces).
+    let has_split = args
+        .iter()
+        .any(|w| matches!(w, IrExpr::Call { func, .. } if func == "split"));
+    if parts.len() == 1 && !has_split {
         // A single glob word is a LIST in Perl — wrap in join(' ', …) so
         // the expansion space-joins like bash (echo file_*.txt).
         if parts[0].starts_with("glob(") {
@@ -3780,24 +3946,16 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
             emit_indent(out, indent);
             out.push_str(&format!("print({}{});\n", parts[0], nl));
         }
+    } else if has_split {
+        emit_indent(out, indent);
+        out.push_str(&format!(
+            "print(join(' ', grep {{ defined($_) && length($_) }} {}){});\n",
+            parts.join(", "),
+            nl
+        ));
     } else {
-        // Unquoted word-splitting drops empty words (bash IFS semantics);
-        // `grep { defined && length }` filters those out and avoids undef
-        // warnings on unset positional params.
-        let has_split = args
-            .iter()
-            .any(|w| matches!(w, IrExpr::Call { func, .. } if func == "split"));
-        if has_split {
-            emit_indent(out, indent);
-            out.push_str(&format!(
-                "print(join(' ', grep {{ defined($_) && length($_) }} {}){});\n",
-                parts.join(", "),
-                nl
-            ));
-        } else {
-            emit_indent(out, indent);
-            out.push_str(&format!("print(join(' ', {}){});\n", parts.join(", "), nl));
-        }
+        emit_indent(out, indent);
+        out.push_str(&format!("print(join(' ', {}){});\n", parts.join(", "), nl));
     }
     emit_indent(out, indent);
     ok(out);
@@ -4400,9 +4558,20 @@ fn tokenize_test(s: &str) -> Vec<String> {
                     toks.push(std::mem::take(&mut cur));
                 }
                 let mut op = String::from("=");
-                if chars.peek() == Some(&'=') {
-                    op.push('=');
-                    chars.next();
+                match chars.peek() {
+                    Some('=') => {
+                        op.push('=');
+                        chars.next();
+                    }
+                    Some('~') => {
+                        // `[[ $s =~ re ]]` — the regex-match operator
+                        // (triage-perl t68_case_glob): `=~` must stay ONE
+                        // token; the old split (`=` + `~`) parsed as
+                        // equality against the literal `~` (`$s eq '~'`).
+                        op.push('~');
+                        chars.next();
+                    }
+                    _ => {}
                 }
                 toks.push(op);
             }
@@ -4514,6 +4683,18 @@ fn parse_test_primary(toks: &[String], i: &mut usize) -> String {
                 Some(op) if is_compare_op(op) => {
                     *i += 1;
                     let rhs = test_next(toks, i).unwrap_or("''");
+                    if op == "=~" {
+                        // `[[ $s =~ re ]]` — regex match (triage-perl
+                        // t68_case_glob). The rhs is a bare ERE pattern
+                        // (quotes stripped by the tokenizer); Perl accepts
+                        // a STRING as the pattern, so the single-quoted
+                        // render is safe against delimiter/interpolation
+                        // chars. Perl's regex dialect ≈ ERE for the
+                        // corpus patterns.
+                        let l = render_test_operand(lhs);
+                        let r = render_test_operand(rhs);
+                        return format!("({l} =~ {r})");
+                    }
                     let perl_op = perl_compare_op(op);
                     let l = render_test_operand(lhs);
                     let r = render_test_operand(rhs);
@@ -4539,7 +4720,7 @@ fn is_file_test_op(op: &str) -> bool {
 fn is_compare_op(op: &str) -> bool {
     matches!(
         op,
-        "=" | "==" | "!=" | "<" | ">" | "<=" | ">=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
+        "=" | "==" | "!=" | "=~" | "<" | ">" | "<=" | ">=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
     )
 }
 
@@ -5076,7 +5257,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     } else {
                         Vec::new()
                     };
-                    let items: Vec<String> = elems.iter().map(|e| render_word(*e)).collect();
+                    let items: Vec<String> = elems.iter().map(|e| render_word_list(*e)).collect();
                     format!("({})", items.join(", "))
                 }
                 "test" => render_test_call(args),
@@ -6436,6 +6617,96 @@ mod tests {
         assert!(
             perl.contains("asm label 'myx'"),
             "perl refuses the asm label: {perl}"
+        );
+    }
+
+    /// Background + wait (triage-perl-20260814-063346 / 064414,
+    /// t44_background py/posix-sh-go): `( cmd ) &` forks a child to run
+    /// the body and the `wait` builtin reaps it — never the old refusal
+    /// die.
+    #[test]
+    fn background_stmt_forks_and_wait_reaps() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Background","body":[{"type":"Subshell","body":[{"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"bg","style":"DoubleQuoted"}]}]}}]}]},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Spawn","args":[{"type":"Str","value":"wait","style":"DoubleQuoted"},{"type":"Array","elements":[]}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"main","style":"DoubleQuoted"}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("background A1 ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(
+            perl.contains("my $__sh2_bg0 = fork();"),
+            "background forks: {perl}"
+        );
+        assert!(
+            perl.contains("if (defined $__sh2_bg0 && $__sh2_bg0 == 0) {"),
+            "child branch: {perl}"
+        );
+        assert!(
+            perl.contains("while (wait() != -1) {}"),
+            "bare wait reaps all children: {perl}"
+        );
+        assert!(
+            !perl.contains("not yet supported"),
+            "no refusal die: {perl}"
+        );
+    }
+
+    /// `[[ $s =~ re ]]` (triage-perl-20260814-063624, t68_case_glob): the
+    /// spaced test tokenizer must keep `=~` as ONE op token and the
+    /// renderer must emit a Perl regex match — the old split (`=` + `~`)
+    /// parsed as equality against the literal `~` (`$s eq '~'`).
+    #[test]
+    fn regex_test_op_renders_match() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"If","cond":{"type":"Call","func":"test","args":[{"type":"Str","value":"\"$s\" =~ ^h","style":"DoubleQuoted"}]},"elsifs":[],"then":[{"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"star","style":"DoubleQuoted"}]}]}}],"else":[]}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("=~ test A1 ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(
+            perl.contains("($s =~ '^h')"),
+            "=~ renders a regex match: {perl}"
+        );
+        assert!(
+            !perl.contains("eq '~'"),
+            "no bogus equality against a literal tilde: {perl}"
+        );
+    }
+
+    /// Field-splitting (triage-perl-20260814-064415, t62_word_split): the
+    /// A1 `split` marker (unquoted `$x`) must expand in LIST contexts —
+    /// printf args cycle the format per field, echo joins the fields, the
+    /// for-iter iterates the fields — and the printf format's bash
+    /// backslash escapes (`\n`) must decode (Perl's printf does not
+    /// interpret them).
+    #[test]
+    fn split_word_expands_in_list_contexts() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"x","sigil":null,"indices":[]}],"expr":{"type":"Str","value":"a b","style":"DoubleQuoted"}},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"split","purity":"PureCpu","args":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"x","style":"DoubleQuoted"}]}]}]}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"printf","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Interpolate","parts":[{"kind":"lit","text":"<%s>\\n"}]},{"type":"Call","func":"split","purity":"PureCpu","args":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"x","style":"DoubleQuoted"}]}]}]}]}},
+            {"type":"For","var":"w","runs":true,"iter":{"type":"Array","elements":[{"type":"Call","func":"split","purity":"PureCpu","args":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"x","style":"DoubleQuoted"}]}]}]},"body":[]}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("split A1 ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(
+            perl.contains("print(join(' ', grep { defined($_) && length($_) } split(/\\s+/, $x)), \"\\n\");"),
+            "echo joins the split fields: {perl}"
+        );
+        assert!(
+            perl.contains("my @__sh2_pa0 = (split(/\\s+/, $x));"),
+            "printf flattens the split fields: {perl}"
+        );
+        assert!(
+            perl.contains("for (my $__sh2_pa0_i = 0;"),
+            "printf cycles the format: {perl}"
+        );
+        assert!(
+            perl.contains("for my $__w (split /\\s+/, $x) {"),
+            "for-iter splits into fields: {perl}"
+        );
+        assert!(
+            perl.contains("printf(\"<%s>\\n\""),
+            "bash printf backslash escapes decode: {perl}"
         );
     }
 }
