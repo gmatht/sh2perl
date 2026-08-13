@@ -773,6 +773,15 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     out.push_str("use strict;\n");
     out.push_str("use warnings;\n");
 
+    // `for ((...))` (core request zsh-sh-go-20260813-153215): the shell
+    // lowering emits the rich A1 ForInit node — the perl renderer must
+    // never see an unstripped one (it refuses), so lower it to
+    // `init; while(cond){body; step}` first (the ingest path's CLI-level
+    // strip; double-strip is a no-op).
+    let mut stripped = prog.clone();
+    crate::shir_passes::strip_cfor(&mut stripped);
+    let prog = &stripped;
+
     // Run optimization passes before emitting.
     let stmts = optimize_stmts(&prog.stmts);
     let modern_ir = prog.imports.is_empty();

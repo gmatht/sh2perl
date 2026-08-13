@@ -441,6 +441,13 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
 /// Render a ShIR program to `sh` source. `Err` on a construct outside the
 /// renderable subset (the gate reports it as a FAIL).
 pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
+    // `for ((...))` (core request zsh-sh-go-20260813-153215): the shell
+    // lowering emits the rich A1 ForInit node — the sh renderer refuses
+    // an unstripped one, so lower it to `init; while(cond){body; step}`
+    // first (the ingest path's CLI-level strip; double-strip is a no-op).
+    let mut stripped = prog.clone();
+    crate::shir_passes::strip_cfor(&mut stripped);
+    let prog = &stripped;
     // collect the array base names (the A1's var_lengths is not carried
     // into IrProgram — the shared core; usage is a sound proxy)
     *ARRAY_NAMES.lock().unwrap() = array_names(prog);

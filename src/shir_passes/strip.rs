@@ -13,7 +13,7 @@
 // A renderer that encounters an UNSTRIPPED ForInit refuses (REFUSE > GUESS)
 // — the pipeline runs this pass before every renderer, so reaching one
 // means a pipeline forgot the strip.
-use crate::ir::{IrProgram, IrStmt};
+use crate::ir::{IrExpr, IrProgram, IrStmt};
 
 pub fn strip_cfor(prog: &mut IrProgram) {
     for s in &mut prog.stmts {
@@ -23,6 +23,57 @@ pub fn strip_cfor(prog: &mut IrProgram) {
 
 fn strip_stmt(s: &mut IrStmt) {
     match s {
+        // A ForInit nested in EXPRESSION position (pipeline stages,
+        // whileLoop/forLoop cond/body arrows, capture bodies, subshell
+        // stages): the statement arms below recurse into statements, but
+        // an expression-carried ForInit (e.g. a `for ((...))` inside a
+        // `( ... ) | sort` stage — the subshell body lives in the
+        // pipeline Call's Arrow arg) would survive to a renderer.
+        IrStmt::Expr(e) => strip_expr(e),
+        IrStmt::Assign { expr, .. } => strip_expr(expr),
+        IrStmt::Declare { init, .. } => {
+            if let Some(i) = init {
+                strip_expr(i);
+            }
+        }
+        IrStmt::Output { value, .. } => strip_expr(value),
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+        } => {
+            strip_expr(cond);
+            for st in then.iter_mut() {
+                strip_stmt(st);
+            }
+            for (_, b) in elsifs.iter_mut() {
+                for st in b.iter_mut() {
+                    strip_stmt(st);
+                }
+            }
+            for st in else_.iter_mut() {
+                strip_stmt(st);
+            }
+        }
+        IrStmt::While { cond, body, .. } => {
+            strip_expr(cond);
+            for st in body.iter_mut() {
+                strip_stmt(st);
+            }
+        }
+        IrStmt::For { iter, body, .. } => {
+            strip_expr(iter);
+            for st in body.iter_mut() {
+                strip_stmt(st);
+            }
+        }
+        IrStmt::DoWhile { cond, body, .. } => {
+            strip_expr(cond);
+            for st in body.iter_mut() {
+                strip_stmt(st);
+            }
+        }
         IrStmt::ForInit { init, cond, step, body } => {
             // body with the step spliced before every top-level continue
             let step = std::mem::take(step);
@@ -56,9 +107,6 @@ fn strip_stmt(s: &mut IrStmt) {
             }
         }
         IrStmt::Block(b)
-        | IrStmt::While { body: b, .. }
-        | IrStmt::For { body: b, .. }
-        | IrStmt::DoWhile { body: b, .. }
         | IrStmt::Function { body: b, .. }
         | IrStmt::Subshell(b)
         | IrStmt::Background(b)
@@ -88,21 +136,6 @@ fn strip_stmt(s: &mut IrStmt) {
                 strip_stmt(st);
             }
         }
-        IrStmt::If {
-            then, elsifs, else_, ..
-        } => {
-            for st in then.iter_mut() {
-                strip_stmt(st);
-            }
-            for (_, b) in elsifs.iter_mut() {
-                for st in b.iter_mut() {
-                    strip_stmt(st);
-                }
-            }
-            for st in else_.iter_mut() {
-                strip_stmt(st);
-            }
-        }
         IrStmt::Case { clauses, .. } => {
             for c in clauses.iter_mut() {
                 for st in c.body.iter_mut() {
@@ -117,6 +150,53 @@ fn strip_stmt(s: &mut IrStmt) {
                 }
             }
         }
+        _ => {}
+    }
+}
+
+/// Expression-level recursion for the strip (a ForInit can hide in an
+/// `IrExpr::Arrow` — pipeline-stage/loop-cond/loop-body/capture bodies —
+/// or behind Call/Array/BinOp/Ternary wrappers). Arith ASTs never carry
+/// statements, so they need no recursion.
+fn strip_expr(e: &mut IrExpr) {
+    match e {
+        IrExpr::Arrow(stmts) => {
+            for st in stmts.iter_mut() {
+                strip_stmt(st);
+            }
+        }
+        IrExpr::Call { args, .. } | IrExpr::MethodCall { args, .. } => {
+            for a in args.iter_mut() {
+                strip_expr(a);
+            }
+        }
+        IrExpr::Array(items) => {
+            for a in items.iter_mut() {
+                strip_expr(a);
+            }
+        }
+        IrExpr::Object(props) => {
+            for (_, v) in props.iter_mut() {
+                strip_expr(v);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            strip_expr(lhs);
+            strip_expr(rhs);
+        }
+        IrExpr::Ternary {
+            cond, then, else_, ..
+        } => {
+            strip_expr(cond);
+            strip_expr(then);
+            strip_expr(else_);
+        }
+        IrExpr::DefinedOr { expr, default, .. } => {
+            strip_expr(expr);
+            strip_expr(default);
+        }
+        IrExpr::Index { key, .. } => strip_expr(key),
+        IrExpr::Capture { expr, .. } => strip_expr(expr),
         _ => {}
     }
 }

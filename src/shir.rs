@@ -5567,13 +5567,79 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
         Command::ShoptCommand(s) => {
             IrStmt::Expr(call("shopt", vec![st(&s.option), IrExpr::Bool(s.enable)]))
         }
-        Command::CStyleFor(cf) => IrStmt::Expr(call(
-            "cstyleFor",
-            vec![
-                st(&cf.arith_content),
-                IrExpr::Arrow(body_stmts(&Command::Block(cf.body.clone()))),
-            ],
-        )),
+        Command::CStyleFor(cf) => {
+            // C-style `for (( init; cond; step ))` → the rich A1 ForInit
+            // node (core request zsh-sh-go-20260813-153215): the header
+            // splits exactly like the runtime's parseCStyleHeader (plain
+            // ';' split, trimmed — parts beyond the third are ignored),
+            // init/step lower through the existing arith-assignment
+            // machinery (`((i=0))` → Assign{Arith(Assign)} and `((i++))`
+            // → Assign{Arith(IncDec)} — the arith-forms shapes), the
+            // cond through the shell path's existing `while (( ... ))`
+            // lowering (exec "let" with the arith text — the runtime
+            // evaluates it with evalArith, identical to the cstyleFor
+            // runtime's cond evaluation; unset vars coerce to 0, exactly
+            // bash's arith semantics). An empty cond is always-true
+            // (`for ((;;))` — the runtime's '' cond never breaks). Any
+            // init/step part that does not parse as a let-able arith
+            // assignment (Assign/IncDec) keeps the WHOLE construct on
+            // the opaque cstyleFor Call (REFUSE > GUESS — the runtime
+            // evaluates the header as one arith program, which a
+            // structured lowering could misrepresent).
+            let parts: Vec<&str> = cf.arith_content.split(';').collect();
+            let part = |i: usize| parts.get(i).map(|s| s.trim()).unwrap_or("");
+            let init_txt = part(0);
+            let cond_txt = part(1);
+            let step_txt = part(2);
+            let arith_assign = |t: &str| -> Option<IrStmt> {
+                if t.is_empty() {
+                    return None;
+                }
+                let ast = parse_arith(t)?;
+                let var = match &ast {
+                    ArithAst::Assign { var, .. } | ArithAst::IncDec { var, .. } => var.clone(),
+                    _ => return None,
+                };
+                Some(IrStmt::Assign {
+                    targets: vec![AssignTarget {
+                        var,
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Arith(Box::new(ast)),
+                })
+            };
+            let init = arith_assign(init_txt);
+            let step = arith_assign(step_txt);
+            let lowerable = (init_txt.is_empty() || init.is_some())
+                && (step_txt.is_empty() || step.is_some());
+            if lowerable {
+                let cond = if cond_txt.is_empty() {
+                    // `for ((;;))` — an empty cond is always-true (the
+                    // runtime's cstyleFor loop treats '' as no break).
+                    IrExpr::Int(1)
+                } else {
+                    call(
+                        "exec",
+                        vec![st("let"), IrExpr::Array(vec![st(cond_txt)])],
+                    )
+                };
+                IrStmt::ForInit {
+                    init: init.into_iter().collect(),
+                    cond,
+                    step: step.into_iter().collect(),
+                    body: body_stmts(&Command::Block(cf.body.clone())),
+                }
+            } else {
+                IrStmt::Expr(call(
+                    "cstyleFor",
+                    vec![
+                        st(&cf.arith_content),
+                        IrExpr::Arrow(body_stmts(&Command::Block(cf.body.clone()))),
+                    ],
+                ))
+            }
+        }
         Command::Function(f) => IrStmt::Function {
             name: f.name.clone(),
             body: body_stmts(&Command::Block(f.body.clone())),
@@ -11627,6 +11693,15 @@ fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
 
 pub fn shir_to_estree(prog: &IrProgram) -> Program {
     let _compile_guard = COMPILE_LOCK.lock().unwrap();
+    // `for ((...))` (core request zsh-sh-go-20260813-153215): the shell
+    // lowering now emits the rich A1 ForInit node — the shell-flavored
+    // renderers never see an unstripped ForInit (REFUSE > GUESS), so
+    // strip here, BEFORE every analysis below (they must see the same
+    // `init; while(cond){body; step}` shape the ingest path's CLI-level
+    // strip produces; double-strip is a no-op).
+    let mut stripped = prog.clone();
+    crate::shir_passes::strip_cfor(&mut stripped);
+    let prog = &stripped;
     // `--true64`: bash arithmetic is true 64-bit. Off by default. When
     // on, out-of-±2^53 numeric vars are homed in BigInt64Array slots
     // (self-RMW accumulator chains — native int64 element arithmetic) or
@@ -29266,6 +29341,16 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 }
             }
             let callee_name = exec_or_builtin(func, args);
+            // A1 func-name → runtime member-name mapping (core request
+            // go-sh-20260813-154009): the contract's type-dispatch call is
+            // `Call { func: "typeof", ... }` (the Go `x.(type)` assertion
+            // spelling), but `typeof` is a JS keyword — the runtime exposes
+            // the helper as `sh2.typeOf`.
+            let callee_name = if callee_name == "typeof" {
+                "typeOf"
+            } else {
+                callee_name
+            };
             if is_async_call(callee_name) {
                 // *Sync twin (the whileLoopSync pattern): a call whose
                 // EVERY lowered arg is await-free — no AwaitExpression
@@ -29368,6 +29453,44 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     r#async: false,
                 }],
             )
+        }
+        // The six VALUE-comparison ops (core request
+        // powershell-sh-go-20260813-160115): the A1 `BinOp` carries them
+        // for non-shell frontends (PowerShell `-eq -ne -lt -le -gt -ge`,
+        // the test grammar). The shell path never emits them into
+        // ESTree-reachable positions (bash conditions go through the
+        // `test` text channel; `$((…))` goes through `Arith`), but the
+        // contract round-trips them (shir_json.rs / shir_json_in.rs) and
+        // the Perl backend already renders them — the operator table
+        // mirrors js_backend.rs (Eq→`==`, Ne→`!=`, Lt→`<`, Gt→`>`,
+        // Le→`<=`, Ge→`>=`; parens are the caller's concern).
+        IrExpr::BinOp {
+            op:
+                op @ (BinOpKind::Eq
+                | BinOpKind::Ne
+                | BinOpKind::Lt
+                | BinOpKind::Gt
+                | BinOpKind::Le
+                | BinOpKind::Ge),
+            lhs,
+            rhs,
+        } => {
+            let l = expr_to_estree(lhs);
+            let r = expr_to_estree(rhs);
+            let js_op = match op {
+                BinOpKind::Eq => "==",
+                BinOpKind::Ne => "!=",
+                BinOpKind::Lt => "<",
+                BinOpKind::Gt => ">",
+                BinOpKind::Le => "<=",
+                BinOpKind::Ge => ">=",
+                _ => unreachable!("comparison arm: non-comparison op {op:?}"),
+            };
+            Expr::BinaryExpression {
+                operator: js_op.to_string(),
+                left: Box::new(l),
+                right: Box::new(r),
+            }
         }
         other => unreachable!("Perl-only IR expression reached the ESTree renderer: {other:?}"),
     }
