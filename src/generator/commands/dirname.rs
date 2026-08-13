@@ -11,9 +11,14 @@ pub fn generate_dirname_command(
     if !cmd.args.is_empty() {
         let path_str = generator.word_to_perl(&cmd.args[0]);
 
-        if !generator.declared_locals.contains("dirname_loaded_file_basename") {
+        if !generator
+            .declared_locals
+            .contains("dirname_loaded_file_basename")
+        {
             output.push_str("use File::Basename qw(dirname);\n");
-            generator.declared_locals.insert("dirname_loaded_file_basename".to_string());
+            generator
+                .declared_locals
+                .insert("dirname_loaded_file_basename".to_string());
         }
 
         output.push_str(&format!("my $dirname_output = dirname({});\n", path_str));

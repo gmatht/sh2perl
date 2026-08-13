@@ -37,7 +37,11 @@ impl ParserUtilities for Lexer {
     fn skip_whitespace_and_comments(&mut self) {
         while let Some(token) = self.peek() {
             match token {
-                Token::Space | Token::Tab | Token::Comment | Token::Newline | Token::CarriageReturn => {
+                Token::Space
+                | Token::Tab
+                | Token::Comment
+                | Token::Newline
+                | Token::CarriageReturn => {
                     self.next();
                 }
                 _ => break,
@@ -79,16 +83,25 @@ impl ParserUtilities for Lexer {
                     self.next();
                 }
                 Some(Token::ArithmeticEvalClose) => {
-                    // )) closes two levels of paren depth
-                    // (ArithmeticEvalClose has priority over ParenClose via logos)
-                    depth -= 2;
-                    if depth > 0 {
+                    // `))` closes two levels of paren depth
+                    // (ArithmeticEvalClose has priority over ParenClose via logos).
+                    // When depth == 1 the FIRST `)` closes THIS $(...); the
+                    // second belongs to an ENCLOSING context — the classic
+                    // shape is a cmdsub as the last element of an array
+                    // literal (`arr=($(cmd))` — the lexer merges the cmdsub's
+                    // `)` with the array's `)` into one token). Pushing
+                    // anything (the old code pushed "))") corrupted the
+                    // captured text and broke the re-parse. The enclosing
+                    // parser detects the swallowed closer via the last-token
+                    // check in parse_array_elements.
+                    if depth >= 3 {
+                        depth -= 2;
                         content.push_str("))");
-                    } else if depth == 0 {
+                    } else if depth == 2 {
+                        depth = 0;
                         content.push(')'); // one ) is inside, one closes
                     } else {
-                        // depth went negative — we overshot; emit all ) needed
-                        content.push_str("))");
+                        // depth == 1: first ) closes us, second is outside
                         depth = 0;
                     }
                     self.next();
@@ -223,7 +236,7 @@ impl ParserUtilities for Lexer {
                             content.push_str(&text);
                         }
                         self.next(); // consume backslash
-                        // After backslash, the next token is the delimiter word
+                                     // After backslash, the next token is the delimiter word
                         if let Some(text) = self.get_current_text() {
                             delim_str = text.to_string();
                             content.push_str(&text);
@@ -247,10 +260,12 @@ impl ParserUtilities for Lexer {
                                 // SingleQuotedString, the truncated text may still
                                 // have a trailing quote from the delimiter's closing
                                 // quote that was consumed as a regular character.
-                                let clean = if truncated.starts_with('\'') && truncated.ends_with('\'') {
-                                    truncated[1..truncated.len()-1].to_string()
+                                let clean = if truncated.starts_with('\'')
+                                    && truncated.ends_with('\'')
+                                {
+                                    truncated[1..truncated.len() - 1].to_string()
                                 } else if truncated.ends_with('\'') || truncated.ends_with('"') {
-                                    truncated[..truncated.len()-1].to_string()
+                                    truncated[..truncated.len() - 1].to_string()
                                 } else {
                                     truncated
                                 };
@@ -259,9 +274,9 @@ impl ParserUtilities for Lexer {
                                 // Don't add a separate newline — the over-greedy
                                 // token already consumed it.  Skip past the token.
                                 self.next(); // consume the over-greedy delimiter token
-                                // The current token is now past the over-greedy string.
-                                // We need to scan the raw input for the heredoc body.
-                                // Find the position right after the '<<' token in raw input.
+                                             // The current token is now past the over-greedy string.
+                                             // We need to scan the raw input for the heredoc body.
+                                             // Find the position right after the '<<' token in raw input.
                                 let heredoc_end = {
                                     // Find the Heredoc token position
                                     let mut h_end = 0;
@@ -296,7 +311,9 @@ impl ParserUtilities for Lexer {
                                             break;
                                         }
                                         content.push_str(line);
-                                        if line_end < self.input.len() && input_bytes[line_end] == b'\n' {
+                                        if line_end < self.input.len()
+                                            && input_bytes[line_end] == b'\n'
+                                        {
                                             content.push('\n');
                                             current_pos = line_end + 1;
                                         } else {
@@ -317,13 +334,14 @@ impl ParserUtilities for Lexer {
                             } else {
                                 // Normal case: delimiter token without newline
                                 // Strip quotes from single-quoted or double-quoted delimiters
-                                let clean_delim = if raw_text.starts_with('\'') && raw_text.ends_with('\'') {
-                                    raw_text[1..raw_text.len()-1].to_string()
-                                } else if raw_text.starts_with('"') && raw_text.ends_with('"') {
-                                    raw_text[1..raw_text.len()-1].to_string()
-                                } else {
-                                    raw_text.clone()
-                                };
+                                let clean_delim =
+                                    if raw_text.starts_with('\'') && raw_text.ends_with('\'') {
+                                        raw_text[1..raw_text.len() - 1].to_string()
+                                    } else if raw_text.starts_with('"') && raw_text.ends_with('"') {
+                                        raw_text[1..raw_text.len() - 1].to_string()
+                                    } else {
+                                        raw_text.clone()
+                                    };
                                 delim_str = clean_delim;
                                 content.push_str(&delim_str);
                                 self.next(); // consume delimiter word
@@ -344,12 +362,19 @@ impl ParserUtilities for Lexer {
                                 // Also extract delimiter from raw line for robustness.
                                 if delim_str.is_empty() {
                                     let heredoc_line_end = cur_pos;
-                                    let heredoc_line_start = self.input[..heredoc_line_end].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                                    let heredoc_line_start = self.input[..heredoc_line_end]
+                                        .rfind('\n')
+                                        .map(|p| p + 1)
+                                        .unwrap_or(0);
                                     let line = &self.input[heredoc_line_start..heredoc_line_end];
                                     let trimmed = line.trim();
                                     if let Some(pos) = trimmed.rfind(|c: char| c.is_whitespace()) {
-                                        let word = trimmed[pos+1..].trim();
-                                        delim_str = if word.starts_with('\\') { word[1..].to_string() } else { word.to_string() };
+                                        let word = trimmed[pos + 1..].trim();
+                                        delim_str = if word.starts_with('\\') {
+                                            word[1..].to_string()
+                                        } else {
+                                            word.to_string()
+                                        };
                                     }
                                 }
 
@@ -370,7 +395,9 @@ impl ParserUtilities for Lexer {
                                             break;
                                         }
                                         content.push_str(line);
-                                        if line_end < self.input.len() && input_bytes[line_end] == b'\n' {
+                                        if line_end < self.input.len()
+                                            && input_bytes[line_end] == b'\n'
+                                        {
                                             content.push('\n');
                                             current_pos = line_end + 1;
                                         } else {
@@ -405,12 +432,18 @@ impl ParserUtilities for Lexer {
             }
         }
 
-
         if crate::debug::is_debug_enabled() {
-            eprintln!("DEBUG capture_parenthetical_text: captured {} chars, returning at token idx {}", content.len(), self.current);
+            eprintln!(
+                "DEBUG capture_parenthetical_text: captured {} chars, returning at token idx {}",
+                content.len(),
+                self.current
+            );
         }
         if crate::debug::is_debug_enabled() && content.len() > 50 {
-            eprintln!("DEBUG capture_parenthetical_text: first 50 chars: {:?}", &content[..50]);
+            eprintln!(
+                "DEBUG capture_parenthetical_text: first 50 chars: {:?}",
+                &content[..50]
+            );
         }
         Ok(content)
     }

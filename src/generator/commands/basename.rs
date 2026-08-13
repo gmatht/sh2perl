@@ -18,9 +18,14 @@ pub fn generate_basename_command(
             None
         };
 
-        if !generator.declared_locals.contains("basename_loaded_file_basename") {
+        if !generator
+            .declared_locals
+            .contains("basename_loaded_file_basename")
+        {
             output.push_str("use File::Basename qw(basename);\n");
-            generator.declared_locals.insert("basename_loaded_file_basename".to_string());
+            generator
+                .declared_locals
+                .insert("basename_loaded_file_basename".to_string());
         }
 
         let basename_expr = if let Some(suffix) = &suffix_str {

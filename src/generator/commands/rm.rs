@@ -50,7 +50,10 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
         let command_str = generator.generate_command_string_for_system(&command);
         let command_lit = generator.perl_string_literal_no_interp(&Word::literal(command_str));
 
-        return format!("do {{ my $rm_cmd_str = {}; $CHILD_ERROR = system($rm_cmd_str) >> 8; }};\n", command_lit);
+        return format!(
+            "do {{ my $rm_cmd_str = {}; $CHILD_ERROR = system($rm_cmd_str) >> 8; }};\n",
+            command_lit
+        );
     }
 
     // Fast path for `rm -f file` (force, non-recursive, no glob): emit
@@ -79,10 +82,7 @@ pub fn generate_rm_command(generator: &mut Generator, cmd: &SimpleCommand) -> St
                     IrExpr::Str(bare.to_string(), StrStyle::SingleQuoted)
                 };
                 output.push_str(&generator.indent());
-                output.push_str(&format!(
-                    "unlink({});\n",
-                    expr_to_perl(&file_expr)
-                ));
+                output.push_str(&format!("unlink({});\n", expr_to_perl(&file_expr)));
             }
             return output;
         }

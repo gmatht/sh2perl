@@ -18,6 +18,11 @@ pub fn show_help(program_name: &str) {
     println!("  parse --perl <input>           - Convert shell script to Perl");
     println!("  --mir <input>                  - Export Mid-level Intermediate Representation (MIR) as JSON");
     println!("  --shir <input>                 - Export the language-neutral ShIR as JSON (backend contract, A1)");
+    println!("  --shir-in-estree <input>        - ShIR JSON -> ESTree/JS (the executed bash translation)");
+    println!("  --true64                        - TRUE 64-bit bash arithmetic (off by default): out-of-±2^53");
+    println!("                                   - vars lower to BigInt64Array slots (hot RMW accumulators) or");
+    println!("                                   - BigInt values. See docs/true64.md. Place after the mode flag:");
+    println!("                                   - debashc --shir-in-estree --true64 <file.a1>");
     println!(
         "  --mir -O <input>               - Export optimized MIR with transformations applied"
     );
@@ -48,6 +53,11 @@ pub fn show_help(program_name: &str) {
     println!("  --no-debug                     - Disable debug output");
     println!("  --freeze                       - Freeze execution for debugging");
     println!("  --unfreeze                     - Unfreeze execution and continue");
+    println!("  --argv0-source <name>          - Bake the ORIGINAL bash file name as $0 / sh2.argv0");
+    println!("                                 (source-name semantic: the translated program identifies");
+    println!("                                 as <name> whatever it is invoked as; default = argv0");
+    println!("                                 pass-through, the harness supplies argv0 at run time).");
+    println!("                                 See harness/argv0-tests/README.md for the two semantics.");
     println!();
     println!("TIMEOUT OPTIONS:");
     println!();
