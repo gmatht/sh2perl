@@ -303,14 +303,14 @@ pub fn ast_to_estree_json(commands: &[Command]) -> Result<String, serde_json::Er
 // `break` inside a `switch` (case clauses) and `return` inside a function
 // arrow stay native (both legal).
 
-fn fix_control_flow(prog: Program) -> Program {
+pub(crate) fn fix_control_flow(prog: Program) -> Program {
     Program {
         type_: prog.type_,
         source_type: prog.source_type,
         body: prog
             .body
             .into_iter()
-            .filter_map(|s| fix_stmt(s, false, false, false))
+            .filter_map(|s| fix_stmt(s, false, false, false, false))
             .collect(),
     }
 }
@@ -349,7 +349,7 @@ fn map_raw_bytes(s: &str) -> String {
     out
 }
 
-fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Option<Stmt> {
+fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop: bool) -> Option<Stmt> {
     Some(match stmt {
         Stmt::BreakStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
             expression: sh2_call("break", vec![]),
@@ -357,7 +357,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
         Stmt::ContinueStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
             expression: sh2_call("continue", vec![]),
         },
-        Stmt::ReturnStatement { argument } if !in_arrow || !in_func => {
+        Stmt::ReturnStatement { argument } if !in_arrow || in_loop => {
             let mut args = vec![];
             if let Some(a) = argument {
                 args.push(a);
@@ -367,12 +367,12 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
             }
         }
         Stmt::ExpressionStatement { expression } => Stmt::ExpressionStatement {
-            expression: fix_expr(expression, in_arrow, in_func),
+            expression: fix_expr(expression, in_arrow, in_func, in_loop),
         },
         Stmt::BlockStatement { body } => Stmt::BlockStatement {
             body: body
                 .into_iter()
-                .filter_map(|s| fix_stmt(s, in_arrow, in_func, false))
+                .filter_map(|s| fix_stmt(s, in_arrow, in_func, false, in_loop))
                 .collect(),
         },
         Stmt::IfStatement {
@@ -380,14 +380,14 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
             consequent,
             alternate,
         } => Stmt::IfStatement {
-            test: fix_expr(test, in_arrow, in_func),
+            test: fix_expr(test, in_arrow, in_func, in_loop),
             consequent: Box::new(
-                fix_stmt(*consequent, in_arrow, in_func, false)
+                fix_stmt(*consequent, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
             alternate: alternate.map(|a| {
                 Box::new(
-                    fix_stmt(*a, in_arrow, in_func, false)
+                    fix_stmt(*a, in_arrow, in_func, false, in_loop)
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )
             }),
@@ -403,64 +403,64 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
             finalizer,
         } => Stmt::TryStatement {
             block: Box::new(
-                fix_stmt(*block, in_arrow, in_func, false)
+                fix_stmt(*block, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
             handler: handler.map(|h| CatchClause {
                 type_: h.type_,
                 param: h.param,
                 body: Box::new(
-                    fix_stmt(*h.body, in_arrow, in_func, false)
+                    fix_stmt(*h.body, in_arrow, in_func, false, in_loop)
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 ),
             }),
             finalizer: finalizer.map(|f| {
                 Box::new(
-                    fix_stmt(*f, in_arrow, in_func, false)
+                    fix_stmt(*f, in_arrow, in_func, false, in_loop)
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )
             }),
         },
         Stmt::ThrowStatement { argument } => Stmt::ThrowStatement {
-            argument: fix_expr(argument, in_arrow, in_func),
+            argument: fix_expr(argument, in_arrow, in_func, in_loop),
         },
         Stmt::SwitchStatement {
             discriminant,
             cases,
         } => Stmt::SwitchStatement {
-            discriminant: fix_expr(discriminant, in_arrow, in_func),
+            discriminant: fix_expr(discriminant, in_arrow, in_func, in_loop),
             cases: cases
                 .into_iter()
                 .map(|c| SwitchCase {
                     type_: c.type_,
-                    test: c.test.map(|t| fix_expr(t, in_arrow, in_func)),
+                    test: c.test.map(|t| fix_expr(t, in_arrow, in_func, in_loop)),
                     consequent: c
                         .consequent
                         .into_iter()
-                        .filter_map(|s| fix_stmt(s, in_arrow, in_func, true))
+                        .filter_map(|s| fix_stmt(s, in_arrow, in_func, true, in_loop))
                         .collect(),
                 })
                 .collect(),
         },
         Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
-            test: fix_expr(test, in_arrow, in_func),
+            test: fix_expr(test, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false)
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
         Stmt::DoWhileStatement { test, body } => Stmt::DoWhileStatement {
-            test: fix_expr(test, in_arrow, in_func),
+            test: fix_expr(test, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false)
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
         Stmt::ForOfStatement { left, right, body } => Stmt::ForOfStatement {
             left,
-            right: fix_expr(right, in_arrow, in_func),
+            right: fix_expr(right, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false)
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
@@ -471,13 +471,13 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
             body,
         } => Stmt::ForStatement {
             init: Box::new(
-                fix_stmt(*init, in_arrow, in_func, false)
+                fix_stmt(*init, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
-            test: fix_expr(test, in_arrow, in_func),
-            update: fix_expr(update, in_arrow, in_func),
+            test: fix_expr(test, in_arrow, in_func, in_loop),
+            update: fix_expr(update, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false)
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
@@ -487,7 +487,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
                 .map(|d| VariableDeclarator {
                     type_: d.type_,
                     id: d.id,
-                    init: d.init.map(|i| fix_expr(i, in_arrow, in_func)),
+                    init: d.init.map(|i| fix_expr(i, in_arrow, in_func, in_loop)),
                 })
                 .collect(),
             kind,
@@ -496,7 +496,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
     })
 }
 
-fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
+fn fix_expr(e: Expr, in_arrow: bool, in_func: bool, in_loop: bool) -> Expr {
     match e {
         Expr::CallExpression {
             callee,
@@ -504,19 +504,74 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             optional,
         } => {
             // Arrows are bash-return contexts (loop bodies, pipeline stages,
-            // subshells) EXCEPT the sh2.define function arrow, where a
-            // native `return` is legal (and keeps the function's value).
-            let is_define = matches!(
-                callee.as_ref(),
-                Expr::MemberExpression { object, property, .. }
+            // subshells) EXCEPT the function arrows — `sh2.define` (the
+            // bash/posix frontends) and `sh2.functions.set` (the A1
+            // IrStmt::Function rendering — bat-sh-go, c-sh-go's fnValue
+            // VALUE-returning functions) — where a native `return` is
+            // legal (and keeps the function's value). Without the
+            // functions.set arm, the A1-ingress fix_control_flow pass
+            // converted the C frontend's value returns to sh2.return()
+            // signals and fnValue lost the value (c-sh-go t58/t73 DIFF,
+            // 2026-08-14).
+            let is_define = match callee.as_ref() {
+                Expr::MemberExpression { object, property, .. } => {
+                    // `sh2.define`
                     if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2")
                         && matches!(property.as_ref(), Expr::Identifier { name } if name == "define")
-            );
+                    {
+                        true
+                    } else if matches!(property.as_ref(), Expr::Identifier { name } if name == "set") {
+                        // `sh2.functions.set` — the A1 IrStmt::Function
+                        // rendering (object = sh2.functions)
+                        matches!(
+                            object.as_ref(),
+                            Expr::MemberExpression { object: o2, property: p2, .. }
+                                if matches!(o2.as_ref(), Expr::Identifier { name } if name == "sh2")
+                                    && matches!(p2.as_ref(), Expr::Identifier { name } if name == "functions")
+                        )
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            let is_loop_helper = match callee.as_ref() {
+                Expr::MemberExpression { object, property, .. }
+                    if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2") =>
+                {
+                    matches!(
+                        property.as_ref(),
+                        Expr::Identifier { name }
+                            if matches!(
+                                name.as_str(),
+                                "whileLoop" | "whileLoopSync" | "whileLoopBatch" | "forLoop"
+                                    | "forLoopSync" | "forLoopBatch" | "cstyleFor"
+                                    | "cstyleForSync"
+                            )
+                    )
+                }
+                _ => false,
+            };
+            // the loop-BODY arrow (the LAST argument of an sh2 loop
+            // helper) is a LOOP-BODY context: a `return` inside it must
+            // signal (a native return would exit the callback and the
+            // loop would spin on). The other args (cond/items/init/update/
+            // batch) descend with the inherited flag. This is the precise
+            // replacement for the old blanket `!in_func` rule, which
+            // over-converted frontend VALUE-returning arrows (the zig
+            // `__fn_f = async () => ...` function defs, the py ArrayComp
+            // IIFE, the C fnValue bodies) — only loop-body arrows need
+            // the signal conversion.
+            let n_args = arguments.len();
             Expr::CallExpression {
-                callee: Box::new(fix_expr(*callee, in_arrow, in_func)),
+                callee: Box::new(fix_expr(*callee, in_arrow, in_func, in_loop)),
                 arguments: arguments
                     .into_iter()
-                    .map(|a| fix_expr(a, in_arrow, if is_define { true } else { false }))
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let a_loop = in_loop || (is_loop_helper && i + 1 == n_args);
+                        fix_expr(a, in_arrow, if is_define { true } else { false }, a_loop)
+                    })
                     .collect(),
                 optional,
             }
@@ -527,13 +582,13 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             computed,
             optional,
         } => Expr::MemberExpression {
-            object: Box::new(fix_expr(*object, in_arrow, in_func)),
-            property: Box::new(fix_expr(*property, in_arrow, in_func)),
+            object: Box::new(fix_expr(*object, in_arrow, in_func, in_loop)),
+            property: Box::new(fix_expr(*property, in_arrow, in_func, in_loop)),
             computed,
             optional,
         },
         Expr::AwaitExpression { argument } => Expr::AwaitExpression {
-            argument: Box::new(fix_expr(*argument, in_arrow, in_func)),
+            argument: Box::new(fix_expr(*argument, in_arrow, in_func, in_loop)),
         },
         Expr::ArrowFunctionExpression {
             params,
@@ -544,10 +599,10 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             params,
             body: match body {
                 ArrowBody::Expr(inner) => {
-                    ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func)))
+                    ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func, in_loop)))
                 }
                 ArrowBody::Block(b) => ArrowBody::Block(Box::new(
-                    fix_stmt(*b, true, in_func, false)
+                    fix_stmt(*b, true, in_func, false, in_loop)
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )),
             },
@@ -560,7 +615,7 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
                 .map(|p| Property {
                     type_: p.type_,
                     key: p.key,
-                    value: fix_expr(p.value, in_arrow, in_func),
+                    value: fix_expr(p.value, in_arrow, in_func, in_loop),
                     kind: p.kind,
                     computed: p.computed,
                     shorthand: p.shorthand,
@@ -570,7 +625,7 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
         Expr::ArrayExpression { elements } => Expr::ArrayExpression {
             elements: elements
                 .into_iter()
-                .map(|el| el.map(|e| fix_expr(e, in_arrow, in_func)))
+                .map(|el| el.map(|e| fix_expr(e, in_arrow, in_func, in_loop)))
                 .collect(),
         },
         Expr::Literal { value, raw, regex } => Expr::Literal {
@@ -598,7 +653,7 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
                 .collect(),
             expressions: expressions
                 .into_iter()
-                .map(|e| fix_expr(e, in_arrow, in_func))
+                .map(|e| fix_expr(e, in_arrow, in_func, in_loop))
                 .collect(),
         },
         Expr::LogicalExpression {
@@ -607,8 +662,8 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             right,
         } => Expr::LogicalExpression {
             operator,
-            left: Box::new(fix_expr(*left, in_arrow, in_func)),
-            right: Box::new(fix_expr(*right, in_arrow, in_func)),
+            left: Box::new(fix_expr(*left, in_arrow, in_func, in_loop)),
+            right: Box::new(fix_expr(*right, in_arrow, in_func, in_loop)),
         },
         Expr::UnaryExpression {
             operator,
@@ -616,13 +671,13 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             prefix,
         } => Expr::UnaryExpression {
             operator,
-            argument: Box::new(fix_expr(*argument, in_arrow, in_func)),
+            argument: Box::new(fix_expr(*argument, in_arrow, in_func, in_loop)),
             prefix,
         },
         Expr::SequenceExpression { expressions } => Expr::SequenceExpression {
             expressions: expressions
                 .into_iter()
-                .map(|e| fix_expr(e, in_arrow, in_func))
+                .map(|e| fix_expr(e, in_arrow, in_func, in_loop))
                 .collect(),
         },
         // the errexit-guard wrapper (`sh2._g = await sh2.forLoop(...)`)
@@ -634,8 +689,8 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             right,
         } => Expr::AssignmentExpression {
             operator,
-            left: Box::new(fix_expr(*left, in_arrow, in_func)),
-            right: Box::new(fix_expr(*right, in_arrow, in_func)),
+            left: Box::new(fix_expr(*left, in_arrow, in_func, in_loop)),
+            right: Box::new(fix_expr(*right, in_arrow, in_func, in_loop)),
         },
         other => other,
     }
