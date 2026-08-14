@@ -891,8 +891,16 @@ exit $main_exit_code;
                 }
                 cli_commands::export_shir(&s, raw);
             } else if input.contains(".sh") || !input.contains(' ') {
-                match fs::read_to_string(input) {
-                    Ok(content) => cli_commands::export_shir(&content, raw),
+                // Bytes read + lossy decode (core requests
+                // sh-20260814-145955 / sh-utf8-20260814-140334): a file
+                // containing a non-UTF-8 byte must NOT fall back to
+                // parsing the FILE PATH as the script (read_to_string's
+                // Err was misread as "not a file"). read() succeeds for
+                // invalid-UTF-8 files; the lossy decode keeps the byte
+                // (U+FFFD) and the program parses. Err only fires for a
+                // genuinely absent file → direct-string fallback.
+                match fs::read(input) {
+                    Ok(bytes) => cli_commands::export_shir(&String::from_utf8_lossy(&bytes), raw),
                     Err(_) => cli_commands::export_shir(input, raw),
                 }
             } else {
@@ -909,8 +917,8 @@ exit $main_exit_code;
                 }
                 cli_commands::export_shir_raw(&s);
             } else if input.contains(".sh") || !input.contains(' ') {
-                match fs::read_to_string(input) {
-                    Ok(c) => cli_commands::export_shir_raw(&c),
+                match fs::read(input) {
+                    Ok(bytes) => cli_commands::export_shir_raw(&String::from_utf8_lossy(&bytes)),
                     Err(_) => cli_commands::export_shir_raw(input),
                 }
             } else { cli_commands::export_shir_raw(input); }

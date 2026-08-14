@@ -137,6 +137,16 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 target
             ));
         }
+        RedirectOperator::ClobberOutput => {
+            // `>|` clobber output: same open as plain `>` for perl (the
+            // noclobber distinction is a POSIX sh / bash concern; perl
+            // open is always clobber).
+            let target = generator.perl_string_literal(&redirect.target);
+            output.push_str(&format!(
+                "open STDOUT, '>', {} or croak \"Cannot write file: $OS_ERROR\\n\";\n",
+                target
+            ));
+        }
         RedirectOperator::Append => {
             // Append redirection: command >> file
             let target = generator.perl_string_literal(&redirect.target);
@@ -587,6 +597,15 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             result.push_str(&format!(" {}> {}", fd, word_to_bash_string(&redirect.target)));
                         } else {
                             result.push_str(&format!(" > {}", word_to_bash_string(&redirect.target)));
+                        }
+                    }
+                    RedirectOperator::ClobberOutput => {
+                        // `>|` — bash-valid; keep the clobber operator in
+                        // the bash -c string.
+                        if let Some(fd) = redirect.fd {
+                            result.push_str(&format!(" {}>| {}", fd, word_to_bash_string(&redirect.target)));
+                        } else {
+                            result.push_str(&format!(" >| {}", word_to_bash_string(&redirect.target)));
                         }
                     }
                     RedirectOperator::Append => {
