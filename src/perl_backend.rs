@@ -1626,10 +1626,11 @@ impl Render {
     /// `arith("$j*$i")` — shell arith syntax ≈ Perl arith syntax; prefix
     /// `$var` refs (and bare identifiers), pass everything else through.
     fn arith_str(&mut self, s: &str) -> String {
-        // `$((echo "test"))` ambiguity: a quote inside the string means the
-        // parser resolved it as command substitution — run it instead.
+        // `$((echo "test"))` — a quote inside the arith text is a bash
+        // ARITHMETIC ERROR (the whole expansion yields empty), not a
+        // command substitution (the parser would have made it a Capture)
         if s.contains('"') || s.contains('\'') {
-            return self.qx(s);
+            return "''".to_string();
         }
         // `$(cmd)` inside arithmetic: lower each substitution to `(qx{...})`
         // (numeric coercion handles the trailing newline)
@@ -4544,6 +4545,22 @@ impl Render {
                 }
                 let items = match iter {
                     IrExpr::Array(items) => {
+                        // `$(cmd)` in a for-iter WORD-SPLITS by IFS — a
+                        // capture element splits into the loop items
+                        let iter_elem = |r: &mut Self, i: &IrExpr| -> String {
+                            match i {
+                                IrExpr::Capture { expr, .. } => format!(
+                                    "split(/\\s+/, {})",
+                                    r.capture_from_expr(expr)
+                                ),
+                                IrExpr::Call { func, args }
+                                    if func == "capture" || func == "captureWords" =>
+                                {
+                                    format!("split(/\\s+/, {})", r.call(func, args))
+                                }
+                                _ => r.expr(i),
+                            }
+                        };
                         // `*.{txt,log,dat}` arrives as an Array carrying a
                         // brace call — glob-bearing items expand at RUNTIME
                         if let [IrExpr::Call { func, args }] = items.as_slice() {
@@ -4561,16 +4578,16 @@ impl Render {
                                     format!("(sort(glob({})))", gs.join("), glob("))
                                 } else {
                                     let l: Vec<String> =
-                                        items.iter().map(|i| self.expr(i)).collect();
+                                        items.iter().map(|i| iter_elem(self, i)).collect();
                                     l.join(", ")
                                 }
                             } else {
                                 let l: Vec<String> =
-                                    items.iter().map(|i| self.expr(i)).collect();
+                                    items.iter().map(|i| iter_elem(self, i)).collect();
                                 l.join(", ")
                             }
                         } else {
-                            let l: Vec<String> = items.iter().map(|i| self.expr(i)).collect();
+                            let l: Vec<String> = items.iter().map(|i| iter_elem(self, i)).collect();
                             l.join(", ")
                         }
                     }
@@ -4614,9 +4631,19 @@ impl Render {
                             "()".to_string()
                         }
                     }
-                    other => {
-                        self.mark_todo("for iter");
-                        self.expr(other)
+                    other => match other {
+                        IrExpr::Capture { expr, .. } => {
+                            format!("split(/\\s+/, {})", self.capture_from_expr(expr))
+                        }
+                        IrExpr::Call { func, args }
+                            if func == "capture" || func == "captureWords" =>
+                        {
+                            format!("split(/\\s+/, {})", self.call(func, args))
+                        }
+                        _ => {
+                            self.mark_todo("for iter");
+                            self.expr(other)
+                        }
                     }
                 };
                 let v = ident(var);
