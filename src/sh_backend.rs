@@ -1219,7 +1219,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str(" in\n");
             for cl in clauses {
                 indent(out, d + 1);
-                out.push_str(&cl.patterns.join(" | "));
+                out.push_str(&cl.patterns.iter().map(|p| case_pattern(p)).collect::<Vec<_>>().join(" | "));
                 out.push_str(")\n");
                 for b in &cl.body {
                     stmt_to_sh(b, d + 2, out)?;
@@ -1888,7 +1888,7 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                     } else {
                         // quote bare $(...) and ${...} so word-splitting
                         // in `[ ]` does not shred cmdsub output
-                        let t = quote_test_expansions(&space_test_ops(t));
+                        let t = escape_test_ltgt(&quote_test_expansions(&space_test_ops(t)));
                         Ok(format!("[ {t} ]"))
                     }
                 } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
@@ -1903,7 +1903,7 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 } else {
                     // quote bare $(...) and ${...} so word-splitting
                     // in `[ ]` does not shred cmdsub output
-                    let t = quote_test_expansions(&space_test_ops(t));
+                    let t = escape_test_ltgt(&quote_test_expansions(&space_test_ops(t)));
                     Ok(format!("[ {t} ]"))
                 }
             }
@@ -3613,8 +3613,9 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
                 IrExpr::Str(k, _) if k.contains(['$', '(']) => {
                     // dynamic key (`${map[$k]}`) — indirect via eval
                     Ok(format!(
-                        "$(eval \"printf '%s' \\\"\\${{{}_{k}}}\\\"\")",
-                        arr_base(&name)
+                        "$(eval \"printf '%s' \\\"\\${{{}_{}}}\\\"\")",
+                        arr_base(&name),
+                        eval_key(&k)
                     ))
                 }
                 IrExpr::Str(k, _) => Ok(format!("\"${{{}}}\"", elem_name(&name, &k))),
@@ -3715,8 +3716,9 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                 if idx.contains(['$', '(']) {
                     // dynamic key (`${map[$k]}`) — indirect via eval
                     return Ok(format!(
-                        "$(eval \"printf '%s' \\\"\\${{{}_{idx}}}\\\"\")",
-                        arr_base(&an)
+                        "$(eval \"printf '%s' \\\"\\${{{}_{}}}\\\"\")",
+                        arr_base(&an),
+                        eval_key(idx)
                     ));
                 }
                 return Ok(format!("\"${{{}}}\"", elem_name(arr_base(&an), idx)));
@@ -3798,6 +3800,15 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                 };
                 return Ok(format!("$(printf '%s' \"${{{name}}}\" | cut -c{range})"));
             }
+            if offn >= 0 && lenn < 0 && !len.is_empty() {
+                // `${x:off:-len}` — a NEGATIVE length counts from the END
+                // of the string: end = ${#x} + len (cut is 1-based)
+                let start = offn + 1;
+                let range = format!("{start}-$(( ${{#{name}}} {lenn} ))");
+                return Ok(format!(
+                    "$(printf '%s' \"${{{name}}}\" | cut -c{range})"
+                ));
+            }
             if offn >= 0 && (lenn >= 0 || len.is_empty()) {
                 if !len.is_empty() && lenn == 0 {
                     // `${x:off:0}` — always empty
@@ -3847,14 +3858,15 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             Ok(format!("${{{name}{op}{pat}}}"))
         }
         "//" | "/" => {
-            // `${x/p/r}` — no dash equivalent; emulate with sed (the IR
-            // conflates first/all occurrences — both render `g`)
+            // `${x/p/r}` — no dash equivalent; emulate with sed (`/` is
+            // FIRST-occurrence only, `//` is global)
             let pat = raw_arg(args, 2)?;
             let rep = raw_arg(args, 3)?;
             let pe = sed_escape_pattern(&pat);
             let re = sed_escape_replacement(&rep);
+            let g = if op == "//" { "g" } else { "" };
             Ok(format!(
-                "$(printf '%s' \"${name}\" | sed -e 's#{pe}#{re}#g')"
+                "$(printf '%s' \"${name}\" | sed -e 's#{pe}#{re}#{g}')"
             ))
         }
         ":-" | ":=" | ":?" => {
@@ -4099,6 +4111,30 @@ fn space_test_ops(t: &str) -> String {
     s
 }
 
+/// In `[ ]`, an unquoted `<` / `>` is parsed as a REDIRECT (dash: syntax
+/// error) — `[[ "a" < "b" ]]` is a lexicographic comparison, so the
+/// operators must be escaped (`\<` / `\>`), which POSIX `[ ]` then
+/// interprets as the string comparison.
+fn escape_test_ltgt(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_dq = false;
+    let mut in_sq = false;
+    for c in s.chars() {
+        match c {
+            '"' if !in_sq => in_dq = !in_dq,
+            '\'' if !in_dq => in_sq = !in_sq,
+            '<' | '>' if !in_dq && !in_sq => {
+                out.push('\\');
+                out.push(c);
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// `[[ lhs == rhs ]]` / `[[ lhs = rhs ]]` — dash has no `==` in `[ ]`
 /// and no extglob patterns; lower to a case-emulation (a POSIX pattern
 /// match with the same semantics).
@@ -4123,6 +4159,47 @@ fn test_eq_to_sh(lhs: &str, rhs: &str) -> String {
     } else {
         format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac")
     }
+}
+
+
+/// A case pattern: dash (and POSIX) use `[!...]` for negated character
+/// classes — `[^...]` is a bash extension that dash treats as a literal
+/// class containing `^`.
+fn case_pattern(p: &str) -> String {
+    p.replace("[^", "[!")
+}
+
+
+/// A dynamic subscript key inside an eval'd element name: the chars that
+/// are not part of a shell name or expansion syntax become `_` so the
+/// eval'd name matches elem_name()'s mangling of the same key text
+/// (`matrix[$i,$j]` -> `matrix_$i_$j` -> eval -> `matrix_0_0`).
+fn eval_key(key: &str) -> String {
+    let mut out = String::new();
+    let b = key.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        // `$name` inside the eval'd element name — the following `_`
+        // would become part of the NAME (`$i_$j` reads var `i_`), so
+        // brace it: `${i}_${j}`
+        if c == '$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') {
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            out.push_str(&format!("${{{}}}", &key[i + 1..j]));
+            i = j;
+            continue;
+        }
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '{' | '}') {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Inside a `\${{...}}` eval string: rewrite array-expansion text to
@@ -4212,14 +4289,35 @@ fn space_test_eq(t: &str) -> String {
             '=' => {
                 let prev = chars[..i].iter().rev().find(|p| !p.is_whitespace()).copied();
                 let next = chars[i + 1..].iter().find(|n| !n.is_whitespace()).copied();
-                let prev_ok = prev.map(|p| !matches!(p, '=' | '!' | '<' | '>')).unwrap_or(false);
-                let next_ok = next.map(|n| !matches!(n, '=')).unwrap_or(false);
-                if prev_ok && next_ok {
+                // 2-char operators (`==` / `!=` / `<=` / `>=`) — dash
+                // reads them as ONE word (`$letter!="c"` is a single
+                // operand, always true)
+                if matches!(prev, Some('!' | '<' | '>')) {
+                    out.pop(); // remove the operator's first char
                     out.push(' ');
-                    out.push(c);
+                    out.push(prev.unwrap());
+                    out.push('=');
                     out.push(' ');
+                } else if next == Some('=') {
+                    out.push(' ');
+                    out.push('=');
+                    out.push('=');
+                    out.push(' ');
+                    // skip past the second `=` (the loop's i+=1 lands
+                    // after it)
+                    if let Some(rel) = chars[i + 1..].iter().position(|c| !c.is_whitespace()) {
+                        i += rel;
+                    }
                 } else {
-                    out.push(c);
+                    let prev_ok = prev.map(|p| !matches!(p, '=' | '!' | '<' | '>')).unwrap_or(false);
+                    let next_ok = next.map(|n| !matches!(n, '=')).unwrap_or(false);
+                    if prev_ok && next_ok {
+                        out.push(' ');
+                        out.push(c);
+                        out.push(' ');
+                    } else {
+                        out.push(c);
+                    }
                 }
             }
             c => out.push(c),
@@ -5152,7 +5250,7 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
         } => {
             let mut out = format!("case {} in", word_to_sh(discriminant)?);
             for cl in clauses {
-                out.push_str(&format!(" {}) {};;", cl.patterns.join("|"), stmts_inline(&cl.body)?));
+                out.push_str(&format!(" {}) {};;", cl.patterns.iter().map(|p| case_pattern(p)).collect::<Vec<_>>().join("|"), stmts_inline(&cl.body)?));
             }
             out.push_str(" esac");
             Ok(out)
