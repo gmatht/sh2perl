@@ -32576,6 +32576,31 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             let key_e = expr_to_estree(key);
             sh2_call("arrayIndex", vec![str_lit(var), key_e])
         }
+        // The A1 `MethodCall` expr node (core request
+        // py-sh-go-20260814-152409): `obj.method(args)` — the contract's
+        // generic member call for non-shell frontends (Python method
+        // calls, JS String.prototype equivalents). The ESTree-side
+        // analysis passes handle the resulting MemberExpression/
+        // CallExpression shapes already (the runtime itself is full of
+        // `String(s).slice(...)` / `sh2.arrayIndex(...)` chains); which
+        // methods a frontend MAY emit (native JS String.prototype names
+        // or a runtime mapping for Python-only names) is a frontend-side
+        // emit decision.
+        IrExpr::MethodCall { obj, method, args } => {
+            let callee = Expr::MemberExpression {
+                object: Box::new(expr_to_estree(obj)),
+                property: Box::new(Expr::Identifier {
+                    name: method.clone(),
+                }),
+                computed: false,
+                optional: false,
+            };
+            Expr::CallExpression {
+                callee: Box::new(callee),
+                arguments: args.iter().map(expr_to_estree).collect(),
+                optional: false,
+            }
+        }
         other => unreachable!("Perl-only IR expression reached the ESTree renderer: {other:?}"),
     }
 }
@@ -35133,6 +35158,33 @@ mod struct_member_tests {
 }
 
 #[cfg(test)]
+mod methodcall_estree_tests {
+    use super::*;
+
+    /// The A1 `MethodCall` expr node renders through the ESTree renderer
+    /// (core request py-sh-go-20260814-152409): the generic member call
+    /// `obj.method(args)` — previously the catch-all
+    /// "Perl-only IR expression reached the ESTree renderer" panic
+    /// (src/shir.rs expr_to_estree) blocked any frontend from emitting
+    /// the contract's own node.
+    #[test]
+    fn methodcall_renders_member_call() {
+        let a1 = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"var_types":[],"subs":[],"stmts":[{"type":"Expr","expr":{"type":"Call","func":"echo","args":[{"type":"MethodCall","object":{"type":"Var","name":"s","sigil":null},"method":"strip","args":[]}]}}]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(a1).expect("ingress accepts MethodCall");
+        let js = crate::shir::shir_to_estree_json(&prog).expect("render");
+        // the member call must survive: `s.strip()` (the var read folds to
+        // "" — never written — but the member shape stays)
+        assert!(
+            js.contains("\"name\":\"strip\"") && js.contains("\"type\":\"MemberExpression\""),
+            "member call lost in render: {js}"
+        );
+        assert!(
+            js.contains("\"type\":\"CallExpression\""),
+            "call shape lost in render: {js}"
+        );
+    }
+}
+
 mod clobber_redirect_tests {
     use super::*;
 
