@@ -546,7 +546,9 @@ impl Render {
             self.emit("}");
             self.emit("static void _sh_arr_set(char **a, size_t *len, size_t cap, long long i, const char *v) {");
             self.emit("  if (i < 0 || i >= (long long)cap || !v) return;");
-            self.emit("  a[i] = (char*)v;");
+            // strdup: the source may be a stack temp that dies when its
+            // block closes (a capture/arith string in a loop body)
+            self.emit("  a[i] = (char*)strdup(v);");
             self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
             self.emit("}");
             self.emit("static const char *_sh_arr_get(char **a, size_t len, long long i) {");
@@ -556,8 +558,8 @@ impl Render {
             self.emit("static void _sh_assoc_set(char **k, char **v, size_t *n, size_t cap, const char *key, const char *val) {");
             self.emit("  if (!key) return;");
             self.emit("  for (size_t i = 0; i < *n; i++)");
-            self.emit("    if (k[i] && strcmp(k[i], key) == 0) { v[i] = (char*)val; return; }");
-            self.emit("  if (*n < cap) { k[*n] = (char*)key; v[*n] = (char*)val; (*n)++; }");
+            self.emit("    if (k[i] && strcmp(k[i], key) == 0) { v[i] = (char*)strdup(val ? val : \"\"); return; }");
+            self.emit("  if (*n < cap) { k[*n] = (char*)strdup(key); v[*n] = (char*)strdup(val ? val : \"\"); (*n)++; }");
             self.emit("}");
             self.emit("static const char *_sh_assoc_get(char **k, char **v, size_t n, const char *key) {");
             self.emit("  if (!key) return \"\";");
@@ -648,6 +650,30 @@ impl Render {
             self.emit("  return _sh_rd;");
             self.emit("}");
             self.emit("/* ${x:off:len} substring (bash: off<0 counts from the end) */");
+            self.emit("/* ${arr[@]:off:len} — an ELEMENT slice of the space-joined string */");
+            self.emit("static void _sh_arr_slice(char *d, size_t cap, const char *s, long long off, long long len) {");
+            self.emit("  const char *p = s; size_t n = 0;");
+            self.emit("  while (*p) { while (*p == ' ') p++; if (!*p) break; n++; while (*p && *p != ' ') p++; }");
+            self.emit("  long long b = off < 0 ? (long long)n + off : off;");
+            self.emit("  if (b < 0) b = 0; if (b > (long long)n) b = (long long)n;");
+            self.emit("  long long e = (len < 0) ? (long long)n : b + len;");
+            self.emit("  if (e > (long long)n) e = (long long)n; if (e < b) e = b;");
+            self.emit("  size_t dn = 0, i = 0; p = s;");
+            self.emit("  while (*p && i < (size_t)e) {");
+            self.emit("    while (*p == ' ') p++;");
+            self.emit("    if (!*p) break;");
+            self.emit("    const char *w = p;");
+            self.emit("    while (*p && *p != ' ') p++;");
+            self.emit("    if (i >= (size_t)b) {");
+            self.emit("      if (dn && dn + 1 < cap) d[dn++] = ' ';");
+            self.emit("      size_t wl = (size_t)(p - w);");
+            self.emit("      if (dn + wl >= cap) wl = cap - dn - 1;");
+            self.emit("      memcpy(d + dn, w, wl); dn += wl;");
+            self.emit("    }");
+            self.emit("    i++;");
+            self.emit("  }");
+            self.emit("  d[dn] = 0;");
+            self.emit("}");
             self.emit("static char *_sh_substr(char *d, size_t cap, const char *s, long long off, long long len) {");
             self.emit("  size_t n = strlen(s);");
             self.emit("  long long b = off < 0 ? (long long)n + off : off;");
@@ -1349,10 +1375,10 @@ impl Render {
                     }
                 }
                 "param" => {
-                    if self.param_is_len(args) {
-                        let v = self.param_call(args);
-                        return self.num_temp(&v);
-                    }
+                    // param_call already returns the right VALUE form
+                    // (a string temp for len/slice) — wrapping it in
+                    // num_temp again would re-stringify the POINTER
+                    // (`%lld` of a char*) into garbage
                     self.param_call(args)
                 }
                 "capture" | "captureWords" => self.capture_call(args),
@@ -2431,21 +2457,44 @@ impl Render {
                     j += 1;
                 }
                 let name: String = chars[i + 1..j].iter().collect();
-                if self.var_types.contains_key(&name) || self.store.contains(&name) {
-                    if self.is_num(&name) {
-                        let t = self.num_temp(&self.c_ident(&name));
-                        self.emit(&format!("_sh_export({}, {t});", Self::cstr(&name)));
-                    } else {
-                        self.emit(&format!(
-                            "_sh_export({}, {});",
-                            Self::cstr(&name),
-                            self.store_ref(&name)
-                        ));
-                    }
-                }
+                self.export_one(&name);
                 i = j;
             } else {
                 i += 1;
+            }
+        }
+        // BARE identifier refs (`(( count + 1 ))` — the arith texts the
+        // core emits without `$`) — export the known vars
+        let mut k = 0;
+        while k < chars.len() {
+            let c = chars[k];
+            if c.is_ascii_alphabetic() || c == '_' {
+                let mut j = k;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let name: String = chars[k..j].iter().collect();
+                self.export_one(&name);
+                k = j;
+            } else {
+                k += 1;
+            }
+        }
+    }
+
+    /// `_sh_export("name", value)` for a program var (numeric vars via
+    /// their string form).
+    fn export_one(&mut self, name: &str) {
+        if self.var_types.contains_key(name) || self.store.contains(name) {
+            if self.is_num(name) {
+                let t = self.num_temp(&self.c_ident(name));
+                self.emit(&format!("_sh_export({}, {t});", Self::cstr(name)));
+            } else {
+                self.emit(&format!(
+                    "_sh_export({}, {});",
+                    Self::cstr(name),
+                    self.store_ref(name)
+                ));
             }
         }
     }
@@ -2785,7 +2834,7 @@ impl Render {
                 self.temp_seq += 1;
                 self.emit(&format!("_sh_argv = {av}; _sh_argc = {};", n));
                 format!(
-                    "({}(), _sh_argv = {sv}, _sh_argc = _sh_sc{}, _sh_rc)",
+                    "({}(), _sh_argv = {sv}, _sh_argc = _sh_sc{}, _sh_rc == 0)",
                     self.c_ident(&cmd),
                     self.temp_seq - 1
                 )
@@ -3585,27 +3634,54 @@ impl Render {
                 return self.num_temp(&l);
             }
         }
-        // `${arr[@]:off:len}` — param("slice", "arr", "@", off, len)
-        if op == "slice"
-            && matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*")
-        {
-            let joined = if let Some(keys) = name.strip_prefix('!') {
-                self.array_keys_join(keys)
-            } else {
-                self.array_join_all(&name)
-            };
-            let off = self.args_value_num(3);
-            let len = match args.get(4) {
-                None => "-1".to_string(),
-                Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
-                Some(_) => self.args_value_num(4),
-            };
-            self.need_sh = true;
-            let t = self.str_temp(65536);
-            self.emit(&format!(
-                "_sh_substr({t}, sizeof {t}, {joined}, {off}, {len});"
-            ));
-            return t;
+        // `${arr[@]:off:len}` — the shir shapes: the idx arg carries
+        // `@`/`*`, the name carries `[@]`, or the plain name with the
+        // idx being the offset
+        if op == "slice" {
+            let idx_is_at = matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
+            let name_has_at = name.ends_with("[@]") || name.ends_with("[*]");
+            if idx_is_at || name_has_at || args.len() >= 4 {
+                self.cur_param_args = args.to_vec();
+                let mut is_array = true;
+                let joined = if let Some(keys) = name.strip_prefix('!') {
+                    self.array_keys_join(keys)
+                } else if name_has_at {
+                    self.array_join_all(&name[..name.len() - 3])
+                } else if self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
+                    self.array_join_all(&name)
+                } else {
+                    // a scalar string slice `${x:off:len}` — CHAR-based
+                    is_array = false;
+                    let v = if self.is_num(&name) {
+                        self.num_temp(&self.c_ident(&name))
+                    } else {
+                        self.store_read(&name)
+                    };
+                    let t = self.str_temp(65536);
+                    self.emit(&format!("strncpy({t}, {v}, 65535); {t}[65535] = 0;"));
+                    t
+                };
+                let off_idx = if idx_is_at { 3 } else { 2 };
+                let len_idx = off_idx + 1;
+                let off = self.args_value_num(off_idx);
+                let len = match args.get(len_idx) {
+                    None => "-1".to_string(),
+                    Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
+                    Some(_) => self.args_value_num(len_idx),
+                };
+                self.need_sh = true;
+                let t = self.str_temp(65536);
+                if is_array {
+                    self.emit(&format!(
+                        "_sh_arr_slice({t}, sizeof {t}, {joined}, {off}, {len});"
+                    ));
+                } else {
+                    self.emit(&format!(
+                        "_sh_substr({t}, sizeof {t}, {joined}, {off}, {len});"
+                    ));
+                }
+                return t;
+            }
         }
         // `${arr[1]}` / `${#arr[@]}` — the array machinery (bare
         // `@`/`*` are the positional params — the var_expr chain below
@@ -4128,7 +4204,9 @@ impl Render {
             _ if self.functions.contains(func) => {
                 let id = self.c_ident(func);
                 self.need_sh = true;
-                format!("({id}(), _sh_rc)")
+                // bash `if f; then` is TRUE iff the function's rc == 0 — the
+                // truthiness is the INVERTED rc
+                format!("({id}(), _sh_rc == 0)")
             }
             "grepMatches" => {
                 // `grepMatches(text, pattern, flags)` — the `grep -o`
@@ -4381,7 +4459,7 @@ impl Render {
         }
         for (i, it) in items.iter().enumerate() {
             let v = self.value_c(it);
-            self.emit(&format!("{id}[{i}] = {v};"));
+            self.emit(&format!("{id}[{i}] = strdup((char*)({v}));"));
         }
         self.emit(&format!("{id}_len = {};", items.len()));
     }
@@ -4396,7 +4474,7 @@ impl Render {
         };
         for (i, it) in items.iter().enumerate() {
             let v = self.value_c(it);
-            self.emit(&format!("{id}[{id}_len + {i}] = {v};"));
+            self.emit(&format!("{id}[{id}_len + {i}] = strdup((char*)({v}));"));
         }
         self.emit(&format!("{id}_len += {};", items.len()));
     }
@@ -5678,7 +5756,7 @@ impl Render {
                 let id = self.c_ident(var);
                 for (i, e) in elements.iter().enumerate() {
                     let v = self.value_c(e);
-                    self.emit(&format!("{id}[{i}] = {v};"));
+                    self.emit(&format!("{id}[{i}] = strdup((char*)({v}));"));
                 }
                 self.emit(&format!("{id}_len = {};", elements.len()));
             }
