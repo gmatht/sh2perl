@@ -91,6 +91,254 @@ pub struct Render {
     in_fn: bool,              // rendering inside a Function body
     todo: usize,
     opts: ShGlslOptions,
+    // texture-fetch load sinking: groups whose fetch + per-channel seeds
+    // move into the single block that dominates every read of their
+    // bridge vars (computed in shir_to_glsl_opts before the body
+    // renders) — the untouched path costs zero fetches.
+    lazy_tex_sinks: Vec<LazyTexSink>,
+}
+
+// ── texture-fetch load sinking ──────────────────────────────────
+// A texture bridge group (tex → uTex, crack → uCrack) is fetched at
+// main() start whenever ANY of its channel vars is referenced. When
+// every reference of the group's channels lives inside ONE block (an
+// if/else arm or a bare block), the fetch + per-channel extraction is
+// instead emitted at the top of that block, so the other path costs
+// zero fetches. MIMEcroft's crack overlay reads cr_r/g/b/a only inside
+// `if damage > 0` — undamaged fragments never sample uCrack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TexGroup { Tex, Crack }
+
+#[derive(Clone, Copy)]
+struct LazyTexSink {
+    group: TexGroup,
+    block: *const [IrStmt],
+}
+
+fn tex_group_channels(g: TexGroup) -> &'static [&'static str] {
+    match g {
+        TexGroup::Tex => &["tex_r", "tex_g", "tex_b"],
+        TexGroup::Crack => &["cr_r", "cr_g", "cr_b", "cr_a"],
+    }
+}
+
+fn record_tex_channel(n: &str, blk: *const [IrStmt], out: &mut Vec<(TexGroup, *const [IrStmt])>) {
+    if n == "tex_r" || n == "tex_g" || n == "tex_b" {
+        out.push((TexGroup::Tex, blk));
+    } else if n == "cr_r" || n == "cr_g" || n == "cr_b" || n == "cr_a" {
+        out.push((TexGroup::Crack, blk));
+    }
+}
+
+// Record every tex/crack channel READ with the innermost block that
+// contains it. A block is a Vec<IrStmt> slice; the top-level statement
+// list is the root — never a sink target. Missing a nested body only
+// attributes its reads to the enclosing block, which still dominates
+// them, so the fetch is never placed somewhere that fails to dominate
+// a read (the walk below covers every block-carrying variant the
+// backend renders).
+fn collect_tex_reads(
+    stmts: &[IrStmt],
+    blk: *const [IrStmt],
+    out: &mut Vec<(TexGroup, *const [IrStmt])>,
+) {
+    for s in stmts {
+        tex_reads_in_stmt(s, blk, out);
+        match s {
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_tex_reads(then, then.as_slice() as *const [IrStmt], out);
+                for (_, b) in elsifs {
+                    collect_tex_reads(b, b.as_slice() as *const [IrStmt], out);
+                }
+                collect_tex_reads(else_, else_.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                collect_tex_reads(body, body.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                collect_tex_reads(body, body.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::For { body, .. } => {
+                collect_tex_reads(body, body.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::ForInit { body, .. } => {
+                collect_tex_reads(body, body.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_tex_reads(&c.body, c.body.as_slice() as *const [IrStmt], out);
+                }
+            }
+            IrStmt::Function { body, .. } => {
+                collect_tex_reads(body, body.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_tex_reads(st, st.as_slice() as *const [IrStmt], out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// Walk a statement's SCALAR expressions (conds, values, outputs) at the
+// current block. Block-carrying fields are walked separately by
+// collect_tex_reads with their own block pointer — double-walking them
+// here would misattribute the reads to the enclosing block.
+fn tex_reads_in_stmt(s: &IrStmt, blk: *const [IrStmt], out: &mut Vec<(TexGroup, *const [IrStmt])>) {
+    match s {
+        IrStmt::Output { value, .. } => tex_reads_in_expr(value, blk, out),
+        IrStmt::WriteFile { path, content, .. } => {
+            tex_reads_in_expr(path, blk, out);
+            tex_reads_in_expr(content, blk, out);
+        }
+        IrStmt::Assign { expr, .. } => tex_reads_in_expr(expr, blk, out),
+        IrStmt::Declare { init, .. } => {
+            if let Some(i) = init {
+                tex_reads_in_expr(i, blk, out);
+            }
+        }
+        IrStmt::DeclareArray { elements, .. } => {
+            for e in elements {
+                tex_reads_in_expr(e, blk, out);
+            }
+        }
+        IrStmt::If { cond, .. } => tex_reads_in_expr(cond, blk, out),
+        IrStmt::While { cond, .. } | IrStmt::DoWhile { cond, .. } => tex_reads_in_expr(cond, blk, out),
+        IrStmt::ForInit { cond, .. } => tex_reads_in_expr(cond, blk, out),
+        IrStmt::For { iter, .. } => tex_reads_in_expr(iter, blk, out),
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => tex_reads_in_expr(expr, blk, out),
+        IrStmt::Exec { cmd, args, redirects, env, .. } => {
+            tex_reads_in_expr(cmd, blk, out);
+            for a in args {
+                tex_reads_in_expr(a, blk, out);
+            }
+            for r in redirects {
+                tex_reads_in_expr(r, blk, out);
+            }
+            for (_, v) in env {
+                tex_reads_in_expr(v, blk, out);
+            }
+        }
+        IrStmt::Case { discriminant, .. } => tex_reads_in_expr(discriminant, blk, out),
+        IrStmt::Redirect { redirects, .. } => {
+            for r in redirects {
+                tex_reads_in_expr(&r.target, blk, out);
+            }
+        }
+        IrStmt::Return(Some(e)) => tex_reads_in_expr(e, blk, out),
+        IrStmt::Exit(Some(e)) => tex_reads_in_expr(e, blk, out),
+        IrStmt::SetChildError(e) => tex_reads_in_expr(e, blk, out),
+        IrStmt::Expr(e) => tex_reads_in_expr(e, blk, out),
+        _ => {}
+    }
+}
+
+fn tex_reads_in_expr(e: &IrExpr, blk: *const [IrStmt], out: &mut Vec<(TexGroup, *const [IrStmt])>) {
+    match e {
+        IrExpr::Var(n, _) => record_tex_channel(n, blk, out),
+        IrExpr::Call { func, args } => {
+            if func == "getVar" {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    record_tex_channel(n, blk, out);
+                }
+            }
+            for a in args {
+                tex_reads_in_expr(a, blk, out);
+            }
+        }
+        IrExpr::Index { key, .. } => tex_reads_in_expr(key, blk, out),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            tex_reads_in_expr(lhs, blk, out);
+            tex_reads_in_expr(rhs, blk, out);
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            tex_reads_in_expr(obj, blk, out);
+            for a in args {
+                tex_reads_in_expr(a, blk, out);
+            }
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            tex_reads_in_expr(cond, blk, out);
+            tex_reads_in_expr(then, blk, out);
+            tex_reads_in_expr(else_, blk, out);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            tex_reads_in_expr(expr, blk, out);
+            tex_reads_in_expr(default, blk, out);
+        }
+        IrExpr::Capture { expr, .. } => tex_reads_in_expr(expr, blk, out),
+        IrExpr::Arrow(body) => collect_tex_reads(body, body.as_slice() as *const [IrStmt], out),
+        IrExpr::Array(items) => {
+            for i in items {
+                tex_reads_in_expr(i, blk, out);
+            }
+        }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            tex_reads_in_expr(iter, blk, out);
+            tex_reads_in_expr(elem, blk, out);
+            if let Some(c) = cond {
+                tex_reads_in_expr(c, blk, out);
+            }
+        }
+        IrExpr::Arith(a) => tex_reads_in_arith(a, blk, out),
+        _ => {}
+    }
+}
+
+fn tex_reads_in_arith(
+    a: &ArithAst,
+    blk: *const [IrStmt],
+    out: &mut Vec<(TexGroup, *const [IrStmt])>,
+) {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => record_tex_channel(n, blk, out),
+        ArithAst::Index { var, key } => {
+            record_tex_channel(var, blk, out);
+            tex_reads_in_arith(key, blk, out);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            tex_reads_in_arith(lhs, blk, out);
+            tex_reads_in_arith(rhs, blk, out);
+        }
+        ArithAst::Un { arg, .. } => tex_reads_in_arith(arg, blk, out),
+        ArithAst::Cond { test, then, else_ } => {
+            tex_reads_in_arith(test, blk, out);
+            tex_reads_in_arith(then, blk, out);
+            tex_reads_in_arith(else_, blk, out);
+        }
+        ArithAst::Assign { rhs, .. } => tex_reads_in_arith(rhs, blk, out),
+        ArithAst::IncDec { var, .. } => record_tex_channel(var, blk, out),
+        ArithAst::Cast { arg, .. } => tex_reads_in_arith(arg, blk, out),
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+    }
+}
+
+// The groups whose reads all live in one non-top-level block → sink the
+// fetch there. Top-level-only reads (e.g. tex_r used unconditionally)
+// keep the current main()-start seeding.
+fn compute_lazy_tex_sinks(prog: &IrProgram) -> Vec<LazyTexSink> {
+    let top = prog.stmts.as_slice() as *const [IrStmt];
+    let mut reads: Vec<(TexGroup, *const [IrStmt])> = Vec::new();
+    collect_tex_reads(&prog.stmts, top, &mut reads);
+    let mut out = Vec::new();
+    for g in [TexGroup::Crack, TexGroup::Tex] {
+        let mut blocks: Vec<*const [IrStmt]> = Vec::new();
+        let mut any = false;
+        for (rg, b) in &reads {
+            if *rg == g {
+                any = true;
+                if !blocks.iter().any(|x| std::ptr::eq(*x, *b)) {
+                    blocks.push(*b);
+                }
+            }
+        }
+        if any && blocks.len() == 1 && !std::ptr::eq(blocks[0], top) {
+            out.push(LazyTexSink { group: g, block: blocks[0] });
+        }
+    }
+    out
 }
 
 /// Renderer options — the default (ES 3.00 stdout-computation) is the
@@ -168,6 +416,11 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
             r.collect_stmt(s);
         }
     }
+    // texture-fetch load sinking: a group whose channel reads all live
+    // in one branch/block is fetched there, not at main() start (only
+    // the top-level program — function bodies render in their own
+    // scope, where the main() uv/damage seeds are not visible).
+    r.lazy_tex_sinks = compute_lazy_tex_sinks(&prog);
     // Input bridges are seeded/declared ONLY when the program references
     // them (see the color_out seeding below) — pass 1 collected every
     // reference into r.vars (direct Var reads, $(( )) arith, test
@@ -385,52 +638,23 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
                 // varying — a prerequisite for every texture sample
                 r.emit(&format!("g_uv_x = int(vUv.x * {sz});"));
                 r.emit(&format!("g_uv_y = int(vUv.y * {sz});"));
-                // tex_r/g/b: the texel's colour (center-sampled), 0..255
-                let uv = format!(
-                    "(vec2(float(g_uv_x), float(g_uv_y)) + vec2(0.5)) / {sz}"
-                );
                 // Sample each texture ONCE into a vec4 local, then
                 // swizzle — the three tex (resp. four crack) seeds use
                 // the same coordinates, and drivers may not CSE
                 // identical texture2D calls, so this is 2 fetches per
-                // fragment instead of 7.
-                if r.vars.contains("tex_r")
-                    || r.vars.contains("tex_g")
-                    || r.vars.contains("tex_b")
-                {
-                    r.emit(&format!("vec4 _tex = texture2D(uTex, {uv});"));
-                    if r.vars.contains("tex_r") {
-                        r.emit("g_tex_r = int(_tex.r * 255.0);");
-                    }
-                    if r.vars.contains("tex_g") {
-                        r.emit("g_tex_g = int(_tex.g * 255.0);");
-                    }
-                    if r.vars.contains("tex_b") {
-                        r.emit("g_tex_b = int(_tex.b * 255.0);");
-                    }
+                // fragment instead of 7. A group whose channel reads
+                // all live in one block (compute_lazy_tex_sinks) is
+                // fetched at the top of that block instead — the
+                // untouched path costs zero fetches.
+                if !r.is_tex_sunk(TexGroup::Tex) {
+                    r.emit_tex_seeds(TexGroup::Tex);
                 }
                 // the crack overlay: uDamage (0..3) + the crack texel
                 if r.vars.contains("damage") {
                     r.emit("g_damage = uDamage;");
                 }
-                if r.vars.contains("cr_r")
-                    || r.vars.contains("cr_g")
-                    || r.vars.contains("cr_b")
-                    || r.vars.contains("cr_a")
-                {
-                    r.emit(&format!("vec4 _crack = texture2D(uCrack, {uv});"));
-                    if r.vars.contains("cr_r") {
-                        r.emit("g_cr_r = int(_crack.r * 127.0);");
-                    }
-                    if r.vars.contains("cr_g") {
-                        r.emit("g_cr_g = int(_crack.g * 127.0);");
-                    }
-                    if r.vars.contains("cr_b") {
-                        r.emit("g_cr_b = int(_crack.b * 127.0);");
-                    }
-                    if r.vars.contains("cr_a") {
-                        r.emit("g_cr_a = int(_crack.a * 127.0);");
-                    }
+                if !r.is_tex_sunk(TexGroup::Crack) {
+                    r.emit_tex_seeds(TexGroup::Crack);
                 }
             }
         }
@@ -729,6 +953,7 @@ impl Default for Render {
             used_ipow: false,
             used_isqrt: false,
             putb_pos: 0,
+            lazy_tex_sinks: Vec::new(),
             fns: BTreeSet::new(),
             fn_bodies: BTreeMap::new(),
             fn_order: Vec::new(),
@@ -1020,6 +1245,79 @@ impl Render {
                 let body = body.clone();
                 self.render_fn(&name, &body);
             }
+        }
+    }
+
+    // ── texture-fetch load sinking (the LazyTexSink hooks) ────────
+    fn is_tex_sunk(&self, g: TexGroup) -> bool {
+        self.lazy_tex_sinks.iter().any(|s| s.group == g)
+    }
+
+    // Emit the ONE fetch + per-channel seeds for a texture group. The
+    // per-channel seeds are use-gated (only referenced channels emit);
+    // at a sink site every referenced channel is read inside the block.
+    fn emit_tex_seeds(&mut self, g: TexGroup) {
+        if self.opts.tex_size == 0 {
+            return;
+        }
+        let sz = format!("{}.0", self.opts.tex_size);
+        let uv = format!(
+            "(vec2(float(g_uv_x), float(g_uv_y)) + vec2(0.5)) / {sz}"
+        );
+        match g {
+            TexGroup::Tex => {
+                if self.vars.contains("tex_r")
+                    || self.vars.contains("tex_g")
+                    || self.vars.contains("tex_b")
+                {
+                    self.emit(&format!("vec4 _tex = texture2D(uTex, {uv});"));
+                    if self.vars.contains("tex_r") {
+                        self.emit("g_tex_r = int(_tex.r * 255.0);");
+                    }
+                    if self.vars.contains("tex_g") {
+                        self.emit("g_tex_g = int(_tex.g * 255.0);");
+                    }
+                    if self.vars.contains("tex_b") {
+                        self.emit("g_tex_b = int(_tex.b * 255.0);");
+                    }
+                }
+            }
+            TexGroup::Crack => {
+                if self.vars.contains("cr_r")
+                    || self.vars.contains("cr_g")
+                    || self.vars.contains("cr_b")
+                    || self.vars.contains("cr_a")
+                {
+                    self.emit(&format!("vec4 _crack = texture2D(uCrack, {uv});"));
+                    if self.vars.contains("cr_r") {
+                        self.emit("g_cr_r = int(_crack.r * 127.0);");
+                    }
+                    if self.vars.contains("cr_g") {
+                        self.emit("g_cr_g = int(_crack.g * 127.0);");
+                    }
+                    if self.vars.contains("cr_b") {
+                        self.emit("g_cr_b = int(_crack.b * 127.0);");
+                    }
+                    if self.vars.contains("cr_a") {
+                        self.emit("g_cr_a = int(_crack.a * 127.0);");
+                    }
+                }
+            }
+        }
+    }
+
+    // When a block is a recorded sink site, emit the group's fetch +
+    // seeds as its first statements (the block dominates every read).
+    fn emit_lazy_tex_seeds(&mut self, blk: &[IrStmt]) {
+        let blk = blk as *const [IrStmt];
+        let groups: Vec<TexGroup> = self
+            .lazy_tex_sinks
+            .iter()
+            .filter(|s| std::ptr::eq(s.block, blk))
+            .map(|s| s.group)
+            .collect();
+        for g in groups {
+            self.emit_tex_seeds(g);
         }
     }
 
@@ -3064,6 +3362,7 @@ impl Render {
                 let c = self.expr_bool(cond);
                 self.emit(&format!("if ({c}) {{"));
                 self.depth += 1;
+                self.emit_lazy_tex_seeds(then.as_slice());
                 for s in then {
                     self.stmt(s);
                 }
@@ -3072,6 +3371,7 @@ impl Render {
                     let c = self.expr_bool(e);
                     self.emit(&format!("}} else if ({c}) {{"));
                     self.depth += 1;
+                    self.emit_lazy_tex_seeds(b.as_slice());
                     for s in b {
                         self.stmt(s);
                     }
@@ -3080,6 +3380,7 @@ impl Render {
                 if !else_.is_empty() {
                     self.emit("} else {");
                     self.depth += 1;
+                    self.emit_lazy_tex_seeds(else_.as_slice());
                     for s in else_ {
                         self.stmt(s);
                     }
@@ -3140,6 +3441,7 @@ impl Render {
             IrStmt::Block(body) => {
                 self.emit("{");
                 self.depth += 1;
+                self.emit_lazy_tex_seeds(body.as_slice());
                 for s in body {
                     self.stmt(s);
                 }

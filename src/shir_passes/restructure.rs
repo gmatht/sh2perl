@@ -204,7 +204,12 @@ fn handle_bare_goto(stmts: &mut Vec<IrStmt>, gpos: usize, lpos: usize, _n: &mut 
             cond: truthy(),
             body: span,
         };
-        stmts.splice(lpos..=gpos, [while_stmt]);
+        // after the drain the list is [Label, Goto] at lpos, lpos+1 —
+        // the splice must use the POST-drain positions (the old
+        // `lpos..=gpos` panicked for any non-empty loop body: a real
+        // backward goto — the batch `:loop ... goto loop` idiom —
+        // never reached the C frontend's forward-goto corpus).
+        stmts.splice(lpos..lpos + 2, [while_stmt]);
         if converted {
             stmts.remove(lpos + 1); // the successor label (now the exit point)
         }
