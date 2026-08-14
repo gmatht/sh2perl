@@ -2488,7 +2488,14 @@ impl Render {
                 for w in &words {
                     a.push(self.expr(w));
                 }
-                format!("system({})", a.join(", "))
+                // the STATUS (0/256) of the spawned command — the boolean
+                // AND-chain value would be 0/1, mixing conventions inside
+                // status-condition blocks
+                format!(
+                    "do {{ (system {{ {} }} {rest}) == -1 and system('bash', {rest}); ($? == 0 ? 0 : 256) }}",
+                    a[0],
+                    rest = a[1..].join(", ")
+                )
             }
         }
     }
@@ -3206,6 +3213,9 @@ impl Render {
                     "(system {{ {} }} {rest}) == -1 and system('bash', {rest});",
                     a[0]
                 ));
+                // the statement's VALUE (and the block-cond convention):
+                // the STATUS (0/256), not the boolean and-chain
+                self.emit("$? = ($? == 0 ? 0 : 256);");
             }
         }
     }
