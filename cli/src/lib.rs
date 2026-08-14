@@ -25,6 +25,20 @@ use debashl::{shared_utils::SharedUtils, Generator, Parser};
 // Global flag for --no-magic-numbers
 static NO_MAGIC_NUMBERS: AtomicBool = AtomicBool::new(false);
 
+// `--argv0-source <name>`: the "source-name" $0 semantic. When set, the
+// translated program identifies as the ORIGINAL bash file (<name>) instead
+// of reporting its own invocation path (argv0 pass-through, the default).
+// Perl bakes `$0 = '<name>'`; --estree emits a leading `sh2.argv0 = …`.
+// This is the semantic a translation PRODUCT wants (the JS shell executing
+// foo.sh should say "foo.sh", not the temp JS file name); pass-through is
+// what a faithful POSIX port wants. See harness/argv0-tests/README.md.
+static ARGV0_SOURCE: Mutex<Option<String>> = Mutex::new(None);
+
+/// The `--argv0-source` value, if set.
+pub fn argv0_source() -> Option<String> {
+    ARGV0_SOURCE.lock().unwrap().clone()
+}
+
 // Virtual stdin: wasm/JS embedders (node:wasi has no filesystem preopens)
 // feed file content through `debashc_cli_run_with_input`; the CLI's `-`
 // filename convention (file --estree -, file --perl -, file -) reads this
@@ -67,6 +81,70 @@ fn fix_command_substitution_placeholders(mut code: String) -> String {
     // This is a workaround for the parsing issue with wc -c < "$file" command substitution
     code = code.replace("$(...)", "-s $file");
     code
+}
+
+/// Parse C source to A1 shIR JSON through the Go `c-sh-go` frontend —
+/// the production C frontend (the old minimal Rust cfront was removed).
+/// The frontend is the same binary the unified otranspilerl pipeline
+/// spawns: `frontends/c-sh-go/c-sh-go --shir <file> --raw` (build it
+/// with `make` in that directory). Located via `OTRANSPILER_ROOT` or by
+/// walking up from the cwd until a `frontends/c-sh-go/c-sh-go` is
+/// found; the source is staged to a temp file (the frontend reads a
+/// filename).
+fn c_frontend_shir(src: &str) -> Result<String, String> {
+    let exe = std::env::var("OTRANSPILER_ROOT")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let mut dir = std::env::current_dir().ok()?;
+            loop {
+                let cand = dir.join("frontends").join("c-sh-go").join("c-sh-go");
+                if cand.exists() {
+                    return Some(dir);
+                }
+                if !dir.pop() {
+                    break;
+                }
+            }
+            None
+        })
+        .and_then(|root| {
+            let cand = root.join("frontends").join("c-sh-go").join("c-sh-go");
+            if cand.exists() {
+                Some(cand)
+            } else {
+                None
+            }
+        });
+    let Some(exe) = exe else {
+        return Err(
+            "cannot locate the c-sh-go frontend (set OTRANSPILER_ROOT, or build \
+             frontends/c-sh-go with `make` and run from the sh2loop checkout)"
+                .to_string(),
+        );
+    };
+    let tmp = std::env::temp_dir().join(format!("c-sh-go-{}.c", std::process::id()));
+    std::fs::write(&tmp, src).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    let out = std::process::Command::new(&exe)
+        .args(["--shir", tmp.to_str().unwrap_or(""), "--raw"])
+        .output()
+        .map_err(|e| format!("spawn {}: {}", exe.display(), e));
+    let _ = std::fs::remove_file(&tmp);
+    let out = out?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Source-name $0 semantic (`--argv0-source <name>`): bake `$0 = '<name>'`
+/// into the generated Perl so the translated program identifies as the
+/// original bash file, whatever it is invoked as. Default (flag absent) =
+/// argv0 pass-through — the harness supplies argv0 at run time.
+fn apply_argv0_source(gen: &mut Generator) {
+    if let Some(name) = argv0_source() {
+        gen.set_original_script_name(name);
+    }
 }
 
 pub fn main_with_args(args: Vec<String>) {
@@ -114,6 +192,22 @@ pub fn main_with_args(args: Vec<String>) {
         // Process remaining arguments as a command
         if args.len() > 2 {
             let remaining_args = &args[2..];
+            let new_args = vec![args[0].clone()]
+                .into_iter()
+                .chain(remaining_args.iter().cloned())
+                .collect::<Vec<String>>();
+            return main_with_args(new_args);
+        }
+        return;
+    } else if command == "--argv0-source" {
+        if args.len() < 3 {
+            println!("Error: --argv0-source requires a name");
+            return;
+        }
+        *ARGV0_SOURCE.lock().unwrap() = Some(args[2].clone());
+        // Process remaining arguments as a command (flag + value stripped)
+        if args.len() > 3 {
+            let remaining_args = &args[3..];
             let new_args = vec![args[0].clone()]
                 .into_iter()
                 .chain(remaining_args.iter().cloned())
@@ -172,6 +266,12 @@ pub fn main_with_args(args: Vec<String>) {
             }
         }
         return;
+    }
+
+    // `--true64`: bash arithmetic is true 64-bit (out-of-±2^53 numeric
+    // vars home in BigInt64Array slots or BigInt values). Off by default.
+    if args.iter().any(|a| a == "--true64") {
+        debashl::shir::set_true64(true);
     }
 
     // Parse AST formatting options and input/output options
@@ -314,10 +414,9 @@ exit $main_exit_code;
                         }
                     };
 
-                    // Generate Perl code
-                    let mut gen = Generator::new();
-                    gen.use_function_signatures = use_function_signatures;
-                    let mut code = gen.generate(&commands);
+                    // Generate Perl code — via the shIR (universal contract).
+                    let prog = debashl::shir::ast_to_ir(&commands);
+                    let mut code = debashl::ir::shir_to_perl(&prog);
 
                     // Post-process to fix command substitution placeholders
                     code = fix_command_substitution_placeholders(code);
@@ -628,16 +727,10 @@ exit $main_exit_code;
                     eprintln!("Error reading file {}: {}", filename, e);
                     std::process::exit(1);
                 });
-                match debashl::cfront::c_to_ir(&src) {
-                    Ok(mut prog) => {
-                        if !output_lineno {
-                            prog.stmt_lines.clear();
-                        }
-                        println!(
-                            "{}",
-                            debashl::shir_json::shir_to_shir_json(&prog)
-                        );
-                    }
+                // --output-lineno: the Go frontend's A1 carries no
+                // stmt_lines either way — accepted for CLI parity.
+                match c_frontend_shir(&src) {
+                    Ok(json) => println!("{}", json.trim_end()),
                     Err(e) => {
                         eprintln!("{}", e);
                         std::process::exit(1);
@@ -735,9 +828,9 @@ exit $main_exit_code;
             }
         }
         "c" => {
-            // the minimal C frontend: parse a portable-C subset and emit
-            // the SAME ShIR JSON contract the shell frontend produces
-            // (frontend-c-core-needs.md)
+            // the Go c-sh-go frontend: parse C and emit the SAME ShIR
+            // JSON contract the shell frontend produces (delegated, see
+            // c_frontend_shir)
             if args.len() < 3 {
                 println!("Error: c command requires input");
                 return;
@@ -770,16 +863,10 @@ exit $main_exit_code;
             } else {
                 input.to_string()
             };
-            match debashl::cfront::c_to_ir(&src) {
-                Ok(mut prog) => {
-                    if !output_lineno {
-                        prog.stmt_lines.clear();
-                    }
-                    println!(
-                        "{}",
-                        debashl::shir_json::shir_to_shir_json(&prog)
-                    );
-                }
+            // --output-lineno: the Go frontend's A1 carries no
+            // stmt_lines either way — accepted for CLI parity.
+            match c_frontend_shir(&src) {
+                Ok(json) => println!("{}", json.trim_end()),
                 Err(e) => {
                     eprintln!("{}", e);
                     std::process::exit(1);
@@ -830,7 +917,12 @@ exit $main_exit_code;
         }
         "--shir-in-estree" => {
             if args.len() < 3 { println!("Error: --shir-in-estree requires input"); return; }
-            let input = &args[2];
+            // `--true64` may sit between the mode and the filename
+            let input = args
+                .iter()
+                .skip(2)
+                .find(|a| *a != "--true64")
+                .unwrap_or(&args[2]);
             let content = if input == "-" {
                 let mut s = String::new();
                 if let Err(e) = std::io::stdin().read_to_string(&mut s) {
@@ -844,10 +936,20 @@ exit $main_exit_code;
                 Ok(c) => c,
                 Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
             };
-            let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
+            // C-family `for (init; cond; step)` A1: lower the rich
+            // ForInit to init + while (core request
+            // c-sh-go-20260812-205941 — the ESTree renderer panics on an
+            // UNSTRIPPED ForInit).
+            debashl::shir_passes::strip_cfor(&mut prog);
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            // process substitution: materialize frontend-emitted
+            // process-in/out into temp-file form (core request
+            // sh-20260807-130936) — same as the file pipeline's transform.
+            debashl::transforms::process_subst::transform_program(&mut prog);
             match debashl::shir::shir_to_estree_json(&prog) {
                 Ok(s) => println!("{}", s),
                 Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
@@ -891,11 +993,42 @@ exit $main_exit_code;
                 Ok(c) => c,
                 Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
             };
-            let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
-            print!("{}", debashl::ir::ir_to_perl(&prog));
+            debashl::shir_passes::strip_cfor(&mut prog);
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
+            print!("{}", debashl::ir::shir_to_perl(&prog));
+        }
+        "--shir-in-sh" => {
+            if args.len() < 3 { println!("Error: --shir-in-sh requires input"); return; }
+            let input = &args[2];
+            let content = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e); std::process::exit(1);
+                }
+                Ok(s)
+            } else {
+                fs::read_to_string(input)
+            };
+            let content = match content {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+            };
+            debashl::shir_passes::strip_cfor(&mut prog);
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
+            print!("{}", match debashl::sh_backend::shir_to_sh(&prog) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
+            });
         }
         "--mir" => {
             if args.len() < 3 {
@@ -996,10 +1129,9 @@ exit $main_exit_code;
                             }
                         };
 
-                        // Generate Perl code
-                        let mut gen = Generator::new();
-                        gen.use_function_signatures = use_function_signatures;
-                        let code = gen.generate(&commands);
+                        // Generate Perl code — via the shIR (universal contract).
+                        let prog = debashl::shir::ast_to_ir(&commands);
+                        let code = debashl::ir::shir_to_perl(&prog);
 
                         // Handle output file option
                         if let Some(output_filename) = &output_file {
@@ -1037,8 +1169,11 @@ exit $main_exit_code;
                     }
                 }
             } else if command.ends_with(".sh") {
-                // Run the shell script directly
-                match fs::read_to_string(command) {
+                // Run the shell script directly.  Read LOSSILY: bash scripts
+                // are byte streams — a non-UTF-8 byte (e.g. ISO-8859-1 in
+                // utf8-non-utf8-content.sh) must not prevent translation;
+                // bash echoes such bytes unchanged.
+                match SharedUtils::read_file_lossy_marked(command) {
                     Ok(content) => {
                         println!("Running shell script: {}", command);
                         // Parse and run the shell script
@@ -1073,17 +1208,9 @@ exit $main_exit_code;
                             }
                         };
 
-                        // Generate Perl code
-                        let mut gen = Generator::new();
-                        gen.use_function_signatures = use_function_signatures;
-                        gen.set_original_script_name(
-                            std::path::Path::new(command)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string(),
-                        );
-                        let code = gen.generate(&commands);
+                        // Generate Perl code — via the shIR (universal contract).
+                        let prog = debashl::shir::ast_to_ir(&commands);
+                        let code = debashl::ir::shir_to_perl(&prog);
 
                         // Handle output file option
                         if let Some(output_filename) = &output_file {
@@ -1319,13 +1446,7 @@ exit $main_exit_code;
                             // Generate Perl code
                             let mut gen = Generator::new();
                             gen.use_function_signatures = use_function_signatures;
-                            gen.set_original_script_name(
-                                std::path::Path::new(&actual_command)
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string(),
-                            );
+                            apply_argv0_source(&mut gen);
                             let perl_code = gen.generate(&commands);
 
                             // Write to temporary file and execute
@@ -1502,6 +1623,7 @@ exit $main_exit_code;
                             // Generate Perl code
                             let mut generator = Generator::new();
                             generator.use_function_signatures = use_function_signatures;
+                            apply_argv0_source(&mut generator);
                             let perl_code = generator.generate(&commands);
 
                             // Write to temporary file and execute

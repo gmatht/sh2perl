@@ -1,7 +1,8 @@
 #!/bin/sh
 # Parameter expansion with ## (remove longest prefix pattern)
 # inside a [[ ... ]] test expression.
-# The ${0##*/} pattern extracts the basename of the script path.
-if [[ "${0##*/}" == "myscript" ]]; then
-    echo "run as myscript"
+# The ${p##*/} pattern extracts the basename of the path.
+p=/usr/local/bin/example
+if [[ "${p##*/}" == "example" ]]; then
+    echo "it is example"
 fi

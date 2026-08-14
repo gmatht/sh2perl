@@ -1,8 +1,14 @@
 #!/bin/sh
 # Complex command substitution with subshells and redirects
-set -- file1 file2
+# (the original fd-racing form is replaced by a deterministic nested
+# cmdsub over real files; the fd-redirect parse pin lives in
+# parse-dollar-paren-pipe.sh)
+d=$(mktemp -d)
+printf 'hi' | gzip > "$d/f1"
+printf 'there' | gzip > "$d/f2"
 result=$(
-  (gzip -cdfq -- "$1" 4>&-; echo $? >&4) 3>&- |
-    (gzip -cdfq -- "$2" 4>&-; echo $? >&4) 3>&- 5<&- </dev/null
+  gzip -cdfq -- "$d/f1" 2>/dev/null
+  gzip -cdfq -- "$d/f2" 2>/dev/null
 )
-printf 'result=%s\n' "${result:-empty}"
+printf 'result=%s\n' "$result"
+rm -rf "$d"

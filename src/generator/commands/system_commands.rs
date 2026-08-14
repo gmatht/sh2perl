@@ -28,7 +28,9 @@ fn escape_shell_double_quotes(s: &str) -> String {
                                     '(' => depth += 1,
                                     ')' => {
                                         depth -= 1;
-                                        if depth == 0 { break; }
+                                        if depth == 0 {
+                                            break;
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -43,7 +45,9 @@ fn escape_shell_double_quotes(s: &str) -> String {
                                     '{' => depth += 1,
                                     '}' => {
                                         depth -= 1;
-                                        if depth == 0 { break; }
+                                        if depth == 0 {
+                                            break;
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -188,7 +192,7 @@ pub fn word_to_bash_string_for_system(generator: &mut Generator, word: &Word) ->
                 // Also preserve double-quotes inside $(...) and ${...} constructs
                 // (nested command substitutions and variable expansions).
                 let escaped = escape_shell_double_quotes(&result);
-                format!("\"{}\"", escaped) 
+                format!("\"{}\"", escaped)
             } else if result.contains(' ')
                 || result.contains('\n')
                 || result.contains('\r')
@@ -367,9 +371,9 @@ pub fn generate_command_string_for_system_impl(generator: &mut Generator, cmd: &
         Command::Redirect(redirect_cmd) => {
             // For RedirectCommand, delegate to generate_bash_command_string which
             // handles redirects (including process substitution) correctly.
-            crate::generator::redirects::generate_bash_command_string(
-                &Command::Redirect(redirect_cmd.clone()),
-            )
+            crate::generator::redirects::generate_bash_command_string(&Command::Redirect(
+                redirect_cmd.clone(),
+            ))
         }
         Command::BuiltinCommand(builtin_cmd) => {
             // Serialize builtin commands (e.g. `set`, `shift`) into a bash string.
