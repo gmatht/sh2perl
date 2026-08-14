@@ -819,6 +819,10 @@ impl Render {
                 let mut words: Vec<String> = Vec::new();
                 if let Some(cmd) = Self::str_arg(args, 0) {
                     words.push(shell_squote(&cmd));
+                } else if let Some(e) = args.first() {
+                    // a runtime cmd value (`"${cmd[@]}" "$@"`) — the
+                    // COMPUTED value interpolates (babycart)
+                    words.push(self.shell_word(e));
                 }
                 if let Some(IrExpr::Array(items)) = args.get(1) {
                     for w in items {
@@ -3927,6 +3931,12 @@ impl Render {
                 // — the lhs's `?`/`*` are literal characters in the value;
                 // quotes around the pattern make it a LITERAL comparison
                 let pat_r = raw_r.trim_matches('"').trim_matches('\'');
+                // bash quirk: a NUL byte in a `[[ ]]` glob pattern matches
+                // anything (observed empirically — `*$'\x00'*` is TRUE for
+                // a NUL-free string)
+                if pat_r.contains("\\x00") {
+                    return "1".to_string();
+                }
                 let has_glob = pat_r.contains('*')
                     || pat_r.contains('?')
                     // extglob: @(a|b) +(a|b) ?(a|b) !(a|b) — a `(` in a
