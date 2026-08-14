@@ -56,6 +56,9 @@ pub struct Render {
     loop_vars: BTreeSet<String>,
     /// User-defined function names (exec("foo") with a known foo → sub call).
     funcs: BTreeSet<String>,
+    /// Shell text of each function body (for `typeset -f NAME` — bash
+    /// canonicalizes the re-parsed definition).
+    func_bodies: BTreeMap<String, String>,
     /// Vars ever `local`'d: hoisted as `our` (package vars) so `local`
     /// (dynamic scoping, matching bash) works instead of `my` (lexical).
     locals: BTreeSet<String>,
@@ -95,6 +98,10 @@ pub struct Render {
     /// Subshell/background rendering forks: both sides must autoflush so
     /// the child's `exit` doesn't duplicate buffered parent output.
     need_autoflush: bool,
+    /// A forked child (subshell/background) exits via POSIX::_exit —
+    /// bash does NOT run the EXIT trap in subshells, so the child must
+    /// skip perl's END blocks.
+    need_posix_exit: bool,
     /// Heredoc marker counter (unique per program).
     heredoc_id: usize,
     /// Custom-fd redirects: fd → perl filehandle var (`$__fd3` etc.).
@@ -107,6 +114,9 @@ pub struct Render {
     /// capture): var refs stay at the SH level (escaped) so sh's own
     /// `read`-assigned loop vars resolve, instead of perl interpolation.
     sh_owned: bool,
+    /// Display-only reconstruction (typeset -f bodies): un-reconstructable
+    /// stmts must NOT mark TODOs (they are not executable lowering gaps).
+    suppress_todo: bool,
     todo: usize,
 }
 
@@ -159,6 +169,9 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     if r.need_autoflush {
         r.emit("STDOUT->autoflush(1);");
         r.emit("STDERR->autoflush(1);");
+    }
+    if r.need_posix_exit {
+        r.emit("use POSIX qw(_exit);");
     }
     if r.need_hostname {
         // bash sets HOSTNAME itself at startup (never from the env) —
@@ -268,6 +281,13 @@ impl Render {
                 '\t' => out.push_str("\\t"),
                 '\r' => out.push_str("\\r"),
                 c if (c as u32) < 32 => out.push_str(&format!("\\x{{{:x}}}", c as u32)),
+                // lossy-read markers (U+E000 + source byte, the legacy
+                // generator's bytes_to_marked_lossy): bash passes invalid
+                // UTF-8 bytes through, so re-emit the RAW byte as a perl
+                // hex escape (\xE9 not the UTF-8 replacement char).
+                c if (0xE000..=0xE0FF).contains(&(c as u32)) => {
+                    out.push_str(&format!("\\x{:02X}", (c as u32 - 0xE000) as u8))
+                }
                 c => out.push(c),
             }
             i += 1;
@@ -636,13 +656,98 @@ impl Render {
         for s in stmts {
             if let Some(p) = self.shell_cmd_stmt(s) {
                 parts.push(p);
-            } else {
+            } else if !self.suppress_todo {
                 eprintln!("DBG capture body stmt: {:?}", s);
                 self.mark_todo("capture body stmt");
             }
         }
         parts.join(sep)
     }
+
+    /// bash's `typeset -f` body text: words bare when safe, else
+    /// double-quoted — the shape bash prints for a plain-word function
+    /// definition (the reconstructed body is re-parsed by bash, which
+    /// preserves this quoting).
+    fn bash_canon_body(&mut self, body: &[IrStmt]) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for s in body {
+            match s {
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+                    let mut ws: Vec<String> = Vec::new();
+                    for a in args {
+                        match a {
+                            IrExpr::Array(items) => {
+                                for it in items {
+                                    ws.push(self.canon_word(it));
+                                }
+                            }
+                            other => ws.push(self.canon_word(other)),
+                        }
+                    }
+                    parts.push(ws.join(" "));
+                }
+                IrStmt::Assign { targets, expr, .. } => {
+                    if let Some(t) = targets.first() {
+                        if t.indices.is_empty() {
+                            parts.push(format!("{}={}", t.var, self.canon_word(expr)));
+                        }
+                    }
+                }
+                other => {
+                    if let Some(p) = self.shell_cmd_stmt(other) {
+                        parts.push(p);
+                    }
+                }
+            }
+        }
+        parts.join("; ")
+    }
+
+    /// One word in bash's canonical (`typeset -f`) form: bare when the
+    /// word is safe, otherwise double-quoted; `$var` refs stay literal.
+    fn canon_word(&mut self, w: &IrExpr) -> String {
+        let s = match w {
+            IrExpr::Str(s, _) => s.clone(),
+            IrExpr::Int(n) => n.to_string(),
+            IrExpr::Interpolate(parts) => {
+                let mut out = String::new();
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(t) => out.push_str(t),
+                        InterpPart::Expr(x) => {
+                            if let IrExpr::Call { func, args } = x.as_ref() {
+                                if func == "getVar" {
+                                    if let Some(n) = Self::str_arg(args, 0) {
+                                        out.push_str(&format!("${n}"));
+                                        continue;
+                                    }
+                                }
+                            }
+                            out.push_str(&self.shell_unquoted(x));
+                        }
+                    }
+                }
+                return Self::dq_canon(&out);
+            }
+            other => return self.shell_word(other),
+        };
+        if s.is_empty() {
+            return "''".to_string();
+        }
+        if s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '_' | '-' | '=' | '/' | '.' | ':' | ',' | '+' | '%' | '@' | '^' | '~')
+        }) {
+            s
+        } else {
+            Self::dq_canon(&s)
+        }
+    }
+
+    fn dq_canon(s: &str) -> String {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
 
     /// One statement as shell text (None → not reconstructable).
     fn shell_cmd_stmt(&mut self, s: &IrStmt) -> Option<String> {
@@ -656,6 +761,17 @@ impl Render {
                     t.var.clone()
                 };
                 let v = self.shell_word(expr);
+                // process-substitution temp (`<(producer)` materialized
+                // by the core's transform): a plain temp FILE would hang
+                // on an infinite producer (the consumer waits for EOF
+                // that never comes). Replace it with a FIFO so the
+                // consumer reads the stream CONCURRENTLY (bash's pipe).
+                if t.var.starts_with("__ps_tmp") {
+                    return Some(format!(
+                        "{lhs}={v}; rm -f ${}; mkfifo ${}",
+                        t.var, t.var
+                    ));
+                }
                 Some(format!("{lhs}={v}"))
             }
             IrStmt::For { var, iter, body } => {
@@ -715,6 +831,26 @@ impl Render {
                 if let IrExpr::Str(c, _) = cmd {
                     words.push(shell_squote(c));
                 }
+                // `type NAME` for a function this program defines (incl.
+                // eval'd `name() {` bodies) — bash reports "NAME is a
+                // function"; a child bash (or the reconstruction)
+                // wouldn't know the function.
+                if let IrExpr::Str(c, _) = cmd {
+                    if c == "type" {
+                        if let Some(IrExpr::Array(items)) =
+                            args.iter().find(|a| matches!(a, IrExpr::Array(_)))
+                        {
+                            if let Some(IrExpr::Str(n, _)) = items.first() {
+                                if !n.starts_with('-') && self.funcs.contains(n) {
+                                    return Some(format!(
+                                        "printf '{} is a function\\n'",
+                                        n.replace('\'', "'\\''")
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
                 // two word shapes: [cmd, Array(words)] (the Call form) or
                 // the words directly (the process-subst transform's Exec)
                 if let Some(IrExpr::Array(items)) =
@@ -742,6 +878,23 @@ impl Render {
             IrStmt::Redirect { inner, redirects } => {
                 let cmd = self.shell_cmd(inner, "; ");
                 let (pre, suf) = self.shell_redirs_typed(redirects);
+                // a process-substitution producer targeting a `__ps_tmpN`
+                // FIFO (see the Assign arm) must run in the BACKGROUND —
+                // a foreground producer on a fifo with no reader yet
+                // would block its first write (deadlock); bash runs the
+                // producer concurrently and the consumer's read end
+                // unblocks it.
+                if pre.is_empty() {
+                    if let Some(r) = redirects.iter().find(|r| {
+                        r.mode == "w"
+                            && matches!(&r.target, IrExpr::Var(name, _) if name.starts_with("__ps_tmp"))
+                    }) {
+                        if let IrExpr::Var(name, _) = &r.target {
+                            // brace-group so the `; ` join separator is valid
+                            return Some(format!("{{ ({cmd}) > ${name} & }}"));
+                        }
+                    }
+                }
                 Some(if pre.is_empty() {
                     format!("{cmd}{suf}")
                 } else {
@@ -827,6 +980,24 @@ impl Render {
                 if let Some(IrExpr::Array(items)) = args.get(1) {
                     for w in items {
                         words.push(self.shell_word(w));
+                    }
+                }
+                // `type NAME` for a function this program defines (incl.
+                // eval'd `name() {` bodies) — bash reports "NAME is a
+                // function"; a child bash (or the reconstruction)
+                // wouldn't know the function.
+                if let Some(cmd) = Self::str_arg(args, 0) {
+                    if cmd == "type" {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if let Some(IrExpr::Str(n, _)) = items.first() {
+                                if !n.starts_with('-') && self.funcs.contains(n) {
+                                    return Some(format!(
+                                        "printf '{} is a function\\n'",
+                                        n.replace('\'', "'\\''")
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
                 // env-prefix
@@ -1029,7 +1200,9 @@ impl Render {
                 // a $var-bearing target must interpolate (perl level) —
                 // never single-quote it
                 match mode {
-                        "w" | "a" | "r+" => {
+                        // "wc" = `>|` clobber — perl opens truncate
+                        // unconditionally (no noclobber), so it is "w"
+                        "w" | "wc" | "a" | "r+" => {
                             if t == "-" {
                                 // `{fd}>&-` — close the fd for the child
                                 suf.push_str(&format!(" {fd}>&-"));
@@ -1110,7 +1283,8 @@ impl Render {
         for r in rs {
             let fd = r.fd.unwrap_or(1);
             match r.mode.as_str() {
-                "w" | "a" | "r+" => {
+                // "wc" = `>|` clobber (perl truncates unconditionally)
+                "w" | "wc" | "a" | "r+" => {
                     let op = match (fd, r.mode.as_str()) {
                         (2, "a") => "2>>",
                         (2, _) => "2>",
@@ -1386,6 +1560,51 @@ impl Render {
 
     // ── expressions ──────────────────────────────────────────────────
 
+    /// `exit WORD` exits with the FIRST word of the expansion. An
+    /// unquoted `exit ${RC}` arrives as a word-split Call — in scalar
+    /// context `split` yields the FIELD COUNT (exit 1 for "0"), so the
+    /// first element must be taken explicitly. Empty expansion = exit 0.
+    /// `${!name*[@]:OFF:LEN}` (param("slice", "!name*", ...)) — a slice
+    /// of the indirect name-match list — is a bash bad substitution
+    /// (the command is skipped, rc 1). Walk the expr tree for it.
+    fn expr_has_bad_subst(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "param" {
+                    if let Some(n) = Self::str_arg(args, 1) {
+                        if let Some(rest) = n.strip_prefix('!') {
+                            let rest = rest
+                                .strip_suffix("[@]")
+                                .or_else(|| rest.strip_suffix("[*]"))
+                                .unwrap_or(rest);
+                            if rest.contains('*') || rest.contains('@') {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                args.iter().any(Self::expr_has_bad_subst)
+            }
+            IrExpr::Array(items) => items.iter().any(Self::expr_has_bad_subst),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                InterpPart::Expr(x) => Self::expr_has_bad_subst(x),
+                _ => false,
+            }),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                Self::expr_has_bad_subst(lhs) || Self::expr_has_bad_subst(rhs)
+            }
+            _ => false,
+        }
+    }
+
+    fn exit_expr(&mut self, code: &IrExpr) -> String {
+        if matches!(code, IrExpr::Call { func, .. } if func == "split") {
+            format!("(({})[0] // 0)", self.expr(code))
+        } else {
+            self.expr(code)
+        }
+    }
+
     fn expr(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Int(n) => n.to_string(),
@@ -1405,8 +1624,8 @@ impl Render {
                     BinOpKind::Add => format!("({l} + {r})"),
                     BinOpKind::Sub => format!("({l} - {r})"),
                     BinOpKind::Mul => format!("({l} * {r})"),
-                    BinOpKind::Div => format!("int((({r}) ? (({l}) / ({r})) : 0))"),
-                    BinOpKind::Mod => format!("((({r}) ? (({l}) % ({r})) : 0))"),
+                    BinOpKind::Div => format!("(({r}) ? int(({l}) / ({r})) : \"\")"),
+                    BinOpKind::Mod => format!("((({r}) ? (({l}) % ({r})) : \"\"))"),
                     BinOpKind::Pow => format!("({l} ** {r})"),
                     BinOpKind::Concat => format!("({l} . {r})"),
                     BinOpKind::Eq => format!("({l} == {r})"),
@@ -1704,10 +1923,12 @@ impl Render {
                 let (l, r) = (self.arith(lhs), self.arith(rhs));
                 if op == "/" {
                     // shell arithmetic is INTEGER division; bash's div by
-                    // zero errors to stderr but yields 0 — perl would die
-                    format!("int((({r}) ? (({l}) / ({r})) : 0))")
+                    // zero errors to stderr but yields an EMPTY expansion
+                    // (the whole word) — perl would die. int() applies to
+                    // the success branch only (int("") would re-coerce).
+                    format!("(({r}) ? int(({l}) / ({r})) : \"\")")
                 } else if op == "%" {
-                    format!("((({r}) ? (({l}) % ({r})) : 0))")
+                    format!("((({r}) ? (({l}) % ({r})) : \"\"))")
                 } else if matches!(op.as_str(), "&" | "|" | "^") {
                     // perl's `& | ^` are STRING-bitwise on string operands
                     // (bash vars are perl strings) — coerce to numbers
@@ -2472,7 +2693,7 @@ impl Render {
                 }
             }
             "exit" => match words.first() {
-                Some(code) => format!("do {{ exit {}; }}", self.expr(code)),
+                Some(code) => format!("do {{ exit {}; }}", self.exit_expr(code)),
                 None => "do { exit 0; }".to_string(),
             },
             "echo" => {
@@ -2546,6 +2767,13 @@ impl Render {
 
     /// exec as a STATEMENT — builtins lower natively, externals → system.
     fn exec_stmt(&mut self, args: &[IrExpr]) {
+        // `${!name*[@]:OFF:LEN}` — a slice of the indirect name-match
+        // list is a bash bad substitution: the whole command is SKIPPED
+        // (no output, not even a newline) and rc is 1.
+        if args.iter().any(|a| Self::expr_has_bad_subst(a)) {
+            self.emit("$? = 256;");
+            return;
+        }
         let Some(cmd) = Self::str_arg(args, 0) else {
             // Non-literal command (e.g. `"$cmd" args`): the name is a
             // runtime value — emit the system LIST form directly (no
@@ -2618,7 +2846,7 @@ impl Render {
             }
             "exit" => match words.first() {
                 Some(code) => {
-                    let e = self.expr(code);
+                    let e = self.exit_expr(code);
                     self.emit(&format!("exit {e};"));
                 }
                 None => self.emit("exit 0;"),
@@ -2824,6 +3052,9 @@ impl Render {
                 let mut upper_attr = false;
                 let mut readonly_attr = false;
                 let mut nameref_attr = false;
+                let mut func_display = false; // -f
+                let mut func_names = false;   // -F
+                let mut print_attrs = false;  // -p
                 let mut vars: Vec<&IrExpr> = Vec::new();
                 for w in &words {
                     match w {
@@ -2852,6 +3083,15 @@ impl Render {
                             if s.contains('n') {
                                 nameref_attr = true;
                             }
+                            if s.contains('f') {
+                                func_display = true;
+                            }
+                            if s.contains('F') {
+                                func_names = true;
+                            }
+                            if s.contains('p') {
+                                print_attrs = true;
+                            }
                         }
                         _ => vars.push(w),
                     }
@@ -2875,6 +3115,81 @@ impl Render {
                         }
                     }
                 };
+                // `typeset -f/-F NAME` — display a function this program
+                // defines. `-F` prints just the name; `-f` re-runs the
+                // definition through bash (which canonicalizes the body
+                // text, matching `bash script`'s output byte-for-byte).
+                if func_display || func_names {
+                    for w in &vars {
+                        if let IrExpr::Str(s, _) = w {
+                            if s.starts_with('-') {
+                                continue;
+                            }
+                            if func_names {
+                                if self.funcs.contains(s) {
+                                    // `typeset -F` prints the name + \n
+                                    self.emit(&format!(
+                                        "print {} . \"\\n\";",
+                                        Self::perl_str(s)
+                                    ));
+                                }
+                            } else if let Some(body) = self.func_bodies.get(s) {
+                                // bash requires a `;` (or newline) before the
+                                // closing `}` of a function body
+                                let body = if body.is_empty() {
+                                    ":".to_string()
+                                } else {
+                                    format!("{body};")
+                                };
+                                let def = format!("{s}() {{ {body} }}; typeset -f {s}");
+                                self.emit(&format!(
+                                    "system('bash', '-c', {});",
+                                    Self::perl_str(&def)
+                                ));
+                            }
+                        }
+                    }
+                    return;
+                }
+                // `typeset -p NAME` — print the attributes in bash's
+                // canonical `declare -<flags> NAME="value"` form (the
+                // attrs are the REGISTERED ones — `typeset -p` itself
+                // carries no flags).
+                if print_attrs {
+                    for w in &vars {
+                        if let IrExpr::Str(s, _) = w {
+                            if s.starts_with('-') {
+                                continue;
+                            }
+                            let mut fl = String::from("-");
+                            if self.int_vars.contains(s) {
+                                fl.push('i');
+                            }
+                            if self.lower_vars.contains(s) {
+                                fl.push('l');
+                            }
+                            if self.upper_vars.contains(s) {
+                                fl.push('u');
+                            }
+                            if self.readonly_vars.contains(s) {
+                                fl.push('r');
+                            }
+                            if self.exported.contains(s) {
+                                fl.push('x');
+                            }
+                            if self.arrays.contains(s) {
+                                fl.push('a');
+                            }
+                            if self.hashes.contains(s) {
+                                fl.push('A');
+                            }
+                            self.emit(&format!(
+                                "print \"declare {fl} {s}=\\\"\" . ${s} . \"\\\"\\n\";",
+                            ));
+                        }
+                    }
+                    return;
+                }
                 let mut vi = 0;
                 while vi < vars.len() {
                     let w = vars[vi];
@@ -3131,6 +3446,35 @@ impl Render {
                         }
                     }
                 }
+                // a function definition in the eval'd text (`doselect() {`)
+                // — bash registers it in the CURRENT shell, but the child
+                // bash -c would lose it. Register the name so `type NAME`
+                // lowers natively (the function body itself has no perl
+                // form; the definition side-effect is what the script
+                // observes).
+                let b = eval_text.as_bytes();
+                let mut i = 0;
+                while i + 1 < b.len() {
+                    if b[i] == b'(' && b[i + 1] == b')' {
+                        let mut j = i;
+                        while j > 0
+                            && (b[j - 1].is_ascii_alphanumeric() || b[j - 1] == b'_')
+                        {
+                            j -= 1;
+                        }
+                        let name = &eval_text[j..i];
+                        if !name.is_empty()
+                            && name
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            self.funcs.insert(name.to_string());
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
                 let parts: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
                 let joined = parts.join(" . \" \" . ");
                 self.emit(&format!("system('bash', '-c', {joined});"));
@@ -3201,7 +3545,22 @@ impl Render {
                     self.emit(&format!("system('bash', {});", a.join(", ")));
                 }
             }
-            "source" | "." | "return" | "umask" | "type" | "hash"
+            "type" => {
+                // `type NAME` — a function this program defines (incl.
+                // eval'd `name() {` bodies): bash reports "NAME is a
+                // function" (rc 0). Unknown names fall through to the
+                // TODO arm (a child bash would report "not found").
+                if let Some(IrExpr::Str(n, _)) = words.first() {
+                    if !n.starts_with('-') && self.funcs.contains(n) {
+                        let n = n.replace('\\', "\\\\").replace('"', "\\\"");
+                        self.emit(&format!("print \"{n} is a function\\n\";"));
+                        self.emit("$? = 0;");
+                        return;
+                    }
+                }
+                self.mark_todo("builtin type");
+            }
+            "source" | "." | "return" | "umask" | "hash"
             | "builtin" | "enable" | "help" | "logout" | "alias" | "unalias"
             | "times" | "ulimit" | "getopts" => {
                 self.mark_todo(&format!("builtin {cmd}"));
@@ -4100,6 +4459,13 @@ impl Render {
                 .or_else(|| rest.strip_suffix("[*]"))
                 .unwrap_or(rest);
             if !rest.is_empty() && (op == "slice" || op == "len") {
+                // `${!prefix*[@]:0:3}` — a SLICE of the indirect name
+                // list is a bash bad substitution — the STATEMENT layer
+                // pre-scans (expr_has_bad_subst) and skips the command
+                // (no output, rc 1); plain `${!map[@]}` keys are fine.
+                if rest.contains('*') || rest.contains('@') {
+                    return "".to_string();
+                }
                 self.hashes.insert(rest.to_string());
                 return format!("keys %{}", ident(rest));
             }
@@ -5180,7 +5546,24 @@ impl Render {
                                             )
                                         })
                                         .collect();
-                                    format!("(sort(glob({})))", gs.join("), glob("))
+                                    // bash concatenates the brace-expanded
+                                    // patterns IN ORDER, sorting within each
+                                    // pattern — an outer sort() would merge
+                                    // across patterns and reorder. A pattern
+                                    // matching NOTHING stays LITERAL (bash
+                                    // without nullglob), so each glob falls
+                                    // back to its own pattern text.
+                                    let gs: Vec<String> = bl
+                                        .iter()
+                                        .map(|s| {
+                                            let pat = s.replace("\u{1}SH2GLOB\u{1}", "");
+                                            let q = Self::perl_str(&pat);
+                                            format!(
+                                                "do {{ my @__g = glob({q}); @__g ? @__g : ({q}) }}"
+                                            )
+                                        })
+                                        .collect();
+                                    format!("({})", gs.join(", "))
                                 } else {
                                     let l: Vec<String> =
                                         items.iter().map(|i| iter_elem(self, i)).collect();
@@ -5201,14 +5584,22 @@ impl Render {
                         let items = self.brace_list(args);
                         if items.iter().any(|s| s.contains('*') || s.contains('?')) {
                             // glob-bearing brace items (`*.{txt,log}`)
-                            // expand at RUNTIME (perl glob, sorted like
-                            // bash) — the SH2GLOB marker is shell-side
-                            // syntax, strip it from the pattern
+                            // expand at RUNTIME (perl glob, sorted within
+                            // each pattern like bash; the SH2GLOB marker is
+                            // shell-side syntax, strip it from the pattern).
+                            // An unmatched pattern stays LITERAL (bash's
+                            // default, nullglob off).
                             let gs: Vec<String> = items
                                 .iter()
-                                .map(|s| Self::perl_str(&s.replace("\u{1}SH2GLOB\u{1}", "")))
+                                .map(|s| {
+                                    let pat = s.replace("\u{1}SH2GLOB\u{1}", "");
+                                    let q = Self::perl_str(&pat);
+                                    format!(
+                                        "do {{ my @__g = glob({q}); @__g ? @__g : ({q}) }}"
+                                    )
+                                })
                                 .collect();
-                            format!("(sort(glob({})))", gs.join("), glob("))
+                            format!("({})", gs.join(", "))
                         } else {
                             self.brace(args)
                         }
@@ -5297,6 +5688,7 @@ impl Render {
                 let disc = self.expr(discriminant);
                 let mut first = true;
                 for clause in clauses {
+                    let mut prelude: Vec<String> = Vec::new();
                     let alts: Vec<String> = clause
                         .patterns
                         .iter()
@@ -5311,10 +5703,31 @@ impl Render {
                                     p.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))
                                 })
                                 .unwrap_or(p);
+                            // `$(cmd)` pattern — the command substitution
+                            // is EVALUATED at runtime and its output (after
+                            // glob matching) is the pattern (bash runs the
+                            // cmdsub at case time).
+                            if let Some(inner) =
+                                p.strip_prefix("$(").and_then(|s| s.strip_suffix(')'))
+                            {
+                                self.heredoc_id += 1;
+                                let v = format!("$__cp{}", self.heredoc_id);
+                                // `$name` refs in the cmdsub text interpolate
+                                // at the perl level — declare them under strict
+                                self.register_shell_refs(inner);
+                                let q = self.qx_raw(inner);
+                                prelude.push(format!(
+                                    "my {v} = do {{ my $__c = {q}; chomp $__c; $__c }};"
+                                ));
+                                return format!("\\Q{v}\\E");
+                            }
                             // `*` default clause → match everything
                             glob_to_regex(p, true)
                         })
                         .collect();
+                    for l in &prelude {
+                        self.emit(l);
+                    }
                     let re = alts.join("|");
                     let wrapped = regex_wrap(&format!("^(?:{re})$"));
                     if first {
@@ -5337,6 +5750,14 @@ impl Render {
             }
             IrStmt::Function { name, body, .. } => {
                 self.funcs.insert(name.clone());
+                // bash-canonical shell text of the body — `typeset -f
+                // NAME` re-runs the definition through bash, which prints
+                // it the same way it prints the original definition
+                let saved = self.suppress_todo;
+                self.suppress_todo = true;
+                let canon = self.bash_canon_body(body);
+                self.suppress_todo = saved;
+                self.func_bodies.insert(name.clone(), canon);
                 let mut saved = self.in_func;
                 self.in_func += 1;
                 self.emit(&format!("sub {} {{", ident(name)));
@@ -5351,8 +5772,11 @@ impl Render {
             IrStmt::Subshell(body) => {
                 // `( ... )` — run in a forked child: env/cd changes must not
                 // leak into the parent (autoflush so the child's exit doesn't
-                // duplicate buffered output)
+                // duplicate buffered output). bash does NOT run the EXIT
+                // trap in a subshell, so the child exits via POSIX::_exit
+                // (skips perl's END blocks).
                 self.need_autoflush = true;
+                self.need_posix_exit = true;
                 self.emit("my $__pid = fork();");
                 self.emit("die \"fork: $!\\n\" unless defined $__pid;");
                 self.emit("if ($__pid == 0) {");
@@ -5361,7 +5785,7 @@ impl Render {
                 for s in body {
                     self.stmt(s);
                 }
-                self.emit("exit($? >> 8);");
+                self.emit("POSIX::_exit($? >> 8);");
                 self.depth -= 1;
                 self.emit("}");
                 self.emit("waitpid($__pid, 0);");
@@ -5369,6 +5793,7 @@ impl Render {
             IrStmt::Background(body) => {
                 // `cmd &` — forked child, no wait (bash returns immediately)
                 self.need_autoflush = true;
+                self.need_posix_exit = true;
                 self.emit("my $__pid = fork();");
                 self.emit("die \"fork: $!\\n\" unless defined $__pid;");
                 self.emit("if ($__pid == 0) {");
@@ -5377,7 +5802,7 @@ impl Render {
                 for s in body {
                     self.stmt(s);
                 }
-                self.emit("exit($? >> 8);");
+                self.emit("POSIX::_exit($? >> 8);");
                 self.depth -= 1;
                 self.emit("}");
                 self.emit("$? = 0;");
@@ -5460,7 +5885,7 @@ impl Render {
             },
             IrStmt::Exit(e) => match e {
                 Some(v) => {
-                let e = self.expr(v);
+                let e = self.exit_expr(v);
                 self.emit(&format!("exit {e};"))
             }
                 None => self.emit("exit 0;"),
@@ -5729,7 +6154,8 @@ impl Render {
                 saved.push((sav, fdn.clone()));
             }
             match r.mode.as_str() {
-                "w" | "a" | "r+" => {
+                // "wc" = `>|` clobber (perl truncates unconditionally)
+                "w" | "wc" | "a" | "r+" => {
                     let op = if r.mode == "a" { ">>" } else { ">" };
                     let t = self.expr(&r.target);
                     // a failed redirect FAILS the command (rc 1) — bash
