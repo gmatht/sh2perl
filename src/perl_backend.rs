@@ -4236,6 +4236,28 @@ impl Render {
                 self.need_basename = true;
                 format!("dirname({v})")
             }
+            "slice" if name == "@" || name == "*" => {
+                // `${@:3}` — a POSITIONAL slice: the ELEMENT at off-1
+                // (bash `$1` is @ARGV[0])
+                let off_raw = Self::str_arg(args, 2);
+                let off = off_raw
+                    .as_deref()
+                    .and_then(|o| o.parse::<i64>().ok())
+                    .unwrap_or(1);
+                if let Some(len_raw) = args.get(3).and_then(|a| Self::str_arg(args, 3)) {
+                    if let Ok(len) = len_raw.parse::<i64>() {
+                        if len > 0 {
+                            let hi = off + len - 2;
+                            return format!(
+                                "@ARGV[{}..{}]",
+                                off - 1,
+                                hi - 1
+                            );
+                        }
+                    }
+                }
+                format!("@ARGV[{}..$#ARGV]", off - 1)
+            }
             "slice" => {
                 let off_raw = Self::str_arg(args, 2);
                 // `${arr[@]}` / `${arr[@]:off:}` — whole-array slices;
