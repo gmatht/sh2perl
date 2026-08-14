@@ -365,13 +365,13 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
             r.emit("g_frag_y = int(gl_FragCoord.y);");
         }
         if r.vars.contains("vcolor_r") {
-            r.emit("g_vcolor_r = int(vColor.r * 255.0);");
+            r.emit("g_vcolor_r = int(vColor.r * 127.0);");
         }
         if r.vars.contains("vcolor_g") {
-            r.emit("g_vcolor_g = int(vColor.g * 255.0);");
+            r.emit("g_vcolor_g = int(vColor.g * 127.0);");
         }
         if r.vars.contains("vcolor_b") {
-            r.emit("g_vcolor_b = int(vColor.b * 255.0);");
+            r.emit("g_vcolor_b = int(vColor.b * 127.0);");
         }
         if opts.tex_size > 0 {
             let uv_needed = r.uses_any(&[
@@ -420,16 +420,16 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
                 {
                     r.emit(&format!("vec4 _crack = texture2D(uCrack, {uv});"));
                     if r.vars.contains("cr_r") {
-                        r.emit("g_cr_r = int(_crack.r * 255.0);");
+                        r.emit("g_cr_r = int(_crack.r * 127.0);");
                     }
                     if r.vars.contains("cr_g") {
-                        r.emit("g_cr_g = int(_crack.g * 255.0);");
+                        r.emit("g_cr_g = int(_crack.g * 127.0);");
                     }
                     if r.vars.contains("cr_b") {
-                        r.emit("g_cr_b = int(_crack.b * 255.0);");
+                        r.emit("g_cr_b = int(_crack.b * 127.0);");
                     }
                     if r.vars.contains("cr_a") {
-                        r.emit("g_cr_a = int(_crack.a * 255.0);");
+                        r.emit("g_cr_a = int(_crack.a * 127.0);");
                     }
                 }
             }
@@ -3923,7 +3923,21 @@ impl Range {
         if bound > MEDIUMP_I16 {
             return None;
         }
-        Some(Range { lo: -bound, hi: bound })
+        // Sign-aware: a non-negative (resp. non-positive) dividend with a
+        // positive divisor truncates to a non-negative (resp. non-positive)
+        // quotient — keeping the sign instead of widening to ±bound is what
+        // lets the 0..127 tint's [0,32385]/128 stay [0,254] (not [-254,254]);
+        // a signed dividend still widens to ±bound. This is what keeps the
+        // damage blend's `r - (r-cr_r)*mix/256` (with r-cr_r ≥ -127) inside
+        // mediump int — the widened negative would otherwise overflow the
+        // CRT term that follows.
+        if a.lo >= 0 {
+            Some(Range { lo: 0, hi: bound })
+        } else if a.hi <= 0 {
+            Some(Range { lo: -bound, hi: 0 })
+        } else {
+            Some(Range { lo: -bound, hi: bound })
+        }
     }
 
     /// The `%` emulation `a - b*(a/b)` — THREE intermediates must fit:
@@ -3963,19 +3977,19 @@ fn fits_mediump_int(prog: &IrProgram, opts: &ShGlslOptions) -> bool {
     if opts.color_out {
         seed(&mut vars, "frag_x", opts.max_view as i64);
         seed(&mut vars, "frag_y", opts.max_view as i64);
-        seed(&mut vars, "vcolor_r", 255);
-        seed(&mut vars, "vcolor_g", 255);
-        seed(&mut vars, "vcolor_b", 255);
+        seed(&mut vars, "vcolor_r", 127);
+        seed(&mut vars, "vcolor_g", 127);
+        seed(&mut vars, "vcolor_b", 127);
         if opts.tex_size > 0 {
             seed(&mut vars, "uv_x", opts.tex_size as i64);
             seed(&mut vars, "uv_y", opts.tex_size as i64);
             seed(&mut vars, "tex_r", 255);
             seed(&mut vars, "tex_g", 255);
             seed(&mut vars, "tex_b", 255);
-            seed(&mut vars, "cr_r", 255);
-            seed(&mut vars, "cr_g", 255);
-            seed(&mut vars, "cr_b", 255);
-            seed(&mut vars, "cr_a", 255);
+            seed(&mut vars, "cr_r", 127);
+            seed(&mut vars, "cr_g", 127);
+            seed(&mut vars, "cr_b", 127);
+            seed(&mut vars, "cr_a", 127);
             seed(&mut vars, "damage", 3);
         }
     }
