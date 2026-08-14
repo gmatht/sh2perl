@@ -471,6 +471,27 @@ impl Render {
                                         continue;
                                     }
                                 }
+                                // a var ref inside a quoted word — the
+                                // VALUE interpolates single-quoted (embedded
+                                // quotes/globs stay data)
+                                if func == "getVar" {
+                                    if let Some(name) = Self::str_arg(args, 0) {
+                                        if !lit.is_empty() {
+                                            let mut seg = String::from("\"");
+                                            seg.push_str(&sh_dq_escape(&lit));
+                                            lit.clear();
+                                            seg.push_str(&format!("'{}'", self.var_ref(&name)));
+                                            seg.push('"');
+                                            out.push_str(&seg);
+                                        } else {
+                                            out.push_str(&format!(
+                                                "'{}'",
+                                                self.var_ref(&name)
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                }
                                 // a param expansion inside a word —
                                 // interpolate the COMPUTED perl value
                                 // (the shell can't see the perl vars)
@@ -495,11 +516,7 @@ impl Render {
                             if let IrExpr::Call { func, args } = x.as_ref() {
                                 if func == "getVar" {
                                     if let Some(name) = Self::str_arg(args, 0) {
-                                        if self.sh_owned {
-                                            out.push_str(&self.shell_var_ref(&name));
-                                        } else {
-                                            out.push_str(&self.var_ref(&name));
-                                        }
+                                        out.push_str(&self.shell_var_ref(&name));
                                         continue;
                                     }
                                 }
@@ -532,7 +549,10 @@ impl Render {
                     if self.sh_owned {
                         return self.shell_var_ref(&name);
                     }
-                    return self.var_ref(&name);
+                    // the perl VALUE interpolates into the shell —
+                    // single-quote it so embedded quotes/globs in the
+                    // value stay data (bash's quoted expansion)
+                    return format!("'{}'", self.var_ref(&name));
                 }
                 "''".to_string()
             }
@@ -1152,7 +1172,14 @@ impl Render {
                             if let IrExpr::Call { func, args } = x.as_ref() {
                                 if func == "getVar" {
                                     if let Some(name) = Self::str_arg(args, 0) {
-                                        out.push_str(&self.shell_var_ref(&name));
+                                        if self.sh_owned {
+                                            out.push_str(&self.shell_var_ref(&name));
+                                        } else {
+                                            out.push_str(&format!(
+                                                "'{}'",
+                                                self.var_ref(&name)
+                                            ));
+                                        }
                                         continue;
                                     }
                                 }
@@ -4145,11 +4172,25 @@ impl Render {
                 // an array slice, anything else is a scalar substring
                 if self.arrays.contains(&name) {
                     self.arrays.insert(name.clone());
-                    // `${arr[@]:off}` — no length → to the end
+                    // `${arr[@]:off}` — no length → to the end; a
+                    // NEGATIVE offset counts from the end (bash)
                     let len_is_empty = args.get(3).map_or(true, |a| {
                         matches!(a, IrExpr::Str(s, _) if s.is_empty())
                     });
                     if len_is_empty {
+                        if let Some(o) = off_raw.as_deref() {
+                            if let Ok(n) = o.trim().parse::<i64>() {
+                                if n < 0 {
+                                    return format!(
+                                        "@{}[($#{} {})..$#{}]",
+                                        ident(&name),
+                                        ident(&name),
+                                        n + 1,
+                                        ident(&name)
+                                    );
+                                }
+                            }
+                        }
                         return format!("@{}[{off}..$#{}]", ident(&name), ident(&name));
                     }
                     let len = args
