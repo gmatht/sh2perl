@@ -2401,6 +2401,27 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 lexer.next();
             }
 
+            // zsh `${(flags)...}` flag prefix (core request
+            // zsh-sh-go-20260815-000728): `${(f)x}`, `${(s:,:)x}`,
+            // `${(j:,:)arr}`, `${(U)x}`, `${(t)x}`. Real bash rejects
+            // `${(...` as a bad substitution, so no bash shape can
+            // collide with the prefix. Only the plain-name form carries
+            // the flag contract (`param("", name, flags[, sep])`); a flag
+            // combined with a bash operator (`${(U)x:-d}`) falls through
+            // to the legacy opaque shape (flag absorbed into the name).
+            if let Some((zflags, zsep, zrest)) = split_zsh_flag_prefix(&braced_content) {
+                if is_plain_zsh_var_name(zrest) {
+                    return Ok(Word::ParameterExpansion(
+                        ParameterExpansion {
+                            variable: zrest.to_string(),
+                            operator: ParameterExpansionOperator::ZshFlags(zflags, zsep),
+                            is_mutable: true,
+                        },
+                        None,
+                    ));
+                }
+            }
+
             eprintln!(
                 "DEBUG parse_variable_expansion: braced_content='{}'",
                 braced_content
@@ -2614,6 +2635,24 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                                     ParameterExpansion {
                                         variable: braced_content.to_string(),
                                         operator: ParameterExpansionOperator::BadSubstitution,
+                                        is_mutable: true,
+                                    },
+                                    None,
+                                ));
+                            }
+
+                            // zsh subscript SEARCH flags — `${arr[(i)pat]}`
+                            // / `[(I)]` / `[(k)]` / `[(r)]`: same flagged
+                            // param shape as the quoted path
+                            // (`param("", "arr", "i", "pat")`).
+                            if let Some((sflag, spat)) = split_zsh_subscript_flag(key) {
+                                return Ok(Word::ParameterExpansion(
+                                    ParameterExpansion {
+                                        variable: map_name.to_string(),
+                                        operator: ParameterExpansionOperator::ZshFlags(
+                                            sflag,
+                                            Some(spat),
+                                        ),
                                         is_mutable: true,
                                     },
                                     None,
@@ -3980,8 +4019,94 @@ pub fn parse_string_interpolation_from_literal(
     Ok(StringInterpolation { parts })
 }
 
+/// zsh `${(flags)...}` parameter-expansion flag prefix (core request
+/// zsh-sh-go-20260815-000728): `(flag)` / `(flag:sep:)` / `(flag.sep.)`
+/// immediately after `${` — the tree-sitter-zsh `flag` node (flag_name
+/// = `[a-zA-Z@-]+`). Real bash rejects `${(...` ("bad substitution"),
+/// so recognizing the prefix cannot collide with any bash shape.
+/// Returns (flag-text, optional separator, the remainder after `)`).
+fn split_zsh_flag_prefix(content: &str) -> Option<(String, Option<String>, &str)> {
+    let rest = content.strip_prefix('(')?;
+    let close = rest.find(')')?;
+    let flag_text = &rest[..close];
+    if flag_text.is_empty() {
+        return None;
+    }
+    let name_len = flag_text
+        .bytes()
+        .take_while(|b| b.is_ascii_alphabetic() || matches!(b, b'@' | b'-'))
+        .count();
+    if name_len == 0 {
+        return None;
+    }
+    let name = &flag_text[..name_len];
+    let tail = &flag_text[name_len..];
+    let sep = if tail.is_empty() {
+        None
+    } else if let Some(sep_text) = tail.strip_prefix(':') {
+        // `(flag:sep:)`
+        let end = sep_text.find(':')?;
+        Some(sep_text[..end].to_string())
+    } else if let Some(sep_text) = tail.strip_prefix('.') {
+        // `(flag.sep.)`
+        let end = sep_text.find('.')?;
+        Some(sep_text[..end].to_string())
+    } else {
+        return None;
+    };
+    Some((name.to_string(), sep, &rest[close + 1..]))
+}
+
+/// Is `s` a plain variable name (or a zsh special-param single char)?
+/// The zsh-flag contract only carries the plain-name form.
+fn is_plain_zsh_var_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        Some(c) => matches!(c, '@' | '*' | '#' | '?' | '$' | '!' | '-') && chars.next().is_none(),
+        None => false,
+    }
+}
+
+/// `${arr[(i)pat]}` — a zsh subscript SEARCH flag inside the brackets:
+/// key of the form `(flag)pattern` (the tree-sitter-zsh `flag` node in
+/// subscript position). Returns (flag-text, pattern).
+fn split_zsh_subscript_flag(key: &str) -> Option<(String, String)> {
+    let rest = key.strip_prefix('(')?;
+    let close = rest.find(')')?;
+    let flag_text = &rest[..close];
+    if flag_text.is_empty()
+        || !flag_text
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || matches!(b, b'@' | b'-'))
+    {
+        return None;
+    }
+    Some((flag_text.to_string(), rest[close + 1..].to_string()))
+}
+
 pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpansion, ParserError> {
     // Parse parameter expansion content like "arr[1]", "map[foo]", "#arr[@]", etc.
+
+    // zsh `${(flags)...}` flag prefix (core request
+    // zsh-sh-go-20260815-000728): `${(f)x}`, `${(s:,:)x}`,
+    // `${(j:,:)arr}`, `${(U)x}`, `${(t)x}`. Real bash rejects `${(...`
+    // as a bad substitution, so no bash shape can collide with the
+    // prefix. Only the plain-name form carries the flag contract
+    // (`param("", name, flags[, sep])`); a flag combined with a bash
+    // operator (`${(U)x:-d}`) falls through to the legacy opaque shape
+    // (flag absorbed into the name) exactly like today.
+    if let Some((zflags, zsep, zrest)) = split_zsh_flag_prefix(content) {
+        if is_plain_zsh_var_name(zrest) {
+            return Ok(ParameterExpansion {
+                variable: zrest.to_string(),
+                operator: ParameterExpansionOperator::ZshFlags(zflags, zsep),
+                is_mutable: true,
+            });
+        }
+    }
 
     // Check for array length: #arr[@]
     if content.starts_with('#') && content.contains('[') && content.contains(']') {
@@ -4246,6 +4371,17 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 }
 
                 // This is array/map access - we'll handle this in the generator
+                // (but FIRST check the zsh subscript SEARCH flags —
+                // `${arr[(i)pat]}` / `[(I)]` / `[(k)]` / `[(r)]`: the flag
+                // stays in the subscript text here and is split into the
+                // param args at lowering, `param("", "arr", "i", "pat")`).
+                if let Some((sflag, spat)) = split_zsh_subscript_flag(key) {
+                    return Ok(ParameterExpansion {
+                        variable: var_name.to_string(),
+                        operator: ParameterExpansionOperator::ZshFlags(sflag, Some(spat)),
+                        is_mutable: true,
+                    });
+                }
                 return Ok(ParameterExpansion {
                     variable: format!("{}[{}]", var_name, key),
                     operator: ParameterExpansionOperator::None,
