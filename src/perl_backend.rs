@@ -2507,18 +2507,22 @@ impl Render {
                 // AND-chain value would be 0/1, mixing conventions inside
                 // status-condition blocks; the plain LIST form (the
                 // indirect-object braces mangle `.`-concatenated args)
-                let fbl = format!(
-                    "{} . \" \" . {}",
-                    shell_squote(&cmd),
-                    words
-                        .iter()
-                        .map(|w| format!("({})", self.expr(w)))
-                        .collect::<Vec<_>>()
-                        .join(" . \" \" . ")
-                );
+                let fbl = if words.is_empty() {
+                    shell_squote(&cmd)
+                } else {
+                    format!(
+                        "{} . \" \" . {}",
+                        shell_squote(&cmd),
+                        words
+                            .iter()
+                            .map(|w| format!("({})", self.expr(w)))
+                            .collect::<Vec<_>>()
+                            .join(" . \" \" . ")
+                    )
+                };
                 format!(
                     "do {{ (system({rest})) == -1 and system('bash', '-c', {fbl}); ($? == 0 ? 0 : 256) }}",
-                    rest = a[1..].join(", ")
+                    rest = a.join(", ")
                 )
             }
         }
@@ -3237,15 +3241,19 @@ impl Render {
                 // (`bash args...` would treat the first arg as a script
                 // file — wrong for builtins like test/command); the
                 // rendered perl exprs concatenate into the -c string
-                let fbl = format!(
-                    "{} . \" \" . {}",
-                    shell_squote(&cmd),
-                    words
-                        .iter()
-                        .map(|w| format!("({})", self.expr(w)))
-                        .collect::<Vec<_>>()
-                        .join(" . \" \" . ")
-                );
+                let fbl = if words.is_empty() {
+                    shell_squote(&cmd)
+                } else {
+                    format!(
+                        "{} . \" \" . {}",
+                        shell_squote(&cmd),
+                        words
+                            .iter()
+                            .map(|w| format!("({})", self.expr(w)))
+                            .collect::<Vec<_>>()
+                            .join(" . \" \" . ")
+                    )
+                };
                 self.emit(&format!(
                     "(system({rest})) == -1 and system('bash', '-c', {fbl});"
                 ));
