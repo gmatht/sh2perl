@@ -74,6 +74,9 @@ pub struct Render {
     /// The literal IFS value when the script assigns it (bash's field
     /// separator — used for `"${arr[*]}"` joins and capture→array splits).
     ifs: String,
+    /// `shopt -s nocasematch` — `[[ x == pat ]]` and case patterns match
+    /// case-insensitively.
+    nocasematch: bool,
     need_say: bool,
     need_basename: bool,
     /// A HOSTNAME read: bash populates it itself at startup (not from the
@@ -547,6 +550,14 @@ impl Render {
                 Some(Sigil::Array) => format!("@{}", ident(name)),
                 _ => self.var_ref(name),
             },
+            // a brace call in a reconstructed word expands to its items
+            // (`echo {1..5}` → `echo '1' '2' '3' '4' '5'`)
+            IrExpr::Call { func, args } if func == "brace" => self
+                .brace_list(args)
+                .iter()
+                .map(|s| shell_squote(s))
+                .collect::<Vec<_>>()
+                .join(" "),
             other => {
                 // complex words: interpolate the rendered value
                 format!("$({})", self.expr(other))
@@ -2084,7 +2095,13 @@ impl Render {
                 "0".into()
             }
             "shopt" => {
-                // shell option toggles — no effect on the lowable subset
+                // `shopt -s nocasematch` — the option NAME + a Bool
+                // enable flag; tracked for the test/case matchers
+                let name = Self::str_arg(args, 0).unwrap_or_default();
+                let enable = matches!(args.get(1), Some(IrExpr::Bool(true)));
+                if name == "nocasematch" {
+                    self.nocasematch = enable;
+                }
                 "1".to_string()
             }
             "split" => match args.first() {
@@ -2830,7 +2847,20 @@ impl Render {
                 }
             }
             "shopt" => {
-                // option toggles — no effect on the lowable subset
+                // `shopt -s/-u nocasematch` — tracked for the test/case
+                // matchers; the other toggles have no effect on the
+                // lowable subset
+                let mut enable = false;
+                for w in &words {
+                    match w {
+                        IrExpr::Str(s, _) if s == "-s" => enable = true,
+                        IrExpr::Str(s, _) if s == "-u" => enable = false,
+                        IrExpr::Str(s, _) if s == "nocasematch" => {
+                            self.nocasematch = enable;
+                        }
+                        _ => {}
+                    }
+                }
             }
             "eval" => {
                 // `eval <string>...` — bash concatenates the words with
@@ -2911,6 +2941,18 @@ impl Render {
             | "builtin" | "enable" | "help" | "logout" | "alias" | "unalias"
             | "times" | "ulimit" | "getopts" => {
                 self.mark_todo(&format!("builtin {cmd}"));
+            }
+            "command" => {
+                // `command -v NAME` — the shell builtin: rc 0 when NAME is
+                // found (a PATH lookup / builtin / function). Reconstruct
+                // through a shell so the lookup semantics match.
+                let mut a = vec!["command".to_string()];
+                for w in &words {
+                    a.push(self.shell_word(w));
+                }
+                let q = self.shell_qx(&a.join(" "));
+                self.emit(&format!("my $__o = {q};"));
+                self.emit("$? = (($? >> 8) == 0) ? 0 : 256;");
             }
             "wait" => {
                 // `wait` — reap every child (bash waits for all jobs).
@@ -3562,31 +3604,39 @@ impl Render {
                     let re = raw_r.trim_matches('"');
                     return format!("(({l}) =~ {})", regex_wrap(re));
                 }
-                let has_glob = raw_l.contains('*')
-                    || raw_l.contains('?')
-                    || raw_r.contains('*')
-                    || raw_r.contains('?')
+                // the GLOB pattern is the RIGHT operand (`[[ x == pattern ]]`)
+                // — the lhs's `?`/`*` are literal characters in the value;
+                // quotes around the pattern make it a LITERAL comparison
+                let pat_r = raw_r.trim_matches('"').trim_matches('\'');
+                let has_glob = pat_r.contains('*')
+                    || pat_r.contains('?')
                     // extglob: @(a|b) +(a|b) ?(a|b) !(a|b) — a `(` in a
                     // pattern operand is a glob construct, not a literal
-                    || raw_r.contains("@(")
-                    || raw_r.contains("+(")
-                    || raw_r.contains("?(")
-                    || raw_r.contains("!(");
+                    || pat_r.contains("@(")
+                    || pat_r.contains("+(")
+                    || pat_r.contains("?(")
+                    || pat_r.contains("!(");
                 if has_glob {
                     // `[[ x == pattern ]]` — glob match (pattern is the
                     // RIGHT operand)
-                    let re_r = glob_to_regex(raw_r, true);
+                    let re_r = glob_to_regex(pat_r, true);
                     if op == "!=" {
-                        let re = re_r;
-                        format!("(({l}) !~ {})", regex_wrap(&format!("^{re}$")))
+                        format!("(({l}) !~ {})", regex_wrap(&format!("^{re_r}$")))
                     } else {
-                        let re = re_r;
-                        format!("(({l}) =~ {})", regex_wrap(&format!("^{re}$")))
+                        format!("(({l}) =~ {})", regex_wrap(&format!("^{re_r}$")))
                     }
                 } else if op == "!=" {
-                    format!("(({l}) ne ({r}))")
+                    if self.nocasematch {
+                        format!("((lc({l}) ne lc({r})))")
+                    } else {
+                        format!("(({l}) ne ({r}))")
+                    }
                 } else {
-                    format!("(({l}) eq ({r}))")
+                    if self.nocasematch {
+                        format!("((lc({l}) eq lc({r})))")
+                    } else {
+                        format!("(({l}) eq ({r}))")
+                    }
                 }
             }
             _ => {
@@ -3646,7 +3696,8 @@ impl Render {
             let tail = name.find(|c: char| !c.is_ascii_alphanumeric() && c != '_');
             match tail {
                 None => return self.var_ref(name),
-                Some(0) => {}
+                // `$?` `$$` `$!` `$#` — the special one-char names
+                Some(0) => return self.var_ref(name),
                 Some(pos) => {
                     let (v, rest) = name.split_at(pos);
                     return format!("({} . {})", self.var_ref(v), Self::perl_str(rest));
@@ -4101,7 +4152,13 @@ impl Render {
     /// Render one exec word; brace-call words expand to their item list.
     fn word_items(&mut self, w: &IrExpr) -> Vec<String> {
         match w {
-            IrExpr::Call { func, args } if func == "brace" => self.brace_list(args),
+            // brace items are RAW strings — quote them (a `-pproject/...`
+            // item must stay a perl string, not a bareword)
+            IrExpr::Call { func, args } if func == "brace" => self
+                .brace_list(args)
+                .iter()
+                .map(|s| Self::perl_str(s))
+                .collect(),
             other => vec![self.expr(other)],
         }
     }
