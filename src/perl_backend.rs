@@ -247,7 +247,10 @@ impl Render {
             "$" => "$$".to_string(),
             "@" | "*" => "@ARGV".to_string(),
             "#" => "scalar(@ARGV)".to_string(),
-            "!" => "0".to_string(),
+            // `$!` — PID of the last background job. The renderer does
+            // not track job PIDs; bash leaves it EMPTY when no job has
+            // been started (the corpus uses it only in that state).
+            "!" => "''".to_string(),
             "-" => "''".to_string(),
             "0" => "$0".to_string(),
             n if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() => {
@@ -878,6 +881,13 @@ impl Render {
                                 // literal heredoc: sh must NOT interpolate
                                 body.replace('$', "\\$")
                             };
+                            // the delimiter needs a line of its OWN: the
+                            // body must end with a newline before it
+                            let body = if body.ends_with('\n') {
+                                body
+                            } else {
+                                format!("{body}\n")
+                            };
                             self.heredoc_id += 1;
                             let marker = format!("__SH2_EOF_{}", self.heredoc_id);
                             let q = if interp { "" } else { "'" };
@@ -927,6 +937,13 @@ impl Render {
                     } else {
                         body.replace('$', "\\$")
                     };
+                    // the delimiter needs a line of its OWN: the body must
+                    // end with a newline before it
+                    let body = if body.ends_with('\n') {
+                        body
+                    } else {
+                        format!("{body}\n")
+                    };
                     self.heredoc_id += 1;
                     let marker = format!("__SH2_EOF_{}", self.heredoc_id);
                     let q = if r.interpolate { "" } else { "'" };
@@ -943,9 +960,33 @@ impl Render {
 
     /// Render an expression as UNQUOTED shell text (heredoc bodies, printf
     /// args): literals raw, `$var` refs in sh syntax.
+    /// Register `$name` refs found in raw shell text (a Str target
+    /// carries the shell command verbatim; its vars interpolate at the
+    /// perl level and must be declared under strict).
+    fn register_shell_refs(&mut self, s: &str) {
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        while i + 1 < chars.len() {
+            if chars[i] == '$' && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_') {
+                let mut j = i + 1;
+                let mut name = String::new();
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    name.push(chars[j]);
+                    j += 1;
+                }
+                self.scalars.insert(name);
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
     fn shell_unquoted(&mut self, e: &IrExpr) -> String {
         match e {
-            IrExpr::Str(s, _) => s.clone(),
+            IrExpr::Str(s, _) => {
+                self.register_shell_refs(s);
+                s.clone()
+            }
             IrExpr::Int(n) => n.to_string(),
             IrExpr::Interpolate(parts) => {
                 let mut out = String::new();
@@ -1076,8 +1117,8 @@ impl Render {
                     BinOpKind::Add => format!("({l} + {r})"),
                     BinOpKind::Sub => format!("({l} - {r})"),
                     BinOpKind::Mul => format!("({l} * {r})"),
-                    BinOpKind::Div => format!("int(({l}) / ({r}))"),
-                    BinOpKind::Mod => format!("({l} % {r})"),
+                    BinOpKind::Div => format!("int((({r}) ? (({l}) / ({r})) : 0))"),
+                    BinOpKind::Mod => format!("((({r}) ? (({l}) % ({r})) : 0))"),
                     BinOpKind::Pow => format!("({l} ** {r})"),
                     BinOpKind::Concat => format!("({l} . {r})"),
                     BinOpKind::Eq => format!("({l} == {r})"),
@@ -1089,9 +1130,12 @@ impl Render {
                     BinOpKind::And => format!("({} && {})", self.boolify(lhs), self.boolify(rhs)),
                     BinOpKind::Or => format!("({} || {})", self.boolify(lhs), self.boolify(rhs)),
                     BinOpKind::Not => format!("(!{})", self.boolify(lhs)),
-                    BinOpKind::BitAnd => format!("({l} & {r})"),
-                    BinOpKind::BitOr => format!("({l} | {r})"),
-                    BinOpKind::BitXor => format!("({l} ^ {r})"),
+                    // perl's `& | ^` are STRING-bitwise when the operands
+                    // are strings — bash vars are strings here, so coerce
+                    // to numbers first (bash arithmetic is integer).
+                    BinOpKind::BitAnd => format!("(int({l}) & int({r}))"),
+                    BinOpKind::BitOr => format!("(int({l}) | int({r}))"),
+                    BinOpKind::BitXor => format!("(int({l}) ^ int({r}))"),
                     BinOpKind::ShiftL => format!("({l} << {r})"),
                     BinOpKind::ShiftR => format!("({l} >> {r})"),
                 }
@@ -1204,6 +1248,58 @@ impl Render {
         }
     }
 
+    /// Parse a raw shell double-quoted-style string (heredoc body with
+    /// interpolate=true) into perl interpolation: `$name`/`${name}`/
+    /// `$1`..`$9`/`$@`/`$?`… become perl refs (registered for strict-mode
+    /// declaration), everything else stays literal. `$(`/`$((` stays
+    /// literal (escaped) — a cmdsub inside a heredoc body is a gap.
+    fn interp_from_shell_str(&mut self, s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let mut parts: Vec<InterpPart> = Vec::new();
+        let mut lit = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '$' && i + 1 < chars.len() {
+                let c = chars[i + 1];
+                let mut name: Option<(String, usize)> = None;
+                if c == '{' {
+                    if let Some(close) = s[i + 2..].find('}') {
+                        let n = &s[i + 2..i + 2 + close];
+                        if !n.is_empty() {
+                            name = Some((n.to_string(), 2 + close + 1));
+                        }
+                    }
+                } else if c.is_ascii_alphabetic() || c == '_' {
+                    let mut j = i + 1;
+                    while j < chars.len()
+                        && (chars[j].is_ascii_alphanumeric() || chars[j] == '_')
+                    {
+                        j += 1;
+                    }
+                    name = Some((s[i + 1..j].to_string(), j - i));
+                } else if c.is_ascii_digit()
+                    || matches!(c, '@' | '*' | '?' | '$' | '!' | '#')
+                {
+                    name = Some((c.to_string(), 2));
+                }
+                if let Some((nm, n)) = name {
+                    if !lit.is_empty() {
+                        parts.push(InterpPart::Lit(std::mem::take(&mut lit)));
+                    }
+                    parts.push(InterpPart::Expr(Box::new(IrExpr::Var(nm, None))));
+                    i += n;
+                    continue;
+                }
+            }
+            lit.push(chars[i]);
+            i += 1;
+        }
+        if !lit.is_empty() || parts.is_empty() {
+            parts.push(InterpPart::Lit(lit));
+        }
+        self.interp(&parts)
+    }
+
     /// String interpolation: `"lit" . $x . "lit2"` (single-expression when
     /// only literals).
     fn interp(&mut self, parts: &[InterpPart]) -> String {
@@ -1236,11 +1332,15 @@ impl Render {
     /// with read-assigned vars) need escaped sh-level refs; plain commands
     /// interpolate the perl vars directly (qx_raw).
     fn shell_qx(&mut self, cmd: &str) -> String {
+        // a heredoc inside a pipeline/subshell: the closing delimiter must
+        // be ALONE on its line — move any trailing continuation (`| next`,
+        // `)` subshell close) onto the opener line.
+        let cmd = hoist_heredoc_tails(cmd);
         if self.sh_owned {
             self.sh_owned = false;
-            self.qx_sh(cmd)
+            self.qx_sh(&cmd)
         } else {
-            self.qx_raw(cmd)
+            self.qx_raw(&cmd)
         }
     }
 
@@ -1301,11 +1401,19 @@ impl Render {
                 format!("${}[{}]", ident(var), k)
             }
             ArithAst::Bin { op, lhs, rhs } => {
+                let (l, r) = (self.arith(lhs), self.arith(rhs));
                 if op == "/" {
-                    // shell arithmetic is INTEGER division
-                    format!("int(({}) / ({}))", self.arith(lhs), self.arith(rhs))
+                    // shell arithmetic is INTEGER division; bash's div by
+                    // zero errors to stderr but yields 0 — perl would die
+                    format!("int((({r}) ? (({l}) / ({r})) : 0))")
+                } else if op == "%" {
+                    format!("((({r}) ? (({l}) % ({r})) : 0))")
+                } else if matches!(op.as_str(), "&" | "|" | "^") {
+                    // perl's `& | ^` are STRING-bitwise on string operands
+                    // (bash vars are perl strings) — coerce to numbers
+                    format!("(int({l}) {op} int({r}))")
                 } else {
-                    format!("({} {op} {})", self.arith(lhs), self.arith(rhs))
+                    format!("({l} {op} {r})")
                 }
             }
             ArithAst::Un { op, arg } => format!("({op}{})", self.arith(arg)),
@@ -1407,12 +1515,39 @@ impl Render {
                     continue;
                 }
             } else if c.is_ascii_alphabetic() || c == '_' {
-                // bare identifier → variable read (`i++ + ++i`)
+                // bare identifier → variable read (`i++ + ++i`); a
+                // following `[` makes it an ARRAY element (`result[i]`)
                 let mut j = i;
                 let mut name = String::new();
                 while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
                     name.push(chars[j]);
                     j += 1;
+                }
+                if j < chars.len() && chars[j] == '[' {
+                    let mut d = 1;
+                    let mut k = j + 1;
+                    let mut inner = String::new();
+                    while k < chars.len() && d > 0 {
+                        if chars[k] == '[' {
+                            d += 1;
+                        } else if chars[k] == ']' {
+                            d -= 1;
+                            if d == 0 {
+                                break;
+                            }
+                        }
+                        inner.push(chars[k]);
+                        k += 1;
+                    }
+                    self.arrays.insert(name.clone());
+                    let key = self.arith_str(&inner);
+                    out.push_str(&format!(
+                        "${}[{}]",
+                        ident(&name),
+                        key.trim_matches(|c| c == '(' || c == ')')
+                    ));
+                    i = k + 1;
+                    continue;
                 }
                 out.push_str(&self.var_ref(&name));
                 i = j;
@@ -1934,6 +2069,16 @@ impl Render {
                 let parts: Vec<String> = ws.iter().map(|w| self.expr(w)).collect();
                 format!("do {{ print join(' ', {}), \"\\n\"; 0 }}", parts.join(", "))
             }
+            "let" => {
+                // `let expr` — arithmetic eval, exit 0 on nonzero result
+                match words.first() {
+                    Some(IrExpr::Str(s, _)) => {
+                        let a = self.arith_str(s);
+                        format!("do {{ my $__r = {a}; ($__r != 0 ? 0 : 256) }}")
+                    }
+                    _ => "256".to_string(),
+                }
+            }
             _ => {
                 if self.funcs.contains(&cmd) {
                     let a: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
@@ -2007,7 +2152,7 @@ impl Render {
                     _ => true,
                 }) {
                     for d in self.word_items(w) {
-                        let d = Self::perl_str(&d);
+                        // word_items already renders a perl expression
                         self.emit(&format!("mkdir({d}) unless -d {d};"));
                     }
                 }
@@ -2015,7 +2160,7 @@ impl Render {
             "touch" => {
                 for w in &words {
                     for f in self.word_items(w) {
-                        let f = Self::perl_str(&f);
+                        // word_items already renders a perl expression
                         self.emit(&format!("open my $__fh, '>>', {f};"));
                         self.emit("close $__fh;");
                     }
@@ -2029,7 +2174,8 @@ impl Render {
                         IrExpr::Str(s, _) if s.starts_with('-') => flags.push(s.clone()),
                         _ => {
                             for f in self.word_items(w) {
-                                files.push(Self::perl_str(&f));
+                                // word_items already renders a perl expr
+                                files.push(f);
                             }
                         }
                     }
@@ -2347,8 +2493,12 @@ impl Render {
                 self.mark_todo(&format!("builtin {cmd}"));
             }
             "wait" => {
-                // `wait` — reap every child (bash waits for all jobs)
-                self.emit("1 while wait() > 0;");
+                // `wait` — reap every child (bash waits for all jobs).
+                // perl's wait() sets $? = -1 on the FINAL failed reap
+                // (no children left), and (-1 >> 8) is garbage (2^56-1)
+                // under perl's unsigned shift; bash's bare `wait` leaves
+                // $? = 0 (its return status is zero), so restore it.
+                self.emit("while (wait() > 0) {} $? = 0;");
             }
             _ => {
                 if self.funcs.contains(&cmd) {
@@ -2512,6 +2662,20 @@ impl Render {
                     let lhs = self.test_value(&a);
                     let rhs = self.test_value(&b);
                     return self.test_compare(op, &lhs, &rhs, &a, &b);
+                }
+            }
+            // escaped operators: `a\>b` / `a\<b` — STRING comparisons
+            // (a bare `>`/`<` would be a redirect; the backslash is
+            // shell-escape syntax, not part of the operator)
+            for (esc, p_op) in [("\\!=", "ne"), ("\\=", "eq"), ("\\>", "gt"), ("\\<", "lt")] {
+                if let Some(pos) = trimmed.find(esc) {
+                    let (a, b) = (
+                        trimmed[..pos].trim().to_string(),
+                        trimmed[pos + esc.len()..].trim().to_string(),
+                    );
+                    let lhs = self.test_value(&a);
+                    let rhs = self.test_value(&b);
+                    return format!("(({lhs}) {p_op} ({rhs}))");
                 }
             }
             let v = self.test_value(trimmed);
@@ -2840,14 +3004,15 @@ impl Render {
                 match flag.as_str() {
                     "-n" => format!("(({v}) ne \"\")"),
                     "-z" => format!("(({v}) eq \"\")"),
+                    // perl lacks `-G` (owned by real GROUP) and `-N`
+                    // (modified since last read) — stat-based equivalents
+                    "-G" => format!("((stat({v}))[5] == $))"),
+                    "-N" => format!("((stat({v}))[8] > (stat({v}))[7])"),
                     "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L" | "-h"
-                    | "-S" | "-p" | "-b" | "-c" | "-g" | "-k" | "-t" | "-u" | "-G"
-                    | "-O" | "-N" => {
+                    | "-S" | "-p" | "-b" | "-c" | "-g" | "-k" | "-t" | "-u" | "-O" => {
                         // bash `-h`/`-L` = symlink = perl `-l`
                         let pf = if flag == "-h" || flag == "-L" {
                             "-l"
-                        } else if flag == "-a" {
-                            "-e"
                         } else {
                             flag
                         };
@@ -2897,26 +3062,41 @@ impl Render {
             "-le" => format!("({l} <= {r})"),
             "-eq" => format!("({l} == {r})"),
             "-ne" => format!("({l} != {r})"),
+            // escaped operators (`[ \"$a\" \\> \"$b\" ]`) are STRING
+            // comparisons (a bare `>` would be a redirect)
+            "\\>" => format!("(({l}) gt ({r}))"),
+            "\\<" => format!("(({l}) lt ({r}))"),
+            "\\=" => format!("(({l}) eq ({r}))"),
+            "\\!=" => format!("(({l}) ne ({r}))"),
             "=" | "==" | "!=" | "=~" => {
                 if op == "=~" {
-                    // `[[ a =~ regex ]]` — unanchored perl regex
-                    let re = brace_escape(r);
-                    return format!("(({l}) =~ m{{{re}}})");
+                    // `[[ a =~ regex ]]` — unanchored perl regex. Use the
+                    // RAW operand (the rendered `r` is a perl literal with
+                    // `$` already escaped); the core's serialization may
+                    // quote the regex operand.
+                    let re = raw_r.trim_matches('"');
+                    return format!("(({l}) =~ {})", regex_wrap(re));
                 }
                 let has_glob = raw_l.contains('*')
                     || raw_l.contains('?')
                     || raw_r.contains('*')
-                    || raw_r.contains('?');
+                    || raw_r.contains('?')
+                    // extglob: @(a|b) +(a|b) ?(a|b) !(a|b) — a `(` in a
+                    // pattern operand is a glob construct, not a literal
+                    || raw_r.contains("@(")
+                    || raw_r.contains("+(")
+                    || raw_r.contains("?(")
+                    || raw_r.contains("!(");
                 if has_glob {
-                    // `[[ x == pattern ]]` — glob match
-                    let re_l = glob_to_regex(raw_l, true);
+                    // `[[ x == pattern ]]` — glob match (pattern is the
+                    // RIGHT operand)
                     let re_r = glob_to_regex(raw_r, true);
                     if op == "!=" {
-                        let re = brace_escape(&re_r);
-                        format!("(({l}) !~ m{{^{re}$}})")
+                        let re = re_r;
+                        format!("(({l}) !~ {})", regex_wrap(&format!("^{re}$")))
                     } else {
-                        let re = brace_escape(&re_r);
-                        format!("(({l}) =~ m{{^{re}$}})")
+                        let re = re_r;
+                        format!("(({l}) =~ {})", regex_wrap(&format!("^{re}$")))
                     }
                 } else if op == "!=" {
                     format!("(({l}) ne ({r}))")
@@ -2943,6 +3123,12 @@ impl Render {
         // command substitution: `"$(cmd)"` / `$(cmd)` — run at test time;
         // bash cmdsub strips trailing newlines
         if inner.starts_with("$(") && inner.ends_with(')') {
+            // `$(( arith ))` — the arith form ALSO starts with `$(`; it is
+            // native perl arithmetic, not a command (running `n % d` as a
+            // shell command yields nothing).
+            if inner.starts_with("$((") && inner.ends_with("))") {
+                return self.arith_str(&inner[3..inner.len() - 2]);
+            }
             return format!(
                 "do {{ my $__c = {}; chomp $__c; $__c }}",
                 self.qx(&inner[2..inner.len() - 1])
@@ -3061,30 +3247,52 @@ impl Render {
             }
         }
         let v = self.var_ref(&name);
+        // A Str default keeps the source quotes (`${x:-"d"}` serializes
+        // the operand VERBATIM — the quotes are shell syntax, not value).
+        let default_expr = |r: &mut Self, a: &IrExpr| -> String {
+            match a {
+                IrExpr::Str(s, _) => {
+                    let unq = s
+                        .strip_prefix('"')
+                        .and_then(|t| t.strip_suffix('"'))
+                        .or_else(|| s.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')))
+                        .unwrap_or(s);
+                    Self::perl_str(unq)
+                }
+                _ => r.expr(a),
+            }
+        };
         match op.as_str() {
             "" => v,
+            ":-" if name == "@" || name == "*" => {
+                // `$@` is an ARRAY of positional params: scalar-context
+                // emptiness (element count) decides, and the expansion
+                // joins with spaces (bash `$@` = all params).
+                let d = default_expr(self, &args[2]);
+                format!("((scalar(@ARGV) > 0) ? join(' ', @ARGV) : {d})")
+            }
             ":-" => {
-                let d = self.expr(&args[2]);
+                let d = default_expr(self, &args[2]);
                 format!("((({v} // \"\") ne \"\") ? {v} : {d})")
             }
             "-" => {
-                let d = self.expr(&args[2]);
+                let d = default_expr(self, &args[2]);
                 format!("(defined({v}) ? {v} : {d})")
             }
             ":=" => {
-                let d = self.expr(&args[2]);
+                let d = default_expr(self, &args[2]);
                 format!("((({v} // \"\") ne \"\") ? {v} : ({v} = {d}))")
             }
             ":+" => {
-                let a = self.expr(&args[2]);
+                let a = default_expr(self, &args[2]);
                 format!("((({v} // \"\") ne \"\") ? {a} : \"\")")
             }
             "+" => {
-                let a = self.expr(&args[2]);
+                let a = default_expr(self, &args[2]);
                 format!("(defined({v}) ? {a} : \"\")")
             }
             ":?" => {
-                let m = self.expr(&args[2]);
+                let m = default_expr(self, &args[2]);
                 format!("((({v} // \"\") ne \"\") ? {v} : die {m})")
             }
             "len" => format!("length({v})"),
@@ -3134,9 +3342,22 @@ impl Render {
             }
             "%" | "%%" => {
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
-                let re = glob_to_regex(&pat, op != "%");
-                let re = brace_escape(&re);
-                format!("do {{ my $__t = {v}; $__t =~ s{{{re}$}}//; $__t }}")
+                if op == "%" {
+                    // SHORTEST suffix removal: a suffix must run to the
+                    // end, so the shortest match starts at the LAST
+                    // occurrence — reverse, remove the shortest PREFIX of
+                    // the reversed pattern, reverse back.
+                    let rev_pat: String = pat.chars().rev().collect();
+                    let re = glob_to_regex(&rev_pat, false);
+                    let re = brace_escape(&re);
+                    format!(
+                        "do {{ my $__t = reverse({v}); $__t =~ s{{^{re}}}//; $__t = reverse($__t); $__t }}"
+                    )
+                } else {
+                    let re = glob_to_regex(&pat, true);
+                    let re = brace_escape(&re);
+                    format!("do {{ my $__t = {v}; $__t =~ s{{{re}$}}//; $__t }}")
+                }
             }
             "//" | "/" => {
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
@@ -3296,11 +3517,60 @@ impl Render {
                         self.emit(&format!("{x};"));
                     }
                     _ => {
+                        // `! cmd` — the Not wraps a status-producing
+                        // expression; bash INVERTS the exit status
+                        // ($? = 0 → 1, else 0)
+                        if let IrExpr::BinOp {
+                            op: BinOpKind::Not,
+                            lhs,
+                            ..
+                        } = e
+                        {
+                            let x = self.expr(e);
+                            self.emit(&format!("{x}; $? = (($? >> 8) == 0) ? 256 : 0;"));
+                            let _ = lhs;
+                            return;
+                        }
+                        // `a && b` / `a || b` command chains — bash's
+                        // status is the last executed command's (nonzero
+                        // iff the chain result is false) — perl's && ||
+                        // don't touch $?
+                        if let IrExpr::BinOp {
+                            op: BinOpKind::And | BinOpKind::Or,
+                            ..
+                        } = e
+                        {
+                            let x = self.expr(e);
+                            self.emit(&format!("$? = (({x}) ? 0 : 256);"));
+                            return;
+                        }
                         let x = self.expr(e);
                         self.emit(&format!("{x};"));
                     }
                 },
                 _ => {
+                    // `! cmd` / `a && b` chains as NON-Call exprs (the
+                    // Call-arm twin handles Call-wrapped shapes)
+                    if let IrExpr::BinOp {
+                        op: BinOpKind::Not,
+                        lhs,
+                        ..
+                    } = e
+                    {
+                        let x = self.expr(e);
+                        self.emit(&format!("{x}; $? = (($? >> 8) == 0) ? 256 : 0;"));
+                        let _ = lhs;
+                        return;
+                    }
+                    if let IrExpr::BinOp {
+                        op: BinOpKind::And | BinOpKind::Or,
+                        ..
+                    } = e
+                    {
+                        let x = self.expr(e);
+                        self.emit(&format!("$? = (({x}) ? 0 : 256);"));
+                        return;
+                    }
                     let x = self.expr(e);
                     self.emit(&format!("{x};"));
                 }
@@ -3443,6 +3713,13 @@ impl Render {
                         self.stmt(s);
                     }
                     self.depth -= 1;
+                } else {
+                    // bash: when NO branch runs, the if's status is 0 —
+                    // perl's if leaves $? at the condition's last value
+                    self.emit("} else {");
+                    self.depth += 1;
+                    self.emit("$? = 0;");
+                    self.depth -= 1;
                 }
                 self.emit("}");
             }
@@ -3508,13 +3785,21 @@ impl Render {
             }
             IrStmt::While { cond, body } => {
                 let c = self.boolify(cond);
+                // bash: the while's status is the last BODY command's
+                // status, or 0 when the body never ran (condition false at
+                // entry) — perl's while leaves $? at the condition's value
+                self.emit("my $__ran = 0;");
+                self.emit("my $__st = 0;");
                 self.emit(&format!("while ({c}) {{"));
                 self.depth += 1;
+                self.emit("$__ran = 1;");
                 for s in body {
                     self.stmt(s);
                 }
+                self.emit("$__st = $?;");
                 self.depth -= 1;
                 self.emit("}");
+                self.emit("$? = $__ran ? $__st : 0;");
             }
             IrStmt::DoWhile { body, cond, until } => {
                 let c = self.boolify(cond);
@@ -3731,6 +4016,29 @@ impl Render {
     }
 
     fn block_stmt(&mut self, body: &[IrStmt]) {
+        // BARE arithmetic statement `((i++))` / `((x += 1))` — the core
+        // wraps the Assign in a Block. bash sets $? from the arith
+        // RESULT (zero → 1), and the incdec/assign EXPRESSION already
+        // performs the write — a wrapping `$i = ($i++)` would assign the
+        // OLD value back (postfix) and undo the increment.
+        if let [IrStmt::Assign { targets, expr, .. }] = body {
+            if let Some(t) = targets.first() {
+                let same_var = match expr {
+                    IrExpr::Arith(a) => match a.as_ref() {
+                        ArithAst::IncDec { var, .. } | ArithAst::Assign { var, .. } => {
+                            var == &t.var
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if same_var && t.indices.is_empty() && t.var.find('[').is_none() {
+                    let e = self.expr(expr);
+                    self.emit(&format!("$? = (({e}) != 0) ? 0 : 256;"));
+                    return;
+                }
+            }
+        }
         self.emit("{");
         self.depth += 1;
         for s in body {
@@ -3759,30 +4067,50 @@ impl Render {
         let mut out = Vec::new();
         if let IrExpr::Array(items) = specs {
             for it in items {
-                if let IrExpr::Json(serde_json::Value::Object(o)) = it {
-                    let fd = o.get("fd").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
-                    let mode = o
-                        .get("mode")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let interp = o
-                        .get("interpolate")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    let target = match o.get("target") {
-                        Some(serde_json::Value::String(s)) => {
-                            IrExpr::Str(s.clone(), StrStyle::DoubleQuoted)
+                // spec shapes: Json object (legacy) or Object expr (the
+                // core's current A1 emit) — both carry fd/mode/target
+                let mut fd = 1i64;
+                let mut mode = String::new();
+                let mut interp = true;
+                let mut target = IrExpr::Str(String::new(), StrStyle::DoubleQuoted);
+                match it {
+                    IrExpr::Json(serde_json::Value::Object(o)) => {
+                        fd = o.get("fd").and_then(|v| v.as_i64()).unwrap_or(1);
+                        mode = o
+                            .get("mode")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        interp = o
+                            .get("interpolate")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        target = match o.get("target") {
+                            Some(serde_json::Value::String(s)) => {
+                                IrExpr::Str(s.clone(), StrStyle::DoubleQuoted)
+                            }
+                            _ => IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+                        };
+                    }
+                    IrExpr::Object(pairs) => {
+                        for (k, v) in pairs {
+                            match (k.as_str(), v) {
+                                ("fd", IrExpr::Int(n)) => fd = *n,
+                                ("mode", IrExpr::Str(s, _)) => mode = s.clone(),
+                                ("interpolate", IrExpr::Bool(b)) => interp = *b,
+                                ("target", other) => target = other.clone(),
+                                _ => {}
+                            }
                         }
-                        _ => IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
-                    };
-                    out.push(MiniRedir {
-                        fd,
-                        mode,
-                        target,
-                        interp,
-                    });
+                    }
+                    _ => {}
                 }
+                out.push(MiniRedir {
+                    fd: fd as i32,
+                    mode,
+                    target,
+                    interp,
+                });
             }
         }
         out
@@ -3938,7 +4266,15 @@ impl Render {
                                 }
                                 other => self.shell_unquoted(other),
                             };
-                            let b = Self::perl_str(&body);
+                            // interpolate=true → the body is shell
+                            // double-quoted text: `$var`/`${var}` refs
+                            // interpolate at the perl level (registered for
+                            // strict-mode declaration); false → literal.
+                            let b = if r.interp {
+                                self.interp_from_shell_str(&body)
+                            } else {
+                                Self::perl_str(&body)
+                            };
                             self.emit(&format!(
                                 "print {{$__hd{}}} {b};",
                                 self.heredoc_id
@@ -4063,10 +4399,19 @@ fn sh_dq_escape(s: &str) -> String {
 
 /// Strip leading tabs from every line (`<<-EOF` semantics).
 fn strip_leading_tabs(s: &str) -> String {
-    s.lines()
+    // `s.lines()` drops the trailing newline — preserve it (a heredoc
+    // body's last line must stay newline-terminated or the content
+    // concatenates with the following output).
+    let trailing = s.ends_with('\n');
+    let mut out = s
+        .lines()
         .map(|l| l.trim_start_matches('\t').to_string())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if trailing {
+        out.push('\n');
+    }
+    out
 }
 
 /// Count the `%` conversion specifiers in a bash printf format (`%%` is a
@@ -4197,6 +4542,82 @@ fn shell_squote(s: &str) -> String {
     out
 }
 
+/// A reconstructed shell command containing a heredoc
+/// (`cmd <<'__SH2_EOF_N'\nBODY\n__SH2_EOF_N`) followed by trailing text T
+/// on the delimiter line (a `| next-stage` pipeline continuation or a `)`
+/// subshell close) — the shell only recognizes the delimiter when it is
+/// ALONE on its line, so hoist T onto the opener line:
+/// `cmd <<'__SH2_EOF_N' T\nBODY\n__SH2_EOF_N`.
+fn hoist_heredoc_tails(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    loop {
+        // `<<'__SH2_EOF_N'` (quoted) and `<<__SH2_EOF_N` (bare) — a
+        // bare `<<` in reconstructed shell text is always a heredoc
+        let Some(open) = rest.find("<<") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let (quote, marker_end) = match after.strip_prefix('\'') {
+            Some(a) => match a.find('\'') {
+                Some(e) => (true, e),
+                None => {
+                    out.push_str("<<");
+                    out.push_str(after);
+                    break;
+                }
+            },
+            None => {
+                let e = after
+                    .find(|c: char| c == '\n' || c == ' ' || c == '\t')
+                    .unwrap_or(after.len());
+                (false, e)
+            }
+        };
+        // marker_end is relative to the UNQUOTED `a` — the marker in
+        // `after` spans [quote, quote + marker_end)
+        let marker = &after[quote as usize..quote as usize + marker_end];
+        if !marker.starts_with("__SH2_EOF_") {
+            out.push_str("<<");
+            rest = after;
+            continue;
+        }
+        // opener = `<<'MARKER'` (quoted) or `<<MARKER` (bare): the quoted
+        // form includes BOTH quote chars
+        let open_len = if quote { marker_end + 2 } else { marker_end };
+        let after_marker = &after[open_len..];
+        let Some(body_start) = after_marker.find('\n') else {
+            out.push_str("<<");
+            out.push_str(&after[..open_len]);
+            rest = after_marker;
+            continue;
+        };
+        let body_and_close = &after_marker[body_start + 1..];
+        let close_pat = format!("\n{marker}");
+        let Some(close_rel) = body_and_close.find(&close_pat) else {
+            out.push_str("<<");
+            out.push_str(&after[..open_len]);
+            out.push_str(after_marker);
+            break;
+        };
+        let after_close = &body_and_close[close_rel + close_pat.len()..];
+        let tail_end = after_close.find('\n').unwrap_or(after_close.len());
+        let tail = &after_close[..tail_end];
+        let rest2 = &after_close[tail_end..];
+        // opener + tail, then the body, then the delimiter on its own line
+        out.push_str("<<");
+        out.push_str(&after[..open_len]);
+        out.push_str(tail);
+        out.push_str("\n");
+        out.push_str(&body_and_close[..close_rel + close_pat.len()]);
+        out.push('\n');
+        rest = rest2;
+    }
+    out
+}
+
 /// Indent every line of a rendered block by `n` levels.
 fn indent_block(s: &str, n: usize) -> String {
     let pad = "    ".repeat(n);
@@ -4204,6 +4625,19 @@ fn indent_block(s: &str, n: usize) -> String {
         .map(|l| if l.is_empty() { String::new() } else { format!("{pad}{l}") })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Pick a perl regex delimiter absent from the pattern (`!`, `#`, `/`,
+/// `|`, `,`, `;`, `:`), falling back to `{` (brace-escaped). `m{...}`
+/// with brace_escape breaks quantifiers (`{1,3}` becomes literal), so
+/// avoid `{}` delimiters whenever possible.
+fn regex_wrap(re: &str) -> String {
+    for d in ['!', '#', '/', '|', ',', ';', ':'] {
+        if !re.contains(d) {
+            return format!("m{d}{re}{d}");
+        }
+    }
+    format!("m{{{}}}", brace_escape(re))
 }
 
 /// Escape `{`/`}` so a regex body survives `m{...}` / `s{...}{...}`
@@ -4230,6 +4664,62 @@ fn glob_to_regex(pat: &str, greedy: bool) -> String {
     while i < chars.len() {
         let c = chars[i];
         match c {
+            // bash extglob: @(a|b) +(a|b) *(a|b) ?(a|b) !(a|b)
+            '@' | '+' | '*' | '?' | '!' if i + 1 < chars.len() && chars[i + 1] == '(' => {
+                let op = c;
+                let mut j = i + 2;
+                let mut depth = 1;
+                let mut inner = String::new();
+                while j < chars.len() && depth > 0 {
+                    if chars[j] == '(' {
+                        depth += 1;
+                    } else if chars[j] == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    inner.push(chars[j]);
+                    j += 1;
+                }
+                // split top-level alternations (`|` must stay regex OR)
+                let mut alts = Vec::new();
+                let mut cur = String::new();
+                let mut d = 0i32;
+                for cc in inner.chars() {
+                    match cc {
+                        '(' => {
+                            d += 1;
+                            cur.push(cc);
+                        }
+                        ')' => {
+                            d -= 1;
+                            cur.push(cc);
+                        }
+                        '|' if d == 0 => {
+                            alts.push(cur.clone());
+                            cur.clear();
+                        }
+                        _ => cur.push(cc),
+                    }
+                }
+                alts.push(cur);
+                let re = alts
+                    .iter()
+                    .map(|a| glob_to_regex(a, greedy))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                let body = match op {
+                    '@' => format!("(?:{re})"),
+                    '+' => format!("(?:{re})+"),
+                    '*' => format!("(?:{re}){}", if greedy { "*" } else { "*?" }),
+                    '?' => format!("(?:{re})?"),
+                    '!' => format!("(?:(?!{re}).)*"),
+                    _ => unreachable!(),
+                };
+                out.push_str(&body);
+                i = j;
+            }
             '*' => out.push_str(star),
             '?' => out.push('.'),
             '[' => {
