@@ -132,7 +132,10 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     let scalars: Vec<String> = r
         .scalars
         .iter()
-        .filter(|v| v.as_str() != "_")
+        // special/positional vars render via dedicated forms ($$, $?, $@,
+        // $ARGV[n], $0, ...) — `my $_` for a var named `$` is a perl
+        // compile error, and `my $0` would shadow the program name
+        .filter(|v| !is_special_var_name(v))
         .cloned()
         .collect();
     let arrays: Vec<String> = r
@@ -169,6 +172,14 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
+
+
+/// A special/positional shell var rendered via a dedicated perl form
+/// (`$$`, `$?`, `$@`, `$ARGV[n]`, `$0`, ...) — never declared with `my`.
+fn is_special_var_name(name: &str) -> bool {
+    matches!(name, "?" | "$" | "@" | "*" | "#" | "!" | "-" | "0")
+        || (name.len() == 1 && name.as_bytes()[0].is_ascii_digit())
+}
 
 impl Render {
     fn emit(&mut self, s: &str) {
