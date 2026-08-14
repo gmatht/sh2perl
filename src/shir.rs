@@ -5298,7 +5298,20 @@ pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
     let ranges = analyze_var_ranges(prog);
     let mut candidates: HashSet<String> = ranges
         .iter()
-        .filter(|(_, (lo, hi))| *lo < -SAFE_NUMBER || *hi > SAFE_NUMBER)
+        .filter(|(_, (lo, hi))| {
+            // PROVEN big only (core request estree-20260814-175715): a
+            // range endpoint that is a loop-fixpoint WIDENING extreme
+            // (i64::MIN/MAX) is an over-approximation, not a proof — the
+            // optimistic default keeps such vars as Numbers (the
+            // SH2_ASSUME_I53 assumption: "vars NOT proven big stay JS
+            // Numbers"). A loop counter compared against a small bound
+            // (cond_bound_resolved) lands in a provably small interval
+            // and stays plain Number instead of leaking BigInt into
+            // mixed arithmetic.
+            (*lo < -SAFE_NUMBER || *hi > SAFE_NUMBER)
+                && *lo != INT_DOMAIN.0
+                && *hi != INT_DOMAIN.1
+        })
         .map(|(n, _)| n.clone())
         .collect();
     if candidates.is_empty() {
@@ -5510,13 +5523,23 @@ pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
         }
     }
 
-    // one walk: classify every write site
-    fn walk(s: &IrStmt, ok: &mut HashMap<String, bool>, candidates: &HashSet<String>) {
+    // one walk: classify every write site; record the write VALUES so
+    // the context-consistency closure can see which vars' writes read a
+    // candidate (a var holding a BigInt value must join the BigInt home
+    // or mixed BigInt/Number arithmetic throws — core request
+    // estree-20260814-175715).
+    fn walk(
+        s: &IrStmt,
+        ok: &mut HashMap<String, bool>,
+        candidates: &HashSet<String>,
+        writes: &mut HashMap<String, Vec<IrExpr>>,
+    ) {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
                 if targets.len() == 1 && targets[0].indices.is_empty() {
                     let w = write_val(expr, candidates);
                     let name = &targets[0].var;
+                    writes.entry(name.clone()).or_default().push(expr.clone());
                     match w {
                         Some(W::ProvenInt) => {
                             ok.entry(name.clone()).or_insert(true);
@@ -5532,6 +5555,7 @@ pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
             IrStmt::Expr(IrExpr::Call { func, args }) => {
                 if func == "setVar" {
                     if let [IrExpr::Str(name, _), e] = args.as_slice() {
+                        writes.entry(name.clone()).or_default().push((*e).clone());
                         match write_val(e, candidates) {
                             Some(W::ProvenInt) => {
                                 ok.entry(name.clone()).or_insert(true);
@@ -5613,7 +5637,7 @@ pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
             }
             IrStmt::Block(b) | IrStmt::Redirect { inner: b, .. } => {
                 for s in b {
-                    walk(s, ok, candidates);
+                    walk(s, ok, candidates, writes);
                 }
             }
             IrStmt::If {
@@ -5623,41 +5647,41 @@ pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
                 ..
             } => {
                 for s in then {
-                    walk(s, ok, candidates);
+                    walk(s, ok, candidates, writes);
                 }
                 for (_, arm) in elsifs {
                     for s in arm {
-                        walk(s, ok, candidates);
+                        walk(s, ok, candidates, writes);
                     }
                 }
                 for s in else_ {
-                    walk(s, ok, candidates);
+                    walk(s, ok, candidates, writes);
                 }
             }
             IrStmt::While { body, .. }
             | IrStmt::For { body, .. }
             | IrStmt::DoWhile { body, .. } => {
                 for s in body {
-                    walk(s, ok, candidates);
+                    walk(s, ok, candidates, writes);
                 }
             }
             IrStmt::ForInit {
                 init, step, body, ..
             } => {
                 for s in init {
-                    walk(s, ok, candidates);
+                    walk(s, ok, candidates, writes);
                 }
                 for s in step {
-                    walk(s, ok, candidates);
+                    walk(s, ok, candidates, writes);
                 }
                 for s in body {
-                    walk(s, ok, candidates);
+                    walk(s, ok, candidates, writes);
                 }
             }
             IrStmt::Case { clauses, .. } => {
                 for c in clauses {
                     for s in &c.body {
-                        walk(s, ok, candidates);
+                        walk(s, ok, candidates, writes);
                     }
                 }
             }
@@ -5668,29 +5692,91 @@ pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
                 finally_body,
             } => {
                 for s in body {
-                    walk(s, ok, candidates);
+                    walk(s, ok, candidates, writes);
                 }
                 for e in excepts {
                     for s in &e.body {
-                        walk(s, ok, candidates);
+                        walk(s, ok, candidates, writes);
                     }
                 }
                 for s in else_body {
-                    walk(s, ok, candidates);
+                    walk(s, ok, candidates, writes);
                 }
                 for s in finally_body {
-                    walk(s, ok, candidates);
+                    walk(s, ok, candidates, writes);
                 }
             }
             _ => {}
         }
     }
     let mut ok: HashMap<String, bool> = HashMap::new();
+    let mut writes: HashMap<String, Vec<IrExpr>> = HashMap::new();
     for s in &prog.stmts {
-        walk(s, &mut ok, &candidates);
+        walk(s, &mut ok, &candidates, &mut writes);
     }
     candidates.retain(|v| ok.get(v).copied().unwrap_or(false));
+    // Context-consistency closure (core request estree-20260814-175715):
+    // the leaf-wrap fires on ANY arith that mentions a candidate, so a
+    // var assigned `dy=$(( y - 7 ))` from an escalated `y` HOLDS a BigInt
+    // value at runtime — if dy is not itself escalated, a later `dy * 2`
+    // mixes BigInt and Number and throws. Every var whose writes are all
+    // proven-integer and whose write READS a candidate (directly or
+    // through arith) must join the BigInt home so all its reads wrap too.
+    // Re-walk on each growth: a Var read of a newly-added candidate is a
+    // proven-int write for the next round.
+    loop {
+        let mut added = false;
+        for (v, ws) in &writes {
+            if candidates.contains(v) || !ok.get(v).copied().unwrap_or(false) {
+                continue;
+            }
+            if ws.iter().any(|e| write_reads_candidate(e, &candidates)) {
+                candidates.insert(v.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+        ok.clear();
+        for s in &prog.stmts {
+            walk(s, &mut ok, &candidates, &mut writes);
+        }
+    }
     candidates
+}
+
+/// Does a write's value read a candidate (a BigInt-typed var)?
+fn write_reads_candidate(e: &IrExpr, cand: &HashSet<String>) -> bool {
+    match e {
+        IrExpr::Arith(a) => arith_reads_candidate(a, cand),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => cand.contains(n),
+        _ => false,
+    }
+}
+
+fn arith_reads_candidate(a: &ArithAst, cand: &HashSet<String>) -> bool {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => cand.contains(n),
+        ArithAst::Index { key, .. } => arith_reads_candidate(key, cand),
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_reads_candidate(lhs, cand) || arith_reads_candidate(rhs, cand)
+        }
+        ArithAst::Un { arg, .. } => arith_reads_candidate(arg, cand),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => {
+            arith_reads_candidate(test, cand)
+                || arith_reads_candidate(then, cand)
+                || arith_reads_candidate(else_, cand)
+        }
+        ArithAst::Assign { var, rhs, .. } => {
+            arith_reads_candidate(rhs, cand) || cand.contains(var)
+        }
+        ArithAst::IncDec { var, .. } => cand.contains(var),
+        ArithAst::Cast { arg, .. } => arith_reads_candidate(arg, cand),
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => false,
+    }
 }/// The FRONTEND's integer arithmetic domain, not the storage width:
 /// bash is signed-64-bit wrapped, so a provable range never leaves
 /// [i64::MIN, i64::MAX] — an op/literal that can cross it is top (None).
@@ -5820,6 +5906,120 @@ fn cond_bound(cond: &IrExpr) -> Option<(String, Cmp, i128)> {
             lhs,
             ..
         } => cond_bound(lhs).map(|(v, c, n)| (v, cmp_flip(c), n)),
+        _ => None,
+    }
+}
+
+/// Like [`cond_bound`], but a `$VAR` bound operand is resolved against
+/// the pre-loop state when it is a provable constant (a point range) and
+/// the var is not assigned in the loop body — `while [ "$y" -lt "$SIZE" ]`
+/// with `SIZE=32` pins the literal bound 32 (core request
+/// estree-20260814-175715: the i53 escalation only widens counters that
+/// are PROVEN to escape ±2^53; an unresolvable bound over-widened the
+/// counter to the full i64 domain and homed it as BigInt, which then
+/// leaked into mixed arithmetic and threw in the browser). A bound var
+/// with a WIDE range, or one written inside the loop body (the cond
+/// re-reads it every iteration), is NOT resolved — conservative.
+fn cond_bound_resolved(
+    cond: &IrExpr,
+    pre: &HashMap<String, Range>,
+    carried: &HashSet<String>,
+) -> Option<(String, Cmp, i128)> {
+    // `$VAR` (test form) / `VAR` (let form) → the constant value, when
+    // provable and loop-invariant.
+    let resolve = |s: &str| -> Option<i128> {
+        let n = s.strip_prefix('$')?;
+        if carried.contains(n) {
+            return None;
+        }
+        let (lo, hi) = pre.get(n).copied().flatten()?;
+        (lo == hi).then_some(lo)
+    };
+    match cond {
+        IrExpr::Call { func, args } if func == "test" => match args.as_slice() {
+            [IrExpr::Str(text, _)] => {
+                let parts: Vec<&str> = text.split_whitespace().collect();
+                if parts.len() != 3 {
+                    return None;
+                }
+                let var = |s: &str| {
+                    s.strip_prefix('$')
+                        .filter(|n| !n.is_empty())
+                        .map(str::to_string)
+                };
+                let num = |s: &str| s.parse::<i128>().ok().or_else(|| resolve(s));
+                let cmp = |s: &str| match s {
+                    "-lt" => Some(Cmp::Lt),
+                    "-le" => Some(Cmp::Le),
+                    "-gt" => Some(Cmp::Gt),
+                    "-ge" => Some(Cmp::Ge),
+                    "-eq" => Some(Cmp::Eq),
+                    _ => None,
+                };
+                if let (Some(v), Some(c), Some(n)) = (var(parts[0]), cmp(parts[1]), num(parts[2]))
+                {
+                    Some((v, c, n))
+                } else if let (Some(n), Some(c), Some(v)) =
+                    (num(parts[0]), cmp(parts[1]), var(parts[2]))
+                {
+                    Some((v, cmp_flip(c), n))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        // `while (( y < SIZE ))` — the parser emits `let "y < SIZE"`
+        IrExpr::Call { func, args } if func == "exec" => match args.as_slice() {
+            [IrExpr::Str(name, _), IrExpr::Array(items)] if name == "let" => {
+                match items.as_slice() {
+                    [IrExpr::Str(text, _)] => {
+                        let parts: Vec<&str> = text.split_whitespace().collect();
+                        if parts.len() != 3 {
+                            return None;
+                        }
+                        let var = |s: &str| {
+                            if !s.is_empty()
+                                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            {
+                                Some(s.to_string())
+                            } else {
+                                None
+                            }
+                        };
+                        let num = |s: &str| s.parse::<i128>().ok().or_else(|| resolve(s));
+                        let cmp = |s: &str| match s {
+                            "<" => Some(Cmp::Lt),
+                            "<=" => Some(Cmp::Le),
+                            ">" => Some(Cmp::Gt),
+                            ">=" => Some(Cmp::Ge),
+                            "==" => Some(Cmp::Eq),
+                            "=" => Some(Cmp::Eq),
+                            "!=" => None,
+                            _ => None,
+                        };
+                        if let (Some(v), Some(c), Some(n)) = (var(parts[0]), cmp(parts[1]), num(parts[2]))
+                        {
+                            Some((v, c, n))
+                        } else if let (Some(n), Some(c), Some(v)) =
+                            (num(parts[0]), cmp(parts[1]), var(parts[2]))
+                        {
+                            Some((v, cmp_flip(c), n))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        // `until cond` wraps the cond in BinOp(Not, cond, cond)
+        IrExpr::BinOp {
+            op: BinOpKind::Not,
+            lhs,
+            ..
+        } => cond_bound_resolved(lhs, pre, carried).map(|(v, c, n)| (v, cmp_flip(c), n)),
         _ => None,
     }
 }
@@ -6292,7 +6492,16 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             *state = merged;
         }
         IrStmt::While { cond, body } => {
-            loop_fixpoint(state, body, None, cond_bound(cond));
+            // `$VAR` bound operands resolve against the pre-loop state (a
+            // provable constant not written in the body) so a
+            // small-bounded counter stays provably small — the i53
+            // escalation's "proven big" gate (core request
+            // estree-20260814-175715).
+            let mut carried = HashSet::new();
+            for s in body {
+                collect_assigned(s, &mut carried);
+            }
+            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried));
         }
         IrStmt::ForInit { init, cond, step, body } => {
             for i in init {
@@ -6301,11 +6510,19 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             for st in step {
                 walk_stmt_ranges(st, state);
             }
-            loop_fixpoint(state, body, None, cond_bound(cond));
+            let mut carried = HashSet::new();
+            for s in body {
+                collect_assigned(s, &mut carried);
+            }
+            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried));
         }
         IrStmt::Continue | IrStmt::Break => {}
         IrStmt::DoWhile { body, cond, until } => {
-            let b = cond_bound(cond);
+            let mut carried = HashSet::new();
+            for s in body {
+                collect_assigned(s, &mut carried);
+            }
+            let b = cond_bound_resolved(cond, state, &carried);
             let b = if *until {
                 b.map(|(v, c, n)| (v, cmp_flip(c), n))
             } else {
@@ -13678,7 +13895,15 @@ fn call_is_always_true(e: &Expr) -> bool {
 }
 
 pub fn shir_to_estree_json(prog: &IrProgram) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&shir_to_estree(prog))
+    // the A1-ingress twin of estree.rs ast_to_estree_json: the control-flow
+    // legality pass applies to frontend-emitted IR too — a bare `return`
+    // inside an sh2.*Loop body arrow exits the callback, not the function,
+    // and the loop spins forever (the bat shift-loop t51 exposed it; bash's
+    // own `if c; then return; fi` inside a loop had the same latent bug on
+    // the A1 path). The pass's return-conversion is now keyed on LOOP-BODY
+    // arrows only (the in_loop flag), so frontend VALUE-returning arrows
+    // (zig `__fn_f`, the py ArrayComp IIFE, C fnValue) keep native returns.
+    serde_json::to_string(&fix_control_flow(shir_to_estree(prog)))
 }
 
 /// Classification of a case-pattern string for the native lowering.
