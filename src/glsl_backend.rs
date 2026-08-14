@@ -4547,11 +4547,20 @@ mod tests {
 
     #[test]
     fn mediump_refused_on_overflow() {
-        // r*tex_r with both 0..255 → 65025 > 32767 → must stay highp int
-        let prog = MEDIUMP_OK_PROG.replace(
-            "\"rhs\":{\"type\":\"Num\",\"value\":90}",
-            "\"rhs\":{\"type\":\"Var\",\"name\":\"tex_r\"}",
-        );
+        // r*tex_r with both 0..255 → 65025 > 32767 → must stay highp int.
+        // r is sourced from tex_r (not vcolor_r): the vcolor bridge seed
+        // dropped to 0..127 (f71d804 colour-scale bridges), so a vcolor-
+        // rooted r can no longer reach the overflow (127*255 = 32385 ≤
+        // 32767) — tex_r stays 0..255, keeping the test's premise.
+        let prog = MEDIUMP_OK_PROG
+            .replace(
+                "\"ast\":{\"type\":\"Var\",\"name\":\"vcolor_r\"}",
+                "\"ast\":{\"type\":\"Var\",\"name\":\"tex_r\"}",
+            )
+            .replace(
+                "\"rhs\":{\"type\":\"Num\",\"value\":90}",
+                "\"rhs\":{\"type\":\"Var\",\"name\":\"tex_r\"}",
+            );
         let shader = render_opts(
             &prog,
             ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 800 },
