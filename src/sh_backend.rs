@@ -1298,6 +1298,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 stmts_inline(inner)?
             };
             line = herestring_wrap(&plain, line)?;
+            line = wrap_redirect_chain(inner, &line);
             if !ps_ins.is_empty() {
                 line = lower_procsub_stmt(&ps_ins, &line)?;
             }
@@ -5642,6 +5643,22 @@ fn lower_materialized_procsub(stmts: &[IrStmt]) -> Result<Option<String>, String
     )))
 }
 
+
+/// A redirect suffix (`>file`) binds to the LAST `&&`/`||` arm only —
+/// `{ A; } && { B; } >file` redirects B, not the chain. Wrap such chains
+/// in a brace group so the redirect applies to the whole command.
+fn wrap_redirect_chain(inner: &[IrStmt], line: &str) -> String {
+    let is_chain = matches!(
+        inner,
+        [IrStmt::Expr(IrExpr::Call { func, .. })] if func == "and" || func == "or"
+    );
+    if is_chain {
+        format!("{{ {line}; }}")
+    } else {
+        line.to_string()
+    }
+}
+
 fn stmt_inline(st: &IrStmt) -> Result<String, String> {
     match st {
         IrStmt::Expr(e) => cmd_to_sh(e),
@@ -5721,6 +5738,7 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
         }
         IrStmt::Redirect { inner, redirects } => {
             let mut out = herestring_wrap(redirects, stmts_inline(inner)?)?;
+            out = wrap_redirect_chain(inner, &out);
             out.push_str(&redirects_to_sh(redirects)?);
             Ok(out)
         }
