@@ -135,7 +135,16 @@ fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
             walk_expr(path, counts);
             walk_expr(content, counts);
         }
-        IrStmt::Assign { expr, .. } => walk_expr(expr, counts),
+        IrStmt::Assign { expr, asm, .. } => {
+            walk_expr(expr, counts);
+            // declarator-position asm label (c-sh-go-toplevelasmargument):
+            // operand exprs are sh2.* call-site tallies too
+            if let Some(spec) = asm {
+                for (_, e) in spec.outputs.iter().chain(spec.inputs.iter()) {
+                    walk_expr(e, counts);
+                }
+            }
+        }
         IrStmt::Declare { init, .. } => {
             if let Some(e) = init {
                 walk_expr(e, counts);
@@ -178,6 +187,19 @@ fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
                 walk_stmt(s, counts);
             }
         }
+        IrStmt::ForInit { init, cond, step, body } => {
+            for i in init {
+                walk_stmt(i, counts);
+            }
+            walk_expr(cond, counts);
+            for st in step {
+                walk_stmt(st, counts);
+            }
+            for s in body {
+                walk_stmt(s, counts);
+            }
+        }
+        IrStmt::Continue | IrStmt::Break => {}
         IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
             walk_expr(expr, counts);
         }
@@ -229,7 +251,49 @@ fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
                 walk_stmt(s, counts);
             }
         }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            for s in body {
+                walk_stmt(s, counts);
+            }
+            for e in excepts {
+                if let Some(m) = &e.match_expr {
+                    walk_expr(m, counts);
+                }
+                for s in &e.body {
+                    walk_stmt(s, counts);
+                }
+            }
+            for s in else_body {
+                walk_stmt(s, counts);
+            }
+            for s in finally_body {
+                walk_stmt(s, counts);
+            }
+        }
         IrStmt::Expr(e) => walk_expr(e, counts),
+        IrStmt::Select { clauses } => {
+            for c in clauses {
+                if let Some(ch) = &c.ch {
+                    walk_expr(ch, counts);
+                }
+                if let Some(v) = &c.value {
+                    walk_expr(v, counts);
+                }
+                for s in &c.body {
+                    walk_stmt(s, counts);
+                }
+            }
+        }
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, e) in outputs.iter().chain(inputs.iter()) {
+                walk_expr(e, counts);
+            }
+        }
         IrStmt::Require(_) => {
             // `require` is a bare string; no IrExpr children.
         }
@@ -297,6 +361,19 @@ fn walk_expr(expr: &IrExpr, counts: &mut HashMap<String, usize>) {
                 walk_stmt(s, counts);
             }
         }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            walk_expr(iter, counts);
+            walk_expr(elem, counts);
+            if let Some(c) = cond {
+                walk_expr(c, counts);
+            }
+        }
+        IrExpr::Lambda { body, .. } => {
+            for s in body {
+                walk_stmt(s, counts);
+            }
+        }
+        IrExpr::Splice(e) => walk_expr(e, counts),
         IrExpr::Capture { expr, .. } => walk_expr(expr, counts),
         IrExpr::Range { .. } => {}
         IrExpr::Arith(a) => walk_arith(a, counts),
@@ -306,7 +383,7 @@ fn walk_expr(expr: &IrExpr, counts: &mut HashMap<String, usize>) {
 fn walk_arith(a: &crate::ir::ArithAst, counts: &mut HashMap<String, usize>) {
     use crate::ir::ArithAst;
     match a {
-        ArithAst::Num(_) | ArithAst::Var(_) => {}
+        ArithAst::Num(_) | ArithAst::Var(_) | ArithAst::Ident(_) => {}
         ArithAst::Index { key, .. } => walk_arith(key, counts),
         ArithAst::Bin { lhs, rhs, .. } => {
             walk_arith(lhs, counts);
@@ -320,6 +397,8 @@ fn walk_arith(a: &crate::ir::ArithAst, counts: &mut HashMap<String, usize>) {
         }
         ArithAst::Assign { rhs, .. } => walk_arith(rhs, counts),
         ArithAst::IncDec { .. } => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => walk_arith(arg, counts),
     }
 }
 

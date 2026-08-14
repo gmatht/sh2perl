@@ -439,6 +439,18 @@ impl Render {
                 self.depth = saved;
                 format!("do {{\n{}\n}}", indent_block(&body, 1))
             }
+            IrExpr::ArrayComp { .. } => {
+                self.mark_todo("ArrayComp expr");
+                "0".to_string()
+            }
+            IrExpr::Lambda { .. } => {
+                self.mark_todo("Lambda expr");
+                "0".to_string()
+            }
+            IrExpr::Splice(_) => {
+                self.mark_todo("Splice expr");
+                "0".to_string()
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr(i)).collect();
                 format!("({})", elems.join(", "))
@@ -534,7 +546,7 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) => self.var_ref(name),
+            ArithAst::Var(name) | ArithAst::Ident(name) => self.var_ref(name),
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
                 self.arrays.insert(var.clone());
@@ -568,6 +580,10 @@ impl Render {
                     format!("({v}{op})")
                 }
             }
+            // C-frontend nodes (never emitted by the shell path): sizeof
+            // is a compile-time constant; casts are identity (Perl IV).
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
 
@@ -793,6 +809,51 @@ impl Render {
                 Some(s) => self.test(&s),
                 None => {
                     self.mark_todo("test arg");
+                    "0".into()
+                }
+            },
+            // `regexMatch(Regex(pattern, flags), value)` — the fish
+            // `string match -rq` cond lift (triage-perl
+            // t81_regex_match): Perl's native regex (`$v =~ /pat/i`)
+            // is the exact ERE search decision (status 0 iff any
+            // match). flags: only fish's `-i` (ignore-case) is emitted
+            // by the frontend; anything else refuses loudly.
+            "regexMatch" => match args.first() {
+                Some(IrExpr::Regex { pattern, flags }) => {
+                    if flags.chars().any(|c| c != 'i') {
+                        self.mark_todo(&format!("regexMatch flags {flags:?}"));
+                        return "0".into();
+                    }
+                    let value = args
+                        .get(1)
+                        .map(|v| self.expr(v))
+                        .unwrap_or_else(|| "''".to_string());
+                    // escape the m{} delimiter braces + interpolation
+                    // chars (`$`/`@` followed by an ident char would
+                    // interpolate in a Perl regex literal)
+                    let mut pat = String::new();
+                    let cs: Vec<char> = pattern.chars().collect();
+                    for (i, c) in cs.iter().enumerate() {
+                        match c {
+                            '{' | '}' => pat.push('\\'),
+                            '$' | '@' => {
+                                let next = cs.get(i + 1).copied();
+                                if next
+                                    .map(|n| n.is_ascii_alphanumeric() || n == '_')
+                                    .unwrap_or(false)
+                                {
+                                    pat.push('\\');
+                                }
+                            }
+                            _ => {}
+                        }
+                        pat.push(*c);
+                    }
+                    let fl = if flags.contains('i') { "i" } else { "" };
+                    format!("(({value}) =~ m{{{pat}}}{fl})")
+                }
+                other => {
+                    self.mark_todo(&format!("regexMatch arg {other:?}"));
                     "0".into()
                 }
             },
@@ -1747,7 +1808,7 @@ impl Render {
                 self.emit(&format!("print {{$__fh}} {c};"));
                 self.emit("close $__fh;");
             }
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 let Some(t) = targets.first() else {
                     self.mark_todo("multi-target assign");
                     return;
@@ -1958,7 +2019,7 @@ impl Render {
                     self.mark_todo("case clauses");
                 }
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 self.funcs.insert(name.clone());
                 let mut saved = self.in_func;
                 self.in_func += 1;
@@ -2082,6 +2143,12 @@ impl Render {
                     "{kind} {name} not restructured by restructure_goto"
                 ));
             }
+            IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
+            IrStmt::Continue => self.emit("next;"),
+            IrStmt::Break => self.emit("last;"),
+            IrStmt::Try { .. } => self.mark_todo("try"),
+            IrStmt::Select { .. } => self.mark_todo("select"),
+            IrStmt::Asm { .. } => self.mark_todo("asm"),
         }
     }
 
@@ -2114,7 +2181,7 @@ impl Render {
     fn collect_funcs(&mut self, stmts: &[IrStmt]) {
         for s in stmts {
             match s {
-                IrStmt::Function { name, body } => {
+                IrStmt::Function { name, body, .. } => {
                     self.funcs.insert(name.clone());
                     self.collect_funcs(body);
                 }

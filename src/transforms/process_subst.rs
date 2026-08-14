@@ -114,6 +114,7 @@ fn mktemp_assign(tmp: &str) -> IrStmt {
                 env: vec![],
             }])],
         },
+        asm: None,
     }
 }
 

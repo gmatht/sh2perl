@@ -145,6 +145,13 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                     expr_names(cond, names);
                     walk(body, names);
                 }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init, names);
+                    expr_names(cond, names);
+                    walk(step, names);
+                    walk(body, names);
+                }
+                IrStmt::Continue | IrStmt::Break => {}
                 IrStmt::For { iter, body, .. } => {
                     expr_names(iter, names);
                     walk(body, names);
@@ -168,6 +175,22 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                 }
                 IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
                     walk(body, names);
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        if let Some(ch) = &c.ch {
+                            expr_names(ch, names);
+                        }
+                        if let Some(v) = &c.value {
+                            expr_names(v, names);
+                        }
+                        walk(&c.body, names);
+                    }
+                }
+                IrStmt::Asm { outputs, inputs, .. } => {
+                    for (_, e) in outputs.iter().chain(inputs.iter()) {
+                        expr_names(e, names);
+                    }
                 }
                 IrStmt::Exec {
                     cmd,
@@ -218,6 +241,22 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                 | IrStmt::RawText(_)
                 | IrStmt::Label(_)
                 | IrStmt::Goto(_) => {}
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body, names);
+                    for e in excepts {
+                        if let Some(m) = &e.match_expr {
+                            expr_names(m, names);
+                        }
+                        walk(&e.body, names);
+                    }
+                    walk(else_body, names);
+                    walk(finally_body, names);
+                }
             }
         }
     }
@@ -344,6 +383,10 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                 IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
                     expr_uses_arr(cond) || walk(body)
                 }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init) || expr_uses_arr(cond) || walk(step) || walk(body)
+                }
+                IrStmt::Continue | IrStmt::Break => false,
                 IrStmt::For { iter, body, .. } => expr_uses_arr(iter) || walk(body),
                 IrStmt::Case {
                     discriminant,
@@ -357,6 +400,15 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                 IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
                     walk(body)
                 }
+                IrStmt::Select { clauses } => clauses.iter().any(|c| {
+                    walk(&c.body)
+                        || c.ch.as_ref().is_some_and(expr_uses_arr)
+                        || c.value.as_ref().is_some_and(expr_uses_arr)
+                }),
+                IrStmt::Asm { outputs, inputs, .. } => outputs
+                    .iter()
+                    .chain(inputs.iter())
+                    .any(|(_, e)| expr_uses_arr(e)),
                 IrStmt::Exec {
                     cmd,
                     args,
@@ -387,6 +439,20 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                 | IrStmt::RawText(_)
                 | IrStmt::Label(_)
                 | IrStmt::Goto(_) => false,
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body)
+                        || excepts.iter().any(|e| {
+                            e.match_expr.as_ref().map(expr_uses_arr).unwrap_or(false)
+                                || walk(&e.body)
+                        })
+                        || walk(else_body)
+                        || walk(finally_body)
+                }
             };
             if hit {
                 return true;
@@ -400,6 +466,13 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
 /// Render a ShIR program to `sh` source. `Err` on a construct outside the
 /// renderable subset (the gate reports it as a FAIL).
 pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
+    // `for ((...))` (core request zsh-sh-go-20260813-153215): the shell
+    // lowering emits the rich A1 ForInit node — the sh renderer refuses
+    // an unstripped one, so lower it to `init; while(cond){body; step}`
+    // first (the ingest path's CLI-level strip; double-strip is a no-op).
+    let mut stripped = prog.clone();
+    crate::shir_passes::strip_cfor(&mut stripped);
+    let prog = &stripped;
     // collect the array base names (the A1's var_lengths is not carried
     // into IrProgram — the shared core; usage is a sound proxy)
     *ARRAY_NAMES.lock().unwrap() = array_names(prog);
@@ -920,7 +993,18 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push('\n');
             Ok(())
         }
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, asm, .. } => {
+            // Declarator-position asm label (core request
+            // c-sh-go-toplevelasmargument-20260814-042952): the label
+            // only renames the object-file symbol — no sh rendering —
+            // refuse loudly (refuse > guess; same contract as the Asm
+            // statement).
+            if let Some(spec) = asm {
+                return Err(format!(
+                    "asm label '{}' on an assign has no sh rendering",
+                    spec.template
+                ));
+            }
             indent(out, d);
             out.push_str(&assign_to_sh(targets, expr)?);
             out.push('\n');
@@ -1001,6 +1085,19 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("done\n");
             Ok(())
         }
+        IrStmt::ForInit { .. } => Err(
+            "sh renderer: un-stripped ForInit (the strip_cfor pass should have lowered it)".into(),
+        ),
+        IrStmt::Continue => {
+            indent(out, d);
+            out.push_str("continue\n");
+            Ok(())
+        }
+        IrStmt::Break => {
+            indent(out, d);
+            out.push_str("break\n");
+            Ok(())
+        }
         IrStmt::DoWhile { body, cond, until } => {
             indent(out, d);
             out.push_str("while :; do\n");
@@ -1041,7 +1138,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("esac\n");
             Ok(())
         }
-        IrStmt::Function { name, body } => {
+        IrStmt::Function { name, body, .. } => {
             indent(out, d);
             out.push_str(name);
             out.push_str("() {\n");
@@ -1115,6 +1212,12 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("}\n");
             Ok(())
         }
+        // sh has no try/except — refuse (the gate reports it as a FAIL)
+        IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
+        // sh has no select-on-channels — refuse loudly
+        IrStmt::Select { .. } => Err("select has no sh rendering".into()),
+        // inline asm has no sh rendering — refuse loudly
+        IrStmt::Asm { .. } => Err("inline asm has no sh rendering".into()),
         IrStmt::Return(e) => {
             indent(out, d);
             out.push_str("return");
@@ -1271,6 +1374,21 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
 /// `var=value` for a statement-level assignment. Handles the sh2.* RHS
 /// forms (capture, pipeline, arith, setArray, assign) natively.
 fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<String, String> {
+    // `((i++))` / `((i--))` — the arith-statement shape (triage-sh
+    // t29_increment): the estree renderer emits the IncDec BARE when the
+    // single target is the SAME var the arith mutates (the assignment
+    // wrapper would clobber the side effect with the expression's value
+    // — `x=$((x++))` assigns the OLD value back). The statement's value
+    // is discarded, so `: $((...))` keeps exactly the increment (the `:`
+    // swallows the expansion result — a bare `$((...))` line would try
+    // to RUN the value as a command: "1: not found").
+    if targets.len() == 1
+        && targets[0].indices.is_empty()
+        && matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == &targets[0].var))
+    {
+        let IrExpr::Arith(a) = expr else { unreachable!() };
+        return Ok(format!(": $(({}))", arith_to_sh(a)));
+    }
     // `arr=(a b c)` — the A1 is Assign{var: arr, expr: setArray(...)}. The
     // setArray lowering IS the assignment (`arr_0=a; arr_1=b; ...`) — the
     // `name=` prefix would corrupt it into `arr=arr_0=a`.
@@ -1732,6 +1850,38 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 line.push_str(&pat);
                 Ok(format!("$({line})"))
             }
+            // `regexMatch(Regex(pattern, flags), value)` — the fish
+            // `string match -rq` cond lift (triage-sh t81_regex_match):
+            // ERE search semantics, status 0 iff any match — the same
+            // decision as the `=~` arm's grep -E pipeline, minus the
+            // test-string round trip. flags: only fish's `-i`
+            // (ignore-case) is emitted by the frontend; anything else
+            // refuses loudly (the estree reference would differ).
+            "regexMatch" => {
+                let (pattern, flags) = match arg(args, 0)? {
+                    IrExpr::Regex { pattern, flags } => (pattern.clone(), flags.clone()),
+                    other => {
+                        return Err(format!("regexMatch: arg 0 not Regex: {other:?}"));
+                    }
+                };
+                if flags.chars().any(|c| c != 'i') {
+                    return Err(format!("regexMatch: unsupported flags {flags:?}"));
+                }
+                let value = word_to_sh(arg(args, 1)?)?;
+                let pat = pattern.replace('\'', "'\\\\''");
+                let i_flag = if flags.contains('i') { "i" } else { "" };
+                Ok(format!(
+                    "printf '%s\\n' {value} | grep -E{i_flag}q '{pat}'"
+                ))
+            }
+            "setVar" => {
+                // the runtime's plain store write — re-emit as a shell
+                // assignment (the A1 store protocol the perl/posix
+                // frontends emit for return values / locals)
+                let name = raw_arg(args, 0)?;
+                let value = word_to_sh(arg(args, 1)?)?;
+                Ok(format!("{name}={value}"))
+            }
             other => Err(format!("command call not renderable: {other:?}")),
         },
         IrExpr::BinOp {
@@ -1749,6 +1899,10 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             lhs,
             ..
         } => Ok(format!("! {}", cmd_to_sh(lhs)?)),
+        // a statement-position arith (`((n++))` — the perl frontend's
+        // increment statements): the arithmetic command, whose exit
+        // status is the value != 0 (bash `(( ))` semantics)
+        IrExpr::Arith(a) => Ok(format!("(( {} ))", arith_to_sh(a))),
         other => Err(format!("command expression not renderable: {other:?}")),
     }
 }
@@ -1857,6 +2011,23 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
                 IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
                     if walk(body) {
                         return true;
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        if walk(&c.body) {
+                            return true;
+                        }
+                        if let Some(ch) = &c.ch {
+                            if has_grep_p(ch) {
+                                return true;
+                            }
+                        }
+                        if let Some(v) = &c.value {
+                            if has_grep_p(v) {
+                                return true;
+                            }
+                        }
                     }
                 }
                 IrStmt::For { iter, body, .. } => {
@@ -4038,7 +4209,7 @@ fn cstyle_for_to_sh(arith: &str, body: &str) -> String {
 fn arith_to_sh(a: &ArithAst) -> String {
     match a {
         ArithAst::Num(n) => n.to_string(),
-        ArithAst::Var(name) => {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
             if NUM_VARS.lock().unwrap().contains(name) {
                 // known-numeric var: bare read (dash rejects quoted
                 // expansions inside $(( )); the analysis guarantees the
@@ -4092,6 +4263,10 @@ fn arith_to_sh(a: &ArithAst) -> String {
                 format!("(({var} = {var} {inc}) {dec})")
             }
         }
+        // C-frontend nodes (never emitted by the shell path): sizeof is a
+        // compile-time constant; casts are identity (shell arith is 64-bit).
+        ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+        ArithAst::Cast { arg, .. } => arith_to_sh(arg),
     }
 }
 
@@ -4136,7 +4311,7 @@ fn stmts_inline(stmts: &[IrStmt]) -> Result<String, String> {
 fn stmt_inline(st: &IrStmt) -> Result<String, String> {
     match st {
         IrStmt::Expr(e) => cmd_to_sh(e),
-        IrStmt::Assign { targets, expr } => assign_to_sh(targets, expr),
+        IrStmt::Assign { targets, expr, .. } => assign_to_sh(targets, expr),
         IrStmt::If {
             cond,
             then,
@@ -4176,6 +4351,11 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             cmd_to_sh(cond)?,
             stmts_inline(body)?
         )),
+        IrStmt::ForInit { .. } => Err(
+            "sh renderer: un-stripped ForInit (the strip_cfor pass should have lowered it)".into(),
+        ),
+        IrStmt::Continue => Ok(format!("continue")),
+        IrStmt::Break => Ok(format!("break")),
         IrStmt::DoWhile { body, cond, until } => {
             let neg = if *until { "" } else { "! " };
             Ok(format!(
@@ -4199,7 +4379,7 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             out.push_str(" esac");
             Ok(out)
         }
-        IrStmt::Function { name, body } => Ok(format!("{name}() {{ {}; }}", stmts_inline(body)?)),
+        IrStmt::Function { name, body, .. } => Ok(format!("{name}() {{ {}; }}", stmts_inline(body)?)),
         IrStmt::Redirect { inner, redirects } => {
             let mut out = herestring_wrap(redirects, stmts_inline(inner)?)?;
             out.push_str(&redirects_to_sh(redirects)?);
@@ -4300,6 +4480,12 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             ))
         }
         IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => Ok(String::new()),
+        // sh has no try/except — refuse (the gate reports it as a FAIL)
+        IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
+        // sh has no select-on-channels — refuse loudly
+        IrStmt::Select { .. } => Err("select has no sh rendering".into()),
+        // inline asm has no sh rendering — refuse loudly
+        IrStmt::Asm { .. } => Err("inline asm has no sh rendering".into()),
     }
 }
 
@@ -4385,6 +4571,9 @@ fn str_arg(e: &IrExpr) -> Result<String, String> {
         IrExpr::Str(s, _) => Ok(s.clone()),
         IrExpr::Int(i) => Ok(i.to_string()),
         IrExpr::Ident(s) => Ok(s.clone()),
+        // numeric arith in an exec-word position renders as the plain
+        // arithmetic result (perl-frontend slice offsets / indices)
+        IrExpr::Arith(a) => Ok(arith_to_sh(a)),
         other => Err(format!("expected Str argument, got {other:?}")),
     }
 }
@@ -4426,5 +4615,32 @@ mod tests {
         let sh = render_sh("grep -P '\\bbar\\b' f");
         assert!(sh.contains("grep_p() {"), "polyfill prologue: {sh}");
         assert!(sh.contains("grep_p '\\bbar\\b' f"), "call: {sh}");
+    }
+
+    /// `((x++))` as a statement — the zsh-sh-go t29_increment A1 shape
+    /// (triage-sh-20260814-032146): Assign with a single target whose
+    /// expr is an Arith IncDec on the SAME var (the estree renderer
+    /// emits the IncDec bare). The statement's value is discarded, so
+    /// the sh renderer lowers it to `: $((x++))` — the `:` swallows the
+    /// expansion result (a bare `$((...))` line would try to RUN the
+    /// value as a command: "1: not found").
+    #[test]
+    fn incdec_assign_emits_colon_arith() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[{"name":"x","type":"Int"}],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"x","sigil":null,"indices":[]}],"expr":{"type":"Str","value":"1","style":"DoubleQuoted"}},
+            {"type":"Block","body":[{"type":"Assign","targets":[{"var":"x","sigil":null,"indices":[]}],"expr":{"type":"Arith","ast":{"type":"IncDec","var":"x","delta":1,"prefix":false}}}]},
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"split","purity":"PureCpu","args":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"x","style":"DoubleQuoted"}]}]}]}]}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("t29 A1 ingress");
+        let sh = shir_to_sh(&prog).expect("t29 A1 render");
+        // arith_to_sh renders the postfix IncDec as `((x = x + 1) - 1)`
+        // (the old value, with the increment applied); the statement
+        // form must wrap it in `: $(( ... ))` — never a bare `$((...))`
+        // line (that would RUN the value as a command) and never an
+        // `x=$((x++))` assign (that would clobber the side effect).
+        assert!(
+            sh.contains(": $((((x = x + 1) - 1)))"),
+            "IncDec statement: {sh}"
+        );
     }
 }

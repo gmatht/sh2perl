@@ -18,7 +18,11 @@ const KNOWN_STMT: &[&str] = &[
     "Declare",
     "DeclareArray",
     "If",
+    "Try",
     "For",
+    "ForInit",
+    "Continue",
+    "Break",
     "While",
     "DoWhile",
     "Die",
@@ -36,6 +40,8 @@ const KNOWN_STMT: &[&str] = &[
     "Subshell",
     "Background",
     "Block",
+    "Select",
+    "Asm",
     "Expr",
     "Label",
     "Goto",
@@ -56,15 +62,18 @@ const KNOWN_EXPR: &[&str] = &[
     "Range",
     "RawExpr",
     "Arrow",
+    "ArrayComp",
+    "Lambda",
     "Array",
     "Arith",
     "Bool",
     "Json",
     "Ident",
+    "Splice",
     "Object",
 ];
 const KNOWN_ARITH: &[&str] = &[
-    "Num", "Var", "Index", "Bin", "Un", "Cond", "Assign", "IncDec",
+    "Num", "Var", "Ident", "Index", "Bin", "Un", "Cond", "Assign", "IncDec", "Sizeof", "Cast",
 ];
 
 pub fn shir_json_to_ir(json: &str) -> Result<IrProgram, String> {
@@ -179,38 +188,44 @@ fn var_types_from(v: Option<&Value>, where_: &str) -> Result<Vec<(String, IrType
                     let o = require_obj(e, &format!("{where_}[{i}]"))?;
                     let n = req_str(o, "name", &format!("{where_}[{i}]"))?.to_string();
                     let t = req(o, "type", &format!("{where_}[{i}]"))?;
-                    let irt = match t {
-                        serde_json::Value::String(s) => match s.as_str() {
-                            "Int" => IrType::Int,
-                            "Str" => IrType::Str,
-                            "Any" => IrType::Any,
-                            other => {
-                                return Err(format!(
-                                    "{where_}[{i}].type: {other} not in Int/Str/Any"
-                                ))
-                            }
-                        },
-                        serde_json::Value::Object(o) => match (
-                            o.get("kind").and_then(|k| k.as_str()),
-                            o.get("width").and_then(|w| w.as_u64()),
-                        ) {
-                            (Some("Float"), Some(w)) if w <= 255 => IrType::Float(w as u8),
-                            _ => {
-                                return Err(format!(
-                                    "{where_}[{i}].type: expected {{{{kind: Float, width: N}}}}"
-                                ))
-                            }
-                        },
-                        _ => {
-                            return Err(format!(
-                                "{where_}[{i}].type: expected a type string or Float object"
-                            ))
-                        }
-                    };
+                    let irt = ir_type_from(t, &format!("{where_}[{i}].type"))?;
                     Ok((n, irt))
                 })
                 .collect()
         }
+    }
+}
+
+/// Parse an IrType from its A1 JSON form: a plain string for the
+/// widthless verdicts ("Int"/"Str"/"Any") or an object for the sized
+/// variants ({"kind":"Float","width":N}, {"kind":"Int32"}, …).
+pub fn ir_type_from(t: &Value, where_: &str) -> Result<IrType, String> {
+    match t {
+        serde_json::Value::String(s) => match s.as_str() {
+            "Int" => Ok(IrType::Int),
+            "Str" => Ok(IrType::Str),
+            "Any" => Ok(IrType::Any),
+            other => Err(format!("{where_}: {other} not in Int/Str/Any")),
+        },
+        serde_json::Value::Object(o) => {
+            let kind = o.get("kind").and_then(|k| k.as_str());
+            match kind {
+                Some("Float") => match o.get("width").and_then(|w| w.as_u64()) {
+                    Some(w) if w <= 255 => Ok(IrType::Float(w as u8)),
+                    _ => Err(format!("{where_}: expected {{{{kind: Float, width: N}}}}")),
+                },
+                Some("Int32") => Ok(IrType::Int32),
+                Some("Int64") => Ok(IrType::Int64),
+                Some("UInt32") => Ok(IrType::UInt32),
+                Some("UInt64") => Ok(IrType::UInt64),
+                _ => Err(format!(
+                    "{where_}: expected {{{{kind: Float, width: N}}}} or {{{{kind: Int32}}}} etc."
+                )),
+            }
+        }
+        _ => Err(format!(
+            "{where_}: expected a type string or a typed-int/Float object"
+        )),
     }
 }
 
@@ -336,7 +351,16 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
                 .map(|(i, t)| assign_target_from(t, &format!("{where_}.targets[{i}]")))
                 .collect::<Result<Vec<_>, String>>()?;
             let expr = expr_from(req(o, "expr", where_)?, &format!("{where_}.expr"))?;
-            IrStmt::Assign { targets, expr }
+            // Optional GCC asm-label spec on a DECLARATION-position assign
+            // (`int x asm("myx") = 7;` — core request
+            // c-sh-go-toplevelasmargument-20260814-042952; the `Asm`
+            // statement's spec shape, operand string-or-node form included).
+            let asm = match o.get("asm") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(m)) => Some(asm_spec_from(m, &format!("{where_}.asm"))?),
+                Some(_) => return Err(format!("{where_}.asm: not an object")),
+            };
+            IrStmt::Assign { targets, expr, asm }
         }
         "Declare" => {
             let vars = arr(o.get("vars"), &format!("{where_}.vars"))?
@@ -389,17 +413,79 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
                 else_,
             }
         }
+        // try/except/else/finally (core request py-sh-go 20260813).
+        // excepts entries: {"type":"TryExcept","match":<expr|null>,
+        // "as":<string|null>,"body":[<stmt>...]}; else/finally are
+        // plain statement lists ([] when absent).
+        "Try" => {
+            let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
+            let excepts = arr(o.get("excepts"), &format!("{where_}.excepts"))?
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let eo = require_obj(e, &format!("{where_}.excepts[{i}]"))?;
+                    let t = req_str(eo, "type", &format!("{where_}.excepts[{i}]"))?;
+                    if t != "TryExcept" {
+                        return Err(format!(
+                            "{where_}.excepts[{i}].type: {t:?} != TryExcept"
+                        ));
+                    }
+                    let match_expr = match eo.get("match") {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(expr_from(
+                            x,
+                            &format!("{where_}.excepts[{i}].match"),
+                        )?),
+                    };
+                    let as_name = match eo.get("as") {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(
+                            x.as_str()
+                                .ok_or_else(|| {
+                                    format!("{where_}.excepts[{i}].as: not a string")
+                                })?
+                                .to_string(),
+                        ),
+                    };
+                    let body =
+                        stmts_from(eo.get("body"), &format!("{where_}.excepts[{i}].body"))?;
+                    Ok(TryExcept {
+                        match_expr,
+                        as_name,
+                        body,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let else_body = stmts_from(o.get("else"), &format!("{where_}.else"))?;
+            let finally_body = stmts_from(o.get("finally"), &format!("{where_}.finally"))?;
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            }
+        }
         "For" => {
             let var = req_str(o, "var", where_)?.to_string();
             let iter = expr_from(req(o, "iter", where_)?, &format!("{where_}.iter"))?;
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
             IrStmt::For { var, iter, body }
         }
+        "ForInit" => {
+            let init = stmts_from(o.get("init"), &format!("{where_}.init"))?;
+            let cond = expr_from(req(o, "cond", where_)?, &format!("{where_}.cond"))?;
+            let step = stmts_from(o.get("step"), &format!("{where_}.step"))?;
+            let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
+            IrStmt::ForInit { init, cond, step, body }
+        }
+        "Continue" => IrStmt::Continue,
+        "Break" => IrStmt::Break,
         "While" => {
             let cond = expr_from(req(o, "cond", where_)?, &format!("{where_}.cond"))?;
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
             IrStmt::While { cond, body }
         }
+
         "DoWhile" => {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
             let cond = expr_from(req(o, "cond", where_)?, &format!("{where_}.cond"))?;
@@ -546,7 +632,56 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
         "Function" => {
             let name = req_str(o, "name", where_)?.to_string();
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
-            IrStmt::Function { name, body }
+            // Go generic declarations (`func id[T any](...)`, core request
+            // go-sh-typeargs): an optional `typeParams` list of
+            // type-parameter strings. Same ERASURE contract as Call's
+            // `typeArgs`: validated (array of strings) and dropped at
+            // ingress — the runtime has no type system, and the frontend
+            // only lowers type-INDEPENDENT generic bodies (where erasure
+            // is behavior-preserving) as ordinary functions.
+            if let Some(tp) = o.get("typeParams") {
+                let a = arr(Some(tp), &format!("{where_}.typeParams"))?;
+                for (i, e) in a.iter().enumerate() {
+                    if !e.is_string() {
+                        return Err(format!("{where_}.typeParams[{i}]: not a string"));
+                    }
+                }
+            }
+            // PowerShell named blocks (core-request powershell-sh-go): an
+            // optional map `block_name -> stmt[]` (dynamicparam / begin /
+            // process / end / clean). Absent = no named blocks (all
+            // existing frontend emits parse unchanged). Unknown block
+            // names REFUSE — the ESTree renderer dispatches on exactly
+            // these five and a stray name would silently miscompile.
+            let mut named_blocks: Vec<(String, Vec<IrStmt>)> = Vec::new();
+            match o.get("named_blocks") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::Object(m)) => {
+                    for (k, v) in m {
+                        if !matches!(
+                            k.as_str(),
+                            "dynamicparam" | "begin" | "process" | "end" | "clean"
+                        ) {
+                            return Err(format!(
+                                "{where_}.named_blocks: unknown block name `{k}` (expected dynamicparam/begin/process/end/clean)"
+                            ));
+                        }
+                        let stmts =
+                            stmts_from(Some(v), &format!("{where_}.named_blocks.{k}"))?;
+                        named_blocks.push((k.clone(), stmts));
+                    }
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "{where_}.named_blocks: expected an object of block_name -> stmt[], got {other}"
+                    ));
+                }
+            }
+            IrStmt::Function {
+                name,
+                body,
+                named_blocks,
+            }
         }
         "Subshell" => {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
@@ -555,6 +690,77 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
         "Background" => {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
             IrStmt::Background(body)
+        }
+        // Go-style select over channel comm clauses (core requests
+        // go-sh-commclause / go-sh-recvstmt). Each clause:
+        //   {"comm": "recv"|"send"|"default", "target": str|null,
+        //    "ch": expr|null, "value": expr|null, "body": [stmt]}
+        // Unknown comm kinds REFUSE (the renderer dispatches on exactly
+        // recv/send/default and a stray kind would silently miscompile).
+        "Select" => {
+            let clauses = arr(o.get("clauses"), &format!("{where_}.clauses"))?
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let co = require_obj(c, &format!("{where_}.clauses[{i}]"))?;
+                    let comm = req_str(co, "comm", &format!("{where_}.clauses[{i}].comm"))?
+                        .to_string();
+                    if !matches!(comm.as_str(), "recv" | "send" | "default") {
+                        return Err(format!(
+                            "{where_}.clauses[{i}].comm: {comm:?} not in recv/send/default"
+                        ));
+                    }
+                    let target = match co.get("target") {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(
+                            x.as_str()
+                                .ok_or_else(|| {
+                                    format!("{where_}.clauses[{i}].target: not a string")
+                                })?
+                                .to_string(),
+                        ),
+                    };
+                    let ch = match co.get("ch") {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(expr_from(
+                            x,
+                            &format!("{where_}.clauses[{i}].ch"),
+                        )?),
+                    };
+                    let value = match co.get("value") {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(expr_from(
+                            x,
+                            &format!("{where_}.clauses[{i}].value"),
+                        )?),
+                    };
+                    let body =
+                        stmts_from(co.get("body"), &format!("{where_}.clauses[{i}].body"))?;
+                    Ok(SelectClause {
+                        comm,
+                        target,
+                        ch,
+                        value,
+                        body,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            IrStmt::Select { clauses }
+        }
+        // Inline assembly (core requests c-sh-go-asm / asmargument /
+        // asmqualifier). `outputs`/`inputs` entries carry the constraint
+        // string plus the operand: a value NODE (the serializer's shape)
+        // or a plain store-name STRING (the request's minimal shape —
+        // "reference variables by the store-name convention").
+        "Asm" => {
+            let spec = asm_spec_from(o, where_)?;
+            IrStmt::Asm {
+                template: spec.template,
+                volatile: spec.volatile,
+                outputs: spec.outputs,
+                inputs: spec.inputs,
+                clobbers: spec.clobbers,
+            }
         }
         "Block" => {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
@@ -573,6 +779,40 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
             IrStmt::Goto(name)
         }
         _ => unreachable!("checked above"),
+    })
+}
+
+/// asm-spec deserializer — the shared shape of the `Asm` statement and
+/// the declarator-position `Assign.asm` field (core request
+/// c-sh-go-toplevelasmargument-20260814-042952). `outputs`/`inputs`
+/// entries carry the constraint string plus the operand: a value NODE
+/// (the serializer's shape) or a plain store-name STRING (the request's
+/// minimal shape).
+fn asm_spec_from(o: &serde_json::Map<String, Value>, where_: &str) -> Result<AsmSpec, String> {
+    let template = req_str(o, "template", where_)?.to_string();
+    let volatile = o.get("volatile").and_then(|x| x.as_bool()).unwrap_or(false);
+    let outputs = asm_operands_from(o.get("outputs"), &format!("{where_}.outputs"), "target")?;
+    let inputs = asm_operands_from(o.get("inputs"), &format!("{where_}.inputs"), "expr")?;
+    let clobbers = match o.get("clobbers") {
+        None | Some(Value::Null) => vec![],
+        Some(x) => {
+            let a = arr(Some(x), &format!("{where_}.clobbers"))?;
+            a.iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    e.as_str()
+                        .map(String::from)
+                        .ok_or_else(|| format!("{where_}.clobbers[{i}]: not a string"))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        }
+    };
+    Ok(AsmSpec {
+        template,
+        volatile,
+        outputs,
+        inputs,
+        clobbers,
     })
 }
 
@@ -660,6 +900,24 @@ fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
             let func = req_str(o, "func", where_)?.to_string();
             let args = exprs_from(o.get("args"), &format!("{where_}.args"))?;
             let _ = o.get("purity"); // recomputed by backend; ignored on ingress
+            // Go generic instantiation (`Name[TypeList]`, core request
+            // go-sh-typeargs): an optional `typeArgs` list of type-argument
+            // strings. The A1 store is an untyped runtime string/array
+            // model with no compile-time phase, so the ERASURE contract
+            // applies: type arguments have no runtime form — the
+            // deserializer validates the shape (array of strings) and
+            // drops them at ingress (identical to every renderer dropping
+            // them at emit). The frontend keeps refusing only
+            // type-DEPENDENT generic bodies (where erasure would change
+            // behavior); type-independent bodies lower as ordinary calls.
+            if let Some(ta) = o.get("typeArgs") {
+                let a = arr(Some(ta), &format!("{where_}.typeArgs"))?;
+                for (i, e) in a.iter().enumerate() {
+                    if !e.is_string() {
+                        return Err(format!("{where_}.typeArgs[{i}]: not a string"));
+                    }
+                }
+            }
             IrExpr::Call { func, args }
         }
         "MethodCall" => {
@@ -752,6 +1010,30 @@ fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
             let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
             IrExpr::Arrow(body)
         }
+        // Comprehension expr (core request py-sh-go-comp-if): var/iter/
+        // elem + the optional comp_if filter (`cond`, null = no filter).
+        "ArrayComp" => {
+            let var = req_str(o, "var", where_)?.to_string();
+            let iter = expr_from(req(o, "iter", where_)?, &format!("{where_}.iter"))?;
+            let elem = expr_from(req(o, "elem", where_)?, &format!("{where_}.elem"))?;
+            let cond = match o.get("cond") {
+                None | Some(Value::Null) => None,
+                Some(x) => Some(expr_from(x, &format!("{where_}.cond"))?),
+            };
+            IrExpr::ArrayComp {
+                var,
+                iter: Box::new(iter),
+                elem: Box::new(elem),
+                cond: cond.map(Box::new),
+            }
+        }
+        // Parameterized function-literal expr (core request
+        // py-sh-go-lambdef): the sibling of `Arrow` with explicit params.
+        "Lambda" => {
+            let params = str_array(o.get("params"), &format!("{where_}.params"))?;
+            let body = stmts_from(o.get("body"), &format!("{where_}.body"))?;
+            IrExpr::Lambda { params, body }
+        }
         "Array" => {
             let elements = exprs_from(o.get("elements"), &format!("{where_}.elements"))?;
             IrExpr::Array(elements)
@@ -774,6 +1056,17 @@ fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
         "Ident" => {
             let name = req_str(o, "name", where_)?.to_string();
             IrExpr::Ident(name)
+        }
+        // Starred-expression splice (core request py-sh-go-star-expr):
+        // `[*a]` / `f(*a)` — the wrapped expr's ELEMENTS splice into the
+        // enclosing Array/Call. The ESTree renderer emits a JS spread
+        // (`[...x]` / `f(...x)`); the runtime store's array values are
+        // native JS arrays, so the spread is the exact splice. Valid only
+        // as an Array element / Call argument (the renderer emits
+        // SpreadElement, which is illegal elsewhere).
+        "Splice" => {
+            let e = expr_from(req(o, "expr", where_)?, &format!("{where_}.expr"))?;
+            IrExpr::Splice(Box::new(e))
         }
         "Object" => {
             let properties = arr(o.get("properties"), &format!("{where_}.properties"))?
@@ -806,6 +1099,38 @@ fn exprs_from(v: Option<&Value>, where_: &str) -> Result<Vec<IrExpr>, String> {
     }
 }
 
+/// asm operand lists (`outputs`/`inputs` of the `Asm` statement; core
+/// requests c-sh-go-asm / asmargument / asmqualifier): each entry is
+/// `{"constraint": <string>, <field>: <operand>}` where `<field>` is
+/// `"target"` for outputs and `"expr"` for inputs, and the operand is
+/// either a value NODE (the serializer's shape) or a plain store-name
+/// STRING (the request's minimal shape — "reference variables by the
+/// store-name convention", same as `Var`/`Assign`).
+fn asm_operands_from(
+    v: Option<&Value>,
+    where_: &str,
+    field: &str,
+) -> Result<Vec<(String, IrExpr)>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(x) => arr(Some(x), where_)?
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let eo = require_obj(e, &format!("{where_}[{i}]"))?;
+                let c =
+                    req_str(eo, "constraint", &format!("{where_}[{i}].constraint"))?.to_string();
+                let op = req(eo, field, &format!("{where_}[{i}].{field}"))?;
+                let expr = match op {
+                    Value::String(name) => IrExpr::Var(name.clone(), None),
+                    other => expr_from(other, &format!("{where_}[{i}].{field}"))?,
+                };
+                Ok((c, expr))
+            })
+            .collect(),
+    }
+}
+
 // ── Arithmetic AST ───────────────────────────────────────────────────
 
 fn arith_from(v: &Value, where_: &str) -> Result<ArithAst, String> {
@@ -825,6 +1150,13 @@ fn arith_from(v: &Value, where_: &str) -> Result<ArithAst, String> {
         "Var" => {
             let name = req_str(o, "name", where_)?.to_string();
             ArithAst::Var(name)
+        }
+        // A1 bare-identifier arith read (core request zsh-sh-go-20260813-
+        // 155123): the export emits it for lifted loop-var reads; every
+        // backend renders it like Var.
+        "Ident" => {
+            let name = req_str(o, "name", where_)?.to_string();
+            ArithAst::Ident(name)
         }
         "Index" => {
             let var = req_str(o, "var", where_)?.to_string();
@@ -880,6 +1212,18 @@ fn arith_from(v: &Value, where_: &str) -> Result<ArithAst, String> {
                 .ok_or_else(|| format!("{where_}.delta: not int"))?;
             let prefix = req_bool(o, "prefix", where_)?;
             ArithAst::IncDec { var, delta, prefix }
+        }
+        "Sizeof" => {
+            let ty = ir_type_from(req(o, "ty", where_)?, &format!("{where_}.ty"))?;
+            ArithAst::Sizeof(ty)
+        }
+        "Cast" => {
+            let ty = ir_type_from(req(o, "ty", where_)?, &format!("{where_}.ty"))?;
+            let arg = arith_from(req(o, "arg", where_)?, &format!("{where_}.arg"))?;
+            ArithAst::Cast {
+                ty,
+                arg: Box::new(arg),
+            }
         }
         _ => unreachable!("checked above"),
     })
@@ -1068,6 +1412,199 @@ mod tests {
         assert!(json2.contains("\"type\":\"Int\""), "json: {json2}");
     }
 
+    /// The sized C int types round-trip through the A1 JSON as
+    /// {"kind": "Int32"} etc., and the Cast/Sizeof arith nodes survive.
+    #[test]
+    fn typed_int_type_roundtrip() {
+        use crate::ir::{ArithAst, IrExpr, IrStmt, IrType};
+        for (ty, kind) in [
+            (IrType::Int32, "Int32"),
+            (IrType::Int64, "Int64"),
+            (IrType::UInt32, "UInt32"),
+            (IrType::UInt64, "UInt64"),
+        ] {
+            let mut prog = IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts: vec![IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "x".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Arith(Box::new(ArithAst::Cast {
+                        ty,
+                        arg: Box::new(ArithAst::Sizeof(ty)),
+                    })),
+                    asm: None,
+                }],
+                subs: vec![],
+                var_types: vec![("x".to_string(), ty)],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_bash_env: vec![],
+            };
+            let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+            assert!(
+                json.contains(&format!("\"kind\":\"{kind}\"")),
+                "{kind} not in json: {json}"
+            );
+            let prog2 = shir_json_to_ir(&json).expect("deser");
+            assert_eq!(
+                prog2.var_types,
+                vec![("x".to_string(), ty)],
+                "{kind} var_types round-trip"
+            );
+            // the Cast/Sizeof arith nodes survive the round-trip
+            prog.var_types = vec![];
+            let json3 = crate::shir_json::shir_to_shir_json_raw(&prog);
+            assert!(json3.contains("\"type\":\"Cast\""), "json: {json3}");
+            assert!(json3.contains("\"type\":\"Sizeof\""), "json: {json3}");
+            let prog3 = shir_json_to_ir(&json3).expect("deser cast/sizeof");
+            assert!(
+                matches!(
+                    prog3.stmts.first(),
+                    Some(IrStmt::Assign { expr, .. })
+                        if matches!(expr, IrExpr::Arith(a)
+                            if matches!(a.as_ref(), ArithAst::Cast { ty: t, .. } if *t == ty))
+                ),
+                "Cast node lost in round-trip"
+            );
+        }
+    }
+
+    /// The rich C-style for (ForInit) round-trips through the A1 JSON
+    /// (core-request cluster triage-{c,java,js,perl,python,sh}-20260814-
+    /// 035542: cpp-sh-go t05_arith_loop.cc emitted `ForInit` and the
+    /// pre-sync backend cores rejected it with `unknown stmt type
+    /// "ForInit"`). init/cond/step/body all survive, the serialized form
+    /// is byte-identical on re-serialization, and the ingest handles the
+    /// frontend-typed var_types objects alongside it.
+    #[test]
+    fn for_init_roundtrip() {
+        use crate::ir::{ArithAst, AssignTarget, IrExpr, IrProgram, IrStmt, IrType};
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::ForInit {
+                init: vec![IrStmt::Assign {
+                    targets: vec![AssignTarget {
+                        var: "i".to_string(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Arith(Box::new(ArithAst::Num(0))),
+                    asm: None,
+                }],
+                cond: IrExpr::Arith(Box::new(ArithAst::Bin {
+                    op: "Lt".to_string(),
+                    lhs: Box::new(ArithAst::Var("i".to_string())),
+                    rhs: Box::new(ArithAst::Num(3)),
+                })),
+                step: vec![IrStmt::Expr(IrExpr::Arith(Box::new(ArithAst::IncDec {
+                    var: "i".to_string(),
+                    delta: 1,
+                    prefix: false,
+                })))],
+                body: vec![IrStmt::Expr(IrExpr::Ident("echo_i".to_string()))],
+            }],
+            subs: vec![],
+            // the cpp-sh-go t05 shape: frontend-typed vars next to ForInit
+            var_types: vec![
+                ("i".to_string(), IrType::Int32),
+                ("sum".to_string(), IrType::Int32),
+            ],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json.contains("\"type\":\"ForInit\""), "json: {json}");
+        assert!(json.contains("\"kind\":\"Int32\""), "json: {json}");
+        let prog2 = shir_json_to_ir(&json).expect("deser ForInit");
+        assert!(
+            matches!(
+                prog2.stmts.first(),
+                Some(IrStmt::ForInit { cond, step, body, .. })
+                    if step.len() == 1
+                        && body.len() == 1
+                        && matches!(cond, IrExpr::Arith(a)
+                            if matches!(a.as_ref(), ArithAst::Bin { op, .. } if op == "Lt"))
+            ),
+            "ForInit node lost in round-trip"
+        );
+        assert_eq!(
+            prog2.var_types,
+            vec![
+                ("i".to_string(), IrType::Int32),
+                ("sum".to_string(), IrType::Int32)
+            ],
+            "typed var_types round-trip"
+        );
+        let json2 = crate::shir_json::shir_to_shir_json_raw(&prog2);
+        assert_eq!(json, json2, "ForInit round-trip drift");
+    }
+
+    /// The bat-sh-go `for /f` loop shape (core-request cluster
+    /// triage-perl-20260814-044426/044427: t12_forf.bat / t24_forf2.bat)
+    /// round-trips through the A1 JSON: the lowered `while read` cond is
+    /// an `exec("read", [args, {IFS: ","}])` Call whose trailing Object
+    /// argument carries the delimiter set (the estree reference renders
+    /// `sh2.builtin("read", ..., {IFS})` and tokenizes on it; a backend
+    /// that ignores the Object falls back to whitespace splitting and
+    /// diverges). The Object arg survives emit → ingress → emit
+    /// byte-identically.
+    #[test]
+    fn read_with_ifs_object_arg_roundtrip() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+        {"type":"While","cond":{"type":"Call","func":"exec","purity":"Emulable","args":[
+          {"type":"Str","value":"read","style":"DoubleQuoted"},
+          {"type":"Array","elements":[
+            {"type":"Str","value":"-r","style":"DoubleQuoted"},
+            {"type":"Str","value":"a","style":"DoubleQuoted"},
+            {"type":"Str","value":"__frest","style":"DoubleQuoted"}
+          ]},
+          {"type":"Object","properties":[
+            {"key":"IFS","value":{"type":"Str","value":",","style":"DoubleQuoted"}}
+          ]}
+        ]},"body":[
+          {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[
+            {"type":"Str","value":"echo","style":"DoubleQuoted"},
+            {"type":"Array","elements":[{"type":"Str","value":"item","style":"DoubleQuoted"}]}
+          ]}}
+        ]}
+      ]}"#;
+        let prog1 = shir_json_to_ir(src).expect("ingress accepts the read-with-IFS shape");
+        let json1 = shir_to_shir_json(&prog1);
+        let prog2 = shir_json_to_ir(&json1).expect("re-ingress");
+        assert_eq!(json1, shir_to_shir_json(&prog2), "read-with-IFS round-trips");
+        assert!(json1.contains("\"key\":\"IFS\""), "IFS key serialized: {json1}");
+        assert!(json1.contains("\"value\":\",\""), "IFS value serialized: {json1}");
+        // the estree reference renders the Object arg (not a whitespace
+        // fallback): the builtin read gets the delimiter set
+        let estree = crate::shir::shir_to_estree_json(&prog1).expect("render");
+        assert!(
+            estree.contains("\"name\":\"IFS\"") && estree.contains("\"value\":\",\""),
+            "estree keeps the IFS delimiter: {estree}"
+        );
+    }
+
+    #[test]
+    fn c_sizeof_constants() {
+        use crate::ir::IrType;
+        assert_eq!(IrType::Int32.c_sizeof(), Some(4));
+        assert_eq!(IrType::UInt32.c_sizeof(), Some(4));
+        assert_eq!(IrType::Int64.c_sizeof(), Some(8));
+        assert_eq!(IrType::UInt64.c_sizeof(), Some(8));
+        assert_eq!(IrType::Int.c_sizeof(), None);
+    }
+
     /// The const-markup round-trips: `--shir` attaches the verdicts
     /// (LIMIT const, i/sum var), the reader ingests them, and re-serializing
     /// is byte-identical.
@@ -1174,6 +1711,67 @@ mod tests {
     // meant to prevent. Errors skip (parse/ingress failures are not the
     // concern of this test; we only assert the serializer/deserializer
     // round-trip on examples that BOTH sides accept).
+    /// The Try node round-trips through the A1 JSON (core request
+    /// py-sh-go 20260813): `{"type":"Try", body, excepts
+    /// [{"type":"TryExcept", match: <expr|null>, as: <string|null>,
+    /// body}], else, finally}` — null match/as for a bare except, empty
+    /// arrays for absent else/finally. Deserialization re-serializes
+    /// byte-identically; a non-TryExcept except entry is rejected.
+    #[test]
+    fn try_stmt_roundtrip() {
+        use crate::ir::{IrExpr, IrProgram, IrStmt, TryExcept};
+        fn mk() -> IrProgram {
+            IrProgram {
+                imports: vec![],
+                requires: vec![],
+                stmts: vec![IrStmt::Try {
+                    body: vec![IrStmt::Expr(IrExpr::Ident("guard".to_string()))],
+                    excepts: vec![
+                        TryExcept {
+                            match_expr: Some(IrExpr::Ident("ValueError".to_string())),
+                            as_name: Some("e".to_string()),
+                            body: vec![IrStmt::Expr(IrExpr::Ident("arm1".to_string()))],
+                        },
+                        TryExcept {
+                            match_expr: None,
+                            as_name: None,
+                            body: vec![IrStmt::Expr(IrExpr::Ident("arm2".to_string()))],
+                        },
+                    ],
+                    else_body: vec![IrStmt::Expr(IrExpr::Ident("els".to_string()))],
+                    finally_body: vec![IrStmt::Expr(IrExpr::Ident("fin".to_string()))],
+                }],
+                subs: vec![],
+                var_types: vec![],
+                stmt_lines: vec![],
+                var_lengths: vec![],
+                var_const: vec![],
+                var_lifetimes: vec![],
+                var_nospace: vec![],
+                var_bash_env: vec![],
+            }
+        }
+        let json = crate::shir_json::shir_to_shir_json_raw(&mk());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let t = &v["stmts"][0];
+        assert_eq!(t["type"], "Try", "json: {json}");
+        assert_eq!(t["excepts"][0]["type"], "TryExcept");
+        assert_eq!(t["excepts"][0]["match"]["type"], "Ident");
+        assert_eq!(t["excepts"][0]["as"], "e");
+        assert!(t["excepts"][1]["match"].is_null());
+        assert!(t["excepts"][1]["as"].is_null());
+        assert_eq!(t["else"], serde_json::json!([{"type": "Expr", "expr": {"type": "Ident", "name": "els"}}]));
+        assert_eq!(t["finally"], serde_json::json!([{"type": "Expr", "expr": {"type": "Ident", "name": "fin"}}]));
+        // byte-identical round-trip
+        let prog2 = shir_json_to_ir(&json).expect("deser");
+        let json2 = crate::shir_json::shir_to_shir_json_raw(&prog2);
+        assert_eq!(json, json2, "Try round-trip drift");
+        // a non-TryExcept except entry is rejected
+        let bad = json.replace("\"TryExcept\"", "\"TryOops\"");
+        let err = shir_json_to_ir(&bad).unwrap_err();
+        assert!(err.contains("TryOops"), "got: {err}");
+    }
+
     #[test]
     fn corpus_roundtrip_byte_equal() {
         use crate::ir::IrProgram;
@@ -1235,5 +1833,269 @@ mod tests {
             "corpus_roundtrip: {} examples, {} byte-equal, {} deser-failed (skipped)",
             total, pass, drf
         );
+    }
+
+    /// PowerShell named blocks (core-request
+    /// powershell-sh-go-20260813-134825): a `Function` node with a
+    /// `named_blocks` map round-trips through the A1 JSON (emit →
+    /// ingress → emit) and the ESTree renderer wraps the blocks in their
+    /// PowerShell order (dynamicparam, begin, process per input item,
+    /// end, body, clean).
+    #[test]
+    fn named_blocks_roundtrip_and_render() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+        {"type":"Function","name":"foo","body":[],"named_blocks":{
+          "begin":[{"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"start","style":"DoubleQuoted"}]}]}}],
+          "process":[{"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"item","style":"DoubleQuoted"}]}]}}],
+          "end":[{"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"done","style":"DoubleQuoted"}]}]}}]
+        }}
+      ]}"#;
+        let prog1 = shir_json_to_ir(src).expect("ingress accepts named_blocks");
+        let json1 = shir_to_shir_json(&prog1);
+        let prog2 = shir_json_to_ir(&json1).expect("re-ingress");
+        assert_eq!(json1, shir_to_shir_json(&prog2), "named_blocks round-trips");
+        // emit only when non-empty: a bash function stays 3 fields
+        assert!(
+            !round_trip("foo() { echo hi; }").contains("named_blocks"),
+            "empty named_blocks not emitted"
+        );
+        let with_blocks = shir_to_shir_json(&prog1);
+        assert!(with_blocks.contains("\"named_blocks\":{\"begin\":"), "map emitted: {with_blocks}");
+        // the ESTree renderer: begin once, process per input line, end after
+        let estree = crate::shir::shir_to_estree_json(&prog1).expect("render");
+        let begin = estree.find("\"value\":\"start\"");
+        let process = estree.find("pipelineInputLines");
+        let end = estree.find("\"value\":\"done\"");
+        assert!(begin.is_some() && process.is_some() && end.is_some(), "wrapper rendered");
+        assert!(begin.unwrap() < process.unwrap(), "begin before process loop");
+        assert!(process.unwrap() < end.unwrap(), "process loop before end");
+    }
+
+    /// Unknown named-block names REFUSE at ingress (the ESTree renderer
+    /// dispatches on exactly the five PowerShell block names).
+    #[test]
+    fn named_blocks_unknown_name_refuses() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[{"type":"Function","name":"foo","body":[],"named_blocks":{"bogus":[]}}]}"#;
+        let err = shir_json_to_ir(src).expect_err("unknown block name refuses");
+        assert!(err.contains("unknown block name"), "{err}");
+    }
+
+    /// The inline-asm statement (core requests c-sh-go-asm /
+    /// asmargument / asmqualifier) round-trips: value-node operands
+    /// (serializer shape), plain-string operands (minimal request shape),
+    /// and the minimal template-only form.
+    #[test]
+    fn asm_stmt_roundtrip() {
+        use crate::ir::{IrExpr, IrStmt};
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Asm {
+                    template: "mov %1, %0".into(),
+                    volatile: true,
+                    outputs: vec![("=r".into(), IrExpr::Var("x".into(), None))],
+                    inputs: vec![("r".into(), IrExpr::Var("y".into(), None))],
+                    clobbers: vec!["cc".into()],
+                },
+                // minimal form: template only (the asmArgument minimal shape)
+                IrStmt::Asm {
+                    template: "nop".into(),
+                    volatile: false,
+                    outputs: vec![],
+                    inputs: vec![],
+                    clobbers: vec![],
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json.contains("\"type\":\"Asm\""), "json: {json}");
+        let prog2 = shir_json_to_ir(&json).expect("deser");
+        assert_eq!(prog2.stmts, prog.stmts, "Asm round-trip");
+        // the minimal STRING-operand shape ingresses too
+        let min = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[{"type":"Asm","template":"nop","volatile":true,"outputs":[{"constraint":"=r","target":"x"}],"inputs":[{"constraint":"r","expr":"y"}],"clobbers":["cc"]}]}"#;
+        let p2 = shir_json_to_ir(min).expect("minimal asm deser");
+        assert!(matches!(
+            &p2.stmts[0],
+            IrStmt::Asm { template, volatile: true, outputs, inputs, clobbers }
+                if template == "nop" && outputs[0].0 == "=r" && inputs[0].0 == "r"
+                    && clobbers == &["cc".to_string()]
+        ));
+    }
+
+    /// The DECLARATOR-position asm label (core request
+    /// c-sh-go-toplevelasmargument-20260814-042952): the optional `asm`
+    /// field on `Assign` carries the same spec shape as the `Asm`
+    /// statement (template-only for the gcc-valid declarator form),
+    /// round-trips, and plain assigns serialize WITHOUT the field (the
+    /// A1 bytes of existing emits are unchanged).
+    #[test]
+    fn assign_asm_label_roundtrip() {
+        use crate::ir::{AsmSpec, IrExpr};
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "x".into(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Int(7),
+                    asm: Some(AsmSpec {
+                        template: "myx".into(),
+                        volatile: false,
+                        outputs: vec![],
+                        inputs: vec![],
+                        clobbers: vec![],
+                    }),
+                },
+                // a plain assign stays byte-identical (no `asm` key)
+                IrStmt::Assign {
+                    targets: vec![crate::ir::AssignTarget {
+                        var: "y".into(),
+                        sigil: None,
+                        indices: vec![],
+                    }],
+                    expr: IrExpr::Int(1),
+                    asm: None,
+                },
+            ],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json.contains("\"asm\":{\"clobbers\":[],\"inputs\":[],\"outputs\":[],\"template\":\"myx\""), "json: {json}");
+        // the plain assign must NOT carry the field
+        let assign2 = json.find("\"var\":\"y\"").map(|i| &json[i..]).unwrap_or("");
+        assert!(!assign2.contains("\"asm\""), "plain assign gained asm: {assign2}");
+        let prog2 = shir_json_to_ir(&json).expect("deser");
+        assert_eq!(prog2.stmts, prog.stmts, "Assign-asm round-trip");
+        // the minimal A1 shape (the request's failing case) ingresses and
+        // the asm rides the declaration
+        let min = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[{"type":"Assign","targets":[{"var":"x","sigil":null,"indices":[]}],"expr":{"type":"Int","value":7},"asm":{"template":"myx","volatile":false,"outputs":[],"inputs":[],"clobbers":[]}}]}"#;
+        let p2 = shir_json_to_ir(min).expect("minimal assign-asm deser");
+        assert!(matches!(
+            &p2.stmts[0],
+            IrStmt::Assign { asm: Some(spec), expr, .. }
+                if spec.template == "myx" && matches!(expr, IrExpr::Int(7))
+        ));
+    }
+
+    /// The starred-splice expr (core request py-sh-go-star-expr) and the
+    /// Go typeArgs/typeParams carriers (core request go-sh-typeargs)
+    /// ingress: Splice round-trips; typeArgs/typeParams are validated and
+    /// ERASED at ingress (the documented erasure contract).
+    #[test]
+    fn splice_and_typeargs_ingress() {
+        use crate::ir::IrExpr;
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Assign","targets":[{"var":"b","sigil":null,"indices":[]}],"expr":{"type":"Array","elements":[{"type":"Splice","expr":{"type":"Var","name":"a","sigil":null}}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"id","args":[{"type":"Str","value":"5","style":"DoubleQuoted"}],"typeArgs":["int"]}},
+            {"type":"Function","name":"id","body":[],"typeParams":["T"]}
+        ]}"#;
+        let prog = shir_json_to_ir(src).expect("splice/typeargs deser");
+        assert!(matches!(
+            &prog.stmts[0],
+            IrStmt::Assign { expr: IrExpr::Array(elems), .. }
+                if matches!(&elems[0], IrExpr::Splice(inner)
+                    if matches!(inner.as_ref(), IrExpr::Var(n, _) if n == "a"))
+        ), "splice node shape");
+        assert!(matches!(&prog.stmts[1], IrStmt::Expr(IrExpr::Call { func, .. }) if func == "id"));
+        // erasure: the re-serialized A1 carries no typeArgs/typeParams
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(!json.contains("typeArgs"), "typeArgs must be erased: {json}");
+        assert!(!json.contains("typeParams"), "typeParams must be erased: {json}");
+        // a non-string typeArgs entry refuses
+        let bad = src.replace("\"typeArgs\":[\"int\"]", "\"typeArgs\":[42]");
+        let err = shir_json_to_ir(&bad).expect_err("non-string typeArgs refuses");
+        assert!(err.contains("typeArgs"), "{err}");
+    }
+
+    /// The A1 bare-identifier arith read (triage requests c/java/js/perl/
+    /// python-20260814-032148, zsh-sh-go t51_arith_loop): a Bin whose
+    /// lhs is {"type":"Ident","name":"i"} — the lifted loop-var read
+    /// the export emits. Every backend's ingress must accept it (render
+    /// like Var); the unknown-arith-type refusal must not fire.
+    #[test]
+    fn arith_ident_ingress() {
+        use crate::ir::{ArithAst, IrExpr, IrStmt};
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"For","var":"i","iter":{"type":"Array","elements":[{"type":"Str","value":"1","style":"DoubleQuoted"}]},"body":[{"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Arith","ast":{"type":"Bin","op":"*","lhs":{"type":"Ident","name":"i"},"rhs":{"type":"Num","value":2}}}]}]}}],"runs":true}
+        ]}"#;
+        let prog = shir_json_to_ir(src).expect("arith Ident ingress");
+        let IrStmt::For { body, .. } = &prog.stmts[0] else {
+            panic!("not a For");
+        };
+        let IrStmt::Expr(IrExpr::Call { args, .. }) = &body[0] else {
+            panic!("not a Call stmt");
+        };
+        let IrExpr::Array(elems) = &args[1] else {
+            panic!("not an Array arg");
+        };
+        let IrExpr::Arith(ast) = &elems[0] else {
+            panic!("not an Arith element");
+        };
+        assert!(
+            matches!(&**ast, ArithAst::Bin { lhs, op, .. }
+                if op == "*" && matches!(lhs.as_ref(), ArithAst::Ident(n) if n == "i")),
+            "Ident lhs shape: {ast:?}"
+        );
+        // the re-serialized A1 keeps the Ident node (byte-contract)
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json.contains("\"lhs\":{\"name\":\"i\",\"type\":\"Ident\"}"), "json: {json}");
+    }
+
+    /// The Go-style select/commClause cluster (core request
+    /// go-sh-commcase-20260814-031345): every clause shape (recv with
+    /// target/ch/body, send with ch/value, default) ingresses and
+    /// round-trips; unknown comm kinds refuse loudly.
+    #[test]
+    fn select_ingress() {
+        use crate::ir::{IrExpr, IrStmt};
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Select","clauses":[
+                {"comm":"recv","target":"v","ch":{"type":"Var","name":"ch","sigil":null},"body":[{"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Var","name":"v","sigil":null}]}]}}]},
+                {"comm":"send","ch":{"type":"Var","name":"ch","sigil":null},"value":{"type":"Int","value":7},"body":[]},
+                {"comm":"default","body":[]}
+            ]}
+        ]}"#;
+        let prog = shir_json_to_ir(src).expect("Select ingress");
+        let IrStmt::Select { clauses } = &prog.stmts[0] else {
+            panic!("not a Select");
+        };
+        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses[0].comm, "recv");
+        assert_eq!(clauses[0].target.as_deref(), Some("v"));
+        assert!(matches!(&clauses[0].ch, Some(IrExpr::Var(n, _)) if n == "ch"));
+        assert_eq!(clauses[0].body.len(), 1);
+        assert_eq!(clauses[1].comm, "send");
+        assert!(matches!(&clauses[1].value, Some(IrExpr::Int(7))));
+        assert_eq!(clauses[2].comm, "default");
+        assert!(clauses[2].ch.is_none() && clauses[2].value.is_none());
+        // round-trip: the re-serialized A1 carries the full clause shape
+        let json = crate::shir_json::shir_to_shir_json_raw(&prog);
+        assert!(json.contains("\"type\":\"Select\""), "json: {json}");
+        assert!(json.contains("\"comm\":\"recv\""), "json: {json}");
+        // unknown comm kinds refuse (the renderer dispatches on exactly
+        // recv/send/default)
+        let bad = src.replace("\"comm\":\"default\"", "\"comm\":\"bogus\"");
+        let err = shir_json_to_ir(&bad).expect_err("unknown comm refuses");
+        assert!(err.contains("not in recv/send/default"), "{err}");
     }
 }

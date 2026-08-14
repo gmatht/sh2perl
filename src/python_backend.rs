@@ -212,7 +212,7 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) => self.py_ident(name),
+            ArithAst::Var(name) | ArithAst::Ident(name) => self.py_ident(name),
             ArithAst::Index { .. } => {
                 self.mark_todo("arith Index");
                 "0".into()
@@ -238,6 +238,8 @@ impl Render {
                 self.sh2_calls.insert("arith".into());
                 format!("sh2_arith()")
             }
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
 
@@ -496,7 +498,14 @@ impl Render {
                 let x = self.expr(e);
                 self.emit(&format!("{x}"));
             }
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, asm, .. } => {
+                // Declarator-position asm label (core request
+                // c-sh-go-toplevelasmargument-20260814-042952) — no
+                // Python rendering; refuse loudly (refuse > guess).
+                if let Some(spec) = asm {
+                    self.mark_todo(&format!("asm label '{}' on an assign", spec.template));
+                    return;
+                }
                 let Some(t) = targets.first() else {
                     self.mark_todo("multi-target assign");
                     return;
@@ -616,7 +625,7 @@ impl Render {
                     .unwrap_or_else(|| "0".into());
                 self.emit(&format!("sys.exit({code})"));
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 let n = self.py_ident(name);
                 self.emit(&format!("def {n}():"));
                 self.in_function += 1;
@@ -748,7 +757,7 @@ impl Render {
 fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
                 }
@@ -806,7 +815,7 @@ fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     collect_vars_expr(x, out);
                 }
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 out.insert(name.clone());
                 collect_vars(body, out);
             }

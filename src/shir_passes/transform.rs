@@ -146,7 +146,7 @@ fn analyze_store_only(
     ) {
         match s {
             IrStmt::Expr(e) => walk_expr(e, store, unsafe_v, any_dynamic),
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if t.indices.is_empty() && is_plain_var(&t.var) {
                         unsafe_v.insert(t.var.clone());
@@ -308,6 +308,7 @@ fn rewrite_setvar_stmts(
                             indices: vec![],
                         }],
                         expr: value.clone(),
+                        asm: None,
                     };
                 }
             }
@@ -363,6 +364,27 @@ fn rewrite_setvar_stmts(
         }
         IrStmt::Function { body, .. } => {
             for s in body {
+                rewrite_setvar_stmts(s, store, unsafe_v);
+            }
+        }
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            for s in body.iter_mut() {
+                rewrite_setvar_stmts(s, store, unsafe_v);
+            }
+            for e in excepts.iter_mut() {
+                for s in e.body.iter_mut() {
+                    rewrite_setvar_stmts(s, store, unsafe_v);
+                }
+            }
+            for s in else_body.iter_mut() {
+                rewrite_setvar_stmts(s, store, unsafe_v);
+            }
+            for s in finally_body.iter_mut() {
                 rewrite_setvar_stmts(s, store, unsafe_v);
             }
         }

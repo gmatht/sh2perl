@@ -753,6 +753,18 @@ impl Render {
                 self.mark_todo("Arrow");
                 "nil".into()
             }
+            IrExpr::ArrayComp { .. } => {
+                self.mark_todo("ArrayComp expr");
+                "nil".into()
+            }
+            IrExpr::Lambda { .. } => {
+                self.mark_todo("Lambda expr");
+                "nil".into()
+            }
+            IrExpr::Splice(_) => {
+                self.mark_todo("Splice expr");
+                "nil".into()
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr_any(i)).collect();
                 format!("[]any{{{}}}", elems.join(", "))
@@ -859,7 +871,7 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) => {
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
                 if let Some(v) = self.arith_var(name) {
                     v
                 } else {
@@ -932,6 +944,10 @@ impl Render {
                     t
                 }
             }
+            // C-frontend nodes (never emitted by the shell path): sizeof is
+            // a compile-time constant; casts are identity (Go int64).
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
 
@@ -1815,7 +1831,21 @@ impl Render {
     fn cmd_text_stmt(&mut self, s: &IrStmt) -> Option<String> {
         match s {
             IrStmt::Expr(e) => self.cmd_text_expr(e),
-            IrStmt::Assign { targets, expr } => {
+            // try/except has no shell text — a bash -c fallback cannot
+            // express it
+            IrStmt::Try { .. } => None,
+            // select over channels has no shell text either
+            IrStmt::Select { .. } => None,
+            // inline asm has no shell text either (JS no-op only)
+            IrStmt::Asm { .. } => None,
+            IrStmt::Assign { targets, expr, asm, .. } => {
+                // Declarator-position asm label (core request
+                // c-sh-go-toplevelasmargument-20260814-042952) — no Go
+                // rendering; refuse loudly (refuse > guess).
+                if let Some(spec) = asm {
+                    self.mark_todo(&format!("asm label '{}' on an assign", spec.template));
+                    return None;
+                }
                 let t = targets.first()?;
                 // array assignment `arr=(a b c)`
                 if let IrExpr::Call { func, args } = expr {
@@ -1860,6 +1890,9 @@ impl Render {
                 let t = self.cmd_text_stmts(b)?;
                 Some(format!("( {t} )"))
             }
+            IrStmt::ForInit { .. } => None,
+            IrStmt::Continue => Some("continue".to_string()),
+            IrStmt::Break => Some("break".to_string()),
             IrStmt::While { cond, body } => {
                 let b = self.cmd_text_stmts(body)?;
                 // multi-command condition (`while cmd1; cmd2; do …`)
@@ -1888,7 +1921,7 @@ impl Render {
                 let list = self.cmd_text_expr(iter)?;
                 Some(format!("for {var} in {list}; do {b}; done"))
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 let b = self.cmd_text_stmts(body)?;
                 Some(format!("{name}() {{ {b}; }}"))
             }
@@ -2434,7 +2467,7 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => self.stmt_expr(e),
-            IrStmt::Assign { targets, expr } => self.stmt_assign(targets, expr),
+            IrStmt::Assign { targets, expr, .. } => self.stmt_assign(targets, expr),
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
                     self.mark_written(&d.name);
@@ -2601,7 +2634,7 @@ impl Render {
                     self.stmt(s);
                 }
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 let m = self.go_ident(name);
                 self.mark_written(name);
                 self.functions.insert(name.clone());
@@ -2799,12 +2832,36 @@ impl Render {
                 // finishes (stdout pipe), so the visible output matches
                 // when the job is skipped
             }
+            IrStmt::Try { .. } => {
+                self.mark_todo("try");
+            }
+            IrStmt::Select { .. } => {
+                self.mark_todo("select");
+            }
+            IrStmt::Asm { .. } => {
+                self.mark_todo("asm");
+            }
             IrStmt::Exec { .. }
             | IrStmt::Require(_)
             | IrStmt::RawText(_)
             | IrStmt::Label(_)
             | IrStmt::Goto(_) => {
                 self.mark_todo(&format!("stmt {:?}", s));
+            }
+            IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
+            IrStmt::Continue => {
+                if self.loop_depth > 0 {
+                    self.emit("continue;");
+                } else {
+                    self.mark_todo("continue outside a loop");
+                }
+            }
+            IrStmt::Break => {
+                if self.loop_depth > 0 {
+                    self.emit("break;");
+                } else {
+                    self.mark_todo("break outside a loop");
+                }
             }
         }
     }
@@ -5264,7 +5321,7 @@ fn scan_imports(text: &str) -> Vec<&'static str> {
 fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>, arrays: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
                     if !t.indices.is_empty() {
@@ -5356,7 +5413,7 @@ fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>, arrays: &mut BT
                     collect_written(&c.body, out, arrays);
                 }
             }
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 out.insert(name.clone());
                 collect_written(body, out, arrays);
             }

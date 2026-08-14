@@ -524,6 +524,18 @@ impl Render {
                 self.mark_todo("Arrow");
                 "\"\"".into()
             }
+            IrExpr::ArrayComp { .. } => {
+                self.mark_todo("ArrayComp expr");
+                "\"\"".into()
+            }
+            IrExpr::Lambda { .. } => {
+                self.mark_todo("Lambda expr");
+                "\"\"".into()
+            }
+            IrExpr::Splice(_) => {
+                self.mark_todo("Splice expr");
+                "\"\"".into()
+            }
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "\"\"".into()
@@ -681,6 +693,18 @@ impl Render {
                 self.mark_todo("Arrow");
                 "false".into()
             }
+            IrExpr::ArrayComp { .. } => {
+                self.mark_todo("ArrayComp expr");
+                "false".into()
+            }
+            IrExpr::Lambda { .. } => {
+                self.mark_todo("Lambda expr");
+                "false".into()
+            }
+            IrExpr::Splice(_) => {
+                self.mark_todo("Splice expr");
+                "false".into()
+            }
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "false".into()
@@ -813,7 +837,7 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) => {
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     self.need_toint = true;
@@ -865,6 +889,8 @@ impl Render {
                 self.sh2_calls.insert("arith".into());
                 "sh2Arith()".to_string()
             }
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
 
@@ -1229,7 +1255,14 @@ impl Render {
                 let x = self.expr_any(e);
                 self.emit(&format!("_ = {x};"));
             }
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, asm, .. } => {
+                // Declarator-position asm label (core request
+                // c-sh-go-toplevelasmargument-20260814-042952) — no Zig
+                // rendering; refuse loudly (refuse > guess).
+                if let Some(spec) = asm {
+                    self.mark_todo(&format!("asm label '{}' on an assign", spec.template));
+                    return;
+                }
                 let Some(t) = targets.first() else {
                     self.mark_todo("multi-target assign");
                     return;
@@ -1447,6 +1480,12 @@ impl Render {
             | IrStmt::Goto(_) => {
                 self.mark_todo(&format!("stmt {:?}", s));
             }
+            IrStmt::Try { .. } => self.mark_todo("try"),
+            IrStmt::Select { .. } => self.mark_todo("select"),
+            IrStmt::Asm { .. } => self.mark_todo("asm"),
+            IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
+            IrStmt::Continue => self.emit("continue;"),
+            IrStmt::Break => self.emit("break;"),
         }
     }
 
@@ -1635,7 +1674,7 @@ fn camel(s: &str) -> String {
 fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
                 }

@@ -18,6 +18,11 @@ pub fn show_help(program_name: &str) {
     println!("  parse --perl <input>           - Convert shell script to Perl");
     println!("  --mir <input>                  - Export Mid-level Intermediate Representation (MIR) as JSON");
     println!("  --shir <input>                 - Export the language-neutral ShIR as JSON (backend contract, A1)");
+    println!("  --shir-in-estree <input>        - ShIR JSON -> ESTree/JS (the executed bash translation)");
+    println!("  --true64                        - TRUE 64-bit bash arithmetic (off by default): out-of-±2^53");
+    println!("                                   - vars lower to BigInt64Array slots (hot RMW accumulators) or");
+    println!("                                   - BigInt values. See docs/true64.md. Place after the mode flag:");
+    println!("                                   - debashc --shir-in-estree --true64 <file.a1>");
     println!(
         "  --mir -O <input>               - Export optimized MIR with transformations applied"
     );

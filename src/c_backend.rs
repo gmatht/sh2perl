@@ -979,7 +979,7 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) => {
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
                 if self.is_num(name) {
                     self.c_ident(name)
                 } else {
@@ -1061,6 +1061,11 @@ impl Render {
                     format!("{}{}", name, if *delta >= 0 { "++" } else { "--" })
                 }
             }
+            // C-frontend nodes (never emitted by the shell path): sizeof
+            // is a compile-time constant; casts render as C casts (the C
+            // target's native widening/narrowing).
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
 
@@ -1928,7 +1933,18 @@ impl Render {
                         self.emit("_sh_addraw(\"; done\");");
                     }
                 }
-                IrStmt::Assign { targets, expr } => {
+                IrStmt::Assign { targets, expr, asm, .. } => {
+                    // Declarator-position asm label (core request
+                    // c-sh-go-toplevelasmargument-20260814-042952) — no C
+                    // rendering in this tree (the backend worktree owns
+                    // the asm-aware renderer); refuse loudly.
+                    if let Some(spec) = asm {
+                        self.emit(&format!(
+                            "// TODO(unsupported): asm label '{}' on an assign",
+                            spec.template
+                        ));
+                        return;
+                    }
                     // shell text form: NAME=$(( ... )) / NAME='value'
                     if let Some(t) = targets.first() {
                         if t.indices.is_empty() {
@@ -4726,7 +4742,7 @@ impl Render {
                 let x = self.expr(e);
                 self.emit(&format!("{x};"));
             }
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 let Some(t) = targets.first() else {
                     self.mark_todo("multi-target assign");
                     return;
@@ -5852,7 +5868,7 @@ fn collect_fn_defs(
 ) {
     for s in stmts {
         match s {
-            IrStmt::Function { name, body } => {
+            IrStmt::Function { name, body, .. } => {
                 names.insert(name.clone());
                 defs.push((name.clone(), body.clone()));
             }
@@ -5891,7 +5907,7 @@ fn const_assign_rhs(
     let mut out = HashMap::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for s in stmts {
-        if let IrStmt::Assign { targets, expr } = s {
+        if let IrStmt::Assign { targets, expr, .. } = s {
             for t in targets {
                 if t.indices.is_empty()
                     && const_vars.get(&t.var) == Some(&VarKind::Const)
@@ -5999,7 +6015,7 @@ fn collect_const_reads_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
 
 fn collect_const_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
     match a {
-        ArithAst::Var(name) => {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
             out.insert(name.clone());
         }
         ArithAst::Index { var, key } => {
@@ -6023,6 +6039,8 @@ fn collect_const_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
             out.insert(var.clone());
         }
         ArithAst::Num(_) => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => collect_const_arith(arg, out),
     }
 }
 
@@ -6080,7 +6098,7 @@ fn mark_seq_loop_vars(s: &IrStmt, var_types: &mut HashMap<String, IrType>) {
 fn collect_assoc_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if !t.indices.is_empty() {
                         if let IrExpr::Str(k, _) = &t.indices[0] {
@@ -6294,7 +6312,7 @@ fn collect_assoc_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
 fn collect_array_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if !t.indices.is_empty() {
                         out.insert(t.var.clone());
@@ -6628,7 +6646,7 @@ fn collect_declare_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
                 }
@@ -6831,7 +6849,7 @@ fn collect_store_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
 
 fn collect_store_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
     match a {
-        ArithAst::Var(name) => {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
             out.insert(name.clone());
         }
         ArithAst::Index { var, key } => {
@@ -6858,6 +6876,8 @@ fn collect_store_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
             out.insert(var.clone());
         }
         ArithAst::Num(_) => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => collect_store_arith(arg, out),
     }
 }
 
@@ -6870,7 +6890,7 @@ fn collect_vars_full(
 ) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
                 }
@@ -6927,7 +6947,7 @@ fn collect_vars_full(
 fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
                 }
@@ -7137,7 +7157,7 @@ fn is_ident(s: &str) -> bool {
 fn arith_leaves_at_width(a: &ArithAst, r: &Render, w: Width, has_var: &mut bool) -> bool {
     match a {
         ArithAst::Num(_) => true,
-        ArithAst::Var(name) => {
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
             *has_var = true;
             // genuinely numeric (a string var's width default I64 must not
             // match; its rendered type is `char*`)
@@ -7163,6 +7183,8 @@ fn arith_leaves_at_width(a: &ArithAst, r: &Render, w: Width, has_var: &mut bool)
             *has_var = true;
             r.is_num(var) && r.width_of_var(var) == w
         }
+        ArithAst::Sizeof(_) => true, // a compile-time constant fits any width
+        ArithAst::Cast { arg, .. } => arith_leaves_at_width(arg, r, w, has_var),
     }
 }
 
@@ -7532,7 +7554,7 @@ fn arith_range_local(
 /// target is excluded — its RHS vars are included).
 fn arith_vars(a: &ArithAst, out: &mut Vec<String>) {
     match a {
-        ArithAst::Var(n) => out.push(n.clone()),
+        ArithAst::Var(n) | ArithAst::Ident(n) => out.push(n.clone()),
         ArithAst::Index { var, key } => {
             out.push(var.clone());
             arith_vars(key, out);
@@ -7552,6 +7574,8 @@ fn arith_vars(a: &ArithAst, out: &mut Vec<String>) {
         ArithAst::Assign { rhs, .. } => arith_vars(rhs, out),
         ArithAst::IncDec { var, .. } => out.push(var.clone()),
         ArithAst::Num(_) => {}
+        ArithAst::Sizeof(_) => {}
+        ArithAst::Cast { arg, .. } => arith_vars(arg, out),
     }
 }
 
@@ -7560,7 +7584,7 @@ fn arith_vars(a: &ArithAst, out: &mut Vec<String>) {
 fn arith_shell(a: &ArithAst) -> String {
     match a {
         ArithAst::Num(n) => n.to_string(),
-        ArithAst::Var(name) => format!("${{{name}}}"),
+        ArithAst::Var(name) | ArithAst::Ident(name) => format!("${{{name}}}"),
         ArithAst::Index { var, key } => format!("${{{var}[{}]}}", arith_shell(key)),
         ArithAst::Bin { op, lhs, rhs } => {
             format!("({} {} {})", arith_shell(lhs), op, arith_shell(rhs))
@@ -7582,6 +7606,8 @@ fn arith_shell(a: &ArithAst) -> String {
                 format!("{var}{u}{d}")
             }
         }
+        ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+        ArithAst::Cast { arg, .. } => arith_shell(arg),
     }
 }
 

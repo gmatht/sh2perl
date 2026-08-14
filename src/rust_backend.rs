@@ -590,6 +590,18 @@ impl Render {
                 self.mark_todo("Arrow");
                 "String::new()".into()
             }
+            IrExpr::ArrayComp { .. } => {
+                self.mark_todo("ArrayComp expr");
+                "String::new()".into()
+            }
+            IrExpr::Lambda { .. } => {
+                self.mark_todo("Lambda expr");
+                "String::new()".into()
+            }
+            IrExpr::Splice(_) => {
+                self.mark_todo("Splice expr");
+                "String::new()".into()
+            }
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "String::new()".into()
@@ -638,7 +650,7 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) => {
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
                 if !self.declared(name) {
                     self.sh2_calls.insert("getVar".into());
                     return "sh2_getvar()".to_string();
@@ -691,6 +703,8 @@ impl Render {
                 self.sh2_calls.insert("arith".into());
                 "sh2_arith()".to_string()
             }
+            ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+            ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
 
@@ -1011,7 +1025,14 @@ impl Render {
                 let x = self.expr_any(e);
                 self.emit(&format!("let _ = {x};"));
             }
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, asm, .. } => {
+                // Declarator-position asm label (core request
+                // c-sh-go-toplevelasmargument-20260814-042952) — no Rust
+                // rendering; refuse loudly (refuse > guess).
+                if let Some(spec) = asm {
+                    self.mark_todo(&format!("asm label '{}' on an assign", spec.template));
+                    return;
+                }
                 let Some(t) = targets.first() else {
                     self.mark_todo("multi-target assign");
                     return;
@@ -1226,6 +1247,12 @@ impl Render {
             | IrStmt::Goto(_) => {
                 self.mark_todo(&format!("stmt {:?}", s));
             }
+            IrStmt::Try { .. } => self.mark_todo("try"),
+            IrStmt::Select { .. } => self.mark_todo("select"),
+            IrStmt::Asm { .. } => self.mark_todo("asm"),
+            IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
+            IrStmt::Continue => self.emit("continue;"),
+            IrStmt::Break => self.emit("break;"),
         }
     }
 
@@ -1352,7 +1379,7 @@ fn stub_name(name: &str) -> String {
 fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
                 }

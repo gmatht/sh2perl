@@ -32,6 +32,8 @@ use std::ptr::null_mut;
 use std::slice;
 
 use crate::estree::ast_to_estree_json;
+use crate::glsl_backend::{shir_to_glsl_opts, ShGlslOptions};
+use crate::shir::ast_to_ir_raw;
 use crate::{Generator, Lexer, Parser};
 
 /// Allocate a `[u32 len][data][0]` buffer and return a pointer to `data`.
@@ -109,6 +111,39 @@ pub extern "C" fn debashc_to_estree(input: *const u8, input_len: usize) -> *mut 
             Ok(json) => alloc_string(&ok_json(&json)),
             Err(e) => alloc_string(&err_json(&e)),
         },
+        Err(e) => alloc_string(&err_json(&e)),
+    }
+}
+
+/// `debashc_to_glsl(input, input_len) -> *mut u8` — shell → **GLSL ES 1.00
+/// render fragment** (the MIMEcroft shader pipeline): the bash program
+/// becomes a fragment shader with the frag_x/frag_y/vcolor_*/uv_*/tex_*
+/// bridges (see glsl_backend) — so the browser can compile bash-authored
+/// shaders through the otranspiler wasm, no native binary needed.
+#[no_mangle]
+pub extern "C" fn debashc_to_glsl(input: *const u8, input_len: usize) -> *mut u8 {
+    let input = unsafe { slice::from_raw_parts(input, input_len) };
+    let input = String::from_utf8_lossy(input);
+    match Parser::new(&input).parse() {
+        Ok(commands) => {
+            let prog = ast_to_ir_raw(&commands);
+            let glsl = shir_to_glsl_opts(
+                &prog,
+                &ShGlslOptions {
+                    es100: true,
+                    color_out: true,
+                    tex_size: 16,
+                    // max_view stays the Default (0): the coordinate
+                    // range is EMBEDDER-owned (core request
+                    // estree-20260813-232001-glsl-options-build-fix) —
+                    // the browser goes through the otranspilerl crate's
+                    // view-parameterized entry points; this legacy frag
+                    // entry must not bake in a canvas size.
+                    ..Default::default()
+                },
+            );
+            alloc_string(&ok_json(&glsl))
+        }
         Err(e) => alloc_string(&err_json(&e)),
     }
 }
@@ -220,7 +255,8 @@ fn render_ir(prog: &crate::ir::IrProgram, lang: &str) -> Result<String, String> 
 
 fn otranspilerl_transpile_impl(src: &str, src_lang: &str, tgt_lang: &str) -> Result<String, String> {
     if src_lang == "shir" {
-        let prog = crate::shir_json_in::shir_json_to_ir(src)?;
+        let mut prog = crate::shir_json_in::shir_json_to_ir(src)?;
+        crate::shir_passes::strip_cfor(&mut prog);
         return render_ir(&prog, tgt_lang);
     }
     if src_lang == "sh" {
@@ -247,7 +283,11 @@ pub extern "C" fn otranspilerl_shir(src: *const u8, src_len: usize) -> *mut u8 {
 pub extern "C" fn otranspilerl_render(a1: *const u8, a1_len: usize, lang: *const u8, lang_len: usize) -> *mut u8 {
     let a1 = read_str(a1, a1_len);
     let lang = read_str(lang, lang_len);
-    let res = crate::shir_json_in::shir_json_to_ir(&a1).and_then(|prog| render_ir(&prog, &lang));
+    let res = crate::shir_json_in::shir_json_to_ir(&a1)
+        .and_then(|mut prog| {
+            crate::shir_passes::strip_cfor(&mut prog);
+            render_ir(&prog, &lang)
+        });
     match res {
         Ok(out) => alloc_string(&ok_json(&out)),
         Err(e) => alloc_string(&err_json(&e)),

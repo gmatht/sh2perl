@@ -332,6 +332,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                                 indices: vec![],
                             }],
                             expr: IrExpr::Int(0),
+                            asm: None,
                         },
                         generator.indent_level,
                     ));
@@ -367,6 +368,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
                                     indices: vec![],
                                 }],
                                 expr: IrExpr::Int(0),
+                                asm: None,
                             },
                             generator.indent_level,
                         ));
