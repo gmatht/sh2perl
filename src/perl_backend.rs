@@ -5622,7 +5622,9 @@ impl Render {
             }
         }
         // a FAILED redirect (missing input file, bad path) fails the
-        // command — the body is skipped (bash continues the script)
+        // command — the body is skipped (bash continues the script);
+        // any open failure set $? = 256 — the reset clears stale values
+        self.emit("$? = 0 unless $? == 256;");
         self.emit("if ($? == 0) {");
         self.depth += 1;
         for s in inner {
