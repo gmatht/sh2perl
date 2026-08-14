@@ -40,6 +40,9 @@ lazy_static::lazy_static! {
     /// `typeset -p NAME` — bash prints `declare -<attrs> NAME="value"`;
     /// the attributes are tracked from the earlier declarations.
     static ref DECLARED_ATTRS: std::sync::Mutex<std::collections::HashMap<String, String>> = Default::default();
+    /// The program reads ${PIPESTATUS[i]} — pipelines must capture the
+    /// per-stage rcs into \$_psb.<i> files.
+    static ref PIPESTATUS_NEEDED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 }
 
 /// Marker prefixes the core's lowering tags unquoted glob / process-
@@ -662,6 +665,7 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
     *NAMEREF_VARS.lock().unwrap() = Default::default();
     *FUNCTION_BODIES.lock().unwrap() = Default::default();
     *DECLARED_ATTRS.lock().unwrap() = Default::default();
+    *PIPESTATUS_NEEDED.lock().unwrap() = needs_pipestatus(&prog.stmts);
     // bash-format function definitions (`typeset -f NAME` displays them)
 
     collect_function_bodies(prog);
@@ -1933,13 +1937,33 @@ fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
         "captureWords" => Ok(capture_wrap(&arrow_to_sh(args)?, false)),
             "pipeline" => {
                 let stages = pipeline_stages(args)?;
+                let ps = *PIPESTATUS_NEEDED.lock().unwrap();
                 let mut line = String::new();
+                if ps {
+                    line.push_str("_psb=\"$(mktemp -u)\"; ");
+                }
+                let mut first = true;
                 for (i, stg) in stages.iter().enumerate() {
-                    if i > 0 {
+                    if !first {
                         line.push_str(" | ");
                     }
+                    first = false;
                     let s = stmts_inline(stg)?;
                     let s = wrap_pipeline_stage(stg, &s);
+                    if ps {
+                        // capture the stage rc into a per-stage file; the
+                        // LAST stage's rc must also be the pipeline's rc
+                        if i + 1 == stages.len() {
+                            line.push_str(&format!(
+                                "{{ {s}; _r=$?; echo \"$_r\" >\"$_psb.{i}\"; [ \"$_r\" -eq 0 ]; }}"
+                            ));
+                        } else {
+                            line.push_str(&format!(
+                                "{{ {s}; echo $? >\"$_psb.{i}\"; }}"
+                            ));
+                        }
+                        continue;
+                    }
                     // a heredoc stage is multi-line — the `| next` must
                     // apply to a brace group, not the EOF terminator line
                     // (the `}` alone on the line after the terminator is
@@ -2111,13 +2135,33 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             }
             "pipeline" => {
                 let stages = pipeline_stages(args)?;
+                let ps = *PIPESTATUS_NEEDED.lock().unwrap();
                 let mut line = String::new();
+                if ps {
+                    line.push_str("_psb=\"$(mktemp -u)\"; ");
+                }
+                let mut first = true;
                 for (i, stg) in stages.iter().enumerate() {
-                    if i > 0 {
+                    if !first {
                         line.push_str(" | ");
                     }
+                    first = false;
                     let s = stmts_inline(stg)?;
                     let s = wrap_pipeline_stage(stg, &s);
+                    if ps {
+                        // capture the stage rc into a per-stage file; the
+                        // LAST stage's rc must also be the pipeline's rc
+                        if i + 1 == stages.len() {
+                            line.push_str(&format!(
+                                "{{ {s}; _r=$?; echo \"$_r\" >\"$_psb.{i}\"; [ \"$_r\" -eq 0 ]; }}"
+                            ));
+                        } else {
+                            line.push_str(&format!(
+                                "{{ {s}; echo $? >\"$_psb.{i}\"; }}"
+                            ));
+                        }
+                        continue;
+                    }
                     // a heredoc stage is multi-line — the `| next` must
                     // apply to a brace group, not the EOF terminator line
                     // (the `}` alone on the line after the terminator is
@@ -2540,6 +2584,71 @@ fn needs_hostname(stmts: &[IrStmt]) -> bool {
         false
     }
     walk(stmts)
+}
+
+
+/// Does the program read ${PIPESTATUS[i]}? The pipeline lowering must
+/// capture the per-stage rcs.
+fn needs_pipestatus(stmts: &[IrStmt]) -> bool {
+    fn has_ps(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => {
+                if (func == "param" || func == "getVar" || func == "arrayIndex")
+                    && args.iter().any(|a| matches!(a, IrExpr::Str(s, _) if s.starts_with("PIPESTATUS")))
+                {
+                    return true;
+                }
+                args.iter().any(has_ps)
+            }
+            IrExpr::Array(es) => es.iter().any(has_ps),
+            IrExpr::Object(es) => es.iter().any(|(_, v)| has_ps(v)),
+            IrExpr::Arrow(stmts) => walk(stmts),
+            IrExpr::BinOp { lhs, rhs, .. } => has_ps(lhs) || has_ps(rhs),
+            IrExpr::Interpolate(parts) => parts
+                .iter()
+                .any(|p| matches!(p, InterpPart::Expr(x) if has_ps(x))),
+            _ => false,
+        }
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            match st {
+                IrStmt::Expr(e) => { if has_ps(e) { return true; } }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    if has_ps(cond) || walk(body) { return true; }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    if has_ps(cond) || walk(then) || walk(else_)
+                        || elsifs.iter().any(|(c, b)| has_ps(c) || walk(b))
+                    { return true; }
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    if walk(body) { return true; }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    if has_ps(iter) || walk(body) { return true; }
+                }
+                IrStmt::Assign { expr, .. } => { if has_ps(expr) { return true; } }
+                IrStmt::Redirect { inner, redirects } => {
+                    if walk(inner) { return true; }
+                    for r in redirects {
+                        if has_ps(&r.target) { return true; }
+                    }
+                }
+                IrStmt::Function { body, .. } => { if walk(body) { return true; } }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
+/// `${PIPESTATUS[i]}` — the per-stage rc files written by the pipeline
+/// lowering (see the pipeline arm); a missing file (no pipeline ran) is
+/// bash's 0 for a non-pipeline context.
+fn pipestatus_read(i: usize) -> String {
+    format!("$(cat \"$_psb.{i}\" 2>/dev/null || echo 0)")
 }
 
 // Does the program need the `_ls` polyfill prologue (a non-`-l` ls that
@@ -3767,6 +3876,24 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
             words.join(" ")
         ));
     }
+    // `printf -v VAR FMT ARGS` — bash assigns the formatted output to a
+    // var; dash has no -v. Render as a cmdsub assignment.
+    if cmd_name == Some("printf") && env.is_none() {
+        if let Some(IrExpr::Str(fl, _)) = args.first() {
+            if fl == "-v" && args.len() >= 3 {
+                if let Some(IrExpr::Str(vn, _)) = args.get(1) {
+                    let mut rest = Vec::new();
+                    for a in args.iter().skip(2) {
+                        rest.push(word_to_sh(a)?);
+                    }
+                    return Ok(format!(
+                        "{vn}=\"$(printf {})\"",
+                        rest.join(" ")
+                    ));
+                }
+            }
+        }
+    }
     // `printf %q` — bash-only directive; dash has no %q. Route through
     // the _printf_q polyfill (ANSI-C quoting via od). (args is the
     // ALREADY de-nested argv — the caller unwraps the Array.)
@@ -4331,6 +4458,16 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
     let name = raw_arg(args, 1)?;
     match op.as_str() {
         "" => {
+            // ${PIPESTATUS[i]} — the per-stage rc files from the pipeline
+            // lowering
+            if *PIPESTATUS_NEEDED.lock().unwrap() {
+                if let Some((an, idx)) = name.strip_suffix(']').and_then(|n| n.split_once('[')) {
+                    if an == "PIPESTATUS" && idx.chars().all(|c| c.is_ascii_digit()) {
+                        let i: usize = idx.parse().unwrap_or(0);
+                        return Ok(pipestatus_read(i));
+                    }
+                }
+            }
             // the baked-name form: `arr[1]` (an element read -> ${arr_1}),
             // `#arr` (length -> ${arr_len}), `arr[@]`/`arr[*]` (the whole
             // array -> the per-element counter helper). A bare `param("",
@@ -4832,9 +4969,13 @@ fn test_eq_to_sh(lhs: &str, rhs: &str) -> String {
         // optional: `?(a|b)` matches empty or a|b
         format!("case \"{lhs}\" in |{inner}) : ;; *) false ;; esac")
     } else if *NOCASEMATCH.lock().unwrap() {
+        // strip the source's quotes around the pattern before folding
+        // (`[[ "ABC" == "abc" ]]` — the rhs arrives `"abc"`; the quote
+        // chars would make the folded class literal)
+        let rhs_clean = rhs.trim_matches(['"', '\'']);
         format!(
             "case \"{lhs}\" in {}) : ;; *) false ;; esac",
-            fold_case_pattern(rhs)
+            fold_case_pattern(rhs_clean)
         )
     } else {
         format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac")
