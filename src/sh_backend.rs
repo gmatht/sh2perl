@@ -922,6 +922,16 @@ _cmp() {
         out.push_str("        ''|'-'|*[!0-9-]*|-*[!0-9]*) echo 0 ;;\n");
         out.push_str("        *) echo \"$1\" ;;\n");
         out.push_str("    esac\n");
+        out.push_str("}\n");
+        // `**` with runtime operands (dash has no power operator)
+        out.push_str("_pow() {\n");
+        out.push_str("    _pw_b=$1; _pw_e=$2\n");
+        out.push_str("    if [ \"$_pw_e\" -lt 0 ]; then echo 0; return; fi\n");
+        out.push_str("    _pw_a=1\n");
+        out.push_str("    while [ \"$_pw_e\" -gt 0 ]; do\n");
+        out.push_str("        _pw_a=$((_pw_a * _pw_b)); _pw_e=$((_pw_e - 1))\n");
+        out.push_str("    done\n");
+        out.push_str("    echo \"$_pw_a\"\n");
         out.push_str("}\n\n");
     }
     if needs_arr_helper(prog) {
@@ -1111,11 +1121,26 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("done\n");
             Ok(())
         }
-        // the strip_cfor pass lowers C-style for loops before render; a
-        // surviving ForInit is a lowering gap — refuse loudly
-        IrStmt::ForInit { .. } => Err(
-            "sh renderer: un-stripped ForInit (the strip_cfor pass should have lowered it)".into(),
-        ),
+        // C-style for loops arrive as ForInit (init; cond; step; body) —
+        // lower to a portable while loop (dash has no `for (( ))`)
+        IrStmt::ForInit { init, cond, step, body } => {
+            for i in init {
+                stmt_to_sh(i, d, out)?;
+            }
+            indent(out, d);
+            out.push_str("while ");
+            out.push_str(&cmd_to_sh(cond)?);
+            out.push_str("; do\n");
+            for b in body {
+                stmt_to_sh(b, d + 1, out)?;
+            }
+            for s in step {
+                stmt_to_sh(s, d + 1, out)?;
+            }
+            indent(out, d);
+            out.push_str("done\n");
+            Ok(())
+        }
         IrStmt::Continue => {
             indent(out, d);
             out.push_str("continue\n");
@@ -1556,11 +1581,93 @@ fn set_array_to_sh(name: &str, items: &str, append: bool) -> String {
     parts.join("; ")
 }
 
+/// A `while`/`until` producer may never terminate — it must stream (a
+/// FIFO + backgrounded writer: the consumer blocks for data and the
+/// producer dies with SIGPIPE once the consumer exits). Finite producers
+/// stay FOREGROUND on a plain temp file — a FIFO would break consumers
+/// that re-open their inputs (the _cmp bisect reads each file many
+/// times; a fifo's second open blocks forever).
+fn producer_maybe_infinite(producer: &str) -> bool {
+    producer.contains("while") || producer.contains("until")
+}
+
+/// `$(inner)` — but a subshell `( ... )` directly after `$(` reads as
+/// the arithmetic `$((` (dash/bash both), so separate with a space.
+fn capture_wrap(inner: &str, quoted: bool) -> String {
+    let inner = if inner.starts_with('(') {
+        format!(" {inner}")
+    } else {
+        inner.to_string()
+    };
+    if quoted {
+        format!("\"$({inner})\"")
+    } else {
+        format!("$({inner})")
+    }
+}
+
+/// dash's arithmetic errors (division/modulo by zero, an unset `$1`-
+/// style positional expansion) are FATAL — the whole script dies with rc
+/// 2; bash reports on stderr and continues with the expansion empty.
+/// A failed-cmdsub guard reproduces bash's observable (empty value, rc
+/// 0) — but only for side-effect-free expressions: an assignment or
+/// ++/-- inside would happen in the subshell and be lost.
+fn arith_needs_guard(raw: &str) -> bool {
+    let mut positional = false;
+    let b = raw.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            positional = true;
+        }
+        i += 1;
+    }
+    let has_assign = {
+        let mut j = 0;
+        let mut a = false;
+        while j < b.len() {
+            if b[j] == b'=' {
+                let prev = if j > 0 { b[j - 1] } else { 0 };
+                let next = if j + 1 < b.len() { b[j + 1] } else { 0 };
+                if prev != b'=' && prev != b'!' && prev != b'<' && prev != b'>' && next != b'=' {
+                    a = true;
+                }
+            }
+            j += 1;
+        }
+        a
+    };
+    (raw.contains('/') || raw.contains('%') || positional)
+        && !has_assign
+        && !raw.contains("++")
+        && !raw.contains("--")
+}
+
+fn arith_value_to_sh(raw: &str) -> String {
+    let body = arith_rewrite(raw);
+    if arith_needs_guard(raw) {
+        format!("$( ( printf '%s' \"$(({body}))\" ) 2>/dev/null || true )")
+    } else {
+        format!("$(({body}))")
+    }
+}
+
+/// The ArithAst form of the above (the guard scan runs over the RENDERED
+/// body — the operators and `_num` wrappers are the same text).
+fn arith_ast_value_to_sh(a: &ArithAst) -> String {
+    let body = arith_to_sh(a);
+    if arith_needs_guard(&body) {
+        format!("$( ( printf '%s' \"$(({body}))\" ) 2>/dev/null || true )")
+    } else {
+        format!("$(({body}))")
+    }
+}
+
 fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
     match expr {
         IrExpr::Call { func, args } => match func.as_str() {
-            "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
-        "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
+            "capture" => Ok(capture_wrap(&arrow_to_sh(args)?, true)),
+        "captureWords" => Ok(capture_wrap(&arrow_to_sh(args)?, false)),
             "pipeline" => {
                 let stages = pipeline_stages(args)?;
                 let mut line = String::new();
@@ -1672,39 +1779,34 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             "test" => {
                 let t = raw_arg(args, 0)?;
                 let t = t.trim();
+                // the second arg is the `[[ ` marker when the source used
+                // `[[ ]]` — single `=` there is a PATTERN match, not the
+                // POSIX string comparison
+                let is_bb = args.get(1).map(|a| matches!(a, IrExpr::Str(s, _) if s.contains("[[") || s.contains("]]"))).unwrap_or(false);
                 // `[[ ... ]]`-style compound tests survive as raw text; `[ ]`
                 // cannot express &&/||, so keep those in [[ ]] form.
                 if t.contains("&&") || t.contains("||") {
                     Ok(format!("[[ {t} ]]"))
                 } else if let Some((lhs, rhs)) = split_test_op(t, "==") {
-                    // pattern match: case emulation (dash has no == in test)
-                    if let Some((neg, rest)) =
-                        rhs.strip_prefix("!(").and_then(|r| r.split_once(')'))
-                    {
-                        // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`:
-                        //   case "$s" in *Y) case "$s" in P Y) false;; *) :;; esac;; *) false;; esac
+                    Ok(test_eq_to_sh(&lhs, &rhs))
+                } else if is_bb {
+                    // `[[ "$x" = PATTERN ]]` — single `=` == `==` for [[ ]]
+                    // (longest operators first: `=~`/`!=` contain `=`)
+                    if let Some((lhs, rhs)) = split_test_op(t, "=~") {
                         Ok(format!(
-                            "case \"{lhs}\" in *{rest}) case \"{lhs}\" in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
+                            "printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"
                         ))
-                    } else if let Some(inner) = rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')')) {
-                        // extglob list match: `@(a|b)` == `a|b`
+                    } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
                         Ok(format!(
-                            "case \"{lhs}\" in {inner}) : ;; *) false ;; esac"
+                            "case \"{lhs}\" in {rhs}) false ;; *) : ;; esac"
                         ))
-                    } else if let Some(inner) = rhs.strip_prefix("?(").and_then(|r| r.strip_suffix(')')) {
-                        // optional: `?(a|b)` matches empty or a|b
-                        Ok(format!(
-                            "case \"{lhs}\" in |{inner}) : ;; *) false ;; esac"
-                        ))
-                    } else if *NOCASEMATCH.lock().unwrap() {
-                        Ok(format!(
-                            "case \"{lhs}\" in {}) : ;; *) false ;; esac",
-                            fold_case_pattern(&rhs)
-                        ))
+                    } else if let Some((lhs, rhs)) = split_test_op(t, "=") {
+                        Ok(test_eq_to_sh(&lhs, &rhs))
                     } else {
-                        Ok(format!(
-                            "case \"{lhs}\" in {rhs}) : ;; *) false ;; esac"
-                        ))
+                        // quote bare $(...) and ${...} so word-splitting
+                        // in `[ ]` does not shred cmdsub output
+                        let t = quote_test_expansions(&space_test_ops(t));
+                        Ok(format!("[ {t} ]"))
                     }
                 } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
                     Ok(format!(
@@ -1732,6 +1834,43 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                     line.push_str(&stmts_inline(stg)?);
                 }
                 Ok(line)
+            }
+            "and" | "or" => {
+                // `A && B` / `A || B` — each Arrow renders as a brace
+                // group (keeps side effects; a subshell would lose them)
+                let mut parts: Vec<String> = Vec::new();
+                for a in args {
+                    if let IrExpr::Arrow(stmts) = a {
+                        if stmts.is_empty() {
+                            parts.push("{ :; }".into());
+                        } else {
+                            parts.push(format!("{{ {}; }}", stmts_inline(stmts)?));
+                        }
+                    } else {
+                        parts.push(word_to_sh(a)?);
+                    }
+                }
+                if parts.is_empty() {
+                    Ok(":".into())
+                } else if func == "and" {
+                    Ok(parts.join(" && "))
+                } else {
+                    Ok(parts.join(" || "))
+                }
+            }
+            "grepMatches" => {
+                // the `grep -o` lift: print each match, one per line
+                // (grep -o's output); rc 0 iff any match
+                let text = word_to_sh(arg(args, 0)?)?;
+                let pat = raw_arg(args, 1)?;
+                let flags = raw_arg(args, 2)?;
+                let mut g = String::from("grep -o");
+                for c in flags.chars() {
+                    if c == 'E' || c == 'i' || c == 'F' {
+                        g.push(c);
+                    }
+                }
+                Ok(format!("printf '%s\\n' {text} | {g} -- '{pat}'"))
             }
             "redirect" => {
                 let inner = arrow_to_sh(args)?;
@@ -1819,8 +1958,8 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 Ok(set_array_to_sh(&name, &array_items(args, 1)?, true))
             }
             "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?, false)),
-            "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
-        "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
+            "capture" => Ok(capture_wrap(&arrow_to_sh(args)?, true)),
+        "captureWords" => Ok(capture_wrap(&arrow_to_sh(args)?, false)),
             "contains" => {
                 let arg = word_to_sh(arg(args, 0)?)?;
                 let pat = raw_arg(args, 1)?;
@@ -2101,7 +2240,7 @@ fn needs_num(stmts: &[IrStmt]) -> bool {
         match a {
             ArithAst::Num(_) => false,
             ArithAst::Var(_) | ArithAst::Ident(_) => true,
-            ArithAst::Index { key, .. } => arith_has_var(key),
+            ArithAst::Index { .. } => true,
             ArithAst::Bin { lhs, rhs, .. } => arith_has_var(lhs) || arith_has_var(rhs),
             ArithAst::Un { arg, .. } => arith_has_var(arg),
             ArithAst::Cond { test, then, else_, .. } => {
@@ -2120,7 +2259,45 @@ fn needs_num(stmts: &[IrStmt]) -> bool {
             }
         }
         match e {
-            IrExpr::Call { args, .. } => args.iter().any(has_num),
+            IrExpr::Call { func, args } => {
+                // the string-form arithmetic (`let EXPR` / `arith` calls —
+                // arith_rewrite wraps bare vars in `$( _num ... )` there,
+                // so the polyfill is needed even though no ArithAst exists)
+                let f = func.as_str();
+                if f == "arith" || f == "cstyleFor" {
+                    if let Ok(s) = raw_arg(args, 0) {
+                        if arith_text_uses_var(&s) {
+                            return true;
+                        }
+                    }
+                }
+                if f == "exec" {
+                    if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                        if cmd == "let" {
+                            for a in args.iter().skip(1) {
+                                match a {
+                                    IrExpr::Str(s, _) => {
+                                        if arith_text_uses_var(s) {
+                                            return true;
+                                        }
+                                    }
+                                    IrExpr::Array(es) => {
+                                        for e in es {
+                                            if let IrExpr::Str(s, _) = e {
+                                                if arith_text_uses_var(s) {
+                                                    return true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                args.iter().any(has_num)
+            }
             IrExpr::Array(es) => es.iter().any(has_num),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_num(v)),
             IrExpr::Arrow(stmts) => walk(stmts),
@@ -2579,7 +2756,7 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
                 let glob = fl_clean.strip_prefix("--include=").unwrap_or("").to_string();
                 let has_r = args.iter().any(|a| matches!(a, IrExpr::Str(s, _) if s == "-r"));
                 if has_r {
-                    let mut words: Vec<String> = Vec::new();
+                    let mut words: Vec<String> = vec!["grep".into()];
                     let mut found_pattern = false;
                     let mut replaced_dir = false;
                     for (i, a) in args.iter().enumerate() {
@@ -2982,7 +3159,24 @@ fn lower_procsub_inline(ps: &[IrRedirect], cmd: &str) -> Result<String, String> 
         names.push(format!("\"${t}\""));
         let producer = proc_target(r)?;
         if r.mode == "process-in" {
-            pre.push_str(&format!("{t}=$(mktemp); {{ {producer}; }} 2>/dev/null > \"${t}\"; "));
+            // `<(producer)` — a FIFO + BACKGROUND producer preserves the
+            // pipe semantics: the consumer blocks until data arrives, and
+            // an infinite producer (e.g. `head <(while true; ...)`) dies
+            // with SIGPIPE once the consumer exits. A foreground producer
+            // would hang (it must finish before the consumer runs) and a
+            // plain backgrounded file races the consumer's first read.
+            // Only potentially-infinite producers stream; finite ones
+            // keep the foreground temp file (multi-read consumers like
+            // the _cmp bisect cannot re-open a fifo).
+            if producer_maybe_infinite(&producer) {
+                pre.push_str(&format!(
+                    "{t}=$(mktemp -u); mkfifo \"${t}\"; {{ {producer}; }} 2>/dev/null > \"${t}\" & "
+                ));
+            } else {
+                pre.push_str(&format!(
+                    "{t}=$(mktemp); {{ {producer}; }} 2>/dev/null > \"${t}\"; "
+                ));
+            }
             args.push_str(&format!(" \"${t}\""));
         } else {
             pre.push_str(&format!("{t}=$(mktemp); "));
@@ -3132,7 +3326,7 @@ fn word_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Ident(name) => Ok(name.clone()),
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Interpolate(parts) => interp_to_sh(parts),
-        IrExpr::Arith(a) => Ok(format!("$(({}))", arith_to_sh(a))),
+        IrExpr::Arith(a) => Ok(arith_ast_value_to_sh(a)),
         IrExpr::Call { func, args } => call_word_to_sh(func, args),
         IrExpr::Json(v) => Ok(json_str(v)),
         other => Err(format!("word not renderable: {other:?}")),
@@ -3199,9 +3393,23 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
         }
         "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
         "arrayLen" => Ok(format!("${{{}}}_len", raw_arg(args, 0)?)),
-        "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
-        "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
-        "arith" => Ok(format!("$(({}))", arith_rewrite(&raw_arg(args, 0)?))),
+        "grepMatches" => {
+            // expression-position grep -o lift: the VALUE is the match
+            // list (one per line)
+            let text = word_to_sh(arg(args, 0)?)?;
+            let pat = raw_arg(args, 1)?;
+            let flags = raw_arg(args, 2)?;
+            let mut g = String::from("grep -o");
+            for c in flags.chars() {
+                if c == 'E' || c == 'i' || c == 'F' {
+                    g.push(c);
+                }
+            }
+            Ok(format!("$(printf '%s\\n' {text} | {g} -- '{pat}')"))
+        }
+        "capture" => Ok(capture_wrap(&arrow_to_sh(args)?, true)),
+        "captureWords" => Ok(capture_wrap(&arrow_to_sh(args)?, false)),
+        "arith" => Ok(arith_value_to_sh(&raw_arg(args, 0)?)),
         "brace" => brace_to_sh(args),
         "join" => join_to_sh(arg(args, 0)?, false),
         "setArray" => {
@@ -3576,8 +3784,8 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
             }
             "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
             "arrayLen" => Ok(format!("${{#{}[@]}}", raw_arg(args, 0)?)),
-            "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
-        "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
+            "capture" => Ok(capture_wrap(&arrow_to_sh(args)?, true)),
+        "captureWords" => Ok(capture_wrap(&arrow_to_sh(args)?, false)),
 
             "arith" => {
                 let raw = raw_arg(args, 0)?;
@@ -3587,14 +3795,14 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
                     // failed cmdsub has the same ${x:-d} observable
                     Ok("$(false)".into())
                 } else {
-                    Ok(format!("$(({}))", arith_rewrite(&raw)))
+                    Ok(arith_value_to_sh(&raw))
                 }
             }
             "join" => join_to_sh(arg(args, 0)?, false),
             "brace" => brace_to_sh(args),
             other => Err(format!("interp call not renderable: {other:?}")),
         },
-        IrExpr::Arith(a) => Ok(format!("$(({}))", arith_to_sh(a))),
+        IrExpr::Arith(a) => Ok(arith_ast_value_to_sh(a)),
         IrExpr::Int(i) => Ok(i.to_string()),
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Var(name, _) => Ok(format!("${name}")),
@@ -3634,6 +3842,32 @@ fn space_test_ops(t: &str) -> String {
         }
     }
     s
+}
+
+/// `[[ lhs == rhs ]]` / `[[ lhs = rhs ]]` — dash has no `==` in `[ ]`
+/// and no extglob patterns; lower to a case-emulation (a POSIX pattern
+/// match with the same semantics).
+fn test_eq_to_sh(lhs: &str, rhs: &str) -> String {
+    if let Some((neg, rest)) = rhs.strip_prefix("!(").and_then(|r| r.split_once(')')) {
+        // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`:
+        //   case "$s" in *Y) case "$s" in P Y) false;; *) :;; esac;; *) false;; esac
+        format!(
+            "case \"{lhs}\" in *{rest}) case \"{lhs}\" in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
+        )
+    } else if let Some(inner) = rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')')) {
+        // extglob list match: `@(a|b)` == `a|b`
+        format!("case \"{lhs}\" in {inner}) : ;; *) false ;; esac")
+    } else if let Some(inner) = rhs.strip_prefix("?(").and_then(|r| r.strip_suffix(')')) {
+        // optional: `?(a|b)` matches empty or a|b
+        format!("case \"{lhs}\" in |{inner}) : ;; *) false ;; esac")
+    } else if *NOCASEMATCH.lock().unwrap() {
+        format!(
+            "case \"{lhs}\" in {}) : ;; *) false ;; esac",
+            fold_case_pattern(rhs)
+        )
+    } else {
+        format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac")
+    }
 }
 
 /// The core's test lowering strips the spaces around comparison
@@ -4000,6 +4234,38 @@ fn arith_rewrite(t: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         let c = b[i] as char;
+        // `${#arr[@]}` / `${arr[idx]}` — array expressions INSIDE
+        // arithmetic text (bash expands them before evaluating): lower to
+        // the per-element conventions (`${arr_len}` / `${arr_1}`).
+        if c == '$' && i + 1 < b.len() && b[i + 1] == b'{' {
+            let close = t[i..].find('}').map(|p| i + p).unwrap_or(usize::MAX);
+            if close < b.len() {
+                let inner = &t[i + 2..close];
+                if let Some(rest) = inner.strip_prefix('#') {
+                    if let Some(base) = rest.strip_suffix("[@]").or_else(|| rest.strip_suffix("[*]")) {
+                        if !base.is_empty()
+                            && base.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                        {
+                            out.push_str(&format!("${{{base}_len}}"));
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                }
+                if let Some((base, idx)) = inner.split_once('[') {
+                    let idx = idx.trim_end_matches(']').trim();
+                    if !base.is_empty()
+                        && base.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                        && !idx.is_empty()
+                        && idx.chars().all(|ch| ch.is_ascii_digit())
+                    {
+                        out.push_str(&format!("${{{base}_{idx}}}"));
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+        }
         if (c == '+' || c == '-') && i + 1 < b.len() && b[i + 1] == b[i] {
             // prefix `++name`
             let next_ident2 = i + 2 < b.len() && (b[i + 2].is_ascii_alphabetic() || b[i + 2] == b'_');
@@ -4083,7 +4349,7 @@ fn arith_rewrite(t: &str) -> String {
             if is_assign {
                 out.push_str(name);
             } else {
-                out.push_str(&format!("$( _num \"{name}\" )"));
+                out.push_str(&format!("$( _num \"${{{name}}}\" )"));
             }
             i = j;
             continue;
@@ -4094,6 +4360,49 @@ fn arith_rewrite(t: &str) -> String {
     out
 }
 
+
+/// does arith_rewrite() wrap any bare variable in `$( _num ... )` for this
+/// raw arithmetic text? (Mirrors the rewrite's decisions: a `$name` sigil
+/// form, or a bare identifier that is not an assignment LHS. Postfix/prefix
+/// `++`/`--` rewrites stay plain, so they do NOT need the polyfill.)
+fn arith_text_uses_var(t: &str) -> bool {
+    let b = t.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c == b'$' as char
+            && i + 1 < b.len()
+            && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_')
+        {
+            return true;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' as char {
+            let mut j = i;
+            while j < b.len() && ident(b[j]) {
+                j += 1;
+            }
+            if j + 1 < b.len() && (b[j] == b'+' || b[j] == b'-') && b[j + 1] == b[j] {
+                i = j + 2;
+                continue;
+            }
+            let mut k = j;
+            while k < b.len() && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let is_assign = k < b.len()
+                && b[k] == b'='
+                && !(k + 1 < b.len() && (b[k + 1] == b'=' || b[k + 1] == b'~'));
+            if !is_assign {
+                return true;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
 
 /// dash has NO c-style `for (( init; cond; incr ))` — lower to a portable
 /// while loop:
@@ -4167,6 +4476,62 @@ fn cstyle_for_to_sh(arith: &str, body: &str) -> String {
     out
 }
 
+/// Constant-fold a fully-literal arithmetic subtree (all Num leaves):
+/// dash has no `**` and errors on some operations bash tolerates, so any
+/// purely-constant expression can be evaluated at render time. Returns
+/// None for anything dynamic (or division by zero — the runtime must
+/// decide that, exactly like bash).
+fn const_fold(a: &ArithAst) -> Option<i64> {
+    match a {
+        ArithAst::Num(n) => Some(*n),
+        ArithAst::Bin { op, lhs, rhs } => {
+            let (l, r) = (const_fold(lhs)?, const_fold(rhs)?);
+            match op.as_str() {
+                "+" => l.checked_add(r),
+                "-" => l.checked_sub(r),
+                "*" => l.checked_mul(r),
+                "/" | "%" => (r != 0).then(|| if op == "/" { l / r } else { l % r }),
+                "**" => {
+                    if r < 0 {
+                        Some(0)
+                    } else {
+                        let mut acc: i64 = 1;
+                        for _ in 0..r {
+                            acc = acc.saturating_mul(l);
+                        }
+                        Some(acc)
+                    }
+                }
+                "<<" | ">>" => {
+                    let sh = r.clamp(0, 63) as u32;
+                    Some(if op == "<<" { l.wrapping_shl(sh) } else { l.wrapping_shr(sh) })
+                }
+                "&" => Some(l & r),
+                "|" => Some(l | r),
+                "^" => Some(l ^ r),
+                "==" => Some((l == r) as i64),
+                "!=" => Some((l != r) as i64),
+                "<" => Some((l < r) as i64),
+                ">" => Some((l > r) as i64),
+                "<=" => Some((l <= r) as i64),
+                ">=" => Some((l >= r) as i64),
+                _ => None,
+            }
+        }
+        ArithAst::Un { op, arg } => {
+            let v = const_fold(arg)?;
+            match op.as_str() {
+                "-" => Some(v.wrapping_neg()),
+                "+" => Some(v),
+                "!" => Some((v == 0) as i64),
+                "~" => Some(!v),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn arith_to_sh(a: &ArithAst) -> String {
     match a {
         ArithAst::Num(n) => n.to_string(),
@@ -4180,20 +4545,37 @@ fn arith_to_sh(a: &ArithAst) -> String {
                 format!("$( _num \"${{{name}}}\" )")
             }
         }
-        ArithAst::Index { var, key } => format!("{var}[{}]", arith_to_sh(key)),
+        ArithAst::Index { var, key } => {
+            // the array is lowered per-element (arr_0, arr_1, ...); an
+            // arithmetic READ of arr[K] is a read of the element var
+            // (dash cannot parse `arr[1]` in arithmetic). Static numeric
+            // keys map to the element var; dynamic keys fall back to the
+            // parseable-but-wrong `arr[K]` (no corpus hit yet — the
+            // per-element naming cannot express a computed subscript
+            // without ${!x}, which dash lacks).
+            match key.as_ref() {
+                ArithAst::Num(k) => format!("$( _num \"${{{var}_{k}}}\" )"),
+                _ => format!("{var}[{}]", arith_to_sh(key)),
+            }
+        }
         ArithAst::Bin { op, lhs, rhs } => {
-            // dash has no `**` — constant-fold literal powers
+            // dash has no `**` — constant-fold literal powers (recursively:
+            // `2 ** (3 ** 2)` — the core folds inner constants at parse
+            // time, so both sides are usually Num by render time)
             if op == "**" {
-                if let (ArithAst::Num(a), ArithAst::Num(b)) = (lhs.as_ref(), rhs.as_ref()) {
-                    let mut acc: i64 = 1;
-                    for _ in 0..*b.max(&0) {
-                        acc = acc.saturating_mul(*a);
-                    }
-                    if *b < 0 {
+                if let (Some(a), Some(b)) = (const_fold(lhs), const_fold(rhs)) {
+                    if b < 0 {
                         return "0".into();
+                    }
+                    let mut acc: i64 = 1;
+                    for _ in 0..b.max(0) {
+                        acc = acc.saturating_mul(a);
                     }
                     return acc.to_string();
                 }
+                // runtime operands — dash has no `**`; the _pow polyfill
+                // (emitted with _num) loops the multiplication
+                return format!("$( _pow {} {} )", arith_to_sh(lhs), arith_to_sh(rhs));
             }
             format!("({} {op} {})", arith_to_sh(lhs), arith_to_sh(rhs))
         }
@@ -4205,7 +4587,13 @@ fn arith_to_sh(a: &ArithAst) -> String {
             arith_to_sh(else_)
         ),
         ArithAst::Assign { var, op, rhs } => {
-            format!("{var} {op}= {}", arith_to_sh(rhs))
+            // op is the assignment operator itself (`=` / `+=` / `-=` ...)
+            // — `{op}=` would turn `=` into `==` (a comparison) and `+=`
+            // into `+==` (a parse error)
+            // op is the assignment operator itself (`=` / `+=` / `-=` ...)
+            // — the shIR carries the `=`, so it must NOT be appended again
+            // (`{op}=` with op `+=` would emit `+==`)
+            format!("{var} {op} {}", arith_to_sh(rhs))
         }
         ArithAst::IncDec {
             var,
@@ -4262,11 +4650,73 @@ fn pipeline_stages(args: &[IrExpr]) -> Result<Vec<Vec<IrStmt>>, String> {
 /// Compact single-line rendering of a statement sequence (capture bodies,
 /// pipeline stages, inline compounds).
 fn stmts_inline(stmts: &[IrStmt]) -> Result<String, String> {
+    // the shared core's process_subst materialization (`__ps_tmpN`) runs
+    // the producer in the FOREGROUND — an infinite producer (`head
+    // <(while true; ...)`) hangs. Re-lower to a FIFO + background
+    // producer (pipe semantics: the consumer blocks for data, and the
+    // producer dies with SIGPIPE once the consumer exits).
+    if let Some(s) = lower_materialized_procsub(stmts)? {
+        return Ok(s);
+    }
     let mut out = Vec::new();
     for s in stmts {
         out.push(stmt_inline(s)?);
     }
     Ok(out.join("; "))
+}
+
+/// Detect the core-materialized process substitution
+/// `tmp=$(mktemp); { producer; } > "$tmp"; CONSUMER` and re-lower it
+/// with a FIFO + backgrounded producer (see stmts_inline). Matches ONLY
+/// the `__ps_tmpN` shape the shared transform emits — ordinary file
+/// redirects are untouched.
+fn lower_materialized_procsub(stmts: &[IrStmt]) -> Result<Option<String>, String> {
+    if stmts.len() < 3 {
+        return Ok(None);
+    }
+    let tmp = match &stmts[0] {
+        IrStmt::Assign { targets, expr, .. } => {
+            if targets.len() != 1 || !targets[0].indices.is_empty() {
+                return Ok(None);
+            }
+            let t = &targets[0].var;
+            if !t.starts_with("__ps_tmp") {
+                return Ok(None);
+            }
+            if !matches!(expr, IrExpr::Call { func, .. } if func == "capture") {
+                return Ok(None);
+            }
+            t.clone()
+        }
+        _ => return Ok(None),
+    };
+    let (producer, target_matches) = match &stmts[1] {
+        IrStmt::Redirect { inner, redirects } => {
+            let mut m = false;
+            for r in redirects {
+                if r.mode == "w"
+                    && matches!(&r.target, IrExpr::Var(n, _) if *n == tmp)
+                {
+                    m = true;
+                }
+            }
+            if !m {
+                return Ok(None);
+            }
+            (stmts_inline(inner)?, m)
+        }
+        _ => return Ok(None),
+    };
+    // finite producers stay foreground (multi-read consumers cannot
+    // re-open a fifo — the _cmp bisect blocks forever on the second
+    // open); only the streaming form helps infinite producers
+    if !producer_maybe_infinite(&producer) {
+        return Ok(None);
+    }
+    let rest = stmts_inline(&stmts[2..])?;
+    Ok(Some(format!(
+        "{tmp}=\"$(mktemp -u)\"; mkfifo \"${tmp}\"; {{ {producer}; }} 2>/dev/null > \"${tmp}\" & {rest}; rc=$?; rm -f \"${tmp}\"; [ \"$rc\" -eq 0 ]"
+    )))
 }
 
 fn stmt_inline(st: &IrStmt) -> Result<String, String> {
