@@ -4183,6 +4183,7 @@ fn redirect_to_sh(r: &IrRedirect) -> Result<String, String> {
     let fd = r.fd.unwrap_or(0);
     let op = match r.mode.as_str() {
         "w" => ">",
+        "wc" => ">|", // `>|` — noclobber-bypassing truncate (POSIX)
         "a" => ">>",
         "r" => "<",
         "r+" => "<>",
