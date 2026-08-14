@@ -1711,14 +1711,25 @@ impl Render {
             let c = chars[i];
             if c == '$' {
                 if i + 1 < chars.len() && chars[i + 1] == '{' {
-                    // ${name} / ${#arr[@]} / ${arr[i]} — parse to the closing brace
+                    // ${name} / ${#arr[@]} / ${arr[i]} — parse to the
+                    // MATCHING close (nested ${...} count their braces:
+                    // `${a[${i:-0}]:-0}`)
                     let mut j = i + 2;
+                    let mut bd = 1;
                     let mut name = String::new();
-                    while j < chars.len() && chars[j] != '}' {
+                    while j < chars.len() && bd > 0 {
+                        if chars[j] == '{' {
+                            bd += 1;
+                        } else if chars[j] == '}' {
+                            bd -= 1;
+                            if bd == 0 {
+                                break;
+                            }
+                        }
                         name.push(chars[j]);
                         j += 1;
                     }
-                    if j < chars.len() {
+                    if bd == 0 {
                         out.push_str(&self.arith_braced(&name));
                         i = j + 1;
                         continue;
@@ -1766,7 +1777,9 @@ impl Render {
                     out.push_str(&format!(
                         "${}[{}]",
                         ident(&name),
-                        key.trim_matches(|c| c == '(' || c == ')')
+                        key.strip_prefix('(')
+                            .and_then(|k| k.strip_suffix(')'))
+                            .unwrap_or(&key)
                     ));
                     i = k + 1;
                     continue;
@@ -1840,6 +1853,32 @@ impl Render {
     /// Inside `${{...}}` in an arith string: `#arr[@]` → length, `arr[i]` →
     /// index read, plain name → var read.
     fn arith_braced(&mut self, name: &str) -> String {
+        // `${x:-default}` — a default inside arithmetic (the `:-` at
+        // BRACKET depth 0 — `${a[${i:-0}]:-0}` nests)
+        let mut depth = 0i32;
+        let mut colon_pos = None;
+        for (i, c) in name.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                ':' if depth == 0 => {
+                    colon_pos = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(pos) = colon_pos {
+            let (n, d) = name.split_at(pos);
+            let d = &d[1..];
+            if let Some(d) = d.strip_prefix('-') {
+                let v = self.arith_str(n);
+                return format!(
+                    "((({v} // \"\") ne \"\") ? {v} : {})",
+                    self.arith_str(d)
+                );
+            }
+        }
         if let Some(rest0) = name.strip_prefix('#') {
             let rest = rest0
                 .strip_suffix("[@]")
@@ -1859,7 +1898,9 @@ impl Render {
                 return format!(
                     "${}[{}]",
                     ident(var),
-                    inner.trim_matches(|c| c == '(' || c == ')')
+                    inner.strip_prefix('(')
+                        .and_then(|k| k.strip_suffix(')'))
+                        .unwrap_or(&inner)
                 );
             }
         }
@@ -2921,7 +2962,60 @@ impl Render {
                 // `eval <string>...` — bash concatenates the words with
                 // spaces and evaluates the result as shell code. The
                 // honest native lowering: hand the string to bash (the
-                // same interpreter bash's eval uses).
+                // same interpreter bash's eval uses) — EXCEPT an
+                // ASSIGNMENT (`eval "name=$(( arith ))"`) which the
+                // current shell must see (a child bash -c would lose it).
+                let mut eval_text = String::new();
+                for w in &words {
+                    match w {
+                        IrExpr::Interpolate(parts) => {
+                            for p in parts {
+                                match p {
+                                    InterpPart::Lit(t) => eval_text.push_str(t),
+                                    // a param expansion inside the eval text:
+                                    // keep the SHELL form (`${x:-0}`) so the
+                                    // arith_str below can evaluate it
+                                    InterpPart::Expr(x) => {
+                                        if let IrExpr::Call { func, args } = x.as_ref() {
+                                            if func == "param" {
+                                                let op =
+                                                    Self::str_arg(args, 0).unwrap_or_default();
+                                                let name =
+                                                    Self::str_arg(args, 1).unwrap_or_default();
+                                                let def = args
+                                                    .get(2)
+                                                    .map(|d| self.shell_unquoted(d))
+                                                    .unwrap_or_default();
+                                                eval_text.push_str(&format!(
+                                                    "${{{name}{op}{def}}}"
+                                                ));
+                                                continue;
+                                            }
+                                        }
+                                        eval_text.push_str(&self.shell_unquoted(x));
+                                    }
+                                }
+                            }
+                        }
+                        IrExpr::Str(t, _) => eval_text.push_str(t),
+                        _ => {}
+                    }
+                }
+                if let Some(eq) = eval_text.find("=$((") {
+                    let name = &eval_text[..eq];
+                    let inner = &eval_text[eq + 4..];
+                    if let Some(end) = inner.rfind("))") {
+                        let arith = &inner[..end];
+                        if !name.is_empty()
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            let a = self.arith_str(arith);
+                            let t = self.scalar_target(name);
+                            self.emit(&format!("{t} = {a};"));
+                            return;
+                        }
+                    }
+                }
                 let parts: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
                 let joined = parts.join(" . \" \" . ");
                 self.emit(&format!("system('bash', '-c', {joined});"));
@@ -3913,6 +4007,26 @@ impl Render {
                         .and_then(|t| t.strip_suffix('"'))
                         .or_else(|| s.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')))
                         .unwrap_or(s);
+                    // `${x:-${NAME}}` — a NESTED param expansion as the
+                    // default: render the inner expansion
+                    if let Some(inner) = unq
+                        .strip_prefix("${")
+                        .and_then(|t| t.strip_suffix('}'))
+                    {
+                        if inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && !inner.is_empty()
+                        {
+                            return r.var_ref(inner);
+                        }
+                        // `${NAME:-d}` nested — recurse via a param call
+                        let s2 = |v: &str| {
+                            IrExpr::Str(v.to_string(), StrStyle::DoubleQuoted)
+                        };
+                        if let Some(pos) = inner.find(":-") {
+                            let (n, d) = inner.split_at(pos);
+                            return r.param(&[s2(":-"), s2(n), s2(&d[2..])]);
+                        }
+                    }
                     Self::perl_str(unq)
                 }
                 _ => r.expr(a),
@@ -4053,6 +4167,10 @@ impl Render {
                 let re = glob_to_regex(&pat, true);
                 let g = if op == "//" { "g" } else { "" };
                 let re = brace_escape(&re);
+                // perl's s/// replacement processes `\` and `\"` — double
+                // the backslashes so the VALUE's `\`/`\"` survive
+                // (bash keeps them literal)
+                let repl = repl.replace("\\", "\\\\");
                 format!(
                     "do {{ my $__t = {v}; $__t =~ s{{{re}}}{{{}}}{g}; $__t }}",
                     brace_escape(&repl)
