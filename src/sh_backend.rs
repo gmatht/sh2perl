@@ -138,9 +138,11 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                         {
                             let idx = idx.trim_matches(['"', '\'']);
                             names.insert(base.to_string());
-                            if !idx.chars().all(|c| c.is_ascii_digit()) {
-                                ASSOC_VARS.lock().unwrap().insert(base.to_string());
-                            }
+                            // NOTE: do NOT mark assoc here — only
+                            // `declare -A` does. A non-digit subscript on
+                            // an undeclared/indexed array is ARITHMETIC
+                            // (args[i+1]); conflating them made indexed
+                            // reads key on the literal text.
                         }
                     }
                 }
@@ -1518,17 +1520,31 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
             // strip the quotes the core keeps around the subscript
             // (`config["user"]` — a quoted subscript is still a plain key)
             let idx = idx.trim_matches(['"', '\'']);
+            let is_assoc = ASSOC_VARS.lock().unwrap().contains(base);
             if idx.chars().all(|c| c.is_ascii_digit()) {
                 out.push_str(&format!("{base}_{idx}={rhs}"));
             } else if !idx.contains(['$', '(', ')', '`', ';', '&', '|', ' '])
                 && !idx.is_empty()
+                && is_assoc
             {
                 // associative (string-key) element: maintain the key list
                 // (bash's ${!map[@]} keys / ${map[*]} values iterate it)
-                ASSOC_VARS.lock().unwrap().insert(base.to_string());
                 let ev = elem_name(base, idx);
                 out.push_str(&format!(
                     "{ev}={rhs}; {base}_len=$(( ${{{base}_len:-0}} + 1 )); {base}_keys=\"${{{base}_keys:-}} {idx}\""
+                ));
+            } else if idx.contains(['$', '(', '`', ';', '&', '|', ' ']) || !is_assoc {
+                // DYNAMIC / arithmetic key — the element name is only
+                // knowable at runtime; eval the assignment (indexed
+                // arrays evaluate the subscript: `$((idx))`; assoc keys
+                // with slices lower to cmdsubs)
+                let key_sh = if is_assoc {
+                    dynamic_key_sh(idx)
+                } else {
+                    format!("$(({idx}))")
+                };
+                out.push_str(&format!(
+                    "eval \"{base}_{key_sh}=\"$(printf '%s' {rhs})\"\"; {base}_len=$(( ${{{base}_len:-0}} + 1 ))"
                 ));
             } else {
                 out.push_str(&format!("{base}[{idx}]={rhs}"));
@@ -1594,6 +1610,41 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
 /// runtime expansions (`arr=($x)`) word-split at runtime (bash counts the
 /// SPLIT words); appends need eval (dash cannot parse an expanded
 /// assignment NAME like `arr_$i=x`).
+/// A dynamic subscript key as a portable sh WORD: `${name:off:len}`
+/// slices become cut cmdsubs (dash cannot expand them), everything else
+/// passes through (the shell expands it when the eval runs).
+fn dynamic_key_sh(idx: &str) -> String {
+    let mut out = String::new();
+    let b = idx.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
+            if let Some(close) = idx[i..].find('}').map(|p| i + p) {
+                let inner = &idx[i + 2..close];
+                if let Some((name, rest)) = inner.split_once(':') {
+                    if !name.is_empty()
+                        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && rest.contains(':')
+                    {
+                        let (off, len) = rest.split_once(':').unwrap();
+                        out.push_str(&format!(
+                            "$(printf '%s' \"${{{name}}}\" | cut -c$((({off})+1))-$((({off})+({len}))))"
+                        ));
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                out.push_str(&idx[i..=close]);
+                i = close + 1;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// The per-element variable name for `base[idx]` — assoc keys can carry
 /// characters that are invalid in a shell variable name (`matrix[0,0]` —
 /// the comma is part of the KEY), so the key is sanitized into the name
@@ -2818,11 +2869,14 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
     // a `'n=$1'` argument (the value would be the literal `$1`).
     if matches!(cmd_name, Some("local" | "export" | "readonly")) {
         let mut words: Vec<String> = Vec::new();
+        let mut flags: Vec<String> = Vec::new();
         let mut i = 0;
         while i < args.len() {
             let a = &args[i];
             match a {
-                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {}
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    flags.push(s.clone());
+                }
                 IrExpr::Str(s, _) => {
                     if let Some(eq) = s.find('=') {
                         let name = &s[..eq];
@@ -2881,6 +2935,28 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
             out.push_str(cmd_name.unwrap());
             out.push(' ');
             out.push_str(&words.join(" "));
+        }
+        // `local -A m` — bash registers an ASSOCIATIVE array (the
+        // per-element keying differs from indexed); `-a` is explicit
+        // indexed (the default)
+        if flags.iter().any(|f| f.contains('A')) {
+            let mut assoc = ASSOC_VARS.lock().unwrap();
+            for w in &words {
+                let name = w.split('=').next().unwrap_or(w.as_str());
+                if !name.is_empty() {
+                    assoc.insert(name.to_string());
+                }
+            }
+            // `local -A m=()` — the array arrives as a setArray call
+            for a in args {
+                if let IrExpr::Call { func, args: cargs } = a {
+                    if func == "setArray" || func == "setArrayAppend" {
+                        if let Ok(s) = raw_arg(cargs, 0) {
+                            assoc.insert(s);
+                        }
+                    }
+                }
+            }
         }
         return Ok(out);
     }
@@ -3713,15 +3789,21 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                     }
                     return Ok(arr_expand_call(arr_base(&an)));
                 }
-                if idx.contains(['$', '(']) {
-                    // dynamic key (`${map[$k]}`) — indirect via eval
-                    return Ok(format!(
-                        "$(eval \"printf '%s' \\\"\\${{{}_{}}}\\\"\")",
-                        arr_base(&an),
+                let base = arr_base(&an);
+                if !idx.chars().all(|c| c.is_ascii_digit()) {
+                    // dynamic key: ASSOC arrays key on the EXPANDED text
+                    // (matrix[$i,$j] -> "0,0"); indexed arrays evaluate
+                    // the subscript as ARITHMETIC (args[i+1] -> args_2)
+                    let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
                         eval_key(idx)
+                    } else {
+                        format!("$(({idx}))")
+                    };
+                    return Ok(format!(
+                        "$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")"
                     ));
                 }
-                return Ok(format!("\"${{{}}}\"", elem_name(arr_base(&an), idx)));
+                return Ok(format!("\"${{{base}_{idx}}}\""));
             }
             if let Some(an) = name.strip_prefix('#') {
                 return Ok(format!("${{{an}_len}}"));
@@ -3855,6 +3937,22 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             // in the pattern (`${x#\"}`) would terminate the quote and
             // dash would report Missing '}'; backticks too
             let pat = pat.replace('"', "\\\"").replace('`', "\\`");
+            // `${arr[i]#pat}` — an element read plus a trim: dash cannot
+            // parse the subscript; eval the whole expansion
+            if let Some((an, idx)) = name.strip_suffix(']').and_then(|n| n.split_once('[')) {
+                let base = arr_base(&an);
+                if !idx.chars().all(|c| c.is_ascii_digit()) {
+                    let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
+                        eval_key(idx)
+                    } else {
+                        format!("$(({idx}))")
+                    };
+                    return Ok(format!(
+                        "$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}{op}{pat}}}\\\"\")"
+                    ));
+                }
+                return Ok(format!("${{{base}_{idx}{op}{pat}}}"));
+            }
             Ok(format!("${{{name}{op}{pat}}}"))
         }
         "//" | "/" => {
@@ -3877,7 +3975,26 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             // (the `\${`/`\$(` escapes keep the OUTER shell from
             // pre-expanding; `${k}` expands at the outer — same value)
             if name.contains('[') || default.contains("[@]") || default.contains("[*]") {
-                let name_rw = name.replace('[', "_").replace(']', "");
+                // the subscript: ASSOC arrays use the EXPANDED text as
+                // the key (matrix[$i,$j] -> "0,0"); indexed arrays
+                // evaluate it as ARITHMETIC (args[i+1] -> args_2)
+                let (base_n, key) = name
+                    .split_once('[')
+                    .map(|(b, k)| (b.to_string(), k.trim_end_matches(']').to_string()))
+                    .unwrap_or_else(|| (name.clone(), String::new()));
+                let key_sh = if key.is_empty() {
+                    key
+                } else if ASSOC_VARS.lock().unwrap().contains(base_n.as_str()) {
+                    key
+                } else if key.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '{' | '}'))
+                    && !key.contains(['$', '{'])
+                {
+                    key
+                } else {
+                    format!("$(({key}))")
+                };
+                let name_rw = format!("{base_n}_{key_sh}");
                 let def_rw = rewrite_array_text(&default);
                 return Ok(format!(
                     "$(eval \"printf '%s' \\\"\\${{{name_rw}{op}{def_rw}}}\\\"\")"
@@ -4649,6 +4766,24 @@ fn arith_rewrite(t: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         let c = b[i] as char;
+        // `$(cmd)` — a command substitution INSIDE arithmetic text (bash
+        // runs it before evaluating): copy verbatim — rewriting its
+        // contents corrupts paths/vars (`$(wc -l < /etc/passwd)`).
+        if c == '$' && i + 1 < b.len() && b[i + 1] == b'(' {
+            let mut depth = 1i32;
+            let mut j = i + 2;
+            while j < b.len() && depth > 0 {
+                if b[j] == b'(' {
+                    depth += 1;
+                } else if b[j] == b')' {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            out.push_str(&t[i..j]);
+            i = j;
+            continue;
+        }
         // `${#arr[@]}` / `${arr[idx]}` — array expressions INSIDE
         // arithmetic text (bash expands them before evaluating): lower to
         // the per-element conventions (`${arr_len}` / `${arr_1}`).
@@ -4679,6 +4814,11 @@ fn arith_rewrite(t: &str) -> String {
                         continue;
                     }
                 }
+                // any OTHER `${...}` (${#s} length, ${x:-d}, ...) — the
+                // shell expands it before the arithmetic: copy verbatim
+                out.push_str(&t[i..=close]);
+                i = close + 1;
+                continue;
             }
         }
         if (c == '+' || c == '-') && i + 1 < b.len() && b[i + 1] == b[i] {
