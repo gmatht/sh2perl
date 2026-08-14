@@ -115,7 +115,16 @@ pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
             ArithAst::Cond { test, then, else_, .. } => {
                 mentions(test) || mentions(then) || mentions(else_)
             }
-            ArithAst::Assign { rhs, .. } => mentions(rhs),
+            ArithAst::Assign { var, rhs, .. } => {
+                // the TARGET matters too (mirror of the guard
+                // `arith_mentions_true64`'s Assign arm): `((x = 5))` on an
+                // Int64 x must wrap the RHS literal (BigInt("5")) — the
+                // guard and the wrapper must agree or the guard fires, the
+                // wrapper no-ops, and the RHS keeps its Number leaf (a
+                // mixed BigInt/Number assignment throws). Core request
+                // zsh-sh-go-20260814-134501.
+                mentions(rhs) || true64_int_var(var) || slot_var_index(var).is_some()
+            }
             ArithAst::IncDec { var, .. } => true64_int_var(var) || slot_var_index(var).is_some(),
             ArithAst::Sizeof(_) | ArithAst::Num(_) => false,
             ArithAst::Cast { arg, .. } => mentions(arg),
@@ -9278,6 +9287,34 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
         // (see arith_lowerable).
         ArithAst::Assign { var, op, rhs } => {
             let rhs_e = arith_to_estree(rhs);
+            // `--true64` slot target: the native int64 element IS the
+            // home — write the new value straight to the slot (the
+            // store-write + read-back seq below would read the slot
+            // BEFORE the enclosing `__t64[k] = …` write — a stale
+            // no-op that never advances the accumulator). The JS
+            // assignment's value is the new element value, so the
+            // expression-position semantics (bash: the assignment's
+            // value is the RHS) hold too.
+            if let Some(k) = slot_var_index(var) {
+                let cur = slot_read(k);
+                let bin = |op: &'static str, l: Expr, r: Expr| Expr::BinaryExpression {
+                    operator: op.to_string(),
+                    left: Box::new(l),
+                    right: Box::new(r),
+                };
+                let new_val = match op.as_str() {
+                    "=" => rhs_e,
+                    "+=" => bin("+", cur, rhs_e.clone()),
+                    "-=" => bin("-", cur, rhs_e.clone()),
+                    "*=" => bin("*", cur, rhs_e.clone()),
+                    _ => unreachable!("parse_arith only emits = += -= *="),
+                };
+                return Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(slot_read(k)),
+                    right: Box::new(new_val),
+                };
+            }
             if is_lifted_num(var) {
                 return Expr::AssignmentExpression {
                     operator: op.to_string(),
@@ -9368,10 +9405,20 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 };
             }
             let cur = arith_var_read(var);
-            let int1 = || Expr::Literal {
-                value: serde_json::Value::from(1),
-                raw: None,
-                regex: None,
+            // i53 escalation / `--true64` BigInt home: the ±1 delta must
+            // be a BigInt literal — `BigInt(x) + 1` mixes types and
+            // throws (the cstyle-for step / `((i++))` on an escalated
+            // var; core request zsh-sh-go-20260814-134501).
+            let int1 = || {
+                if true64_int_var(var) {
+                    bigint_lit_expr(1)
+                } else {
+                    Expr::Literal {
+                        value: serde_json::Value::from(1),
+                        raw: None,
+                        regex: None,
+                    }
+                }
             };
             let new_val = Expr::BinaryExpression {
                 operator: if *delta > 0 {
@@ -32514,6 +32561,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         // the same ESTree shape — a `Literal` with the `regex` property
         // (printed `/pattern/flags`, executed as a native RegExp).
         IrExpr::Regex { pattern, flags } => regex_lit_flags(pattern, flags),
+        // The A1 `Index` expr node (core requests go-sh-20260814-132037 /
+        // py-sh-go-20260814-125405): array element read — the contract's
+        // rich form of the `arrayIndex` call. The key is a full expr
+        // (Str/Int/...). The arith variant renders at `ArithAst::Index`,
+        // and go/rust/zig/perl backends already render IrExpr::Index.
+        IrExpr::Index { var, key } => {
+            let key_e = expr_to_estree(key);
+            sh2_call("arrayIndex", vec![str_lit(var), key_e])
+        }
         other => unreachable!("Perl-only IR expression reached the ESTree renderer: {other:?}"),
     }
 }
@@ -34116,6 +34172,50 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
 /// store sync would have written). Only exact literal-name matches are
 /// touched.
 fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
+    // `sh2.vars.<var>` — the plain-object store member read.
+    fn is_vars_member(e: &Expr, var: &str) -> bool {
+        matches!(
+            e,
+            Expr::MemberExpression {
+                object,
+                property,
+                computed: false,
+                ..
+            } if matches!(property.as_ref(), Expr::Identifier { name } if name == var)
+                && matches!(
+                    object.as_ref(),
+                    Expr::MemberExpression {
+                        object: o2,
+                        property: p2,
+                        computed: false,
+                        ..
+                    } if matches!(p2.as_ref(), Expr::Identifier { name } if name == "vars")
+                        && matches!(o2.as_ref(), Expr::Identifier { name } if name == "sh2")
+                )
+        )
+    }
+    // `process.env.<var>` — the env fallback member read.
+    fn is_env_member(e: &Expr, var: &str) -> bool {
+        matches!(
+            e,
+            Expr::MemberExpression {
+                object,
+                property,
+                computed: false,
+                ..
+            } if matches!(property.as_ref(), Expr::Identifier { name } if name == var)
+                && matches!(
+                    object.as_ref(),
+                    Expr::MemberExpression {
+                        object: o2,
+                        property: p2,
+                        computed: false,
+                        ..
+                    } if matches!(p2.as_ref(), Expr::Identifier { name } if name == "env")
+                        && matches!(o2.as_ref(), Expr::Identifier { name } if name == "process")
+                )
+        )
+    }
     fn expr_rewrite(e: &mut Expr, var: &str, js_var: &str) {
         let callee_name = sh2_callee_name(e).map(|s| s.to_string());
         match e {
@@ -34176,6 +34276,37 @@ fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
                 }
             }
             Expr::SpreadElement { argument } => expr_rewrite(argument, var, js_var),
+            Expr::LogicalExpression { operator, left, right } if operator == "??" => {
+                // `(sh2.vars.<var> ?? (process.env.<var> ?? ""))` — the
+                // native_store_read lowering of a store-bound `getVar`
+                // (the sync-elim ok-check admits it, so the rewrite must
+                // cover it too: the store is STALE during a
+                // sync-eliminated loop — the pre-loop read holds the
+                // PRIOR value, the per-iteration writes go to the native
+                // binding only).
+                if is_vars_member(left, var)
+                    && matches!(
+                        right.as_ref(),
+                        Expr::LogicalExpression {
+                            operator: r_op,
+                            left: rl,
+                            right: rr,
+                        } if r_op == "??"
+                            && is_env_member(rl, var)
+                            && matches!(
+                                rr.as_ref(),
+                                Expr::Literal { value, .. } if value.as_str() == Some("")
+                            )
+                    )
+                {
+                    *e = Expr::Identifier {
+                        name: js_var.to_string(),
+                    };
+                    return;
+                }
+                expr_rewrite(left, var, js_var);
+                expr_rewrite(right, var, js_var);
+            }
             Expr::LogicalExpression { left, right, .. }
             | Expr::BinaryExpression { left, right, .. }
             | Expr::AssignmentExpression { left, right, .. } => {
