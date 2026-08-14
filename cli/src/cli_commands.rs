@@ -592,11 +592,16 @@ pub fn parse_file_to_estree(filename: &str) {
 pub fn parse_file_to_shir(filename: &str) {
     let commands = match read_cli_input(filename) {
         Ok(bytes) => {
-            // lossy decode (core requests sh-20260814-145955 /
-            // sh-utf8-20260814-140334): an invalid-UTF-8 byte must not
+            // marked-lossy decode (core request
+            // perl-20260814-175710): an invalid-UTF-8 byte must not
             // collapse the whole file to an empty program — bash is
-            // byte-agnostic, so parse the U+FFFD-laced text.
-            let content = String::from_utf8_lossy(&bytes).into_owned();
+            // byte-agnostic, so parse the text with each invalid byte
+            // preserved as a PUA marker (U+E000+byte) that serde_json
+            // round-trips into the A1 JSON, exactly like
+            // parse_file_to_perl above. Backends decode the marker
+            // back to `\xNN` byte escapes for byte-exact output.
+            let content =
+                debashl::shared_utils::SharedUtils::bytes_to_marked_lossy(&bytes);
             match Parser::new(&content).parse() {
                 Ok(c) => c,
                 Err(e) => {
