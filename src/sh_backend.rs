@@ -58,20 +58,45 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                     }
                 }
                 if f == "param" {
-                    let name = args
-                        .get(1)
-                        .and_then(|a| match a {
-                            IrExpr::Str(s, _) => Some(s.as_str()),
-                            _ => None,
-                        })
-                        .unwrap_or("");
-                    // `${arr[@]}`-family baked names
-                    if name.ends_with("[@]") || name.ends_with("[*]") {
-                        if let Some(base) = name
-                            .strip_suffix("[@]")
-                            .or_else(|| name.strip_suffix("[*]"))
-                        {
-                            names.insert(base.to_string());
+                    for (ai, a) in args.iter().enumerate() {
+                        // `${arr[@]}`-family baked names (the name arg AND
+                        // array text nested inside default/value args:
+                        // `${x:-${arr[@]:0:2}}`)
+                        if let IrExpr::Str(s, _) = a {
+                            for w in s.split("${") {
+                                let w = w.trim();
+                                if w.starts_with('#') {
+                                    continue;
+                                }
+                                if let Some(base) = w
+                                    .strip_suffix("[@]}")
+                                    .or_else(|| w.strip_suffix("[*]}"))
+                                    .or_else(|| {
+                                        // `${arr[@]:off:len}`
+                                        let r = w.split_once("[@]:");
+                                        r.and_then(|(b, _)| {
+                                            (!b.is_empty()
+                                                && b.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                                                .then(|| b)
+                                        })
+                                    })
+                                {
+                                    names.insert(base.to_string());
+                                }
+                            }
+                        }
+                        // the name arg itself (position 1)
+                        if ai == 1 {
+                            if let IrExpr::Str(name, _) = a {
+                                if name.ends_with("[@]") || name.ends_with("[*]") {
+                                    if let Some(base) = name
+                                        .strip_suffix("[@]")
+                                        .or_else(|| name.strip_suffix("[*]"))
+                                    {
+                                        names.insert(base.to_string());
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -565,6 +590,17 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
         // messages, `echo >&2` diagnostics) to match exactly
         out.push_str("exec 2>/dev/null\n");
     }
+    if needs_ls(&prog.stmts) {
+        out.push_str("_ls() {\n");
+        out.push_str("    # busybox ls output is unsorted (GNU sorts); sort the\n");
+        out.push_str("    # captured output, but return LS's own rc (a bare\n");
+        out.push_str("    # `| sort` would mask failures from `ls x || echo`).\n");
+        out.push_str("    _ls_o=$(ls \"$@\" 2>/dev/null)\n");
+        out.push_str("    _ls_r=$?\n");
+        out.push_str("    [ -z \"$_ls_o\" ] || printf '%s\\n' \"$_ls_o\" | sort\n");
+        out.push_str("    return $_ls_r\n");
+        out.push_str("}\n\n");
+    }
     if needs_grep_p(&prog.stmts) {
         out.push_str("\n");
         out.push_str("# portable PCRE grep: GNU grep -P, macOS gnu-grep, or perl\n");
@@ -985,10 +1021,14 @@ _arr_keys_k() {
 }
 _arr_slice() {
     # $1=name $2=off $3=len — elements off..off+len-1, space-joined
-    _i=$(( $2 ))
     _end=$(eval echo "\${$1_len}")
     _end=${_end:-0}
+    # bash's negative offsets count from the END (${arr[@]: -10})
+    _i=$(( $2 ))
+    [ "$_i" -lt 0 ] && _i=$(( _end + $_i ))
+    [ "$_i" -lt 0 ] && _i=0
     _lim=$(( $2 + ${3:-1000000} ))
+    [ "$_lim" -lt 0 ] && _lim=$(( _end + $_lim ))
     while [ "$_i" -lt "$_lim" ] && [ "$_i" -lt "$_end" ]; do
         eval "printf '%s' \"\${$1_$_i}\""
         _i=$((_i + 1))
@@ -1442,7 +1482,10 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
         && matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == &targets[0].var))
     {
         let IrExpr::Arith(a) = expr else { unreachable!() };
-        return Ok(format!(": $(({}))", arith_to_sh(a)));
+        // `[ "$((...))" -ne 0 ]` preserves the STATEMENT's rc (bash:
+        // `(( i++ ))` with i=0 exits 1 — the expression's value); a
+        // `: $((...))` would always exit 0
+        return Ok(format!("[ \"$(({ }))\" -ne 0 ]", arith_to_sh(a)));
     }
     // `arr=(a b c)` — the A1 is Assign{var: arr, expr: setArray(...)}. The
     // setArray lowering IS the assignment (`arr_0=a; arr_1=b; ...`) — the
@@ -1483,8 +1526,9 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
                 // associative (string-key) element: maintain the key list
                 // (bash's ${!map[@]} keys / ${map[*]} values iterate it)
                 ASSOC_VARS.lock().unwrap().insert(base.to_string());
+                let ev = elem_name(base, idx);
                 out.push_str(&format!(
-                    "{base}_{idx}={rhs}; {base}_len=$(( ${{{base}_len:-0}} + 1 )); {base}_keys=\"${{{base}_keys:-}} {idx}\""
+                    "{ev}={rhs}; {base}_len=$(( ${{{base}_len:-0}} + 1 )); {base}_keys=\"${{{base}_keys:-}} {idx}\""
                 ));
             } else {
                 out.push_str(&format!("{base}[{idx}]={rhs}"));
@@ -1550,6 +1594,24 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
 /// runtime expansions (`arr=($x)`) word-split at runtime (bash counts the
 /// SPLIT words); appends need eval (dash cannot parse an expanded
 /// assignment NAME like `arr_$i=x`).
+/// The per-element variable name for `base[idx]` — assoc keys can carry
+/// characters that are invalid in a shell variable name (`matrix[0,0]` —
+/// the comma is part of the KEY), so the key is sanitized into the name
+/// (both the writer and every reader must use the SAME mangling).
+fn elem_name(base: &str, idx: &str) -> String {
+    let mut s = String::with_capacity(base.len() + idx.len() + 1);
+    s.push_str(base);
+    s.push('_');
+    for c in idx.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            s.push(c);
+        } else {
+            s.push('_');
+        }
+    }
+    s
+}
+
 fn set_array_to_sh(name: &str, items: &str, append: bool) -> String {
     if items.is_empty() {
         return format!("{name}_len=0");
@@ -1675,7 +1737,20 @@ fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
                     if i > 0 {
                         line.push_str(" | ");
                     }
-                    line.push_str(&stmts_inline(stg)?);
+                    let s = stmts_inline(stg)?;
+                    // a heredoc stage is multi-line — the `| next` must
+                    // apply to a brace group, not the EOF terminator line
+                    // (the `}` alone on the line after the terminator is
+                    // the only form dash accepts — `; }` is a syntax error)
+                    if stage_has_heredoc(stg) {
+                        if s.ends_with('\n') {
+                            line.push_str(&format!("{{ {s}}}"));
+                        } else {
+                            line.push_str(&format!("{{ {s}; }}"));
+                        }
+                    } else {
+                        line.push_str(&s);
+                    }
                 }
                 Ok(format!("$({line})"))
             }
@@ -1787,6 +1862,14 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 // cannot express &&/||, so keep those in [[ ]] form.
                 if t.contains("&&") || t.contains("||") {
                     Ok(format!("[[ {t} ]]"))
+                } else if t.contains(" -o ") || t.contains(" -a ") {
+                    // `[[ a == b || c == d ]]` arrives as the POSIX
+                    // `-o`/`-a` form — dash's `[ ]` supports it natively
+                    // (`==` must become `=`)
+                    Ok(format!(
+                        "[ {} ]",
+                        space_test_eq(&t.replace("==", "="))
+                    ))
                 } else if let Some((lhs, rhs)) = split_test_op(t, "==") {
                     Ok(test_eq_to_sh(&lhs, &rhs))
                 } else if is_bb {
@@ -1831,7 +1914,20 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                     if i > 0 {
                         line.push_str(" | ");
                     }
-                    line.push_str(&stmts_inline(stg)?);
+                    let s = stmts_inline(stg)?;
+                    // a heredoc stage is multi-line — the `| next` must
+                    // apply to a brace group, not the EOF terminator line
+                    // (the `}` alone on the line after the terminator is
+                    // the only form dash accepts — `; }` is a syntax error)
+                    if stage_has_heredoc(stg) {
+                        if s.ends_with('\n') {
+                            line.push_str(&format!("{{ {s}}}"));
+                        } else {
+                            line.push_str(&format!("{{ {s}; }}"));
+                        }
+                    } else {
+                        line.push_str(&s);
+                    }
                 }
                 Ok(line)
             }
@@ -2059,6 +2155,12 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
         match e {
             IrExpr::Array(es) => es.iter().any(has_grep_p),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_grep_p(v)),
+            IrExpr::Arrow(stmts) => walk(stmts),
+            IrExpr::BinOp { lhs, rhs, .. } => has_grep_p(lhs) || has_grep_p(rhs),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                InterpPart::Expr(x) => has_grep_p(x),
+                _ => false,
+            }),
             _ => false,
         }
     }
@@ -2110,6 +2212,77 @@ fn readlink_flag(s: &str) -> bool {
         || (s.starts_with('-') && s.len() > 2
             && s[1..].chars().all(|c| "efmn".contains(c))
             && s[1..].chars().any(|c| "efm".contains(c)))
+}
+
+// Does the program need the `_ls` polyfill prologue (a non-`-l` ls that
+// could run under a sort-less busybox — and whose rc must survive an
+// `|| echo` chain)?
+fn needs_ls(stmts: &[IrStmt]) -> bool {
+    fn has_ls(e: &IrExpr) -> bool {
+        if let IrExpr::Call { func, args } = e {
+            if func == "exec" && args.len() >= 1 {
+                if let IrExpr::Str(cn, _) = &args[0] {
+                    if cn == "ls" {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            let has_l = items.iter().any(|a| matches!(a, IrExpr::Str(s, _)
+                                if s == "-l" || s.starts_with("--")));
+                            if !has_l {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            args.iter().any(has_ls)
+        } else if let IrExpr::Arrow(stmts) = e {
+            walk(stmts)
+        } else if let IrExpr::Array(es) = e {
+            es.iter().any(has_ls)
+        } else if let IrExpr::Object(es) = e {
+            es.iter().any(|(_, v)| has_ls(v))
+        } else if let IrExpr::BinOp { lhs, rhs, .. } = e {
+            has_ls(lhs) || has_ls(rhs)
+        } else if let IrExpr::Interpolate(parts) = e {
+            parts.iter().any(|p| match p {
+                InterpPart::Expr(x) => has_ls(x),
+                _ => false,
+            })
+        } else {
+            false
+        }
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            match st {
+                IrStmt::Expr(e) => { if has_ls(e) { return true; } }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    if has_ls(cond) || walk(body) { return true; }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    if has_ls(cond) || walk(then) || walk(else_)
+                        || elsifs.iter().any(|(c, b)| has_ls(c) || walk(b))
+                    { return true; }
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    if walk(body) { return true; }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    if has_ls(iter) || walk(body) { return true; }
+                }
+                IrStmt::Assign { expr, .. } => { if has_ls(expr) { return true; } }
+                IrStmt::Redirect { inner, redirects } => {
+                    if walk(inner) { return true; }
+                    for r in redirects {
+                        if has_ls(&r.target) { return true; }
+                    }
+                }
+                IrStmt::Function { body, .. } => { if walk(body) { return true; } }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
 }
 
 // Does the program need the `_readlink` polyfill prologue?
@@ -2534,6 +2707,19 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
         }
         return Ok(out);
     }
+    // `unset -n` (nameref) — bash-only flag; dash's unset has no -n.
+    // Dropping the flag still unsets the named variable (the -n only
+    // changes whether the NAME or the REFERENT is unset).
+    if cmd_name == Some("unset") {
+        let mut kept: Vec<String> = Vec::new();
+        for a in args {
+            match a {
+                IrExpr::Str(s, _) if s == "-n" || s == "--nameref" => {}
+                other => kept.push(word_to_sh(other)?),
+            }
+        }
+        return Ok(format!("unset {}", kept.join(" ")));
+    }
     // `declare`/`typeset` are bash-only builtins (dash rejects them);
     // translate the POSIX-representable forms: `declare x=1` -> `x=1`,
     // `-r` -> readonly, `-x` -> export, `-i`/`-a`/`-A`/`-u`/`-l`/`-n` flags
@@ -2542,16 +2728,41 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
     if matches!(cmd_name, Some("declare" | "typeset")) {
         let mut words: Vec<String> = Vec::new();
         let mut flags: Vec<String> = Vec::new();
-        for a in args {
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
             match a {
                 IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
                     flags.push(s.clone());
                 }
                 // `typeset -i n=42` — the assignment word stays UNQUOTED
                 // (dash would create a literal "n=42" variable)
-                IrExpr::Str(s, _) if s.contains('=') => words.push(s.clone()),
+                IrExpr::Str(s, _) if s.contains('=') => {
+                    // `typeset -r rovar=immutable` — the core splits the
+                    // assignment into ["rovar=", "immutable"]; rejoin the
+                    // value word (the local/export/readonly arm below does
+                    // the same)
+                    if s.ends_with('=') && i + 1 < args.len() {
+                        if let Some(next) = args.get(i + 1) {
+                            let is_flag = matches!(next, IrExpr::Str(x, _)
+                                if x.starts_with('-') && x.len() > 1);
+                            if !is_flag {
+                                let nv = word_to_sh(next)?;
+                                if nv.is_empty() || nv == "''" || nv == "\"\"" {
+                                    words.push(s.trim_end_matches('=').to_string());
+                                } else {
+                                    words.push(format!("{s}{nv}"));
+                                }
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    }
+                    words.push(s.clone());
+                }
                 other => words.push(word_to_sh(other)?),
             }
+            i += 1;
         }
         if flags.iter().any(|f| f.contains('i')) {
             let mut ints = INT_VARS.lock().unwrap();
@@ -2565,6 +2776,22 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
             for w in &words {
                 let name = w.split('=').next().unwrap_or(w.as_str());
                 assoc.insert(name.to_string());
+            }
+        }
+        // `typeset -l`/`-u` — bash lowercases/uppercases the assigned
+        // VALUE (dash has no such attribute); transform static values
+        // with tr (dynamic `$var` values are left alone — the attribute
+        // would apply at assignment time in bash, unknowable here)
+        if flags.iter().any(|f| f.contains('l') || f.contains('u')) && !words.is_empty() {
+            let up = flags.iter().any(|f| f.contains('u'));
+            let tr = if up { "tr a-z A-Z" } else { "tr A-Z a-z" };
+            for w in words.iter_mut() {
+                if let Some(eq) = w.find('=') {
+                    let (name, val) = w.split_at(eq + 1);
+                    if !val.contains(['$', '`', '\\']) {
+                        *w = format!("{name}$(printf '%s' {val} | {tr})");
+                    }
+                }
             }
         }
         let prefix = if flags.iter().any(|f| f.contains('r')) {
@@ -2925,12 +3152,15 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
         let has_l = args.iter().any(|a| matches!(a, IrExpr::Str(s, _)
             if s == "-l" || s.starts_with("--")));
         if !has_l {
-            out.push_str(&word_to_sh(cmd)?);
+            // busybox ls output is unsorted; GNU's is. The `_ls` polyfill
+            // sorts the CAPTURED output and returns ls's own rc — a bare
+            // `| sort` would make the pipeline rc sort's (0), breaking
+            // `ls missing || echo` chains.
+            out.push_str("_ls");
             for w in args {
                 out.push(' ');
                 out.push_str(&word_to_sh(w)?);
             }
-            out.push_str(" | sort");
             return Ok(out);
         }
     }
@@ -3387,7 +3617,7 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
                         arr_base(&name)
                     ))
                 }
-                IrExpr::Str(k, _) => Ok(format!("\"${{{name}_{k}}}\"")),
+                IrExpr::Str(k, _) => Ok(format!("\"${{{}}}\"", elem_name(&name, &k))),
                 _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
             }
         }
@@ -3489,7 +3719,7 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                         arr_base(&an)
                     ));
                 }
-                return Ok(format!("\"${{{an}_{idx}}}\""));
+                return Ok(format!("\"${{{}}}\"", elem_name(arr_base(&an), idx)));
             }
             if let Some(an) = name.strip_prefix('#') {
                 return Ok(format!("${{{an}_len}}"));
@@ -3610,6 +3840,10 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
         )),
         "#" | "##" | "%" | "%%" => {
             let pat = raw_arg(args, 2)?;
+            // the pattern is embedded in a DOUBLE-QUOTED context — a `"`
+            // in the pattern (`${x#\"}`) would terminate the quote and
+            // dash would report Missing '}'; backticks too
+            let pat = pat.replace('"', "\\\"").replace('`', "\\`");
             Ok(format!("${{{name}{op}{pat}}}"))
         }
         "//" | "/" => {
@@ -3625,6 +3859,18 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
         }
         ":-" | ":=" | ":?" => {
             let default = raw_arg(args, 2)?;
+            // `${arr[${k}]:-...}` / a default containing array text
+            // (`${default[@]:0:2}`) — dash cannot parse either; eval the
+            // whole expansion at runtime with the per-element forms
+            // (the `\${`/`\$(` escapes keep the OUTER shell from
+            // pre-expanding; `${k}` expands at the outer — same value)
+            if name.contains('[') || default.contains("[@]") || default.contains("[*]") {
+                let name_rw = name.replace('[', "_").replace(']', "");
+                let def_rw = rewrite_array_text(&default);
+                return Ok(format!(
+                    "$(eval \"printf '%s' \\\"\\${{{name_rw}{op}{def_rw}}}\\\"\")"
+                ));
+            }
             // `${arr:-d}` — bash's array form reads ELEMENT 0 when the
             // array is non-empty (the per-element vars have no scalar)
             if ARRAY_NAMES.lock().unwrap().contains(name.as_str()) {
@@ -3748,7 +3994,16 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
                     out.push('"');
                     open = false;
                 }
-                out.push_str(&interp_expr_to_sh(x)?);
+                let e = interp_expr_to_sh(x)?;
+                if open {
+                    // the expr sits INSIDE the interp's quotes — strip its
+                    // own quoting (param "" / capture render `"$x"` /
+                    // `"$(...)"`; `"a ""$x"" b"` would leave $x
+                    // UNQUOTED and field-split)
+                    out.push_str(e.trim_matches('"'));
+                } else {
+                    out.push_str(&e);
+                }
             }
         }
     }
@@ -3779,7 +4034,7 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
                         arr_base(&name)
                     ))
                 } else {
-                    Ok(format!("${{{name}_{key}}}"))
+                    Ok(format!("${{{}}}", elem_name(arr_base(&name), &key)))
                 }
             }
             "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
@@ -3868,6 +4123,68 @@ fn test_eq_to_sh(lhs: &str, rhs: &str) -> String {
     } else {
         format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac")
     }
+}
+
+/// Inside a `\${{...}}` eval string: rewrite array-expansion text to
+/// the per-element helpers. `${X[@]:OFF:LEN}` → `\$(_arr_slice X OFF
+/// LEN)`; `${X[@]}` → `\$(_arr_expand X)`; `${X[K]}` → `\${{X_K}}`.
+/// (The leading `\$` survives the outer shell; the eval'd shell runs
+/// the helper.)
+fn rewrite_array_text(t: &str) -> String {
+    let mut out = String::new();
+    let b = t.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
+            if let Some(close) = t[i..].find('}').map(|p| i + p) {
+                let inner = &t[i + 2..close];
+                if let Some(rest) = inner.strip_prefix('#') {
+                    // `${#X[@]}` — the length counter
+                    if let Some(base) =
+                        rest.strip_suffix("[@]").or_else(|| rest.strip_suffix("[*]"))
+                    {
+                        out.push_str(&format!("\\${{{base}_len}}"));
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                if let Some((base, mid)) = inner.split_once("[@]:") {
+                    if !base.is_empty()
+                        && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        out.push_str(&format!("\\$(_arr_slice {base} {})", mid.replace(':', " ")));
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                if let Some(base) =
+                    inner.strip_suffix("[@]").or_else(|| inner.strip_suffix("[*]"))
+                {
+                    if !base.is_empty()
+                        && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        out.push_str(&format!("\\$(_arr_expand {base})"));
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                if let Some((base, key)) = inner.split_once('[') {
+                    let key = key.trim_end_matches(']');
+                    if !base.is_empty()
+                        && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && !key.is_empty()
+                    {
+                        out.push_str(&format!("\\${{{base}_{key}}}"));
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// The core's test lowering strips the spaces around comparison
@@ -4633,6 +4950,53 @@ fn arrow_at(args: &[IrExpr], idx: usize) -> Result<String, String> {
 }
 
 /// The stages of a pipeline call: `Array([Arrow, Arrow, ...])`.
+/// A pipeline stage whose command carries a heredoc renders as a
+/// MULTI-LINE string ending in the `EOF` terminator — appending ` | next`
+/// after it is a syntax error. Wrap the stage in a brace group
+/// (`{ cat <<'EOF' … EOF; } | next`) so the pipe applies to the group.
+fn stage_has_heredoc(stmts: &[IrStmt]) -> bool {
+    fn redirs_have(rs: &[IrRedirect]) -> bool {
+        rs.iter().any(|r| r.mode == "heredoc" || r.mode == "heredoc-tabs")
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            match st {
+                IrStmt::Redirect { redirects, .. } => {
+                    if redirs_have(redirects) {
+                        return true;
+                    }
+                }
+                // the `redirect` CALL form (heredocs ride here too)
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "redirect" => {
+                    if let Some(IrExpr::Array(specs)) = args.get(1) {
+                        for sp in specs {
+                            if let IrExpr::Object(pairs) = sp {
+                                for (k, v) in pairs {
+                                    if k == "mode" {
+                                        if let IrExpr::Str(m, _) = v {
+                                            if m == "heredoc" || m == "heredoc-tabs" {
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                    if walk(b) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
 fn pipeline_stages(args: &[IrExpr]) -> Result<Vec<Vec<IrStmt>>, String> {
     let Some(IrExpr::Array(stages)) = args.first() else {
         return Err("pipeline stages not Array".into());
@@ -4753,9 +5117,25 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             cmd_to_sh(cond)?,
             stmts_inline(body)?
         )),
-        IrStmt::ForInit { .. } => Err(
-            "sh renderer: un-stripped ForInit (the strip_cfor pass should have lowered it)".into(),
-        ),
+        IrStmt::ForInit { init, cond, step, body } => {
+            // C-style for in an inline context — portable while loop
+            let mut parts: Vec<String> = Vec::new();
+            for i in init {
+                parts.push(stmt_inline(i)?);
+            }
+            let mut looped = format!(
+                "while {}; do {}",
+                cmd_to_sh(cond)?,
+                stmts_inline(body)?
+            );
+            for s in step {
+                looped.push(';');
+                looped.push_str(&stmt_inline(s)?);
+            }
+            looped.push_str("; done");
+            parts.push(looped);
+            Ok(parts.join("; "))
+        }
         IrStmt::Continue => Ok(format!("continue")),
         IrStmt::Break => Ok(format!("break")),
         IrStmt::DoWhile { body, cond, until } => {
@@ -4912,7 +5292,16 @@ fn for_items_to_sh(iter: &IrExpr) -> Result<String, String> {
 
 fn for_item_to_sh(e: &IrExpr) -> Result<String, String> {
     match e {
-        IrExpr::Call { func, args } if func == "getVar" => Ok(format!("${}", raw_arg(args, 0)?)),
+        // getVar is the QUOTED form — `for i in "$*"` must iterate ONE
+        // (possibly empty) argument, not the field-split expansion
+        IrExpr::Call { func, args } if func == "getVar" => {
+            let n = raw_arg(args, 0)?;
+            if n == "*" || n == "@" {
+                Ok(format!("\"${n}\""))
+            } else {
+                Ok(format!("${n}"))
+            }
+        }
         IrExpr::Call { func, args } if func == "listVar" => {
             let n = raw_arg(args, 0)?;
             Ok(if n == "*" { "\"$*\"".into() } else { "\"$@\"".into() })
