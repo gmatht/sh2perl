@@ -377,14 +377,24 @@ fn redirect_call_touches_fd1(args: &[IrExpr]) -> bool {
 /// sh2-namespace.mjs (verified against the full git history). The only
 /// remaining async reason is an AWAIT in the lowered body or specs —
 /// which the callers already check separately (expr_has_await).)
-fn redirect_specs_sync_ok(_specs: &[(i64, &str, &IrExpr)]) -> bool {
-    true
+fn redirect_specs_sync_ok(specs: &[(i64, &str, &IrExpr)]) -> bool {
+    specs
+        .iter()
+        .all(|(_, _, t)| matches!(t, IrExpr::Str(s, _) if s.starts_with('&')))
 }
 
 /// The expr-position `redirect` CALL form: the same verdict over the
 /// spec OBJECTS (see [`redirect_specs_sync_ok`]).
-fn redirect_call_sync_ok(_args: &[IrExpr]) -> bool {
-    true
+fn redirect_call_sync_ok(args: &[IrExpr]) -> bool {
+    let [_, IrExpr::Array(spec_objs)] = args else {
+        return false;
+    };
+    spec_objs.iter().all(|so| match so {
+        IrExpr::Object(props) => props.iter().any(|(k, v)| {
+            k == "target" && matches!(v, IrExpr::Str(s, _) if s.starts_with('&'))
+        }),
+        _ => false,
+    })
 }
 /// Whether the program contains a PERSISTENT fd-1 redirect (a bare
 /// `exec >file` / `exec 1>&2` / `exec 1>&-` — the runtime keeps those in
@@ -2873,6 +2883,9 @@ fn estree_stmt_reads_positional(s: &Stmt) -> bool {
                     .any(estree_stmt_reads_positional)
         }
         Stmt::WhileStatement { test, body } => {
+            estree_reads_positional(test) || estree_stmt_reads_positional(body)
+        }
+        Stmt::DoWhileStatement { test, body } => {
             estree_reads_positional(test) || estree_stmt_reads_positional(body)
         }
         Stmt::TryStatement {
@@ -14257,9 +14270,9 @@ fn lowered_stmts_have_signals(stmts: &[Stmt]) -> bool {
             Stmt::SwitchStatement { cases, .. } => cases
                 .iter()
                 .any(|c| c.consequent.iter().any(|x| stmt_has_signal(x, true))),
-            Stmt::WhileStatement { body, .. } | Stmt::ForOfStatement { body, .. } => {
-                stmt_has_signal(body, false)
-            }
+            Stmt::WhileStatement { body, .. }
+            | Stmt::DoWhileStatement { body, .. }
+            | Stmt::ForOfStatement { body, .. } => stmt_has_signal(body, false),
             Stmt::ForStatement { body, .. } => stmt_has_signal(body, false),
             Stmt::VariableDeclaration { declarations, .. } => declarations
                 .iter()
@@ -15651,6 +15664,43 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 ),
             }
         }
+        IrStmt::DoWhile { body, cond, until } => {
+            // The A1 contract's post-test loop (core request
+            // c-sh-go-20260814-111815): `do { body } while (test)` — the
+            // body runs at least once, THEN the condition is re-checked
+            // (the While arm's pre-test shape). The c-sh-go frontend
+            // emits this for C `do-while`; `until` (the contract's
+            // repeat-until form) negates the test, mirroring
+            // js_backend.rs's `until → while (!(cond))` lowering. The
+            // cond rendering is the While arm's (a test-string Call →
+            // native/runtime test). Native do-while: the body provably
+            // runs at least once, so no `ran`-flag / runtime-loop
+            // machinery is needed.
+            let cond_e = {
+                if test_cond_write_is_dead(stmt) {
+                    *TEST_UNSTATUSED_DEPTH.lock().unwrap() += 1;
+                    let c = expr_to_estree(cond);
+                    *TEST_UNSTATUSED_DEPTH.lock().unwrap() -= 1;
+                    c
+                } else {
+                    expr_to_estree(cond)
+                }
+            };
+            let test = if *until {
+                Expr::UnaryExpression {
+                    operator: "!".to_string(),
+                    argument: Box::new(cond_e),
+                    prefix: true,
+                }
+            } else {
+                cond_e
+            };
+            let body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
+            Stmt::DoWhileStatement {
+                test,
+                body: Box::new(Stmt::BlockStatement { body: body_stmts }),
+            }
+        }
         IrStmt::For { var, iter, body } => {
             let js_var = safe_ident(var);
             // The `seq_range_for` transform's native-range iterable (a
@@ -16416,18 +16466,19 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     .map(|r| redirect_spec_to_estree(r, persist))
                     .collect(),
             );
-            let call = if expr_has_await(&body) || expr_has_await(&specs) {
+            let call = if expr_has_await(&body)
+                || expr_has_await(&specs)
+                || !redirect_specs_sync_ok(&redirect_specs)
+            {
                 await_call("redirect", vec![body, specs])
             } else {
                 // *Sync twin (see the generic call arm): an await-free
-                // body AND await-free (literal or dynamic) redirect
-                // targets run through the sync runtime twin — the same
-                // spec install/restore/persist logic, no per-call
-                // promise. Every spec mode is synchronous in the
-                // runtime's _applyRedirectSpecs (see
-                // redirect_specs_sync_ok — the eligibility audit); the
-                // only async reason is an await in the body or specs,
-                // checked above.
+                // body AND literal (await-free) redirect targets run
+                // through the sync runtime twin — the same spec
+                // install/restore/persist logic, no per-call promise.
+                // ONLY fd-dup (`&N`) specs qualify: file targets need
+                // the async fs bridge (redirect_specs_sync_ok — the
+                // runtime's redirectSync refuses non-& targets).
                 sh2_call("redirectSync", vec![sync_arrow_flip(body), specs])
             };
             Stmt::ExpressionStatement { expression: call }
@@ -31260,10 +31311,10 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 if SYNC_TWIN_CALLS.contains(&callee_name)
                     && mapped_args.iter().all(|a| !expr_has_await(a))
                     && (callee_name != "redirect" || redirect_call_sync_ok(args))
-                    // redirect: ALL spec targets are sync-capable in
-                    // the runtime twin (redirect_call_sync_ok — the
-                    // eligibility audit; the await-free args check
-                    // above is the only gate).
+                    // redirect: ONLY fd-dup (`&N`) spec targets run in
+                    // the sync twin — file targets need the async fs
+                    // bridge (redirect_call_sync_ok; the runtime's
+                    // redirectSync refuses non-& targets).
                 {
                     sh2_call(
                         &format!("{callee_name}Sync"),
@@ -33077,6 +33128,9 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
                     })
             }
             Stmt::WhileStatement { test, body } => expr_ok(test, var) && stmt_ok(body, var),
+            Stmt::DoWhileStatement { test, body } => {
+                expr_ok(test, var) && stmt_ok(body, var)
+            }
             Stmt::ForStatement {
                 init,
                 test,
@@ -33246,6 +33300,10 @@ fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
                 }
             }
             Stmt::WhileStatement { test, body } => {
+                expr_rewrite(test, var, js_var);
+                stmt_rewrite(body, var, js_var);
+            }
+            Stmt::DoWhileStatement { test, body } => {
                 expr_rewrite(test, var, js_var);
                 stmt_rewrite(body, var, js_var);
             }
