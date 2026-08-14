@@ -473,14 +473,24 @@ impl Render {
                                 }
                                 // a var ref inside a quoted word — the
                                 // VALUE interpolates single-quoted (embedded
-                                // quotes/globs stay data)
+                                // quotes/globs stay data); sh-owned loops
+                                // keep the ref at the sh level (bare)
                                 if func == "getVar" {
                                     if let Some(name) = Self::str_arg(args, 0) {
-                                        if !lit.is_empty() {
+                                        if self.sh_owned {
+                                            if !lit.is_empty() {
+                                                out.push_str(&shell_squote(&lit));
+                                                lit.clear();
+                                            }
+                                            out.push_str(&self.shell_var_ref(&name));
+                                        } else if !lit.is_empty() {
                                             let mut seg = String::from("\"");
                                             seg.push_str(&sh_dq_escape(&lit));
                                             lit.clear();
-                                            seg.push_str(&format!("'{}'", self.var_ref(&name)));
+                                            seg.push_str(&format!(
+                                                "'{}'",
+                                                self.var_ref(&name)
+                                            ));
                                             seg.push('"');
                                             out.push_str(&seg);
                                         } else {
@@ -933,7 +943,9 @@ impl Render {
                 Some(format!("({inner})"))
             }
             "whileLoop" => {
-                // whileLoop(condArrow, bodyArrow)
+                // whileLoop(condArrow, bodyArrow) — sh owns the loop vars
+                // (read-assigned): refs in the BODY stay sh-level
+                self.sh_owned = true;
                 let c = args.first().and_then(|a| match a {
                     IrExpr::Arrow(stmts) => Some(self.shell_cmd(stmts, "; ")),
                     _ => None,
@@ -942,8 +954,6 @@ impl Render {
                     IrExpr::Arrow(stmts) => Some(self.shell_cmd(stmts, "; ")),
                     _ => None,
                 })?;
-                // sh owns the loop vars (read-assigned): refs stay sh-level
-                self.sh_owned = true;
                 Some(format!("while {c}; do {b}; done"))
             }
             "grepMatches" => {
