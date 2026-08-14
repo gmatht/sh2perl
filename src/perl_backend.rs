@@ -3259,8 +3259,9 @@ impl Render {
                     "(system({rest})) == -1 and system('bash', '-c', {fbl});"
                 ));
                 // the statement's VALUE (and the block-cond convention):
-                // the STATUS (0/256), not the boolean and-chain
-                self.emit("$? = ($? == 0 ? 0 : 256);");
+                // the STATUS (0/256), not the boolean and-chain — but
+                // keep the FULL exit code detail ($? >> 8) for `exit: $?`
+                self.emit("$? = ($? == 0 ? 0 : (($? >> 8) * 256));");
             }
         }
     }
