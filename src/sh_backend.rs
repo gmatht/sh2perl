@@ -3687,11 +3687,17 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
                     Ok(arr_expand_call(arr_base(&name)))
                 }
                 IrExpr::Str(k, _) if k.contains(['$', '(']) => {
-                    // dynamic key (`${map[$k]}`) — indirect via eval
-                    Ok(format!(
-                        "$(eval \"printf '%s' \\\"\\${{{}_{}}}\\\"\")",
-                        arr_base(&name),
+                    // dynamic key — assoc arrays key on the expanded
+                    // text; indexed arrays evaluate the subscript as
+                    // arithmetic
+                    let base = arr_base(&name);
+                    let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
                         eval_key(&k)
+                    } else {
+                        format!("$(({k}))")
+                    };
+                    Ok(format!(
+                        "$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")"
                     ))
                 }
                 IrExpr::Str(k, _) => Ok(format!("\"${{{}}}\"", elem_name(&name, &k))),
@@ -3847,9 +3853,13 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
             if name == "@" || name == "*" {
                 // `${@:off}` — positional slice: shift + join
                 let offn: i64 = off.trim().parse().unwrap_or(-1);
-                if offn >= 1 {
+                if offn > 1 {
                     let sh = offn - 1;
                     return Ok(format!("$(shift {sh}; printf '%s' \"$*\")"));
+                }
+                if offn == 1 {
+                    // `${@:1}` — all params; `shift 0` is a dash error
+                    return Ok(format!("$(printf '%s' \"$*\")"));
                 }
                 return Ok(format!("${{{name}:{off}}}"));
             }
