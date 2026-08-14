@@ -188,7 +188,9 @@ pub fn generate_sha512sum_command(
                         file
                     };
                 output.push_str(&format!("    if ( -f {} ) {{\n", file));
-                output.push_str(&format!("        my $hash = sha512_hex(\n            do {{\n                "));
+                output.push_str(&format!(
+                    "        my $hash = sha512_hex(\n            do {{\n                "
+                ));
                 output.push_str(&stmt_to_perl(
                     &IrStmt::Declare {
                         vars: vec![Decl {
@@ -229,7 +231,9 @@ pub fn generate_sha512sum_command(
                         file
                     };
                 output.push_str(&format!("    if ( -f {} ) {{\n", file));
-                output.push_str(&format!("        my $hash = sha512_hex(\n            do {{\n                "));
+                output.push_str(&format!(
+                    "        my $hash = sha512_hex(\n            do {{\n                "
+                ));
                 output.push_str(&stmt_to_perl(
                     &IrStmt::Declare {
                         vars: vec![Decl {

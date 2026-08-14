@@ -7,6 +7,7 @@ done
 
 for i in {1..3}; do j=$((j+1)); done; echo $j
 
+i=0
 while [ $i -lt 10 ]; do
     echo "Counter: $i"
     i=$((i + 1))

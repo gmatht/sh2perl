@@ -1,6 +1,9 @@
 #!/bin/bash
 
 # 19. Function call with complex argument processing
+complex_function() {
+    echo "fn args: $*"
+}
 complex_function \
     --long-option="value with spaces" \
     --array-option "item1" "item2" "item3" \

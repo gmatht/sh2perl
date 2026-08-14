@@ -127,7 +127,10 @@ pub fn generate_date_expression(generator: &mut Generator, cmd: &SimpleCommand) 
             // Since expr_to_perl gives us the clean call, we swap the time argument.
             let time_arg = format!("localtime((stat({}))[9])", path_expr);
             let modified_call = strftime_call.replace("localtime()", &time_arg);
-            format!("my $date_path = {};\nrequire POSIX; {}", path_expr, modified_call)
+            format!(
+                "my $date_path = {};\nrequire POSIX; {}",
+                path_expr, modified_call
+            )
         }
         [flag_word, arg, ..] if simple_word_text(flag_word).as_deref() == Some("-d") => {
             let source_expr = generator.word_to_perl(arg);
@@ -185,4 +188,3 @@ pub fn generate_date_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
         format!("my $date = do {{\n{}\n}} . \"\\n\";\nprint $date;\n", body)
     }
 }
-

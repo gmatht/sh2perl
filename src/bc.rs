@@ -31,7 +31,9 @@ struct Num {
 }
 
 fn pow10(k: u32) -> Result<i128, String> {
-    10i128.checked_pow(k).ok_or_else(|| format!("bc: scale {k} overflows"))
+    10i128
+        .checked_pow(k)
+        .ok_or_else(|| format!("bc: scale {k} overflows"))
 }
 
 impl Num {
@@ -66,12 +68,22 @@ enum Tok {
     Num(Num),
     Ident(String),
     // multi-char ops
-    EqEq,   // ==
-    NotEq,  // !=
-    Le,     // <=
-    Ge,     // >=
+    EqEq,  // ==
+    NotEq, // !=
+    Le,    // <=
+    Ge,    // >=
     // single-char ops
-    Eq, Plus, Minus, Star, Slash, Percent, Caret, LParen, RParen, Lt, Gt,
+    Eq,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    Caret,
+    LParen,
+    RParen,
+    Lt,
+    Gt,
     Sep, // ; or newline
 }
 
@@ -137,7 +149,10 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     .checked_mul(pow10(frac_s.len() as u32)?)
                     .and_then(|x| x.checked_add(frac_v))
                     .ok_or("bc: number too large")?;
-                toks.push(Tok::Num(Num { v, scale: frac_s.len() as u32 }));
+                toks.push(Tok::Num(Num {
+                    v,
+                    scale: frac_s.len() as u32,
+                }));
             }
             'a'..='z' | '_' => {
                 let mut id = String::new();
@@ -242,14 +257,8 @@ fn isqrt(v: i128) -> i128 {
 
 fn add(a: Num, b: Num) -> Result<Num, String> {
     let r = a.scale.max(b.scale);
-    let av = a
-        .v
-        .checked_mul(pow10(r - a.scale)?)
-        .ok_or("bc: overflow")?;
-    let bv = b
-        .v
-        .checked_mul(pow10(r - b.scale)?)
-        .ok_or("bc: overflow")?;
+    let av = a.v.checked_mul(pow10(r - a.scale)?).ok_or("bc: overflow")?;
+    let bv = b.v.checked_mul(pow10(r - b.scale)?).ok_or("bc: overflow")?;
     Ok(Num {
         v: av.checked_add(bv).ok_or("bc: overflow")?,
         scale: r,
@@ -259,12 +268,11 @@ fn add(a: Num, b: Num) -> Result<Num, String> {
 fn mul(a: Num, b: Num, cur: u32) -> Result<Num, String> {
     // bc: result scale = min(sa+sb, max(sa, sb, cur)); truncate
     let r = (a.scale + b.scale).min(a.scale.max(b.scale).max(cur));
-    let v = a
-        .v
-        .checked_mul(b.v)
-        .ok_or("bc: overflow")?
-        .checked_div(pow10(a.scale + b.scale - r)?)
-        .ok_or("bc: overflow")?;
+    let v =
+        a.v.checked_mul(b.v)
+            .ok_or("bc: overflow")?
+            .checked_div(pow10(a.scale + b.scale - r)?)
+            .ok_or("bc: overflow")?;
     Ok(Num { v, scale: r })
 }
 
@@ -273,10 +281,9 @@ fn div(a: Num, b: Num, cur: u32) -> Result<Num, String> {
         return Err("bc: division by zero".to_string());
     }
     // (a.v/10^sa) / (b.v/10^sb) truncated to cur: a.v*10^(sb+cur)/(b.v*10^sa)
-    let num = a
-        .v
-        .checked_mul(pow10(b.scale + cur)?)
-        .ok_or("bc: overflow")?;
+    let num =
+        a.v.checked_mul(pow10(b.scale + cur)?)
+            .ok_or("bc: overflow")?;
     let den = b.v.checked_mul(pow10(a.scale)?).ok_or("bc: overflow")?;
     Ok(Num {
         v: num / den, // Rust / truncates toward zero — bc's scale truncation
@@ -297,7 +304,10 @@ fn rem(a: Num, b: Num, cur: u32) -> Result<Num, String> {
 
 impl Num {
     fn neg(self) -> Num {
-        Num { v: -self.v, scale: self.scale }
+        Num {
+            v: -self.v,
+            scale: self.scale,
+        }
     }
 }
 
@@ -343,11 +353,13 @@ fn sqrt(a: Num, cur: u32) -> Result<Num, String> {
     }
     // result scale k = max(cur, arg_scale); int = isqrt(v * 10^(2k-s))
     let k = cur.max(a.scale);
-    let scaled = a
-        .v
-        .checked_mul(pow10(2 * k - a.scale)?)
-        .ok_or("bc: overflow")?;
-    Ok(Num { v: isqrt(scaled), scale: k })
+    let scaled =
+        a.v.checked_mul(pow10(2 * k - a.scale)?)
+            .ok_or("bc: overflow")?;
+    Ok(Num {
+        v: isqrt(scaled),
+        scale: k,
+    })
 }
 
 // ── parser / evaluator ───────────────────────────────────────────────
@@ -533,7 +545,11 @@ fn num_cmp(a: Num, b: Num) -> std::cmp::Ordering {
 /// subset returns [`Err`] (the caller falls back to spawning real `bc`).
 pub fn eval(program: &str) -> Result<String, String> {
     let toks = lex(program)?;
-    let mut ev = Eval { toks, pos: 0, cur_scale: 0 };
+    let mut ev = Eval {
+        toks,
+        pos: 0,
+        cur_scale: 0,
+    };
     let mut out = String::new();
     let mut first = true;
     loop {
