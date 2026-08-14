@@ -2107,7 +2107,8 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                         ))
                     } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
                         Ok(format!(
-                            "case \"{lhs}\" in {rhs}) false ;; *) : ;; esac"
+                            "case \"{lhs}\" in {}) false ;; *) : ;; esac",
+                            ansi_c_quotes_to_sh(&rhs)
                         ))
                     } else if let Some((lhs, rhs)) = split_test_op(t, "=") {
                         Ok(test_eq_to_sh(&lhs, &rhs))
@@ -2119,7 +2120,8 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                     }
                 } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
                     Ok(format!(
-                        "case \"{lhs}\" in {rhs}) false ;; *) : ;; esac"
+                        "case \"{lhs}\" in {}) false ;; *) : ;; esac",
+                        ansi_c_quotes_to_sh(&rhs)
                     ))
                 } else if let Some((lhs, rhs)) = split_test_op(t, "=~") {
                     // regex match: grep -E ([[ =~ ]] semantics)
@@ -4956,6 +4958,7 @@ fn escape_test_ltgt(s: &str) -> String {
 /// and no extglob patterns; lower to a case-emulation (a POSIX pattern
 /// match with the same semantics).
 fn test_eq_to_sh(lhs: &str, rhs: &str) -> String {
+    let rhs = ansi_c_quotes_to_sh(rhs);
     if let Some((neg, rest)) = rhs.strip_prefix("!(").and_then(|r| r.split_once(')')) {
         // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`:
         //   case "$s" in *Y) case "$s" in P Y) false;; *) :;; esac;; *) false;; esac
@@ -4982,6 +4985,59 @@ fn test_eq_to_sh(lhs: &str, rhs: &str) -> String {
     }
 }
 
+
+/// dash has no `$'...'` ANSI-C quoting (a bash extension) — translate
+/// each ANSI-C quoted string into a `$(printf '...')` substitution that
+/// both dash and bash decode identically. dash's printf lacks `\xHH`
+/// (it prints the escape literally), so hex escapes become octal
+/// (`\x00` -> `\000`, `\x41` -> `\101`); the rest of the body passes
+/// through verbatim — `\n`/`\t`/`\0NNN`/`\\` are common to both
+/// builtins, and an escaped `\'` is already printf-valid. NUL payloads
+/// decay to an empty expansion (dash strips NUL bytes from command
+/// substitution output), which mirrors bash's own fnmatch behavior —
+/// its pattern matcher truncates at the NUL byte, so
+/// `[[ x == *$'\x00'* ]]` is true-for-everything on both sides.
+fn ansi_c_quotes_to_sh(s: &str) -> String {
+    fn octalize(body: &str) -> String {
+        let mut out = String::new();
+        let mut rest = body;
+        while let Some(i) = rest.find("\\x") {
+            out.push_str(&rest[..i]);
+            let hex = &rest[i + 2..];
+            if hex.len() >= 2 && hex[..2].chars().all(|c| c.is_ascii_hexdigit()) {
+                let v = u32::from_str_radix(&hex[..2], 16).unwrap();
+                out.push_str(&format!("\\{:03o}", v));
+                rest = &hex[2..];
+            } else {
+                out.push_str("\\x");
+                rest = hex;
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("$'") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('\'') {
+            Some(end) => {
+                out.push_str("$(printf '");
+                out.push_str(&octalize(&after[..end]));
+                out.push_str("')");
+                rest = &after[end + 1..];
+            }
+            None => {
+                // unterminated — keep the text as-is
+                out.push_str("$'");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 /// A case pattern: dash (and POSIX) use `[!...]` for negated character
 /// classes — `[^...]` is a bash extension that dash treats as a literal
