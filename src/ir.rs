@@ -2765,6 +2765,7 @@ fn bash_word_for(w: &IrExpr) -> String {
                                 '"' => s.push_str("\\\""),
                                 '$' => s.push_str("\\$"),
                                 '`' => s.push_str("\\`"),
+                                c if is_byte_marker(c) => s.push_str(&byte_marker_escape(c)),
                                 c => s.push(c),
                             }
                         }
@@ -3603,6 +3604,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                             '"' => f.push_str("\\\""),
                             '$' => f.push_str("\\$"),
                             '@' => f.push_str("\\@"),
+                            c if is_byte_marker(c) => f.push_str(&byte_marker_escape(c)),
                             c => f.push(c),
                         }
                     }
@@ -3639,6 +3641,9 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                                         '"' => f.push_str("\\\""),
                                         '$' => f.push_str("\\$"),
                                         '@' => f.push_str("\\@"),
+                                        c if is_byte_marker(c) => {
+                                            f.push_str(&byte_marker_escape(c))
+                                        }
                                         c => f.push(c),
                                     }
                                 }
@@ -3913,6 +3918,7 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
                 '$' => s.push_str("\\$"),
                 '@' => s.push_str("\\@"),
                 '\n' => s.push_str("\\n"),
+                c if is_byte_marker(c) => s.push_str(&byte_marker_escape(c)),
                 _ => s.push(ch),
             }
         }
@@ -4784,17 +4790,46 @@ fn render_test_operand(tok: &str) -> String {
             match ch {
                 '"' => s.push_str("\\\""),
                 '\\' => s.push_str("\\\\"),
+                c if is_byte_marker(c) => s.push_str(&byte_marker_escape(c)),
                 _ => s.push(ch),
             }
         }
         s.push('"');
         s
+    } else if tok.chars().any(is_byte_marker) {
+        // Invalid-UTF-8 byte in a bare test operand: split out \xNN
+        // byte escapes (single quotes would keep them literal).
+        let mut out = String::from("'");
+        for ch in tok.chars() {
+            if is_byte_marker(ch) {
+                out.push_str(&format!("' . \"{}\" . '", byte_marker_escape(ch)));
+            } else if ch == '\'' {
+                out.push_str("\\'");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('\'');
+        out
     } else {
         format!("'{}'", tok.replace('\'', "\\\\'"))
     }
 }
 
 /// Render a Str literal (shared by ir_expr_to_perl and render_word).
+/// Private-use marker chars (U+E000+byte, from
+/// SharedUtils::bytes_to_marked_lossy — the A1 emit's invalid-UTF-8
+/// preservation, core request perl-20260814-175710) become `\xNN` BYTE
+/// escapes so non-UTF-8 source bytes round-trip byte-for-byte (bash treats
+/// scripts as byte streams).
+fn is_byte_marker(c: char) -> bool {
+    (0xE000..=0xE0FF).contains(&(c as u32))
+}
+
+fn byte_marker_escape(c: char) -> String {
+    format!("\\x{:02X}", (c as u32 - 0xE000) as u8)
+}
+
 fn render_str_literal(s: &str, style: &StrStyle) -> String {
     match style {
         StrStyle::SingleQuoted => {
@@ -4802,10 +4837,22 @@ fn render_str_literal(s: &str, style: &StrStyle) -> String {
             // escape quotes.  Escaping only `'` → `\'` is wrong when the
             // source has `\` before a quote: `\'` in the output would be
             // read by Perl as escaped-backslash + string CLOSE.
-            format!(
-                "'{}'",
-                s.replace("\\", "\\\\").replace('\'', "\\'")
-            )
+            // Byte markers break out into a double-quoted `\xNN` escape
+            // (single quotes do not interpolate).
+            let mut out = String::from("'");
+            for ch in s.chars() {
+                if is_byte_marker(ch) {
+                    out.push_str(&format!("' . \"{}\" . '", byte_marker_escape(ch)));
+                } else if ch == '\\' {
+                    out.push_str("\\\\");
+                } else if ch == '\'' {
+                    out.push_str("\\'");
+                } else {
+                    out.push(ch);
+                }
+            }
+            out.push('\'');
+            out
         }
         StrStyle::DoubleQuoted | StrStyle::Heredoc => {
             let mut escaped = String::from("\"");
@@ -4818,13 +4865,27 @@ fn render_str_literal(s: &str, style: &StrStyle) -> String {
                     '\n' => escaped.push_str("\\n"),
                     '\t' => escaped.push_str("\\t"),
                     '\r' => escaped.push_str("\\r"),
+                    c if is_byte_marker(c) => escaped.push_str(&byte_marker_escape(c)),
                     c => escaped.push(c),
                 }
             }
             escaped.push('"');
             escaped
         }
-        StrStyle::Command => format!("`{}`", s),
+        StrStyle::Command => {
+            // Backticks interpolate like double quotes, so \xNN byte
+            // escapes work here too.
+            let mut out = String::from("`");
+            for ch in s.chars() {
+                if is_byte_marker(ch) {
+                    out.push_str(&byte_marker_escape(ch));
+                } else {
+                    out.push(ch);
+                }
+            }
+            out.push('`');
+            out
+        }
     }
 }
 
@@ -5070,20 +5131,44 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     found
                 };
                 if has_leading_zero {
-                    format!(
-                        "q{{{}}}",
-                        s.replace("\\", "\\\\")
-                            .replace("{", "\\{")
-                            .replace("}", "\\}")
-                    )
+                    // q{...} is literal (no interpolation): markers must
+                    // break out into a double-quoted \xNN byte escape.
+                    let mut out = String::from("q{");
+                    for ch in s.chars() {
+                        if is_byte_marker(ch) {
+                            out.push_str(&format!("}}\n\"{}\"\nq{{", byte_marker_escape(ch)));
+                        } else if ch == '\\' {
+                            out.push_str("\\\\");
+                        } else if ch == '{' {
+                            out.push_str("\\{");
+                        } else if ch == '}' {
+                            out.push_str("\\}");
+                        } else {
+                            out.push(ch);
+                        }
+                    }
+                    out.push('}');
+                    out
                 } else {
                     // Double backslashes FIRST, then escape quotes: `\\'` in
                     // the output would otherwise be read as escaped-backslash
                     // + string CLOSE (see render_str_literal).
-                    format!(
-                        "'{}'",
-                        s.replace("\\", "\\\\").replace('\'', "\\'")
-                    )
+                    // Markers break out into a double-quoted \xNN byte
+                    // escape (single quotes do not interpolate).
+                    let mut out = String::from("'");
+                    for ch in s.chars() {
+                        if is_byte_marker(ch) {
+                            out.push_str(&format!("' . \"{}\" . '", byte_marker_escape(ch)));
+                        } else if ch == '\\' {
+                            out.push_str("\\\\");
+                        } else if ch == '\'' {
+                            out.push_str("\\'");
+                        } else {
+                            out.push(ch);
+                        }
+                    }
+                    out.push('\'');
+                    out
                 }
             }
             StrStyle::DoubleQuoted => {
@@ -5101,13 +5186,28 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         '\n' => escaped.push_str("\\n"),
                         '\t' => escaped.push_str("\\t"),
                         '\r' => escaped.push_str("\\r"),
+                        c if is_byte_marker(c) => escaped.push_str(&byte_marker_escape(c)),
                         c => escaped.push(c),
                     }
                 }
                 escaped.push('"');
                 escaped
             }
-            StrStyle::Command => format!("`{}`", s),
+            StrStyle::Command => {
+                // Backticks interpolate like double quotes: \xNN byte
+                // escapes work directly.
+                let mut out = String::with_capacity(s.len() + 4);
+                out.push('`');
+                for ch in s.chars() {
+                    if is_byte_marker(ch) {
+                        out.push_str(&byte_marker_escape(ch));
+                    } else {
+                        out.push(ch);
+                    }
+                }
+                out.push('`');
+                out
+            }
             StrStyle::Heredoc => {
                 // Like DoubleQuoted but preserves $ and @ for Perl interpolation.
                 let mut escaped = String::with_capacity(s.len() + 4);
@@ -5120,6 +5220,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         '\n' => escaped.push_str("\\n"),
                         '\t' => escaped.push_str("\\t"),
                         '\r' => escaped.push_str("\\r"),
+                        c if is_byte_marker(c) => escaped.push_str(&byte_marker_escape(c)),
                         c => escaped.push(c),
                     }
                 }
@@ -5414,6 +5515,9 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                                     '\n' => s.push_str("\\n"),
                                     '\t' => s.push_str("\\t"),
                                     '\r' => s.push_str("\\r"),
+                                    c if is_byte_marker(c) => {
+                                        s.push_str(&byte_marker_escape(c))
+                                    }
                                     c => s.push(c),
                                 }
                             }
@@ -5451,6 +5555,9 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                                     '\n' => lit.push_str("\\n"),
                                     '\t' => lit.push_str("\\t"),
                                     '\r' => lit.push_str("\\r"),
+                                    c if is_byte_marker(c) => {
+                                        lit.push_str(&byte_marker_escape(c))
+                                    }
                                     c => lit.push(c),
                                 }
                             }
