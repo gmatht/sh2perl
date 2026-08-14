@@ -307,7 +307,10 @@ pub enum Token {
     // Long options (must come before Identifier to avoid conflicts)
     // Match both --option=value and --option (without =value)
     // Note: use raw string r##"..."## to allow double quotes inside
-    #[regex(r##"--[a-zA-Z][a-zA-Z0-9_*?.-]*(=("[^"]*"|'[^']*'|[^ \t\n\r|&;(){}<>"'`$\[\]\?#!@*]*))?"##, priority = 3)]
+    #[regex(
+        r##"--[a-zA-Z][a-zA-Z0-9_*?.-]*(=("[^"]*"|'[^']*'|[^ \t\n\r|&;(){}<>"'`$\[\]\?#!@*]*))?"##,
+        priority = 3
+    )]
     LongOption,
 
     // Identifiers and words
@@ -468,7 +471,9 @@ impl Lexer {
             // Skip bare ' and " and ` that logos may choke on
             let mut skip = 0;
             while skip < remaining.len()
-                && (remaining.as_bytes()[skip] == b'\'' || remaining.as_bytes()[skip] == b'"' || remaining.as_bytes()[skip] == b'`')
+                && (remaining.as_bytes()[skip] == b'\''
+                    || remaining.as_bytes()[skip] == b'"'
+                    || remaining.as_bytes()[skip] == b'`')
             {
                 let ch = remaining.as_bytes()[skip];
                 if ch == b'\'' {
@@ -505,11 +510,7 @@ impl Lexer {
                     let span = resume.span();
                     match token_result {
                         Ok(tok) => {
-                            tokens.push((
-                                tok,
-                                last_end + span.start,
-                                last_end + span.end,
-                            ));
+                            tokens.push((tok, last_end + span.start, last_end + span.end));
                         }
                         Err(_) => continue,
                     }
@@ -534,9 +535,9 @@ impl Lexer {
                     && i + 1 < tokens.len()
                     && matches!(tokens[i + 1].0, Token::Newline | Token::CarriageReturn)
                 {
-                    tokens.remove(i);      // remove backslash
-                    tokens.remove(i);      // remove newline (indices shifted)
-                    // Don't increment i — the next token is now at position i
+                    tokens.remove(i); // remove backslash
+                    tokens.remove(i); // remove newline (indices shifted)
+                                      // Don't increment i — the next token is now at position i
                 } else {
                     i += 1;
                 }
@@ -661,11 +662,7 @@ impl Lexer {
             // Use the last known position for a better error.
             if let Some((_, _, last_end)) = self.tokens.last() {
                 let (line, col) = self.offset_to_line_col(*last_end);
-                Err(LexerError::UnexpectedChar {
-                    ch: '?',
-                    line,
-                    col,
-                })
+                Err(LexerError::UnexpectedChar { ch: '?', line, col })
             } else {
                 Err(LexerError::UnexpectedChar {
                     ch: '?',
@@ -673,6 +670,18 @@ impl Lexer {
                     col: 1,
                 })
             }
+        }
+    }
+
+    /// The source line (1-based) of the CURRENT token — the lexer's
+    /// tokens carry BYTE offsets, so map the token's start through the
+    /// line_starts table (binary search). Used by the parser to record
+    /// each top-level statement's line for stmt_lines.
+    pub fn current_line(&self) -> usize {
+        let pos = self.tokens.get(self.current).map(|(_, s, _)| *s).unwrap_or(0);
+        match self.line_starts.binary_search(&pos) {
+            Ok(i) => i + 1,
+            Err(i) => i,
         }
     }
 
@@ -842,7 +851,7 @@ impl Lexer {
             }
             i += 1;
         }
-        
+
         let captured = self.input[start..i].to_string();
 
         // Build list of tokens to inject:
@@ -881,7 +890,7 @@ impl Lexer {
         // Any tokens between the Comment and the first token after the newline
         // are stale (they were subsumed by the Comment).  Remove them all.
         let after_comment_end = self.tokens[self.current].2; // Comment's byte end
-        let remove_start_idx = self.current;     // Remove the Comment itself
+        let remove_start_idx = self.current; // Remove the Comment itself
         let mut remove_end_idx = remove_start_idx + 1;
         while remove_end_idx < self.tokens.len() {
             if self.tokens[remove_end_idx].1 >= after_comment_end {
@@ -957,8 +966,8 @@ impl Lexer {
         }
 
         if let Some(pos) = found_pos {
-            let before = &text[..pos];       // content up to `}`
-            let after  = &text[pos + 1..];   // content after `}`
+            let before = &text[..pos]; // content up to `}`
+            let after = &text[pos + 1..]; // content after `}`
 
             // Remove the Comment token itself; we are going to replace it.
             self.tokens.remove(idx);
@@ -1048,13 +1057,12 @@ impl Lexer {
                 let bytes = input.as_bytes();
                 // Only re-parse if this " is at byte position with "
                 if bytes[start] == b'"' {
-
                     let mut end = start + 1; // skip past opening "
-                    let mut p_depth = 0i32;          // $(  ) depth
-                    let mut b_depth = 0i32;          // ${  } depth
-                    let mut bt_depth = 0i32;          // backtick depth
-                    // When inside $(), track standalone '(' that are not part of
-                    // '$(' so we correctly match ')' to its corresponding '$('.
+                    let mut p_depth = 0i32; // $(  ) depth
+                    let mut b_depth = 0i32; // ${  } depth
+                    let mut bt_depth = 0i32; // backtick depth
+                                             // When inside $(), track standalone '(' that are not part of
+                                             // '$(' so we correctly match ')' to its corresponding '$('.
                     let mut paren_depth = 0i32;
                     // Track single-quote depth inside $(): a ' inside $() starts
                     // a single-quoted string where all characters (including ),
@@ -1077,8 +1085,15 @@ impl Lexer {
                                 found_close = true;
                                 break;
                             }
-                            b'"' if p_depth > 0 || bt_depth > 0 => {
-                                // Toggle double-quote depth inside $() or backtick.
+                            b'"' if (p_depth > 0 || bt_depth > 0) && sq_depth == 0 => {
+                                // Toggle double-quote depth inside $() or backtick. A
+                                // `"` inside a single-quoted string within $() is a
+                                // LITERAL character (bash: `'s/"//g'` inside `$(...)`
+                                // inside a DQS) — it must not toggle dq_depth, or the
+                                // single-quote arm below would stop seeing the closing
+                                // `'` and the whole DQS would fail to find its closing
+                                // `"` (parse-gaps: multiple-awk-in-dqs.sh +
+                                // subshell-sed-squote-dquote.sh).
                                 dq_depth = if dq_depth == 0 { 1 } else { 0 };
                                 end += 1;
                             }
@@ -1094,18 +1109,26 @@ impl Lexer {
                                     end += 2; // skip escaped char
                                 }
                             }
-                            b'`' => {
+                            b'`' if sq_depth == 0 => {
                                 // Toggle backtick depth — backticks inside double
                                 // quotes are command substitutions and should not
-                                // cause the inner " to close the outer string.
+                                // cause the inner " to close the outer string. Inside
+                                // a single-quoted string within $() a backtick is
+                                // literal (same rule as the `"` arm above).
                                 bt_depth = if bt_depth == 0 { 1 } else { 0 };
                                 end += 1;
                             }
-                            b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'(' && sq_depth == 0 => {
+                            b'$' if end + 1 < bytes.len()
+                                && bytes[end + 1] == b'('
+                                && sq_depth == 0 =>
+                            {
                                 p_depth += 1;
                                 end += 2;
                             }
-                            b'$' if end + 1 < bytes.len() && bytes[end + 1] == b'{' && sq_depth == 0 => {
+                            b'$' if end + 1 < bytes.len()
+                                && bytes[end + 1] == b'{'
+                                && sq_depth == 0 =>
+                            {
                                 b_depth += 1;
                                 end += 2;
                             }
@@ -1233,9 +1256,16 @@ impl Lexer {
     pub fn split_overgreedy_sq(input: &str, tokens: &mut Vec<(Token, usize, usize)>) {
         let bytes = input.as_bytes();
         let mut result: Vec<(Token, usize, usize)> = Vec::new();
+        // When a bogus SQS is dropped because it overlaps a preceding DQS, the
+        // covered original tokens (the over-greedy match's artifacts) must be
+        // skipped too; the re-lexed region replaces them wholesale.
+        let mut skip_until = 0usize;
 
         for token in tokens.drain(..) {
             let (tok, start, end) = token;
+            if start < skip_until {
+                continue;
+            }
             if tok != Token::SingleQuotedString {
                 result.push((tok, start, end));
                 continue;
@@ -1246,13 +1276,82 @@ impl Lexer {
             // closing `'` of one SQS is mistakenly treated as the opening `'`
             // of a new SQS.  In that case, emit a bare SingleQuote for the
             // overlapping character and re-lex the tail (the rest of this token).
-            if let Some(&(Token::SingleQuotedString, prev_start, prev_end)) = result.last() {
-                if start > prev_start && start < prev_end {
+            if let Some(&(ref prev_tok, prev_start, prev_end)) = result.last() {
+                if (matches!(
+                    *prev_tok,
+                    Token::SingleQuotedString | Token::DoubleQuotedString
+                )) && start > prev_start
+                    && start < prev_end
+                {
+                    if *prev_tok == Token::DoubleQuotedString {
+                        // The opening `'` is a quote INSIDE the previous DQS
+                        // (a single-quoted segment within a "$(...)" string),
+                        // which logos over-greedily paired with a quote on a
+                        // LATER line (dqs-nested-awk-sed.sh: the line-9 DQS's
+                        // inner `'s|\(.*\)/.*|\1|'` closed at 470 and logos
+                        // paired it with line 10's `printf '` opening quote,
+                        // eating the whole `printf 'pretty_name=[%s]\n'`). The
+                        // DQS already covers everything up to prev_end; the
+                        // SQS is bogus — drop it and re-lex from the DQS end
+                        // through the end of the SQS's line (all of that line's
+                        // tokens are artifacts of the same over-greedy match).
+                        let line_end = (end..input.len())
+                            .find(|&i| bytes[i] == b'\n')
+                            .map(|i| i + 1)
+                            .unwrap_or(input.len());
+                        let region = &input[prev_end..line_end];
+                        let region_start = prev_end;
+                        let mut off = 0usize;
+                        while off < region.len() {
+                            let remaining = &region[off..];
+                            let mut sub = Token::lexer(remaining);
+                            let mut had_ok = false;
+                            while let Some(token_result) = sub.next() {
+                                let span = sub.span();
+                                match token_result {
+                                    Ok(t) => {
+                                        result.push((
+                                            t,
+                                            region_start + off + span.start,
+                                            region_start + off + span.end,
+                                        ));
+                                        had_ok = true;
+                                    }
+                                    Err(_) => continue,
+                                }
+                            }
+                            if had_ok {
+                                if let Some(&(_, _, last_end)) = result.last() {
+                                    off = last_end - region_start;
+                                } else {
+                                    off = region.len();
+                                }
+                            } else {
+                                let ch = region.as_bytes()[off];
+                                if ch == b'\'' {
+                                    result.push((
+                                        Token::SingleQuote,
+                                        region_start + off,
+                                        region_start + off + 1,
+                                    ));
+                                } else if ch == b'"' {
+                                    result.push((
+                                        Token::DoubleQuote,
+                                        region_start + off,
+                                        region_start + off + 1,
+                                    ));
+                                }
+                                off += 1;
+                            }
+                        }
+                        skip_until = line_end;
+                        continue;
+                    }
                     // Opening ' is actually the closing quote of the previous SQS.
                     result.push((Token::SingleQuote, start, start + 1));
                     // Re-lex the content after this bare quote.
                     if start + 1 < end {
-                        let tail_text = &input[start+1..end];
+                        let tail_text = &input[start + 1..end];
                         let tail_start = start + 1;
                         let mut tail_offset = 0;
                         while tail_offset < tail_text.len() {
@@ -1333,18 +1432,14 @@ impl Lexer {
             // Opening keywords like '{', 'while', 'for', 'if', 'case',
             // 'until', 'select', 'function' can legitimately appear inside
             // multi-line quoted strings passed to awk, sed, perl, etc.
-            let keywords = [
-                "done", "then", "fi", "esac", "elif",
-                "do", ")",
-            ];
+            let keywords = ["done", "then", "fi", "esac", "elif", "do", ")"];
             let mut split_pos = None;
 
             for (i, ch) in content.char_indices() {
                 if ch == '\n' {
                     let mut j = i + 1;
                     while j < content.len()
-                        && (content.as_bytes()[j] == b' '
-                            || content.as_bytes()[j] == b'\t')
+                        && (content.as_bytes()[j] == b' ' || content.as_bytes()[j] == b'\t')
                     {
                         j += 1;
                     }
@@ -1545,8 +1640,8 @@ impl Lexer {
         let mut i = 0;
         while i < tokens.len() {
             let (ref tok, start, end) = tokens[i];
-            let single_span = end - start == 1
-                && (*tok == Token::SingleQuote || *tok == Token::DoubleQuote);
+            let single_span =
+                end - start == 1 && (*tok == Token::SingleQuote || *tok == Token::DoubleQuote);
             if !single_span {
                 result.push(tokens[i].clone());
                 i += 1;
@@ -1609,14 +1704,46 @@ impl Lexer {
                             dq_depth = if dq_depth == 0 { 1 } else { 0 };
                             pos += 1;
                         }
-                        b'\\' if pos + 1 < input.len() && sq_depth == 0 => { pos += 2; }
-                        b'`' => { bt_depth = if bt_depth == 0 { 1 } else { 0 }; pos += 1; }
-                        b'\'' if p_depth > 0 && dq_depth == 0 => { sq_depth = if sq_depth == 0 { 1 } else { 0 }; pos += 1; }
-                        b'$' if pos + 1 < input.len() && bytes[pos + 1] == b'(' && sq_depth == 0 => { p_depth += 1; pos += 2; }
-                        b'$' if pos + 1 < input.len() && bytes[pos + 1] == b'{' && sq_depth == 0 => { b_depth += 1; pos += 2; }
-                        b')' if sq_depth == 0 => { if p_depth > 0 { p_depth -= 1; } pos += 1; }
-                        b'}' if sq_depth == 0 => { if b_depth > 0 { b_depth -= 1; } pos += 1; }
-                        _ => { pos += 1; }
+                        b'\\' if pos + 1 < input.len() && sq_depth == 0 => {
+                            pos += 2;
+                        }
+                        b'`' => {
+                            bt_depth = if bt_depth == 0 { 1 } else { 0 };
+                            pos += 1;
+                        }
+                        b'\'' if p_depth > 0 && dq_depth == 0 => {
+                            sq_depth = if sq_depth == 0 { 1 } else { 0 };
+                            pos += 1;
+                        }
+                        b'$' if pos + 1 < input.len()
+                            && bytes[pos + 1] == b'('
+                            && sq_depth == 0 =>
+                        {
+                            p_depth += 1;
+                            pos += 2;
+                        }
+                        b'$' if pos + 1 < input.len()
+                            && bytes[pos + 1] == b'{'
+                            && sq_depth == 0 =>
+                        {
+                            b_depth += 1;
+                            pos += 2;
+                        }
+                        b')' if sq_depth == 0 => {
+                            if p_depth > 0 {
+                                p_depth -= 1;
+                            }
+                            pos += 1;
+                        }
+                        b'}' if sq_depth == 0 => {
+                            if b_depth > 0 {
+                                b_depth -= 1;
+                            }
+                            pos += 1;
+                        }
+                        _ => {
+                            pos += 1;
+                        }
                     }
                 }
                 if pos >= input.len() {
@@ -1651,7 +1778,7 @@ impl Lexer {
                 while j < tokens.len() && depth > 0 {
                     match tokens[j].0 {
                         Token::ArithmeticEval => depth += 2,
-                        Token::Arithmetic => depth += 2, // $((
+                        Token::Arithmetic => depth += 2,  // $((
                         Token::DollarParen => depth += 1, // $(
                         Token::ParenOpen => depth += 1,
                         Token::ArithmeticEvalClose => {

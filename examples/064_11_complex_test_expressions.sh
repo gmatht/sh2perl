@@ -1,6 +1,8 @@
 #!/bin/bash
 
 # 11. Complex test expressions with extended operators
-if [[ "$1" =~ ^[0-9]+$ ]] && [[ "$2" == "test" || "$2" == "debug" ]]; then
+n="42"
+m="debug"
+if [[ "$n" =~ ^[0-9]+$ ]] && [[ "$m" == "test" || "$m" == "debug" ]]; then
     echo "Valid input"
 fi

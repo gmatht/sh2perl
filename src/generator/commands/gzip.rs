@@ -73,9 +73,9 @@ pub fn generate_gzip_command(
                     generator.format_regex_pattern(r"\\.gz$")
                 ));
                 let bash_cmd = format!("gunzip -c {}.gz", file);
-                let bash_lit = generator.perl_string_literal_no_interp(
-                    &crate::ast::Word::literal(bash_cmd.to_string()),
-                );
+                let bash_lit = generator.perl_string_literal_no_interp(&crate::ast::Word::literal(
+                    bash_cmd.to_string(),
+                ));
                 output.push_str(&format!(
                     "my $decompressed = do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or croak \"cmd failed: $!\"; local $/; my $_r = <$__fh>; close $__fh; $_r; }};\n",
                     bash_lit

@@ -24,7 +24,7 @@ pub fn extract_array_key_impl(var: &str) -> Option<(String, String)> {
                     let first = key.chars().next().unwrap();
                     let last = key.chars().next_back().unwrap();
                     if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-                        key[1..key.len()-1].to_string()
+                        key[1..key.len() - 1].to_string()
                     } else {
                         key
                     }
@@ -60,7 +60,8 @@ pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String 
             &s[2..s.len() - 1]
         } else {
             &s[2..]
-        }.trim();
+        }
+        .trim();
         // Detect common patterns that can be translated to native Perl.
         // 1. sort <<<"${var[*]}" or sort <<<"${var[@]}"  —  sort values %var
         if let Some(var_name) = try_extract_sort_herestring_var(inner) {
@@ -75,9 +76,8 @@ pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String 
         let mut parser = crate::parser::commands::Parser::new(inner);
         if let Ok(commands) = parser.parse() {
             if let Some(cmd) = commands.into_iter().next() {
-                let result = generator.word_to_perl(
-                    &Word::CommandSubstitution(Box::new(cmd), None),
-                );
+                let result =
+                    generator.word_to_perl(&Word::CommandSubstitution(Box::new(cmd), None));
                 if !result.contains("qx{") && !result.is_empty() {
                     return result;
                 }
@@ -94,9 +94,8 @@ pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String 
         let mut parser = crate::parser::commands::Parser::new(inner);
         if let Ok(commands) = parser.parse() {
             if let Some(cmd) = commands.into_iter().next() {
-                let result = generator.word_to_perl(
-                    &Word::CommandSubstitution(Box::new(cmd), None),
-                );
+                let result =
+                    generator.word_to_perl(&Word::CommandSubstitution(Box::new(cmd), None));
                 if !result.contains("qx{") && !result.is_empty() {
                     return result;
                 }
@@ -126,7 +125,11 @@ pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String 
                         if let Some(len_str) = length {
                             let len = len_str.trim().parse::<i32>().unwrap_or(0);
                             let start_num = start.parse::<i32>().unwrap_or(0);
-                            let end = if len > 0 { start_num + len - 1 } else { start_num };
+                            let end = if len > 0 {
+                                start_num + len - 1
+                            } else {
+                                start_num
+                            };
                             format!("@{}[{}..{}]", pe.variable, start, end)
                         } else {
                             format!("@{}[{}..$#{}]", pe.variable, start, pe.variable)
@@ -142,12 +145,163 @@ pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String 
             // Failed to parse parameter expansion, fall back to literal
             format!("'{}'", s.replace("'", "\\'"))
         }
-    } else if s.len() > 1 && s.as_bytes()[0] == b'$' && s[1..].chars().next().map_or(false, |c| c.is_alphabetic() || c == '_') {
+    } else if s.len() > 1
+        && s.as_bytes()[0] == b'$'
+        && s[1..]
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_alphabetic() || c == '_')
+    {
         // Bare variable reference like $var — emit $var, not a quoted string.
         s.to_string()
     } else {
         // Not a ${...} pattern - wrap in quotes
         format!("'{}'", s.replace("'", "\\'"))
+    }
+}
+
+/// The single non-empty part of a StringInterpolation (if exactly one
+/// non-literal-or-empty part exists).
+fn single_nonempty_part(
+    interp: &crate::ast::StringInterpolation,
+) -> Option<&crate::ast_words::StringPart> {
+    let mut found: Option<&crate::ast_words::StringPart> = None;
+    for p in &interp.parts {
+        match p {
+            crate::ast_words::StringPart::Literal(s) if s.is_empty() => {}
+            other => {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(other);
+            }
+        }
+    }
+    found
+}
+
+/// Word-aware twin of [`try_extract_sort_herestring_var`]: the array
+/// element `$(sort <<<"${config[*]}")` now parses as a real
+/// CommandSubstitution word — detect the `sort` + herestring shape
+/// directly instead of re-parsing reconstructed text.
+fn try_extract_sort_herestring_word(cmd: &crate::ast::Command) -> Option<String> {
+    let crate::ast::Command::Simple(sc) = cmd else {
+        return None;
+    };
+    if !sc.args.is_empty() {
+        return None;
+    }
+    let Word::Literal(name, _) = &sc.name else {
+        return None;
+    };
+    if name != "sort" {
+        return None;
+    }
+    if sc.redirects.len() != 1 {
+        return None;
+    }
+    let r = &sc.redirects[0];
+    if !matches!(r.operator, crate::ast::RedirectOperator::HereString) {
+        return None;
+    }
+    // the target: `"${config[*]}"` — a single-part interpolation of a
+    // ParameterExpansion `${name[*]}` / `${name[@]}`
+    let Word::StringInterpolation(interp, _) = &r.target else {
+        return None;
+    };
+    if interp.parts.len() != 1 {
+        return None;
+    }
+    match &interp.parts[0] {
+        crate::ast_words::StringPart::ParameterExpansion(pe) => match &pe.operator {
+            crate::ast::ParameterExpansionOperator::ArraySlice(off, None) => {
+                if off == "*" || off == "@" {
+                    return Some(pe.variable.clone());
+                }
+                None
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Word::Array element → Perl (core request posix-sh-go-20260806-174619 —
+/// array elements are now real Words). LITERAL elements render
+/// byte-identically to the raw-text path; richer words dispatch to the
+/// word-level generators (`"$@"` → @_ — one element per positional,
+/// `$(...)` → the capture generator, `${arr[@]:off:len}` → a Perl array
+/// slice, `${x}` → parameter expansion).
+pub fn array_element_word_to_perl_impl(generator: &mut Generator, w: &Word) -> String {
+    match w {
+        Word::Literal(s, _) => array_element_to_perl_impl(generator, s),
+        Word::Variable(name, _, _) if name == "@" || name == "*" => "@_".to_string(),
+        Word::StringInterpolation(interp, _) => {
+            // single-part `"$@"` / `"$*"` — one element per positional
+            let mut var: Option<&str> = None;
+            let mut pos_only = true;
+            for p in &interp.parts {
+                match p {
+                    crate::ast_words::StringPart::Literal(s) if s.is_empty() => {}
+                    crate::ast_words::StringPart::Variable(name) if var.is_none() => {
+                        var = Some(name)
+                    }
+                    _ => {
+                        pos_only = false;
+                        break;
+                    }
+                }
+            }
+            if pos_only && matches!(var, Some("@") | Some("*")) {
+                return "@_".to_string();
+            }
+            // single-part `"${...}"` — dispatch like a bare
+            // ParameterExpansion (the raw-text path parsed `${numbers[@]:3:4}`
+            // into @numbers[3..6]; word_to_perl would add a join wrapper)
+            if let Some(part) = single_nonempty_part(interp) {
+                if let crate::ast_words::StringPart::ParameterExpansion(pe) = part {
+                    return array_element_word_to_perl_impl(
+                        generator,
+                        &Word::ParameterExpansion(pe.clone(), None),
+                    );
+                }
+            }
+            generator.word_to_perl(w)
+        }
+        Word::CommandSubstitution(cmd, _) => {
+            // `$(sort <<<"${var[*]}")` → native `(sort @var)` /
+            // `(sort values %var)` (assoc-aware)
+            if let Some(var_name) = try_extract_sort_herestring_word(cmd) {
+                if generator.associative_arrays.contains(&var_name) {
+                    return format!("(sort values %{})", var_name);
+                }
+                return format!("(sort @{})", var_name);
+            }
+            generator.word_to_perl(w)
+        }
+        Word::ParameterExpansion(pe, _) => match &pe.operator {
+            crate::ast::ParameterExpansionOperator::ArraySlice(offset, length) => {
+                if offset == "@" {
+                    format!("@{}", pe.variable)
+                } else {
+                    let start = offset.trim();
+                    if let Some(len_str) = length {
+                        let len = len_str.trim().parse::<i32>().unwrap_or(0);
+                        let start_num = start.parse::<i32>().unwrap_or(0);
+                        let end = if len > 0 {
+                            start_num + len - 1
+                        } else {
+                            start_num
+                        };
+                        format!("@{}[{}..{}]", pe.variable, start, end)
+                    } else {
+                        format!("@{}[{}..$#{}]", pe.variable, start, pe.variable)
+                    }
+                }
+            }
+            _ => generator.generate_parameter_expansion(pe),
+        },
+        _ => generator.word_to_perl(w),
     }
 }
 
@@ -164,12 +318,12 @@ fn try_extract_sort_herestring_var(inner: &str) -> Option<&str> {
         return None;
     }
     rest = &rest[1..]; // consume opening "
-    // Now expect ${...}
+                       // Now expect ${...}
     if !rest.starts_with("${") {
         return None;
     }
     rest = &rest[2..]; // consume ${
-    // Extract variable name (stop at [ or } or :)
+                       // Extract variable name (stop at [ or } or :)
     let var_end = rest.find(|c| c == '[' || c == '}' || c == ':')?;
     let var_name = &rest[..var_end];
     // After the variable, expect [*]}" or [@]}" (the } closes ${...}
@@ -185,6 +339,23 @@ fn try_extract_sort_herestring_var(inner: &str) -> Option<&str> {
     }
 }
 
+
+/// Escape a char for a Perl double-quoted string literal.  Private-use
+/// marker chars (U+E000 + invalid source byte, see
+/// SharedUtils::bytes_to_marked_lossy) are emitted as `\xNN` BYTE escapes
+/// so non-UTF-8 source bytes round-trip byte-for-byte (bash treats scripts
+/// as byte streams).  Other non-ASCII chars become `\x{...}` escapes.
+pub(crate) fn perl_char_escape(c: char) -> String {
+    let cp = c as u32;
+    if (0xE000..=0xE0FF).contains(&cp) {
+        format!("\\x{:02X}", (cp - 0xE000) as u8)
+    } else if !c.is_ascii() {
+        format!("\\x{{{:04X}}}", cp)
+    } else {
+        c.to_string()
+    }
+}
+
 pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
         Word::Literal(s, _) => {
@@ -192,15 +363,23 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
             // (backslash is removed, the following character is kept literally).
             // This matches how the shell processes unquoted words.
             let s = apply_shell_quote_removal(s);
-            
+
             let has_standalone_system = {
                 let mut found = false;
                 let mut pos = 0;
                 while let Some(idx) = s[pos..].find("system") {
                     let abs_idx = pos + idx;
-                    let prev_ok = abs_idx == 0 || !s[..abs_idx].chars().last().map_or(false, |c| c.is_alphanumeric() || c == '_');
+                    let prev_ok = abs_idx == 0
+                        || !s[..abs_idx]
+                            .chars()
+                            .last()
+                            .map_or(false, |c| c.is_alphanumeric() || c == '_');
                     let after_idx = abs_idx + 6;
-                    let next_ok = after_idx >= s.len() || !s[after_idx..].chars().next().map_or(false, |c| c.is_alphanumeric() || c == '_');
+                    let next_ok = after_idx >= s.len()
+                        || !s[after_idx..]
+                            .chars()
+                            .next()
+                            .map_or(false, |c| c.is_alphanumeric() || c == '_');
                     if prev_ok && next_ok {
                         found = true;
                         break;
@@ -230,8 +409,9 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 || s.contains('\\')
                 || s.contains('"')
             {
-                let escaped = s.chars().map(|c| {
-                    match c {
+                let escaped = s
+                    .chars()
+                    .map(|c| match c {
                         '\\' => "\\\\".to_string(),
                         '"' => "\\\"".to_string(),
                         '\n' => "\\n".to_string(),
@@ -240,9 +420,10 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                         '@' => "\\@".to_string(),
                         '$' => "\\$".to_string(),
                         _ if c.is_ascii() => c.to_string(),
-                        _ => format!("\\x{{{:04X}}}", c as u32),
-                    }
-                }).collect::<Vec<_>>().join("");
+                        _ => perl_char_escape(c),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
                 format!("\"{}\"", escaped)
             } else {
                 // Use q{} for single characters to avoid "noisy quotes" violations
@@ -266,10 +447,16 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 continue;
                             }
                             // Found a digit — check if it's '0' followed by [0-7]
-                            if bytes[i] == b'0' && i + 1 < len && bytes[i + 1] >= b'0' && bytes[i + 1] <= b'7' {
+                            if bytes[i] == b'0'
+                                && i + 1 < len
+                                && bytes[i + 1] >= b'0'
+                                && bytes[i + 1] <= b'7'
+                            {
                                 // Check that this isn't part of a longer number
                                 // (i.e. preceded by non-word char or start of string)
-                                let preceded_by_boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+                                let preceded_by_boundary = i == 0
+                                    || !bytes[i - 1].is_ascii_alphanumeric()
+                                        && bytes[i - 1] != b'_';
                                 if preceded_by_boundary {
                                     // Verify the sequence is at least 2 digits
                                     // and contains at least one digit 0-7 after the first 0
@@ -278,7 +465,8 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                         j += 1;
                                     }
                                     if j - i >= 2 {
-                                        let has_octal_digit = bytes[i+1..j].iter().any(|&b| b >= b'0' && b <= b'7');
+                                        let has_octal_digit =
+                                            bytes[i + 1..j].iter().any(|&b| b >= b'0' && b <= b'7');
                                         if has_octal_digit {
                                             found = true;
                                         }
@@ -295,21 +483,24 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                     if has_leading_zero {
                         // Use q{...} to avoid PPI parsing "07403" as octal.
                         // Escape braces inside the content.
-                        let escaped_q = s.chars().map(|c| {
-                            match c {
+                        let escaped_q = s
+                            .chars()
+                            .map(|c| match c {
                                 '\\' => "\\\\".to_string(),
                                 '{' => "\\{".to_string(),
                                 '}' => "\\}".to_string(),
                                 _ if c.is_ascii() => c.to_string(),
-                                _ => format!("\\x{{{:04X}}}", c as u32),
-                            }
-                        }).collect::<Vec<_>>().join("");
+                                _ => perl_char_escape(c),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
                         format!("q{{{}}}", escaped_q)
                     } else if s.chars().any(|c| !c.is_ascii()) {
                         // Non-ASCII characters: use double-quoted string with \x{...} escapes
                         // so PPI does not choke on multi-byte UTF-8 sequences in the output.
-                        let escaped = s.chars().map(|c| {
-                            match c {
+                        let escaped = s
+                            .chars()
+                            .map(|c| match c {
                                 '\\' => "\\\\".to_string(),
                                 '"' => "\\\"".to_string(),
                                 '\n' => "\\n".to_string(),
@@ -318,9 +509,10 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 '@' => "\\@".to_string(),
                                 '$' => "\\$".to_string(),
                                 _ if c.is_ascii() => c.to_string(),
-                                _ => format!("\\x{{{:04X}}}", c as u32),
-                            }
-                        }).collect::<Vec<_>>().join("");
+                                _ => perl_char_escape(c),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
                         format!("\"{}\"", escaped)
                     } else {
                         let escaped = s.replace("\\", "\\\\").replace("'", "\\'");
@@ -335,12 +527,12 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 "#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
                 "@" => "@ARGV".to_string(),         // $@ -> @ARGV for arguments array
                 "*" => "@ARGV".to_string(),         // $* -> @ARGV for arguments array
-                "$" => "$$".to_string(),       // $$ -> $$ (process ID)
+                "$" => "$$".to_string(),            // $$ -> $$ (process ID)
                 "?" => "($? == -1 ? 0 : $? >> 8)".to_string(), // $? -> exit code
                 "!" => "''".to_string(), // $! -> empty (last background PID, not tracked)
                 "-" => "''".to_string(), // $- -> empty (shell options not tracked)
                 "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
-                _ => format!("${}", var),           // Regular variables
+                _ => format!("${}", var), // Regular variables
             }
         }
         Word::Arithmetic(expr, _) => {
@@ -537,17 +729,15 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                             // and wrap in qx{} with the array-element pattern for clean
                             // shell command generation.
                             let cmd_str = generator.generate_command_string_for_system(cmd);
-                            let cmd_lit = generator.perl_string_literal_no_interp(
-                                &Word::literal(cmd_str),
-                            );
+                            let cmd_lit =
+                                generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                             crate::ir::expr_to_open_perl(&cmd_lit, true)
                         }
                     } else {
                         // For non-literal command names, use generate_command_string_for_system
                         let cmd_str = generator.generate_command_string_for_system(cmd);
-                        let cmd_lit = generator.perl_string_literal_no_interp(
-                            &Word::literal(cmd_str),
-                        );
+                        let cmd_lit =
+                            generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
                         crate::ir::expr_to_open_perl(&cmd_lit, true)
                     }
                 }
@@ -1018,8 +1208,9 @@ pub fn strip_shell_quotes_for_regex_impl(generator: &mut Generator, word: &Word)
     match word {
         Word::Literal(s, _) => {
             // Strip shell quotes if present and return the raw string for regex
-            if s.len() >= 2 && ((s.starts_with("'") && s.ends_with("'"))
-                || (s.starts_with("\"") && s.ends_with("\"")))
+            if s.len() >= 2
+                && ((s.starts_with("'") && s.ends_with("'"))
+                    || (s.starts_with("\"") && s.ends_with("\"")))
             {
                 // Remove the outer quotes
                 s[1..s.len() - 1].to_string()

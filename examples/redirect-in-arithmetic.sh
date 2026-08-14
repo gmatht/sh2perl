@@ -1,4 +1,5 @@
 #!/bin/bash
 # Minimal reproduction of RedirectOut inside an array/arithmetic expression
 # Similar to docker/docker-compose failures
-echo ${arr[1]>2}
+arr=(10 20 30)
+echo $((arr[1]>2))

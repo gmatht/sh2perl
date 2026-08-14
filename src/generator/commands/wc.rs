@@ -99,15 +99,9 @@ pub fn generate_wc_command_with_output(
 
     // Declare output variable
     if generator.declared_locals.contains(output_name) {
-        output.push_str(&format!(
-            "{} = do {{\n",
-            output_var_expr
-        ));
+        output.push_str(&format!("{} = do {{\n", output_var_expr));
     } else {
-        output.push_str(&format!(
-            "my {} = do {{\n",
-            output_var_expr
-        ));
+        output.push_str(&format!("my {} = do {{\n", output_var_expr));
         generator.declared_locals.insert(output_name.to_string());
     }
     generator.indent_level += 1;
@@ -150,8 +144,15 @@ pub fn generate_wc_command_with_output(
     // output like:  my $_wc_result = sprintf "%7d %7d %7d\n",
     //                $_wc_lines, $_wc_words, $_wc_bytes;
     // instead of the piecewise .= concatenation.
-    let num_cols = [count_lines, count_words, count_chars || count_bytes, longest_line]
-        .iter().filter(|&&x| x).count();
+    let num_cols = [
+        count_lines,
+        count_words,
+        count_chars || count_bytes,
+        longest_line,
+    ]
+    .iter()
+    .filter(|&&x| x)
+    .count();
     let use_padding = num_cols > 1;
     let pad = if use_padding { "%7d" } else { "%d" };
 
@@ -168,7 +169,11 @@ pub fn generate_wc_command_with_output(
     }
     if count_chars || count_bytes {
         fmt_parts.push(pad.to_string());
-        let var_name = if count_chars { "_wc_chars" } else { "_wc_bytes" };
+        let var_name = if count_chars {
+            "_wc_chars"
+        } else {
+            "_wc_bytes"
+        };
         sprintf_args.push(IrExpr::Var(var_name.to_string(), Some(Sigil::Scalar)));
     }
     if longest_line {

@@ -25,6 +25,9 @@ impl std::fmt::Display for ParameterExpansion {
             ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
                 write!(f, "${{{0}%{1}}}", self.variable, pattern)
             }
+            ParameterExpansionOperator::SubstituteFirst(pattern, replacement) => {
+                write!(f, "${{{0}/{1}/{2}}}", self.variable, pattern, replacement)
+            }
             ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
                 write!(f, "${{{0}//{1}/{2}}}", self.variable, pattern, replacement)
             }
@@ -36,6 +39,9 @@ impl std::fmt::Display for ParameterExpansion {
             }
             ParameterExpansionOperator::ErrorIfUnset(error) => {
                 write!(f, "${{{0}:?{1}}}", self.variable, error)
+            }
+            ParameterExpansionOperator::BadSubstitution => {
+                write!(f, "${{{0}}}", self.variable)
             }
             ParameterExpansionOperator::Basename => write!(f, "${{{0}##*/}}", self.variable),
             ParameterExpansionOperator::Dirname => write!(f, "${{{0}%/*}}", self.variable),
@@ -67,12 +73,17 @@ pub enum ParameterExpansionOperator {
     RemoveShortestSuffix(String), // %pattern
 
     // Pattern substitution
-    SubstituteAll(String, String), // //pattern/replacement
+    SubstituteFirst(String, String), // /pattern/replacement (first match)
+    SubstituteAll(String, String),  // //pattern/replacement
 
     // Default values
     DefaultValue(String),  // :-default
     AssignDefault(String), // :=default
-    ErrorIfUnset(String),  // :?error
+    ErrorIfUnset(String),  // :?error / ?error
+
+    // Invalid ${...} content (e.g. `${arr[1]>2}`) — bash prints "bad
+    // substitution", skips the whole command (status 1), keeps going.
+    BadSubstitution,
 
     // Path manipulation
     Basename, // ##*/
@@ -144,6 +155,16 @@ pub enum StringPart {
     CommandSubstitution(Box<crate::ast::Command>),
 }
 
+/// Space-joined Display of a Word list (Word::Array elements render as
+/// `name=(a b c)`).
+pub fn word_list_text(elements: &[Word]) -> String {
+    elements
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Represents a word in the shell language (literal, variable, expansion, etc.)
 /// This is the AST version - pure syntax without analysis information
 /// The Option<()> field is reserved for future MIR annotations
@@ -152,10 +173,10 @@ pub enum Word {
     Literal(String, Option<()>),
     Variable(String, bool, Option<()>), // variable_name, is_mutable, annotations
     ParameterExpansion(ParameterExpansion, Option<()>),
-    Array(String, Vec<String>, Option<()>), // array_name, elements, annotations
-    MapAccess(String, String, Option<()>),  // map_name, key, annotations
-    MapKeys(String, Option<()>),            // !map[@] -> get keys of associative array, annotations
-    MapLength(String, Option<()>),          // #arr[@] -> get length of array, annotations
+    Array(String, Vec<Word>, Option<()>), // array_name, elements, annotations
+    MapAccess(String, String, Option<()>), // map_name, key, annotations
+    MapKeys(String, Option<()>),          // !map[@] -> get keys of associative array, annotations
+    MapLength(String, Option<()>),        // #arr[@] -> get length of array, annotations
     ArraySlice(String, String, Option<String>, Option<()>), // array_name, offset, optional_length, annotations
     Arithmetic(ArithmeticExpression, Option<()>),
     BraceExpansion(BraceExpansion, Option<()>),
@@ -172,8 +193,8 @@ impl std::fmt::Display for Word {
                 // Delegate to ParameterExpansion's own Display impl which
                 // produces correct shell syntax (e.g., ${0##*/} not ${0}##*/).
                 write!(f, "{}", pe)
-            },
-            Word::Array(name, elements, _) => write!(f, "{}=({})", name, elements.join(" ")),
+            }
+            Word::Array(name, elements, _) => write!(f, "{}=({})", name, word_list_text(elements)),
             Word::MapAccess(map_name, key, _) => write!(f, "{}[{}]", map_name, key),
             Word::MapKeys(map_name, _) => write!(f, "!{}[@]", map_name),
             Word::MapLength(map_name, _) => write!(f, "#{}[@]", map_name),
@@ -255,6 +276,12 @@ impl std::fmt::Display for Word {
                             ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
                                 result.push_str(&format!("${{{}}}%{}", pe.variable, pattern))
                             }
+                            ParameterExpansionOperator::SubstituteFirst(pattern, replacement) => {
+                                result.push_str(&format!(
+                                    "${{{}}}/{}/{}",
+                                    pe.variable, pattern, replacement
+                                ))
+                            }
                             ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
                                 result.push_str(&format!(
                                     "${{{}}}//{}/{}",
@@ -269,6 +296,9 @@ impl std::fmt::Display for Word {
                             }
                             ParameterExpansionOperator::ErrorIfUnset(error) => {
                                 result.push_str(&format!("${{{}}}:?{}", pe.variable, error))
+                            }
+                            ParameterExpansionOperator::BadSubstitution => {
+                                result.push_str(&format!("${{{}}}", pe.variable))
                             }
                             ParameterExpansionOperator::Basename => {
                                 result.push_str(&format!("${{{}}}##*/", pe.variable))
@@ -366,7 +396,7 @@ impl Word {
     }
 
     /// Create an array word
-    pub fn array(name: String, elements: Vec<String>) -> Self {
+    pub fn array(name: String, elements: Vec<Word>) -> Self {
         Word::Array(name, elements, None)
     }
 
@@ -432,6 +462,9 @@ impl Word {
                 ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
                     format!("${{{}}}%{}", pe.variable, pattern)
                 }
+                ParameterExpansionOperator::SubstituteFirst(pattern, replacement) => {
+                    format!("${{{}}}/{}/{}", pe.variable, pattern, replacement)
+                }
                 ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
                     format!("${{{}}}//{}/{}", pe.variable, pattern, replacement)
                 }
@@ -444,6 +477,7 @@ impl Word {
                 ParameterExpansionOperator::ErrorIfUnset(error) => {
                     format!("${{{}}}:?{}", pe.variable, error)
                 }
+                ParameterExpansionOperator::BadSubstitution => format!("${{{}}}", pe.variable),
                 ParameterExpansionOperator::Basename => format!("${{{}}}##*/", pe.variable),
                 ParameterExpansionOperator::Dirname => format!("${{{}}}%/*", pe.variable),
                 ParameterExpansionOperator::ArraySlice(offset, length) => {
@@ -454,7 +488,7 @@ impl Word {
                     }
                 }
             },
-            Word::Array(name, elements, _) => format!("{}=({})", name, elements.join(" ")),
+            Word::Array(name, elements, _) => format!("{}=({})", name, word_list_text(elements)),
             Word::MapAccess(map_name, key, _) => format!("{}[{}]", map_name, key),
             Word::MapKeys(map_name, _) => format!("!{}[@]", map_name),
             Word::MapLength(map_name, _) => format!("#{}[@]", map_name),
@@ -536,6 +570,12 @@ impl Word {
                             ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
                                 result.push_str(&format!("${{{}}}%{}", pe.variable, pattern))
                             }
+                            ParameterExpansionOperator::SubstituteFirst(pattern, replacement) => {
+                                result.push_str(&format!(
+                                    "${{{}}}/{}/{}",
+                                    pe.variable, pattern, replacement
+                                ))
+                            }
                             ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
                                 result.push_str(&format!(
                                     "${{{}}}//{}/{}",
@@ -550,6 +590,9 @@ impl Word {
                             }
                             ParameterExpansionOperator::ErrorIfUnset(error) => {
                                 result.push_str(&format!("${{{}}}:?{}", pe.variable, error))
+                            }
+                            ParameterExpansionOperator::BadSubstitution => {
+                                result.push_str(&format!("${{{}}}", pe.variable))
                             }
                             ParameterExpansionOperator::Basename => {
                                 result.push_str(&format!("${{{}}}##*/", pe.variable))
