@@ -455,7 +455,7 @@ impl Render {
     fn shell_cmd_stmt(&mut self, s: &IrStmt) -> Option<String> {
         match s {
             IrStmt::Expr(e) => self.shell_cmd_expr(e),
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 let t = targets.first()?;
                 let lhs = if !t.indices.is_empty() {
                     format!("{}[{}]", t.var, self.shell_unquoted(&t.indices[0]))
@@ -1142,6 +1142,10 @@ impl Render {
                 self.mark_todo("ArrayComp/Lambda expr");
                 "0".to_string()
             }
+            IrExpr::Splice(_) => {
+                self.mark_todo("Splice expr");
+                "0".to_string()
+            }
             IrExpr::Arith(a) => self.arith(a),
             IrExpr::Bool(b) => {
                 if *b { "1".into() } else { "0".into() }
@@ -1755,11 +1759,19 @@ impl Render {
                     return "0".into();
                 };
                 let t = self.expr(text);
-                let p = match pat {
-                    IrExpr::Str(s, _) => brace_escape(&glob_to_regex(s, true)),
-                    _ => String::new(),
-                };
-                format!("do {{ my $__t = {t}; ($__t =~ /{p}/ ? 1 : 0) }}")
+                match pat {
+                    IrExpr::Str(s, _) => {
+                        let p = brace_escape(&glob_to_regex(s, true));
+                        format!("do {{ my $__t = {t}; ($__t =~ /{p}/ ? 1 : 0) }}")
+                    }
+                    // Interpolated pattern (e.g. `$s =~ /$pat/`): a
+                    // runtime substring check (grep semantics for plain
+                    // text) — an empty regex would match EVERYTHING.
+                    other => {
+                        let p = self.expr(other);
+                        format!("do {{ my $__t = {t}; my $__p = {p}; (index($__t, $__p) >= 0 ? 1 : 0) }}")
+                    }
+                }
             }
             "break" => "do { last; 0 }".to_string(),
             "continue" => "do { next; 0 }".to_string(),
@@ -1859,9 +1871,31 @@ impl Render {
                 } else if vars.is_empty() {
                     "do { my $__r = <STDIN>; (defined $__r ? 0 : 1) }".to_string()
                 } else {
+                    // bat forf `delims=` / `IFS=, read` — the env Object
+                    // carries the delimiter; bash read splits on IFS and
+                    // the LAST var receives the rest of the line (perl's
+                    // split LIMIT replicates that: at most N fields, the
+                    // last holds the remainder).
+                    let delim = match args.get(2) {
+                        Some(IrExpr::Object(props)) => props.iter().find(|(k, _)| k == "IFS").and_then(|(_, v)| match v {
+                            IrExpr::Str(s, _) => Some(s.clone()),
+                            _ => None,
+                        }),
+                        _ => None,
+                    };
+                    let re = match delim.as_deref() {
+                        None | Some("") => r"\s+".to_string(),
+                        Some(ifs) => format!(
+                            "[{}]",
+                            ifs.chars()
+                                .map(|c| if "\\]^-".contains(c) { format!("\\{c}") } else { c.to_string() })
+                                .collect::<String>()
+                        ),
+                    };
                     format!(
-                        "do {{ my $__r = <STDIN>; if (defined $__r) {{ chomp $__r; ({}) = split /\\s+/, $__r; 0 }} else {{ 1 }} }}",
-                        vars.join(", ")
+                        "do {{ my $__r = <STDIN>; if (defined $__r) {{ chomp $__r; ({}) = split /{re}/, $__r, {}; 0 }} else {{ 1 }} }}",
+                        vars.join(", "),
+                        vars.len()
                     )
                 }
             }
@@ -2564,9 +2598,22 @@ impl Render {
                             in_quote = !in_quote;
                         }
                     }
-                    '(' => depth += 1,
+                    // `$(` opens a cmdsub; a bare `(` is a test GROUP
+                    // paren (must not swallow the group into one token —
+                    // `[ ! ( "$a" == "$b" ) ]` would render as a literal).
+                    '(' => {
+                        if i > 0 && chars[i - 1] == '$' {
+                            depth += 1;
+                        }
+                    }
                     ')' => depth = (depth - 1).max(0),
-                    '{' => braces += 1,
+                    // `${` opens a brace expansion; a bare `{` is not a
+                    // grouping construct in test strings.
+                    '{' => {
+                        if i > 0 && chars[i - 1] == '$' {
+                            braces += 1;
+                        }
+                    }
                     '}' => braces = (braces - 1).max(0),
                     _ => {}
                 }
@@ -3276,7 +3323,7 @@ impl Render {
                 self.emit(&format!("print {{$__fh}} {c};"));
                 self.emit("close $__fh;");
             }
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 let Some(t) = targets.first() else {
                     self.mark_todo("multi-target assign");
                     return;
@@ -3668,6 +3715,7 @@ impl Render {
             IrStmt::Break => self.emit("last;"),
             IrStmt::Try { .. } => self.mark_todo("try"),
             IrStmt::Select { .. } => self.mark_todo("select"),
+            IrStmt::Asm { .. } => self.mark_todo("asm"),
         }
     }
 
