@@ -3325,6 +3325,26 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
     // `echo -n` / `echo -e` / `echo -E` — dash's echo has no flags; render
     // the equivalent printf so stdout matches bash.
     if cmd_name == Some("echo") {
+        // a SINGLE guarded-arith arg: bash SKIPS the whole command when
+        // the arithmetic expansion fails (no output at all — not even a
+        // newline); a `[ -n ... ] && printf` reproduces both observables
+        let plain: Vec<&IrExpr> = args
+            .iter()
+            .filter(|a| !matches!(a, IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 && !s.contains(' ')))
+            .collect();
+        if plain.len() == 1 {
+            if let Ok(w) = word_to_sh(plain[0]) {
+                if w.starts_with("$( ( printf '%s' \"$((")
+                    || w.starts_with("\"$( ( printf '%s' \"$((")
+                {
+                    // quote the guard: an unquoted FAILED cmdsub vanishes
+                    // entirely (`[ -n ]` tests the literal -n)
+                    return Ok(format!(
+                        "[ -n \"{w}\" ] && printf '%s\\n' \"{w}\""
+                    ));
+                }
+            }
+        }
         if let Some(first) = args.first() {
             if let IrExpr::Str(s, _) = first {
                 let rest = &args[1..];
