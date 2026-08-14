@@ -2460,7 +2460,10 @@ impl Render {
                 // `let expr` — arithmetic eval, exit 0 on nonzero result
                 match words.first() {
                     Some(IrExpr::Str(s, _)) => {
-                        let a = self.arith_str(s);
+                        // the SH2GLOB marker wraps a variable name, not a
+                        // glob
+                        let s = s.replace("\u{1}SH2GLOB\u{1}", "");
+                        let a = self.arith_str(&s);
                         format!("do {{ my $__r = {a}; ($__r != 0 ? 0 : 256) }}")
                     }
                     _ => "256".to_string(),
@@ -2666,7 +2669,9 @@ impl Render {
             "let" => {
                 // `let expr` — arithmetic eval, exit 0 on nonzero result
                 if let Some(IrExpr::Str(s, _)) = words.first() {
-                    let a = self.arith_str(s);
+                    // the SH2GLOB marker wraps a variable name, not a glob
+                    let s = s.replace("\u{1}SH2GLOB\u{1}", "");
+                    let a = self.arith_str(&s);
                     self.emit(&format!("my $__r = {a};"));
                     self.emit("$? = ($__r != 0 ? 0 : 256);");
                 }
@@ -4038,8 +4043,12 @@ impl Render {
                     if len == "0" {
                         return format!("@{}[{off}..$#{}]", ident(var), ident(var));
                     }
+                    // the slice end is BOUNDED by $#arr (an empty array's
+                    // range would pad with undefs)
                     return format!(
-                        "@{}[{off}..({off})+({len})-1]",
+                        "@{}[{off}..((({off})+({len})-1) < $#{} ? ({off})+({len})-1 : $#{})]",
+                        ident(var),
+                        ident(var),
                         ident(var)
                     );
                 }
@@ -4086,6 +4095,30 @@ impl Render {
                             let (n, d) = inner.split_at(pos);
                             return r.param(&[s2(":-"), s2(n), s2(&d[2..])]);
                         }
+                        // `${arr[@]:0:2}` nested — a slice default
+                        if let Some(close) = inner.find(']') {
+                            let n = &inner[..close + 1];
+                            let rest = &inner[close + 1..];
+                            let parts: Vec<&str> = rest.split(':').collect();
+                            if parts.len() == 3 && !n.is_empty() {
+                                return r.param(&[
+                                    s2("slice"),
+                                    s2(n),
+                                    s2(parts[1]),
+                                    s2(parts[2]),
+                                ]);
+                            }
+                        }
+                    }
+                    // `$(cmd)` as the default — run it
+                    if let Some(cmd) = unq
+                        .strip_prefix("$(")
+                        .and_then(|t| t.strip_suffix(')'))
+                    {
+                        return format!(
+                            "do {{ my $__c = {}; chomp $__c; $__c }}",
+                            r.qx(cmd)
+                        );
                     }
                     Self::perl_str(unq)
                 }
@@ -4200,7 +4233,14 @@ impl Render {
                             _ => self.expr(a),
                         })
                         .unwrap_or_else(|| "0".into());
-                    return format!("@{}[{off}..({off})+({len})-1]", ident(&name));
+                    // the slice end is BOUNDED by $#arr: an empty array's
+                    // `0..1` range would pad with undefs (bash: no elems)
+                    return format!(
+                        "@{}[{off}..((({off})+({len})-1) < $#{} ? ({off})+({len})-1 : $#{})]",
+                        ident(&name),
+                        ident(&name),
+                        ident(&name)
+                    );
                 }
                 match args.get(3) {
                     Some(IrExpr::Str(s, _)) if s.is_empty() => format!("substr({v}, {off})"),
