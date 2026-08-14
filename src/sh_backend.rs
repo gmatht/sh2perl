@@ -4870,7 +4870,7 @@ fn protect_key_arith(idx: &str) -> String {
             while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
                 j += 1;
             }
-            out.push_str(&format!("${{{}}}:-0}}", &idx[i + 1..j]));
+            out.push_str(&format!("${{{name}:-0}}", name = &idx[i + 1..j]));
             i = j;
             continue;
         }
@@ -4879,7 +4879,7 @@ fn protect_key_arith(idx: &str) -> String {
                 let close = i + rel;
                 let inner = &idx[i + 2..close];
                 if !inner.contains(":-") {
-                    out.push_str(&format!("${{{inner}:-0}}"));
+                    out.push_str(&format!("${{{inner}:-0}}", inner = inner));
                 } else {
                     out.push_str(&idx[i..=close]);
                 }
