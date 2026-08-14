@@ -132,6 +132,13 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                     expr_names(cond, names);
                     walk(body, names);
                 }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init, names);
+                    expr_names(cond, names);
+                    walk(step, names);
+                    walk(body, names);
+                }
+                IrStmt::Continue | IrStmt::Break => {}
                 IrStmt::For { iter, body, .. } => {
                     expr_names(iter, names);
                     walk(body, names);
@@ -186,7 +193,45 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                     expr_names(path, names);
                     expr_names(content, names);
                 }
-                IrStmt::Return(None) | IrStmt::Exit(None) | IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => {}
+                IrStmt::Return(None)
+                | IrStmt::Exit(None)
+                | IrStmt::SetChildError(_)
+                | IrStmt::Require(_)
+                | IrStmt::RawText(_)
+                | IrStmt::Label(_)
+                | IrStmt::Goto(_) => {}
+                IrStmt::Select { clauses } => {
+                    for c in clauses {
+                        if let Some(ch) = &c.ch {
+                            expr_names(ch, names);
+                        }
+                        if let Some(v) = &c.value {
+                            expr_names(v, names);
+                        }
+                        walk(&c.body, names);
+                    }
+                }
+                IrStmt::Asm { outputs, inputs, .. } => {
+                    for (_, e) in outputs.iter().chain(inputs.iter()) {
+                        expr_names(e, names);
+                    }
+                }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body, names);
+                    for e in excepts {
+                        if let Some(m) = &e.match_expr {
+                            expr_names(m, names);
+                        }
+                        walk(&e.body, names);
+                    }
+                    walk(else_body, names);
+                    walk(finally_body, names);
+                }
             }
         }
     }
@@ -246,6 +291,10 @@ fn has_fd_dup(prog: &IrProgram) -> bool {
                 IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
                     expr_dup(cond) || walk(body)
                 }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init) || expr_dup(cond) || walk(step) || walk(body)
+                }
+                IrStmt::Continue | IrStmt::Break => false,
                 IrStmt::For { iter, body, .. } => expr_dup(iter) || walk(body),
                 IrStmt::Case { discriminant, clauses, .. } => {
                     expr_dup(discriminant) || clauses.iter().any(|c| walk(&c.body))
@@ -274,7 +323,35 @@ fn has_fd_dup(prog: &IrProgram) -> bool {
                 IrStmt::Declare { init, .. } => init.as_ref().map(expr_dup).unwrap_or(false),
                 IrStmt::DeclareArray { elements, .. } => elements.iter().any(expr_dup),
                 IrStmt::WriteFile { path, content, .. } => expr_dup(path) || expr_dup(content),
-                IrStmt::Return(None) | IrStmt::Exit(None) | IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => false,
+                IrStmt::Return(None)
+                | IrStmt::Exit(None)
+                | IrStmt::SetChildError(_)
+                | IrStmt::Require(_)
+                | IrStmt::RawText(_)
+                | IrStmt::Label(_)
+                | IrStmt::Goto(_) => false,
+                IrStmt::Select { clauses } => clauses.iter().any(|c| {
+                    c.ch.as_ref().map(expr_dup).unwrap_or(false)
+                        || c.value.as_ref().map(expr_dup).unwrap_or(false)
+                        || walk(&c.body)
+                }),
+                IrStmt::Asm { outputs, inputs, .. } => outputs
+                    .iter()
+                    .chain(inputs.iter())
+                    .any(|(_, e)| expr_dup(e)),
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body)
+                        || excepts
+                            .iter()
+                            .any(|e| e.match_expr.as_ref().map(expr_dup).unwrap_or(false) || walk(&e.body))
+                        || walk(else_body)
+                        || walk(finally_body)
+                }
             };
             if hit {
                 return true;
@@ -394,6 +471,10 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                 IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
                     expr_uses_arr(cond) || walk(body)
                 }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    walk(init) || expr_uses_arr(cond) || walk(step) || walk(body)
+                }
+                IrStmt::Continue | IrStmt::Break => false,
                 IrStmt::For { iter, body, .. } => expr_uses_arr(iter) || walk(body),
                 IrStmt::Case { discriminant, clauses, .. } => {
                     expr_uses_arr(discriminant)
@@ -425,7 +506,38 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                 IrStmt::WriteFile { path, content, .. } => {
                     expr_uses_arr(path) || expr_uses_arr(content)
                 }
-                IrStmt::Return(None) | IrStmt::Exit(None) | IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => false,
+                IrStmt::Return(None)
+                | IrStmt::Exit(None)
+                | IrStmt::SetChildError(_)
+                | IrStmt::Require(_)
+                | IrStmt::RawText(_)
+                | IrStmt::Label(_)
+                | IrStmt::Goto(_) => false,
+                IrStmt::Select { clauses } => clauses.iter().any(|c| {
+                    c.ch.as_ref().map(expr_uses_arr).unwrap_or(false)
+                        || c.value.as_ref().map(expr_uses_arr).unwrap_or(false)
+                        || walk(&c.body)
+                }),
+                IrStmt::Asm { outputs, inputs, .. } => outputs
+                    .iter()
+                    .chain(inputs.iter())
+                    .any(|(_, e)| expr_uses_arr(e)),
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body)
+                        || excepts
+                            .iter()
+                            .any(|e| {
+                                e.match_expr.as_ref().map(expr_uses_arr).unwrap_or(false)
+                                    || walk(&e.body)
+                            })
+                        || walk(else_body)
+                        || walk(finally_body)
+                }
             };
             if hit {
                 return true;
@@ -923,7 +1035,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push('\n');
             Ok(())
         }
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, .. } => {
             indent(out, d);
             out.push_str(&assign_to_sh(targets, expr)?);
             out.push('\n');
@@ -999,6 +1111,21 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("done\n");
             Ok(())
         }
+        // the strip_cfor pass lowers C-style for loops before render; a
+        // surviving ForInit is a lowering gap — refuse loudly
+        IrStmt::ForInit { .. } => Err(
+            "sh renderer: un-stripped ForInit (the strip_cfor pass should have lowered it)".into(),
+        ),
+        IrStmt::Continue => {
+            indent(out, d);
+            out.push_str("continue\n");
+            Ok(())
+        }
+        IrStmt::Break => {
+            indent(out, d);
+            out.push_str("break\n");
+            Ok(())
+        }
         IrStmt::DoWhile { body, cond, until } => {
             indent(out, d);
             out.push_str("while :; do\n");
@@ -1039,7 +1166,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("esac\n");
             Ok(())
         }
-        IrStmt::Function { name, body } => {
+        IrStmt::Function { name, body, .. } => {
             indent(out, d);
             out.push_str(name);
             out.push_str("() {\n");
@@ -1253,6 +1380,24 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             Ok(())
         }
         IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => Ok(()),
+        IrStmt::Label(name) | IrStmt::Goto(name) => {
+            indent(out, d);
+            let kind = if matches!(st, IrStmt::Label(_)) {
+                "label"
+            } else {
+                "goto"
+            };
+            out.push_str(&format!(
+                "# TODO(unsupported): {kind} {name} not restructured by restructure_goto\n"
+            ));
+            Ok(())
+        }
+        // sh has no try/except — refuse loudly
+        IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
+        // sh has no select-on-channels — refuse loudly
+        IrStmt::Select { .. } => Err("select has no sh rendering".into()),
+        // inline asm has no sh rendering — refuse loudly
+        IrStmt::Asm { .. } => Err("inline asm has no sh rendering".into()),
     }
 }
 
@@ -1940,7 +2085,7 @@ fn needs_num(stmts: &[IrStmt]) -> bool {
     fn arith_has_var(a: &ArithAst) -> bool {
         match a {
             ArithAst::Num(_) => false,
-            ArithAst::Var(_) => true,
+            ArithAst::Var(_) | ArithAst::Ident(_) => true,
             ArithAst::Index { key, .. } => arith_has_var(key),
             ArithAst::Bin { lhs, rhs, .. } => arith_has_var(lhs) || arith_has_var(rhs),
             ArithAst::Un { arg, .. } => arith_has_var(arg),
@@ -1949,6 +2094,7 @@ fn needs_num(stmts: &[IrStmt]) -> bool {
             }
             ArithAst::Assign { rhs, .. } => arith_has_var(rhs),
             ArithAst::IncDec { var, .. } => true,
+            ArithAst::Sizeof(_) | ArithAst::Cast { .. } => false,
         }
     }
     fn has_num(e: &IrExpr) -> bool {
@@ -3912,7 +4058,7 @@ fn cstyle_for_to_sh(arith: &str, body: &str) -> String {
 fn arith_to_sh(a: &ArithAst) -> String {
     match a {
         ArithAst::Num(n) => n.to_string(),
-        ArithAst::Var(name) => format!("$( _num \"{name}\" )"),
+        ArithAst::Var(name) | ArithAst::Ident(name) => format!("$( _num \"{name}\" )"),
         ArithAst::Index { var, key } => format!("{var}[{}]", arith_to_sh(key)),
         ArithAst::Bin { op, lhs, rhs } => {
             // dash has no `**` — constant-fold literal powers
@@ -3957,6 +4103,10 @@ fn arith_to_sh(a: &ArithAst) -> String {
                 format!("(({var} = {var} {inc}) {dec})")
             }
         }
+        // C-frontend nodes (never emitted by the shell path): sizeof is a
+        // compile-time constant; casts are identity (shell arith is 64-bit).
+        ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+        ArithAst::Cast { arg, .. } => arith_to_sh(arg),
     }
 }
 
@@ -4001,7 +4151,7 @@ fn stmts_inline(stmts: &[IrStmt]) -> Result<String, String> {
 fn stmt_inline(st: &IrStmt) -> Result<String, String> {
     match st {
         IrStmt::Expr(e) => cmd_to_sh(e),
-        IrStmt::Assign { targets, expr } => assign_to_sh(targets, expr),
+        IrStmt::Assign { targets, expr, .. } => assign_to_sh(targets, expr),
         IrStmt::If { cond, then, elsifs, else_ } => {
             let mut out = format!("if {}; then {}", cmd_to_sh(cond)?, stmts_inline(then)?);
             for (ec, body) in elsifs {
@@ -4032,6 +4182,11 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             cmd_to_sh(cond)?,
             stmts_inline(body)?
         )),
+        IrStmt::ForInit { .. } => Err(
+            "sh renderer: un-stripped ForInit (the strip_cfor pass should have lowered it)".into(),
+        ),
+        IrStmt::Continue => Ok(format!("continue")),
+        IrStmt::Break => Ok(format!("break")),
         IrStmt::DoWhile { body, cond, until } => {
             let neg = if *until { "" } else { "! " };
             Ok(format!(
@@ -4051,7 +4206,7 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             out.push_str(" esac");
             Ok(out)
         }
-        IrStmt::Function { name, body } => {
+        IrStmt::Function { name, body, .. } => {
             Ok(format!("{name}() {{ {}; }}", stmts_inline(body)?))
         }
         IrStmt::Redirect { inner, redirects } => {
@@ -4146,6 +4301,22 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             word_to_sh(path)?
         )),
         IrStmt::SetChildError(_) | IrStmt::Require(_) | IrStmt::RawText(_) => Ok(String::new()),
+        IrStmt::Label(name) | IrStmt::Goto(name) => {
+            let kind = if matches!(st, IrStmt::Label(_)) {
+                "label"
+            } else {
+                "goto"
+            };
+            Ok(format!(
+                "# TODO(unsupported): {kind} {name} not restructured by restructure_goto"
+            ))
+        }
+        // sh has no try/except — refuse loudly
+        IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
+        // sh has no select-on-channels — refuse loudly
+        IrStmt::Select { .. } => Err("select has no sh rendering".into()),
+        // inline asm has no sh rendering — refuse loudly
+        IrStmt::Asm { .. } => Err("inline asm has no sh rendering".into()),
     }
 }
 
