@@ -1404,6 +1404,21 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
 /// `var=value` for a statement-level assignment. Handles the sh2.* RHS
 /// forms (capture, pipeline, arith, setArray, assign) natively.
 fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<String, String> {
+    // `((i++))` / `((i--))` — the arith-statement shape (triage-sh
+    // t29_increment): the estree renderer emits the IncDec BARE when the
+    // single target is the SAME var the arith mutates (the assignment
+    // wrapper would clobber the side effect with the expression's value
+    // — `x=$((x++))` assigns the OLD value back). The statement's value
+    // is discarded, so `: $((...))` keeps exactly the increment (the `:`
+    // swallows the expansion result — a bare `$((...))` line would try
+    // to RUN the value as a command: "1: not found").
+    if targets.len() == 1
+        && targets[0].indices.is_empty()
+        && matches!(expr, IrExpr::Arith(a) if matches!(&**a, ArithAst::IncDec { var, .. } if var == &targets[0].var))
+    {
+        let IrExpr::Arith(a) = expr else { unreachable!() };
+        return Ok(format!(": $(({}))", arith_to_sh(a)));
+    }
     // `arr=(a b c)` — the A1 is Assign{var: arr, expr: setArray(...)}. The
     // setArray lowering IS the assignment (`arr_0=a; arr_1=b; ...`) — the
     // `name=` prefix would corrupt it into `arr=arr_0=a`.
@@ -2094,7 +2109,8 @@ fn needs_num(stmts: &[IrStmt]) -> bool {
             }
             ArithAst::Assign { rhs, .. } => arith_has_var(rhs),
             ArithAst::IncDec { var, .. } => true,
-            ArithAst::Sizeof(_) | ArithAst::Cast { .. } => false,
+            ArithAst::Sizeof(_) => false,
+            ArithAst::Cast { arg, .. } => arith_has_var(arg),
         }
     }
     fn has_num(e: &IrExpr) -> bool {
@@ -2143,8 +2159,104 @@ fn needs_num(stmts: &[IrStmt]) -> bool {
                         return true;
                     }
                 }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    if has_num(cond) || walk(init) || walk(step) || walk(body) {
+                        return true;
+                    }
+                }
                 IrStmt::Assign { expr, .. } => {
                     if has_num(expr) {
+                        return true;
+                    }
+                }
+                IrStmt::Exec {
+                    cmd,
+                    args,
+                    redirects,
+                    env,
+                    ..
+                } => {
+                    if has_num(cmd)
+                        || args.iter().any(has_num)
+                        || redirects.iter().any(has_num)
+                        || env.iter().any(|(_, v)| has_num(v))
+                    {
+                        return true;
+                    }
+                }
+                IrStmt::Output { value, .. }
+                | IrStmt::Return(Some(value))
+                | IrStmt::Exit(Some(value))
+                | IrStmt::Die { expr: value, .. }
+                | IrStmt::Warn { expr: value, .. } => {
+                    if has_num(value) {
+                        return true;
+                    }
+                }
+                IrStmt::Declare { init, .. } => {
+                    if init.as_ref().map(|i| has_num(i)).unwrap_or(false) {
+                        return true;
+                    }
+                }
+                IrStmt::DeclareArray { elements, .. } => {
+                    if elements.iter().any(has_num) {
+                        return true;
+                    }
+                }
+                IrStmt::WriteFile { path, content, .. } => {
+                    if has_num(path) || has_num(content) {
+                        return true;
+                    }
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    if stages.iter().any(|st| walk(st)) {
+                        return true;
+                    }
+                }
+                IrStmt::Redirect { inner, redirects } => {
+                    if walk(inner) || redirects.iter().any(|r| has_num(&r.target)) {
+                        return true;
+                    }
+                }
+                IrStmt::Case { discriminant, clauses, .. } => {
+                    if has_num(discriminant)
+                        || clauses.iter().any(|c| walk(&c.body))
+                    {
+                        return true;
+                    }
+                }
+                IrStmt::Function { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                IrStmt::Select { clauses } => {
+                    if clauses.iter().any(|c| {
+                        c.ch.as_ref().map(has_num).unwrap_or(false)
+                            || c.value.as_ref().map(has_num).unwrap_or(false)
+                            || walk(&c.body)
+                    }) {
+                        return true;
+                    }
+                }
+                IrStmt::Asm { outputs, inputs, .. } => {
+                    if outputs.iter().chain(inputs.iter()).any(|(_, e)| has_num(e)) {
+                        return true;
+                    }
+                }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    if walk(body)
+                        || excepts.iter().any(|e| {
+                            e.match_expr.as_ref().map(has_num).unwrap_or(false) || walk(&e.body)
+                        })
+                        || walk(else_body)
+                        || walk(finally_body)
+                    {
                         return true;
                     }
                 }
@@ -4058,7 +4170,16 @@ fn cstyle_for_to_sh(arith: &str, body: &str) -> String {
 fn arith_to_sh(a: &ArithAst) -> String {
     match a {
         ArithAst::Num(n) => n.to_string(),
-        ArithAst::Var(name) | ArithAst::Ident(name) => format!("$( _num \"{name}\" )"),
+        ArithAst::Var(name) | ArithAst::Ident(name) => {
+            if INT_VARS.lock().unwrap().contains(name) {
+                // known-numeric var: bare read (dash rejects quoted
+                // expansions inside $(( )); the analysis guarantees the
+                // value is numeric text)
+                name.clone()
+            } else {
+                format!("$( _num \"${{{name}}}\" )")
+            }
+        }
         ArithAst::Index { var, key } => format!("{var}[{}]", arith_to_sh(key)),
         ArithAst::Bin { op, lhs, rhs } => {
             // dash has no `**` — constant-fold literal powers
