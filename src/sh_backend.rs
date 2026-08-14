@@ -27,6 +27,19 @@ lazy_static::lazy_static! {
     /// per-element vars are KEY-named (`config_user`) — the expansion
     /// helpers iterate the key list, not indices.
     static ref ASSOC_VARS: std::sync::Mutex<HashSet<String>> = Default::default();
+    /// `typeset -l` / `-u` variables — the case attribute PERSISTS: every
+    /// later plain assignment is transformed too (bash lowercases /
+    /// uppercases the assigned value). Value: true = uppercase.
+    static ref CASE_VARS: std::sync::Mutex<std::collections::HashMap<String, bool>> = Default::default();
+    /// `typeset -n name=target` — a nameref: every read/write of `name`
+    /// goes through to `target` (bash assigns/expands the referent).
+    static ref NAMEREF_VARS: std::sync::Mutex<std::collections::HashMap<String, String>> = Default::default();
+    /// `typeset -f NAME` — bash prints the function DEFINITION; the
+    /// bash-format text is rendered up front from the Function stmts.
+    static ref FUNCTION_BODIES: std::sync::Mutex<std::collections::HashMap<String, String>> = Default::default();
+    /// `typeset -p NAME` — bash prints `declare -<attrs> NAME="value"`;
+    /// the attributes are tracked from the earlier declarations.
+    static ref DECLARED_ATTRS: std::sync::Mutex<std::collections::HashMap<String, String>> = Default::default();
 }
 
 /// Marker prefixes the core's lowering tags unquoted glob / process-
@@ -584,6 +597,13 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
     *NOCASEMATCH.lock().unwrap() = false;
     *INT_VARS.lock().unwrap() = Default::default();
     *ASSOC_VARS.lock().unwrap() = Default::default();
+    *CASE_VARS.lock().unwrap() = Default::default();
+    *NAMEREF_VARS.lock().unwrap() = Default::default();
+    *FUNCTION_BODIES.lock().unwrap() = Default::default();
+    *DECLARED_ATTRS.lock().unwrap() = Default::default();
+    // bash-format function definitions (`typeset -f NAME` displays them)
+
+    collect_function_bodies(prog);
     let mut out = String::new();
     out.push_str("#!/bin/sh\n");
     if !has_fd_dup(prog) {
@@ -591,6 +611,24 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
         // bash's stderr is discarded, so silence ours (command-not-found
         // messages, `echo >&2` diagnostics) to match exactly
         out.push_str("exec 2>/dev/null\n");
+    }
+    if needs_printf_q(&prog.stmts) {
+        out.push_str("_printf_q() {\n");
+        out.push_str("    # bash's printf %q — ANSI-C-quoted form for\n");
+        out.push_str("    # non-printables ($'\\n\\t'), plain text otherwise\n");
+        out.push_str("    printf '%s' \"\\$'\"\n");
+        out.push_str("    for _q_c in $(printf '%s' \"$1\" | od -An -c | awk '{for(_i=1;_i<=NF;_i++) print $_i}'); do\n");
+        out.push_str("        case \"$_q_c\" in\n");
+        out.push_str("            '\\n') printf '\\\\n' ;;");
+        out.push_str("            '\\t') printf '\\\\t' ;;");
+        out.push_str("            '\\r') printf '\\\\r' ;;");
+        out.push_str("            '\\\\') printf '\\\\' ;;");
+        out.push_str("            \"\\'\") printf \"\\'\" ;;");
+        out.push_str("            *) printf '%s' \"$_q_c\" ;;");
+        out.push_str("        esac\n");
+        out.push_str("    done\n");
+        out.push_str("    printf '%s' \"'\"\n");
+        out.push_str("}\n\n");
     }
     if needs_ls(&prog.stmts) {
         out.push_str("_ls() {\n");
@@ -1514,6 +1552,16 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
             };
             rhs = format!("$(({raw}))");
         }
+        // `typeset -l`/`-u` vars — the case attribute persists: transform
+        // static assignment values (dynamic ones are left alone)
+        if t.indices.is_empty() {
+            if let Some(&up) = CASE_VARS.lock().unwrap().get(&t.var) {
+                if !rhs.contains(['$', '`', '\\']) && !rhs.is_empty() {
+                    let tr = if up { "tr a-z A-Z" } else { "tr A-Z a-z" };
+                    rhs = format!("$(printf '%s' {rhs} | {tr})");
+                }
+            }
+        }
         // baked element targets (`arr[1]=x` — the A1 folds the subscript
         // into the var name)
         if let Some((base, idx)) = t.var.strip_suffix(']').and_then(|v| v.split_once('[')) {
@@ -1552,7 +1600,14 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
             continue;
         }
         if t.indices.is_empty() {
-            out.push_str(&t.var);
+            // `typeset -n ref=original` — the write goes through
+            let target = NAMEREF_VARS
+                .lock()
+                .unwrap()
+                .get(&t.var)
+                .cloned()
+                .unwrap_or_else(|| t.var.clone());
+            out.push_str(&target);
             out.push('=');
             out.push_str(&rhs);
             continue;
@@ -1666,6 +1721,23 @@ fn elem_name(base: &str, idx: &str) -> String {
 fn set_array_to_sh(name: &str, items: &str, append: bool) -> String {
     if items.is_empty() {
         return format!("{name}_len=0");
+    }
+    // the KEYED literal form — `assoc=([key1]=value1 [key2]=value2)` —
+    // each item is `[k]=v` (arrives single-quoted): write the per-key
+    // element + key list
+    let items_clean = items.trim().trim_start_matches(['\'', '"']);
+    if items_clean.starts_with('[') {
+        let mut parts = Vec::new();
+        for raw in items.split(' ') {
+            let it = raw.trim().trim_start_matches(['\'', '"']).trim_end_matches(['\'', '"']);
+            let Some(rest) = it.strip_prefix('[') else { continue };
+            let Some((key, val)) = rest.split_once("]=") else { continue };
+            let ev = elem_name(name, key);
+            parts.push(format!("{ev}={val}"));
+            parts.push(format!("{name}_len=$(( ${{{name}_len:-0}} + 1 ))"));
+            parts.push(format!("{name}_keys=\"${{{name}_keys:-}} {key}\""));
+        }
+        return parts.join("; ");
     }
     if items.contains('$') && !append {
         return format!(
@@ -2265,6 +2337,68 @@ fn readlink_flag(s: &str) -> bool {
             && s[1..].chars().any(|c| "efm".contains(c)))
 }
 
+// Does the program call `printf %q` (dash lacks the directive)?
+fn needs_printf_q(stmts: &[IrStmt]) -> bool {
+    fn has_pq(e: &IrExpr) -> bool {
+        if let IrExpr::Call { func, args } = e {
+            if func == "exec" && args.len() >= 2 {
+                if let IrExpr::Str(cn, _) = &args[0] {
+                    if cn == "printf" {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if items.iter().any(|a| matches!(a, IrExpr::Str(s, _) if s.contains("%q"))) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            args.iter().any(has_pq)
+        } else if let IrExpr::Arrow(stmts) = e {
+            walk(stmts)
+        } else if let IrExpr::Array(es) = e {
+            es.iter().any(has_pq)
+        } else if let IrExpr::Object(es) = e {
+            es.iter().any(|(_, v)| has_pq(v))
+        } else if let IrExpr::BinOp { lhs, rhs, .. } = e {
+            has_pq(lhs) || has_pq(rhs)
+        } else {
+            false
+        }
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            match st {
+                IrStmt::Expr(e) => { if has_pq(e) { return true; } }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    if has_pq(cond) || walk(body) { return true; }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    if has_pq(cond) || walk(then) || walk(else_)
+                        || elsifs.iter().any(|(c, b)| has_pq(c) || walk(b))
+                    { return true; }
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    if walk(body) { return true; }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    if has_pq(iter) || walk(body) { return true; }
+                }
+                IrStmt::Assign { expr, .. } => { if has_pq(expr) { return true; } }
+                IrStmt::Redirect { inner, redirects } => {
+                    if walk(inner) { return true; }
+                    for r in redirects {
+                        if has_pq(&r.target) { return true; }
+                    }
+                }
+                IrStmt::Function { body, .. } => { if walk(body) { return true; } }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
 // Does the program need the `_ls` polyfill prologue (a non-`-l` ls that
 // could run under a sort-less busybox — and whose rc must survive an
 // `|| echo` chain)?
@@ -2669,6 +2803,74 @@ fn needs_num(stmts: &[IrStmt]) -> bool {
     walk(stmts)
 }
 
+/// Render the program's Function stmts into bash's `typeset -f` display
+/// format (`name () \n{ \n    stmt;\n    last\n}`) for the -f arm.
+fn collect_function_bodies(prog: &IrProgram) {
+    fn display_stmt(st: &IrStmt) -> Option<String> {
+        match st {
+            // bash's display: command bare, assignments bare, other
+            // words double-quoted (echo stays echo — no printf rewrite)
+            IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+                let mut words = Vec::new();
+                if let Some(IrExpr::Str(cn, _)) = args.first() {
+                    words.push(cn.clone());
+                }
+                // the argv lives in args[1] as an Array
+                let argv = match args.get(1) {
+                    Some(IrExpr::Array(items)) => items.as_slice(),
+                    _ => &[],
+                };
+                for a in argv {
+                    match a {
+                        IrExpr::Str(s, _) if s.contains('=') => words.push(s.clone()),
+                        IrExpr::Str(s, _) => words.push(format!("\"{s}\"")),
+                        IrExpr::Interpolate(parts) => {
+                            let mut t = String::new();
+                            for p in parts {
+                                match p {
+                                    InterpPart::Lit(x) => t.push_str(x),
+                                    InterpPart::Expr(x) => {
+                                        if let Ok(e) = interp_expr_to_sh(x) {
+                                            t.push_str(&e);
+                                        }
+                                    }
+                                }
+                            }
+                            words.push(format!("\"{t}\""));
+                        }
+                        other => words.push(word_to_sh(other).ok()?),
+                    }
+                }
+                Some(words.join(" "))
+            }
+            _ => stmt_inline(st).ok(),
+        }
+    }
+    fn walk(sts: &[IrStmt]) {
+        for st in sts {
+            match st {
+                IrStmt::Function { name, body, .. } => {
+                    let mut out = format!("{name} () \n{{ \n");
+                    for (i, b) in body.iter().enumerate() {
+                        if let Some(s) = display_stmt(b) {
+                            if i + 1 < body.len() {
+                                out.push_str(&format!("    {s};\n"));
+                            } else {
+                                out.push_str(&format!("    {s}\n"));
+                            }
+                        }
+                    }
+                    out.push_str("}\n");
+                    FUNCTION_BODIES.lock().unwrap().insert(name.clone(), out);
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => walk(b),
+                _ => {}
+            }
+        }
+    }
+    walk(&prog.stmts);
+}
+
 fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)]>) -> Result<String, String> {
     // GNU-only flags: refuse rather than leak an unportable invocation
     if let IrExpr::Str(cn, _) = cmd {
@@ -2828,21 +3030,82 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
                 let name = w.split('=').next().unwrap_or(w.as_str());
                 assoc.insert(name.to_string());
             }
+            // `declare -A m=()` — the array arrives as a setArray call
+            for a in args {
+                if let IrExpr::Call { func, args: cargs } = a {
+                    if func == "setArray" || func == "setArrayAppend" {
+                        if let Ok(s) = raw_arg(cargs, 0) {
+                            assoc.insert(s);
+                        }
+                    }
+                }
+            }
         }
         // `typeset -l`/`-u` — bash lowercases/uppercases the assigned
         // VALUE (dash has no such attribute); transform static values
         // with tr (dynamic `$var` values are left alone — the attribute
-        // would apply at assignment time in bash, unknowable here)
-        if flags.iter().any(|f| f.contains('l') || f.contains('u')) && !words.is_empty() {
+        // would apply at assignment time in bash, unknowable here). The
+        // attribute PERSISTS — later plain assignments are transformed
+        // too (see assign_to_sh).
+        if (flags.iter().any(|f| f.contains('l')) || flags.iter().any(|f| f.contains('u'))) && !words.is_empty() {
             let up = flags.iter().any(|f| f.contains('u'));
             let tr = if up { "tr a-z A-Z" } else { "tr A-Z a-z" };
+            let mut case_vars = CASE_VARS.lock().unwrap();
             for w in words.iter_mut() {
                 if let Some(eq) = w.find('=') {
                     let (name, val) = w.split_at(eq + 1);
+                    case_vars.insert(name[..eq].to_string(), up);
                     if !val.contains(['$', '`', '\\']) {
                         *w = format!("{name}$(printf '%s' {val} | {tr})");
                     }
+                } else if !w.is_empty() {
+                    case_vars.insert(w.clone(), up);
                 }
+            }
+        }
+        // `typeset -n name=target` — a nameref: `name` becomes an alias
+        // for `target`; reads/writes go through (the -r/-x flags are
+        // still handled normally)
+        if flags.iter().any(|f| f.contains('n')) {
+            let mut nrefs = NAMEREF_VARS.lock().unwrap();
+            for w in &words {
+                if let Some(eq) = w.find('=') {
+                    let (n, t) = w.split_at(eq);
+                    nrefs.insert(n.to_string(), t[1..].to_string());
+                }
+            }
+        }
+        // `typeset -p NAME` — bash PRINTS `declare -<attrs> NAME="v"`
+        if flags.iter().any(|f| f.contains('p')) {
+            let mut lines = Vec::new();
+            let attrs = DECLARED_ATTRS.lock().unwrap();
+            for w in &words {
+                let name = w.split('=').next().unwrap_or(w.as_str());
+                let a = attrs.get(name).map(|s| s.as_str()).unwrap_or("");
+                lines.push(format!(
+                    "printf '%s\\n' \"declare -{a} {name}=\\\"${name}\\\"\""
+                ));
+            }
+            if !lines.is_empty() {
+                return Ok(lines.join("; "));
+            }
+        }
+        // register the attributes for `typeset -p` / `declare -p`
+        {
+            let mut attrs = DECLARED_ATTRS.lock().unwrap();
+            for w in &words {
+                let name = w.split('=').next().unwrap_or(w.as_str());
+                let mut s = attrs.entry(name.to_string()).or_default().clone();
+                for f in &flags {
+                    for c in f.chars() {
+                        if matches!(c, 'i' | 'r' | 'x' | 'l' | 'u' | 'a' | 'A') && !s.contains(c) {
+                            s.push(c);
+                        }
+                    }
+                }
+                let mut cs: Vec<char> = s.chars().collect();
+                cs.sort_unstable();
+                attrs.insert(name.to_string(), cs.into_iter().collect());
             }
         }
         let prefix = if flags.iter().any(|f| f.contains('r')) {
@@ -2855,6 +3118,33 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
         // bare names (`declare -A config`) are attribute declarations —
         // the per-element lowering self-initializes the len counter
         let assigns: Vec<&str> = words.iter().filter(|w| w.contains('=')).map(|w| w.as_str()).collect();
+        // `typeset -f NAME` — bash PRINTS the function definition; the
+        // body is in the program's Function stmts (`-F` lists the names)
+        if assigns.is_empty() && (flags.iter().any(|f| f.contains('f')) || flags.iter().any(|f| f.contains('F'))) {
+            let list_names = flags.iter().any(|f| f.contains('F'))
+                && !flags.iter().any(|f| f.contains('f'));
+            let mut defs = Vec::new();
+            let bodies = FUNCTION_BODIES.lock().unwrap();
+            for w in &words {
+                if list_names {
+                    defs.push(w.clone());
+                } else if let Some(d) = bodies.get(w) {
+                    defs.push(d.clone());
+                }
+            }
+            if !defs.is_empty() {
+                // print the defs VERBATIM (a bare `name () { ... }` would
+                // RE-DEFINE the function instead of displaying it)
+                let delim = "_SH2FUNCDEF_1";
+                let mut out = format!("cat <<'{delim}'\n");
+                for d in &defs {
+                    out.push_str(d.trim_end_matches('\n'));
+                    out.push('\n');
+                }
+                out.push_str(delim);
+                return Ok(out);
+            }
+        }
         if assigns.is_empty() {
             out.push(':');
         } else {
@@ -3238,6 +3528,21 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
                 out.push_str(&word_to_sh(w)?);
             }
             return Ok(out);
+        }
+    }
+    // `printf %q` — bash-only directive; dash has no %q. Route through
+    // the _printf_q polyfill (ANSI-C quoting via od). (args is the
+    // ALREADY de-nested argv — the caller unwraps the Array.)
+    if cmd_name == Some("printf") && env.is_none() {
+        if args.iter().any(|a| matches!(a, IrExpr::Str(s, _) if s.contains("%q"))) {
+            let mut words: Vec<String> = vec!["_printf_q".into()];
+            for a in args {
+                if matches!(a, IrExpr::Str(s, _) if s.contains("%q")) {
+                    continue;
+                }
+                words.push(word_to_sh(a)?);
+            }
+            return Ok(words.join(" "));
         }
     }
     // `tty --silent` / `tty --quiet` (GNU long options) -> `tty -s`
@@ -3749,6 +4054,12 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
 /// `${name}`-family rendering. `list` selects the list form (join
 /// context, `"${arr[@]}"`).
 fn var_ref_to_sh(name: &str, list: bool) -> String {
+    // `typeset -n ref=original` — the read goes through to the referent
+    if !list && !name.is_empty() {
+        if let Some(t) = NAMEREF_VARS.lock().unwrap().get(name) {
+            return format!("${{{t}}}");
+        }
+    }
     if name == "RANDOM" {
         // bash-only; POSIX sh has no portable random — POSIX awk's
         // srand()/rand() (int(rand()*32768) = bash's 0..32767 range)
