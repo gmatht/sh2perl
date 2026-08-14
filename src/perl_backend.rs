@@ -1465,6 +1465,17 @@ impl Render {
                 // command, not a substitution)
                 format!("do {{ my $__o = {}; print $__o; ($? == 0) }}", self.expr(e))
             }
+            IrExpr::Call { func, .. } if func == "block" || func == "subshell" => {
+                // a block/subshell evaluates to the STATUS convention
+                // (0 = true / 256 = false) — the condition tests `== 0`
+                format!("(({}) == 0)", self.expr(e))
+            }
+            IrExpr::Arrow(_) => {
+                // a statement-arrow evaluates to the STATUS convention
+                // (0 = true / 256 = false, like $?) — the condition tests
+                // `== 0` (a bare `(( counter < max ))` in a while cond)
+                format!("(({}) == 0)", self.expr(e))
+            }
             _ => self.expr(e),
         }
     }
@@ -2404,7 +2415,18 @@ impl Render {
                         ws.remove(0);
                     }
                 }
-                let parts: Vec<String> = ws.iter().map(|w| self.expr(w)).collect();
+                let parts: Vec<String> = ws
+            .iter()
+            .map(|w| match w {
+                // an UNQUOTED cmdsub word word-splits into args
+                IrExpr::Call { func, args }
+                    if func == "capture" || func == "captureWords" =>
+                {
+                    format!("split(/\\s+/, {})", self.call(func, args))
+                }
+                _ => self.expr(w),
+            })
+            .collect();
                 format!("do {{ print join(' ', {}), \"\\n\"; 0 }}", parts.join(", "))
             }
             "let" => {
@@ -3197,7 +3219,18 @@ impl Render {
             }
             return;
         }
-        let parts: Vec<String> = ws.iter().map(|w| self.expr(w)).collect();
+        let parts: Vec<String> = ws
+            .iter()
+            .map(|w| match w {
+                // an UNQUOTED cmdsub word word-splits into args
+                IrExpr::Call { func, args }
+                    if func == "capture" || func == "captureWords" =>
+                {
+                    format!("split(/\\s+/, {})", self.call(func, args))
+                }
+                _ => self.expr(w),
+            })
+            .collect();
         // `echo $(( $1 * 100 + $2 ))` — with an unset positional bash
         // syntax-errors and prints NOTHING (perl would compute with 0)
         if let Some(g) = ws.iter().find_map(|w| match w {
@@ -4940,12 +4973,13 @@ impl Render {
                             glob_to_regex(p, true)
                         })
                         .collect();
-                    let re = brace_escape(&alts.join("|"));
+                    let re = alts.join("|");
+                    let wrapped = regex_wrap(&format!("^(?:{re})$"));
                     if first {
-                        self.emit(&format!("if (({disc}) =~ m{{^(?:{re})$}}) {{"));
+                        self.emit(&format!("if (({disc}) =~ {wrapped}) {{"));
                         first = false;
                     } else {
-                        self.emit(&format!("}} elsif (({disc}) =~ m{{^(?:{re})$}}) {{"));
+                        self.emit(&format!("}} elsif (({disc}) =~ {wrapped}) {{"));
                     }
                     self.depth += 1;
                     for s in &clause.body {
@@ -5425,9 +5459,14 @@ impl Render {
                         IrExpr::Arrow(stmts) => self.shell_cmd(stmts, "; "),
                         other => self.shell_unquoted(other),
                     };
-                    let q = self.shell_qx(&cmd);
+                    // the reconstructed command is the sh -c ARG (a perl
+                    // double-quoted string with $var interpolation) — the
+                    // qx{} form would run the command HERE and hand the
+                    // OUTPUT to sh -c
+                    let q = self.qx_raw(&cmd);
+                    let inner = q[3..q.len() - 1].replace('"', "\\\"");
                     self.emit(&format!(
-                        "open {fdn}, '-|', 'sh', '-c', {q} or die \"redirect: $!\\n\";"
+                        "open {fdn}, '-|', 'sh', '-c', \"{inner}\" or die \"redirect: $!\\n\";"
                     ));
                 }
                 m => self.mark_todo(&format!("redirect mode {m}")),
