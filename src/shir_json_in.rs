@@ -2098,4 +2098,38 @@ mod tests {
         let err = shir_json_to_ir(&bad).expect_err("unknown comm refuses");
         assert!(err.contains("not in recv/send/default"), "{err}");
     }
+
+    #[test]
+    fn dowhile_renders_estree_do_while_statement() {
+        // Core request c-sh-go-20260814-111815: the A1 DoWhile node
+        // used to hit the renderer's `unreachable!` ("Perl-only IR
+        // statement reached the ESTree renderer") — the c-sh-go
+        // frontend could only lower C `do-while` to a duplicated While.
+        // The exact shape the frontend emits for
+        // `int i = 0; do { i++; } while (i < 3); printf("%d\n", i);`
+        // (contract-valid A1, deserializes fine — the panic was in the
+        // renderer). Now the ESTree arm renders the post-test loop
+        // natively: `DoWhileStatement { test, body }` — body first,
+        // THEN the condition (unlike the While arm's pre-test shape).
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
+ {"type":"Assign","targets":[{"var":"i","sigil":null,"indices":[]}],"expr":{"type":"Str","style":"DoubleQuoted","value":"0"}},
+ {"type":"DoWhile","body":[{"type":"Assign","targets":[{"var":"i","sigil":null,"indices":[]}],"expr":{"type":"Arith","ast":{"type":"Bin","op":"+","lhs":{"type":"Var","name":"i"},"rhs":{"type":"Num","value":1}}}}],
+  "cond":{"type":"Call","func":"test","purity":"Emulable","args":[{"type":"Str","style":"DoubleQuoted","value":"$i -lt 3"}]},"until":false}
+],"subs":[],"var_const":[],"var_lengths":[],"var_lifetimes":[],"var_types":[{"name":"i","type":{"kind":"Int32"}}]}"#;
+        let prog = shir_json_to_ir(src).expect("A1 DoWhile deserializes");
+        let json = serde_json::to_string(&crate::shir::shir_to_estree(&prog)).unwrap();
+        assert!(
+            json.contains("\"type\":\"DoWhileStatement\""),
+            "no DoWhileStatement in: {json}"
+        );
+        // `until: false` → `test` is the cond itself (C `do … while (c)`).
+        assert!(!json.contains("\"operator\":\"!\""), "until:false must not negate");
+        // `until: true` (the contract's repeat-until form) negates the
+        // test — mirrors js_backend's `until → while (!(cond))`.
+        let until_src = src.replace("\"until\":false", "\"until\":true");
+        let prog2 = shir_json_to_ir(&until_src).expect("until variant deserializes");
+        let json2 = serde_json::to_string(&crate::shir::shir_to_estree(&prog2)).unwrap();
+        assert!(json2.contains("\"type\":\"DoWhileStatement\""));
+        assert!(json2.contains("\"operator\":\"!\""), "until:true must negate");
+    }
 }
