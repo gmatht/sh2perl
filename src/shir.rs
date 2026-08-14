@@ -31892,25 +31892,39 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // builtins — keep the pipeline then (the runtime dispatches
             // to the function).
             if func == "pipeline" {
-                if !program_defines_function("echo") && !program_defines_function("bc") {
-                    if let Some(native) = try_native_echo_bc_stmt(e) {
-                        return native;
+                // BOTH folds emit a DIRECT `process.stdout.write` of the
+                // folded text — the module's DEFAULT stdout sink only.
+                // The ECHO_SINK_DEPTH gate (the same discipline every
+                // native-echo lowering follows) is REQUIRED: inside a
+                // capture arrow the fd-1 target is a capture buffer, and
+                // a direct write would LEAK the folded output to the real
+                // stdout (the posix-sh-go t03_pipeline divergence —
+                // `x=$(echo one; echo two | wc -l)` printed the `1`
+                // before `x=one`, the pipeline's output bypassing the
+                // capture). When the depth is > 0 the pipeline stays on
+                // the runtime path (pipeline/pipelineSync write the last
+                // stage through the CURRENT fd-1 target).
+                if *ECHO_SINK_DEPTH.lock().unwrap() == 0 {
+                    if !program_defines_function("echo") && !program_defines_function("bc") {
+                        if let Some(native) = try_native_echo_bc_stmt(e) {
+                            return native;
+                        }
                     }
-                }
-                // `echo ARGS | head -N` / `printf FMT | head -N` / `... |
-                // tail -N` / `... | wc FLAGS` — a static producer feeding
-                // a static consumer: the whole pipeline folds to a native
-                // stdout write (see try_native_echo_pipe_stmt) — no
-                // pipeline machinery, no builtin dispatch. Script-defined
-                // functions shadow the builtins — keep the pipeline then.
-                if !program_defines_function("echo")
-                    && !program_defines_function("printf")
-                    && !program_defines_function("head")
-                    && !program_defines_function("tail")
-                    && !program_defines_function("wc")
-                {
-                    if let Some(native) = try_native_echo_pipe_stmt(e) {
-                        return native;
+                    // `echo ARGS | head -N` / `printf FMT | head -N` / `... |
+                    // tail -N` / `... | wc FLAGS` — a static producer feeding
+                    // a static consumer: the whole pipeline folds to a native
+                    // stdout write (see try_native_echo_pipe_stmt) — no
+                    // pipeline machinery, no builtin dispatch. Script-defined
+                    // functions shadow the builtins — keep the pipeline then.
+                    if !program_defines_function("echo")
+                        && !program_defines_function("printf")
+                        && !program_defines_function("head")
+                        && !program_defines_function("tail")
+                        && !program_defines_function("wc")
+                    {
+                        if let Some(native) = try_native_echo_pipe_stmt(e) {
+                            return native;
+                        }
                     }
                 }
             }
