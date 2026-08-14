@@ -17912,6 +17912,62 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 },
             }),
         },
+        // A1 `Pipeline` statement (contract node; core request
+        // py-sh-go-20260814-164552): render the stages as arrows EXACTLY
+        // the way the expression-form `$(a | b)` / the bash corpus's
+        // statement-level `Call("pipeline", [Array([Arrow, …])])` lower —
+        // construct the expression-form call and route it through
+        // `expr_to_estree`, so the native folds (echo|bc /
+        // echo|head|tail|wc / tr / grep / cut / the echo-stage string
+        // collapse), the ECHO_SINK_DEPTH discipline and the *Sync-twin
+        // verdict (`expr_has_await` + `sync_arrow_flip_deep`) apply
+        // identically. The runtime `pipeline`/`pipelineSync` helpers
+        // (harness/sh2-namespace.mjs) run each stage with fd 0 = the
+        // previous stage's captured output, write non-last stages into a
+        // capture buffer and the LAST stage through the current fd-1
+        // sink, record PIPESTATUS, and restore `fdTargets` in a finally
+        // — so the statement is self-contained (the expression form is
+        // already awaited when any stage awaits; the await-free form is
+        // the sync twin).
+        IrStmt::Pipeline { stages, capture, .. } => {
+            let pipeline_call = IrExpr::Call {
+                func: "pipeline".to_string(),
+                args: vec![IrExpr::Array(
+                    stages
+                        .iter()
+                        .map(|s| IrExpr::Arrow(s.clone()))
+                        .collect(),
+                )],
+            };
+            match capture {
+                // Side-effect pipeline (`capture: null`): the last
+                // stage's output lands on the current fd-1 sink (module
+                // stdout at top level).
+                None => Stmt::ExpressionStatement {
+                    expression: expr_to_estree(&pipeline_call),
+                },
+                // Capture pipeline (`capture: "var"`): the pipeline's
+                // output is captured with the same machinery the `$(a |
+                // b)` command-substitution form uses (the capture wraps
+                // the pipeline call; the runtime strips trailing
+                // newlines, the command-substitution convention) and
+                // stored in var via the store.
+                Some(var) => Stmt::ExpressionStatement {
+                    expression: sh2_call(
+                        "setVar",
+                        vec![
+                            str_lit(var),
+                            expr_to_estree(&IrExpr::Call {
+                                func: "capture".to_string(),
+                                args: vec![IrExpr::Arrow(vec![IrStmt::Expr(
+                                    pipeline_call,
+                                )])],
+                            }),
+                        ],
+                    ),
+                },
+            }
+        }
         other => unreachable!("Perl-only IR statement reached the ESTree renderer: {other:?}"),
     })
 }
