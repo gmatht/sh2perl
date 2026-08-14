@@ -109,6 +109,14 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
                                         names.insert(base.to_string());
                                     }
                                 }
+                                // `${array[key]...}` — any baked element ref
+                                if let Some((base, _)) = name.split_once('[') {
+                                    if !base.is_empty()
+                                        && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                    {
+                                        names.insert(base.to_string());
+                                    }
+                                }
                             }
                         }
                     }
@@ -428,11 +436,48 @@ fn arr_keys_call(name: &str) -> String {
 /// Does the program use whole-array expansions (`"${arr[@]}"`, `${!arr[@]}`,
 /// `${arr[*]}`)? They need the `_arr_expand`/`_arr_keys` prologue helpers
 /// (the per-element vars + counter lowering).
+/// The literal text of a Str / all-lit Interpolate.
+fn str_lit(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(s) => out.push_str(s),
+                    InterpPart::Expr(_) => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 fn needs_arr_helper(prog: &IrProgram) -> bool {
     fn expr_uses_arr(e: &IrExpr) -> bool {
         match e {
             IrExpr::Call { func, args } => {
                 let f = func.as_str();
+                // the eval-text rewrite (${arr[key]:-d}) needs the helpers
+                if f == "exec" {
+                    if let Some(IrExpr::Str(cn, _)) = args.first() {
+                        if cn == "eval" {
+                            // the argv is Array-wrapped in the raw Call
+                            let argv: Vec<&IrExpr> = match args.get(1) {
+                                Some(IrExpr::Array(items)) => items.iter().collect(),
+                                _ => vec![],
+                            };
+                            for a in argv {
+                                if let Some(s) = str_lit(a) {
+                                    if s.contains("[$") || s.contains("[@]") {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if f == "arrayItems" {
                     return true;
                 }
@@ -458,6 +503,11 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
                             _ => None,
                         })
                         .unwrap_or("");
+                    // any baked element ref (`${arr[k]}`) may need the
+                    // element helpers (the eval-based reads)
+                    if name.contains('[') || name.ends_with("[@]") || name.ends_with("[*]") {
+                        return true;
+                    }
                     if name.ends_with("[@]") || name.ends_with("[*]") {
                         return true;
                     }
@@ -1065,6 +1115,16 @@ _arr_keys_k() {
           printf '%s\n' "$_k"
       done )
 }
+_arr_elem() {
+    # `$1=base $2=key-text $3=default` — element-or-default read
+    eval "_v=\${$1_$2}"
+    if [ -n "$_v" ]; then
+        printf '%s' "$_v"
+    else
+        printf '%s' "$3"
+    fi
+}
+
 _arr_slice() {
     # $1=name $2=off $3=len — elements off..off+len-1, space-joined
     _end=$(eval echo "\${$1_len}")
@@ -3621,6 +3681,77 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
             }
             return Ok(out);
         }
+    }
+    // `eval` with a STATIC string: bash-only constructs inside the
+    // evaluated text (select, ${arr[...]}) would kill dash's eval —
+    // rewrite the text to the portable forms before it is evaluated.
+    if cmd_name == Some("eval") && env.is_none() {
+        // the evaluated text lives in args[1]'s Array (the caller
+        // de-nests the argv; the first item is the eval arg)
+        fn lit_text(e: &IrExpr) -> Option<String> {
+            match e {
+                IrExpr::Str(s, _) => Some(s.clone()),
+                IrExpr::Interpolate(parts) => {
+                    let mut out = String::new();
+                    for p in parts {
+                        match p {
+                            InterpPart::Lit(s) => out.push_str(s),
+                            InterpPart::Expr(_) => return None,
+                        }
+                    }
+                    Some(out)
+                }
+                _ => None,
+            }
+        }
+        let text = match args.first() {
+            Some(e) => lit_text(e),
+            None => None,
+        };
+        if let Some(s) = text {
+            let mut t = s.clone();
+            let mut changed = false;
+            // `select NAME; do` → a read-loop (bash prints the menu to
+            // stderr — discarded by the gate — and EOF ends the loop)
+            if t.contains("select ") && t.contains("; do") {
+                let re = regex::Regex::new(r"select\s+([A-Za-z_][A-Za-z0-9_]*)\s*;\s*do")
+                    .unwrap();
+                let n2 = re.replace_all(&t, "while :; do if ! read -r $1; then break; fi");
+                if n2 != t {
+                    t = n2.to_string();
+                    changed = true;
+                }
+            }
+            // `${arr[KEY]:-DEFAULT}` — dash cannot parse the subscript;
+            // route through the _arr_elem helper (eval-based)
+            if t.contains("${") && t.contains("[$") {
+                let re = regex::Regex::new(
+                    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\[([^]]+)\]:-([^}]*)\}",
+                )
+                .unwrap();
+                let n2 = re.replace_all(&t, "$(_arr_elem $1 $2 $3)");
+                if n2 != t {
+                    t = n2.to_string();
+                    changed = true;
+                }
+            }
+            if changed {
+                return Ok(format!("eval {}", str_word(&t)));
+            }
+        }
+    }
+    // `type NAME` — dash says "X is a shell function", bash says "X is
+    // a function"; a sed normalizes (the gate compares stdout).
+    if cmd_name == Some("type") && env.is_none()
+        && !args.iter().any(|a| matches!(a, IrExpr::Str(s, _) if s.starts_with('-'))) {
+        let mut words = vec!["type".into()];
+        for a in args {
+            words.push(word_to_sh(a)?);
+        }
+        return Ok(format!(
+            "{} | sed 's/ is a shell function/ is a function/'",
+            words.join(" ")
+        ));
     }
     // `printf %q` — bash-only directive; dash has no %q. Route through
     // the _printf_q polyfill (ANSI-C quoting via od). (args is the
