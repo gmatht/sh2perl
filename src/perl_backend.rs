@@ -84,6 +84,9 @@ pub struct Render {
     assigned_env: BTreeSet<String>,
     /// Names the script `export`ed (or `declare -x`) — the $ENV mapping.
     exported: BTreeSet<String>,
+    /// A PIPESTATUS read: the pipeline statements must record each
+    /// stage's exit status (the qx'd shell reports via a temp file).
+    need_pipestatus: bool,
     need_say: bool,
     need_basename: bool,
     /// A HOSTNAME read: bash populates it itself at startup (not from the
@@ -124,6 +127,12 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     r.collect_funcs(&prog.stmts);
     for s in &prog.subs {
         r.funcs.insert(s.name.clone());
+    }
+    // a PRE-PASS: PIPESTATUS reads must be known before the pipeline
+    // statements render (they appear AFTER the pipeline in the program)
+    r.probe_pipestatus(&prog.stmts);
+    for sub in &prog.subs {
+        r.probe_pipestatus(&sub.body);
     }
     // Pass 1: render the body (registers vars + helper flags).
     let mut body_out = Vec::new();
@@ -1294,7 +1303,9 @@ impl Render {
                 // the CHILD shell's own `__ps_tmpN=$(mktemp)` — the perl
                 // level must pass the ref through, not interpolate its own
                 // (undefined) var
-                '$' if i + 4 < chars.len() && &chars[i + 1..i + 5] == ['_', '_', 'p', 's'] => {
+                '$' if i + 4 < chars.len()
+                    && &chars[i + 1..i + 5] == ['_', '_', 'p', 's']
+                    && (i == 0 || chars[i - 1] != '\\') => {
                     out.push_str("\\$");
                     i += 1;
                     continue;
@@ -3358,6 +3369,34 @@ impl Render {
             self.emit("print \"\";");
             return;
         };
+        // `printf -v VAR FMT ARGS` — assign the formatted output to VAR
+        // instead of writing stdout (bash semantics)
+        if let IrExpr::Str(s, _) = fmt {
+            if s == "-v" {
+                if let Some(vname) = words
+                    .get(1)
+                    .and_then(|w| Self::str_arg(std::slice::from_ref(w), 0))
+                {
+                    let rest = &words[2..];
+                    let t = self.scalar_target(&vname);
+                    if rest.is_empty() {
+                        self.emit(&format!("{t} = \"\";"));
+                        return;
+                    }
+                    // the remaining printf (single specifier per corpus
+                    // use) via sprintf
+                    let fmt_e = self.expr(&rest[0]);
+                    let args: Vec<String> = rest[1..].iter().map(|w| self.expr(w)).collect();
+                    let argstr = args.join(", ");
+                    if args.is_empty() {
+                        self.emit(&format!("{t} = sprintf({fmt_e});"));
+                    } else {
+                        self.emit(&format!("{t} = sprintf({fmt_e}, {argstr});"));
+                    }
+                    return;
+                }
+            }
+        }
         // bash `%q` (shell-quote the argument) — perl printf has no %q:
         // replace with %s and quote the value at runtime (the ANSI-C
         // `$'...'` form bash emits for non-printables)
@@ -4439,6 +4478,108 @@ impl Render {
             .collect()
     }
 
+    /// PRE-PASS: find any PIPESTATUS read so the pipeline statements can
+    /// record the stage statuses.
+    fn probe_pipestatus(&mut self, stmts: &[IrStmt]) {
+        for s in stmts {
+            match s {
+                IrStmt::Expr(e) => self.probe_pipestatus_expr(e),
+                IrStmt::Assign { expr, .. } => self.probe_pipestatus_expr(expr),
+                IrStmt::Declare { init, .. } => {
+                    if let Some(i) = init {
+                        self.probe_pipestatus_expr(i);
+                    }
+                }
+                IrStmt::Output { value, .. } => self.probe_pipestatus_expr(value),
+                IrStmt::If {
+                    cond,
+                    then,
+                    elsifs,
+                    else_,
+                } => {
+                    self.probe_pipestatus_expr(cond);
+                    self.probe_pipestatus(then);
+                    for (_, b) in elsifs {
+                        self.probe_pipestatus(b);
+                    }
+                    self.probe_pipestatus(else_);
+                }
+                IrStmt::While { cond, body, .. } => {
+                    self.probe_pipestatus_expr(cond);
+                    self.probe_pipestatus(body);
+                }
+                IrStmt::For { iter, body, .. } => {
+                    self.probe_pipestatus_expr(iter);
+                    self.probe_pipestatus(body);
+                }
+                IrStmt::DoWhile { cond, body, .. } => {
+                    self.probe_pipestatus_expr(cond);
+                    self.probe_pipestatus(body);
+                }
+                IrStmt::Block(b)
+                | IrStmt::Function { body: b, .. }
+                | IrStmt::Subshell(b)
+                | IrStmt::Background(b)
+                | IrStmt::Redirect { inner: b, .. } => self.probe_pipestatus(b),
+                _ => {}
+            }
+        }
+    }
+    fn probe_pipestatus_expr(&mut self, e: &IrExpr) {
+        match e {
+            IrExpr::Call { func, args } => {
+                if func == "arrayIndex" {
+                    if Self::str_arg(args, 0).as_deref() == Some("PIPESTATUS") {
+                        self.need_pipestatus = true;
+                    }
+                }
+                if func == "param" {
+                    let n = Self::str_arg(args, 1).unwrap_or_default();
+                    if n == "PIPESTATUS" || n.starts_with("PIPESTATUS[") {
+                        self.need_pipestatus = true;
+                    }
+                }
+                for a in args {
+                    self.probe_pipestatus_expr(a);
+                }
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        self.probe_pipestatus_expr(x);
+                    }
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                self.probe_pipestatus_expr(lhs);
+                self.probe_pipestatus_expr(rhs);
+            }
+            IrExpr::Array(items) => {
+                for i in items {
+                    self.probe_pipestatus_expr(i);
+                }
+            }
+            IrExpr::Capture { expr, .. } => self.probe_pipestatus_expr(expr),
+            IrExpr::Ternary { cond, then, else_ } => {
+                self.probe_pipestatus_expr(cond);
+                self.probe_pipestatus_expr(then);
+                self.probe_pipestatus_expr(else_);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                self.probe_pipestatus_expr(expr);
+                self.probe_pipestatus_expr(default);
+            }
+            IrExpr::Index { var, key } => {
+                if var == "PIPESTATUS" {
+                    self.need_pipestatus = true;
+                }
+                self.probe_pipestatus_expr(key);
+            }
+            IrExpr::Arrow(stmts) => self.probe_pipestatus(stmts),
+            _ => {}
+        }
+    }
+
     /// A pipeline stage whose For-loop iter is perl-side data (`${!map[@]}`
     /// keys, `${arr[@]}` items, split lists) cannot be reconstructed as
     /// shell text — the child shell cannot see the perl containers.
@@ -4573,8 +4714,30 @@ impl Render {
                                 .iter()
                                 .map(|s| self.shell_cmd(s, "; "))
                                 .collect();
-                            let cmd = self.shell_qx(&joined.join(" | "));
-                            self.emit(&format!("print {cmd};"));
+                            let joined = joined.join(" | ");
+                            if self.need_pipestatus {
+                                // record each stage's status via
+                                // system('bash', '-c', ...) (no sh layer to
+                                // mangle the ${PIPESTATUS[@]} expansion; the
+                                // echo must be the FIRST command after the
+                                // pipeline — any command resets PIPESTATUS)
+                                let f = format!("/tmp/perl_ps_{}", std::process::id());
+                                let fq = Self::perl_str(&f);
+                                let wrap = format!(
+                                    "{joined}; echo ${{PIPESTATUS[@]}} > {f}; exit ${{PIPESTATUS[${{#PIPESTATUS[@]}}-1]}}"
+                                );
+                                let esc = wrap.replace('$', "\\$").replace('@', "\\@");
+                                self.emit(&format!(
+                                    "system('bash', '-c', \"{esc}\");"
+                                ));
+                                self.emit(&format!(
+                                    "@PIPESTATUS = split(/\\s+/, do {{ local $/; open my $__f, '<', {fq} or return; <$__f> }});"
+                                ));
+                                self.emit(&format!("unlink {fq};"));
+                            } else {
+                                let cmd = self.shell_qx(&joined);
+                                self.emit(&format!("print {cmd};"));
+                            }
                         }
                     }
                     "redirect" => {
