@@ -7463,6 +7463,7 @@ fn redirect_shell_text(r: &Redirect) -> String {
     match &r.operator {
         RedirectOperator::Input => format!("< {}", word_shell_text(&r.target)),
         RedirectOperator::Output => format!("> {}", word_shell_text(&r.target)),
+        RedirectOperator::ClobberOutput => format!(">| {}", word_shell_text(&r.target)),
         RedirectOperator::Append => format!(">> {}", word_shell_text(&r.target)),
         RedirectOperator::ProcessSubstitutionInput(c) => {
             format!("<({})", command_to_shell_text(c))
@@ -7487,6 +7488,11 @@ fn redirect_to_ir(r: &Redirect) -> IrRedirect {
     let (mode, default_fd) = match &r.operator {
         RedirectOperator::Input => ("r", 0),
         RedirectOperator::Output => ("w", 1),
+        // `>|` — noclobber-bypassing output. Distinct mode string "wc"
+        // (documented alongside "r"/"w"/"a"/"r+" in ir.rs IrRedirect.mode)
+        // so backends can render `>|` faithfully under `set -C` (core
+        // requests sh-20260814-140334 / sh-20260814-150110).
+        RedirectOperator::ClobberOutput => ("wc", 1),
         RedirectOperator::Append => ("a", 1),
         RedirectOperator::InputOutput => ("r+", 0),
         RedirectOperator::Heredoc => ("heredoc", 0),
@@ -35123,5 +35129,28 @@ mod struct_member_tests {
         let prog2 = crate::shir_json_in::shir_json_to_ir(plain).expect("ingress");
         let json2 = serde_json::to_string(&shir_to_estree(&prog2)).unwrap();
         assert!(json2.contains("\"name\":\"x\""), "plain name should lift: {json2}");
+    }
+}
+
+#[cfg(test)]
+mod clobber_redirect_tests {
+    use super::*;
+
+    /// `>|` survives parse → shIR → A1 with the distinct "wc" mode
+    /// (core requests sh-20260814-140334 / sh-20260814-150110): the
+    /// parser must NOT collapse it to plain Output, or no backend can
+    /// render the noclobber-bypassing operator under `set -C`.
+    #[test]
+    fn clobber_redirect_keeps_wc_mode() {
+        let cmds = crate::Parser::new(": >| \"$tmpf\"").parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        // shir_to_shir_json returns the serialized A1 JSON string (compact)
+        let s = crate::shir_json::shir_to_shir_json(&prog);
+        assert!(s.contains("\"mode\":\"wc\""), "clobber mode lost: {s}");
+        assert!(s.contains("\"fd\":1"), "default fd should be stdout: {s}");
+        // and the A1 round-trip accepts it (shir_json_in reads mode generically)
+        let back = crate::shir_json_in::shir_json_to_ir(&s).expect("ingress");
+        let s2 = crate::shir_json::shir_to_shir_json(&back);
+        assert!(s2.contains("\"mode\":\"wc\""), "round-trip lost clobber: {s2}");
     }
 }

@@ -592,7 +592,11 @@ pub fn parse_file_to_estree(filename: &str) {
 pub fn parse_file_to_shir(filename: &str) {
     let commands = match read_cli_input(filename) {
         Ok(bytes) => {
-            let content = String::from_utf8(bytes).unwrap_or_default();
+            // lossy decode (core requests sh-20260814-145955 /
+            // sh-utf8-20260814-140334): an invalid-UTF-8 byte must not
+            // collapse the whole file to an empty program — bash is
+            // byte-agnostic, so parse the U+FFFD-laced text.
+            let content = String::from_utf8_lossy(&bytes).into_owned();
             match Parser::new(&content).parse() {
                 Ok(c) => c,
                 Err(e) => {
