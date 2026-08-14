@@ -59,6 +59,18 @@ pub struct Render {
     /// Vars ever `local`'d: hoisted as `our` (package vars) so `local`
     /// (dynamic scoping, matching bash) works instead of `my` (lexical).
     locals: BTreeSet<String>,
+    /// `typeset -i` vars: assignments evaluate as arithmetic (bash's
+    /// integer attribute — a non-numeric value becomes 0).
+    int_vars: BTreeSet<String>,
+    /// `typeset -l` / `typeset -u` vars: assignments case-fold the value.
+    lower_vars: BTreeSet<String>,
+    upper_vars: BTreeSet<String>,
+    /// `typeset -r` vars: later assignments are ignored (bash errors to
+    /// stderr and keeps the readonly value).
+    readonly_vars: BTreeSet<String>,
+    /// `typeset -n` namerefs: the name aliases another var (reads and
+    /// writes go through to the target).
+    namerefs: BTreeMap<String, String>,
     need_say: bool,
     need_basename: bool,
     /// Subshell/background rendering forks: both sides must autoflush so
@@ -242,6 +254,12 @@ impl Render {
 
     /// Read reference for a shell variable (getVar/Var/arith contexts).
     fn var_ref(&mut self, name: &str) -> String {
+        // `typeset -n` nameref: reads go through to the TARGET
+        let name = self
+            .namerefs
+            .get(name)
+            .map(|s| s.as_str())
+            .unwrap_or(name);
         match name {
             "?" => "(($? >> 8))".to_string(),
             "$" => "$$".to_string(),
@@ -336,6 +354,12 @@ impl Render {
 
     /// A user-facing scalar write target.
     fn scalar_target(&mut self, name: &str) -> String {
+        // `typeset -n` nameref: writes go through to the TARGET
+        let name = self
+            .namerefs
+            .get(name)
+            .map(|s| s.as_str())
+            .unwrap_or(name);
         if is_env_style_var_name(name) {
             format!("$ENV{{{}}}", name)
         } else {
@@ -1830,7 +1854,28 @@ impl Render {
                 if is_assoc {
                     self.hashes.insert(name.clone());
                     let pairs: Vec<String> = match items {
-                        IrExpr::Array(els) => els.iter().map(|e| elem(self, e)).collect(),
+                        IrExpr::Array(els) => els
+                            .iter()
+                            .map(|e| match e {
+                                // `[key1]=value1` elements
+                                IrExpr::Str(s, _) => {
+                                    if let Some(eq) = s.find('=') {
+                                        let k = s[..eq]
+                                            .trim_start_matches('[')
+                                            .trim_end_matches(']');
+                                        let v = &s[eq + 1..];
+                                        format!(
+                                            "{} => {}",
+                                            Self::perl_str(k),
+                                            Self::perl_str(v)
+                                        )
+                                    } else {
+                                        Self::perl_str(s)
+                                    }
+                                }
+                                _ => elem(self, e),
+                            })
+                            .collect(),
                         _ => vec!["0".into()],
                     };
                     format!("(%{} = ({}))", ident(&name), pairs.join(", "))
@@ -2199,10 +2244,24 @@ impl Render {
             // The LIST must START with the program name (perl passes
             // LIST[0] as the child's argv[0]).
             let rest = a.join(", ");
-            self.emit(&format!(
-                "(system {{ {} }} {rest}) == -1 and system('bash', {rest});",
-                a[0]
-            ));
+            // a LIST-valued program (`system { @_ }` would be the element
+            // COUNT in scalar context) — plain LIST exec (LIST[0] = prog)
+            let list_prog = matches!(
+                &args[0],
+                IrExpr::Var(_, Some(Sigil::Array))
+                    | IrExpr::Call { .. }
+                    | IrExpr::Interpolate(_)
+            );
+            if list_prog {
+                self.emit(&format!(
+                    "(system({rest})) == -1 and system('bash', {rest});"
+                ));
+            } else {
+                self.emit(&format!(
+                    "(system {{ {} }} {rest}) == -1 and system('bash', {rest});",
+                    a[0]
+                ));
+            }
             return;
         };
         let words = match args.get(1) {
@@ -2367,7 +2426,7 @@ impl Render {
                             self.scalars.insert(name.clone());
                             if val.is_empty() && i + 1 < words.len() {
                                 // `local x=$(cmd)` — value is the next word
-                                let v = self.expr(&words[i + 1]);
+                                let v = self.assign_value(&words[i + 1]);
                                 self.emit(&format!("local ${} = {};", ident(&name), v));
                                 i += 2;
                                 continue;
@@ -2412,6 +2471,11 @@ impl Render {
                 let mut export_flag = false;
                 let mut assoc = false;
                 let mut indexed = false;
+                let mut int_attr = false;
+                let mut lower_attr = false;
+                let mut upper_attr = false;
+                let mut readonly_attr = false;
+                let mut nameref_attr = false;
                 let mut vars: Vec<&IrExpr> = Vec::new();
                 for w in &words {
                     match w {
@@ -2425,41 +2489,131 @@ impl Render {
                             if s.contains('a') {
                                 indexed = true;
                             }
+                            if s.contains('i') {
+                                int_attr = true;
+                            }
+                            if s.contains('l') {
+                                lower_attr = true;
+                            }
+                            if s.contains('u') {
+                                upper_attr = true;
+                            }
+                            if s.contains('r') {
+                                readonly_attr = true;
+                            }
+                            if s.contains('n') {
+                                nameref_attr = true;
+                            }
                         }
                         _ => vars.push(w),
                     }
                 }
-                for w in vars {
+                let register_attrs = |r: &mut Self, nm: &str, target: Option<&str>| {
+                    if int_attr {
+                        r.int_vars.insert(nm.to_string());
+                    }
+                    if lower_attr {
+                        r.lower_vars.insert(nm.to_string());
+                    }
+                    if upper_attr {
+                        r.upper_vars.insert(nm.to_string());
+                    }
+                    if readonly_attr {
+                        r.readonly_vars.insert(nm.to_string());
+                    }
+                    if nameref_attr {
+                        if let Some(t) = target {
+                            r.namerefs.insert(nm.to_string(), t.to_string());
+                        }
+                    }
+                };
+                let mut vi = 0;
+                while vi < vars.len() {
+                    let w = vars[vi];
                     if let IrExpr::Str(s, _) = w {
                         if let Some(eq) = s.find('=') {
                             let name = &s[..eq];
                             let val = &s[eq + 1..];
-                            let v = self.local_value(val);
+                            // nameref target = the assigned VALUE
+                            let nref_target = if val.is_empty() {
+                                match vars.get(vi + 1) {
+                                    Some(IrExpr::Str(t, _)) => Some(t.clone()),
+                                    Some(IrExpr::Interpolate(parts))
+                                        if parts.len() == 1 =>
+                                    {
+                                        match &parts[0] {
+                                            InterpPart::Lit(t) => Some(t.clone()),
+                                            _ => None,
+                                        }
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                Some(val.to_string())
+                            };
+                            register_attrs(
+                                self,
+                                name,
+                                nref_target.as_deref(),
+                            );
                             if assoc {
                                 self.hashes.insert(name.to_string());
                             } else if indexed {
                                 self.arrays.insert(name.to_string());
                             }
-                            if export_flag {
-                                self.emit(&format!("$ENV{{{}}} = {v};", name));
-                            } else {
-                                let t = self.scalar_target(name);
-                                self.emit(&format!("{t} = {v};"));
+                            // `typeset -r rovar="immutable"` — the value
+                            // arrives as the NEXT word (the core splits the
+                            // quoted word off the `name=` token)
+                            if val.is_empty() && vi + 1 < vars.len() {
+                                let mut v = self.assign_value(vars[vi + 1]);
+                                if lower_attr {
+                                    v = format!("lc({v})");
+                                }
+                                if upper_attr {
+                                    v = format!("uc({v})");
+                                }
+                                if !nameref_attr {
+                                    if export_flag {
+                                        self.emit(&format!("$ENV{{{}}} = {v};", name));
+                                    } else {
+                                        let t = self.scalar_target(name);
+                                        self.emit(&format!("{t} = {v};"));
+                                    }
+                                }
+                                vi += 2;
+                                continue;
                             }
+                            let v = self.local_value(val);
+                            // `typeset -n ref=original` CREATES the nameref —
+                            // it must not write through to the target
+                            if !nameref_attr {
+                                if export_flag {
+                                    self.emit(&format!("$ENV{{{}}} = {v};", name));
+                                } else {
+                                    let t = self.scalar_target(name);
+                                    self.emit(&format!("{t} = {v};"));
+                                }
+                            }
+                            vi += 1;
+                            continue;
                         } else {
                             // `declare -A map` / `declare -a arr` — register
                             // the container kind for later subscript reads
+                            register_attrs(self, s, None);
                             if assoc {
                                 self.hashes.insert(s.clone());
                             } else if indexed {
                                 self.arrays.insert(s.clone());
                             }
+                            vi += 1;
+                            continue;
                         }
                     } else {
                         // `declare -a arr=(1 2)` — the setArray word renders
                         // the store directly
                         let x = self.expr(w);
                         self.emit(&format!("{x};"));
+                        vi += 1;
                     }
                 }
             }
@@ -2536,12 +2690,12 @@ impl Render {
                             self.emit(&format!("delete $ENV{{{s}}};"));
                         } else {
                             // bash `unset x` clears every flavor of the name
+                            // (only the scalar is undef'd — registering the
+                            // container kinds would flip later reads to
+                            // `$x[0]`, and undeclared `undef @x` breaks
+                            // strict)
                             self.scalars.insert(s.clone());
-                            self.arrays.insert(s.clone());
-                            self.hashes.insert(s.clone());
                             self.emit(&format!("undef ${};", ident(s)));
-                            self.emit(&format!("undef @{};", ident(s)));
-                            self.emit(&format!("undef %{};", ident(s)));
                         }
                     }
                 }
@@ -2729,6 +2883,8 @@ impl Render {
         } else {
             self.emit(&format!("print join(' ', {});", parts.join(", ")));
         }
+        // bash: echo exits 0
+        self.emit("$? = 0;");
     }
 
     fn printf_stmt(&mut self, words: &[IrExpr]) {
@@ -3292,14 +3448,45 @@ impl Render {
             );
         }
         if let Some(name) = inner.strip_prefix('$') {
-            // `${name}` — the curly-brace form arrives verbatim
-            let name = name
+            // `${name op arg}` — the BRACED form — a param EXPANSION inside
+            // the test operand (`[ ${MAXWAIT% *} -gt ... ]`)
+            if let Some(braced) = name
                 .strip_prefix('{')
                 .and_then(|n| n.strip_suffix('}'))
-                .unwrap_or(name);
-            if !name.is_empty() {
-                return self.var_ref(name);
+            {
+                for op in ["%%", "##", "%", "#", ":-", ":=", ":+", ":?", "//", "/", "^^", ",,", "^", ","] {
+                    if let Some(pos) = braced.find(op) {
+                        let (n, rest) = braced.split_at(pos);
+                        let arg = &rest[op.len()..];
+                        if !n.is_empty() && (!arg.is_empty() || op.len() > 1) {
+                            let s = |v: &str| {
+                                IrExpr::Str(v.to_string(), StrStyle::DoubleQuoted)
+                            };
+                            return self.param(&[s(op), s(n), s(arg)]);
+                        }
+                    }
+                }
+                return self.var_ref(braced);
             }
+            // UNBRACED: `$var` — possibly with a literal tail
+            // (`$HOME/Documents` — the `/` is a path separator, not a
+            // param op)
+            let tail = name.find(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+            match tail {
+                None => return self.var_ref(name),
+                Some(0) => {}
+                Some(pos) => {
+                    let (v, rest) = name.split_at(pos);
+                    return format!("({} . {})", self.var_ref(v), Self::perl_str(rest));
+                }
+            }
+        }
+        // `~` / `~/path` — tilde expansion
+        if inner == "~" {
+            return "$ENV{HOME}".to_string();
+        }
+        if let Some(rest) = inner.strip_prefix("~/") {
+            return format!("($ENV{{HOME}} . \"/{rest}\")");
         }
         if t.starts_with('$') && t.len() > 1 {
             let name = &t[1..];
@@ -3903,9 +4090,36 @@ impl Render {
                     }
                     if let IrExpr::BinOp {
                         op: BinOpKind::And | BinOpKind::Or,
-                        ..
+                        lhs,
+                        rhs,
                     } = e
                     {
+                        // `A | B || C` — the pipeline side's stdout PRINTS
+                        // (bash runs it, then the chain continues)
+                        if let IrExpr::Call { func, args } = lhs.as_ref() {
+                            if func == "pipeline" {
+                                let mut stages: Vec<String> = Vec::new();
+                                if let Some(IrExpr::Array(items)) = args.first() {
+                                    for it in items {
+                                        if let IrExpr::Arrow(stmts) = it {
+                                            stages.push(self.shell_cmd(stmts, "; "));
+                                        }
+                                    }
+                                }
+                                let cmd = self.shell_qx(&stages.join(" | "));
+                                self.emit(&format!("print {cmd};"));
+                                let r = self.boolify(rhs);
+                                self.emit(&format!(
+                                    "$? = (((($? == 0) {} {r})) ? 0 : 256);",
+                                    if matches!(e, IrExpr::BinOp { op: BinOpKind::Or, .. }) {
+                                        "||"
+                                    } else {
+                                        "&&"
+                                    }
+                                ));
+                                return;
+                            }
+                        }
                         let x = self.expr(e);
                         self.emit(&format!("$? = (({x}) ? 0 : 256);"));
                         return;
@@ -3934,6 +4148,8 @@ impl Render {
                         }
                     }
                 }
+                // bash: a simple command (echo/printf) exits 0
+                self.emit("$? = 0;");
             }
             IrStmt::WriteFile { path, content, append } => {
                 let p = self.expr(path);
@@ -3979,6 +4195,30 @@ impl Render {
                     }
                 }
                 let lhs = self.scalar_target(&t.var);
+                // `typeset -i/-l/-u/-r` attribute semantics
+                if self.readonly_vars.contains(&t.var) {
+                    // bash: assigning to a readonly var fails (stderr) and
+                    // keeps the readonly value
+                    return;
+                }
+                if self.int_vars.contains(&t.var) {
+                    let e = match expr {
+                        IrExpr::Str(s, _) => self.arith_str(s),
+                        _ => format!("(0 + {})", self.expr(expr)),
+                    };
+                    self.emit(&format!("{lhs} = {e};"));
+                    return;
+                }
+                if self.lower_vars.contains(&t.var) {
+                    let e = self.expr(expr);
+                    self.emit(&format!("{lhs} = lc({e});"));
+                    return;
+                }
+                if self.upper_vars.contains(&t.var) {
+                    let e = self.expr(expr);
+                    self.emit(&format!("{lhs} = uc({e});"));
+                    return;
+                }
                 // `((i++))`-style arith write (incl. the c-style for STEP
                 // that strip_cfor lowers to a trailing Assign): the
                 // expression already performs the increment — a wrapping
@@ -4016,7 +4256,7 @@ impl Render {
                 self.emit(&format!("{lhs} = {e};"));
             }
             IrStmt::Declare { vars, init, .. } => {
-                let init_expr = init.as_ref().map(|e| self.expr(e));
+                let init_expr = init.as_ref().map(|e| self.assign_value(e));
                 for (i, d) in vars.iter().enumerate() {
                     let t = self.scalar_target(&d.name);
                     if i == 0 {
@@ -4399,6 +4639,24 @@ impl Render {
         // the trailing `;` keeps an empty bare block a valid statement
         // (`{ }` followed by another statement is a Perl syntax error)
         self.emit("};");
+    }
+
+    /// An ASSIGNMENT-context value: bash does NOT word-split on the RHS
+    /// of `=` — the core's `split(getVar(x))` wrapper (unquoted-expansion
+    /// marker) unwraps to the plain var read here.
+    fn assign_value(&mut self, e: &IrExpr) -> String {
+        if let IrExpr::Call { func, args } = e {
+            if func == "split" {
+                if let Some(IrExpr::Call { func: g, args: ga }) = args.first() {
+                    if g == "getVar" {
+                        if let Some(name) = Self::str_arg(ga, 0) {
+                            return self.var_ref(&name);
+                        }
+                    }
+                }
+            }
+        }
+        self.expr(e)
     }
 
     /// `local x=val` value: `$1`/`$name` → var ref, else a literal string.
