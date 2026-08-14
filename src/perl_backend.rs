@@ -77,6 +77,13 @@ pub struct Render {
     /// `shopt -s nocasematch` — `[[ x == pat ]]` and case patterns match
     /// case-insensitively.
     nocasematch: bool,
+    /// env-style (ALL-CAPS) names ASSIGNED by the script — bash keeps
+    /// them as SHELL vars (children don't see them) unless `export`ed
+    /// (the current `$ENV{...}` mapping is only right for real env vars
+    /// and exported names).
+    assigned_env: BTreeSet<String>,
+    /// Names the script `export`ed (or `declare -x`) — the $ENV mapping.
+    exported: BTreeSet<String>,
     need_say: bool,
     need_basename: bool,
     /// A HOSTNAME read: bash populates it itself at startup (not from the
@@ -316,7 +323,15 @@ impl Render {
                     // (`${LIST:-}` on `LIST+=(item)` → "item")
                     format!("${}[0]", ident(name))
                 } else if is_env_style_var_name(name) {
-                    format!("$ENV{{{}}}", name)
+                    if self.exported.contains(name) {
+                        format!("$ENV{{{}}}", name)
+                    } else if self.assigned_env.contains(name) {
+                        // assigned but NOT exported — a plain shell var
+                        self.scalars.insert(name.to_string());
+                        format!("${}", ident(name))
+                    } else {
+                        format!("$ENV{{{}}}", name)
+                    }
                 } else {
                     self.scalars.insert(name.to_string());
                     format!("${}", ident(name))
@@ -384,8 +399,18 @@ impl Render {
             .get(name)
             .map(|s| s.as_str())
             .unwrap_or(name);
+        if is_env_style_var_name(name) && !self.assigned_env.contains(name) {
+            // the FIRST write of an env-style name: bash keeps it a SHELL
+            // var (children don't see it) unless it was exported earlier
+            self.assigned_env.insert(name.to_string());
+        }
         if is_env_style_var_name(name) {
-            format!("$ENV{{{}}}", name)
+            if self.exported.contains(name) {
+                format!("$ENV{{{}}}", name)
+            } else {
+                self.scalars.insert(name.to_string());
+                format!("${}", ident(name))
+            }
         } else {
             self.scalars.insert(name.to_string());
             format!("${}", ident(name))
@@ -1432,12 +1457,13 @@ impl Render {
             IrExpr::Call { func, .. }
                 if matches!(
                     func.as_str(),
-                    "capture" | "captureWords" | "pipeline" | "and" | "or"
+                    "pipeline" | "and" | "or"
                 ) =>
             {
-                // a qx/pipeline runs the command and sets $? — bash tests
-                // the STATUS, not the (possibly empty) captured output
-                format!("do {{ my $__o = {}; ($? == 0) }}", self.expr(e))
+                // a pipeline/chain runs the command and sets $? — bash
+                // tests the STATUS; the command's stdout PRINTS (it is a
+                // command, not a substitution)
+                format!("do {{ my $__o = {}; print $__o; ($? == 0) }}", self.expr(e))
             }
             _ => self.expr(e),
         }
@@ -2145,14 +2171,21 @@ impl Render {
             }
             "grepMatches" => {
                 // `grep -o` semantics (match-all): perl regex ≈ ERE for the
-                // simple patterns the corpus uses
+                // simple patterns the corpus uses (grep `\+`/`\?` are the
+                // ERE one-or-more/optional — perl would read them literal)
                 let (Some(text), Some(pat)) = (args.first(), args.get(1)) else {
                     self.mark_todo("grepMatches args");
                     return "0".into();
                 };
                 let t = self.expr(text);
                 let p = match pat {
-                    IrExpr::Str(s, _) => brace_escape(&glob_to_regex(s, true)),
+                    IrExpr::Str(s, _) => {
+                        // the shIR pattern is ERE-ish (`\+` = one-or-more):
+                        // unescape the \-prefixed quantifiers and keep the
+                        // metachars RAW (glob_to_regex would re-escape them)
+                        let s = s.replace("\\+", "+").replace("\\?", "?");
+                        brace_escape(&s)
+                    }
                     _ => String::new(),
                 };
                 format!(
@@ -2169,7 +2202,8 @@ impl Render {
                 let t = self.expr(text);
                 match pat {
                     IrExpr::Str(s, _) => {
-                        let p = brace_escape(&glob_to_regex(s, true));
+                        let s = s.replace("\\+", "+").replace("\\?", "?");
+                        let p = brace_escape(&s);
                         format!("do {{ my $__t = {t}; ($__t =~ /{p}/ ? 1 : 0) }}")
                     }
                     // Interpolated pattern (e.g. `$s =~ /$pat/`): a
@@ -2404,8 +2438,20 @@ impl Render {
         match cmd.as_str() {
             // `exec` with NO args: the redirects-only form (`exec 3>&1`) —
             // the surrounding Redirect wrapper applies them; the builtin
-            // itself is a no-op (with args it would replace the process).
+            // itself is a no-op. WITH args it replaces the process — at the
+            // end of the program that is unobservable, so render the words
+            // as an ordinary command.
             "exec" if words.is_empty() => {}
+            "exec" => {
+                if let Some(first) = words.first() {
+                    let mut rest = vec![IrExpr::Array(words[1..].to_vec())];
+                    self.exec_stmt(&{
+                        let mut a = vec![first.clone()];
+                        a.append(&mut rest);
+                        a
+                    });
+                }
+            }
             "echo" => self.echo_stmt(&words),
             "printf" => self.printf_stmt(&words),
             "cd" => {
@@ -2720,6 +2766,8 @@ impl Render {
                                 }
                                 if !nameref_attr {
                                     if export_flag {
+                                        self.exported.insert(name.to_string());
+                                        self.assigned_env.insert(name.to_string());
                                         self.emit(&format!("$ENV{{{}}} = {v};", name));
                                     } else {
                                         let t = self.scalar_target(name);
@@ -2734,6 +2782,8 @@ impl Render {
                             // it must not write through to the target
                             if !nameref_attr {
                                 if export_flag {
+                                    self.exported.insert(name.to_string());
+                                    self.assigned_env.insert(name.to_string());
                                     self.emit(&format!("$ENV{{{}}} = {v};", name));
                                 } else {
                                     let t = self.scalar_target(name);
@@ -2813,10 +2863,15 @@ impl Render {
                             let name = &s[..eq];
                             let val = &s[eq + 1..];
                             let v = self.local_value(val);
+                            self.exported.insert(name.to_string());
+                            self.assigned_env.insert(name.to_string());
                             self.emit(&format!("$ENV{{{}}} = {v};", name));
                         } else {
+                            // `export VAR` — copy the shell var into the env
                             let v = self.var_ref(s);
-                            self.emit(&format!("$ENV{{{}}} = {v};", s));
+                            self.exported.insert(s.clone());
+                            self.assigned_env.insert(s.clone());
+                            self.emit(&format!("$ENV{{{s}}} = {v};"));
                         }
                     } else {
                         self.mark_todo("export word");
