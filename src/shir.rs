@@ -8253,6 +8253,15 @@ fn param_ir(pe: &ParameterExpansion) -> IrExpr {
         ParameterExpansionOperator::DefaultValue(d) => (":-".into(), vec![st(d)]),
         ParameterExpansionOperator::AssignDefault(d) => (":=".into(), vec![st(d)]),
         ParameterExpansionOperator::ErrorIfUnset(e) => (":?".into(), vec![st(e)]),
+        ParameterExpansionOperator::ZshFlags(flags, sep) => {
+            // zsh `${(flags)var}` / `${(flag:sep:)var}` — the zsh-only
+            // flag expansion; the A1 `param("", name, flags[, sep])`
+            // shape (the request's documented lowering).
+            let mut args = vec![st(""), st(pe.variable.as_str())];
+            if !flags.is_empty() { args.push(st(flags.as_str())); }
+            if let Some(s) = sep { args.push(st(s.as_str())); }
+            return call("param", args);
+        }
         ParameterExpansionOperator::BadSubstitution => ("badsub".into(), vec![]),
         ParameterExpansionOperator::Basename => ("basename".into(), vec![]),
         ParameterExpansionOperator::Dirname => ("dirname".into(), vec![]),

@@ -52,6 +52,10 @@ impl std::fmt::Display for ParameterExpansion {
                     write!(f, "${{{}}}:{}", self.variable, offset)
                 }
             }
+            ParameterExpansionOperator::ZshFlags(flags, sep) => match sep {
+                Some(s) => write!(f, "${{({}:{}:)}}{}", flags, s, self.variable),
+                None => write!(f, "${{({})}}{}", flags, self.variable),
+            },
         }
     }
 }
@@ -91,6 +95,17 @@ pub enum ParameterExpansionOperator {
 
     // Array slice operations
     ArraySlice(String, Option<String>), // :offset or :start:length
+
+    // zsh parameter-expansion flag prefix (core request
+    // zsh-sh-go-20260815-000728): `${(flags)var}` / `${(flag:sep:)var}`
+    // and the subscript search flags `${arr[(i)pat]}` / `[(I)]` /
+    // `[(k)]` / `[(r)]`. `flags` is the raw flag-name text (e.g. "f",
+    // "s", "j", "U", "t", "i" — combos like "fU" allowed); `sep` is
+    // the separator (s/j prefix forms) or the subscript search pattern.
+    // Real bash rejects `${(...)` ("bad substitution"), so no bash
+    // shape can produce this variant. Lowers to `param("", name,
+    // flags[, sep])` — the flag rides the `a`/`b` slots.
+    ZshFlags(String, Option<String>),
 }
 
 /// Represents arithmetic expressions
@@ -252,6 +267,9 @@ impl std::fmt::Display for Word {
                         StringPart::Literal(s) => result.push_str(s),
                         StringPart::Variable(var) => result.push_str(&format!("${}", var)),
                         StringPart::ParameterExpansion(pe) => match &pe.operator {
+                            ParameterExpansionOperator::ZshFlags(flags, pat) => {
+                                result.push_str(&format!("${{{}}}{}{}", pe.variable, flags, pat.as_deref().unwrap_or("")))
+                            }
                             ParameterExpansionOperator::None => {
                                 result.push_str(&format!("${{{}}}", pe.variable))
                             }
@@ -316,6 +334,13 @@ impl std::fmt::Display for Word {
                                     result.push_str(&format!("${{{}}}:{1}", pe.variable, offset))
                                 }
                             }
+                            ParameterExpansionOperator::ZshFlags(flags, sep) => match sep {
+                                Some(s) => result.push_str(&format!(
+                                    "${{({}:{}:)}}{}",
+                                    flags, s, pe.variable
+                                )),
+                                None => result.push_str(&format!("${{({})}}{}", flags, pe.variable)),
+                            },
                         },
                         StringPart::MapAccess(map_name, key) => {
                             result.push_str(&format!("{}[{}]", map_name, key))
@@ -446,6 +471,9 @@ impl Word {
             Word::Literal(s, _) => s.to_string(),
             Word::Variable(var, _, _) => format!("${}", var),
             Word::ParameterExpansion(pe, _) => match &pe.operator {
+                ParameterExpansionOperator::ZshFlags(flags, pat) => {
+                    format!("${{{}}}{}{}", pe.variable, flags, pat.as_deref().unwrap_or(""))
+                }
                 ParameterExpansionOperator::None => format!("${{{}}}", pe.variable),
                 ParameterExpansionOperator::UppercaseAll => format!("${{{}}}", pe.variable),
                 ParameterExpansionOperator::LowercaseAll => format!("${{{}}}", pe.variable),
@@ -487,6 +515,10 @@ impl Word {
                         format!("${{{}}}:{1}", pe.variable, offset)
                     }
                 }
+                ParameterExpansionOperator::ZshFlags(flags, sep) => match sep {
+                    Some(s) => format!("${{({}:{}:)}}{}", flags, s, pe.variable),
+                    None => format!("${{({})}}{}", flags, pe.variable),
+                },
             },
             Word::Array(name, elements, _) => format!("{}=({})", name, word_list_text(elements)),
             Word::MapAccess(map_name, key, _) => format!("{}[{}]", map_name, key),
@@ -546,6 +578,9 @@ impl Word {
                         StringPart::Literal(s) => result.push_str(s),
                         StringPart::Variable(var) => result.push_str(&format!("${}", var)),
                         StringPart::ParameterExpansion(pe) => match &pe.operator {
+                            ParameterExpansionOperator::ZshFlags(flags, pat) => {
+                                result.push_str(&format!("${{{}}}{}{}", pe.variable, flags, pat.as_deref().unwrap_or("")))
+                            }
                             ParameterExpansionOperator::None => {
                                 result.push_str(&format!("${{{}}}", pe.variable))
                             }
@@ -610,6 +645,13 @@ impl Word {
                                     result.push_str(&format!("${{{}}}:{1}", pe.variable, offset))
                                 }
                             }
+                            ParameterExpansionOperator::ZshFlags(flags, sep) => match sep {
+                                Some(s) => result.push_str(&format!(
+                                    "${{({}:{}:)}}{}",
+                                    flags, s, pe.variable
+                                )),
+                                None => result.push_str(&format!("${{({})}}{}", flags, pe.variable)),
+                            },
                         },
                         StringPart::MapAccess(map_name, key) => {
                             result.push_str(&format!("${{{}}}[{}]", map_name, key))
