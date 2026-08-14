@@ -1103,7 +1103,22 @@ impl Render {
                         (_, "a") => ">>",
                         _ => ">",
                     };
-                    suf.push_str(&format!(" {op} {}", self.shell_word(&r.target)));
+                    // a custom fd keeps its number (`4> f` — the op's
+                    // 2-prefix only covers stderr)
+                    let full = if fd > 2 {
+                        format!("{fd}{op}")
+                    } else {
+                        op.to_string()
+                    };
+                    if let IrExpr::Str(t, _) = &r.target {
+                        if t.starts_with('&') {
+                            // fd-dup (`>&1`): the target is a DESCRIPTOR,
+                            // not a filename — never quote it
+                            suf.push_str(&format!(" {full}{t}"));
+                            continue;
+                        }
+                    }
+                    suf.push_str(&format!(" {full} {}", self.shell_word(&r.target)));
                 }
                 "r" => suf.push_str(&format!(" < {}", self.shell_word(&r.target))),
                 "heredoc" | "heredoc-tabs" => {
@@ -5491,15 +5506,19 @@ impl Render {
                 "w" | "a" | "r+" => {
                     let op = if r.mode == "a" { ">>" } else { ">" };
                     let t = self.expr(&r.target);
+                    // a failed redirect FAILS the command (rc 1) — bash
+                    // continues; the body below is skipped via $?
                     self.emit(&format!(
-                        "open {fdn}, {op:?}, {t} or die \"redirect: $!\\n\";"
+                        "open {fdn}, {op:?}, {t} or $? = 256;"
                     ));
+                    self.emit("$? = 0 unless $? == 256;");
                 }
                 "r" => {
                     let t = self.expr(&r.target);
                     self.emit(&format!(
-                        "open {fdn}, '<', {t} or die \"redirect: $!\\n\";"
+                        "open {fdn}, '<', {t} or $? = 256;"
                     ));
+                    self.emit("$? = 0 unless $? == 256;");
                 }
                 "heredoc" | "heredoc-tabs" | "herestring" => {
                     // scalar-ref opens can't dup onto STDIN for system
@@ -5573,9 +5592,15 @@ impl Render {
                 m => self.mark_todo(&format!("redirect mode {m}")),
             }
         }
+        // a FAILED redirect (missing input file, bad path) fails the
+        // command — the body is skipped (bash continues the script)
+        self.emit("if ($? == 0) {");
+        self.depth += 1;
         for s in inner {
             self.stmt(s);
         }
+        self.depth -= 1;
+        self.emit("}");
         for (sav, fdn) in saved.iter().rev() {
             self.emit(&format!("close {fdn};"));
             self.emit(&format!(
