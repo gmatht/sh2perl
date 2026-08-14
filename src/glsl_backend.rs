@@ -4563,7 +4563,7 @@ mod tests {
             );
         let shader = render_opts(
             &prog,
-            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 800 },
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 32, max_view: 800 },
         );
         assert!(shader.contains("precision highp int;"), "overflow must refuse mediump int");
         assert!(shader.contains("precision mediump float;"), "float side stays provable");
@@ -4613,7 +4613,7 @@ mod tests {
             r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
               {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
-            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 0 },
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 32, max_view: 0 },
         );
         assert!(!shader.contains("OUT_CAP"), "OUT_CAP in render fragment");
         assert!(!shader.contains("out_len"), "out_len in render fragment");
@@ -4649,7 +4649,7 @@ mod tests {
               {"type":"Assign","targets":[{"var":"fx","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Var","name":"frag_x"}}},
               {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
-            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 0 },
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 32, max_view: 0 },
         );
         assert!(shader.contains("g_frag_x = int(gl_FragCoord.x);"), "frag_x seed missing");
         assert!(!shader.contains("vColor"), "vColor declared unused");
@@ -4670,7 +4670,7 @@ mod tests {
               {"type":"Assign","targets":[{"var":"t","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Var","name":"tex_r"}}},
               {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
-            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 0 },
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 32, max_view: 0 },
         );
         assert!(shader.contains("varying vec2 vUv;"), "vUv missing for tex bridge");
         assert!(shader.contains("uniform sampler2D uTex;"), "uTex missing for tex bridge");
@@ -4716,7 +4716,7 @@ vp_w=$w
 vc_r=$((ash_r * ublk_r / 1000))
 vu_u=$auv_u
 "#,
-            ShGlslOptions { es100: true, color_out: false, vert_out: true, tex_size: 16, max_view: 0 },
+            ShGlslOptions { es100: true, color_out: false, vert_out: true, tex_size: 32, max_view: 0 },
         );
         // header: attributes/uniforms/varyings
         assert!(shader.contains("attribute vec3 aPosition;"), "aPosition missing");
