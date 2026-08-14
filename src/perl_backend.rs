@@ -2505,10 +2505,19 @@ impl Render {
                 }
                 // the STATUS (0/256) of the spawned command — the boolean
                 // AND-chain value would be 0/1, mixing conventions inside
-                // status-condition blocks
+                // status-condition blocks; the plain LIST form (the
+                // indirect-object braces mangle `.`-concatenated args)
+                let fbl = format!(
+                    "{} . \" \" . {}",
+                    shell_squote(&cmd),
+                    words
+                        .iter()
+                        .map(|w| format!("({})", self.expr(w)))
+                        .collect::<Vec<_>>()
+                        .join(" . \" \" . ")
+                );
                 format!(
-                    "do {{ (system {{ {} }} {rest}) == -1 and system('bash', {rest}); ($? == 0 ? 0 : 256) }}",
-                    a[0],
+                    "do {{ (system({rest})) == -1 and system('bash', '-c', {fbl}); ($? == 0 ? 0 : 256) }}",
                     rest = a[1..].join(", ")
                 )
             }
@@ -3224,9 +3233,21 @@ impl Render {
                     return;
                 }
                 let rest = a.join(", ");
+                // the bash fallback runs the RECONSTRUCTED command line
+                // (`bash args...` would treat the first arg as a script
+                // file — wrong for builtins like test/command); the
+                // rendered perl exprs concatenate into the -c string
+                let fbl = format!(
+                    "{} . \" \" . {}",
+                    shell_squote(&cmd),
+                    words
+                        .iter()
+                        .map(|w| format!("({})", self.expr(w)))
+                        .collect::<Vec<_>>()
+                        .join(" . \" \" . ")
+                );
                 self.emit(&format!(
-                    "(system {{ {} }} {rest}) == -1 and system('bash', {rest});",
-                    a[0]
+                    "(system({rest})) == -1 and system('bash', '-c', {fbl});"
                 ));
                 // the statement's VALUE (and the block-cond convention):
                 // the STATUS (0/256), not the boolean and-chain
