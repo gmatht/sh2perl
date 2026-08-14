@@ -73,6 +73,9 @@ pub struct Render {
     namerefs: BTreeMap<String, String>,
     need_say: bool,
     need_basename: bool,
+    /// A HOSTNAME read: bash populates it itself at startup (not from the
+    /// env) — the preamble captures `hostname` when it is referenced.
+    need_hostname: bool,
     /// Subshell/background rendering forks: both sides must autoflush so
     /// the child's `exit` doesn't duplicate buffered parent output.
     need_autoflush: bool,
@@ -134,6 +137,12 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     if r.need_autoflush {
         r.emit("STDOUT->autoflush(1);");
         r.emit("STDERR->autoflush(1);");
+    }
+    if r.need_hostname {
+        // bash sets HOSTNAME itself at startup (never from the env) —
+        // populate it when a script reads it
+        r.emit("chomp(my $__h = qx{hostname});");
+        r.emit("$ENV{HOSTNAME} = $__h unless defined $ENV{HOSTNAME};");
     }
     for import in &prog.imports {
         r.emit(&format!("use {};", import));
@@ -260,6 +269,9 @@ impl Render {
             .get(name)
             .map(|s| s.as_str())
             .unwrap_or(name);
+        if name == "HOSTNAME" {
+            self.need_hostname = true;
+        }
         match name {
             "?" => "(($? >> 8))".to_string(),
             "$" => "$$".to_string(),
@@ -421,6 +433,22 @@ impl Render {
                                         }
                                         continue;
                                     }
+                                }
+                                // a param expansion inside a word —
+                                // interpolate the COMPUTED perl value
+                                // (the shell can't see the perl vars)
+                                if func == "param" {
+                                    if !lit.is_empty() {
+                                        let mut seg = String::from("\"");
+                                        seg.push_str(&sh_dq_escape(&lit));
+                                        lit.clear();
+                                        seg.push_str(&format!("@{{[{}]}}", self.param(args)));
+                                        seg.push('"');
+                                        out.push_str(&seg);
+                                    } else {
+                                        out.push_str(&format!("@{{[{}]}}", self.param(args)));
+                                    }
+                                    continue;
                                 }
                             }
                             if !lit.is_empty() {
@@ -1164,6 +1192,62 @@ impl Render {
                 // (undefined) var
                 '$' if i + 4 < chars.len() && &chars[i + 1..i + 5] == ['_', '_', 'p', 's'] => {
                     out.push_str("\\$");
+                    i += 1;
+                    continue;
+                }
+                // `$name{...}` (e.g. `$ENV{PWD}`) — perl interpolates the
+                // hash element; the braces must stay UNESCAPED (they are
+                // balanced, so the qx{} delimiter survives)
+                '$' if i + 1 < chars.len()
+                    && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_') =>
+                {
+                    let mut j = i + 1;
+                    while j < chars.len()
+                        && (chars[j].is_ascii_alphanumeric() || chars[j] == '_')
+                    {
+                        j += 1;
+                    }
+                    if j < chars.len() && chars[j] == '{' {
+                        let mut d = 1;
+                        let mut k = j + 1;
+                        while k < chars.len() && d > 0 {
+                            if chars[k] == '{' {
+                                d += 1;
+                            } else if chars[k] == '}' {
+                                d -= 1;
+                            }
+                            k += 1;
+                        }
+                        if d == 0 {
+                            out.push_str(&cmd[i..k]);
+                            i = k;
+                            continue;
+                        }
+                    }
+                    out.push_str(&cmd[i..j]);
+                    i = j;
+                    continue;
+                }
+                // perl babycart `@{[...]}` — the computed value of a
+                // perl-side expression interpolates into the command;
+                // the braces must stay UNESCAPED (balanced)
+                '@' if i + 2 < chars.len() && chars[i + 1] == '{' && chars[i + 2] == '[' => {
+                    let mut d = 1;
+                    let mut k = i + 3;
+                    while k < chars.len() && d > 0 {
+                        if chars[k] == '[' {
+                            d += 1;
+                        } else if chars[k] == ']' {
+                            d -= 1;
+                        }
+                        k += 1;
+                    }
+                    if d == 0 && k < chars.len() && chars[k] == '}' {
+                        out.push_str(&cmd[i..k + 1]);
+                        i = k + 1;
+                        continue;
+                    }
+                    out.push('@');
                     i += 1;
                     continue;
                 }
@@ -2407,11 +2491,19 @@ impl Render {
             "local" => {
                 // `local x=val` — dynamic scope: `local $x` on the hoisted
                 // `our $x` (never `my` — lexical scope differs from bash)
+                let mut local_assoc = false;
+                let mut local_indexed = false;
                 let mut i = 0;
                 while i < words.len() {
                     let w = &words[i];
                     if let IrExpr::Str(s, _) = w {
                         if s.starts_with('-') && s != "--" {
+                            if s.contains('A') {
+                                local_assoc = true;
+                            }
+                            if s.contains('a') {
+                                local_indexed = true;
+                            }
                             i += 1;
                             continue;
                         }
@@ -2435,6 +2527,11 @@ impl Render {
                             self.emit(&format!("local ${} = {};", ident(&name), v));
                             i += 1;
                             continue;
+                        }
+                        if local_assoc {
+                            self.hashes.insert(s.clone());
+                        } else if local_indexed {
+                            self.arrays.insert(s.clone());
                         }
                         self.locals.insert(s.clone());
                         self.scalars.insert(s.clone());
@@ -2878,6 +2975,21 @@ impl Render {
             return;
         }
         let parts: Vec<String> = ws.iter().map(|w| self.expr(w)).collect();
+        // `echo $(( $1 * 100 + $2 ))` — with an unset positional bash
+        // syntax-errors and prints NOTHING (perl would compute with 0)
+        if let Some(g) = ws.iter().find_map(|w| match w {
+            IrExpr::Call { func, args } if func == "arith" => {
+                Self::str_arg(args, 0).and_then(|s| arith_pos_guard(&s))
+            }
+            _ => None,
+        }) {
+            let joined = parts.join(", ");
+            self.emit(&format!(
+                "print (({g}) ? join(' ', {joined}) . \"\\n\" : \"\");"
+            ));
+            self.emit("$? = 0;");
+            return;
+        }
         if newline {
             self.emit(&format!("say join(' ', {});", parts.join(", ")));
         } else {
@@ -2892,6 +3004,21 @@ impl Render {
             self.emit("print \"\";");
             return;
         };
+        // bash `%q` (shell-quote the argument) — perl printf has no %q:
+        // replace with %s and quote the value at runtime (the ANSI-C
+        // `$'...'` form bash emits for non-printables)
+        let has_q = matches!(fmt, IrExpr::Str(s, _) if s.contains("%q"));
+        let words: Vec<IrExpr> = if has_q {
+            let mut ws = words.to_vec();
+            if let IrExpr::Str(s, _) = &mut ws[0] {
+                *s = s.replace("%q", "%s");
+            }
+            ws
+        } else {
+            words.to_vec()
+        };
+        let words = words;
+        let fmt = &words[0];
         let fmt_str = self.expr(fmt);
         let fmt_lit = match fmt {
             IrExpr::Str(s, _) => Some(s.clone()),
@@ -2923,7 +3050,20 @@ impl Render {
             Some(s) => Self::perl_str(&bash_printf_unescape(s)),
             None => fmt_str,
         };
-        let args: Vec<String> = words[1..].iter().map(|w| self.expr(w)).collect();
+        let args: Vec<String> = words[1..]
+            .iter()
+            .enumerate()
+            .map(|(idx, w)| {
+                let e = self.expr(w);
+                if has_q && idx == 0 {
+                    format!(
+                        "do {{ my $__q = join '', map {{ my $c = $_; $c eq '\\'' ? \"\\\\'\" : $c eq '\\\\' ? \"\\\\\\\\\" : $c eq \"\\n\" ? \"\\\\n\" : $c eq \"\\t\" ? \"\\\\t\" : $c eq \"\\r\" ? \"\\\\r\" : (ord($c) < 0x20 || ord($c) > 0x7e) ? sprintf(\"\\\\x%02x\", ord($c)) : $c }} split //, {e}; \"\\$'\" . $__q . \"'\" }}"
+                    )
+                } else {
+                    e
+                }
+            })
+            .collect();
         // bash printf CYCLES the format over the args; perl printf only
         // consumes the first chunk — loop when there are more args than
         // format specifiers, or when the arg count is runtime-dependent
@@ -3696,6 +3836,13 @@ impl Render {
                 // an array slice, anything else is a scalar substring
                 if self.arrays.contains(&name) {
                     self.arrays.insert(name.clone());
+                    // `${arr[@]:off}` — no length → to the end
+                    let len_is_empty = args.get(3).map_or(true, |a| {
+                        matches!(a, IrExpr::Str(s, _) if s.is_empty())
+                    });
+                    if len_is_empty {
+                        return format!("@{}[{off}..$#{}]", ident(&name), ident(&name));
+                    }
                     let len = args
                         .get(3)
                         .map(|a| match a {
@@ -3703,9 +3850,6 @@ impl Render {
                             _ => self.expr(a),
                         })
                         .unwrap_or_else(|| "0".into());
-                    if len == "0" {
-                        return format!("@{}[{off}..$#{}]", ident(&name), ident(&name));
-                    }
                     return format!("@{}[{off}..({off})+({len})-1]", ident(&name));
                 }
                 match args.get(3) {
@@ -4129,6 +4273,25 @@ impl Render {
                 }
             },
             IrStmt::Output { value, newline, target } => {
+                // `echo $(( $1 * 100 + $2 ))` — bash SYNTAX-ERRORS when a
+                // positional is unset (the empty operand), printing
+                // NOTHING; perl would compute 0 — guard the whole output
+                let arith_guard: Option<String> = if let IrExpr::Call { func, args } = value {
+                    if func == "arith" {
+                        Self::str_arg(args, 0).and_then(|s| arith_pos_guard(&s))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(g) = arith_guard {
+                    let v = self.expr(value);
+                    let nl = if *newline { "\"\\n\"" } else { "\"\"" };
+                    self.emit(&format!("print (({g}) ? ({v} . {nl}) : \"\");"));
+                    self.emit("$? = 0;");
+                    return;
+                }
                 let v = self.expr(value);
                 match target {
                     Some(fh) => {
@@ -4407,10 +4570,13 @@ impl Render {
                         .map(|p| {
                             // the core's case serialization carries the
                             // operand quotes on literal patterns
-                            // (`"hello"`); strip them before globbing
+                            // (`"hello"` / `''`); strip them before globbing
                             let p = p
                                 .strip_prefix('"')
                                 .and_then(|s| s.strip_suffix('"'))
+                                .or_else(|| {
+                                    p.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))
+                                })
                                 .unwrap_or(p);
                             // `*` default clause → match everything
                             glob_to_regex(p, true)
@@ -5025,6 +5191,32 @@ fn strip_leading_tabs(s: &str) -> String {
 
 /// Count the `%` conversion specifiers in a bash printf format (`%%` is a
 /// literal percent, not a specifier).
+/// `$(( $1 + ... ))` with positional refs: bash SYNTAX-ERRORS when a
+/// positional is unset (an empty operand) and prints NOTHING — perl
+/// would compute with 0. Returns the defined() guard for the referenced
+/// positionals, or None when no positional is referenced.
+fn arith_pos_guard(s: &str) -> Option<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut refs: Vec<usize> = Vec::new();
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '$' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+            let d = chars[i + 1].to_digit(10).unwrap_or(1);
+            refs.push(d as usize - 1);
+        }
+    }
+    if refs.is_empty() {
+        return None;
+    }
+    refs.sort();
+    refs.dedup();
+    Some(
+        refs.iter()
+            .map(|n| format!("defined($ARGV[{n}])"))
+            .collect::<Vec<_>>()
+            .join(" && "),
+    )
+}
+
 fn count_format_specs(s: &str) -> usize {
     let chars: Vec<char> = s.chars().collect();
     let mut n = 0;
@@ -5278,6 +5470,43 @@ fn sub_key_expr(key: &str) -> IrExpr {
                 };
             }
             IrExpr::Str(key.to_string(), StrStyle::DoubleQuoted)
+        } else if kname.contains(',') {
+            // `$i,$j` — a COMPOSITE assoc subscript (`matrix[$i,$j]`):
+            // interpolate each `$ref`, commas stay literal
+            let mut parts: Vec<InterpPart> = Vec::new();
+            let mut lit = String::new();
+            let mut rest = kname;
+            let name_end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            parts.push(InterpPart::Expr(Box::new(IrExpr::Var(
+                rest[..name_end].to_string(),
+                None,
+            ))));
+            rest = &rest[name_end..];
+            while !rest.is_empty() {
+                if let Some(p) = rest.find('$') {
+                    lit.push_str(&rest[..p]);
+                    let ne = rest[p + 1..]
+                        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .unwrap_or(rest[p + 1..].len());
+                    if !lit.is_empty() {
+                        parts.push(InterpPart::Lit(std::mem::take(&mut lit)));
+                    }
+                    parts.push(InterpPart::Expr(Box::new(IrExpr::Var(
+                        rest[p + 1..p + 1 + ne].to_string(),
+                        None,
+                    ))));
+                    rest = &rest[p + 1 + ne..];
+                } else {
+                    lit.push_str(rest);
+                    rest = "";
+                }
+            }
+            if !lit.is_empty() {
+                parts.push(InterpPart::Lit(lit));
+            }
+            IrExpr::Interpolate(parts)
         } else {
             IrExpr::Str(key.to_string(), StrStyle::DoubleQuoted)
         }
