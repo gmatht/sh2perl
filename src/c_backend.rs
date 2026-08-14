@@ -288,6 +288,23 @@ impl Render {
             "snprintf", "printf", "fprintf", "fputs", "puts", "fopen", "fclose",
             "malloc", "realloc", "free", "atoi", "atol", "atoll", "atof", "abort",
             "exit", "assert", "regexec", "regcomp", "fnmatch", "getline", "signal",
+            // _GNU_SOURCE additionally exposes these from string.h/libgen.h
+            "basename", "dirname", "strcasecmp", "strncasecmp", "strdup", "strndup",
+            "strtok", "strtok_r", "strsep", "memmove", "memcmp", "memset", "strchr",
+            "strrchr", "strstr", "strcat", "strncat", "strtod", "strtol", "strtoll",
+            "strtoul", "strtoull", "qsort", "bsearch", "abs", "labs", "llabs", "getline",
+            "rewind", "fflush", "feof", "ferror", "clearerr", "remove", "rename",
+            "tmpfile", "tmpnam", "setvbuf", "perror", "sprintf", "vsnprintf",
+            "vprintf", "vfprintf", "fdopen", "fileno", "popen", "pclose", "system",
+            "chmod", "chown", "link", "unlink", "symlink", "readlink", "realpath",
+            "mkstemp", "mkdtemp", "umask", "dup", "dup2", "pipe", "close", "open",
+            "creat", "lseek", "pread", "pwrite", "gethostname", "uname", "getcwd",
+            "putenv", "clearenv", "setenv", "unsetenv", "getopt", "optarg", "optind",
+            "isalpha", "isdigit", "isalnum", "isspace", "isupper", "islower", "isprint",
+            "iscntrl", "ispunct", "isxdigit", "isgraph", "getchar", "putchar", "gets",
+            "fgets", "fread", "fwrite", "fscanf", "sscanf", "strftime", "localtime",
+            "gmtime", "ctime", "asctime", "difftime", "mktime", "clock", "time",
+            "nanosleep", "usleep", "alarm", "pause", "kill", "raise", "sigaction",
         ];
         if C_KEYWORDS.contains(&name) {
             format!("{name}_")
@@ -409,6 +426,11 @@ impl Render {
 
     /// Emit the runtime preamble pieces the renderer has flagged.
     fn emit_runtime(&mut self) {
+        if self.need_fnmatch || self.need_regex {
+            // FNM_EXTMATCH (extglobs) and REG_ICASE live behind
+            // _GNU_SOURCE — must precede EVERY system include
+            self.emit("#define _GNU_SOURCE");
+        }
         self.emit("#include <stdio.h>");
         self.emit("#include <stdlib.h>");
         self.emit("#include <string.h>");
@@ -1501,6 +1523,23 @@ impl Render {
             CmdBuf::Shared => r.emit(&format!("_sh_word({v});")),
             CmdBuf::Private(id) => r.emit(&format!("_sh_bword(&_c{id}_cmd, &_c{id}_cap, {v});")),
         };
+        // a glob-marked literal (`\x01SH2GLOB\x01*.txt`) is an UNQUOTED
+        // glob pattern: emit it RAW (stripped) so the child bash
+        // expands it against the filesystem — quoting it would keep it
+        // literal (bash `ls \"$x\"` semantics are for quoted refs)
+        if let IrExpr::Str(s, _) = e {
+            if s.starts_with("\u{1}SH2GLOB\u{1}") {
+                let raw = strip_glob(s).to_string();
+                match buf {
+                    CmdBuf::Shared => self.emit(&format!("_sh_addraw({});", Self::cstr(&raw))),
+                    CmdBuf::Private(id) => self.emit(&format!(
+                        "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                        Self::cstr(&format!(" {raw}"))
+                    )),
+                }
+                return;
+            }
+        }
         match e {
             IrExpr::Str(s, _) => word(self, Self::cstr(s)),
             IrExpr::Int(i) => word(self, format!("\"{i}\"")),
@@ -2023,7 +2062,9 @@ impl Render {
                     self.sh_stage_expr(buf, discriminant);
                     self.sh_raw(buf, "in");
                     for cl in clauses {
-                        let pats = cl.patterns.join("|");
+                        let pats: Vec<String> =
+                            cl.patterns.iter().map(|p| strip_glob(p).to_string()).collect();
+                        let pats = pats.join("|");
                         self.sh_raw(buf, &format!("{pats})"));
                         self.sh_stage(buf, &cl.body);
                         self.sh_raw(buf, ";;");
@@ -3298,31 +3339,41 @@ impl Render {
                     || raw_r.contains('?');
                 if has_glob {
                     // `[[ x == pattern ]]` — glob match (fnmatch);
-                    // `!(...)` extglob approximated (negated fnmatch)
+                    // extglobs (`!(a)`, `@(a|b)`, `+(a)`, ...) use
+                    // glibc's FNM_EXTMATCH (native semantics — the
+                    // old negated-fnmatch approximation was wrong)
                     self.need_fnmatch = true;
                     let neg = op == "!=";
                     let pat = if neg { raw_r.clone() } else { raw_r.clone() };
-                    if let Some(inner) = pat.strip_prefix("!(") {
-                        if let Some(rest) = inner.split_once(')') {
-                            let inner_pat = format!("{}{}", rest.0, rest.1);
-                            let flags = if self.nocasematch { ", FNM_CASEFOLD" } else { "" };
-                            let m = format!("fnmatch({}, {l}, 0{flags}) == 0", Self::cstr(&inner_pat));
-                            return if neg {
-                                format!("(!{m})")
-                            } else {
-                                format!("({m})")
-                            };
-                        }
-                    }
-                    let flags = if self.nocasematch { ", FNM_CASEFOLD" } else { "" };
-                    let m = format!("fnmatch({}, {l}, 0{flags}) == 0", Self::cstr(&pat));
+                    let ext = pat.contains("!(")
+                        || pat.contains("@(")
+                        || pat.contains("+(")
+                        || pat.contains("*(")
+                        || pat.contains("?(");
+                    let flags = if ext { " | FNM_EXTMATCH" } else { "" };
+                    let flags = if self.nocasematch {
+                        format!("{flags} | FNM_CASEFOLD")
+                    } else {
+                        flags.to_string()
+                    };
+                    let m = format!("fnmatch({}, {l}, 0{flags}) == 0", Self::cstr(strip_glob(&pat)));
                     if neg {
                         format!("(!{m})")
                     } else {
                         m
                     }
                 } else if op == "!=" {
-                    format!("(strcmp({l}, {r}) != 0)")
+                    if self.nocasematch {
+                        // shopt -s nocasematch: == compares are
+                        // case-insensitive
+                        self.need_fnmatch = true;
+                        format!("(fnmatch({}, {l}, FNM_CASEFOLD) != 0)", Self::cstr(&raw_r))
+                    } else {
+                        format!("(strcmp({l}, {r}) != 0)")
+                    }
+                } else if self.nocasematch {
+                    self.need_fnmatch = true;
+                    format!("(fnmatch({}, {l}, FNM_CASEFOLD) == 0)", Self::cstr(&raw_r))
                 } else {
                     format!("(strcmp({l}, {r}) == 0)")
                 }
@@ -3340,13 +3391,10 @@ impl Render {
             }
             "=~" => {
                 self.need_regex = true;
-                let t = format!("_s{}", self.temp_seq);
-                self.temp_seq += 1;
-                self.emit(&format!("char {t}[1024];"));
-                self.emit(&format!(
-                    "snprintf({t}, sizeof {t}, \"^(?:%s)$\", {r});"
-                ));
-                format!("_sh_regex_match({l}, {t})")
+                // bash `=~` is UNANCHORED (a match anywhere in the
+                // string); the pattern carries its own `^`/`$` when the
+                // script anchored it — no wrapping
+                format!("_sh_regex_match({l}, {r})")
             }
             _ => {
                 self.mark_todo(&format!("test op {op}"));
@@ -3598,7 +3646,7 @@ impl Render {
                 let greedy = if op.starts_with("##") { "1" } else { "0" };
                 self.emit(&format!(
                     "_sh_strippre({t}, sizeof {t}, {var_expr}, {}, {greedy});",
-                    Self::cstr(&pat)
+                    Self::cstr(strip_glob(&pat))
                 ));
                 t
             }
@@ -3610,7 +3658,7 @@ impl Render {
                 let greedy = if op.starts_with("%%") { "1" } else { "0" };
                 self.emit(&format!(
                     "_sh_stripsuf({t}, sizeof {t}, {var_expr}, {}, {greedy});",
-                    Self::cstr(&pat)
+                    Self::cstr(strip_glob(&pat))
                 ));
                 t
             }
@@ -3620,7 +3668,7 @@ impl Render {
                 let t = self.str_temp(4096);
                 self.emit(&format!(
                     "_sh_replace({t}, sizeof {t}, {var_expr}, {}, {repl});",
-                    Self::cstr(&pat)
+                    Self::cstr(strip_glob(&pat))
                 ));
                 t
             }
@@ -3900,6 +3948,12 @@ impl Render {
                 if s.contains("nocasematch") && s.contains("-s") {
                     self.nocasematch = true;
                 }
+                // Bool form: shopt("nocasematch", true)
+                if let Some(IrExpr::Bool(b)) = args.get(1) {
+                    if s.contains("nocasematch") && *b {
+                        self.nocasematch = true;
+                    }
+                }
                 self.need_sh = true;
                 self.need_fnmatch = true;
                 "(_sh_rc = 0, 1)".into()
@@ -4062,7 +4116,7 @@ impl Render {
                 };
                 format!(
                     "_sh_grep_matches({text}, {}, {})",
-                    Self::cstr(&pat),
+                    Self::cstr(strip_glob(&pat)),
                     Self::cstr(&flags)
                 )
             }
@@ -5112,6 +5166,57 @@ impl Render {
                         }
                     }
                 }
+                // `for f in *.txt` / `for f in *.{t,l}.x` — the items
+                // are glob PATTERNS; bash expands them against the
+                // filesystem at runtime, so the loop runs a child-bash
+                // glob (`printf '%s\n' <raw patterns>` — with no match
+                // the literal pattern stays, exactly like bash's
+                // nullglob-off default).
+                let has_glob = items.iter().any(|it| {
+                    matches!(it, IrExpr::Str(s, _)
+                        if s.contains('*') || s.contains('?') || s.contains('['))
+                });
+                if has_glob {
+                    let items = items.clone();
+                    let cap = self.cap_site(|r, id| {
+                        r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
+                        r.emit(&format!(
+                            "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                            Self::cstr("printf '%s\\n'")
+                        ));
+                        for it in &items {
+                            if let IrExpr::Str(s, _) = it {
+                                // RAW (unquoted) — the child globs it
+                                r.emit(&format!(
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                    Self::cstr(&format!(" {}", strip_glob(s)))
+                                ));
+                            }
+                        }
+                        r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
+                        r.emit("return buf;");
+                    });
+                    self.need_sh = true;
+                    let wn = format!("_wn_{}", self.temp_seq);
+                    self.temp_seq += 1;
+                    let ws = format!("_ws_{}", self.temp_seq);
+                    self.temp_seq += 1;
+                    self.emit(&format!(
+                        "char *{wn} = {cap}; char *{ws}[1024]; size_t _wc_{wn} = _sh_split({wn}, {ws}, 1024);"
+                    ));
+                    let var_name = self.c_ident(var);
+                    self.emit(&format!(
+                        "for (size_t _wi_{wn} = 0; _wi_{wn} < _wc_{wn}; _wi_{wn}++) {{"
+                    ));
+                    self.depth += 1;
+                    self.emit(&format!("{var_name} = {ws}[_wi_{wn}];"));
+                    for s in body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                    return;
+                }
                 // `for a in "$@"` / `$*` — the argv loop
                 if items.len() == 1 {
                     if let IrExpr::Call { func, args } = &items[0] {
@@ -5478,8 +5583,8 @@ impl Render {
                     for pat in &cl.patterns {
                         let kw = if first { "if" } else { "else if" };
                         first = false;
-                        let flags = if self.nocasematch { ", FNM_CASEFOLD" } else { "" };
-                        let pat_c = Self::cstr(pat);
+                        let flags = if self.nocasematch { " | FNM_CASEFOLD" } else { "" };
+                        let pat_c = Self::cstr(strip_glob(pat));
                         self.emit(&format!(
                             "{kw} (fnmatch({pat_c}, {d}, 0{flags}) == 0) {{"
                         ));
@@ -7282,6 +7387,13 @@ fn collect_vars_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
 /// A plain C identifier (a mangled var name or a string-literal-less
 /// expression is NOT — used to decide whether an RHS is a string value
 /// that may be length-asserted before a guarded copy).
+/// The core wraps unquoted glob patterns in a `\x01SH2GLOB\x01` marker
+/// (shir.rs GLOB_MAGIC) to distinguish literal text from a glob; the C
+/// renderer strips it before emitting the pattern anywhere.
+fn strip_glob(s: &str) -> &str {
+    s.strip_prefix("\u{1}SH2GLOB\u{1}").unwrap_or(s)
+}
+
 fn is_ident(s: &str) -> bool {
     !s.is_empty()
         && (s.chars().next().unwrap().is_ascii_alphabetic() || s.chars().next().unwrap() == '_')
@@ -7777,14 +7889,21 @@ fn brace_group_items(entry: &serde_json::Value) -> Vec<String> {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(1);
         if let (Ok(na), Ok(nb)) = (a.parse::<i64>(), b.parse::<i64>()) {
-            // numeric range with zero-padding to the wider operand
-            let width = a.len().max(b.len());
+            // zero-padding follows bash: only when the FIRST operand has
+            // a leading zero; the width is the FIRST operand's width
+            // (`{1..10..2}` stays unpadded, `{00..04..2}` pads to 2)
+            let pad: Option<usize> = if a.len() > 1 && a.starts_with('0') {
+                Some(a.len())
+            } else {
+                None
+            };
             let pad = |n: i64| -> String {
                 let s = n.to_string();
-                if s.len() < width {
-                    format!("{}{}", "0".repeat(width - s.len()), s)
-                } else {
-                    s
+                match pad {
+                    Some(width) if s.len() < width => {
+                        format!("{}{}", "0".repeat(width - s.len()), s)
+                    }
+                    _ => s,
                 }
             };
             let mut out = Vec::new();
@@ -7839,6 +7958,7 @@ fn brace_expand(args: &[IrExpr]) -> Vec<String> {
             IrExpr::Str(s, _) => Some(s.clone()),
             _ => None,
         })
+        .map(|s| strip_glob(&s).to_string())
         .unwrap_or_default();
     let suffix = args
         .get(3)
@@ -7846,6 +7966,7 @@ fn brace_expand(args: &[IrExpr]) -> Vec<String> {
             IrExpr::Str(s, _) => Some(s.clone()),
             _ => None,
         })
+        .map(|s| strip_glob(&s).to_string())
         .unwrap_or_default();
     let Some(v) = brace_json_arg(args) else {
         return vec![format!("{prefix}{suffix}")];
