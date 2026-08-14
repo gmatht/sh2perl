@@ -71,9 +71,7 @@ impl super::Analysis for ConstVar {
         "const_var"
     }
     fn run(&self, prog: &IrProgram, ctx: &mut PassContext) {
-        ctx.const_vars = crate::shir::analyze_var_const(prog)
-            .into_iter()
-            .collect();
+        ctx.const_vars = crate::shir::analyze_var_const(prog).into_iter().collect();
     }
 }
 
@@ -197,6 +195,8 @@ mod tests {
 
     fn empty_prog() -> IrProgram {
         IrProgram {
+            var_nospace: vec![],
+            var_bash_env: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![],
@@ -283,6 +283,8 @@ mod tests {
         // `x=5` once, straight-line → Const; `y` reassigned → Var;
         // `z` written by a loop body → Var (multi-run site).
         let prog = IrProgram {
+            var_nospace: vec![],
+            var_bash_env: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![
@@ -293,6 +295,7 @@ mod tests {
                         indices: vec![],
                     }],
                     expr: IrExpr::Int(5),
+                    asm: None,
                 },
                 IrStmt::Assign {
                     targets: vec![crate::ir::AssignTarget {
@@ -301,6 +304,7 @@ mod tests {
                         indices: vec![],
                     }],
                     expr: IrExpr::Int(1),
+                    asm: None,
                 },
                 IrStmt::Assign {
                     targets: vec![crate::ir::AssignTarget {
@@ -309,6 +313,7 @@ mod tests {
                         indices: vec![],
                     }],
                     expr: IrExpr::Int(2),
+                    asm: None,
                 },
                 IrStmt::While {
                     cond: IrExpr::Call {
@@ -322,6 +327,7 @@ mod tests {
                             indices: vec![],
                         }],
                         expr: IrExpr::Int(0),
+                        asm: None,
                     }],
                 },
             ],

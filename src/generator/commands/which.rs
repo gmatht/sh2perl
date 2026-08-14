@@ -17,8 +17,5 @@ pub fn generate_which_command(generator: &mut Generator, cmd: &SimpleCommand) ->
     } else {
         format!("join(\"\\n\", {})", results.join(", "))
     };
-    format!(
-        "print {}, \"\\n\";\n$CHILD_ERROR = 0;\n",
-        joined
-    )
+    format!("print {}, \"\\n\";\n$CHILD_ERROR = 0;\n", joined)
 }

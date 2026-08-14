@@ -116,7 +116,10 @@ pub fn batch_ok(st: &IrStmt) -> bool {
 pub fn stats() -> (usize, usize) {
     let s = SYNC_OK_LOOPS.lock().unwrap();
     let b = BATCH_OK_LOOPS.lock().unwrap();
-    (s.as_ref().map(|x| x.len()).unwrap_or(0), b.as_ref().map(|x| x.len()).unwrap_or(0))
+    (
+        s.as_ref().map(|x| x.len()).unwrap_or(0),
+        b.as_ref().map(|x| x.len()).unwrap_or(0),
+    )
 }
 
 /// The transform entry: walk the whole tree (stmts + exprs), compute the
@@ -176,7 +179,13 @@ fn walk(st: &IrStmt, sync_ok: &mut HashSet<usize>, batch_ok: &mut HashSet<usize>
                 _ => {}
             }
         }
-        IrStmt::If { cond, then, elsifs, else_, .. } => {
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
             walk_expr(cond, sync_ok, batch_ok);
             for b in then.iter().chain(else_) {
                 walk(b, sync_ok, batch_ok);
@@ -195,7 +204,9 @@ fn walk(st: &IrStmt, sync_ok: &mut HashSet<usize>, batch_ok: &mut HashSet<usize>
                 walk(s, sync_ok, batch_ok);
             }
         }
-        IrStmt::Redirect { inner, redirects, .. } => {
+        IrStmt::Redirect {
+            inner, redirects, ..
+        } => {
             for s in inner {
                 walk(s, sync_ok, batch_ok);
             }
@@ -236,10 +247,14 @@ fn walk(st: &IrStmt, sync_ok: &mut HashSet<usize>, batch_ok: &mut HashSet<usize>
             walk_expr(path, sync_ok, batch_ok);
             walk_expr(content, sync_ok, batch_ok);
         }
-        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => {
-            walk_expr(expr, sync_ok, batch_ok)
-        }
-        IrStmt::Exec { cmd, args, redirects, env, .. } => {
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => walk_expr(expr, sync_ok, batch_ok),
+        IrStmt::Exec {
+            cmd,
+            args,
+            redirects,
+            env,
+            ..
+        } => {
             walk_expr(cmd, sync_ok, batch_ok);
             for a in args {
                 walk_expr(a, sync_ok, batch_ok);
@@ -251,7 +266,11 @@ fn walk(st: &IrStmt, sync_ok: &mut HashSet<usize>, batch_ok: &mut HashSet<usize>
                 walk_expr(v, sync_ok, batch_ok);
             }
         }
-        IrStmt::Case { discriminant, clauses, .. } => {
+        IrStmt::Case {
+            discriminant,
+            clauses,
+            ..
+        } => {
             walk_expr(discriminant, sync_ok, batch_ok);
             for c in clauses {
                 for s in &c.body {
@@ -326,7 +345,12 @@ fn body_output_free(st: &IrStmt) -> bool {
         IrStmt::For { body, .. } | IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
             body.iter().all(body_output_free)
         }
-        IrStmt::If { then, elsifs, else_, .. } => {
+        IrStmt::If {
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
             then.iter().chain(else_).all(body_output_free)
                 && elsifs.iter().all(|(_, b)| b.iter().all(body_output_free))
         }
@@ -391,21 +415,19 @@ fn static_trip_count(iter: &IrExpr) -> Option<u64> {
 /// whose args[1] is the range `Json([[{range:[start,end,null,null]}]])`.
 fn brace_count(e: &IrExpr) -> Option<u64> {
     match e {
-        IrExpr::Call { func, args, .. } if func == "brace" && args.len() >= 2 => {
-            match &args[1] {
-                IrExpr::Json(serde_json::Value::Array(groups)) => {
-                    let range = groups.first()?.as_array()?.first()?.get("range")?;
-                    let start: i64 = range.as_array()?.first()?.as_str()?.parse().ok()?;
-                    let end: i64 = range.as_array()?.get(1)?.as_str()?.parse().ok()?;
-                    if end >= start {
-                        Some((end - start + 1) as u64)
-                    } else {
-                        Some(0)
-                    }
+        IrExpr::Call { func, args, .. } if func == "brace" && args.len() >= 2 => match &args[1] {
+            IrExpr::Json(serde_json::Value::Array(groups)) => {
+                let range = groups.first()?.as_array()?.first()?.get("range")?;
+                let start: i64 = range.as_array()?.first()?.as_str()?.parse().ok()?;
+                let end: i64 = range.as_array()?.get(1)?.as_str()?.parse().ok()?;
+                if end >= start {
+                    Some((end - start + 1) as u64)
+                } else {
+                    Some(0)
                 }
-                _ => None,
             }
-        }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -459,7 +481,12 @@ fn iter_cost(st: &IrStmt) -> Option<u64> {
             // trip count is not the outer's) → not cheap by composition
             None
         }
-        IrStmt::If { then, elsifs, else_, .. } => {
+        IrStmt::If {
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
             let mut c = 0u64;
             for b in then.iter().chain(else_) {
                 c += iter_cost(b)?;
@@ -525,7 +552,12 @@ fn batch_body_stmt(st: &IrStmt) -> bool {
         IrStmt::For { body, .. } | IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
             body.iter().all(batch_body_stmt)
         }
-        IrStmt::If { then, elsifs, else_, .. } => {
+        IrStmt::If {
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
             then.iter().chain(else_).all(batch_body_stmt)
                 && elsifs.iter().all(|(_, b)| b.iter().all(batch_body_stmt))
         }
@@ -533,15 +565,14 @@ fn batch_body_stmt(st: &IrStmt) -> bool {
         IrStmt::Assign { .. } | IrStmt::Declare { .. } | IrStmt::DeclareArray { .. } => true,
         IrStmt::Output { value, .. } => expr_pure(value),
         IrStmt::Expr(e) => match exec_cmd_name(st) {
-            Some(name) => {
-                !SIGNAL_OR_BLOCKING.contains(&name) && sync_builtin(name)
-            }
+            Some(name) => !SIGNAL_OR_BLOCKING.contains(&name) && sync_builtin(name),
             None => expr_pure(e),
         },
         // the neutral Exec form
-        IrStmt::Exec { cmd: IrExpr::Str(name, _), .. } => {
-            !SIGNAL_OR_BLOCKING.contains(&name.as_str()) && sync_builtin(name)
-        }
+        IrStmt::Exec {
+            cmd: IrExpr::Str(name, _),
+            ..
+        } => !SIGNAL_OR_BLOCKING.contains(&name.as_str()) && sync_builtin(name),
         _ => false,
     }
 }
@@ -552,7 +583,10 @@ fn batch_body_stmt(st: &IrStmt) -> bool {
 /// (what `ast_to_ir` actually emits for simple commands).
 fn exec_cmd_name(st: &IrStmt) -> Option<&str> {
     match st {
-        IrStmt::Exec { cmd: IrExpr::Str(name, _), .. } => Some(name),
+        IrStmt::Exec {
+            cmd: IrExpr::Str(name, _),
+            ..
+        } => Some(name),
         IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "exec" => match args.first() {
             Some(IrExpr::Str(name, _)) => Some(name),
             _ => None,
@@ -564,17 +598,55 @@ fn exec_cmd_name(st: &IrStmt) -> Option<&str> {
 /// Builtins that must disqualify a batch body: signals (break/continue/
 /// return need the async signal delivery), blocking I/O (read/wait/sleep
 /// would freeze a whole chunk), and eval/exit (unknown/process-level).
-const SIGNAL_OR_BLOCKING: &[&str] =
-    &["break", "continue", "return", "read", "wait", "sleep", "eval", "exit", "exec"];
+const SIGNAL_OR_BLOCKING: &[&str] = &[
+    "break", "continue", "return", "read", "wait", "sleep", "eval", "exit", "exec",
+];
 
 fn sync_builtin(name: &str) -> bool {
     // mirrors crate::shir::SYNC_BUILTINS (the runtime's in-process
     // builtins); local copy so this module stays self-contained.
     const SYNC: &[&str] = &[
-        ".", ":", "basename", "cat", "cd", "cmp", "comm", "cut", "declare", "dirname", "echo",
-        "export", "false", "grep", "head", "let", "local", "mapfile", "mktemp", "printf", "pwd",
-        "readarray", "readonly", "seq", "sed", "set", "shift", "sort", "source", "stat", "tail",
-        "test", "touch", "tr", "trap", "true", "type", "typeset", "uniq", "unset", "wc",
+        ".",
+        ":",
+        "basename",
+        "cat",
+        "cd",
+        "cmp",
+        "comm",
+        "cut",
+        "declare",
+        "dirname",
+        "echo",
+        "export",
+        "false",
+        "grep",
+        "head",
+        "let",
+        "local",
+        "mapfile",
+        "mktemp",
+        "printf",
+        "pwd",
+        "readarray",
+        "readonly",
+        "seq",
+        "sed",
+        "set",
+        "shift",
+        "sort",
+        "source",
+        "stat",
+        "tail",
+        "test",
+        "touch",
+        "tr",
+        "trap",
+        "true",
+        "type",
+        "typeset",
+        "uniq",
+        "unset",
+        "wc",
     ];
     SYNC.contains(&name)
 }
@@ -595,9 +667,7 @@ fn expr_pure(e: &IrExpr) -> bool {
         IrExpr::Ternary { cond, then, else_ } => {
             expr_pure(cond) && expr_pure(then) && expr_pure(else_)
         }
-        IrExpr::DefinedOr { expr, default } => {
-            expr_pure(expr) && expr_pure(default)
-        }
+        IrExpr::DefinedOr { expr, default } => expr_pure(expr) && expr_pure(default),
         IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
             crate::ir::InterpPart::Lit(_) => true,
             crate::ir::InterpPart::Expr(e) => expr_pure(e),

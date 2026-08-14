@@ -86,7 +86,9 @@ fn expansion_into_parts(expansion: Word) -> Option<Vec<StringPart>> {
         Word::MapAccess(name, key, _) => Some(vec![StringPart::MapAccess(name, key)]),
         Word::MapKeys(name, _) => Some(vec![StringPart::MapKeys(name)]),
         Word::MapLength(name, _) => Some(vec![StringPart::MapLength(name)]),
-        Word::ArraySlice(name, offset, len, _) => Some(vec![StringPart::ArraySlice(name, offset, len)]),
+        Word::ArraySlice(name, offset, len, _) => {
+            Some(vec![StringPart::ArraySlice(name, offset, len)])
+        }
         Word::Arithmetic(a, _) => Some(vec![StringPart::Arithmetic(a)]),
         Word::CommandSubstitution(c, _) => Some(vec![StringPart::CommandSubstitution(c)]),
         Word::StringInterpolation(interp, _) => Some(interp.parts),
@@ -191,7 +193,11 @@ fn merge_contiguous_quoted_fragments(
                                         s.push_str(t);
                                     }
                                 }
-                                if s.is_empty() { None } else { Some(s) }
+                                if s.is_empty() {
+                                    None
+                                } else {
+                                    Some(s)
+                                }
                             }
                             _ => None,
                         };
@@ -287,17 +293,32 @@ fn merge_contiguous_quoted_fragments(
             // `'a'-suffix`. Same token set the combine loop treats as
             // word-continuation characters (dead in branch A — the loop already
             // consumed them; live for branch B results).
-            Some(Token::Identifier) | Some(Token::Number) | Some(Token::Float)
-            | Some(Token::PaddedNumber) | Some(Token::HexNumber)
-            | Some(Token::Slash) | Some(Token::Dot) | Some(Token::Range)
-            | Some(Token::Plus) | Some(Token::Minus) | Some(Token::Colon)
-            | Some(Token::Star) | Some(Token::Percent) | Some(Token::Comma)
-            | Some(Token::Question) | Some(Token::BraceClose)
-            | Some(Token::TestBracket) | Some(Token::TestBracketClose)
-            | Some(Token::Equality) | Some(Token::Caret)
-            | Some(Token::PlusAssign) | Some(Token::MinusAssign)
-            | Some(Token::StarAssign) | Some(Token::SlashAssign)
-            | Some(Token::PercentAssign) | Some(Token::Assign) => {
+            Some(Token::Identifier)
+            | Some(Token::Number)
+            | Some(Token::Float)
+            | Some(Token::PaddedNumber)
+            | Some(Token::HexNumber)
+            | Some(Token::Slash)
+            | Some(Token::Dot)
+            | Some(Token::Range)
+            | Some(Token::Plus)
+            | Some(Token::Minus)
+            | Some(Token::Colon)
+            | Some(Token::Star)
+            | Some(Token::Percent)
+            | Some(Token::Comma)
+            | Some(Token::Question)
+            | Some(Token::BraceClose)
+            | Some(Token::TestBracket)
+            | Some(Token::TestBracketClose)
+            | Some(Token::Equality)
+            | Some(Token::Caret)
+            | Some(Token::PlusAssign)
+            | Some(Token::MinusAssign)
+            | Some(Token::StarAssign)
+            | Some(Token::SlashAssign)
+            | Some(Token::PercentAssign)
+            | Some(Token::Assign) => {
                 if !append_raw_token_text(lexer, word)? {
                     break;
                 }
@@ -324,7 +345,50 @@ fn strip_outer_quotes(text: &str) -> String {
     }
 }
 
+/// CRLF line endings (Windows-style scripts): bash treats `\r` as a
+/// LITERAL word character — a CR at the end of a line JOINS the last word
+/// (`echo "hello world"\r\n` prints `hello world\r`); it is not a line
+/// terminator. The lexer emits a CarriageReturn token that the parser
+/// otherwise treats as a line separator; when one directly follows a word
+/// (no whitespace between), append its text to the word so the emitted
+/// string matches bash byte-for-byte (crlf-line-endings.sh,
+/// parse-crlf-shebang.sh). A CR after whitespace/comments or in other
+/// positions keeps its line-separator treatment.
+fn append_adjacent_cr(lexer: &mut Lexer, mut word: Word) -> Result<Word, ParserError> {
+    if !matches!(lexer.peek(), Some(Token::CarriageReturn)) {
+        return Ok(word);
+    }
+    // The CR is adjacent iff it starts exactly where the word's last real
+    // token ended (walk back over any inline whitespace/comments the word
+    // parser consumed after the word).
+    let mut i = lexer.current;
+    while i > 0 {
+        match lexer.tokens.get(i - 1).map(|(t, _, _)| t) {
+            Some(Token::Space | Token::Tab | Token::Comment) => i -= 1,
+            _ => break,
+        }
+    }
+    let adjacent = i > 0 && lexer.tokens[i - 1].2 == lexer.tokens[lexer.current].1;
+    if !adjacent {
+        return Ok(word);
+    }
+    let text = lexer.get_string_text()?; // consume the CR token ("\r")
+    match &mut word {
+        Word::Literal(s, _) => s.push_str(&text),
+        Word::StringInterpolation(interp, _) => {
+            interp.parts.push(StringPart::Literal(text));
+        }
+        _ => {}
+    }
+    Ok(word)
+}
+
 pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    let w = parse_word_inner(lexer)?;
+    append_adjacent_cr(lexer, w)
+}
+
+fn parse_word_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Handle backtick command substitution first
     if matches!(lexer.peek(), Some(Token::BacktickChar)) {
         if crate::debug::is_debug_enabled() {
@@ -468,8 +532,8 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
             | Some(Token::While) | Some(Token::Until) | Some(Token::For)
             | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-            | Some(Token::Select) | Some(Token::Function)
-        ) {
+            | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
+    ) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
@@ -557,7 +621,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
                 | Some(Token::While) | Some(Token::Until) | Some(Token::For)
                 | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-                | Some(Token::Select) | Some(Token::Function)
+                | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
                 => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that
@@ -603,20 +667,34 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 let mut suffix = String::new();
                 while let Some(tok) = lexer.peek() {
                     match tok {
-                        Token::Identifier | Token::Number | Token::Float
-                        | Token::PaddedNumber | Token::HexNumber
-                        | Token::Slash | Token::Dot | Token::Range
-                        | Token::Plus | Token::Minus | Token::Escape
-                        | Token::Colon | Token::Star | Token::Percent
-                        | Token::Comma | Token::Question | Token::BraceClose
-                        | Token::TestBracket | Token::TestBracketClose
-                        | Token::Assign | Token::Dollar => {
+                        Token::Identifier
+                        | Token::Number
+                        | Token::Float
+                        | Token::PaddedNumber
+                        | Token::HexNumber
+                        | Token::Slash
+                        | Token::Dot
+                        | Token::Range
+                        | Token::Plus
+                        | Token::Minus
+                        | Token::Escape
+                        | Token::Colon
+                        | Token::Star
+                        | Token::Percent
+                        | Token::Comma
+                        | Token::Question
+                        | Token::BraceClose
+                        | Token::TestBracket
+                        | Token::TestBracketClose
+                        | Token::Assign
+                        | Token::Dollar => {
                             // Stop at Dollar if followed by a variable name
                             // (that would be a new variable expansion)
                             if matches!(tok, Token::Dollar) {
-                                let is_var_ref = lexer.peek_n(1).map(|t| {
-                                    matches!(t, Token::Identifier | Token::Number)
-                                }).unwrap_or(false);
+                                let is_var_ref = lexer
+                                    .peek_n(1)
+                                    .map(|t| matches!(t, Token::Identifier | Token::Number))
+                                    .unwrap_or(false);
                                 if is_var_ref {
                                     break;
                                 }
@@ -673,8 +751,16 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 Ok(parse_string_interpolation(&mut sub_lexer)?)
             } else {
                 // Fallback: return the content as a literal
-                let inner = if whole.len() >= 2 && whole.as_bytes()[0] == b'"' { &whole[1..] } else { &whole };
-                let inner = if inner.ends_with('"') { &inner[..inner.len()-1] } else { inner };
+                let inner = if whole.len() >= 2 && whole.as_bytes()[0] == b'"' {
+                    &whole[1..]
+                } else {
+                    &whole
+                };
+                let inner = if inner.ends_with('"') {
+                    &inner[..inner.len() - 1]
+                } else {
+                    inner
+                };
                 Ok(Word::Literal(inner.to_string(), None))
             }
         }
@@ -742,19 +828,35 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 let mut suffix = String::new();
                 while let Some(tok) = lexer.peek() {
                     match tok {
-                        Token::Identifier | Token::Number | Token::Float
-                        | Token::PaddedNumber | Token::HexNumber
-                        | Token::Slash | Token::Dot | Token::Range
-                        | Token::Plus | Token::Minus | Token::Escape
-                        | Token::Colon | Token::Star | Token::Percent
-                        | Token::Comma | Token::Question | Token::BraceClose
-                        | Token::TestBracket | Token::TestBracketClose
-                        | Token::Assign | Token::Dollar => {
+                        Token::Identifier
+                        | Token::Number
+                        | Token::Float
+                        | Token::PaddedNumber
+                        | Token::HexNumber
+                        | Token::Slash
+                        | Token::Dot
+                        | Token::Range
+                        | Token::Plus
+                        | Token::Minus
+                        | Token::Escape
+                        | Token::Colon
+                        | Token::Star
+                        | Token::Percent
+                        | Token::Comma
+                        | Token::Question
+                        | Token::BraceClose
+                        | Token::TestBracket
+                        | Token::TestBracketClose
+                        | Token::Assign
+                        | Token::Dollar => {
                             if matches!(tok, Token::Dollar) {
-                                let is_var_ref = lexer.peek_n(1).map(|t| {
-                                    matches!(t, Token::Identifier | Token::Number)
-                                }).unwrap_or(false);
-                                if is_var_ref { break; }
+                                let is_var_ref = lexer
+                                    .peek_n(1)
+                                    .map(|t| matches!(t, Token::Identifier | Token::Number))
+                                    .unwrap_or(false);
+                                if is_var_ref {
+                                    break;
+                                }
                             }
                             if let Some(text) = lexer.get_current_text() {
                                 suffix.push_str(&text);
@@ -765,7 +867,9 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                                         lexer.next();
                                     }
                                 }
-                            } else { break; }
+                            } else {
+                                break;
+                            }
                         }
                         _ => break,
                     }
@@ -775,7 +879,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
             }
             Ok(be_word)
-        },
+        }
         Some(Token::Source) => {
             // Treat standalone 'source' as a normal word (e.g., `source file.sh`)
             lexer.next();
@@ -948,16 +1052,35 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         Token::DoubleQuotedString => {
                             let quoted = lexer.get_string_text()?;
                             let inner = if quoted.starts_with('"') && quoted.ends_with('"') {
-                                &quoted[1..quoted.len()-1]
+                                &quoted[1..quoted.len() - 1]
                             } else {
                                 &quoted
                             };
+                            // If the quoted value contains an expansion
+                            // (`--x="${VAR}"`), flattening it into the literal
+                            // would lose the variable reference (the generated
+                            // Perl then prints `\${VAR}` literally).  Parse the
+                            // quoted content as an interpolation word and keep
+                            // the prefix as a literal part.
+                            if inner.contains('$') {
+                                let prefix = text.clone();
+                                if let Ok(interp) =
+                                    parse_string_interpolation_from_literal(inner)
+                                {
+                                    let mut parts = vec![StringPart::Literal(prefix)];
+                                    parts.extend(interp.parts);
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
+                                }
+                            }
                             text.push_str(inner);
                         }
                         Token::SingleQuotedString => {
                             let quoted = lexer.get_string_text()?;
                             let inner = if quoted.starts_with('\'') && quoted.ends_with('\'') {
-                                &quoted[1..quoted.len()-1]
+                                &quoted[1..quoted.len() - 1]
                             } else {
                                 &quoted
                             };
@@ -970,12 +1093,28 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 // Strip quotes from value if the regex captured them as part of the token
                 // (e.g. --option="value" or --option='value')
                 if let Some(eq_pos) = text.find('=') {
-                    let value_part = &text[eq_pos+1..];
+                    let value_part = &text[eq_pos + 1..];
                     if value_part.len() >= 2 {
                         if (value_part.starts_with('"') && value_part.ends_with('"'))
                             || (value_part.starts_with('\'') && value_part.ends_with('\''))
                         {
-                            let inner = &value_part[1..value_part.len()-1];
+                            let inner = &value_part[1..value_part.len() - 1];
+                            // `--x="${X}"` — the quoted value holds an expansion;
+                            // keep it as a real interpolation so the generated
+                            // Perl substitutes $X instead of printing `\${X}`.
+                            if inner.contains('$') {
+                                if let Ok(interp) =
+                                    parse_string_interpolation_from_literal(inner)
+                                {
+                                    let mut parts =
+                                        vec![StringPart::Literal(format!("{}=", &text[..eq_pos]))];
+                                    parts.extend(interp.parts);
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
+                                }
+                            }
                             text = format!("{}={}", &text[..eq_pos], inner);
                         }
                     }
@@ -1064,9 +1203,7 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
         Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
             Ok(parse_arithmetic_expression(lexer)?)
         }
-        Some(Token::ArithmeticBracket) => {
-            Ok(parse_arithmetic_bracket(lexer)?)
-        }
+        Some(Token::ArithmeticBracket) => Ok(parse_arithmetic_bracket(lexer)?),
         Some(Token::True) => {
             // Treat standalone 'true' as a normal word (e.g., `true` or `command || true`)
             lexer.next();
@@ -1085,17 +1222,40 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
             // If we encounter a shell keyword token in argument position,
             // treat it as a literal word rather than failing.
             match token {
-                Some(Token::If) | Some(Token::Then) | Some(Token::Else) | Some(Token::Elif)
-                | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
-                | Some(Token::While) | Some(Token::Until) | Some(Token::For)
-                | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-                | Some(Token::Select) | Some(Token::Function) | Some(Token::Bang)
-                | Some(Token::Let) | Some(Token::Break) | Some(Token::Continue)
-                | Some(Token::Return) | Some(Token::Exit) | Some(Token::Shift)
-                | Some(Token::Eval) | Some(Token::Exec) | Some(Token::Source)
-                | Some(Token::Trap) | Some(Token::Wait) | Some(Token::Unset)
-                | Some(Token::Set) | Some(Token::Export) | Some(Token::Readonly)
-                | Some(Token::Declare) | Some(Token::Typeset) | Some(Token::Local) => {
+                Some(Token::If)
+                | Some(Token::Then)
+                | Some(Token::Else)
+                | Some(Token::Elif)
+                | Some(Token::Fi)
+                | Some(Token::Do)
+                | Some(Token::Done)
+                | Some(Token::While)
+                | Some(Token::Until)
+                | Some(Token::For)
+                | Some(Token::Case)
+                | Some(Token::Esac)
+                | Some(Token::In)
+                | Some(Token::Select)
+                | Some(Token::Function)
+                | Some(Token::Bang)
+                | Some(Token::Let)
+                | Some(Token::Break)
+                | Some(Token::Continue)
+                | Some(Token::Return)
+                | Some(Token::Exit)
+                | Some(Token::Shift)
+                | Some(Token::Eval)
+                | Some(Token::Exec)
+                | Some(Token::Source)
+                | Some(Token::Trap)
+                | Some(Token::Wait)
+                | Some(Token::Unset)
+                | Some(Token::Set)
+                | Some(Token::Export)
+                | Some(Token::Readonly)
+                | Some(Token::Declare)
+                | Some(Token::Typeset)
+                | Some(Token::Local) => {
                     let text = lexer.get_current_text().unwrap_or_default();
                     lexer.next();
                     Ok(Word::Literal(text, None))
@@ -1133,6 +1293,11 @@ pub fn parse_word(lexer: &mut Lexer) -> Result<Word, ParserError> {
 /// Parse a word without skipping newlines at the end.
 /// This is used specifically for argument parsing where we want to preserve newlines.
 pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError> {
+    let w = parse_word_no_newline_skip_inner(lexer)?;
+    append_adjacent_cr(lexer, w)
+}
+
+fn parse_word_no_newline_skip_inner(lexer: &mut Lexer) -> Result<Word, ParserError> {
     if let Some(word) = parse_at_prefixed_word(lexer) {
         return Ok(word);
     }
@@ -1239,8 +1404,8 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
             | Some(Token::While) | Some(Token::Until) | Some(Token::For)
             | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-            | Some(Token::Select) | Some(Token::Function)
-        ) {
+            | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
+    ) {
         let mut combined = String::new();
         loop {
             match lexer.peek() {
@@ -1335,7 +1500,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
                 | Some(Token::While) | Some(Token::Until) | Some(Token::For)
                 | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-                | Some(Token::Select) | Some(Token::Function)
+                | Some(Token::Select) | Some(Token::Function) | Some(Token::Source)
                 => {
                     // For $, check if the NEXT token is a variable name
                     // (Identifier or Number). If so, break out so that
@@ -1381,20 +1546,34 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 let mut suffix = String::new();
                 while let Some(tok) = lexer.peek() {
                     match tok {
-                        Token::Identifier | Token::Number | Token::Float
-                        | Token::PaddedNumber | Token::HexNumber
-                        | Token::Slash | Token::Dot | Token::Range
-                        | Token::Plus | Token::Minus | Token::Escape
-                        | Token::Colon | Token::Star | Token::Percent
-                        | Token::Comma | Token::Question | Token::BraceClose
-                        | Token::TestBracket | Token::TestBracketClose
-                        | Token::Assign | Token::Dollar => {
+                        Token::Identifier
+                        | Token::Number
+                        | Token::Float
+                        | Token::PaddedNumber
+                        | Token::HexNumber
+                        | Token::Slash
+                        | Token::Dot
+                        | Token::Range
+                        | Token::Plus
+                        | Token::Minus
+                        | Token::Escape
+                        | Token::Colon
+                        | Token::Star
+                        | Token::Percent
+                        | Token::Comma
+                        | Token::Question
+                        | Token::BraceClose
+                        | Token::TestBracket
+                        | Token::TestBracketClose
+                        | Token::Assign
+                        | Token::Dollar => {
                             // Stop at Dollar if followed by a variable name
                             // (that would be a new variable expansion)
                             if matches!(tok, Token::Dollar) {
-                                let is_var_ref = lexer.peek_n(1).map(|t| {
-                                    matches!(t, Token::Identifier | Token::Number)
-                                }).unwrap_or(false);
+                                let is_var_ref = lexer
+                                    .peek_n(1)
+                                    .map(|t| matches!(t, Token::Identifier | Token::Number))
+                                    .unwrap_or(false);
                                 if is_var_ref {
                                     break;
                                 }
@@ -1450,8 +1629,16 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 Ok(parse_string_interpolation(&mut sub_lexer)?)
             } else {
                 // Fallback: return the content as a literal
-                let inner = if whole.len() >= 2 && whole.as_bytes()[0] == b'"' { &whole[1..] } else { &whole };
-                let inner = if inner.ends_with('"') { &inner[..inner.len()-1] } else { inner };
+                let inner = if whole.len() >= 2 && whole.as_bytes()[0] == b'"' {
+                    &whole[1..]
+                } else {
+                    &whole
+                };
+                let inner = if inner.ends_with('"') {
+                    &inner[..inner.len() - 1]
+                } else {
+                    inner
+                };
                 Ok(Word::Literal(inner.to_string(), None))
             }
         }
@@ -1519,19 +1706,35 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 let mut suffix = String::new();
                 while let Some(tok) = lexer.peek() {
                     match tok {
-                        Token::Identifier | Token::Number | Token::Float
-                        | Token::PaddedNumber | Token::HexNumber
-                        | Token::Slash | Token::Dot | Token::Range
-                        | Token::Plus | Token::Minus | Token::Escape
-                        | Token::Colon | Token::Star | Token::Percent
-                        | Token::Comma | Token::Question | Token::BraceClose
-                        | Token::TestBracket | Token::TestBracketClose
-                        | Token::Assign | Token::Dollar => {
+                        Token::Identifier
+                        | Token::Number
+                        | Token::Float
+                        | Token::PaddedNumber
+                        | Token::HexNumber
+                        | Token::Slash
+                        | Token::Dot
+                        | Token::Range
+                        | Token::Plus
+                        | Token::Minus
+                        | Token::Escape
+                        | Token::Colon
+                        | Token::Star
+                        | Token::Percent
+                        | Token::Comma
+                        | Token::Question
+                        | Token::BraceClose
+                        | Token::TestBracket
+                        | Token::TestBracketClose
+                        | Token::Assign
+                        | Token::Dollar => {
                             if matches!(tok, Token::Dollar) {
-                                let is_var_ref = lexer.peek_n(1).map(|t| {
-                                    matches!(t, Token::Identifier | Token::Number)
-                                }).unwrap_or(false);
-                                if is_var_ref { break; }
+                                let is_var_ref = lexer
+                                    .peek_n(1)
+                                    .map(|t| matches!(t, Token::Identifier | Token::Number))
+                                    .unwrap_or(false);
+                                if is_var_ref {
+                                    break;
+                                }
                             }
                             if let Some(text) = lexer.get_current_text() {
                                 suffix.push_str(&text);
@@ -1542,7 +1745,9 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                                         lexer.next();
                                     }
                                 }
-                            } else { break; }
+                            } else {
+                                break;
+                            }
                         }
                         _ => break,
                     }
@@ -1552,7 +1757,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 }
             }
             Ok(be_word)
-        },
+        }
         Some(Token::Source) => {
             // Treat standalone 'source' as a normal word (e.g., `source file.sh`)
             lexer.next();
@@ -1727,16 +1932,35 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                         Token::DoubleQuotedString => {
                             let quoted = lexer.get_string_text()?;
                             let inner = if quoted.starts_with('"') && quoted.ends_with('"') {
-                                &quoted[1..quoted.len()-1]
+                                &quoted[1..quoted.len() - 1]
                             } else {
                                 &quoted
                             };
+                            // If the quoted value contains an expansion
+                            // (`--x="${VAR}"`), flattening it into the literal
+                            // would lose the variable reference (the generated
+                            // Perl then prints `\${VAR}` literally).  Parse the
+                            // quoted content as an interpolation word and keep
+                            // the prefix as a literal part.
+                            if inner.contains('$') {
+                                let prefix = text.clone();
+                                if let Ok(interp) =
+                                    parse_string_interpolation_from_literal(inner)
+                                {
+                                    let mut parts = vec![StringPart::Literal(prefix)];
+                                    parts.extend(interp.parts);
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
+                                }
+                            }
                             text.push_str(inner);
                         }
                         Token::SingleQuotedString => {
                             let quoted = lexer.get_string_text()?;
                             let inner = if quoted.starts_with('\'') && quoted.ends_with('\'') {
-                                &quoted[1..quoted.len()-1]
+                                &quoted[1..quoted.len() - 1]
                             } else {
                                 &quoted
                             };
@@ -1749,12 +1973,28 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
                 // Strip quotes from value if the regex captured them as part of the token
                 // (e.g. --option="value" or --option='value')
                 if let Some(eq_pos) = text.find('=') {
-                    let value_part = &text[eq_pos+1..];
+                    let value_part = &text[eq_pos + 1..];
                     if value_part.len() >= 2 {
                         if (value_part.starts_with('"') && value_part.ends_with('"'))
                             || (value_part.starts_with('\'') && value_part.ends_with('\''))
                         {
-                            let inner = &value_part[1..value_part.len()-1];
+                            let inner = &value_part[1..value_part.len() - 1];
+                            // `--x="${X}"` — the quoted value holds an expansion;
+                            // keep it as a real interpolation so the generated
+                            // Perl substitutes $X instead of printing `\${X}`.
+                            if inner.contains('$') {
+                                if let Ok(interp) =
+                                    parse_string_interpolation_from_literal(inner)
+                                {
+                                    let mut parts =
+                                        vec![StringPart::Literal(format!("{}=", &text[..eq_pos]))];
+                                    parts.extend(interp.parts);
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
+                                }
+                            }
                             text = format!("{}={}", &text[..eq_pos], inner);
                         }
                     }
@@ -1843,9 +2083,7 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
         Some(Token::Arithmetic) | Some(Token::ArithmeticEval) => {
             Ok(parse_arithmetic_expression(lexer)?)
         }
-        Some(Token::ArithmeticBracket) => {
-            Ok(parse_arithmetic_bracket(lexer)?)
-        }
+        Some(Token::ArithmeticBracket) => Ok(parse_arithmetic_bracket(lexer)?),
         Some(Token::True) => {
             // Treat standalone 'true' as a normal word (e.g., `true` or `command || true`)
             lexer.next();
@@ -1864,17 +2102,40 @@ pub fn parse_word_no_newline_skip(lexer: &mut Lexer) -> Result<Word, ParserError
             // If we encounter a shell keyword token in argument position,
             // treat it as a literal word rather than failing.
             match token {
-                Some(Token::If) | Some(Token::Then) | Some(Token::Else) | Some(Token::Elif)
-                | Some(Token::Fi) | Some(Token::Do) | Some(Token::Done)
-                | Some(Token::While) | Some(Token::Until) | Some(Token::For)
-                | Some(Token::Case) | Some(Token::Esac) | Some(Token::In)
-                | Some(Token::Select) | Some(Token::Function) | Some(Token::Bang)
-                | Some(Token::Let) | Some(Token::Break) | Some(Token::Continue)
-                | Some(Token::Return) | Some(Token::Exit) | Some(Token::Shift)
-                | Some(Token::Eval) | Some(Token::Exec) | Some(Token::Source)
-                | Some(Token::Trap) | Some(Token::Wait) | Some(Token::Unset)
-                | Some(Token::Set) | Some(Token::Export) | Some(Token::Readonly)
-                | Some(Token::Declare) | Some(Token::Typeset) | Some(Token::Local) => {
+                Some(Token::If)
+                | Some(Token::Then)
+                | Some(Token::Else)
+                | Some(Token::Elif)
+                | Some(Token::Fi)
+                | Some(Token::Do)
+                | Some(Token::Done)
+                | Some(Token::While)
+                | Some(Token::Until)
+                | Some(Token::For)
+                | Some(Token::Case)
+                | Some(Token::Esac)
+                | Some(Token::In)
+                | Some(Token::Select)
+                | Some(Token::Function)
+                | Some(Token::Bang)
+                | Some(Token::Let)
+                | Some(Token::Break)
+                | Some(Token::Continue)
+                | Some(Token::Return)
+                | Some(Token::Exit)
+                | Some(Token::Shift)
+                | Some(Token::Eval)
+                | Some(Token::Exec)
+                | Some(Token::Source)
+                | Some(Token::Trap)
+                | Some(Token::Wait)
+                | Some(Token::Unset)
+                | Some(Token::Set)
+                | Some(Token::Export)
+                | Some(Token::Readonly)
+                | Some(Token::Declare)
+                | Some(Token::Typeset)
+                | Some(Token::Local) => {
                     let text = lexer.get_current_text().unwrap_or_default();
                     lexer.next();
                     Ok(Word::Literal(text, None))
@@ -2022,40 +2283,52 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 // Check for adjacent suffix tokens (no whitespace gap) that
                 // should be concatenated, like $DEST.new or $var-suffix.
                 if let Some(next_start) = lexer.tokens.get(lexer.current).map(|(_, s, _)| *s) {
-                    let prev_end = lexer.tokens.get(lexer.current.checked_sub(1).unwrap_or(0)).map(|(_, _, e)| *e).unwrap_or(0);
+                    let prev_end = lexer
+                        .tokens
+                        .get(lexer.current.checked_sub(1).unwrap_or(0))
+                        .map(|(_, _, e)| *e)
+                        .unwrap_or(0);
                     if next_start == prev_end {
                         if let Some(Token::Dot) = lexer.peek() {
                             // $var.suffix — consume . and following identifier
-                            let mut parts = vec![
-                                StringPart::Variable(var_name.clone()),
-                            ];
+                            let mut parts = vec![StringPart::Variable(var_name.clone())];
                             lexer.next(); // consume the Dot
                             if let Some(Token::Identifier) = lexer.peek() {
                                 if let Some(id_text) = lexer.get_current_text() {
                                     parts.push(StringPart::Literal(format!(".{}", id_text)));
                                     lexer.next();
-                                    return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
                                 }
                             }
                             // Just the dot
                             parts.push(StringPart::Literal(".".to_string()));
-                            return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                            return Ok(Word::StringInterpolation(
+                                StringInterpolation { parts },
+                                None,
+                            ));
                         }
                         if let Some(Token::Minus) = lexer.peek() {
                             // $var-suffix — consume - and following identifier
-                            let mut parts = vec![
-                                StringPart::Variable(var_name.clone()),
-                            ];
+                            let mut parts = vec![StringPart::Variable(var_name.clone())];
                             lexer.next(); // consume the Minus
                             if let Some(Token::Identifier) = lexer.peek() {
                                 if let Some(id_text) = lexer.get_current_text() {
                                     parts.push(StringPart::Literal(format!("-{}", id_text)));
                                     lexer.next();
-                                    return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                                    return Ok(Word::StringInterpolation(
+                                        StringInterpolation { parts },
+                                        None,
+                                    ));
                                 }
                             }
                             parts.push(StringPart::Literal("-".to_string()));
-                            return Ok(Word::StringInterpolation(StringInterpolation { parts }, None));
+                            return Ok(Word::StringInterpolation(
+                                StringInterpolation { parts },
+                                None,
+                            ));
                         }
                     }
                 }
@@ -2163,7 +2436,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 // This is ${!prefix@} or ${!prefix*} - indirect expansion.
                 // In bash this expands to all variable names starting with prefix.
                 // Generate as keys %prefix for Perl.
-                let var_name = &braced_content[1..braced_content.len()-1];
+                let var_name = &braced_content[1..braced_content.len() - 1];
                 return Ok(Word::MapKeys(var_name.to_string(), None));
             } else if braced_content.contains("::") {
                 // ${var::offset} or ${var::offset:length} - substring syntax
@@ -2176,7 +2449,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 return Ok(Word::ParameterExpansion(
                     ParameterExpansion {
                         variable: var_name.to_string(),
-                        operator: ParameterExpansionOperator::ArraySlice("0".to_string(), Some(rest.to_string())),
+                        operator: ParameterExpansionOperator::ArraySlice(
+                            "0".to_string(),
+                            Some(rest.to_string()),
+                        ),
                         is_mutable: true,
                     },
                     None,
@@ -2239,7 +2515,13 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     },
                     None,
                 ));
-            } else if braced_content.contains(':') && !braced_content.contains("::") && !braced_content.contains(":-") && !braced_content.contains(":=") && !braced_content.contains(":+") && !braced_content.contains(":?") {
+            } else if braced_content.contains(':')
+                && !braced_content.contains("::")
+                && !braced_content.contains(":-")
+                && !braced_content.contains(":=")
+                && !braced_content.contains(":+")
+                && !braced_content.contains(":?")
+            {
                 // ${var:offset} or ${var:offset:length} - substring/array-slice
                 // The first colon must not be part of any two-char operator.
                 let colon_pos = braced_content.find(':').unwrap();
@@ -2251,7 +2533,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     return Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                            operator: ParameterExpansionOperator::ArraySlice(
+                                offset.to_string(),
+                                Some(length.to_string()),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2260,7 +2545,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     return Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::ArraySlice(rest.to_string(), None),
+                            operator: ParameterExpansionOperator::ArraySlice(
+                                rest.to_string(),
+                                None,
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2280,7 +2568,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         // pattern-removal or substitution operators, this is a
                         // parameter expansion with brackets in the pattern, not
                         // an array/map access.
-                        if !(map_name.contains('#') || map_name.contains('%') || map_name.contains('/')) {
+                        if !(map_name.contains('#')
+                            || map_name.contains('%')
+                            || map_name.contains('/'))
+                        {
                             // Special case: if key is "@", this is array iteration
                             if key == "@" {
                                 // Check if there's array slicing in braced_content after ']'
@@ -2311,7 +2602,29 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                                 ));
                             }
 
-                            return Ok(Word::MapAccess(map_name.to_string(), key.to_string(), None));
+                            // Trailing junk after `]` in a NON-@ subscript
+                            // (e.g. `${arr[1]>2}`): bash rejects the whole
+                            // expansion as a "bad substitution" (skips the
+                            // command, status 1). A `:` continuation is a
+                            // valid element slice (`${arr[1]:0:2}`) — kept
+                            // as-is below (pre-existing behavior).
+                            let after_bracket = &braced_content[bracket_end + 1..];
+                            if !after_bracket.is_empty() && !after_bracket.starts_with(':') {
+                                return Ok(Word::ParameterExpansion(
+                                    ParameterExpansion {
+                                        variable: braced_content.to_string(),
+                                        operator: ParameterExpansionOperator::BadSubstitution,
+                                        is_mutable: true,
+                                    },
+                                    None,
+                                ));
+                            }
+
+                            return Ok(Word::MapAccess(
+                                map_name.to_string(),
+                                key.to_string(),
+                                None,
+                            ));
                         }
                         // else: fall through to parameter expansion checks below
                     }
@@ -2398,7 +2711,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 } else {
                     Ok(Word::Variable(braced_content, true, None))
                 }
-            } else if braced_content.contains("%%") && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*")) {
+            } else if braced_content.contains("%%")
+                && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*"))
+            {
                 let parts: Vec<&str> = braced_content.split("%%").collect();
                 if parts.len() == 2 {
                     Ok(Word::ParameterExpansion(
@@ -2430,7 +2745,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 } else {
                     Ok(Word::Variable(braced_content, true, None))
                 }
-            } else if braced_content.contains("%") && !braced_content.contains("%%") && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*")) {
+            } else if braced_content.contains("%")
+                && !braced_content.contains("%%")
+                && !(braced_content.ends_with("%/*") && !braced_content.ends_with("%%/*"))
+            {
                 let parts: Vec<&str> = braced_content.splitn(2, "%").collect();
                 if parts.len() == 2 {
                     Ok(Word::ParameterExpansion(
@@ -2469,7 +2787,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: parts[0].to_string(),
-                            operator: ParameterExpansionOperator::SubstituteAll(
+                            operator: ParameterExpansionOperator::SubstituteFirst(
                                 parts[1].to_string(),
                                 parts[2].to_string(),
                             ),
@@ -2489,7 +2807,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                            operator: ParameterExpansionOperator::DefaultValue(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2521,7 +2841,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                            operator: ParameterExpansionOperator::ErrorIfUnset(
+                                error_msg.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2537,7 +2859,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                            operator: ParameterExpansionOperator::AssignDefault(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2594,7 +2918,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                 // ${!prefix@} or ${!prefix*} - indirect expansion.
                 // In bash this expands to all variable names starting with prefix.
                 // Generate as keys %prefix for Perl.
-                let var_name = &prefixed[1..prefixed.len()-1];
+                let var_name = &prefixed[1..prefixed.len() - 1];
                 return Ok(Word::MapKeys(var_name.to_string(), None));
             }
             Ok(Word::Variable(prefixed, true, None))
@@ -2620,7 +2944,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                            operator: ParameterExpansionOperator::DefaultValue(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2632,7 +2958,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                            operator: ParameterExpansionOperator::AssignDefault(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2656,7 +2984,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                                operator: ParameterExpansionOperator::DefaultValue(
+                                    default_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2671,7 +3001,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
+                                operator: ParameterExpansionOperator::DefaultValue(
+                                    alt_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2686,7 +3018,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                                operator: ParameterExpansionOperator::ErrorIfUnset(
+                                    error_msg.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2701,7 +3035,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                                operator: ParameterExpansionOperator::AssignDefault(
+                                    default_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2709,7 +3045,13 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     } else {
                         Ok(Word::Variable(content, true, None))
                     }
-                } else if content.contains(':') && !content.contains("::") && !content.contains(":-") && !content.contains(":=") && !content.contains(":+") && !content.contains(":?") {
+                } else if content.contains(':')
+                    && !content.contains("::")
+                    && !content.contains(":-")
+                    && !content.contains(":=")
+                    && !content.contains(":+")
+                    && !content.contains(":?")
+                {
                     // ${*:offset} or ${*:offset:length} - array slice
                     let colon_pos = content.find(':').unwrap();
                     let var_name = &content[..colon_pos];
@@ -2720,7 +3062,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    offset.to_string(),
+                                    Some(length.to_string()),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2729,7 +3074,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ArraySlice(rest.to_string(), None),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    rest.to_string(),
+                                    None,
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2764,7 +3112,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                            operator: ParameterExpansionOperator::DefaultValue(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2776,7 +3126,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     Ok(Word::ParameterExpansion(
                         ParameterExpansion {
                             variable: var_name.to_string(),
-                            operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                            operator: ParameterExpansionOperator::AssignDefault(
+                                default_val.to_string(),
+                            ),
                             is_mutable: true,
                         },
                         None,
@@ -2801,7 +3153,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::DefaultValue(default_val.to_string()),
+                                operator: ParameterExpansionOperator::DefaultValue(
+                                    default_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2817,7 +3171,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::DefaultValue(alt_val.to_string()),
+                                operator: ParameterExpansionOperator::DefaultValue(
+                                    alt_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2833,7 +3189,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                                operator: ParameterExpansionOperator::ErrorIfUnset(
+                                    error_msg.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2849,7 +3207,9 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::AssignDefault(default_val.to_string()),
+                                operator: ParameterExpansionOperator::AssignDefault(
+                                    default_val.to_string(),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2857,7 +3217,13 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                     } else {
                         Ok(Word::Variable(content, true, None))
                     }
-                } else if content.contains(':') && !content.contains("::") && !content.contains(":-") && !content.contains(":=") && !content.contains(":+") && !content.contains(":?") {
+                } else if content.contains(':')
+                    && !content.contains("::")
+                    && !content.contains(":-")
+                    && !content.contains(":=")
+                    && !content.contains(":+")
+                    && !content.contains(":?")
+                {
                     // ${@:offset} or ${@:offset:length} - array slice
                     let colon_pos = content.find(':').unwrap();
                     let var_name = &content[..colon_pos];
@@ -2868,7 +3234,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    offset.to_string(),
+                                    Some(length.to_string()),
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2877,7 +3246,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         Ok(Word::ParameterExpansion(
                             ParameterExpansion {
                                 variable: var_name.to_string(),
-                                operator: ParameterExpansionOperator::ArraySlice(rest.to_string(), None),
+                                operator: ParameterExpansionOperator::ArraySlice(
+                                    rest.to_string(),
+                                    None,
+                                ),
                                 is_mutable: true,
                             },
                             None,
@@ -2945,7 +3317,10 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
                         // body runs (a `$(cmd1\ncmd2)` substitution captures
                         // both — parse-dollar-paren-pipe.sh).
                         let block = crate::ast::Block { commands };
-                        Ok(Word::CommandSubstitution(Box::new(crate::ast::Command::Block(block)), None))
+                        Ok(Word::CommandSubstitution(
+                            Box::new(crate::ast::Command::Block(block)),
+                            None,
+                        ))
                     }
                 }
                 Err(_) => {
@@ -2977,8 +3352,7 @@ pub fn parse_variable_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> 
 // Placeholder functions - these would need to be implemented based on the actual AST structures
 
 fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
-    use crate::ast::{Command, SimpleCommand, StringInterpolation, StringPart, Word};
-    use std::collections::{BTreeMap, HashMap};
+    use crate::ast::{StringInterpolation, Word};
 
     // Get the double-quoted string content (this includes the quotes)
     let string_content = lexer.get_string_text()?;
@@ -2990,17 +3364,46 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
         &string_content
     };
 
-    let content = content.replace("\\\"", "\"");
-    let content = content.replace("\\\\", "\\");
-    // Remove backslash-newline line continuations (\<newline>)
-    // that were not handled by the lexer's regex (logos captures
-    // them inside the DoubleQuotedString token).
-    let content = content.replace("\\\n", "");
-    let content = content.replace("\\\r\n", "");
+    let content = unescape_interpolation_content(content);
 
     if crate::debug::is_debug_enabled() {
-        eprintln!("DEBUG parse_string_interpolation: content len={}, content={:?}", content.len(), &content[..content.len().min(80)]);
+        eprintln!(
+            "DEBUG parse_string_interpolation: content len={}, content={:?}",
+            content.len(),
+            &content[..content.len().min(80)]
+        );
     }
+
+    let parts = scan_interpolation_parts(&content)?;
+
+    Ok(Word::StringInterpolation(
+        StringInterpolation { parts },
+        None,
+    ))
+}
+
+/// The double-quoted-string content preprocessing shared by both
+/// interpolation scanners: `\"` → `"`, `\\` → `\`, and backslash-newline
+/// line continuations are removed (the lexer's DoubleQuotedString regex
+/// captures them inside the token).
+fn unescape_interpolation_content(content: &str) -> String {
+    content
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
+        .replace("\\\n", "")
+        .replace("\\\r\n", "")
+}
+
+/// Scan a double-quoted string's content into interpolation parts:
+/// literal text, `$var` / `${...}` / `$((...))` / `$(...)` / backtick
+/// substitutions. Shared by the lexer-driven `parse_string_interpolation`
+/// and the LongOption-quoted-value path
+/// (`parse_string_interpolation_from_literal` — `--x="${X}"` must keep
+/// the expansion as a part, not flatten it into the literal; the corpus
+/// test parse-longoption-with-dollar.sh documents this).
+fn scan_interpolation_parts(content: &str) -> Result<Vec<StringPart>, ParserError> {
+    use crate::ast::{Command, SimpleCommand, StringPart};
+    use std::collections::BTreeMap;
 
     // Parse the string content to extract literal parts and variable references
     let mut parts = Vec::new();
@@ -3038,8 +3441,13 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     parts.push(StringPart::Literal(format!("\\\\`{}\\\\`", cmd_content)));
                 }
             } else {
-                // Unmatched escaped backtick, treat as literal
-                parts.push(StringPart::Literal("\\\\`".to_string()));
+                // Unmatched escaped backtick (`\\\`` = escaped backslash
+                // + escaped backtick in a DQS): bash consumes BOTH escapes —
+                // `\\` → `\` and `\`` → a literal backtick — so the
+                // literal text is `\`` (one backslash + backtick), NOT the
+                // raw `\\\``. (echo-with-escaped-backtick.sh: top-level
+                // DQS `\`` with no closing pair.)
+                parts.push(StringPart::Literal("\\`".to_string()));
                 i = cmd_start;
             }
         } else if content[i..].starts_with("\\`") {
@@ -3071,8 +3479,15 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     parts.push(StringPart::Literal(format!("\\`{}\\`", cmd_content)));
                 }
             } else {
-                // Unmatched escaped backtick, treat as literal
-                parts.push(StringPart::Literal("\\`".to_string()));
+                // Unmatched single-escaped backtick (a DQS `\\`` with no
+                // closing pair): bash consumes the backslash — the result
+                // is a literal backtick, NOT `\\`` (echo-with-escaped-
+                // backtick.sh + -and-quotes.sh print `Invalid
+                // configuration `...`). In a backtick-cmdsub context a
+                // MATCHED `\\`...\\`` pair is a nested substitution (the
+                // branch above); an unmatched one is a literal backtick
+                // in every context.
+                parts.push(StringPart::Literal("`".to_string()));
                 i = cmd_start;
             }
         } else if content[i..].starts_with("`") {
@@ -3199,11 +3614,17 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         continue;
                     }
                     match content[i..].chars().next() {
-                        Some('"') if dq_depth == 0 => {
-                            // Toggle double-quote depth.
+                        Some('"') if dq_depth == 0 && !sq_depth => {
+                            // Toggle double-quote depth. A `"` inside a
+                            // single-quoted string within $() is LITERAL
+                            // (bash: `awk '{ print $1 }' | sed 's/"//g'`
+                            // inside a DQS) — it must not toggle dq_depth,
+                            // or the closing `'` would be misread and the
+                            // `)` would never close the substitution
+                            // (parse-gaps: multiple-awk-in-dqs.sh).
                             dq_depth = 1;
                         }
-                        Some('"') => {
+                        Some('"') if !sq_depth => {
                             dq_depth = 0;
                         }
                         Some('\'') if dq_depth == 0 => {
@@ -3287,9 +3708,15 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         parts.push(StringPart::Literal(format!("${{{}}}", expansion_content)));
                     }
                 } else {
-                    // Unmatched braces, treat as literal
-                    parts.push(StringPart::Literal("${".to_string()));
-                    i = expansion_start;
+                    // Unmatched braces: bash rejects unterminated `${`
+                    // at parse time (exit 2) — a real syntax error, not a
+                    // literal (parse-parameter-expansion-eof.sh: the old
+                    // literal fallback silently executed the broken word,
+                    // bash=2 vs estree=0). The CLI's parse-error fallback
+                    // reproduces bash's verdict.
+                    return Err(ParserError::InvalidSyntax(
+                        "unterminated `${` in double-quoted string".to_string(),
+                    ));
                 }
             } else {
                 // Simple variable reference like $var or a literal $ followed by a non-variable char
@@ -3303,7 +3730,14 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
 
                 let next_char = content[i..].chars().next().unwrap();
-                if next_char == '#' || next_char == '@' || next_char == '*' || next_char == '?' || next_char == '-' || next_char == '!' || next_char == '$' {
+                if next_char == '#'
+                    || next_char == '@'
+                    || next_char == '*'
+                    || next_char == '?'
+                    || next_char == '-'
+                    || next_char == '!'
+                    || next_char == '$'
+                {
                     // Special shell variable
                     parts.push(StringPart::Variable(next_char.to_string()));
                     i += 1;
@@ -3385,24 +3819,31 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                     if crate::debug::is_debug_enabled() {
                         eprintln!("DEBUG parse_string_interpolation: found $(...), cmd_content len={}, first 80: {:?}", cmd_content.len(), &cmd_content[..cmd_content.len().min(80)]);
                     }
-                    if let Ok(cmds) = crate::parser::commands::parse_commands_from_text(cmd_content) {
+                    if let Ok(cmds) = crate::parser::commands::parse_commands_from_text(cmd_content)
+                    {
                         if crate::debug::is_debug_enabled() {
                             eprintln!("DEBUG parse_string_interpolation: parse_commands_from_text OK, {} commands", cmds.len());
                         }
                         if cmds.is_empty() {
                             parts.push(StringPart::Literal(format!("$({})", cmd_content)));
                         } else if cmds.len() == 1 {
-                            parts.push(StringPart::CommandSubstitution(Box::new(cmds.into_iter().next().unwrap())));
+                            parts.push(StringPart::CommandSubstitution(Box::new(
+                                cmds.into_iter().next().unwrap(),
+                            )));
                         } else {
                             let block = crate::ast::Block { commands: cmds };
-                            parts.push(StringPart::CommandSubstitution(Box::new(crate::ast::Command::Block(block))));
+                            parts.push(StringPart::CommandSubstitution(Box::new(
+                                crate::ast::Command::Block(block),
+                            )));
                         }
                     } else {
                         if crate::debug::is_debug_enabled() {
                             eprintln!("DEBUG parse_string_interpolation: parse_commands_from_text FAILED, trying pipeline");
                         }
                         // Fallback: try the old pipeline-based parser
-                        if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
+                        if let Ok(cmd) =
+                            crate::parser::commands::parse_pipeline_from_text(cmd_content)
+                        {
                             if crate::debug::is_debug_enabled() {
                                 eprintln!("DEBUG parse_string_interpolation: pipeline parser OK");
                             }
@@ -3441,8 +3882,13 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         parts.push(StringPart::Literal(format!("${{{}}}", expansion_content)));
                     }
                 } else {
-                    parts.push(StringPart::Literal("${".to_string()));
-                    i = expansion_start;
+                    // Unmatched braces: bash rejects unterminated `${`
+                    // at parse time (exit 2) — a real syntax error, not a
+                    // literal (see the identical arm in
+                    // parse_string_interpolation).
+                    return Err(ParserError::InvalidSyntax(
+                        "unterminated `${` in double-quoted string".to_string(),
+                    ));
                 }
             } else {
                 // Simple $var or special var or literal $
@@ -3453,7 +3899,14 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                 }
 
                 let next_char = content[i..].chars().next().unwrap();
-                if next_char == '#' || next_char == '@' || next_char == '*' || next_char == '?' || next_char == '-' || next_char == '!' || next_char == '$' {
+                if next_char == '#'
+                    || next_char == '@'
+                    || next_char == '*'
+                    || next_char == '?'
+                    || next_char == '-'
+                    || next_char == '!'
+                    || next_char == '$'
+                {
                     parts.push(StringPart::Variable(next_char.to_string()));
                     let ch = content[i..].chars().next().unwrap_or('?');
                     i += ch.len_utf8();
@@ -3499,18 +3952,18 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
         parts.push(StringPart::Literal(content.to_string()));
     }
 
-    Ok(Word::StringInterpolation(
-        StringInterpolation { parts },
-        None,
-    ))
+    Ok(parts)
 }
 
-/// Parse a literal string as string interpolation to handle escaped backticks
+/// Parse a literal string as string interpolation — the LongOption lexer
+/// path (`--x="${X}"` merges the quoted value into the option text as raw
+/// text) and the Perl generator's echo/arg handling re-parse a quoted
+/// value that may hold expansions. The FULL scanner runs here (not just
+/// backticks): `--x="${X}"` must produce a ParameterExpansion part or the
+/// generated code prints `\${X}` literally (parse-longoption-with-dollar.sh). to handle escaped backticks
 pub fn parse_string_interpolation_from_literal(
     literal: &str,
 ) -> Result<StringInterpolation, ParserError> {
-    use crate::ast::{StringInterpolation, StringPart};
-
     // Remove outer quotes if present
     let content = if (literal.starts_with('"') && literal.ends_with('"'))
         || (literal.starts_with('\'') && literal.ends_with('\''))
@@ -3520,162 +3973,9 @@ pub fn parse_string_interpolation_from_literal(
         literal
     };
 
-    // Parse the string content to extract literal parts and command substitutions
-    let mut parts = Vec::new();
-    let mut current_literal = String::new();
-    let mut i = 0;
+    let content = unescape_interpolation_content(content);
 
-    while i < content.len() {
-        if content[i..].starts_with("\\\\`") {
-            // We found an escaped backtick command substitution
-            // First, add any accumulated literal text
-            if !current_literal.is_empty() {
-                parts.push(StringPart::Literal(current_literal.clone()));
-                current_literal.clear();
-            }
-
-            // Find the closing escaped backtick
-            i += 3; // skip the \\`
-            let cmd_start = i;
-            while i < content.len() && !content[i..].starts_with("\\\\`") {
-                let ch = content[i..].chars().next().unwrap_or('?');
-                i += ch.len_utf8();
-            }
-
-            if i < content.len() {
-                // We found a complete escaped command substitution
-                let cmd_content = &content[cmd_start..i];
-                i += 3; // skip the closing \\`
-
-                // Parse the command content as a pipeline (to handle pipes)
-                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
-                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
-                } else {
-                    // Fall back to treating it as a literal
-                    parts.push(StringPart::Literal(format!("\\\\`{}\\\\`", cmd_content)));
-                }
-            } else {
-                // Unmatched escaped backtick, treat as literal
-                parts.push(StringPart::Literal("\\\\`".to_string()));
-                i = cmd_start;
-            }
-        } else if content[i..].starts_with("\\`") {
-            // We found a single-escaped backtick command substitution
-            // First, add any accumulated literal text
-            if !current_literal.is_empty() {
-                parts.push(StringPart::Literal(current_literal.clone()));
-                current_literal.clear();
-            }
-
-            // Find the closing escaped backtick
-            i += 2; // skip the \`
-            let cmd_start = i;
-            while i < content.len() && !content[i..].starts_with("\\`") {
-                let ch = content[i..].chars().next().unwrap_or('?');
-                i += ch.len_utf8();
-            }
-
-            if i < content.len() {
-                // We found a complete escaped command substitution
-                let cmd_content = &content[cmd_start..i];
-                i += 2; // skip the closing \`
-
-                // Parse the command content as a pipeline (to handle pipes)
-                if let Ok(cmd) = crate::parser::commands::parse_pipeline_from_text(cmd_content) {
-                    parts.push(StringPart::CommandSubstitution(Box::new(cmd)));
-                } else {
-                    // Fall back to treating it as a literal
-                    parts.push(StringPart::Literal(format!("\\`{}\\`", cmd_content)));
-                }
-            } else {
-                // Unmatched escaped backtick, treat as literal
-                parts.push(StringPart::Literal("\\`".to_string()));
-                i = cmd_start;
-            }
-        } else if content[i..].starts_with("`") {
-            // We found a backtick command substitution
-            // First, add any accumulated literal text
-            if !current_literal.is_empty() {
-                parts.push(StringPart::Literal(current_literal.clone()));
-                current_literal.clear();
-            }
-
-            // Find the closing backtick
-            i += 1; // skip the opening `
-            let cmd_start = i;
-            while i < content.len() && content[i..].chars().next() != Some('`') {
-                let ch = content[i..].chars().next().unwrap_or('?');
-                i += ch.len_utf8();
-            }
-
-            if i < content.len() {
-                // We found a complete command substitution
-                let cmd_content = &content[cmd_start..i];
-                i += 1; // skip the closing `
-
-                // Parse the command content using the full parser to handle pipelines
-                let sub_lexer = Lexer::new(cmd_content);
-                let mut sub_parser = Parser::new_with_lexer(sub_lexer);
-                match sub_parser.parse() {
-                    Ok(commands) => {
-                        eprintln!(
-                            "DEBUG: String interpolation parsed command '{}' as {} commands",
-                            cmd_content,
-                            commands.len()
-                        );
-                        if commands.len() == 1 {
-                            parts.push(StringPart::CommandSubstitution(Box::new(
-                                commands[0].clone(),
-                            )));
-                        } else if commands.is_empty() {
-                            // If no commands parsed, treat as a simple command with the text as argument
-                            let placeholder_cmd = Command::Simple(SimpleCommand {
-                                name: Word::Literal("echo".to_string(), None),
-                                args: vec![Word::Literal(cmd_content.to_string(), None)],
-                                redirects: Vec::new(),
-                                env_vars: BTreeMap::new(),
-                                stdout_used: true,
-                                stderr_used: true,
-                            });
-                            parts.push(StringPart::CommandSubstitution(Box::new(placeholder_cmd)));
-                        } else {
-                            // If multiple commands, use the first one
-                            parts.push(StringPart::CommandSubstitution(Box::new(
-                                commands[0].clone(),
-                            )));
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "DEBUG: String interpolation failed to parse command '{}': {:?}",
-                            cmd_content, e
-                        );
-                        // Fall back to treating it as a literal
-                        parts.push(StringPart::Literal(format!("`{}`", cmd_content)));
-                    }
-                }
-            } else {
-                // Unmatched backtick, treat as literal
-                parts.push(StringPart::Literal("`".to_string()));
-                i = cmd_start;
-            }
-        } else {
-            // Add to current literal
-            let ch = content[i..].chars().next().unwrap();
-            current_literal.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-
-    // Add any remaining literal text
-    if !current_literal.is_empty() {
-        parts.push(StringPart::Literal(current_literal));
-    }
-
-    // If we have no parts, this shouldn't happen, but handle it gracefully
-    if parts.is_empty() {
-        parts.push(StringPart::Literal(content.to_string()));
-    }
+    let parts = scan_interpolation_parts(&content)?;
 
     Ok(StringInterpolation { parts })
 }
@@ -3722,7 +4022,10 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
         let rest = &content[colon_pos + 2..];
         return Ok(ParameterExpansion {
             variable: var_name.to_string(),
-            operator: ParameterExpansionOperator::ArraySlice("0".to_string(), Some(rest.to_string())),
+            operator: ParameterExpansionOperator::ArraySlice(
+                "0".to_string(),
+                Some(rest.to_string()),
+            ),
             is_mutable: true,
         });
     }
@@ -3799,14 +4102,13 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
         }
     }
     // Single / pattern substitution: ${var/pattern/replacement} (first
-    // occurrence — the runtime has no first-vs-all distinction, so both map
-    // to SubstituteAll; matches the main parser).
+    // occurrence only — SubstituteFirst).
     if content.contains('/') {
         let parts: Vec<&str> = content.splitn(3, '/').collect();
         if parts.len() == 3 {
             return Ok(ParameterExpansion {
                 variable: parts[0].to_string(),
-                operator: ParameterExpansionOperator::SubstituteAll(
+                operator: ParameterExpansionOperator::SubstituteFirst(
                     parts[1].to_string(),
                     parts[2].to_string(),
                 ),
@@ -3820,6 +4122,14 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
     // because a regex character class like [a-z] inside a substitution pattern
     // would otherwise be misinterpreted as array access.
     if content.contains('[') && content.contains(']') {
+        // Guard: if the part BEFORE the `[` contains pattern-removal or
+        // substitution operators (`${x##*[/\\]}` — a bracket CLASS inside
+        // the pattern, not a subscript), fall through to the operator
+        // checks below (mirrors the parse_variable_expansion copy).
+        let pattern_op_before_bracket = content.find('[').map_or(false, |bs| {
+            content[..bs].contains('#') || content[..bs].contains('%') || content[..bs].contains('/')
+        });
+        if !pattern_op_before_bracket {
         if let Some(bracket_start) = content.find('[') {
             if let Some(bracket_end) = content.rfind(']') {
                 let var_name = &content[..bracket_start];
@@ -3869,28 +4179,36 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                     let pattern = &rest[2..];
                     return Ok(ParameterExpansion {
                         variable: format!("{}[{}]", var_name, key),
-                        operator: ParameterExpansionOperator::RemoveLongestPrefix(pattern.to_string()),
+                        operator: ParameterExpansionOperator::RemoveLongestPrefix(
+                            pattern.to_string(),
+                        ),
                         is_mutable: true,
                     });
                 } else if rest.starts_with('#') {
                     let pattern = &rest[1..];
                     return Ok(ParameterExpansion {
                         variable: format!("{}[{}]", var_name, key),
-                        operator: ParameterExpansionOperator::RemoveShortestPrefix(pattern.to_string()),
+                        operator: ParameterExpansionOperator::RemoveShortestPrefix(
+                            pattern.to_string(),
+                        ),
                         is_mutable: true,
                     });
                 } else if rest.starts_with("%%") {
                     let pattern = &rest[2..];
                     return Ok(ParameterExpansion {
                         variable: format!("{}[{}]", var_name, key),
-                        operator: ParameterExpansionOperator::RemoveLongestSuffix(pattern.to_string()),
+                        operator: ParameterExpansionOperator::RemoveLongestSuffix(
+                            pattern.to_string(),
+                        ),
                         is_mutable: true,
                     });
                 } else if rest.starts_with('%') {
                     let pattern = &rest[1..];
                     return Ok(ParameterExpansion {
                         variable: format!("{}[{}]", var_name, key),
-                        operator: ParameterExpansionOperator::RemoveShortestSuffix(pattern.to_string()),
+                        operator: ParameterExpansionOperator::RemoveShortestSuffix(
+                            pattern.to_string(),
+                        ),
                         is_mutable: true,
                     });
                 } else if rest == "^^" {
@@ -3914,6 +4232,17 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 } else if rest.starts_with('/') {
                     // This is ${arr[1]/pattern/replacement} - substitution on an array element
                     // We'll handle this later - for now, just treat as array access
+                } else if !rest.is_empty() && !rest.starts_with(':') {
+                    // Trailing junk after `]` (e.g. `${arr[1]>2}`, `${arr[1]foo}`):
+                    // bash rejects the whole expansion as a "bad substitution"
+                    // (skips the command, status 1). A `:` continuation is a
+                    // valid element slice — falls through below (pre-existing
+                    // behavior).
+                    return Ok(ParameterExpansion {
+                        variable: content.to_string(),
+                        operator: ParameterExpansionOperator::BadSubstitution,
+                        is_mutable: true,
+                    });
                 }
 
                 // This is array/map access - we'll handle this in the generator
@@ -3924,6 +4253,7 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 });
             }
         }
+        }
     }
 
     // Check for ${var:offset} or ${var:offset:length} - substring/array-slice
@@ -3933,11 +4263,19 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
     // We only reach here for simple variable names (no brackets) like ${@:3} or ${var:offset}.
     // Also guard against operator patterns like ${var%%pattern} where the pattern
     // contains ':' by checking that no operator characters precede the colon.
-    if content.contains(':') && !content.contains('[') && !content.contains(']') 
-        && !content.contains("::") && !content.contains(":-") && !content.contains(":=") 
-        && !content.contains(":+") && !content.contains(":?") 
-        && !content.contains('%') && !content.contains('#') 
-        && !content.contains('/') && !content.contains('^') && !content.contains(',')
+    if content.contains(':')
+        && !content.contains('[')
+        && !content.contains(']')
+        && !content.contains("::")
+        && !content.contains(":-")
+        && !content.contains(":=")
+        && !content.contains(":+")
+        && !content.contains(":?")
+        && !content.contains('%')
+        && !content.contains('#')
+        && !content.contains('/')
+        && !content.contains('^')
+        && !content.contains(',')
     {
         let colon_pos = content.find(':').unwrap();
         // Only treat as ArraySlice if the colon is at a position that could be
@@ -3950,7 +4288,10 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 let length = &rest[second_colon + 1..];
                 return Ok(ParameterExpansion {
                     variable: var_name.to_string(),
-                    operator: ParameterExpansionOperator::ArraySlice(offset.to_string(), Some(length.to_string())),
+                    operator: ParameterExpansionOperator::ArraySlice(
+                        offset.to_string(),
+                        Some(length.to_string()),
+                    ),
                     is_mutable: true,
                 });
             } else {
@@ -4045,7 +4386,10 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 is_mutable: true,
             })
         }
-    } else if content.contains("%") && !content.contains("%%") && !(content.ends_with("%/*") && !content.ends_with("%%/*")) {
+    } else if content.contains("%")
+        && !content.contains("%%")
+        && !(content.ends_with("%/*") && !content.ends_with("%%/*"))
+    {
         let parts: Vec<&str> = content.split("%").collect();
         if parts.len() == 2 {
             Ok(ParameterExpansion {
@@ -4105,7 +4449,13 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
                 is_mutable: true,
             })
         }
-    } else if content.contains('-') && !content.contains('%') && !content.contains('#') && !content.contains('/') && !content.contains('!') && !content.contains(':') {
+    } else if content.contains('-')
+        && !content.contains('%')
+        && !content.contains('#')
+        && !content.contains('/')
+        && !content.contains('!')
+        && !content.contains(':')
+    {
         // ${var-default} - use default if var is unset (not if empty)
         let parts: Vec<&str> = content.splitn(2, '-').collect();
         if parts.len() == 2 && !parts[0].is_empty() {
@@ -4124,13 +4474,39 @@ pub fn parse_parameter_expansion_content(content: &str) -> Result<ParameterExpan
     } else if content.contains("=-") {
         // ${var=-default} - assign default if var is unset
         let parts: Vec<&str> = content.splitn(2, "=-").collect();
-        if parts.len() == 2 && !parts[0].is_empty() && !parts[0].contains('%') && !parts[0].contains('#') {
+        if parts.len() == 2
+            && !parts[0].is_empty()
+            && !parts[0].contains('%')
+            && !parts[0].contains('#')
+        {
             Ok(ParameterExpansion {
                 variable: parts[0].to_string(),
                 operator: ParameterExpansionOperator::AssignDefault(parts[1].to_string()),
                 is_mutable: true,
             })
         } else {
+            Ok(ParameterExpansion {
+                variable: content.to_string(),
+                operator: ParameterExpansionOperator::None,
+                is_mutable: true,
+            })
+        }
+    } else if let Some(quest_pos) = content.find('?') {
+        // ${var?error} - error if var is UNSET (the `?` without a colon;
+        // `:?` is handled above). Must come AFTER the -/=- branches so
+        // `${var-?}` / `${var=-?}` stay default-value forms. Patterns with
+        // `?` (${var%?}, ${var#?}, ${var/pat?/rep}) are handled by their
+        // own branches above.
+        if quest_pos > 0 {
+            let var_name = &content[..quest_pos];
+            let error_msg = &content[quest_pos + 1..];
+            Ok(ParameterExpansion {
+                variable: var_name.to_string(),
+                operator: ParameterExpansionOperator::ErrorIfUnset(error_msg.to_string()),
+                is_mutable: true,
+            })
+        } else {
+            // `${?}` — the `$?` special var in braces
             Ok(ParameterExpansion {
                 variable: content.to_string(),
                 operator: ParameterExpansionOperator::None,

@@ -15,6 +15,7 @@
 //! the `whileLoopSync` lowering into `sync_loop.rs::WhileLoopSync`, etc.
 
 pub mod contains;
+pub mod grep_to_case;
 
 use crate::ir::{IrExpr, IrStmt};
 
@@ -44,7 +45,10 @@ pub trait PatternLift: Sync {
 /// Stage 0: the walker is provided here so the trait has a default
 /// integration path. Stage 1 wires the lifts into the pipeline (after
 /// the transforms, before the renderer).
-pub fn walk_exprs<F: FnMut(&IrExpr) -> Option<IrExpr>>(_prog: &crate::ir::IrProgram, _f: F) -> usize {
+pub fn walk_exprs<F: FnMut(&IrExpr) -> Option<IrExpr>>(
+    _prog: &crate::ir::IrProgram,
+    _f: F,
+) -> usize {
     // Stage 0: not wired. The trait's default `try_lift_expr` returns
     // `None` for every lift, so a stage-0 call always returns 0.
     0
@@ -67,6 +71,8 @@ mod tests {
     #[test]
     fn walker_handles_empty_program() {
         let prog = IrProgram {
+            var_nospace: vec![],
+            var_bash_env: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![],
@@ -87,6 +93,8 @@ mod tests {
     #[test]
     fn walker_handles_non_liftable_program() {
         let prog = IrProgram {
+            var_nospace: vec![],
+            var_bash_env: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![IrStmt::Expr(IrExpr::Int(42))],

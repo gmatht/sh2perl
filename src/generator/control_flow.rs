@@ -48,7 +48,7 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             // layer.  Strip the outer parens here.
             let trimmed = test_result.trim();
             if trimmed.starts_with('(') && trimmed.ends_with(')') {
-                output.push_str(&trimmed[1..trimmed.len()-1]);
+                output.push_str(&trimmed[1..trimmed.len() - 1]);
             } else {
                 output.push_str(&test_result);
             }
@@ -107,7 +107,15 @@ pub fn generate_if_statement_impl(generator: &mut Generator, if_stmt: &IfStateme
             // where `if func; then` enters when func returns 0.
             // Use `!do { ... }` instead of `!(...)` so multi-statement
             // code (e.g. from redirect commands) is valid in Perl.
-            output.push_str(&format!("!do {{ local $CHILD_ERROR; {} }}", cond));
+            // The do-block must end with `$CHILD_ERROR` (the command's
+            // exit status): the generated command code's LAST expression
+            // is not reliably the status (ls ends with `$ls_success = 1`,
+            // redirect-restore with `open STDOUT ...` = 1), and `!` of
+            // that would invert the condition incorrectly.
+            output.push_str(&format!(
+                "!do {{ local $CHILD_ERROR; {}; $CHILD_ERROR }}",
+                cond
+            ));
         }
     }
     output.push_str(") {\n");
@@ -216,7 +224,10 @@ pub fn generate_case_statement_impl(
                 // Check whether this is a simple literal pattern (no glob characters).
                 // If so, use `eq` instead of a regex match — it's cleaner and avoids
                 // the `msx` flags that are unnecessary for plain string equality.
-                let has_glob = pattern_str.contains('*') || pattern_str.contains('?') || pattern_str.contains('[') || pattern_str.contains(']');
+                let has_glob = pattern_str.contains('*')
+                    || pattern_str.contains('?')
+                    || pattern_str.contains('[')
+                    || pattern_str.contains(']');
 
                 // Convert the case subject to a Perl expression.
                 // If it's an undeclared variable, wrap it in $ENV{var} to
@@ -226,7 +237,10 @@ pub fn generate_case_statement_impl(
                     Word::Variable(var_name, _, _) => {
                         if generator.declared_locals.contains(var_name)
                             || generator.function_level_vars.contains(var_name)
-                            || matches!(var_name.as_str(), "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0")
+                            || matches!(
+                                var_name.as_str(),
+                                "#" | "@" | "*" | "-" | "?" | "$" | "!" | "0"
+                            )
                             || var_name.chars().all(|c| c.is_ascii_digit())
                         {
                             word_str
@@ -255,11 +269,15 @@ pub fn generate_case_statement_impl(
                     // concatenation.  Without parens,  A . B =~ /re/  parses as
                     // A . (B =~ /re/), which is always truthy (the concat of A
                     // with the match result 1/"").
-                    pattern_conditions.push(format!("({}) =~ /{}/msx", processed_word, regex_pattern));
+                    pattern_conditions
+                        .push(format!("({}) =~ /{}/msx", processed_word, regex_pattern));
                 } else {
                     // Simple literal — use eq for clarity and performance.
                     // Quote the pattern for Perl: wrap in single quotes (escape embedded quotes).
-                    let quoted_pattern = format!("'{}'", pattern_str.replace("\\", "\\\\").replace("'", "\\'"));
+                    let quoted_pattern = format!(
+                        "'{}'",
+                        pattern_str.replace("\\", "\\\\").replace("'", "\\'")
+                    );
                     pattern_conditions.push(format!("{} eq {}", processed_word, quoted_pattern));
                 }
             }
@@ -298,7 +316,11 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
         hoist_my_declarations(generator, &body_vars, &mut output);
     }
 
-    let loop_keyword = if while_loop.is_until { "until" } else { "while" };
+    let loop_keyword = if while_loop.is_until {
+        "until"
+    } else {
+        "while"
+    };
 
     // Check if the while loop condition uses variables that might need initialization
     // This is needed for shell compatibility where loop variables persist
@@ -523,13 +545,19 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                                             output.push_str(&format!("last if ({});\n", cond_code));
                                         } else {
                                             output.push_str(&generator.indent());
-                                            output.push_str(&format!("last unless ({});\n", cond_code));
+                                            output.push_str(&format!(
+                                                "last unless ({});\n",
+                                                cond_code
+                                            ));
                                         }
                                     } else {
                                         // For OR: exit if any succeeds
                                         if is_until {
                                             output.push_str(&generator.indent());
-                                            output.push_str(&format!("last unless ({});\n", cond_code));
+                                            output.push_str(&format!(
+                                                "last unless ({});\n",
+                                                cond_code
+                                            ));
                                         } else {
                                             output.push_str(&generator.indent());
                                             output.push_str(&format!("last if ({});\n", cond_code));
@@ -806,7 +834,9 @@ pub fn generate_cstyle_for_loop_impl(
     let incr_clean = strip_eval_wrapper(&incr_perl);
 
     output.push_str(&generator.indent());
-    output.push_str(&format!("for ({init_clean}; {cond_clean}; {incr_clean}) {{\n"));
+    output.push_str(&format!(
+        "for ({init_clean}; {cond_clean}; {incr_clean}) {{\n"
+    ));
 
     generator.indent_level += 1;
     let body_output = generator.generate_block(&for_loop.body);
@@ -890,9 +920,13 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
     if !generator.declared_locals.contains(loop_var)
         && !generator.function_level_vars.contains(loop_var)
     {
-        // Variable is not declared anywhere — no need to insert a dead
-        // `my $i;` because `for my $i` declares it lexically.
-        // Just mark it as declared so post-loop code knows it exists.
+        // The IR range path renders `for my $__i (…) { $i = $__i; … }` —
+        // the body references the REAL variable name, so `$i` must exist
+        // as a non-lexical variable under `use strict`.  Declare it before
+        // the loop: bash leaves the loop var holding its last value, so it
+        // cannot be lexical to the loop (Perl's `for my` restores it).
+        output.push_str(&generator.indent());
+        output.push_str(&format!("my ${};\n", loop_var));
         generator.declared_locals.insert(loop_var.clone());
     }
 
@@ -926,7 +960,10 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
 
             let ir_for = crate::ir::IrStmt::For {
                 var: for_loop.variable.clone(),
-                iter: crate::ir::IrExpr::Range { start: start_num, end: end_num },
+                iter: crate::ir::IrExpr::Range {
+                    start: start_num,
+                    end: end_num,
+                },
                 body: vec![crate::ir::IrStmt::RawText(body_str)],
             };
             output.push_str(&crate::ir::stmt_to_perl(&ir_for, generator.indent_level));
@@ -960,7 +997,10 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
 
                         let ir_for = crate::ir::IrStmt::For {
                             var: for_loop.variable.clone(),
-                            iter: crate::ir::IrExpr::Range { start: start_num, end: end_num },
+                            iter: crate::ir::IrExpr::Range {
+                                start: start_num,
+                                end: end_num,
+                            },
                             body: vec![crate::ir::IrStmt::RawText(body_str)],
                         };
                         output.push_str(&crate::ir::stmt_to_perl(&ir_for, generator.indent_level));
@@ -1068,13 +1108,18 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                         }
                         BraceItem::Literal(s) => {
                             // Single literal item, include prefix/suffix
-                            let val = format!("{}{}{}",
+                            let val = format!(
+                                "{}{}{}",
                                 expansion.prefix.as_deref().unwrap_or(""),
                                 s,
-                                expansion.suffix.as_deref().unwrap_or(""));
+                                expansion.suffix.as_deref().unwrap_or("")
+                            );
                             // If the value contains glob metacharacters (*, ?, [), use glob() with sort and fallback
                             if val.contains('*') || val.contains('?') || val.contains('[') {
-                                all_items.push(format!("do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}", val, val));
+                                all_items.push(format!(
+                                    "do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}",
+                                    val, val
+                                ));
                             } else {
                                 all_items.push(format!("\"{}\"", val));
                             }
@@ -1082,13 +1127,18 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                         BraceItem::Sequence(seq) => {
                             // Convert {a,b,c} to separate quoted items, include prefix/suffix
                             for item in seq {
-                                let val = format!("{}{}{}",
+                                let val = format!(
+                                    "{}{}{}",
                                     expansion.prefix.as_deref().unwrap_or(""),
                                     item,
-                                    expansion.suffix.as_deref().unwrap_or(""));
+                                    expansion.suffix.as_deref().unwrap_or("")
+                                );
                                 // If the value contains glob metacharacters (*, ?, [), use glob() with sort and fallback
                                 if val.contains('*') || val.contains('?') || val.contains('[') {
-                                    all_items.push(format!("do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}", val, val));
+                                    all_items.push(format!(
+                                        "do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}",
+                                        val, val
+                                    ));
                                 } else {
                                     all_items.push(format!("\"{}\"", val));
                                 }
@@ -1102,17 +1152,22 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                     for item in &expansion.items {
                         match item {
                             BraceItem::Literal(s) => {
-                                let val = format!("{}{}{}",
+                                let val = format!(
+                                    "{}{}{}",
                                     expansion.prefix.as_deref().unwrap_or(""),
                                     s,
-                                    expansion.suffix.as_deref().unwrap_or(""));
+                                    expansion.suffix.as_deref().unwrap_or("")
+                                );
                                 // If the value contains glob metacharacters (*, ?, [), use glob() with sort and fallback
                                 if val.contains('*') || val.contains('?') || val.contains('[') {
-                                    all_items.push(format!("do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}", val, val));
+                                    all_items.push(format!(
+                                        "do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}",
+                                        val, val
+                                    ));
                                 } else {
                                     all_items.push(format!("\"{}\"", val));
                                 }
-                            },
+                            }
                             BraceItem::Range(range) => {
                                 if let (Ok(start_num), Ok(end_num)) =
                                     (range.start.parse::<i64>(), range.end.parse::<i64>())
@@ -1146,10 +1201,12 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                             }
                             BraceItem::Sequence(seq) => {
                                 for item in seq {
-                                    let val = format!("{}{}{}",
+                                    let val = format!(
+                                        "{}{}{}",
                                         expansion.prefix.as_deref().unwrap_or(""),
                                         item,
-                                        expansion.suffix.as_deref().unwrap_or(""));
+                                        expansion.suffix.as_deref().unwrap_or("")
+                                    );
                                     if val.contains('*') || val.contains('?') || val.contains('[') {
                                         all_items.push(format!("do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}", val, val));
                                     } else {
@@ -1251,7 +1308,9 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     // e.g. `x=$1; y=$2` → {1: "x", 2: "y"}
     let param_map = build_param_name_map(&func.body);
     if !param_map.is_empty() || !func.parameters.is_empty() {
-        generator.fn_param_names.insert(func.name.clone(), param_map.clone());
+        generator
+            .fn_param_names
+            .insert(func.name.clone(), param_map.clone());
     }
 
     // Determine if this function is nested inside another function
@@ -1321,11 +1380,10 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
             } else if uses_positional_params {
                 // Function uses $1, $2, etc. but has no declared parameters
                 // Check if the function body already has local commands that handle parameters
-                let has_local_commands = func
-                    .body
-                    .commands
-                    .iter()
-                    .any(|cmd| matches!(cmd, Command::BuiltinCommand(cmd) if cmd.name == "local"));
+                let has_local_commands =
+                    func.body.commands.iter().any(
+                        |cmd| matches!(cmd, Command::BuiltinCommand(cmd) if cmd.name == "local"),
+                    );
 
                 if !has_local_commands {
                     // Generate parameter unpacking for the first parameter using proper @_ unpacking
@@ -1382,12 +1440,12 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     // of whether a param-name map (from name=$1 assignments) was built.
     let uses_pos = check_function_uses_positional_params(&func.body);
     if uses_pos {
-        // Replace $1 through $9 with $_[0] through $_[8]
-        for i in 1..=9 {
-            let old_ref = format!("${}", i);
-            let new_ref = format!("$_[{}]", i - 1);
-            body_code = body_code.replace(&old_ref, &new_ref);
-        }
+        // Replace $1 through $9 with $_[0] through $_[8] — but ONLY outside
+        // single-quoted Perl string literals.  Shell-out command strings are
+        // embedded as `'echo "$1" | tr a-z A-Z'` where `$1` is BASH syntax
+        // for the child's positional arg; rewriting it to `$_[0]` breaks the
+        // child.  A naive .replace("$1", ...) hits those literals too.
+        body_code = replace_positional_outside_quotes(&body_code);
     }
 
     // If we have named parameters, prepend a clean unpacking line and
@@ -1402,8 +1460,11 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
             .collect::<Vec<_>>()
             .join(", ");
         // Build the unpacking line
-        let unpack_line = format!("    my ({}) = @_;
-", params_str);
+        let unpack_line = format!(
+            "    my ({}) = @_;
+",
+            params_str
+        );
         output.push_str(&unpack_line);
 
         // Remove the individual `$x = $_[0];` lines since they're now
@@ -1434,7 +1495,6 @@ pub fn generate_function_impl(generator: &mut Generator, func: &Function) -> Str
     // literals.  The individual command generators should produce balanced
     // code; if they don't, a real imbalance will be caught by the Perl
     // interpreter (syntax error).
-
 
     // Restore nesting depth
     generator.fn_nesting_depth -= 1;
@@ -1474,7 +1534,7 @@ fn count_structural_braces(code: &str) -> (usize, usize) {
     let mut opens = 0usize;
     let mut closes = 0usize;
     let mut in_string = false;
-    let mut string_delim: Option<char> = None;  // None means not in string
+    let mut string_delim: Option<char> = None; // None means not in string
     let mut in_comment = false;
     // We use a simple state machine over characters.
     // This is not a full Perl tokenizer, but it handles the common cases
@@ -1566,6 +1626,49 @@ fn count_structural_braces(code: &str) -> (usize, usize) {
     (opens, closes)
 }
 
+/// Replace `$1`..`$9` with `$_[0]`..`$_[8]` in generated Perl, skipping
+/// single-quoted string literals (where `$1` is literal text — e.g. bash
+/// command strings embedded as `'echo "$1" | tr a-z A-Z'`).
+fn replace_positional_outside_quotes(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    let mut in_single = false;
+    while let Some(c) = chars.next() {
+        if in_single {
+            out.push(c);
+            if c == '\\' {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            } else if c == '\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        if c == '\'' {
+            in_single = true;
+            out.push(c);
+            continue;
+        }
+        if c == '$' {
+            // look ahead for a digit 1..=9
+            if let Some(d) = chars.peek() {
+                if let Some(n) = d.to_digit(10) {
+                    if (1..=9).contains(&n) {
+                        chars.next();
+                        out.push_str(&format!("$_[{}]", n - 1));
+                        continue;
+                    }
+                }
+            }
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn check_function_uses_positional_params(block: &Block) -> bool {
     for command in &block.commands {
         if check_command_uses_positional_params(command) {
@@ -1632,9 +1735,7 @@ fn check_command_uses_positional_params(command: &Command) -> bool {
         }
         Command::For(for_loop) => check_function_uses_positional_params(&for_loop.body),
         Command::While(while_loop) => check_function_uses_positional_params(&while_loop.body),
-        Command::Assignment(assign) => {
-            check_word_uses_positional_params(&assign.value)
-        }
+        Command::Assignment(assign) => check_word_uses_positional_params(&assign.value),
         Command::Redirect(redir) => check_command_uses_positional_params(&redir.command),
         Command::And(left, right) | Command::Or(left, right) => {
             check_command_uses_positional_params(left)
@@ -1643,7 +1744,9 @@ fn check_command_uses_positional_params(command: &Command) -> bool {
         Command::Subshell(c) | Command::Background(c) | Command::Not(c) => {
             check_command_uses_positional_params(c)
         }
-        Command::Return(w) => w.as_ref().map_or(false, |w| check_word_uses_positional_params(w)),
+        Command::Return(w) => w
+            .as_ref()
+            .map_or(false, |w| check_word_uses_positional_params(w)),
         Command::CStyleFor(c) => check_function_uses_positional_params(&c.body),
         _ => false,
     }
@@ -1741,10 +1844,15 @@ pub fn generate_block_commands_impl(generator: &mut Generator, block: &Block) ->
         // If the generated command ends with `}` without `;`, add a semicolon
         // so it can be used as a statement inside a `do { }` block.
         let trimmed = cmd_out.trim();
-        if trimmed.ends_with('}') && !trimmed.ends_with(';') && !trimmed.ends_with(";}")
-            && !trimmed.ends_with("};") && !trimmed.starts_with("if")
-            && !trimmed.starts_with("while") && !trimmed.starts_with("for")
-            && !trimmed.starts_with("foreach") && !trimmed.starts_with("sub")
+        if trimmed.ends_with('}')
+            && !trimmed.ends_with(';')
+            && !trimmed.ends_with(";}")
+            && !trimmed.ends_with("};")
+            && !trimmed.starts_with("if")
+            && !trimmed.starts_with("while")
+            && !trimmed.starts_with("for")
+            && !trimmed.starts_with("foreach")
+            && !trimmed.starts_with("sub")
         {
             output.push(';');
         }
@@ -1799,7 +1907,10 @@ fn generate_combined_test_condition(generator: &mut Generator, cmd: &Command) ->
                             body.push('\n');
                         }
                     }
-                    body.push_str(&combine(generator, &block.commands[block.commands.len() - 1]));
+                    body.push_str(&combine(
+                        generator,
+                        &block.commands[block.commands.len() - 1],
+                    ));
                     format!("do {{ {} }}", body)
                 }
             }
@@ -1814,7 +1925,10 @@ fn generate_combined_test_condition(generator: &mut Generator, cmd: &Command) ->
                     .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                     .trim_end_matches(';')
                     .to_string();
-                format!("!do {{ local $CHILD_ERROR; {} }}", c)
+                // End with the command's exit status so `!do { ... }` sees a
+                // value proportional to $CHILD_ERROR (the last expression of
+                // the generated command is not reliably the status).
+                format!("!do {{ local $CHILD_ERROR; {}; $CHILD_ERROR }}", c)
             }
         }
     }
@@ -1903,10 +2017,13 @@ pub fn collect_assigned_vars(cmd: &Command, vars: &mut std::collections::HashSet
 /// been declared in the generator.  This is used before conditional statements
 /// so that the `my` declaration sits outside the conditional body, satisfying
 /// Perl::Critic's `ProhibitConditionalDeclarations` policy.
-pub fn hoist_my_declarations(generator: &mut Generator, vars: &std::collections::HashSet<String>, output: &mut String) {
+pub fn hoist_my_declarations(
+    generator: &mut Generator,
+    vars: &std::collections::HashSet<String>,
+    output: &mut String,
+) {
     for var in vars {
-        if !generator.declared_locals.contains(var)
-            && !generator.function_level_vars.contains(var)
+        if !generator.declared_locals.contains(var) && !generator.function_level_vars.contains(var)
         {
             // Ensure there's a newline before the declaration if the output
             // doesn't end with one (avoids joining with a previous closing brace).
@@ -1930,7 +2047,12 @@ fn extract_read_vars_from_condition(cmd: &Command) -> Vec<String> {
                 if name == "read" {
                     for arg in &cmd.args {
                         if let Word::Literal(s, _) = arg {
-                            if s != "-r" && s != "-p" && s != "-n" && s != "-t" && !s.starts_with('-') {
+                            if s != "-r"
+                                && s != "-p"
+                                && s != "-n"
+                                && s != "-t"
+                                && !s.starts_with('-')
+                            {
                                 vars.push(s.clone());
                             }
                         }

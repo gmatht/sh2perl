@@ -193,6 +193,7 @@ pub fn generate_sort_command_with_output(
                 indices: vec![],
             }],
             expr: join_expr,
+            asm: None,
         };
         output.push_str(&stmt_to_perl(&stmt, indent_level));
     } else {

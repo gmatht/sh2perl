@@ -17,18 +17,27 @@ use crate::ir::IrStmt;
 
 pub type TransformFn = fn(&mut Vec<IrStmt>) -> bool;
 
+pub mod arith_forms;
+pub mod grep_o; // `grep -o PAT` → the generic grepMatches(text, pattern, flags) op
+pub mod process_subst;
+pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
 /// Registered transforms. The estree worker APPENDS entries here (and a
 /// `pub mod <name>;` above) when a worker-submitted transform is accepted
 /// into the crate. Each entry is (name, transform_fn).
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
-pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
         // (name, <name>::transform) — estree worker adds entries here
         ("sync-ok-loops", sync_ok_loops::transform),
         ("seq-range-for", seq_range_for::transform),
+        ("grep-o", grep_o::transform),
+        // process substitution: the estree corpus path never reaches this
+        // (estree.rs transform_cmd rewrites `<(...)` pre-IR) — it serves
+        // the --shir export and the A1 ingress (frontend-emitted JSON).
+        ("process-subst", process_subst::transform),
+        ("arith-forms", arith_forms::transform),
     ]
 }
 

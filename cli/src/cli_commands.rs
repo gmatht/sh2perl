@@ -1,6 +1,36 @@
 use debashl::ast::Word;
 use debashl::mir_simple::MirCommand;
 use debashl::{Generator, Lexer, Parser};
+
+/// The ESTree fallback emitted when the parser REJECTS a script: bash also
+/// rejects it (syntax error — every corpus file that reaches this path has
+/// bash exit 2 and empty stdout), so the transpiled program must reproduce
+/// the verdict: no stdout, exit 2 (the stderr diagnostic is not compared).
+/// Before this fallback the CLI printed nothing on stdout, the gate
+/// materialized an empty Program, and the runner exited 0 — "exit code
+/// (bash=2 estree=0)" failures for every parse-error corpus test.
+fn parse_error_estree_fallback() -> String {
+    serde_json::json!({
+        "type": "Program",
+        "sourceType": "module",
+        "body": [{
+            "type": "ExpressionStatement",
+            "expression": {
+                "type": "CallExpression",
+                "callee": {
+                    "type": "MemberExpression",
+                    "object": {"type": "Identifier", "name": "process"},
+                    "property": {"type": "Identifier", "name": "exit"},
+                    "computed": false,
+                    "optional": false
+                },
+                "arguments": [{"type": "Literal", "value": 2, "raw": "2"}],
+                "optional": false
+            }
+        }]
+    })
+    .to_string()
+}
 use std::fs;
 use std::io::Read;
 use std::io::Write;
@@ -93,7 +123,9 @@ pub fn parse_input(input: &str) {
 pub fn parse_file(filename: &str) {
     match read_cli_input(filename) {
         Ok(bytes) => {
-            parse_input(&String::from_utf8_lossy(&bytes));
+            // Preserve invalid bytes as PUA markers so the generator can
+            // re-emit them as `\xNN` byte escapes (byte-exact vs bash).
+            parse_input(&debashl::shared_utils::SharedUtils::bytes_to_marked_lossy(&bytes));
         }
         Err(e) => {
             println!("Error reading file {}: {}", filename, e);
@@ -107,10 +139,13 @@ pub fn parse_to_perl(input: &str) {
 }
 
 pub fn parse_to_perl_with_opts(input: &str, no_magic_numbers: Option<bool>) {
-    let mut generator = Generator::new();
-    if let Some(val) = no_magic_numbers {
-        generator.set_no_magic_numbers(val);
-    }
+    // The Perl backend consumes the shIR (the universal contract), NOT the
+    // AST directly — the AST-side Generator is the legacy text-builder that
+    // the shIR renderer supersedes (PLAN §3).  parse → ast_to_ir →
+    // shir_to_perl.  `no_magic_numbers` is a legacy-generator option the
+    // shIR path ignores (the shIR renderer never emits magic-number
+    // constants).
+    let _ = no_magic_numbers;
 
     // Check if debug is enabled before printing debug output
     if debashl::debug::is_debug_enabled() {
@@ -125,7 +160,8 @@ pub fn parse_to_perl_with_opts(input: &str, no_magic_numbers: Option<bool>) {
             return;
         }
     };
-    let perl_code = generator.generate(&commands);
+    let prog = debashl::shir::ast_to_ir(&commands);
+    let perl_code = debashl::ir::shir_to_perl(&prog);
     println!("Converting to Perl:");
     println!("{}", "=".repeat(50));
     println!("{}", perl_code);
@@ -423,7 +459,7 @@ fn extract_backticks_perl_logic(perl_code: &str) -> String {
 pub fn parse_file_to_perl(filename: &str) {
     match read_cli_input(filename) {
         Ok(bytes) => {
-            parse_to_perl(&String::from_utf8_lossy(&bytes));
+            parse_to_perl(&debashl::shared_utils::SharedUtils::bytes_to_marked_lossy(&bytes));
         }
         Err(e) => {
             println!("Error reading file {}: {}", filename, e);
@@ -485,6 +521,10 @@ pub fn parse_file_to_estree(filename: &str) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Parse error: {}", e);
+                    // bash rejects the same file (syntax error, exit 2, no
+                    // stdout) — emit the exit-2 fallback program so the
+                    // runner's verdict matches bash's.
+                    println!("{}", parse_error_estree_fallback());
                     return;
                 }
             };
@@ -496,6 +536,41 @@ pub fn parse_file_to_estree(filename: &str) {
                     // byte-identical by default (SH2_BC_NATIVE=1 to enable).
                     let json = if std::env::var("SH2_BC_NATIVE").is_ok() {
                         crate::bc_native::lower_bc_native(&json)
+                    } else {
+                        json
+                    };
+                    // Opt-in source-name $0 semantic (`--argv0-source <name>`):
+                    // bake `sh2.argv0 = '<name>'` as the first statement so the
+                    // translated JS identifies as the ORIGINAL bash file, whatever
+                    // the executor's temp file is called. Default (flag absent) =
+                    // argv0 pass-through — the executor supplies argv0 at run time
+                    // (estree-runner --source/--name). See
+                    // harness/argv0-tests/README.md for the two semantics.
+                    let json = if let Some(name) = crate::argv0_source() {
+                        match serde_json::from_str::<serde_json::Value>(&json) {
+                            Ok(mut v) => {
+                                let assign = serde_json::json!({
+                                    "type": "ExpressionStatement",
+                                    "expression": {
+                                        "type": "AssignmentExpression",
+                                        "operator": "=",
+                                        "left": {
+                                            "type": "MemberExpression",
+                                            "object": {"type": "Identifier", "name": "sh2"},
+                                            "property": {"type": "Identifier", "name": "argv0"},
+                                            "computed": false,
+                                            "optional": false
+                                        },
+                                        "right": {"type": "Literal", "value": name}
+                                    }
+                                });
+                                if let Some(body) = v.get_mut("body").and_then(|b| b.as_array_mut()) {
+                                    body.insert(0, assign);
+                                }
+                                v.to_string()
+                            }
+                            Err(_) => json,
+                        }
                     } else {
                         json
                     };
@@ -522,6 +597,18 @@ pub fn parse_file_to_shir(filename: &str) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Parse error: {}", e);
+                    // parse-gaps core request: a parse failure must never
+                    // produce EMPTY stdout (frontends die "invalid JSON:
+                    // EOF"). Emit the canonical empty Program — the same
+                    // shape `--shir` produces for an empty file — so the
+                    // A1 contract stays ingestible. Genuinely-incomplete
+                    // scripts (parse-paren-after-do.sh, parse-unexpected-
+                    // end-of-input.sh) are faithfully an empty program
+                    // (bash rejects them too).
+                    println!(
+                        "{}",
+                        debashl::shir_json::shir_to_shir_json(&debashl::shir::ast_to_ir(&[]))
+                    );
                     return;
                 }
             }
@@ -558,7 +645,15 @@ pub fn parse_shir_json_to_perl(filename: &str) {
 pub fn export_shir(input: &str, raw: bool) {
     let commands = match Parser::new(input).parse() {
         Ok(c) => c,
-        Err(e) => { eprintln!("Parse error: {}", e); return; }
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            // parse-gaps core request: graceful fallback — a parse failure
+            // emits the canonical empty Program (never empty stdout, which
+            // frontends read as "invalid JSON: EOF").
+            let json = debashl::shir_json::shir_to_shir_json(&debashl::shir::ast_to_ir(&[]));
+            if raw { print!("{}", json); } else { println!("{}", json); }
+            return;
+        }
     };
     let prog = debashl::shir::ast_to_ir(&commands);
     let json = debashl::shir_json::shir_to_shir_json(&prog);

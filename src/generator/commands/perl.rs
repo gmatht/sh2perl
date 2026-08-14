@@ -2,8 +2,8 @@ use crate::ast::SimpleCommand;
 use crate::ast::Word;
 use crate::generator::commands::system_commands::word_to_bash_string_for_system;
 use crate::generator::Generator;
-use crate::ir::IrStmt;
 use crate::ir::IrExpr;
+use crate::ir::IrStmt;
 use crate::ir::{stmt_to_perl, StrStyle};
 
 /// Simple transformation: replace bareword file handles in Perl code with lexical ones.
@@ -21,10 +21,12 @@ fn bareword_fh_to_lexical(code: &str) -> String {
     let bytes = result.as_bytes().to_vec();
     while i < bytes.len() {
         // look for "open" or "open("
-        if (i + 4 <= bytes.len() && &bytes[i..i+4] == b"open") {
+        if (i + 4 <= bytes.len() && &bytes[i..i + 4] == b"open") {
             // skip past "open" and any whitespace/parens
             let mut j = i + 4;
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'(' || bytes[j] == b'\n') {
+            while j < bytes.len()
+                && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'(' || bytes[j] == b'\n')
+            {
                 j += 1;
             }
             // check for uppercase identifier (filehandle name)
@@ -34,7 +36,12 @@ fn bareword_fh_to_lexical(code: &str) -> String {
             }
             if j > start {
                 let name = String::from_utf8_lossy(&bytes[start..j]).to_string();
-                if !names.contains(&name) && name != "STDIN" && name != "STDOUT" && name != "STDERR" && name.len() >= 1 {
+                if !names.contains(&name)
+                    && name != "STDIN"
+                    && name != "STDOUT"
+                    && name != "STDERR"
+                    && name.len() >= 1
+                {
                     names.push(name);
                 }
             }
@@ -53,16 +60,31 @@ fn bareword_fh_to_lexical(code: &str) -> String {
         // open NAME, -> open my $NAME, (but not "open my $NAME," already)
         result = result.replace(&format!("open {},", name), &format!("open my ${},", name));
         // while (<NAME>) -> while (<$NAME>)
-        result = result.replace(&format!("while (<{}>)", name), &format!("while (<${}>)", name));
+        result = result.replace(
+            &format!("while (<{}>)", name),
+            &format!("while (<${}>)", name),
+        );
         // (<NAME>) in other contexts -> (<$NAME>)
         // but be careful: close(NAME) -> close($NAME)
         result = result.replace(&format!("close({})", name), &format!("close(${})", name));
         result = result.replace(&format!("close {}", name), &format!("close ${}", name));
         // print NAME -> print {$NAME}
-        result = result.replace(&format!("print {} ", name), &format!("print {{${}}} ", name));
-        result = result.replace(&format!("print {}\n", name), &format!("print {{${}}}\n", name));
-        result = result.replace(&format!("print {};", name), &format!("print {{${}}};", name));
-        result = result.replace(&format!("print {} or", name), &format!("print {{${}}} or", name));
+        result = result.replace(
+            &format!("print {} ", name),
+            &format!("print {{${}}} ", name),
+        );
+        result = result.replace(
+            &format!("print {}\n", name),
+            &format!("print {{${}}}\n", name),
+        );
+        result = result.replace(
+            &format!("print {};", name),
+            &format!("print {{${}}};", name),
+        );
+        result = result.replace(
+            &format!("print {} or", name),
+            &format!("print {{${}}} or", name),
+        );
         // <NAME> (angle-bracket read from filehandle)
         result = result.replace(&format!("<{}>", name), &format!("<${}>", name));
     }
@@ -92,7 +114,13 @@ fn bareword_fh_to_lexical(code: &str) -> String {
                 }
                 // Simplified approach: scan for mode characters after the match
                 let mut mode_pos = abs + pat.len();
-                while mode_pos < rb.len() && (rb[mode_pos] == b'>' || rb[mode_pos] == b'<' || rb[mode_pos] == b'&' || rb[mode_pos] == b'|' || rb[mode_pos] == b'-') {
+                while mode_pos < rb.len()
+                    && (rb[mode_pos] == b'>'
+                        || rb[mode_pos] == b'<'
+                        || rb[mode_pos] == b'&'
+                        || rb[mode_pos] == b'|'
+                        || rb[mode_pos] == b'-')
+                {
                     mode_pos += 1;
                 }
                 if mode_pos > abs + pat.len() {
@@ -202,16 +230,10 @@ pub fn generate_perl_command(generator: &mut Generator, cmd: &SimpleCommand) -> 
 
             // Generate proper Perl -ne loop with in-place editing
             if !inplace_ext.is_empty() {
-                output.push_str(&format!(
-                    "local $^I = '{}';\n",
-                    inplace_ext
-                ));
+                output.push_str(&format!("local $^I = '{}';\n", inplace_ext));
             }
             if !file_args.is_empty() {
-                output.push_str(&format!(
-                    "local @ARGV = ({});\n",
-                    file_args.join(", ")
-                ));
+                output.push_str(&format!("local @ARGV = ({});\n", file_args.join(", ")));
             }
             output.push_str("while (<>) {\n");
             generator.indent_level += 1;
@@ -344,10 +366,7 @@ pub fn generate_perl_pipeline_command(
         output.push_str(&format!("my ${} = q{{}};\n", output_var));
 
         if is_ne {
-            output.push_str(&format!(
-                "for my $line (split /\\n/, ${}) {{\n",
-                input_var
-            ));
+            output.push_str(&format!("for my $line (split /\\n/, ${}) {{\n", input_var));
             output.push_str(&format!("    $_ = \"$line\\n\";\n"));
         } else {
             output.push_str(&format!("$_ = ${};\n", input_var));
