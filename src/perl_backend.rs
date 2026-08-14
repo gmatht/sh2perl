@@ -484,13 +484,14 @@ impl Render {
                                             }
                                             out.push_str(&self.shell_var_ref(&name));
                                         } else if !lit.is_empty() {
+                                            // inside the "..."-quoted
+                                            // segment the ref interpolates
+                                            // BARE (the `'` wrapping would
+                                            // become literal quotes)
                                             let mut seg = String::from("\"");
                                             seg.push_str(&sh_dq_escape(&lit));
                                             lit.clear();
-                                            seg.push_str(&format!(
-                                                "'{}'",
-                                                self.var_ref(&name)
-                                            ));
+                                            seg.push_str(&self.var_ref(&name));
                                             seg.push('"');
                                             out.push_str(&seg);
                                         } else {
