@@ -20,7 +20,7 @@ fn main() {
     let cmds = parse_commands_from_text(&src).expect("parse");
     let prog = ast_to_ir_raw(&cmds);
     let out = if es100 || color {
-        shir_to_glsl_opts(&prog, &ShGlslOptions { es100, color_out: color })
+        shir_to_glsl_opts(&prog, &ShGlslOptions { es100, color_out: color, ..Default::default() })
     } else {
         shir_to_glsl(&prog)
     };
