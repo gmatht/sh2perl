@@ -69,6 +69,16 @@ pub enum Stmt {
         test: Expr,
         body: Box<Stmt>,
     },
+    /// The A1 contract's post-test loop (core request
+    /// c-sh-go-20260814-111815): `do { body } while (test)` — the body
+    /// runs at least once, then the condition is re-checked (the While
+    /// arm's pre-test shape). Emitted by the c-sh-go frontend for C
+    /// `do-while` / `repeat-until` (until=true → the test is the
+    /// negated cond).
+    DoWhileStatement {
+        test: Expr,
+        body: Box<Stmt>,
+    },
     /// The native numeric-range loop — `for (let i = lo; i <= hi; i++)`
     /// — the `seq_range_for` transform's target (the hand-js ideal for
     /// `for i in $(seq lo hi)`). init is a `VariableDeclaration`
@@ -433,6 +443,13 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
                 .collect(),
         },
         Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
+            test: fix_expr(test, in_arrow, in_func),
+            body: Box::new(
+                fix_stmt(*body, in_arrow, in_func, false)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+            ),
+        },
+        Stmt::DoWhileStatement { test, body } => Stmt::DoWhileStatement {
             test: fix_expr(test, in_arrow, in_func),
             body: Box::new(
                 fix_stmt(*body, in_arrow, in_func, false)
@@ -845,6 +862,10 @@ fn hoist_stmt(stmt: Stmt) -> Stmt {
             test,
             body: Box::new(hoist_stmt(*body)),
         },
+        Stmt::DoWhileStatement { test, body } => Stmt::DoWhileStatement {
+            test,
+            body: Box::new(hoist_stmt(*body)),
+        },
         Stmt::TryStatement {
             block,
             handler,
@@ -941,6 +962,9 @@ fn body_tail_write(body: &Stmt) -> Option<i64> {
 fn loop_tail_hoist(stmt: &Stmt) -> Option<(Stmt, i64)> {
     let (body, n) = match stmt {
         Stmt::WhileStatement { body, .. } => (body, body_tail_write(body)?),
+        // a do-while body provably runs at least once — the tail hoist
+        // is valid exactly as for the (provably-runs) For loops
+        Stmt::DoWhileStatement { body, .. } => (body, body_tail_write(body)?),
         Stmt::ForStatement { body, .. } => {
             let n = body_tail_write(body)?;
             if !for_provably_runs(stmt) {
@@ -965,6 +989,10 @@ fn loop_tail_hoist(stmt: &Stmt) -> Option<(Stmt, i64)> {
     }
     let new_stmt = match stmt {
         Stmt::WhileStatement { test, .. } => Stmt::WhileStatement {
+            test: test.clone(),
+            body: Box::new(stripped),
+        },
+        Stmt::DoWhileStatement { test, .. } => Stmt::DoWhileStatement {
             test: test.clone(),
             body: Box::new(stripped),
         },
@@ -1387,6 +1415,10 @@ fn walk_stmt_exprs(stmt: &Stmt, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
             walk_expr(test, in_fn, f);
             walk_stmt_exprs(body, in_fn, f);
         }
+        Stmt::DoWhileStatement { test, body, .. } => {
+            walk_expr(test, in_fn, f);
+            walk_stmt_exprs(body, in_fn, f);
+        }
         Stmt::TryStatement {
             block,
             handler,
@@ -1734,6 +1766,10 @@ fn lower_stmt(stmt: Stmt, natives: &std::collections::HashSet<String>) -> Stmt {
             test: lower_expr(test, natives),
             body: Box::new(lower_stmt(*body, natives)),
         },
+        Stmt::DoWhileStatement { test, body } => Stmt::DoWhileStatement {
+            test: lower_expr(test, natives),
+            body: Box::new(lower_stmt(*body, natives)),
+        },
         Stmt::TryStatement {
             block,
             handler,
@@ -2072,6 +2108,10 @@ fn drop_nested_flags(stmt: &mut Stmt) {
             }
         }
         Stmt::WhileStatement { test, body } => {
+            drop_expr_flags(test);
+            drop_stmt_flags(body);
+        }
+        Stmt::DoWhileStatement { test, body } => {
             drop_expr_flags(test);
             drop_stmt_flags(body);
         }
@@ -4914,6 +4954,9 @@ fn stmt_read(st: &Stmt, name: &str, shadowed: bool) -> bool {
                 })
         }
         Stmt::WhileStatement { test, body } => {
+            expr_read(test, name, shadowed) || stmt_read(body, name, shadowed)
+        }
+        Stmt::DoWhileStatement { test, body } => {
             expr_read(test, name, shadowed) || stmt_read(body, name, shadowed)
         }
         Stmt::TryStatement {
