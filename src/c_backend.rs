@@ -1899,6 +1899,33 @@ impl Render {
                     // shell text form: NAME=$(( ... )) / NAME='value'
                     if let Some(t) = targets.first() {
                         if t.indices.is_empty() {
+                            // a capture RHS: run it ONCE and store into
+                            // the C var — later site text reads the C
+                            // var (`_sh_word((__ps_tmp0 ...))`), so the
+                            // child-bash-only assign would leave it NULL
+                            // and the downstream commands would see ""
+                            if let IrExpr::Call { func, args } = expr {
+                                if func == "capture" || func == "captureWords" {
+                                    let cap = self.capture_call(args);
+                                    let id = self.c_ident(&t.var);
+                                    self.store.insert(t.var.clone());
+                                    self.emit(&format!("{id} = {cap};"));
+                                    self.emit(&format!(
+                                        "_sh_addraw({});",
+                                        Self::cstr(&format!("{}=", t.var))
+                                    ));
+                                    let v = format!("({id} ? {id} : \"\")");
+                                    match buf {
+                                        CmdBuf::Shared => {
+                                            self.emit(&format!("_sh_word({v});"))
+                                        }
+                                        CmdBuf::Private(bid) => self.emit(&format!(
+                                            "_sh_bword(&_c{bid}_cmd, &_c{bid}_cap, {v});"
+                                        )),
+                                    }
+                                    continue;
+                                }
+                            }
                             self.emit(&format!(
                                 "_sh_addraw({});",
                                 Self::cstr(&format!("{}=", t.var))
@@ -2481,18 +2508,27 @@ impl Render {
         for rd in redirects {
             let mode = rd.mode.as_str();
             let fd = rd.fd.unwrap_or(1);
-            let _fd_pre = if fd == 1 { String::new() } else { format!("{fd}") };
+            let fd_pre = if fd == 1 { String::new() } else { format!("{fd}") };
             match mode {
                 "w" => {
-                    raw(self, ">");
+                    // `2>&1` — the target is a fd reference: no quoting
+                    // (a quoted `'&1'` would name a file)
+                    if let crate::ir::IrExpr::Str(t, _) = &rd.target {
+                        if t.starts_with('&') {
+                            raw(self, &format!("{fd_pre}>"));
+                            add(self, t); // NO leading space: `2>&1`
+                            continue;
+                        }
+                    }
+                    raw(self, &format!("{fd_pre}>"));
                     self.sh_word(buf, &rd.target);
                 }
                 "a" => {
-                    raw(self, ">>");
+                    raw(self, &format!("{fd_pre}>>"));
                     self.sh_word(buf, &rd.target);
                 }
                 "r" | "r+" => {
-                    raw(self, "<");
+                    raw(self, &format!("{fd_pre}<"));
                     self.sh_word(buf, &rd.target);
                 }
                 "heredoc" | "heredoc-tabs" => {
