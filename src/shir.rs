@@ -364,24 +364,27 @@ fn redirect_call_touches_fd1(args: &[IrExpr]) -> bool {
 /// a redirect carrying any of them must stay on the async `redirect`
 /// path (the sync twin would throw "redirection needs the async
 /// redirect bridge" at runtime).
-fn redirect_specs_sync_ok(specs: &[(i64, &str, &IrExpr)]) -> bool {
-    specs
-        .iter()
-        .all(|(_, _, t)| matches!(t, IrExpr::Str(s, _) if s.starts_with('&')))
+///
+/// (2026-08-14 audit — ELIGIBILITY WIDENED to ALL targets: the runtime's
+/// `redirectSync` shares `_applyRedirectSpecs` with the async `redirect`
+/// and every mode it handles is synchronous — fd-dups are fd-table
+/// operations, heredocs/herestrings are in-memory string targets,
+/// `r`-mode does `fs.existsSync`, `w`/`a`-mode does the eager
+/// `openSync`/`closeSync` check, body writes go through the sync
+/// `writeFileSync` emitter and `readFileSync` reader, and dynamic
+/// targets resolve via the sync `expandWord`. The "async fs bridge"
+/// throw this function's original comment described never existed in
+/// sh2-namespace.mjs (verified against the full git history). The only
+/// remaining async reason is an AWAIT in the lowered body or specs —
+/// which the callers already check separately (expr_has_await).)
+fn redirect_specs_sync_ok(_specs: &[(i64, &str, &IrExpr)]) -> bool {
+    true
 }
 
 /// The expr-position `redirect` CALL form: the same verdict over the
 /// spec OBJECTS (see [`redirect_specs_sync_ok`]).
-fn redirect_call_sync_ok(args: &[IrExpr]) -> bool {
-    let [_, IrExpr::Array(spec_objs)] = args else {
-        return false;
-    };
-    spec_objs.iter().all(|so| match so {
-        IrExpr::Object(props) => props.iter().any(|(k, v)| {
-            k == "target" && matches!(v, IrExpr::Str(s, _) if s.starts_with('&'))
-        }),
-        _ => false,
-    })
+fn redirect_call_sync_ok(_args: &[IrExpr]) -> bool {
+    true
 }
 /// Whether the program contains a PERSISTENT fd-1 redirect (a bare
 /// `exec >file` / `exec 1>&2` / `exec 1>&-` — the runtime keeps those in
@@ -15002,6 +15005,34 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // (native arith numbers) — the store must stay
                     // string-typed (the runtime String()s every value).
                     let ve = expr_to_estree(expr);
+                    // `i=$((i+2))` / `((i=5))` / cstyle init/step with a
+                    // STORE-BOUND target: the arith-assign expr lowers to
+                    // `(sh2.setVar(n, String(v)), <read-back>)` — the inner
+                    // setVar is the arith's own store write, and the
+                    // read-back re-reads it, so the outer setVar below would
+                    // re-write the SAME value (String(Number(canonical
+                    // string)) — identical digits, provably: the inner
+                    // value is always String(<finite JS number>)). Drop the
+                    // redundant outer write and append `true` — the
+                    // statement value the errexit guard consumes (the old
+                    // outer setVar returned true; the guard's
+                    // `errexit && !v` check must never fire on a successful
+                    // assignment).
+                    if let Expr::SequenceExpression { expressions } = &ve {
+                        if let [head, ..] = expressions.as_slice() {
+                            if sh2_callee_name(head) == Some("setVar")
+                                && sh2_name_arg(head) == Some(target.var.as_str())
+                            {
+                                let mut exprs = expressions.clone();
+                                exprs.push(bool_lit(true));
+                                return Some(Stmt::ExpressionStatement {
+                                    expression: Expr::SequenceExpression {
+                                        expressions: exprs,
+                                    },
+                                });
+                            }
+                        }
+                    }
                     let native = target.indices.is_empty()
                         && native_store_write_ok(&target.var)
                         && call_free_expr(&ve).is_some();
@@ -16385,18 +16416,18 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     .map(|r| redirect_spec_to_estree(r, persist))
                     .collect(),
             );
-            let call = if expr_has_await(&body)
-                || expr_has_await(&specs)
-                || !redirect_specs_sync_ok(&redirect_specs)
-            {
+            let call = if expr_has_await(&body) || expr_has_await(&specs) {
                 await_call("redirect", vec![body, specs])
             } else {
                 // *Sync twin (see the generic call arm): an await-free
-                // body AND literal (await-free) redirect targets run
-                // through the sync runtime twin — the same spec
-                // install/restore/persist logic, no per-call promise.
-                // ONLY fd-dup (`&N`) specs qualify: file targets need
-                // the async fs bridge (redirect_specs_sync_ok).
+                // body AND await-free (literal or dynamic) redirect
+                // targets run through the sync runtime twin — the same
+                // spec install/restore/persist logic, no per-call
+                // promise. Every spec mode is synchronous in the
+                // runtime's _applyRedirectSpecs (see
+                // redirect_specs_sync_ok — the eligibility audit); the
+                // only async reason is an await in the body or specs,
+                // checked above.
                 sh2_call("redirectSync", vec![sync_arrow_flip(body), specs])
             };
             Stmt::ExpressionStatement { expression: call }
@@ -31229,6 +31260,10 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                 if SYNC_TWIN_CALLS.contains(&callee_name)
                     && mapped_args.iter().all(|a| !expr_has_await(a))
                     && (callee_name != "redirect" || redirect_call_sync_ok(args))
+                    // redirect: ALL spec targets are sync-capable in
+                    // the runtime twin (redirect_call_sync_ok — the
+                    // eligibility audit; the await-free args check
+                    // above is the only gate).
                 {
                     sh2_call(
                         &format!("{callee_name}Sync"),

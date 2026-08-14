@@ -3798,14 +3798,16 @@ mod tests {
         assert!(!json.contains("\"name\":\"builtin\""));
         assert!(!json.contains("unsupported"));
         // non-echo bodies keep the runtime redirect — `ls` is a sync
-        // builtin, but a FILE target needs the async fs bridge, so the
-        // redirect stays on the async `redirect` path (the sync twin
-        // redirectSync handles ONLY fd-dup `&N` targets — the runtime's
-        // sync twin would throw "redirection needs the async redirect
-        // bridge" for a file path; see redirect_specs_sync_ok)
+        // builtin and the FILE target is sync-capable in the runtime's
+        // `redirectSync` twin (every _applyRedirectSpecs mode is
+        // synchronous — fs.existsSync/openSync/writeFileSync; the
+        // "async fs bridge" throw the fd-dup-only rule described never
+        // existed in sh2-namespace.mjs — see redirect_specs_sync_ok),
+        // so the await-free body + literal target lowers to the sync
+        // twin: no per-call promise, no microtask.
         let json2 = to_json("ls > out.txt");
-        assert!(json2.contains("\"name\":\"redirect\""));
-        assert!(!json2.contains("\"name\":\"redirectSync\""));
+        assert!(json2.contains("\"name\":\"redirectSync\""));
+        assert!(!json2.contains("\"name\":\"redirect\""));
         // Property keys serialize as {key: Identifier{name}, value: Literal}.
         assert!(json2.contains("\"name\":\"mode\""));
         assert!(json2.contains("\"value\":\"w\""));
@@ -3813,6 +3815,31 @@ mod tests {
         assert!(json2.contains("\"value\":1"));
         assert!(json2.contains("\"type\":\"ObjectExpression\""));
         assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn file_target_redirect_lowers_to_sync_twin() {
+        // `cat file.txt > out.txt` — a sync builtin body with a literal
+        // FILE target lowers to the runtime's `redirectSync` twin (the
+        // eligibility audit: every _applyRedirectSpecs mode is
+        // synchronous — existsSync/openSync/writeFileSync — so the
+        // await-free body is the only gate; see
+        // redirect_specs_sync_ok).
+        let json = to_json("cat file.txt > out.txt");
+        assert!(json.contains("\"name\":\"redirectSync\""));
+        assert!(!json.contains("\"name\":\"redirect\""));
+        // a DYNAMIC target that lowers await-free (the `$(pwd)` twin is
+        // a native `sh2.cwd` read — no capture) also qualifies.
+        let json2 = to_json("ls > \"$(pwd)/x\"");
+        assert!(json2.contains("\"name\":\"redirectSync\""));
+        assert!(!json2.contains("\"name\":\"redirect\""));
+        // a target whose cmdsub is a real capture (`$(cat ...)` — an
+        // await in the specs) keeps the async `redirect` path: the sync
+        // twin cannot wait for the capture before installing the spec.
+        let json3 = to_json("ls > \"$(cat /etc/hostname)\"");
+        assert!(json3.contains("\"name\":\"redirect\""));
+        assert!(!json3.contains("\"name\":\"redirectSync\""));
+        assert!(!json3.contains("unsupported"));
     }
 
     #[test]
@@ -3964,6 +3991,37 @@ mod tests {
         let json4 = to_json("((i++))");
         assert!(!json4.contains("\"name\":\"setVar\""));
         assert!(!json4.contains("\"name\":\"getVar\""));
+    }
+
+    #[test]
+    fn store_bound_arith_assign_skips_redundant_outer_write() {
+        // `(( i += 2 ))` with a STORE-BOUND target (the dynamic-key
+        // subscript `options["$key"]` keeps `i` store-bound): the
+        // arith-assign expr lowers to `(sh2.setVar(n, String(v)),
+        // <read-back>)` — the inner setVar is the arith's own store
+        // write and the read-back re-reads it, so the old emission's
+        // OUTER statement setVar re-wrote the same value
+        // (`setVar("i", (setVar("i", ...), ...))`). The outer call is
+        // dropped; the sequence keeps a trailing `true` (the statement
+        // value the errexit guard consumes — the old outer setVar
+        // returned true).
+        let src = "complex_function() {\n\
+            local -a args=(\"$@\")\n\
+            local -A options=()\n\
+            local i=0\n\
+            while (( i < ${#args[@]} )); do\n\
+                local key=\"${args[i]#--}\"\n\
+                options[\"$key\"]=\"true\"\n\
+                (( i += 2 ))\n\
+            done\n\
+            echo \"Processed ${#options[@]} options\"\n\
+        }\n\
+        complex_function --flag1 --option1=value1 -abc";
+        let json = to_json(src);
+        // the `(( i += 2 ))` writes the store ONCE (the inner arith
+        // write); the redundant outer setVar is gone
+        assert_eq!(json.matches("\"name\":\"setVar\"").count(), 2);
+        assert!(!json.contains("\"value\":\"i\"},{\"type\":\"SequenceExpression\""));
     }
 
     #[test]
@@ -4357,10 +4415,12 @@ mod tests {
         let json = to_json("IFS=, read a b c <<< \"1,2,3\"");
         // the redirect wraps the env-carrying read (the env stays on the
         // command; the no-op `true` split is gone) — a herestring target
-        // needs the async fs bridge (the sync twin handles only fd-dup
-        // `&N` targets), so the redirect stays on the async path
-        assert!(json.contains("\"name\":\"redirect\""));
-        assert!(!json.contains("\"name\":\"redirectSync\""));
+        // is an in-memory string target, sync-capable in the runtime
+        // twin, so the await-free body lowers to `redirectSync` (the
+        // fd-dup-only eligibility rule was retired — see
+        // redirect_specs_sync_ok)
+        assert!(json.contains("\"name\":\"redirectSync\""));
+        assert!(!json.contains("\"name\":\"redirect\""));
         assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("\"value\":\"read\""));
         // the env object's property key is an Identifier (prop() renders
@@ -4415,11 +4475,13 @@ mod tests {
         let json2 = to_json("mapfile -t lines < <(printf 'x\\ny\\n')");
         assert!(!json2.contains("\"name\":\"unsupported\""));
         assert!(!json2.contains("\"value\":\"unsupported\""));
-        // the producer + mapfile body are both sync builtins, but the
-        // process-substitution fd-0 target is NOT an fd-dup — the async
-        // `redirect` path (the sync twin handles only `&N` targets)
-        assert!(json2.contains("\"name\":\"redirect\""));
-        assert!(!json2.contains("\"name\":\"redirectSync\""));
+        // the producer + mapfile body are both sync builtins and the
+        // process-substitution fd-0 target is a here-string in-memory
+        // target — sync-capable in the runtime twin, so the redirect
+        // lowers to the sync path (the fd-dup-only rule was retired —
+        // see redirect_specs_sync_ok)
+        assert!(json2.contains("\"name\":\"redirectSync\""));
+        assert!(!json2.contains("\"name\":\"redirect\""));
         assert!(json2.contains("\"name\":\"builtin\""));
     }
 }
