@@ -426,6 +426,17 @@ fn arr_expand_call(name: &str) -> String {
 }
 
 fn arr_keys_call(name: &str) -> String {
+    // `${!prefix@}` — a PREFIX-match of variable NAMES (bash lists the
+    // vars starting with `prefix`); the per-element helpers cannot scan
+    // names, so enumerate the shell's variables at runtime
+    if let Some(prefix) = name.strip_suffix('*') {
+        if !prefix.is_empty() {
+            let p = prefix.replace('\'', "'\\''");
+            return format!(
+                "$(for _kv in $(set | sed 's/=.*//'); do case \"$_kv\" in '{p}'*) printf '%s\\n' \"$_kv\";; esac; done)"
+            );
+        }
+    }
     if ASSOC_VARS.lock().unwrap().contains(name) {
         format!("$(_arr_keys_k {name})")
     } else {
@@ -1656,7 +1667,7 @@ fn assign_to_sh(targets: &[crate::ir::AssignTarget], expr: &IrExpr) -> Result<St
                 let key_sh = if is_assoc {
                     dynamic_key_sh(idx)
                 } else {
-                    format!("$(({idx}))")
+                    format!("$(({}))", protect_key_arith(idx))
                 };
                 out.push_str(&format!(
                     "eval \"{base}_{key_sh}=\"$(printf '%s' {rhs})\"\"; {base}_len=$(( ${{{base}_len:-0}} + 1 ))"
@@ -3396,6 +3407,9 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
             if let Ok(w) = word_to_sh(plain[0]) {
                 if w.starts_with("$( ( printf '%s' \"$((")
                     || w.starts_with("\"$( ( printf '%s' \"$((")
+                    // ${!prefix*[@]} — bash ALWAYS fails the expansion
+                    // (bad substitution) and skips the echo
+                    || w.starts_with("\"$(for _kv in")
                 {
                     // quote the guard: an unquoted FAILED cmdsub vanishes
                     // entirely (`[ -n ]` tests the literal -n)
@@ -4222,7 +4236,7 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
                     let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
                         eval_key(&k)
                     } else {
-                        format!("$(({k}))")
+                        format!("$(({}))", protect_key_arith(&k))
                     };
                     Ok(format!(
                         "$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")"
@@ -4337,7 +4351,7 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                     let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
                         eval_key(idx)
                     } else {
-                        format!("$(({idx}))")
+                        format!("$(({}))", protect_key_arith(idx))
                     };
                     return Ok(format!(
                         "$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")"
@@ -4489,7 +4503,7 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                     let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
                         eval_key(idx)
                     } else {
-                        format!("$(({idx}))")
+                        format!("$(({}))", protect_key_arith(idx))
                     };
                     return Ok(format!(
                         "$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}{op}{pat}}}\\\"\")"
@@ -4536,7 +4550,7 @@ fn param_to_sh(args: &[IrExpr], list: bool) -> Result<String, String> {
                 {
                     key
                 } else {
-                    format!("$(({key}))")
+                    format!("$(({}))", protect_key_arith(&key))
                 };
                 let name_rw = format!("{base_n}_{key_sh}");
                 let def_rw = rewrite_array_text(&default);
@@ -4702,9 +4716,14 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
                 if key == "@" || key == "*" {
                     Ok(arr_expand_call(arr_base(&name)))
                 } else if key.contains(['$', '(']) {
+                    let base = arr_base(&name);
+                    let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
+                        eval_key(&key)
+                    } else {
+                        format!("$(({}))", protect_key_arith(&key))
+                    };
                     Ok(format!(
-                        "$(eval \"printf '%s' \\\"\\${{{}_{key}}}\\\"\")",
-                        arr_base(&name)
+                        "$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")"
                     ))
                 } else {
                     Ok(format!("${{{}}}", elem_name(arr_base(&name), &key)))
@@ -4835,6 +4854,45 @@ fn case_pattern(p: &str) -> String {
 /// are not part of a shell name or expansion syntax become `_` so the
 /// eval'd name matches elem_name()'s mangling of the same key text
 /// (`matrix[$i,$j]` -> `matrix_$i_$j` -> eval -> `matrix_0_0`).
+
+/// `$var` / `${var}` expansions inside an arithmetic subscript: an UNSET
+/// var expands to EMPTY, and `$(( ))` is a FATAL dash error (bash
+/// treats the empty subscript as 0). `:-0` supplies the zero; bare
+/// identifiers are fine (dash treats unset names as 0).
+fn protect_key_arith(idx: &str) -> String {
+    let mut out = String::new();
+    let b = idx.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c == '$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') {
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            out.push_str(&format!("${{{}}}:-0}}", &idx[i + 1..j]));
+            i = j;
+            continue;
+        }
+        if c == '$' && i + 1 < b.len() && b[i + 1] == b'{' {
+            if let Some(rel) = idx[i..].find('}') {
+                let close = i + rel;
+                let inner = &idx[i + 2..close];
+                if !inner.contains(":-") {
+                    out.push_str(&format!("${{{inner}:-0}}"));
+                } else {
+                    out.push_str(&idx[i..=close]);
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 fn eval_key(key: &str) -> String {
     let mut out = String::new();
     let b = key.as_bytes();
@@ -5340,7 +5398,7 @@ fn arith_rewrite(t: &str) -> String {
                         if !base.is_empty()
                             && base.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
                         {
-                            out.push_str(&format!("${{{base}_len}}"));
+                            out.push_str(&format!("$( _num \"${{{base}_len}}\" )"));
                             i = close + 1;
                             continue;
                         }
