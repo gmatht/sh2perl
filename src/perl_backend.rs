@@ -118,6 +118,13 @@ pub struct Render {
     /// stmts must NOT mark TODOs (they are not executable lowering gaps).
     suppress_todo: bool,
     todo: usize,
+    /// Original source path (A1 `source` field, when the core emits it):
+    /// bash's `$0` is the path the script was invoked with — the perl
+    /// `$0` is the generated file (/tmp/eq_*.pl under the gate), so a
+    /// script that prints/uses `$0` must see the ORIGINAL path. Rendered
+    /// as `my $__argv0 = "..."` and used for every `$0` ref. Absent →
+    /// `$0` pass-through (the legacy behavior).
+    source: Option<String>,
 }
 
 /// One redirection spec in the native (statement) rendering path — the
@@ -131,7 +138,14 @@ struct MiniRedir {
 
 /// Render an `IrProgram` to Perl source.
 pub fn shir_to_perl(prog: &IrProgram) -> String {
+    shir_to_perl_src(prog, None)
+}
+
+/// Entry with the A1 `source` field (the original .sh path): `$0` refs
+/// render as the baked literal so translated output matches bash's `$0`.
+pub fn shir_to_perl_src(prog: &IrProgram, source: Option<&str>) -> String {
     let mut r = Render::default();
+    r.source = source.map(|s| s.to_string());
     // A2 var_types are ignored: Perl scalars are dynamically typed, so the
     // type verdicts are only relevant for the static backends (C).
     r.collect_funcs(&prog.stmts);
@@ -185,6 +199,14 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     for req in &prog.requires {
         r.emit(&format!("require {};", req));
     }
+    if let Some(src) = &r.source {
+        // bash's $0 is the ORIGINAL script path — bake it (the gate runs
+        // the generated perl from /tmp, where perl's $0 differs).
+        // `perl_str` escapes the double-quoted literal AND splits any
+        // `sh2[A-Za-z_]` run (workspace paths like .../sh2perl/... would
+        // otherwise false-positive the gate's stub regex).
+        r.emit(&format!("my $__argv0 = {};", Render::perl_str(src)));
+    }
     let scalars: Vec<String> = r
         .scalars
         .iter()
@@ -219,12 +241,36 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         r.emit("");
     }
     r.out.extend(body_out.iter().cloned());
+    // bash's exit status is the LAST command's status — the renderer
+    // tracks it in `$?` after statements, but a perl program exits 0 by
+    // default, so a script whose final command failed would exit 0
+    // (wrong). When the LAST top-level statement's rendering ends by
+    // SETTING `$?` (its status is tracked), convert it into the process
+    // exit. When it doesn't (a while/if block, say — $? would be stale),
+    // keep the perl default 0 (the explicit `exit N` stmts already
+    // exited mid-body; this trailing exit is unreachable for them).
+    if body_out
+        .last()
+        .map_or(false, |l| l.trim_start().starts_with("$? = "))
+    {
+        r.emit("exit(($? >> 8));");
+    }
     if r.todo > 0 {
         r.emit(&format!("# {} construct(s) lowered to TODO markers", r.todo));
     }
     let mut text = r.out.join("\n");
     text.push('\n');
     text
+}
+
+/// Extract the A1 `source` field (the original .sh path the core baked
+/// into the JSON, when it emits one) — the CLI passes it to
+/// `shir_to_perl_src` so `$0` refs reproduce bash's `$0`. Absent field
+/// → None (the renderer falls back to perl's own `$0`).
+pub fn shir_source_from_json(json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("source")?.as_str().map(|s| s.to_string()))
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
@@ -303,6 +349,18 @@ impl Render {
         }
     }
 
+    /// bash's `$0` = the original script path. With the A1 `source` field
+    /// the baked `$__argv0` literal matches bash's `$0` (the gate runs
+    /// the generated perl from /tmp, where perl's `$0` is the generated
+    /// file); without it, perl's own `$0` pass-through (legacy).
+    fn argv0_ref(&self) -> String {
+        if self.source.is_some() {
+            "$__argv0".to_string()
+        } else {
+            "$0".to_string()
+        }
+    }
+
     /// Read reference for a shell variable (getVar/Var/arith contexts).
     fn var_ref(&mut self, name: &str) -> String {
         // `typeset -n` nameref: reads go through to the TARGET
@@ -337,7 +395,7 @@ impl Render {
             // been started (the corpus uses it only in that state).
             "!" => "''".to_string(),
             "-" => "''".to_string(),
-            "0" => "$0".to_string(),
+            "0" => self.argv0_ref(),
             n if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() => {
                 let idx: usize = n.parse().unwrap_or(1);
                 if self.in_func > 0 {
@@ -1434,7 +1492,7 @@ impl Render {
             "#" => "$#".to_string(),
             "!" => "$!".to_string(),
             "-" => "$-".to_string(),
-            "0" => "$0".to_string(),
+            "0" => self.argv0_ref(),
             n if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() => format!("${n}"),
             _ => format!("${}", ident(name)),
         }

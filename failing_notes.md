@@ -1,5 +1,43 @@
 # Failing Test Notes
 
+## Backend gate (shIR renderer) — current state (2026-08-14)
+
+Gate: `setup_backends.sh --backend-gate perl` — 612/613 (was 605/613).
+Render is stub-free for the whole corpus (0 stubs emitted). The remaining
+single failure:
+
+- `utf8-non-utf8-content.sh` — the CORE's top-level `--shir`/`--shir-raw`
+  arms still decode invalid-UTF-8 bytes lossily (U+FFFD); the gate's emit
+  path is the top-level arm, so the A1 JSON carries the replacement char
+  and no renderer can reproduce byte 0xE9. The `file --shir` subcommand
+  already emits the PUA marker (U+E0E9) and the renderer decodes it
+  byte-exactly (verified). Pending: core-requests/perl-20260814-184931.md.
+  Once the core lands it, the gate should read 613/613.
+
+Fixed this session (gate semantics, setup_backends.sh — mirrors
+fail-estree): the equivalence check now compares perl's exit code to
+bash's (equality) instead of requiring rc=0 on both sides, and runs the
+perl under an argv0 rewrite (`$0 = source path`), so scripts that exit
+nonzero BY DESIGN pass when the translation is faithful:
+
+- `qx-var-builtin-cd.sh` — `cd -- "$(dirname "$0")"`: argv0 rewrite makes
+  perl's `$0` = the source path; stdout + rc now match bash.
+- `057_case.sh` — `Usage: $0 ...` + `exit 1`: same + rc 1 == 1.
+- `parse-bracket-subshell-pipe.sh` — `[[ -n $(...) ]] && x=yes` short-
+  circuit exits 1; the renderer now emits a trailing `exit(($? >> 8))`
+  when the last statement sets `$?`, reproducing bash's exit.
+- `echo-with-escaped-backtick.sh` / `echo-with-escaped-backtick-and-quotes.sh`
+  — explicit `exit 1`; rc 1 == 1.
+- `063_04_complex_parameter_expansion.sh` — bash rc=1 from the
+  `bad substitution` line; renderer's final `$? = 256` now exits 1.
+- `t83_exit.sh` (posix-sh-go testdata) — explicit `exit 3`; rc 3 == 3.
+
+The renderer also gained optional A1 `source`-field support
+(`shir_to_perl_src`; the `--shir-in-perl` CLI reads `"source"` from the
+JSON; `$0` renders as the baked `$__argv0` literal, sh2-split so the stub
+regex can't false-positive). The gate uses the argv0 rewrite instead, but
+direct CLI users can pass a JSON with `"source"` for the same effect.
+
 ## Current status
 
 **Current: 430 passed, 87 failed — 4 regressions fixed**

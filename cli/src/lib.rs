@@ -982,10 +982,15 @@ exit $main_exit_code;
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
+            // A1 `source` field (the original .sh path): bake it so `$0`
+            // refs reproduce bash's `$0` (the gate runs the generated
+            // perl from /tmp, where perl's own $0 differs). Absent →
+            // legacy `$0` pass-through.
+            let source = debashl::perl_backend::shir_source_from_json(&content);
             // Worktree-local renderer (branch backend/perl): the full ShIR
             // vocabulary renders without panicking (unsupported constructs
             // become `# TODO(unsupported)` markers).
-            print!("{}", debashl::perl_backend::shir_to_perl(&prog));
+            print!("{}", debashl::perl_backend::shir_to_perl_src(&prog, source.as_deref()));
 
         }
         "--mir" => {
