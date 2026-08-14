@@ -89,7 +89,13 @@ pub fn arith_mentions_true64(a: &ArithAst) -> bool {
             ArithAst::Cond { test, then, else_, .. } => {
                 mentions(test) || mentions(then) || mentions(else_)
             }
-            ArithAst::Assign { rhs, .. } => mentions(rhs),
+            ArithAst::Assign { var, rhs, .. } => {
+                // the TARGET matters too: `((x = 5))` on an Int64 x must
+                // wrap the RHS literal (BigInt("5")) — the assignment's
+                // value is the RHS, and a plain Number literal would round
+                // past 2^53
+                mentions(rhs) || true64_int_var(var) || slot_var_index(var).is_some()
+            }
             ArithAst::IncDec { var, .. } => true64_int_var(var) || slot_var_index(var).is_some(),
             ArithAst::Sizeof(_) | ArithAst::Num(_) => false,
             ArithAst::Cast { arg, .. } => mentions(arg),
@@ -294,6 +300,10 @@ static AND_OR_DEPTH: Mutex<usize> = Mutex::new(0);
 /// +/- into the arithEval boundary) can go fully native — NaN reaches
 /// the wrapper and converts to the bash empty result.
 static ARITH_POISON_DEPTH: Mutex<usize> = Mutex::new(0);
+/// The render-time i53/`--true64` leaf-wrap depth (see
+/// [`arith_to_estree_wrapped`]): 0 = the top-level call, which owns the
+/// mention-wrap; nested calls skip it (the tree is already wrapped).
+static ARITH_WRAP_DEPTH: Mutex<usize> = Mutex::new(0);
 /// Native-echo emission depth: >0 while lowering inside a construct whose
 /// runtime stdout sink differs from the module's stdout — `redirect` /
 /// `pipeline` / `capture` / `captureWords` calls (the runtime swaps
@@ -5251,6 +5261,427 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
         }
     }
     (int_vars, slots)
+}
+
+/// The i53 ESCALATION analysis (Task 1 — the optimistic width rule):
+/// which vars' ranges are PROVEN out of ±2^53 (so JS Number would round
+/// them — `x=9007199254740993; echo $((x+1))` prints 9007199254740992
+/// today) and whose every write is a PROVEN-INTEGER write, so the BigInt
+/// home (`--true64`'s non-slot Int64 machinery) never sees a non-integer
+/// runtime value — `BigInt("")`/`BigInt("abc")` would THROW where
+/// `Number(x)||0` coerces to 0. This is the "escalate" tier of
+/// `choose_width`: vars NOT proven big stay JS Numbers (the optimistic
+/// default — the SH2_ASSUME_I53 assumption, see [`i53_escalation_enabled`]);
+/// `--true64`'s analyze_true64 is the CONSERVATIVE superset (every
+/// unproven numeric var escalates).
+///
+/// Proven-integer writes: `Assign`/`setVar` with Int / integer-string /
+/// Arith sources (bash arith ALWAYS yields an integer — non-numeric
+/// operands coerce to 0), the runtime `assign` compound form, and
+/// `local x=<int>`-style exec args (the `name=value` shape). EVERY other
+/// write rejects the var: unproven-string sources (getVar/param/capture/
+/// Interpolate), `read`/`getopts`/`unset`/`eval` args, indexed assigns,
+/// and any write inside a Function/Subshell/Background/Pipeline body (the
+/// JS closure binding is shared — a non-integer write there would poison
+/// the BigInt home too). Case/Redirect/Try/loop bodies are parent-scope
+/// and classify normally.
+pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
+    let ranges = analyze_var_ranges(prog);
+    let mut candidates: HashSet<String> = ranges
+        .iter()
+        .filter(|(_, (lo, hi))| *lo < -SAFE_NUMBER || *hi > SAFE_NUMBER)
+        .map(|(n, _)| n.clone())
+        .collect();
+    if candidates.is_empty() {
+        return candidates;
+    }
+
+    // a write's value class: ProvenInt (always an integer), Reject
+    // (unproven — the var may hold a non-integer at runtime)
+    enum W {
+        ProvenInt,
+        Reject,
+    }
+    fn write_val(e: &IrExpr, candidates: &HashSet<String>) -> Option<W> {
+        match e {
+            IrExpr::Int(_) => Some(W::ProvenInt),
+            // an integer string literal
+            IrExpr::Str(sv, _) => {
+                if sv.trim().parse::<i64>().is_ok() {
+                    Some(W::ProvenInt)
+                } else {
+                    Some(W::Reject)
+                }
+            }
+            // bash arith ALWAYS yields an integer (non-numeric operands
+            // coerce to 0)
+            IrExpr::Arith(_) => Some(W::ProvenInt),
+            // a read of another candidate: the BigInt home holds an
+            // integer; any other var's value is unproven
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                if candidates.contains(n) {
+                    Some(W::ProvenInt)
+                } else {
+                    Some(W::Reject)
+                }
+            }
+            _ => Some(W::Reject),
+        }
+    }
+
+    // per-var write verdicts: false = a reject write was seen
+    fn mark_ok(ok: &mut HashMap<String, bool>, name: &str, w: W) {
+        match w {
+            W::ProvenInt => {
+                ok.entry(name.to_string()).or_insert(true);
+            }
+            W::Reject => {
+                ok.insert(name.to_string(), false);
+            }
+        }
+    }
+    // mark every var written by the exec arg list: `name` (read-builtin /
+    // unset / bare word — the runtime may store anything) rejects,
+    // `name=<int>` (local x=5) proves, `name=<non-int>` rejects. Over-
+    // marking is conservative (a non-write marked Reject only blocks an
+    // escalation, never unsound).
+    fn exec_write_args(args: &[IrExpr], ok: &mut HashMap<String, bool>) {
+        for a in args {
+            match a {
+                IrExpr::Array(elems) => exec_write_args(elems, ok),
+                IrExpr::Object(props) => {
+                    for (_, v) in props {
+                        exec_write_args(std::slice::from_ref(v), ok);
+                    }
+                }
+                IrExpr::Str(sv, _) => {
+                    let mut it = sv.splitn(2, '=');
+                    let name = it.next().unwrap_or("");
+                    if name.is_empty()
+                        || !name
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        continue;
+                    }
+                    let w = match it.next() {
+                        None => W::Reject, // `read x` / `unset x` / bare word
+                        Some(v) => {
+                            if v.trim().parse::<i64>().is_ok() {
+                                W::ProvenInt
+                            } else {
+                                W::Reject
+                            }
+                        }
+                    };
+                    match w {
+                        W::ProvenInt => {
+                            ok.entry(name.to_string()).or_insert(true);
+                        }
+                        W::Reject => {
+                            ok.insert(name.to_string(), false);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    fn reject(ok: &mut HashMap<String, bool>, names: &[String]) {
+        for n in names {
+            ok.insert(n.clone(), false);
+        }
+    }
+    fn reject_assigned(s: &IrStmt, ok: &mut HashMap<String, bool>) {
+        match s {
+            IrStmt::Assign { targets, .. } => {
+                for t in targets {
+                    ok.insert(t.var.clone(), false);
+                }
+            }
+            IrStmt::Expr(IrExpr::Call { func, args }) => {
+                if func == "setVar" || func == "assign" {
+                    if let [IrExpr::Str(n, _), ..] = args.as_slice() {
+                        ok.insert(n.clone(), false);
+                    }
+                } else if func == "exec" {
+                    exec_write_args(args, ok);
+                } else if func == "arith" {
+                    // the runtime evaluates the arith text — every ident
+                    // may be written with an unproven value
+                    for a in args {
+                        if let IrExpr::Str(t, _) = a {
+                            for w in t.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                                if !w.is_empty()
+                                    && w.chars().next().is_some_and(|c| {
+                                        c.is_ascii_alphabetic() || c == '_'
+                                    })
+                                {
+                                    ok.insert(w.to_string(), false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Redirect { inner: b, .. } => {
+                for s in b {
+                    reject_assigned(s, ok);
+                }
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                for s in then {
+                    reject_assigned(s, ok);
+                }
+                for (_, arm) in elsifs {
+                    for s in arm {
+                        reject_assigned(s, ok);
+                    }
+                }
+                for s in else_ {
+                    reject_assigned(s, ok);
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::DoWhile { body, .. } => {
+                for s in body {
+                    reject_assigned(s, ok);
+                }
+            }
+            IrStmt::ForInit {
+                init, step, body, ..
+            } => {
+                for s in init {
+                    reject_assigned(s, ok);
+                }
+                for s in step {
+                    reject_assigned(s, ok);
+                }
+                for s in body {
+                    reject_assigned(s, ok);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for s in &c.body {
+                        reject_assigned(s, ok);
+                    }
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for s in body {
+                    reject_assigned(s, ok);
+                }
+                for e in excepts {
+                    for s in &e.body {
+                        reject_assigned(s, ok);
+                    }
+                }
+                for s in else_body {
+                    reject_assigned(s, ok);
+                }
+                for s in finally_body {
+                    reject_assigned(s, ok);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // one walk: classify every write site
+    fn walk(s: &IrStmt, ok: &mut HashMap<String, bool>, candidates: &HashSet<String>) {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if targets.len() == 1 && targets[0].indices.is_empty() {
+                    let w = write_val(expr, candidates);
+                    let name = &targets[0].var;
+                    match w {
+                        Some(W::ProvenInt) => {
+                            ok.entry(name.clone()).or_insert(true);
+                        }
+                        _ => {
+                            ok.insert(name.clone(), false);
+                        }
+                    }
+                } else {
+                    reject(ok, &targets.iter().map(|t| t.var.clone()).collect::<Vec<_>>());
+                }
+            }
+            IrStmt::Expr(IrExpr::Call { func, args }) => {
+                if func == "setVar" {
+                    if let [IrExpr::Str(name, _), e] = args.as_slice() {
+                        match write_val(e, candidates) {
+                            Some(W::ProvenInt) => {
+                                ok.entry(name.clone()).or_insert(true);
+                            }
+                            _ => {
+                                ok.insert(name.clone(), false);
+                            }
+                        }
+                    }
+                } else if func == "assign" {
+                    // the runtime compound arith form always stores an
+                    // integer
+                    if let [IrExpr::Str(name, _), ..] = args.as_slice() {
+                        ok.entry(name.clone()).or_insert(true);
+                    }
+                } else if func == "exec" {
+                    exec_write_args(args, ok);
+                } else if func == "arith" {
+                    for a in args {
+                        if let IrExpr::Str(t, _) = a {
+                            for w in t.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                                if !w.is_empty()
+                                    && w.chars().next().is_some_and(|c| {
+                                        c.is_ascii_alphabetic() || c == '_'
+                                    })
+                                {
+                                    ok.insert(w.to_string(), false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            IrStmt::Function { body, .. } => {
+                // a function body may write the global binding (dynamic
+                // scope) — every write there rejects (locals, unproven
+                // values, shadowing all possible)
+                let mut fok: HashMap<String, bool> = HashMap::new();
+                for s in body {
+                    reject_assigned(s, &mut fok);
+                }
+                reject(ok, &fok.keys().cloned().collect::<Vec<_>>());
+            }
+            IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                // the JS closure shares the binding — a child-scope write
+                // of a non-integer would poison the BigInt home
+                let mut bok: HashMap<String, bool> = HashMap::new();
+                for s in b {
+                    reject_assigned(s, &mut bok);
+                }
+                reject(ok, &bok.keys().cloned().collect::<Vec<_>>());
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    let mut pok: HashMap<String, bool> = HashMap::new();
+                    for s in st {
+                        reject_assigned(s, &mut pok);
+                    }
+                    reject(ok, &pok.keys().cloned().collect::<Vec<_>>());
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    for s in &c.body {
+                        reject_assigned(s, ok);
+                    }
+                }
+            }
+            IrStmt::Declare { vars, .. } => {
+                reject(ok, &vars.iter().map(|v| v.name.clone()).collect::<Vec<_>>());
+            }
+            IrStmt::DeclareArray { var, .. } => {
+                ok.insert(var.clone(), false);
+            }
+            IrStmt::Exec { env, .. } => {
+                for (n, _) in env {
+                    ok.insert(n.clone(), false);
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Redirect { inner: b, .. } => {
+                for s in b {
+                    walk(s, ok, candidates);
+                }
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                for s in then {
+                    walk(s, ok, candidates);
+                }
+                for (_, arm) in elsifs {
+                    for s in arm {
+                        walk(s, ok, candidates);
+                    }
+                }
+                for s in else_ {
+                    walk(s, ok, candidates);
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::DoWhile { body, .. } => {
+                for s in body {
+                    walk(s, ok, candidates);
+                }
+            }
+            IrStmt::ForInit {
+                init, step, body, ..
+            } => {
+                for s in init {
+                    walk(s, ok, candidates);
+                }
+                for s in step {
+                    walk(s, ok, candidates);
+                }
+                for s in body {
+                    walk(s, ok, candidates);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for s in &c.body {
+                        walk(s, ok, candidates);
+                    }
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for s in body {
+                    walk(s, ok, candidates);
+                }
+                for e in excepts {
+                    for s in &e.body {
+                        walk(s, ok, candidates);
+                    }
+                }
+                for s in else_body {
+                    walk(s, ok, candidates);
+                }
+                for s in finally_body {
+                    walk(s, ok, candidates);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ok: HashMap<String, bool> = HashMap::new();
+    for s in &prog.stmts {
+        walk(s, &mut ok, &candidates);
+    }
+    candidates.retain(|v| ok.get(v).copied().unwrap_or(false));
+    candidates
 }/// The FRONTEND's integer arithmetic domain, not the storage width:
 /// bash is signed-64-bit wrapped, so a provable range never leaves
 /// [i64::MIN, i64::MAX] — an op/literal that can cross it is top (None).
@@ -5751,14 +6182,51 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         IrStmt::Assign { targets, expr, .. } if targets.len() == 1 && targets[0].indices.is_empty() => {
             let name = targets[0].var.clone();
             state.insert(name, ir_range(expr, state));
+            // in-expression arith writes (`x=$((x++))`, `((x+=1))` — the
+            // Assign's RANGE is the expression's VALUE; the write updates
+            // the var's post-statement state (the IncDec postfix value is
+            // the OLD value, the var's own state the NEW one)
+            if let IrExpr::Arith(a) = expr {
+                arith_stmt_writes(a, state);
+            }
         }
         // multi-target / indexed assignments — no single-variable range
         IrStmt::Assign { .. } => {}
-        IrStmt::Expr(IrExpr::Call { func, args })
-            if func == "setVar" && matches!(args.as_slice(), [IrExpr::Str(_, _), _]) =>
-        {
-            if let [IrExpr::Str(name, _), e] = args.as_slice() {
-                state.insert(name.clone(), ir_range(e, state));
+        // setVar(name, v) — the plain write; `assign(name, op, v)` — the
+        // runtime compound form (v+=1, a && v=x): both name the target
+        // first and store the ARITHMETIC result (always an integer).
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" || func == "assign" => {
+            if let [IrExpr::Str(name, _), ..] = args.as_slice() {
+                state.insert(name.clone(), ir_range(args.last().unwrap(), state));
+                if let Some(IrExpr::Arith(a)) = args.last() {
+                    arith_stmt_writes(a, state);
+                }
+            }
+        }
+        // `local x=<int>` / `declare x=<int>` — the exec name=value shape:
+        // a provable integer write (the same parsing the escalation's
+        // write-provenance walker uses).
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+            if let [IrExpr::Str(name, _), IrExpr::Array(items)] = args.as_slice() {
+                if matches!(name.as_str(), "local" | "declare" | "readonly" | "export" | "typeset") {
+                    for it in items {
+                        if let IrExpr::Str(sv, _) = it {
+                            let mut parts = sv.splitn(2, '=');
+                            if let (Some(n), Some(v)) = (parts.next(), parts.next()) {
+                                if let Ok(nv) = v.trim().parse::<i64>() {
+                                    if !n.is_empty()
+                                        && n.chars().next().is_some_and(|c| {
+                                            c.is_ascii_alphabetic() || c == '_'
+                                        })
+                                        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                    {
+                                        state.insert(n.to_string(), Some((nv as i128, nv as i128)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         IrStmt::Block(stmts) => {
@@ -5981,28 +6449,89 @@ fn ir_range(e: &IrExpr, state: &HashMap<String, Range>) -> Range {
     }
 }
 
+/// bash's 64-bit wrap: the SIGNED value of `v mod 2^64` (bash arithmetic
+/// is intmax_t, wrapping at 2^64 — `$((2**63))` is -2^63).
+fn wrap64(v: i128) -> i64 {
+    let m = 1i128 << 64;
+    let w = v.rem_euclid(m); // [0, 2^64)
+    if w >= (1i128 << 63) {
+        (w - m) as i64
+    } else {
+        w as i64
+    }
+}
+
+/// The wrapped interval of a TRUE-value interval [lo, hi] (bash int64
+/// wrap): exact when the interval spans < 2^64 and contains no wrap
+/// point (a value ≡ 2^63 mod 2^64 — the signedness fold, where the
+/// sawtooth jumps 2^63-1 → -2^63); a point is always exact. Otherwise
+/// the full i64 domain (sound — the wrapped set straddles the fold).
+fn wrap_interval(lo: i128, hi: i128) -> (i128, i128) {
+    if lo == hi {
+        let w = wrap64(lo);
+        return (w as i128, w as i128);
+    }
+    let p = 1i128 << 64;
+    let m = 1i128 << 63;
+    if hi - lo >= p {
+        return (i64::MIN as i128, i64::MAX as i128);
+    }
+    // count of integers ≡ m (mod p) inside [lo, hi]
+    let cnt = (hi - m).div_euclid(p) - (lo - m - 1).div_euclid(p);
+    if cnt > 0 {
+        (i64::MIN as i128, i64::MAX as i128)
+    } else {
+        (wrap64(lo) as i128, wrap64(hi) as i128)
+    }
+}
+
+/// `b**e` in i128 (checked): the exact true value, or None when it does
+/// not fit i128 (the wrapped interval is then provably any i64 — the
+/// caller's full-domain fallback).
+fn pow_i128(b: i128, e: i128) -> Option<i128> {
+    if e == 0 {
+        return Some(1);
+    }
+    if b == 0 || b == 1 {
+        return Some(b);
+    }
+    if b == -1 {
+        return Some(if e % 2 == 0 { 1 } else { -1 });
+    }
+    // |b| >= 2: b^e fits i128 only for e <= 127 (2^127 max); a larger
+    // exponent is provably out of the wrapped domain (full i64).
+    if e > 127 {
+        return None;
+    }
+    b.checked_pow(e as u32)
+}
+
+/// The exact wrapped interval of `x op y` over range operands whose true
+/// interval is [lo, hi] (all ops: + - * are monotone in each endpoint;
+/// the wrapped interval is exact when it contains no fold point).
 fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
     match a {
         ArithAst::Num(i) => Some((*i as i128, *i as i128)),
         ArithAst::Var(n) => state.get(n).copied().flatten(),
+        // a lifted binding read (A1 Ident) — same state lookup as Var
+        ArithAst::Ident(n) => state.get(n).copied().flatten(),
         ArithAst::Bin { op, lhs, rhs } => {
             let (l, r) = (arith_range(lhs, state)?, arith_range(rhs, state)?);
             let (l0, l1, r0, r1) = (l.0, l.1, r.0, r.1);
-            // the interval of the op, provably within the frontend's
-            // integer domain; a result that can leave it (wrap) is top
-            let res = match op.as_str() {
-                "+" => Some((l0.checked_add(r0)?, l1.checked_add(r1)?)),
-                "-" => Some((l0.checked_sub(r1)?, l1.checked_sub(r0)?)),
+            let res: Range = match op.as_str() {
+                "+" => Some(wrap_interval(l0 + r0, l1 + r1)),
+                "-" => Some(wrap_interval(l0 - r1, l1 - r0)),
                 "*" => {
-                    // min/max over all four endpoint products; None on overflow
-                    let ps = [
-                        l0.checked_mul(r0)?,
-                        l0.checked_mul(r1)?,
-                        l1.checked_mul(r0)?,
-                        l1.checked_mul(r1)?,
-                    ];
-                    Some((*ps.iter().min()?, *ps.iter().max()?))
+                    // min/max over all four endpoint products
+                    let ps = [l0 * r0, l0 * r1, l1 * r0, l1 * r1];
+                    Some(wrap_interval(*ps.iter().min()?, *ps.iter().max()?))
                 }
+                // integer division truncates toward zero (Rust i128 /
+                // matches bash); the quotient of two i64 values fits i64
+                // (no wrap), and the extrema sit at the endpoints (div is
+                // monotone in each operand while the divisor keeps its
+                // sign). MIN / -1 = 2^63 is bash's "division by -1" abort
+                // (not representable) — None.
                 "/" => {
                     if r0 <= 0 && r1 >= 0 {
                         return None; // possible division by zero
@@ -6013,22 +6542,283 @@ fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
                         l1.checked_div(r0)?,
                         l1.checked_div(r1)?,
                     ];
-                    Some((*qs.iter().min()?, *qs.iter().max()?))
+                    let (lo, hi) = (*qs.iter().min()?, *qs.iter().max()?);
+                    in_domain((lo, hi)).then_some((lo, hi))
                 }
-                _ => None, // % , ^, ... conservative
+                // modulo: |x % d| < |d|, sign follows the dividend
+                // (truncated); a point dividend and divisor compute the
+                // exact wrapped value
+                "%" => {
+                    if r0 <= 0 && r1 >= 0 {
+                        return None; // possible division by zero (abort)
+                    }
+                    if l0 == l1 && r0 == r1 {
+                        let q = if r0 == 0 { return None; } else { l0 % r0 };
+                        return Some((q, q));
+                    }
+                    let m = r0.abs().max(r1.abs());
+                    if l0 >= 0 {
+                        Some((0, m - 1))
+                    } else if l1 <= 0 {
+                        Some((-(m - 1), 0))
+                    } else {
+                        Some((-(m - 1), m - 1))
+                    }
+                }
+                // exponentiation: bash wraps mod 2^64; a negative
+                // exponent aborts the expansion (None). Point base/exp
+                // compute the exact wrapped value; a nonneg point base
+                // over an exponent range is monotone (checked i128 pow);
+                // a negative point base takes the two largest exponents
+                // (the parity extremes).
+                "**" => {
+                    if r0 < 0 {
+                        return None; // exponent less than 0 — bash aborts
+                    }
+                    match (l0 == l1, r0 == r1) {
+                        (true, true) => {
+                            let v = pow_i128(l0, r0)?;
+                            Some(wrap_interval(v, v))
+                        }
+                        (true, false) => {
+                            let b = l0;
+                            let (e0, e1) = (r0, r1);
+                            match b {
+                                0 => Some(if e0 == 0 { (0, 1) } else { (0, 0) }),
+                                1 => Some((1, 1)),
+                                -1 => Some(if e0 == e1 {
+                                    let v = if e0 % 2 == 0 { 1 } else { -1 };
+                                    (v, v)
+                                } else {
+                                    (-1, 1)
+                                }),
+                                b if b > 1 => {
+                                    let hi = pow_i128(b, e1)?;
+                                    Some(wrap_interval(pow_i128(b, e0)?, hi))
+                                }
+                                b => {
+                                    // b <= -2: the magnitude extremes are
+                                    // the two largest exponents (opposite
+                                    // parities)
+                                    let hi = pow_i128(b, e1)?;
+                                    let lo = pow_i128(b, e1 - 1)?;
+                                    Some(wrap_interval(lo.min(hi), lo.max(hi)))
+                                }
+                            }
+                        }
+                        (false, true) => {
+                            let e = r0;
+                            if l0 >= 0 {
+                                let hi = pow_i128(l1, e)?;
+                                Some(wrap_interval(pow_i128(l0, e)?, hi))
+                            } else if l1 < 0 {
+                                if e % 2 == 1 {
+                                    // odd exponent: x^e is increasing
+                                    let hi = pow_i128(l1, e)?;
+                                    Some(wrap_interval(pow_i128(l0, e)?, hi))
+                                } else {
+                                    // even exponent: b^e = |b|^e, and
+                                    // |b| ∈ [|l1|, |l0|] (l0 ≤ l1 < 0)
+                                    let lo = pow_i128(l1.abs(), e)?;
+                                    let mx = pow_i128(l0.abs(), e)?;
+                                    Some(wrap_interval(lo, mx))
+                                }
+                            } else {
+                                // 0 ∈ [l0, l1]: even e → [0, max^e]; odd
+                                // e → increasing over the sign change
+                                let mx = pow_i128(l0.abs().max(l1.abs()), e)?;
+                                if e % 2 == 1 {
+                                    Some(wrap_interval(pow_i128(l0, e)?, pow_i128(l1, e)?))
+                                } else {
+                                    Some(wrap_interval(0, mx))
+                                }
+                            }
+                        }
+                        (false, false) => None, // conservative
+                    }
+                }
+                // shifts: bash masks the count mod 64 (1<<64 = 1,
+                // 1<<-1 = 1<<63) — arithmetic << on the wrapped value;
+                // >> is sign-extending (arithmetic). A point count over
+                // a range is monotone; a range count is conservative.
+                "<<" => {
+                    if r0 != r1 {
+                        return None;
+                    }
+                    let c = r0.rem_euclid(64) as u32;
+                    Some(wrap_interval(l0 << c, l1 << c))
+                }
+                ">>" => {
+                    if r0 != r1 {
+                        return None;
+                    }
+                    let c = r0.rem_euclid(64) as u32;
+                    Some((l0 >> c, l1 >> c))
+                }
+                // bitwise ops on wrapped values: points are exact; the
+                // nonneg-interval forms are sound (AND: result ≤ both
+                // operands, ≥ 0; OR: ≥ both, ≤ the OR of the maxima —
+                // OR is monotone in the numeric order; XOR: between 0
+                // and the OR of the maxima). Negatives: conservative.
+                "&" => {
+                    if l0 == l1 && r0 == r1 {
+                        return Some((wrap64(l0 & r0) as i128, wrap64(l0 & r0) as i128));
+                    }
+                    if l0 >= 0 && r0 >= 0 {
+                        Some((0, l1.min(r1)))
+                    } else {
+                        None
+                    }
+                }
+                "|" => {
+                    if l0 == l1 && r0 == r1 {
+                        return Some((wrap64(l0 | r0) as i128, wrap64(l0 | r0) as i128));
+                    }
+                    if l0 >= 0 && r0 >= 0 {
+                        Some((l0.max(r0), l1 | r1))
+                    } else {
+                        None
+                    }
+                }
+                "^" => {
+                    if l0 == l1 && r0 == r1 {
+                        return Some((wrap64(l0 ^ r0) as i128, wrap64(l0 ^ r0) as i128));
+                    }
+                    if l0 >= 0 && r0 >= 0 {
+                        Some((0, l1 | r1))
+                    } else {
+                        None
+                    }
+                }
+                // comparisons and logicals yield bash's 0/1
+                "<" | "<=" | ">" | ">=" | "==" | "!=" | "&&" | "||" => Some((0, 1)),
+                _ => None,
             };
             res.filter(|&r| in_domain(r))
         }
         ArithAst::Un { op, arg } => {
             let (lo, hi) = arith_range(arg, state)?;
-            let res = match op.as_str() {
-                "-" => Some((-hi, -lo)),
+            let res: Range = match op.as_str() {
+                // ~x = -x-1 (two's complement, any width) — fits i64
+                "~" => Some((-hi - 1, -lo - 1)),
+                "!" => Some((0, 1)),
+                "-" => Some(wrap_interval(-hi, -lo)),
                 "+" => Some((lo, hi)),
                 _ => None,
             };
             res.filter(|&r| in_domain(r))
         }
-        _ => None, // Index / Cond / Assign / IncDec — step 2
+        // lazy conditional: the result is the taken branch's value — a
+        // provably-constant test picks the branch, else the join
+        ArithAst::Cond { test, then, else_ } => {
+            match arith_range(test, state) {
+                Some((0, 0)) => arith_range(else_, state),
+                Some((lo, hi)) if lo >= 1 || hi <= -1 => arith_range(then, state),
+                _ => join(arith_range(then, state), arith_range(else_, state)),
+            }
+        }
+        // the assignment's VALUE is the new value (bash semantics): the
+        // rhs for `=`; the current value op the rhs for the compound ops
+        ArithAst::Assign { var, op, rhs } => {
+            let r = arith_range(rhs, state)?;
+            match op.as_str() {
+                "=" => Some(r),
+                "+=" => {
+                    let (lo, hi) = state.get(var).copied().flatten()?;
+                    Some(wrap_interval(lo + r.0, hi + r.1))
+                }
+                "-=" => {
+                    let (lo, hi) = state.get(var).copied().flatten()?;
+                    Some(wrap_interval(lo - r.1, hi - r.0))
+                }
+                "*=" => {
+                    let (lo, hi) = state.get(var).copied().flatten()?;
+                    let ps = [lo * r.0, lo * r.1, hi * r.0, hi * r.1];
+                    Some(wrap_interval(*ps.iter().min()?, *ps.iter().max()?))
+                }
+                _ => None,
+            }
+        }
+        // ++/--: the expression's VALUE is the old value (postfix) or the
+        // new one (prefix); the var's own post-state is always new (the
+        // caller's [`arith_stmt_writes`] applies it)
+        ArithAst::IncDec { var, delta, prefix } => {
+            let (lo, hi) = state.get(var).copied().flatten()?;
+            if *prefix {
+                Some(wrap_interval(lo + *delta as i128, hi + *delta as i128))
+            } else {
+                Some((lo, hi))
+            }
+        }
+        // an array element read is unprovable
+        ArithAst::Index { .. } => None,
+        // C-frontend casts: the wrapped value of the inner expression
+        ArithAst::Cast { arg, .. } => arith_range(arg, state),
+        ArithAst::Sizeof(ty) => {
+            let n = ty.c_sizeof().unwrap_or(4) as i128;
+            Some((n, n))
+        }
+    }
+}
+
+/// Apply the WRITES an arith expression performs (`x=…`, `x+=…`, `x++`)
+/// to the statement-level range state (pre-order — an outer write's RHS
+/// may read a var an inner write changes, but the common shapes are
+/// sequential). The expression's own VALUE is arith_range's job; this is
+/// the var's post-statement state.
+fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>) {
+    match a {
+        ArithAst::Assign { var, op, rhs } => {
+            let r = arith_range(rhs, state);
+            let next: Range = match op.as_str() {
+                "=" => r,
+                "+=" => match (state.get(var).copied().flatten(), r) {
+                    (Some((lo, hi)), Some(r)) => Some(wrap_interval(lo + r.0, hi + r.1)),
+                    _ => None,
+                },
+                "-=" => match (state.get(var).copied().flatten(), r) {
+                    (Some((lo, hi)), Some(r)) => Some(wrap_interval(lo - r.1, hi - r.0)),
+                    _ => None,
+                },
+                "*=" => match (state.get(var).copied().flatten(), r) {
+                    (Some((lo, hi)), Some(r)) => {
+                        let ps = [lo * r.0, lo * r.1, hi * r.0, hi * r.1];
+                        Some(wrap_interval(
+                            *ps.iter().min().unwrap_or(&0),
+                            *ps.iter().max().unwrap_or(&0),
+                        ))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(nv) = next {
+                state.insert(var.clone(), Some(nv));
+            } else {
+                state.insert(var.clone(), None);
+            }
+            arith_stmt_writes(rhs, state);
+        }
+        ArithAst::IncDec { var, delta, .. } => {
+            let next = match state.get(var).copied().flatten() {
+                Some((lo, hi)) => Some(wrap_interval(lo + *delta as i128, hi + *delta as i128)),
+                None => None,
+            };
+            state.insert(var.clone(), next);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_stmt_writes(lhs, state);
+            arith_stmt_writes(rhs, state);
+        }
+        ArithAst::Un { arg, .. } => arith_stmt_writes(arg, state),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_stmt_writes(test, state);
+            arith_stmt_writes(then, state);
+            arith_stmt_writes(else_, state);
+        }
+        ArithAst::Cast { arg, .. } => arith_stmt_writes(arg, state),
+        ArithAst::Index { key, .. } => arith_stmt_writes(key, state),
+        _ => {}
     }
 }
 
@@ -8406,7 +9196,24 @@ fn arith_has_poison(a: &ArithAst) -> bool {
 /// assignments, `let`/`(( ))` statements, array keys) lowers the WHOLE
 /// expression through this wrapper so the depth reflects the root's
 /// poison-ness for every nested div/mod.
+///
+/// The i53-escalation / `--true64` leaf wrap also happens HERE at the
+/// top level: the pre-pass [`wrap_true64_arith`] only reaches top-level
+/// Assign/Expr trees — an Arith nested in an interpolation, an exec arg
+/// or a test string (the `$((...))` inside `echo "$((x+1))"`) renders
+/// through this entry and gets its Int64 leaves wrapped on the spot (a
+/// mixed BigInt/Number binary op would THROW). Trees that already carry
+/// a Cast (pre-wrapped, C-frontend-typed) skip the re-wrap (idempotent
+/// emission).
 fn arith_to_estree_wrapped(a: &ArithAst) -> Expr {
+    if *ARITH_WRAP_DEPTH.lock().unwrap() == 0 && arith_mentions_true64(a) && !arith_has_cast(a) {
+        let mut c = a.clone();
+        wrap_true64_arith_ast(&mut c);
+        *ARITH_WRAP_DEPTH.lock().unwrap() += 1;
+        let out = arith_to_estree(&c);
+        *ARITH_WRAP_DEPTH.lock().unwrap() -= 1;
+        return out;
+    }
     if arith_has_poison(a) {
         *ARITH_POISON_DEPTH.lock().unwrap() += 1;
         let out = arith_to_estree(a);
@@ -8414,6 +9221,24 @@ fn arith_to_estree_wrapped(a: &ArithAst) -> Expr {
         out
     } else {
         arith_to_estree(a)
+    }
+}
+
+/// Does an ArithAst already carry an Int64/UInt64 cast (pre-wrapped by
+/// [`wrap_true64_arith`], or C-frontend-typed)? Re-wrapping would nest
+/// redundant `BigInt.asIntN(64, BigInt(...))` layers.
+fn arith_has_cast(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Cast { ty, .. } => matches!(ty, IrType::Int64 | IrType::UInt64),
+        ArithAst::Bin { lhs, rhs, .. } => arith_has_cast(lhs) || arith_has_cast(rhs),
+        ArithAst::Un { arg, .. } => arith_has_cast(arg),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => arith_has_cast(test) || arith_has_cast(then) || arith_has_cast(else_),
+        ArithAst::Assign { rhs, .. } => arith_has_cast(rhs),
+        ArithAst::IncDec { .. } => false,
+        ArithAst::Index { key, .. } => arith_has_cast(key),
+        _ => false,
     }
 }
 
@@ -8897,6 +9722,21 @@ fn collect_true64_divisors(a: &ArithAst, out: &mut Vec<ArithAst>) {
 /// A `memLoad` read from a 64-bit-elem heap pointer (the C frontend passes
 /// the element C type name as the third arg): the value is a store string
 /// — `parseInt` would round it past 2^53, so printf renders it directly.
+/// Is an IrExpr's RENDERED value a BigInt (so a `parseInt(...)` coercion
+/// would throw and Number(...) would round)? C-frontend i64 arith casts,
+/// 64-bit-elem memLoad reads, and the i53 escalation's Int64-typed var
+/// reads (a lifted binding or a store getVar — both render BigInt in
+/// arith contexts).
+fn ir_arg_is_bigint(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Arith(a) => arith_is_bigint(a) || arith_mentions_true64(a),
+        IrExpr::Call { func, args } if func == "getVar" => {
+            matches!(args.as_slice(), [IrExpr::Str(n, _)] if var_type_of(n) == Some(IrType::Int64))
+        }
+        _ => mem_load_is_64(e),
+    }
+}
+
 fn mem_load_is_64(e: &IrExpr) -> bool {
     if let IrExpr::Call { func, args } = e {
         if func == "memLoad" && args.len() >= 3 {
@@ -10088,13 +10928,22 @@ fn mktemp_native_enabled() -> bool {
 /// STRING bash stores (positional reads via the native `sh2.positional`
 /// access — the exact value the runtime's expandWord yields).
 fn decl_source_to_estree(name: &str, src: &IrExpr) -> Expr {
+    // i53 escalation / `--true64`: an Int64 target homes the EXACT
+    // literal (a Number literal would round past 2^53)
+    let int64 = var_type_of(name) == Some(IrType::Int64);
     match src {
+        IrExpr::Int(i) if int64 => bigint_lit_expr(*i),
         IrExpr::Str(sv, _) => {
             if is_lifted_num(name) {
-                Expr::Literal {
-                    value: serde_json::Value::from(sv.trim().parse::<i64>().unwrap_or(0)),
-                    raw: None,
-                    regex: None,
+                let n = sv.trim().parse::<i64>().unwrap_or(0);
+                if int64 {
+                    bigint_lit_expr(n)
+                } else {
+                    Expr::Literal {
+                        value: serde_json::Value::from(n),
+                        raw: None,
+                        regex: None,
+                    }
                 }
             } else {
                 str_lit(sv)
@@ -10836,6 +11685,30 @@ fn arith_native_enabled() -> bool {
 /// assumptions vanish (exact bc semantics, errors → "").
 fn bc_exact_enabled() -> bool {
     std::env::var("SH2_BC_NATIVE").map_or(false, |v| v == "exact")
+}
+
+/// SH2_ASSUME_I53=0 — turn off the i53 BigInt escalation (Task 1).
+///
+/// Documented assumption (default ON): bash arithmetic is 64-bit
+/// wrapped; JS `Number` is exact only to ±2^53 — `x=9007199254740993;
+/// echo $((x+1))` prints 9007199254740992 under the plain Number
+/// lowering (the literal rounds). The range analysis (Task 1) PROVES a
+/// var's final value interval; a var proven outside ±2^53 homes as BigInt
+/// (the `--true64` non-slot Int64 machinery — exact literals via
+/// `BigInt("...")`, pure-BigInt arithmetic, `BigInt.asIntN(64, …)`
+/// wraps on assignment). The ASSUMPTION: every var the analysis CANNOT
+/// prove out of ±2^53 stays within it at runtime — so the Number
+/// lowering stays exact for them (unproven-provenance vars — reads,
+/// captures, unset strings — stay Numbers, and the escalation only
+/// admits vars whose every write is a proven-integer write, so the
+/// BigInt home never sees a non-integer: `BigInt("")` would throw where
+/// `Number("")||0` coerces to 0). A script that feeds a >2^53 value
+/// through an UNPROVEN path (a read, a capture) diverges — set
+/// SH2_ASSUME_I53=0 for the old Number-everything emission, or run
+/// `--true64` (the conservative mode: every unproven numeric var homes
+/// as BigInt) for full 64-bit fidelity.
+fn i53_escalation_enabled() -> bool {
+    std::env::var("SH2_ASSUME_I53").map_or(true, |v| v != "0")
 }
 
 fn mark_store_refs(s: &str, out: &mut HashSet<String>) {
@@ -12292,11 +13165,18 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // BigInt values (Int64, the C-path lowering). The analysis runs on
     // the ORIGINAL arith shapes (the RMW detection needs the unwrapped
     // trees); the wrap below then rewrites the leaves on the clone.
-    let (true64_int, true64_slots) = if true64_enabled() {
+    let (mut true64_int, true64_slots) = if true64_enabled() {
         analyze_true64(prog)
     } else {
         (HashSet::new(), HashMap::new())
     };
+    // i53 escalation (Task 1 — SH2_ASSUME_I53, default ON): range-PROVEN
+    // out-of-±2^53 vars home as BigInt (Int64) even without `--true64`.
+    // Optimistic: unproven vars stay Numbers. Under `--true64` the
+    // conservative set already covers them (the union is a no-op).
+    if i53_escalation_enabled() {
+        true64_int.extend(analyze_big_i53(prog));
+    }
     *TRUE64_INT.lock().unwrap() = Some(true64_int.clone());
     *TRUE64_SLOTS.lock().unwrap() = Some(true64_slots.clone());
     // StoreToNative (core request shir-passes-store-to-native-20260806):
@@ -12316,10 +13196,12 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
             &crate::shir_passes::PassContext::default(),
         );
     }
-    // `--true64` leaf wrapping: Num leaves -> Cast(Int64, Num) (exact
-    // BigInt("N")), non-slot Var leaves -> Cast(Int64, Var); slot reads
-    // stay RAW (the native int64 element fast path).
-    if true64_enabled() {
+    // Int64 leaf wrapping (the `--true64` machinery, now also the i53
+    // escalation's): Num leaves -> Cast(Int64, Num) (exact BigInt("N")),
+    // non-slot Var leaves -> Cast(Int64, Var); slot reads stay RAW (the
+    // native int64 element fast path). Nested arith (interpolations,
+    // exec args) is wrapped at RENDER time by [`arith_to_estree_wrapped`].
+    if true64_enabled() || i53_escalation_enabled() {
         wrap_true64_arith(&mut store_to_native);
     }
     let prog = &store_to_native;
@@ -12485,16 +13367,26 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // requires a deterministic order (JS let decls are order-independent,
     // so sorting is behavior-neutral).
     for name in sorted_set(&LIFTED_NUMERIC) {
+        // i53 escalation / `--true64`: an Int64 home declares the
+        // binding as BigInt (the exact 0 — Number 0 would round a
+        // BigInt read only past 2^53, but the binding's TYPE must stay
+        // consistent with every write: mixed BigInt/Number arithmetic
+        // throws)
+        let init = if var_type_of(&name) == Some(IrType::Int64) {
+            bigint_lit_expr(0)
+        } else {
+            Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }
+        };
         body.push(Stmt::VariableDeclaration {
             kind: "let",
             declarations: vec![VariableDeclarator {
                 type_: "VariableDeclarator",
                 id: Expr::Identifier { name: name.clone() },
-                init: Some(Expr::Literal {
-                    value: serde_json::Value::from(0),
-                    raw: None,
-                    regex: None,
-                }),
+                init: Some(init),
             }],
         });
     }
@@ -14419,6 +15311,21 @@ fn range_items_array(lo: i64, hi: i64) -> IrExpr {
 /// `let` shadows the module `let i = 0` (numeric lift) exactly like the
 /// for-of binding.
 fn native_range_for(js_var: String, lo: i64, hi: i64, body: Vec<Stmt>) -> Stmt {
+    // i53 escalation: an Int64 loop var (a provably out-of-±2^53 range)
+    // homes the exact BigInt literals — the rounded Number would break
+    // the counter, the comparison and the String() of the final value
+    let int64 = var_type_of(&js_var) == Some(IrType::Int64);
+    let lit = |v: i64| {
+        if int64 {
+            bigint_lit_expr(v)
+        } else {
+            Expr::Literal {
+                value: serde_json::Value::from(v),
+                raw: None,
+                regex: None,
+            }
+        }
+    };
     Stmt::ForStatement {
         init: Box::new(Stmt::VariableDeclaration {
             kind: "let",
@@ -14427,11 +15334,7 @@ fn native_range_for(js_var: String, lo: i64, hi: i64, body: Vec<Stmt>) -> Stmt {
                 id: Expr::Identifier {
                     name: js_var.clone(),
                 },
-                init: Some(Expr::Literal {
-                    value: serde_json::Value::from(lo),
-                    raw: None,
-                    regex: None,
-                }),
+                init: Some(lit(lo)),
             }],
         }),
         test: Expr::BinaryExpression {
@@ -14439,11 +15342,7 @@ fn native_range_for(js_var: String, lo: i64, hi: i64, body: Vec<Stmt>) -> Stmt {
             left: Box::new(Expr::Identifier {
                 name: js_var.clone(),
             }),
-            right: Box::new(Expr::Literal {
-                value: serde_json::Value::from(hi),
-                raw: None,
-                regex: None,
-            }),
+            right: Box::new(lit(hi)),
         },
         update: Expr::UnaryExpression {
             operator: "++".to_string(),
@@ -14902,16 +15801,33 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             inner
                         }
                     }
-                    IrExpr::Int(i) => Expr::Literal {
-                        value: serde_json::Value::from(*i),
-                        raw: None,
-                        regex: None,
-                    },
-                    IrExpr::Str(sv, _) if is_lifted_num(&target.var) => Expr::Literal {
-                        value: serde_json::Value::from(sv.trim().parse::<i64>().unwrap_or(0)),
-                        raw: None,
-                        regex: None,
-                    },
+                    IrExpr::Int(i) => {
+                        // i53 escalation / `--true64`: an Int64 target
+                        // homes the EXACT literal — a Number literal would
+                        // round past 2^53 (the Task 1 bug:
+                        // x=9007199254740993 → 9007199254740992)
+                        if var_type_of(&target.var) == Some(IrType::Int64) {
+                            bigint_lit_expr(*i)
+                        } else {
+                            Expr::Literal {
+                                value: serde_json::Value::from(*i),
+                                raw: None,
+                                regex: None,
+                            }
+                        }
+                    }
+                    IrExpr::Str(sv, _) if is_lifted_num(&target.var) => {
+                        let n = sv.trim().parse::<i64>().unwrap_or(0);
+                        if var_type_of(&target.var) == Some(IrType::Int64) {
+                            bigint_lit_expr(n)
+                        } else {
+                            Expr::Literal {
+                                value: serde_json::Value::from(n),
+                                raw: None,
+                                regex: None,
+                            }
+                        }
+                    }
                     // string-lifted source
                     IrExpr::Str(sv, _) => Expr::Literal {
                         value: serde_json::Value::String(sv.clone()),
@@ -15007,7 +15923,21 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // call-free RHS). String()-wrap only non-string RHS
                     // (native arith numbers) — the store must stay
                     // string-typed (the runtime String()s every value).
-                    let ve = expr_to_estree(expr);
+                    let ve = match expr {
+                        // i53 escalation: an Int64 store target keeps the
+                        // EXACT digits — a Number literal would round past
+                        // 2^53 before String() sees it
+                        IrExpr::Int(i) if var_type_of(&target.var) == Some(IrType::Int64) => {
+                            bigint_lit_expr(*i)
+                        }
+                        IrExpr::Str(sv, _)
+                            if var_type_of(&target.var) == Some(IrType::Int64)
+                                && sv.trim().parse::<i64>().is_ok() =>
+                        {
+                            bigint_lit_expr(sv.trim().parse::<i64>().unwrap_or(0))
+                        }
+                        _ => expr_to_estree(expr),
+                    };
                     // `i=$((i+2))` / `((i=5))` / cstyle init/step with a
                     // STORE-BOUND target: the arith-assign expr lowers to
                     // `(sh2.setVar(n, String(v)), <read-back>)` — the inner
@@ -20141,11 +21071,10 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
                     // template stringifies the BigInt exactly). Same for
                     // memLoad reads from 64-bit-elem heap pointers: the
                     // value is a store string — parseInt would round it
-                    // past 2^53.
-                    arg_is_bigint.push(
-                        matches!(other, IrExpr::Arith(a) if arith_is_bigint(a))
-                            || mem_load_is_64(other),
-                    );
+                    // past 2^53. The i53 escalation's Int64 vars read as
+                    // BigInt too (getVar-of-Int64, or an arith mentioning
+                    // one).
+                    arg_is_bigint.push(ir_arg_is_bigint(other));
                 }
             }
         }
@@ -24407,12 +25336,14 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                 // arith semantics — the test sees a number, never NaN).
                 if let Some(inner) = e.strip_prefix("$((").and_then(|x| x.strip_suffix("))")) {
                     let mut a = parse_arith(inner)?;
-                    // `--true64`: a test operand touching a slot/Int64 var
-                    // must render pure BigInt arithmetic (mixed ops throw).
-                    let bigint = true64_enabled() && arith_mentions_true64(&a);
+                    // `--true64` / i53 escalation: a test operand touching
+                    // a slot/Int64 var must render pure BigInt arithmetic
+                    // (mixed ops throw).
+                    let bigint = (true64_enabled() || i53_escalation_enabled())
+                        && arith_mentions_true64(&a);
                     wrap_true64_arith_ast(&mut a);
                     let rendered = arith_to_estree_wrapped(&a);
-                    if true64_enabled() && arith_has_div_mod(&a) {
+                    if (true64_enabled() || i53_escalation_enabled()) && arith_has_div_mod(&a) {
                         // BigInt % 0 throws (Number % 0 -> NaN); bash
                         // ABORTS the expansion on a zero divisor (empty ->
                         // test false). Guard each divisor: `(d ===
@@ -24453,24 +25384,35 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                     // the runtime's intVal semantics). Reading the bare
                     // binding is EXACTLY the value the runtime's test
                     // would see with the value inlined (lifted vars are
-                    // not in the store — a getVar would read '').
+                    // not in the store — a getVar would read ''). An
+                    // Int64 (BigInt) home marks the operand big — the
+                    // equality arms then compare BigInt-to-BigInt exactly
+                    // (Number(BigInt) would round past 2^53).
                     return Some((
                         Expr::Identifier {
                             name: bare.to_string(),
                         },
                         !is_lifted_num(bare),
-                        false,
+                        var_type_of(bare) == Some(IrType::Int64),
                     ));
                 }
                 if let Ok(v) = e.parse::<i64>() {
+                    // a literal past ±2^53 cannot be a JS Number (it
+                    // would round) — exact BigInt literal, marked big
+                    let vi = v as i128;
+                    let big = vi < -(SAFE_NUMBER) || vi > SAFE_NUMBER;
                     return Some((
-                        Expr::Literal {
-                            value: serde_json::Value::from(v),
-                            raw: None,
-                            regex: None,
+                        if big {
+                            bigint_lit_expr(v)
+                        } else {
+                            Expr::Literal {
+                                value: serde_json::Value::from(v),
+                                raw: None,
+                                regex: None,
+                            }
                         },
                         false,
-                        false,
+                        big,
                     ));
                 }
                 // `$?` / `$#` / `$$` are the runtime's own numeric state
@@ -24497,23 +25439,21 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                 continue;
             };
             if !l_risky && !r_risky {
-                // `--true64` BigInt operands: `0n === 0` is FALSE (strict
-                // equality does not coerce BigInt/Number) — equality ops
-                // wrap the BigInt operand in Number() (exact: Number of a
-                // nonzero BigInt is never 0). Relational ops keep the raw
-                // BigInt (exact — BigInt vs Number comparisons are legal).
+                // BigInt/Number strict equality does not coerce: a
+                // one-sided BigInt operand wraps the NUMBER side in
+                // BigInt() (exact — BigInt of a small Number is exact,
+                // where Number of a BIG BigInt would round); when BOTH
+                // sides are big the raw `===` is exact BigInt-vs-BigInt.
                 let eq = js == "===" || js == "!==";
-                let numof = |e: Expr| -> Expr {
-                    Expr::CallExpression {
-                        callee: Box::new(Expr::Identifier {
-                            name: "Number".to_string(),
-                        }),
-                        arguments: vec![e],
-                        optional: false,
-                    }
+                let bigof = |e: Expr| Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "BigInt".to_string(),
+                    }),
+                    arguments: vec![e],
+                    optional: false,
                 };
-                let l = if eq && l_big { numof(l) } else { l };
-                let r = if eq && r_big { numof(r) } else { r };
+                let l = if eq && !l_big && r_big { bigof(l) } else { l };
+                let r = if eq && l_big && !r_big { bigof(r) } else { r };
                 return Some(Expr::BinaryExpression {
                     operator: js.to_string(),
                     left: Box::new(l),
@@ -33663,11 +34603,20 @@ mod range_analysis_tests {
         let r3 = ranges_of("i=1\nj=2\nwhile [ $i -lt 5 ]; do i=$((i+1)); done");
         assert_eq!(r3.get("j"), Some(&(2, 2)));
         // a non-counter loop (body doesn't prove monotone +1) — the
-        // entry invariant cannot be pinned: the widening hits the i64
-        // arithmetic extremes, i+1 overflows it, and the invariant goes
-        // Any (sound: the loop could run unboundedly)
+        // entry invariant cannot be pinned, and the widening hits the i64
+        // arithmetic extremes. With the WRAPPED `+` (bash int64 wrap) the
+        // fixpoint then converges: the counter is PROVABLY in [i64::MIN,
+        // i64::MAX] (the widening's soundness — bash arithmetic never
+        // leaves i64), so the var stays in the map at the full domain
+        // (the old checked_add overflowed to None — Any; the wrap made
+        // the extreme PROVABLE, which is exactly the i53 escalation's
+        // trigger: the value can exceed ±2^53, so it must home as BigInt).
         let r4 = ranges_of("i=1\nwhile :; do i=$((i+1)); done");
-        assert!(!r4.contains_key("i"));
+        assert_eq!(
+            r4.get("i"),
+            Some(&(i64::MIN as i128, i64::MAX as i128)),
+            "wrapped arithmetic keeps the counter provably in i64"
+        );
     }
 
     #[test]
@@ -33710,6 +34659,136 @@ mod range_analysis_tests {
 
     #[test]
     #[ignore] // corpus-wide tally — run on demand: cargo test -- --ignored --nocapture
+    /// The wrapped-interval completion (Task 1): Pow / IncDec / Cond /
+    /// Assign / Index + the previously-punted Bin ops, all with EXACT
+    /// bash int64 wrap semantics (`$((2**62))` is a precise value, not
+    /// Any; `MAX+1` wraps to MIN).
+    #[test]
+    fn wrapped_arith_ops() {
+        // bash wraps at 2^64: 2**62 is exact, 2**63 wraps to -2^63,
+        // MAX+1 wraps to MIN
+        let r = ranges_of(
+            "a=$((2**62))\nb=$((2**63))\nc=$((9223372036854775807+1))\nd=$((1<<62))\ne=$((1<<64))\nf=$((-1>>1))\ng=$((7%3))\nh=$((-7%3))\ni=$((5&3))\nj=$((5|2))\nk=$((5^3))\nl=$((~5))\nm=$((7<3))\nn=$((1&&0))\no=$((-2**2))\n",
+        );
+        assert_eq!(r.get("a"), Some(&(4611686018427387904, 4611686018427387904)));
+        assert_eq!(r.get("b"), Some(&(-9223372036854775808, -9223372036854775808)));
+        assert_eq!(r.get("c"), Some(&(-9223372036854775808, -9223372036854775808)));
+        assert_eq!(r.get("d"), Some(&(4611686018427387904, 4611686018427387904)));
+        // bash masks the shift count mod 64: 1<<64 = 1
+        assert_eq!(r.get("e"), Some(&(1, 1)));
+        assert_eq!(r.get("f"), Some(&(-1, -1)));
+        assert_eq!(r.get("g"), Some(&(1, 1)));
+        assert_eq!(r.get("h"), Some(&(-1, -1)));
+        assert_eq!(r.get("i"), Some(&(1, 1)));
+        assert_eq!(r.get("j"), Some(&(7, 7)));
+        assert_eq!(r.get("k"), Some(&(6, 6)));
+        assert_eq!(r.get("l"), Some(&(-6, -6)));
+        assert_eq!(r.get("m"), Some(&(0, 1)));
+        assert_eq!(r.get("n"), Some(&(0, 1)));
+        assert_eq!(r.get("o"), Some(&(4, 4)));
+        // a negative exponent aborts the expansion (bash error) — Any
+        let r2 = ranges_of("a=$((2**-1))");
+        assert!(!r2.contains_key("a"));
+    }
+
+    /// IncDec / Assign / Cond ranges: the value of the node (bash
+    /// semantics — the assign's value is the new value).
+    #[test]
+    fn arith_assign_incdec_cond_ranges() {
+        let r = ranges_of("x=5\ny=$((x++))\nz=$((x+=10))\nw=$((1 ? 7 : 100))");
+        // x++: value 5 (the OLD value), x becomes 6 — the RANGE walker
+        // tracks x's final value from the last write
+        assert_eq!(r.get("y"), Some(&(5, 5)));
+        assert_eq!(r.get("x"), Some(&(16, 16)));
+        assert_eq!(r.get("z"), Some(&(16, 16)));
+        assert_eq!(r.get("w"), Some(&(7, 7)));
+        // an IncDec past the domain wraps exactly (bash: i++ at MAX → MIN)
+        let r2 = ranges_of("i=9223372036854775807\nj=$((i++))");
+        assert_eq!(r2.get("j"), Some(&(9223372036854775807, 9223372036854775807)));
+        assert_eq!(r2.get("i"), Some(&(-9223372036854775808, -9223372036854775808)));
+    }
+
+    /// The i53 escalation set: proven out-of-±2^53 vars with all-integer
+    /// writes escalate; unproven-string writes / read-builtins / function
+    /// bodies / captures reject.
+    #[test]
+    fn big_i53_escalation() {
+        // x: literal 2^53+1, arith read — escalates
+        let prog = ast_to_ir(&crate::Parser::new("x=9007199254740993\necho $((x+1))")
+            .parse()
+            .expect("parse"));
+        assert!(analyze_big_i53(&prog).contains("x"));
+        // y = x + 1: arith-proven, the write is an integer arith — but y's
+        // range comes from x's (proven big) — both escalate
+        let prog2 = ast_to_ir(
+            &crate::Parser::new("x=9007199254740993\ny=$((x+1))\necho $y")
+                .parse()
+                .expect("parse"),
+        );
+        let big = analyze_big_i53(&prog2);
+        assert!(big.contains("x"));
+        assert!(big.contains("y"));
+        // a string write mixed in rejects the escalation (the BigInt home
+        // must never see a non-integer: BigInt("") throws)
+        let prog3 = ast_to_ir(
+            &crate::Parser::new("x=abc\nx=9007199254740993\necho $((x+1))")
+                .parse()
+                .expect("parse"),
+        );
+        assert!(!analyze_big_i53(&prog3).contains("x"));
+        // read-builtin arg rejects
+        let prog4 = ast_to_ir(
+            &crate::Parser::new("x=9007199254740993\nread x\necho $((x+1))")
+                .parse()
+                .expect("parse"),
+        );
+        assert!(!analyze_big_i53(&prog4).contains("x"));
+        // a capture write rejects
+        let prog5 = ast_to_ir(
+            &crate::Parser::new("x=9007199254740993\nx=$(echo hi)\necho $((x+1))")
+                .parse()
+                .expect("parse"),
+        );
+        assert!(!analyze_big_i53(&prog5).contains("x"));
+        // a function-body write rejects (dynamic scope)
+        let prog6 = ast_to_ir(
+            &crate::Parser::new("x=9007199254740993\nf() { x=5; }\nf\necho $((x+1))")
+                .parse()
+                .expect("parse"),
+        );
+        assert!(!analyze_big_i53(&prog6).contains("x"));
+        // `local x=<int>` (the exec name=value shape) is a proven write
+        let prog7 = ast_to_ir(
+            &crate::Parser::new("local x=9007199254740993\necho $((x+1))")
+                .parse()
+                .expect("parse"),
+        );
+        assert!(analyze_big_i53(&prog7).contains("x"));
+    }
+
+    /// The Task 1 acceptance case, end to end: `x=9007199254740993;
+    /// echo $((x+1))` must emit BigInt literals/ops (bash prints
+    /// 9007199254740994; Number would print 9007199254740992).
+    #[test]
+    fn big_i53_emission() {
+        let src = "x=9007199254740993\necho $((x+1))";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        // the emission runs on a clone with the escalation active
+        let json = shir_to_estree(&prog);
+        let s = serde_json::to_string(&json).unwrap();
+        assert!(s.contains("9007199254740993"), "exact literal: {s}");
+        assert!(
+            s.contains("BigInt")
+                && s.contains("9007199254740993")
+                && s.contains("asIntN"),
+            "BigInt literal + wrap: {s}"
+        );
+        // and the number must not appear as a rounding literal
+        assert!(!s.contains("9007199254740992"), "no rounded literal: {s}");
+    }
+
+    #[test]
     fn corpus_var_width_tally() {
         let mut widths: HashMap<&'static str, usize> = HashMap::new();
         widths.insert("u32", 0);
