@@ -912,6 +912,23 @@ fn lastexit_scan_top_read(stmts: &[IrStmt], end_live: bool) -> bool {
 /// reaches the ESTree emitter (the renderer's catch-all refuses it); the
 /// cond must be a direct `test` Call (a `!`/`&&`/`||`-wrapped cond keeps
 /// the statused form — its value/status flow is chain-shaped).
+/// A condition that is a pure chain of `[ ]`-style tests: an `And`/`Or`
+/// tree whose leaves are all `test` calls (a test's VALUE equals its exit
+/// status, so a native JS `&&`/`||` on the test values matches bash — the
+/// reason the chain's status protocol is droppable when unread).
+fn is_pure_test_chain(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, .. } => func == "test",
+        IrExpr::BinOp { op, lhs, rhs } => {
+            (matches!(op, BinOpKind::And | BinOpKind::Or)
+                && is_pure_test_chain(lhs)
+                && is_pure_test_chain(rhs))
+                || (matches!(op, BinOpKind::Not) && is_pure_test_chain(lhs))
+        }
+        _ => false,
+    }
+}
+
 fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMap<usize, bool> {
     fn mark(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMap<usize, bool>) {
         for stmt in stmts {
@@ -924,7 +941,7 @@ fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMa
                     else_,
                     ..
                 } => {
-                    if matches!(cond, IrExpr::Call { func, .. } if func == "test") {
+                    if is_pure_test_chain(cond) {
                         let mut top = lastexit_scan_top_read(then, self_live);
                         for (_, arm) in elsifs {
                             top |= lastexit_scan_top_read(arm, self_live);
@@ -936,7 +953,7 @@ fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMa
                     }
                 }
                 IrStmt::While { cond, body, .. } => {
-                    if matches!(cond, IrExpr::Call { func, .. } if func == "test") {
+                    if is_pure_test_chain(cond) {
                         if !lastexit_scan_top_read(body, self_live) {
                             dead.insert(stmt as *const IrStmt as usize, true);
                         }
@@ -12171,7 +12188,14 @@ fn mark_store_refs(s: &str, out: &mut HashSet<String>) {
 fn arith_has_div_mod(a: &ArithAst) -> bool {
     match a {
         ArithAst::Bin { op, lhs, rhs } => {
-            *op == "/" || *op == "%" || arith_has_div_mod(lhs) || arith_has_div_mod(rhs)
+            // Only a div/mod whose divisor could be ZERO aborts the
+            // expansion — a provably-nonzero divisor (a nonzero numeric
+            // literal, optionally sign-flipped) emits the plain native
+            // operation (see arith_to_estree's Bin arm), so its
+            // arithEval wrapper is dead weight and does not count.
+            ((*op == "/" || *op == "%") && !arith_is_nonzero(rhs))
+                || arith_has_div_mod(lhs)
+                || arith_has_div_mod(rhs)
         }
         ArithAst::Un { arg, .. } => arith_has_div_mod(arg),
         ArithAst::Cond {
@@ -31686,6 +31710,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                         } else if let Some(native) = try_native_test(sv) {
                             return native;
                         }
+                    } else if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+                        // Inside `&&`/`||` BUT the whole chain's status is
+                        // provably unread (a pure test-chain if/while
+                        // guard — compute_test_cond_deadness): the
+                        // operands stay UNSTATUSED and the chain emits
+                        // plain JS `&&`/`||` (native_and_or_unstatused).
+                        if let Some(native) = try_native_test_unstatused(sv) {
+                            return native;
+                        }
                     } else if let Some(native) = try_native_test(sv) {
                         // Inside `&&`/`||` the chain links branch on
                         // `sh2.lastExit`, which a native comparison never
@@ -32612,7 +32645,16 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             let l = expr_to_estree(lhs);
             let r = expr_to_estree(rhs);
             *AND_OR_DEPTH.lock().unwrap() -= 1;
-            native_and_or(BinOpKind::And, l, r)
+            // A test-CHAIN in a dead-status condition (an if/while guard
+            // whose `$?` write is provably unread — see
+            // compute_test_cond_deadness): the operands lowered unstatused
+            // (pure tests), so the chain is plain JS `&&` — no lastExit
+            // reads/writes per operand.
+            if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+                native_and_or_unstatused(BinOpKind::And, l, r)
+            } else {
+                native_and_or(BinOpKind::And, l, r)
+            }
         }
         IrExpr::BinOp {
             op: BinOpKind::Or,
@@ -32623,7 +32665,11 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             let l = expr_to_estree(lhs);
             let r = expr_to_estree(rhs);
             *AND_OR_DEPTH.lock().unwrap() -= 1;
-            native_and_or(BinOpKind::Or, l, r)
+            if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+                native_and_or_unstatused(BinOpKind::Or, l, r)
+            } else {
+                native_and_or(BinOpKind::Or, l, r)
+            }
         }
         // `! cmd` — bash inverts the exit STATUS (so `$?` flips too); a pure
         // JS negation would leave lastExit untouched. The native lowering
@@ -34108,6 +34154,17 @@ fn native_and_or(op: BinOpKind, l: Expr, r: Expr) -> Expr {
             },
         ]),
         _ => unreachable!("native_and_or: only And/Or"),
+    }
+}
+
+/// The plain-JS form of a test chain in a dead-status condition: `a && b`
+/// / `a || b` where the operands are pure unstatused tests (their VALUE
+/// equals their exit status, so the boolean short-circuit matches bash).
+fn native_and_or_unstatused(op: BinOpKind, l: Expr, r: Expr) -> Expr {
+    Expr::LogicalExpression {
+        operator: (if op == BinOpKind::And { "&&" } else { "||" }).to_string(),
+        left: Box::new(l),
+        right: Box::new(r),
     }
 }
 

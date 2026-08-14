@@ -91,11 +91,16 @@ pub struct Render {
     in_fn: bool,              // rendering inside a Function body
     todo: usize,
     opts: ShGlslOptions,
+    // the input bridges
     // texture-fetch load sinking: groups whose fetch + per-channel seeds
     // move into the single block that dominates every read of their
     // bridge vars (computed in shir_to_glsl_opts before the body
     // renders) — the untouched path costs zero fetches.
     lazy_tex_sinks: Vec<LazyTexSink>,
+    // true when the PROGRAM reads the uv_x/uv_y bridges directly (the
+    // texture samples wrap via fract(vUv) and don't need the texel-grid
+    // seeds; only a genuine uv read does)
+    reads_uv: bool,
 }
 
 // ── texture-fetch load sinking ──────────────────────────────────
@@ -546,8 +551,8 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
         // the varyings — always written at the end of main() (the
         // fragment shader declares the ones it consumes; a vertex-only
         // varying is legal ES 1.00 and links fine).
-        r.emit("varying vec4 vColor;");
-        r.emit("varying vec2 vUv;");
+        r.emit("varying highp vec4 vColor;");
+        r.emit("varying highp vec2 vUv;");
     } else if !r.opts.color_out {
         if r.opts.es100 {
             // ES 1.00 has no `out` — outColor is a local, written to
@@ -570,10 +575,17 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
         let tex = r.uses_any(&["tex_r", "tex_g", "tex_b"]);
         let crack = r.uses_any(&["cr_r", "cr_g", "cr_b", "cr_a"]);
         if vcolor {
-            r.emit(if r.opts.es100 { "varying vec4 vColor;" } else { "in vec4 vColor;" });
+            r.emit(if r.opts.es100 { "varying highp vec4 vColor;" } else { "in highp vec4 vColor;" });
         }
         if uv {
-            r.emit(if r.opts.es100 { "varying vec2 vUv;" } else { "in vec2 vUv;" });
+            // vUv carries WORLD coordinates for the camera-following
+            // background planes (usc_x > 1100 → the vertex shader
+            // outputs p.xz, up to ±35 world units) — a mediump read
+            // (fp16 on Vulkan/Metal ANGLE backends) loses the
+            // fractional part and jitters the texel-grid selection by
+            // ±1 texel, so the floor texture flaked. highp read, like
+            // the hand-written fallback (fs_fb) always had.
+            r.emit(if r.opts.es100 { "varying highp vec2 vUv;" } else { "in highp vec2 vUv;" });
         }
         if tex {
             r.emit("uniform sampler2D uTex;");
@@ -632,12 +644,16 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
                 "cr_r", "cr_g", "cr_b", "cr_a",
             ]);
             if uv_needed {
-                let f = |v: u32| format!("{v}.0");
-                let sz = f(opts.tex_size);
                 // uv_x/uv_y: the texel index (0..tex_size) from the
-                // varying — a prerequisite for every texture sample
-                r.emit(&format!("g_uv_x = int(vUv.x * {sz});"));
-                r.emit(&format!("g_uv_y = int(vUv.y * {sz});"));
+                // varying — a program that READS the uv bridges directly
+                // needs these seeds; the texture samples themselves use
+                // fract(vUv) (precision-safe wrapping) and don't.
+                if r.reads_uv {
+                    let f = |v: u32| format!("{v}.0");
+                    let sz = f(opts.tex_size);
+                    r.emit(&format!("g_uv_x = int(vUv.x * {sz});"));
+                    r.emit(&format!("g_uv_y = int(vUv.y * {sz});"));
+                }
                 // Sample each texture ONCE into a vec4 local, then
                 // swizzle — the three tex (resp. four crack) seeds use
                 // the same coordinates, and drivers may not CSE
@@ -954,6 +970,7 @@ impl Default for Render {
             used_isqrt: false,
             putb_pos: 0,
             lazy_tex_sinks: Vec::new(),
+            reads_uv: false,
             fns: BTreeSet::new(),
             fn_bodies: BTreeMap::new(),
             fn_order: Vec::new(),
@@ -1260,10 +1277,16 @@ impl Render {
         if self.opts.tex_size == 0 {
             return;
         }
-        let sz = format!("{}.0", self.opts.tex_size);
-        let uv = format!(
-            "(vec2(float(g_uv_x), float(g_uv_y)) + vec2(0.5)) / {sz}"
-        );
+        // Sample through `fract(vUv)` — the wrap happens here, in [0,1)
+        // space, so the texture2D coordinate stays small and is EXACT at
+        // any precision. The old `(g_uv_x + 0.5) / sz` form built a
+        // coordinate up to ±35 for the camera-following background planes
+        // (vUv = world xz) — a MEDIUMP float (fp16 on Vulkan/Metal
+        // ANGLE) quantized its fractional part to ±1 texel, so the floor
+        // texture's selection jittered ("sometimes shows"). fract() keeps
+        // the wrap value tiny (fp16-exact), and REPEAT wrap mode is no
+        // longer required for the sampling either.
+        let uv = "fract(vUv)".to_string();
         match g {
             TexGroup::Tex => {
                 if self.vars.contains("tex_r")
@@ -1561,6 +1584,9 @@ impl Render {
                 self.strlit(s);
             }
             IrExpr::Var(n, _) => {
+                if n == "uv_x" || n == "uv_y" {
+                    self.reads_uv = true;
+                }
                 self.vars.insert(n.clone());
             }
             IrExpr::Index { var, key } => {
@@ -4974,7 +5000,7 @@ mod tests {
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
             ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 32, max_view: 0 },
         );
-        assert!(shader.contains("varying vec2 vUv;"), "vUv missing for tex bridge");
+        assert!(shader.contains("varying highp vec2 vUv;"), "vUv missing for tex bridge");
         assert!(shader.contains("uniform sampler2D uTex;"), "uTex missing for tex bridge");
         assert!(shader.contains("int g_uv_x;"), "uv_x not declared (the tex seeds write it)");
         assert!(shader.contains("int g_uv_y;"), "uv_y not declared (the tex seeds write it)");
@@ -5028,8 +5054,8 @@ vu_u=$auv_u
         assert!(shader.contains("uniform vec3 uObjPos;"), "uObjPos missing");
         assert!(shader.contains("uniform vec3 uScale;"), "uScale missing");
         assert!(shader.contains("uniform vec3 uBlockColor;"), "uBlockColor missing");
-        assert!(shader.contains("varying vec4 vColor;"), "vColor missing");
-        assert!(shader.contains("varying vec2 vUv;"), "vUv missing");
+        assert!(shader.contains("varying highp vec4 vColor;"), "vColor missing");
+        assert!(shader.contains("varying highp vec2 vUv;"), "vUv missing");
         // seeds ×1000
         assert!(shader.contains("g_ap_x = int(aPosition.x * 1000.0);"), "ap_x seed");
         assert!(shader.contains("g_auv_u = int(aUv.x * 1000.0);"), "auv_u seed");

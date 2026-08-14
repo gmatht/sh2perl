@@ -1394,8 +1394,10 @@ fn classify_array_call(
         "getVar" => match args.first() {
             Some(Expr::Literal { value, .. }) => {
                 if let Some((_, Some(idx))) = parse_var_arg_str(value.as_str().unwrap_or("")) {
-                    if idx.parse::<i64>().map(|v| v >= 0).unwrap_or(false) {
-                        // plain literal element read — OK
+                    if idx.parse::<i64>().map(|v| v >= 0).unwrap_or(false)
+                        || parse_dollar_var(idx).is_some()
+                    {
+                        // plain literal or `$var` element read — OK
                         entry.read_stmt_idxs.push(stmt_idx);
                     } else {
                         entry.index_bad = true;
@@ -1416,6 +1418,15 @@ fn classify_array_call(
                     .unwrap_or(false)
                 {
                     // plain literal element read — OK
+                    entry.read_stmt_idxs.push(stmt_idx);
+                } else if value
+                    .as_str()
+                    .and_then(parse_dollar_var)
+                    .is_some()
+                {
+                    // `$var` element read — the runtime expands it
+                    // through the store; the native rewrite reads the
+                    // SAME store path (no dispatch / expansion)
                     entry.read_stmt_idxs.push(stmt_idx);
                 } else {
                     entry.index_bad = true;
@@ -1675,8 +1686,16 @@ pub(crate) fn lower_native_arrays(prog: Program) -> Program {
         });
     }
     // Decide: exactly one top-level array-valued setArray; read-only
-    // literal-index refs; nothing whole/write/unset/computed/in-function;
-    // no other bare use of the name anywhere.
+    // literal/`$var`-index refs; nothing whole/write/unset/computed/
+    // in-function-before-init; no other bare use of the name anywhere.
+    // The `in_fn` reads are SAFE when the function declaration comes
+    // after the setArray (the order guard below): the `let` initializes
+    // before the function can exist or run (a `let __fn_` is in the TDZ
+    // until its declaration), and a function-local that SHADOWS the
+    // array name surfaces as a bare declarator identifier in `declared`
+    // (disqualifying it). The old blanket `in_fn` ban dropped the game's
+    // direction tables (DIR_X/DIR_Z — read per frame) just because
+    // `shoot()` also reads them.
     let natives: std::collections::HashSet<String> = acc
         .iter()
         .filter(|(name, a)| {
@@ -1688,7 +1707,6 @@ pub(crate) fn lower_native_arrays(prog: Program) -> Program {
                     .all(|i| a.set_array_idx.unwrap() < *i)
                 && !a.whole
                 && !a.writes
-                && !a.in_fn
                 && !a.index_bad
                 && !declared.contains(*name)
         })
@@ -1996,16 +2014,50 @@ fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
 
 /// `sh2.getVar("arr[1]")` / `sh2.arrayIndex("arr", "1")` → (name, Some(idx))
 /// for a LITERAL non-negative integer index; None for anything else.
-fn array_read_index<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, Option<i64>)> {
+/// A native-array read index: a literal non-negative integer, or a
+/// `$var` store read. The runtime expands `$name` indexes through the
+/// store (`arrayIndex("DIR_X", "$yaw")` — the game's direction tables,
+/// read every frame); the native rewrite reads the SAME store path, so
+/// it is byte-equivalent and skips the per-read dispatch + expansion.
+enum NativeIdx {
+    Lit(i64),
+    Var(String),
+}
+
+/// `$yaw` → `Some("yaw")` for a simple store-var index (no `${…}`).
+fn parse_dollar_var(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('$')?;
+    match rest.chars().next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return None,
+    }
+    rest.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        .then_some(rest)
+}
+
+/// `sh2.getVar("arr[1])")` / `sh2.arrayIndex("arr", "1")` → (name, Some(idx))
+/// for a LITERAL non-negative integer index, or a `$var` (store) index;
+/// None for anything else.
+fn array_read_index<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, Option<NativeIdx>)> {
     let name = lit_str(args.first()?)?;
     if fn_name == "getVar" {
         let (n, idx) = parse_var_arg_str(name)?;
         let idx = idx?;
+        if let Some(v) = parse_dollar_var(idx) {
+            return Some((n, Some(NativeIdx::Var(v.to_string()))));
+        }
         let v = idx.parse::<i64>().ok()?;
-        (v >= 0).then_some((n, Some(v)))
+        (v >= 0).then_some((n, Some(NativeIdx::Lit(v))))
     } else {
-        let v = args.get(1)?.as_literal_i64()?;
-        (v >= 0).then_some((name, Some(v)))
+        if let Some(v) = args.get(1)?.as_literal_i64() {
+            return (v >= 0).then_some((name, Some(NativeIdx::Lit(v))));
+        }
+        if let Some(s) = lit_str(args.get(1)?) {
+            if let Some(v) = parse_dollar_var(s) {
+                return Some((name, Some(NativeIdx::Var(v.to_string()))));
+            }
+        }
+        None
     }
 }
 
@@ -2030,33 +2082,98 @@ fn array_len_join<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, bool)
     }
 }
 
-fn native_element_read(name: &str, idx: i64) -> Expr {
-    let elem = Expr::MemberExpression {
-        object: Box::new(Expr::Identifier {
-            name: name.to_string(),
-        }),
-        property: Box::new(Expr::Literal {
-            value: serde_json::Value::from(idx),
-            raw: None,
-            regex: None,
-        }),
-        computed: true,
-        optional: false,
-    };
-    Expr::ConditionalExpression {
-        test: Box::new(Expr::BinaryExpression {
-            operator: "!==".to_string(),
-            left: Box::new(elem.clone()),
-            right: Box::new(Expr::Identifier {
-                name: "undefined".to_string(),
-            }),
-        }),
-        consequent: Box::new(elem),
-        alternate: Box::new(Expr::Literal {
-            value: serde_json::Value::String(String::new()),
-            raw: None,
-            regex: None,
-        }),
+fn native_element_read(name: &str, idx: NativeIdx) -> Expr {
+    match idx {
+        NativeIdx::Lit(v) => {
+            let elem = Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: name.to_string(),
+                }),
+                property: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(v),
+                    raw: None,
+                    regex: None,
+                }),
+                computed: true,
+                optional: false,
+            };
+            Expr::ConditionalExpression {
+                test: Box::new(Expr::BinaryExpression {
+                    operator: "!==".to_string(),
+                    left: Box::new(elem.clone()),
+                    right: Box::new(Expr::Identifier {
+                        name: "undefined".to_string(),
+                    }),
+                }),
+                consequent: Box::new(elem),
+                alternate: Box::new(Expr::Literal {
+                    value: serde_json::Value::String(String::new()),
+                    raw: None,
+                    regex: None,
+                }),
+            }
+        }
+        NativeIdx::Var(var) => {
+            // `String(<name>[Number(sh2.vars.<var> ?? "")] ?? "")` — the
+            // runtime's arrayIndex for a `$var` index does
+            // `String(v[Number(expand("$" + var))] ?? "")`; reading the
+            // SAME store path natively is byte-equivalent without the
+            // dispatch + operand-expansion machinery.
+            let vars = Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "sh2".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "vars".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            };
+            let store_read = Expr::MemberExpression {
+                object: Box::new(vars),
+                property: Box::new(Expr::Identifier { name: var }),
+                computed: false,
+                optional: false,
+            };
+            let idx_expr = Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "Number".to_string(),
+                }),
+                arguments: vec![Expr::LogicalExpression {
+                    operator: "??".to_string(),
+                    left: Box::new(store_read),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::String(String::new()),
+                        raw: None,
+                        regex: None,
+                    }),
+                }],
+                optional: false,
+            };
+            let elem = Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: name.to_string(),
+                }),
+                property: Box::new(idx_expr),
+                computed: true,
+                optional: false,
+            };
+            Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "String".to_string(),
+                }),
+                arguments: vec![Expr::LogicalExpression {
+                    operator: "??".to_string(),
+                    left: Box::new(elem),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::String(String::new()),
+                        raw: None,
+                        regex: None,
+                    }),
+                }],
+                optional: false,
+            }
+        }
     }
 }
 
@@ -4830,9 +4947,14 @@ mod migrated_passes_tests {
         // ref inside a script function (deferred invocation / shadowing)
         let j3 = to_json("f() { echo ${arr[1]}; }; arr=(a b c); f");
         assert_eq!(count(&j3, "\"name\":\"setArray\""), 1, "in-function keeps runtime: {j3}");
-        // computed subscript (runtime evalArith + negative wrap)
+        // computed subscript: `$var` indexes (the game's direction tables
+        // — `DIR_X[$yaw]` per frame) now lower to a NATIVE array read
+        // with the store index (String(arr[Number(sh2.vars.i ?? "")] ??
+        // "") — byte-equivalent to the runtime's expansion)
         let j4 = to_json("arr=(a b c); i=1; echo ${arr[$i]}");
-        assert_eq!(count(&j4, "\"name\":\"setArray\""), 1, "computed index keeps runtime: {j4}");
+        assert_eq!(count(&j4, "\"name\":\"setArray\""), 0, "computed $var index goes native: {j4}");
+        assert_eq!(count(&j4, "arrayIndex"), 0, "no arrayIndex dispatch: {j4}");
+        assert!(j4.contains("\"name\":\"arr\""), "native array identifier: {j4}");
         // a nested (conditional) setArray can't become a top-level `let`
         let j5 = to_json("if true; then arr=(a b); fi; echo ${arr[1]}");
         assert_eq!(count(&j5, "\"name\":\"setArray\""), 1, "nested setArray keeps runtime: {j5}");
