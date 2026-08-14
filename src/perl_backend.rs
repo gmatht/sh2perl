@@ -71,6 +71,9 @@ pub struct Render {
     /// `typeset -n` namerefs: the name aliases another var (reads and
     /// writes go through to the target).
     namerefs: BTreeMap<String, String>,
+    /// The literal IFS value when the script assigns it (bash's field
+    /// separator — used for `"${arr[*]}"` joins and capture→array splits).
+    ifs: String,
     need_say: bool,
     need_basename: bool,
     /// A HOSTNAME read: bash populates it itself at startup (not from the
@@ -330,8 +333,14 @@ impl Render {
             }
             "_" => "@_".to_string(),
             _ => {
-                self.arrays.insert(name.to_string());
-                format!("@{}", ident(name))
+                // an assoc array's list form is its VALUES
+                if self.hashes.contains(name) {
+                    self.hashes.insert(name.to_string());
+                    format!("values %{}", ident(name))
+                } else {
+                    self.arrays.insert(name.to_string());
+                    format!("@{}", ident(name))
+                }
             }
         }
     }
@@ -998,8 +1007,14 @@ impl Render {
                             suf.push_str(&format!(" <<{q}{marker}{q}\n{body}{marker}"));
                         }
                         "herestring" => {
-                            // dash has no `<<<`; feed via printf (adds one \n)
-                            pre.push(format!("printf '%s\\n' {}", shell_squote(&t)));
+                            // dash has no `<<<`; feed via printf (adds one
+                            // \n) — a param/expr target interpolates its
+                            // COMPUTED value via shell_word
+                            let w = match t_expr {
+                                Some(e) => self.shell_word(e),
+                                None => shell_squote(&t),
+                            };
+                            pre.push(format!("printf '%s\\n' {w}"));
                         }
                         _ => self.mark_todo(&format!("redirect spec mode {mode}")),
                     }
@@ -1916,12 +1931,28 @@ impl Render {
                 let is_assoc = matches!(args.get(2), Some(IrExpr::Bool(true)));
                 // a capture element that yields EMPTY contributes NO element
                 // (bash: `arr=(`empty-cmd`)` → zero elements)
+                // bash word-splits a cmdsub's output into array elements
+                // by IFS — the capture element splits (empty → no element)
+                let split_re = if self.ifs.trim().is_empty() {
+                    "\\s+".to_string()
+                } else {
+                    self.ifs
+                        .chars()
+                        .map(|c| {
+                            if "\\]^-/".contains(c) {
+                                format!("\\{c}")
+                            } else {
+                                c.to_string()
+                            }
+                        })
+                        .collect()
+                };
                 let elem = |r: &mut Self, e: &IrExpr| -> String {
                     match e {
                         IrExpr::Capture { expr, .. } => {
                             let c = r.capture_from_expr(expr);
                             format!(
-                                "do {{ my $__c = {c}; chomp $__c; ($__c eq \"\" ? () : $__c) }}"
+                                "do {{ my $__c = {c}; chomp $__c; my @__w = ($__c eq \"\" ? () : split /{split_re}/, $__c); @__w }}"
                             )
                         }
                         IrExpr::Call { func, args }
@@ -1929,7 +1960,7 @@ impl Render {
                         {
                             let c = r.call(func, args);
                             format!(
-                                "do {{ my $__c = {c}; chomp $__c; ($__c eq \"\" ? () : $__c) }}"
+                                "do {{ my $__c = {c}; chomp $__c; my @__w = ($__c eq \"\" ? () : split /{split_re}/, $__c); @__w }}"
                             )
                         }
                         _ => r.expr(e),
@@ -3706,9 +3737,20 @@ impl Render {
                     return format!("scalar(@{})", ident(var));
                 }
                 "slice" => {
-                    self.arrays.insert(var.to_string());
                     let off_raw = args.get(2).and_then(|a| Self::str_arg(args, 2));
                     let len_raw = args.get(3).and_then(|a| Self::str_arg(args, 3));
+                    // an ASSOC array's `[@]`/`[*]` are its VALUES
+                    if self.hashes.contains(var) {
+                        self.hashes.insert(var.to_string());
+                        if off_raw.as_deref() == Some("*") {
+                            return format!(
+                                "join(substr(($ENV{{IFS}} // \" \"), 0, 1), values %{})",
+                                ident(var)
+                            );
+                        }
+                        return format!("values %{}", ident(var));
+                    }
+                    self.arrays.insert(var.to_string());
                     // off/len are shell ARITHMETIC text (`${x:j:1}`) — the
                     // value of the named var, not a literal string
                     let off = args
@@ -3817,10 +3859,23 @@ impl Render {
             }
             "slice" => {
                 let off_raw = Self::str_arg(args, 2);
-                // `${arr[@]}` / `${arr[@]:off:}` — whole-array slices
+                // `${arr[@]}` / `${arr[@]:off:}` — whole-array slices;
+                // `${arr[*]}` joins with the first IFS char (bash); an
+                // ASSOC array's `[@]`/`[*]` are its VALUES
                 if matches!(off_raw.as_deref(), Some("@") | Some("*")) {
-                    self.arrays.insert(name.clone());
-                    return format!("@{}", ident(&name));
+                    let list = if self.hashes.contains(&name) {
+                        self.hashes.insert(name.clone());
+                        format!("values %{}", ident(&name))
+                    } else {
+                        self.arrays.insert(name.clone());
+                        format!("@{}", ident(&name))
+                    };
+                    if off_raw.as_deref() == Some("*") {
+                        return format!(
+                            "join(substr(($ENV{{IFS}} // \" \"), 0, 1), {list})"
+                        );
+                    }
+                    return list;
                 }
                 // off/len are shell ARITHMETIC text (`${x:j:1}`) — the
                 // VALUE of the named var, not a literal string
@@ -4358,6 +4413,12 @@ impl Render {
                     }
                 }
                 let lhs = self.scalar_target(&t.var);
+                // record a literal IFS assignment (bash's field separator)
+                if t.var == "IFS" {
+                    if let IrExpr::Str(v, _) = expr {
+                        self.ifs = v.clone();
+                    }
+                }
                 // `typeset -i/-l/-u/-r` attribute semantics
                 if self.readonly_vars.contains(&t.var) {
                     // bash: assigning to a readonly var fails (stderr) and
@@ -4483,12 +4544,52 @@ impl Render {
                 }
                 let items = match iter {
                     IrExpr::Array(items) => {
-                        let l: Vec<String> = items.iter().map(|i| self.expr(i)).collect();
-                        l.join(", ")
+                        // `*.{txt,log,dat}` arrives as an Array carrying a
+                        // brace call — glob-bearing items expand at RUNTIME
+                        if let [IrExpr::Call { func, args }] = items.as_slice() {
+                            if func == "brace" {
+                                let bl = self.brace_list(args);
+                                if bl.iter().any(|s| s.contains('*') || s.contains('?')) {
+                                    let gs: Vec<String> = bl
+                                        .iter()
+                                        .map(|s| {
+                                            Self::perl_str(
+                                                &s.replace("\u{1}SH2GLOB\u{1}", ""),
+                                            )
+                                        })
+                                        .collect();
+                                    format!("(sort(glob({})))", gs.join("), glob("))
+                                } else {
+                                    let l: Vec<String> =
+                                        items.iter().map(|i| self.expr(i)).collect();
+                                    l.join(", ")
+                                }
+                            } else {
+                                let l: Vec<String> =
+                                    items.iter().map(|i| self.expr(i)).collect();
+                                l.join(", ")
+                            }
+                        } else {
+                            let l: Vec<String> = items.iter().map(|i| self.expr(i)).collect();
+                            l.join(", ")
+                        }
                     }
                     IrExpr::Range { start, end } => format!("{start}..{end}"),
                     IrExpr::Call { func, args } if func == "brace" => {
-                        self.brace(args)
+                        let items = self.brace_list(args);
+                        if items.iter().any(|s| s.contains('*') || s.contains('?')) {
+                            // glob-bearing brace items (`*.{txt,log}`)
+                            // expand at RUNTIME (perl glob, sorted like
+                            // bash) — the SH2GLOB marker is shell-side
+                            // syntax, strip it from the pattern
+                            let gs: Vec<String> = items
+                                .iter()
+                                .map(|s| Self::perl_str(&s.replace("\u{1}SH2GLOB\u{1}", "")))
+                                .collect();
+                            format!("(sort(glob({})))", gs.join("), glob("))
+                        } else {
+                            self.brace(args)
+                        }
                     }
                     IrExpr::Call { func, args } if func == "seq" => {
                         let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
