@@ -454,6 +454,7 @@ mod tests {
                     indices: vec![],
                 }],
                 expr: crate::ir::IrExpr::Int(42),
+                asm: None,
             }],
             subs: vec![],
             var_types: vec![],

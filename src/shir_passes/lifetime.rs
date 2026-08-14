@@ -176,7 +176,7 @@ fn walk_stmt(
     let p = *pos;
     match st {
         IrStmt::Label(_) | IrStmt::Goto(_) => {}
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, asm, .. } => {
             for t in targets {
                 if t.indices.is_empty() {
                     // plain scalar def
@@ -194,6 +194,20 @@ fn walk_stmt(
                 }
             }
             walk_expr(expr, p, first, last, escapes, in_closure);
+            // declarator-position asm label: OUTPUT operand targets are
+            // store writes; input operand exprs are plain reads (same
+            // contract as the Asm statement).
+            if let Some(spec) = asm {
+                for (_, t) in &spec.outputs {
+                    if let IrExpr::Var(name, _) = t {
+                        access(name, p, first, last, escapes, in_closure);
+                    }
+                    walk_expr(t, p, first, last, escapes, in_closure);
+                }
+                for (_, e) in &spec.inputs {
+                    walk_expr(e, p, first, last, escapes, in_closure);
+                }
+            }
         }
         IrStmt::Declare { vars, init, .. } => {
             for d in vars {
@@ -334,6 +348,20 @@ fn walk_stmt(
                 if let Some(v) = &c.value {
                     walk_expr(v, *pos, first, last, escapes, in_closure);
                 }
+            }
+        }
+        // Inline asm (core requests c-sh-go-asm family): OUTPUT operand
+        // targets are store writes (access them like assignment targets);
+        // input operand exprs are plain reads.
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, t) in outputs {
+                if let IrExpr::Var(name, _) = t {
+                    access(name, p, first, last, escapes, in_closure);
+                }
+                walk_expr(t, p, first, last, escapes, in_closure);
+            }
+            for (_, e) in inputs {
+                walk_expr(e, p, first, last, escapes, in_closure);
             }
         }
         IrStmt::Try {
@@ -490,6 +518,7 @@ fn walk_expr(
                 walk_expr(c, pos, first, last, escapes, in_closure);
             }
         }
+        IrExpr::Splice(e) => walk_expr(e, pos, first, last, escapes, in_closure),
         IrExpr::Lambda { body, .. } => {
             // a closure: every access inside escapes (like Arrow)
             let mut p = pos;
@@ -647,12 +676,27 @@ fn mark_stmt_vars_escape(
 ) {
     match st {
         IrStmt::Label(_) | IrStmt::Goto(_) => {}
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, asm, .. } => {
             for t in targets {
                 first.entry(t.var.clone()).or_insert(0);
                 escapes.insert(t.var.clone());
             }
             mark_vars_escape(expr, first, escapes);
+            // declarator-position asm label: output target vars escape
+            // (the asm writes them); operand exprs may carry retained
+            // values (same contract as the Asm statement).
+            if let Some(spec) = asm {
+                for (_, t) in &spec.outputs {
+                    if let IrExpr::Var(name, _) = t {
+                        first.entry(name.clone()).or_insert(0);
+                        escapes.insert(name.clone());
+                    }
+                    mark_vars_escape(t, first, escapes);
+                }
+                for (_, e) in &spec.inputs {
+                    mark_vars_escape(e, first, escapes);
+                }
+            }
         }
         IrStmt::Declare { vars, init, .. } => {
             for d in vars {
@@ -772,6 +816,20 @@ fn mark_stmt_vars_escape(
                 }
             }
         }
+        // Inline asm: output target vars escape (the asm writes them);
+        // operand exprs may carry retained values.
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, t) in outputs {
+                if let IrExpr::Var(name, _) = t {
+                    first.entry(name.clone()).or_insert(0);
+                    escapes.insert(name.clone());
+                }
+                mark_vars_escape(t, first, escapes);
+            }
+            for (_, e) in inputs {
+                mark_vars_escape(e, first, escapes);
+            }
+        }
         IrStmt::Try {
             body,
             excepts,
@@ -873,6 +931,7 @@ mod tests {
                 indices: vec![],
             }],
             expr,
+            asm: None,
         }
     }
 
@@ -945,6 +1004,7 @@ mod tests {
                     indices: vec![IrExpr::Int(0)],
                 }],
                 expr: read("x"),
+                asm: None,
             }],
             ..empty_prog()
         };

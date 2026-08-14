@@ -761,6 +761,10 @@ impl Render {
                 self.mark_todo("Lambda expr");
                 "nil".into()
             }
+            IrExpr::Splice(_) => {
+                self.mark_todo("Splice expr");
+                "nil".into()
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr_any(i)).collect();
                 format!("[]any{{{}}}", elems.join(", "))
@@ -1832,7 +1836,16 @@ impl Render {
             IrStmt::Try { .. } => None,
             // select over channels has no shell text either
             IrStmt::Select { .. } => None,
-            IrStmt::Assign { targets, expr } => {
+            // inline asm has no shell text either (JS no-op only)
+            IrStmt::Asm { .. } => None,
+            IrStmt::Assign { targets, expr, asm, .. } => {
+                // Declarator-position asm label (core request
+                // c-sh-go-toplevelasmargument-20260814-042952) — no Go
+                // rendering; refuse loudly (refuse > guess).
+                if let Some(spec) = asm {
+                    self.mark_todo(&format!("asm label '{}' on an assign", spec.template));
+                    return None;
+                }
                 let t = targets.first()?;
                 // array assignment `arr=(a b c)`
                 if let IrExpr::Call { func, args } = expr {
@@ -2454,7 +2467,7 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => self.stmt_expr(e),
-            IrStmt::Assign { targets, expr } => self.stmt_assign(targets, expr),
+            IrStmt::Assign { targets, expr, .. } => self.stmt_assign(targets, expr),
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
                     self.mark_written(&d.name);
@@ -2824,6 +2837,9 @@ impl Render {
             }
             IrStmt::Select { .. } => {
                 self.mark_todo("select");
+            }
+            IrStmt::Asm { .. } => {
+                self.mark_todo("asm");
             }
             IrStmt::Exec { .. }
             | IrStmt::Require(_)
@@ -5305,7 +5321,7 @@ fn scan_imports(text: &str) -> Vec<&'static str> {
 fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>, arrays: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
                     if !t.indices.is_empty() {

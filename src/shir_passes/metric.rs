@@ -135,7 +135,16 @@ fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
             walk_expr(path, counts);
             walk_expr(content, counts);
         }
-        IrStmt::Assign { expr, .. } => walk_expr(expr, counts),
+        IrStmt::Assign { expr, asm, .. } => {
+            walk_expr(expr, counts);
+            // declarator-position asm label (c-sh-go-toplevelasmargument):
+            // operand exprs are sh2.* call-site tallies too
+            if let Some(spec) = asm {
+                for (_, e) in spec.outputs.iter().chain(spec.inputs.iter()) {
+                    walk_expr(e, counts);
+                }
+            }
+        }
         IrStmt::Declare { init, .. } => {
             if let Some(e) = init {
                 walk_expr(e, counts);
@@ -280,6 +289,11 @@ fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
                 }
             }
         }
+        IrStmt::Asm { outputs, inputs, .. } => {
+            for (_, e) in outputs.iter().chain(inputs.iter()) {
+                walk_expr(e, counts);
+            }
+        }
         IrStmt::Require(_) => {
             // `require` is a bare string; no IrExpr children.
         }
@@ -359,6 +373,7 @@ fn walk_expr(expr: &IrExpr, counts: &mut HashMap<String, usize>) {
                 walk_stmt(s, counts);
             }
         }
+        IrExpr::Splice(e) => walk_expr(e, counts),
         IrExpr::Capture { expr, .. } => walk_expr(expr, counts),
         IrExpr::Range { .. } => {}
         IrExpr::Arith(a) => walk_arith(a, counts),

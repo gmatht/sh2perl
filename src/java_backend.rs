@@ -55,7 +55,18 @@ fn collect_fields(st: &IrStmt, out: &mut String) -> Result<(), String> {
 fn stmt_to_java(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
     match st {
         IrStmt::Expr(e) => expr_stmt_to_java(e, d, out),
-        IrStmt::Assign { targets, expr } => {
+        IrStmt::Assign { targets, expr, asm, .. } => {
+            // Declarator-position asm label (core request
+            // c-sh-go-toplevelasmargument-20260814-042952) — no Java
+            // rendering; refuse loudly (refuse > guess).
+            if let Some(spec) = asm {
+                indent(out, d);
+                out.push_str(&format!(
+                    "// TODO(unsupported): asm label '{}' on an assign\n",
+                    spec.template
+                ));
+                return Ok(());
+            }
             let t = targets.first().ok_or("assign: no target (v1)")?;
             if !t.indices.is_empty() {
                 return Err("assign with indices not in the v1 subset".into());

@@ -3002,6 +3002,113 @@ mod tests {
     }
 
     #[test]
+    fn echo_head_statement_pipeline_folds_to_native_write() {
+        // statement-form `echo "select" | head -1` — a static echo
+        // producer feeding a static head consumer: the whole pipeline
+        // folds to a native `process.stdout.write("select\n")` (the
+        // head output over the echo text computed at emit time — no
+        // pipeline machinery, no builtin dispatch). A DYNAMIC producer
+        // (`$x`) keeps the pipeline.
+        let json = to_json("echo \"select\" | head -1");
+        assert!(json.contains("\"value\":\"select\\n\""));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("\"name\":\"head\""));
+        assert!(!json.contains("unsupported"));
+        // printf producer folds too (`printf 'abcdef' | head -c 3`)
+        let json2 = to_json("printf 'abcdef' | head -c 3");
+        assert!(json2.contains("\"value\":\"abc\""));
+        assert!(!json2.contains("\"name\":\"builtin\""));
+        // a dynamic producer keeps the pipeline
+        let json3 = to_json("echo \"$x\" | head -1");
+        assert!(json3.contains("\"name\":\"pipelineSync\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn echo_wc_capture_with_grep_filter_folds_native() {
+        // `x=$(echo -e "line1\nline2\nline3" | grep -v "line2" | wc -l)`
+        // — the 3-stage echo|grep -v|wc capture: the count is a native
+        // filter chain over the echo text (grepSelect's line model + the
+        // literal pattern's !includes) — no capture/pipeline machinery,
+        // no builtin dispatch.
+        let json = to_json("x=$(echo -e \"line1\\nline2\\nline3\" | grep -v \"line2\" | wc -l)");
+        assert!(json.contains("\"name\":\"filter\""));
+        assert!(json.contains("\"value\":\"line2\""));
+        assert!(!json.contains("\"name\":\"captureSync\""));
+        assert!(!json.contains("\"name\":\"pipelineSync\""));
+        assert!(!json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("unsupported"));
+        // a metachar pattern keeps the runtime pipeline (regex matching)
+        let json2 = to_json("x=$(echo a | grep -v \"a.*\" | wc -l)");
+        assert!(json2.contains("\"name\":\"pipelineSync\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn uname_cmdsub_test_operand_lowers_native() {
+        // `[[ $(uname -r) == 5.4.* ]]` — the cmdsub operand is the
+        // native uname value twin (no bash -c spawn, no sh2.test text
+        // parse): `String(sh2.uname("-r")).startsWith("5.4.")` — the
+        // glob-pattern equality folds to the prefix test.
+        let json = to_json("[[ $(uname -r) == 5.4.* ]]");
+        assert!(json.contains("\"name\":\"uname\""));
+        assert!(json.contains("\"name\":\"startsWith\""));
+        assert!(json.contains("\"value\":\"5.4.\""));
+        assert!(!json.contains("\"name\":\"test\""));
+        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(!json.contains("unsupported"));
+        // `$(pwd)` folds to the cwd field read; `$(echo LIT)` to the
+        // literal (the pre-existing echo fold)
+        let json2 = to_json("[[ \"$(pwd)\" = \"$HOME\" ]]");
+        assert!(json2.contains("\"name\":\"cwd\""));
+        assert!(!json2.contains("\"name\":\"test\""));
+        assert!(!json2.contains("unsupported"));
+        // a cmdsub with a dynamic command keeps the runtime test
+        let json3 = to_json("[[ \"$(cat f)\" = x ]]");
+        assert!(json3.contains("\"name\":\"test\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn quiet_grep_cmdsub_test_folds_constant() {
+        // `[ "$(echo "$v" | grep -q "p")" ]` — grep -q NEVER writes
+        // stdout, so the captured operand value is always "" and the
+        // value test is constant-false (the runtime would run the whole
+        // pipeline per evaluation for a value it cannot observe).
+        let json = to_json("[ \"$(echo \"$v\" | grep -q \"p\")\" ]");
+        assert!(json.contains("\"value\":false"));
+        assert!(!json.contains("\"name\":\"test\""));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("unsupported"));
+        // the `!` form is constant-true
+        let json2 = to_json("[ ! \"$(echo x | grep -q y)\" ]");
+        assert!(json2.contains("\"value\":true"));
+        assert!(!json2.contains("\"name\":\"test\""));
+        // a non-grep cmdsub operand keeps the runtime test
+        let json3 = to_json("[ \"$(echo x)\" ]");
+        assert!(json3.contains("\"name\":\"test\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn case_cmdsub_pattern_folds_to_static_chain() {
+        // `case "w" in $(echo "pattern") )` — the runtime caseMatch
+        // evaluates the $(echo LIT) pattern via runCmdSubst (a bash -c
+        // SPAWN per case evaluation); the fold substitutes the captured
+        // value at emit time so the static case chain sees "pattern" —
+        // no caseMatch dispatch, no spawn.
+        let json = to_json("case \"w\" in $(echo \"pattern\") ) echo m; esac");
+        assert!(json.contains("\"value\":\"pattern\""));
+        assert!(!json.contains("\"name\":\"caseMatch\""));
+        assert!(!json.contains("unsupported"));
+        // a dynamic pattern (a function call) keeps the runtime caseMatch
+        let json2 = to_json("case \"w\" in $(f) ) echo m; esac");
+        assert!(json2.contains("\"name\":\"caseMatch\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
     fn cut_herestring_capture_lifts_to_native() {
         // `$(cut -c2 <<< X)` — the here-string feed is the same per-line
         // selection over the target value; the split has no trailing ''
@@ -3691,11 +3798,16 @@ mod tests {
         assert!(!json.contains("\"name\":\"builtin\""));
         assert!(!json.contains("unsupported"));
         // non-echo bodies keep the runtime redirect — `ls` is a sync
-        // builtin, so the await-free redirect dispatches to the sync twin
-        // redirectSync (the *Sync family; the async `redirect` only when a
-        // body/target awaits)
+        // builtin and the FILE target is sync-capable in the runtime's
+        // `redirectSync` twin (every _applyRedirectSpecs mode is
+        // synchronous — fs.existsSync/openSync/writeFileSync; the
+        // "async fs bridge" throw the fd-dup-only rule described never
+        // existed in sh2-namespace.mjs — see redirect_specs_sync_ok),
+        // so the await-free body + literal target lowers to the sync
+        // twin: no per-call promise, no microtask.
         let json2 = to_json("ls > out.txt");
         assert!(json2.contains("\"name\":\"redirectSync\""));
+        assert!(!json2.contains("\"name\":\"redirect\""));
         // Property keys serialize as {key: Identifier{name}, value: Literal}.
         assert!(json2.contains("\"name\":\"mode\""));
         assert!(json2.contains("\"value\":\"w\""));
@@ -3703,6 +3815,31 @@ mod tests {
         assert!(json2.contains("\"value\":1"));
         assert!(json2.contains("\"type\":\"ObjectExpression\""));
         assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn file_target_redirect_lowers_to_sync_twin() {
+        // `cat file.txt > out.txt` — a sync builtin body with a literal
+        // FILE target lowers to the runtime's `redirectSync` twin (the
+        // eligibility audit: every _applyRedirectSpecs mode is
+        // synchronous — existsSync/openSync/writeFileSync — so the
+        // await-free body is the only gate; see
+        // redirect_specs_sync_ok).
+        let json = to_json("cat file.txt > out.txt");
+        assert!(json.contains("\"name\":\"redirectSync\""));
+        assert!(!json.contains("\"name\":\"redirect\""));
+        // a DYNAMIC target that lowers await-free (the `$(pwd)` twin is
+        // a native `sh2.cwd` read — no capture) also qualifies.
+        let json2 = to_json("ls > \"$(pwd)/x\"");
+        assert!(json2.contains("\"name\":\"redirectSync\""));
+        assert!(!json2.contains("\"name\":\"redirect\""));
+        // a target whose cmdsub is a real capture (`$(cat ...)` — an
+        // await in the specs) keeps the async `redirect` path: the sync
+        // twin cannot wait for the capture before installing the spec.
+        let json3 = to_json("ls > \"$(cat /etc/hostname)\"");
+        assert!(json3.contains("\"name\":\"redirect\""));
+        assert!(!json3.contains("\"name\":\"redirectSync\""));
+        assert!(!json3.contains("unsupported"));
     }
 
     #[test]
@@ -3854,6 +3991,37 @@ mod tests {
         let json4 = to_json("((i++))");
         assert!(!json4.contains("\"name\":\"setVar\""));
         assert!(!json4.contains("\"name\":\"getVar\""));
+    }
+
+    #[test]
+    fn store_bound_arith_assign_skips_redundant_outer_write() {
+        // `(( i += 2 ))` with a STORE-BOUND target (the dynamic-key
+        // subscript `options["$key"]` keeps `i` store-bound): the
+        // arith-assign expr lowers to `(sh2.setVar(n, String(v)),
+        // <read-back>)` — the inner setVar is the arith's own store
+        // write and the read-back re-reads it, so the old emission's
+        // OUTER statement setVar re-wrote the same value
+        // (`setVar("i", (setVar("i", ...), ...))`). The outer call is
+        // dropped; the sequence keeps a trailing `true` (the statement
+        // value the errexit guard consumes — the old outer setVar
+        // returned true).
+        let src = "complex_function() {\n\
+            local -a args=(\"$@\")\n\
+            local -A options=()\n\
+            local i=0\n\
+            while (( i < ${#args[@]} )); do\n\
+                local key=\"${args[i]#--}\"\n\
+                options[\"$key\"]=\"true\"\n\
+                (( i += 2 ))\n\
+            done\n\
+            echo \"Processed ${#options[@]} options\"\n\
+        }\n\
+        complex_function --flag1 --option1=value1 -abc";
+        let json = to_json(src);
+        // the `(( i += 2 ))` writes the store ONCE (the inner arith
+        // write); the redundant outer setVar is gone
+        assert_eq!(json.matches("\"name\":\"setVar\"").count(), 2);
+        assert!(!json.contains("\"value\":\"i\"},{\"type\":\"SequenceExpression\""));
     }
 
     #[test]
@@ -4246,10 +4414,13 @@ mod tests {
         // whitespace IFS).
         let json = to_json("IFS=, read a b c <<< \"1,2,3\"");
         // the redirect wraps the env-carrying read (the env stays on the
-        // command; the no-op `true` split is gone) — the await-free body
-        // + literal herestring target dispatch to the sync twin
-        // redirectSync
+        // command; the no-op `true` split is gone) — a herestring target
+        // is an in-memory string target, sync-capable in the runtime
+        // twin, so the await-free body lowers to `redirectSync` (the
+        // fd-dup-only eligibility rule was retired — see
+        // redirect_specs_sync_ok)
         assert!(json.contains("\"name\":\"redirectSync\""));
+        assert!(!json.contains("\"name\":\"redirect\""));
         assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("\"value\":\"read\""));
         // the env object's property key is an Identifier (prop() renders
@@ -4304,9 +4475,13 @@ mod tests {
         let json2 = to_json("mapfile -t lines < <(printf 'x\\ny\\n')");
         assert!(!json2.contains("\"name\":\"unsupported\""));
         assert!(!json2.contains("\"value\":\"unsupported\""));
-        // the producer + mapfile body are both sync builtins → the
-        // await-free redirect dispatches to the sync twin redirectSync
+        // the producer + mapfile body are both sync builtins and the
+        // process-substitution fd-0 target is a here-string in-memory
+        // target — sync-capable in the runtime twin, so the redirect
+        // lowers to the sync path (the fd-dup-only rule was retired —
+        // see redirect_specs_sync_ok)
         assert!(json2.contains("\"name\":\"redirectSync\""));
+        assert!(!json2.contains("\"name\":\"redirect\""));
         assert!(json2.contains("\"name\":\"builtin\""));
     }
 }

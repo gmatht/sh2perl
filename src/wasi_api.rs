@@ -133,7 +133,12 @@ pub extern "C" fn debashc_to_glsl(input: *const u8, input_len: usize) -> *mut u8
                     es100: true,
                     color_out: true,
                     tex_size: 16,
-                    max_view: 800, // the sh2runtime device canvas is 800×600
+                    // max_view stays the Default (0): the coordinate
+                    // range is EMBEDDER-owned (core request
+                    // estree-20260813-232001-glsl-options-build-fix) —
+                    // the browser goes through the otranspilerl crate's
+                    // view-parameterized entry points; this legacy frag
+                    // entry must not bake in a canvas size.
                     ..Default::default()
                 },
             );

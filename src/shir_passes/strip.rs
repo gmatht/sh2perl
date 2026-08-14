@@ -270,6 +270,7 @@ mod tests {
                     indices: vec![],
                 }],
                 expr: IrExpr::Str("0".into(), StrStyle::DoubleQuoted),
+                asm: None,
             }],
             cond: IrExpr::Str("$i -lt 3".into(), StrStyle::DoubleQuoted),
             step: vec![IrStmt::Assign {
@@ -279,6 +280,7 @@ mod tests {
                     indices: vec![],
                 }],
                 expr: IrExpr::Str("i + 1".into(), StrStyle::DoubleQuoted),
+                asm: None,
             }],
             body: vec![IrStmt::Continue, IrStmt::Break],
         }];

@@ -129,11 +129,27 @@ fn stmt_json(s: &IrStmt) -> Value {
             "type": "WriteFile", "path": expr_json(path),
             "content": expr_json(content), "append": append,
         }),
-        IrStmt::Assign { targets, expr } => json!({
-            "type": "Assign",
-            "targets": targets.iter().map(target_json).collect::<Vec<_>>(),
-            "expr": expr_json(expr),
-        }),
+        IrStmt::Assign {
+            targets,
+            expr,
+            asm,
+        } => {
+            let mut o = serde_json::Map::new();
+            o.insert("type".to_string(), json!("Assign"));
+            o.insert(
+                "targets".to_string(),
+                json!(targets.iter().map(target_json).collect::<Vec<_>>()),
+            );
+            o.insert("expr".to_string(), expr_json(expr));
+            // Optional GCC asm-label spec on a DECLARATION-position assign
+            // (`int x asm("myx") = 7;` — core request
+            // c-sh-go-toplevelasmargument-20260814-042952). Absent when
+            // None, so the A1 bytes of plain assigns are unchanged.
+            if let Some(spec) = asm {
+                o.insert("asm".to_string(), asm_spec_json(spec));
+            }
+            serde_json::Value::Object(o)
+        }
         IrStmt::Declare { vars, init, local } => json!({
             "type": "Declare",
             "vars": vars.iter().map(decl_json).collect::<Vec<_>>(),
@@ -307,10 +323,44 @@ fn stmt_json(s: &IrStmt) -> Value {
                 "body": stmts_json(&c.body),
             })).collect::<Vec<_>>(),
         }),
+        // Inline assembly (core requests c-sh-go-asm / asmargument /
+        // asmqualifier): the raw template + operand bindings + clobbers.
+        // outputs/inputs serialize the constraint string + the lowered
+        // operand expr (the existing value-node serialization). The
+        // deserializer also accepts a plain store-name STRING in place of
+        // the value node (the request's minimal shape).
+        IrStmt::Asm { template, volatile, outputs, inputs, clobbers } =>
+            asm_spec_json(&AsmSpec {
+                template: template.clone(),
+                volatile: *volatile,
+                outputs: outputs.clone(),
+                inputs: inputs.clone(),
+                clobbers: clobbers.clone(),
+            }),
         IrStmt::Expr(e) => json!({ "type": "Expr", "expr": expr_json(e) }),
         IrStmt::Label(name) => json!({ "type": "Label", "name": name }),
         IrStmt::Goto(name) => json!({ "type": "Goto", "name": name }),
     }
+}
+
+/// Inline-assembly / asm-label spec JSON — the shared shape of the
+/// `Asm` statement and the declarator-position `Assign.asm` field
+/// (core request c-sh-go-toplevelasmargument-20260814-042952):
+/// `{"template","volatile","outputs","inputs","clobbers"}` with the
+/// operand value-node serialization.
+fn asm_spec_json(spec: &AsmSpec) -> Value {
+    json!({
+        "type": "Asm",
+        "template": spec.template,
+        "volatile": spec.volatile,
+        "outputs": spec.outputs.iter().map(|(c, t)| json!({
+            "constraint": c, "target": expr_json(t),
+        })).collect::<Vec<_>>(),
+        "inputs": spec.inputs.iter().map(|(c, e)| json!({
+            "constraint": c, "expr": expr_json(e),
+        })).collect::<Vec<_>>(),
+        "clobbers": spec.clobbers,
+    })
 }
 
 fn stmts_json(v: &[IrStmt]) -> Value {
@@ -398,6 +448,10 @@ fn expr_json(e: &IrExpr) -> Value {
         IrExpr::Bool(b) => json!({ "type": "Bool", "value": b }),
         IrExpr::Json(v) => json!({ "type": "Json", "value": v }),
         IrExpr::Ident(name) => json!({ "type": "Ident", "name": name }),
+        // Starred-expression splice (core request py-sh-go-star-expr):
+        // `[*a]` / `f(*a)` — the wrapped expr's elements splice into the
+        // enclosing Array/Call (the estree renderer emits a JS spread).
+        IrExpr::Splice(e) => json!({ "type": "Splice", "expr": expr_json(e) }),
         IrExpr::Object(props) => json!({
             "type": "Object",
             "properties": props.iter().map(|(k, v)| json!({"key": k, "value": expr_json(v)})).collect::<Vec<_>>(),

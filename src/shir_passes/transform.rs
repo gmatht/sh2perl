@@ -146,7 +146,7 @@ fn analyze_store_only(
     ) {
         match s {
             IrStmt::Expr(e) => walk_expr(e, store, unsafe_v, any_dynamic),
-            IrStmt::Assign { targets, expr } => {
+            IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     if t.indices.is_empty() && is_plain_var(&t.var) {
                         unsafe_v.insert(t.var.clone());
@@ -308,6 +308,7 @@ fn rewrite_setvar_stmts(
                             indices: vec![],
                         }],
                         expr: value.clone(),
+                        asm: None,
                     };
                 }
             }

@@ -287,6 +287,7 @@ pub fn generate_find_command(
                     IrExpr::Var(input_var.to_string(), Some(Sigil::Array)),
                 ],
             },
+            asm: None,
         });
 
         // chomp $input_var;
@@ -429,6 +430,7 @@ pub fn generate_find_for_substitution(
                 op: ir::BinOpKind::Concat,
                 rhs: Box::new(IrExpr::Str("\n".to_string(), StrStyle::DoubleQuoted)),
             },
+            asm: None,
         }],
         elsifs: vec![],
         else_: vec![],

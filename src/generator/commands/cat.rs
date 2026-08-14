@@ -197,6 +197,7 @@ pub fn generate_cat_command(
                         indices: vec![],
                     }],
                     expr: IrExpr::Str(body, style),
+                    asm: None,
                 };
                 output.push_str(&stmt_to_perl(&ir_stmt, 0));
             }
