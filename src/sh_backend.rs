@@ -630,6 +630,12 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
         out.push_str("    printf '%s' \"'\"\n");
         out.push_str("}\n\n");
     }
+    if needs_hostname(&prog.stmts) {
+        // bash sets HOSTNAME on startup (the gate's bash ref has it);
+
+        out.push_str("HOSTNAME=\"$(hostname)\"\n\n");
+
+    }
     if needs_ls(&prog.stmts) {
         out.push_str("_ls() {\n");
         out.push_str("    # busybox ls output is unsorted (GNU sorts); sort the\n");
@@ -1862,6 +1868,7 @@ fn assign_rhs_to_sh(expr: &IrExpr) -> Result<String, String> {
                         line.push_str(" | ");
                     }
                     let s = stmts_inline(stg)?;
+                    let s = wrap_pipeline_stage(stg, &s);
                     // a heredoc stage is multi-line — the `| next` must
                     // apply to a brace group, not the EOF terminator line
                     // (the `}` alone on the line after the terminator is
@@ -2039,6 +2046,7 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                         line.push_str(" | ");
                     }
                     let s = stmts_inline(stg)?;
+                    let s = wrap_pipeline_stage(stg, &s);
                     // a heredoc stage is multi-line — the `| next` must
                     // apply to a brace group, not the EOF terminator line
                     // (the `}` alone on the line after the terminator is
@@ -2109,6 +2117,11 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                     out
                 };
                 let mut line = herestring_wrap(&plain, inner)?;
+                // the inner may be a bare `A && B` chain — the redirect
+                // suffix would bind to B only
+                if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                    line = wrap_redirect_chain(stmts, &line);
+                }
                 if !ps_ins.is_empty() {
                     line = lower_procsub_inline(&ps_ins, &line)?;
                 }
@@ -2389,6 +2402,64 @@ fn needs_printf_q(stmts: &[IrStmt]) -> bool {
                     if walk(inner) { return true; }
                     for r in redirects {
                         if has_pq(&r.target) { return true; }
+                    }
+                }
+                IrStmt::Function { body, .. } => { if walk(body) { return true; } }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
+// Does the program reference $HOSTNAME (bash sets it on startup; dash
+// does not — the equivalence gate's bash ref gets it, the render must
+// inject the same value)?
+fn needs_hostname(stmts: &[IrStmt]) -> bool {
+    fn has_hn(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => {
+                if (func == "getVar" || func == "param" || func == "listVar")
+                    && args.iter().any(|a| matches!(a, IrExpr::Str(s, _) if s == "HOSTNAME"))
+                {
+                    return true;
+                }
+                args.iter().any(has_hn)
+            }
+            IrExpr::Array(es) => es.iter().any(has_hn),
+            IrExpr::Object(es) => es.iter().any(|(_, v)| has_hn(v)),
+            IrExpr::Arrow(stmts) => walk(stmts),
+            IrExpr::BinOp { lhs, rhs, .. } => has_hn(lhs) || has_hn(rhs),
+            IrExpr::Interpolate(parts) => parts
+                .iter()
+                .any(|p| matches!(p, InterpPart::Expr(x) if has_hn(x))),
+            _ => false,
+        }
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            match st {
+                IrStmt::Expr(e) => { if has_hn(e) { return true; } }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    if has_hn(cond) || walk(body) { return true; }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    if has_hn(cond) || walk(then) || walk(else_)
+                        || elsifs.iter().any(|(c, b)| has_hn(c) || walk(b))
+                    { return true; }
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    if walk(body) { return true; }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    if has_hn(iter) || walk(body) { return true; }
+                }
+                IrStmt::Assign { expr, .. } => { if has_hn(expr) { return true; } }
+                IrStmt::Redirect { inner, redirects } => {
+                    if walk(inner) { return true; }
+                    for r in redirects {
+                        if has_hn(&r.target) { return true; }
                     }
                 }
                 IrStmt::Function { body, .. } => { if walk(body) { return true; } }
@@ -5510,6 +5581,20 @@ fn arrow_at(args: &[IrExpr], idx: usize) -> Result<String, String> {
 }
 
 /// The stages of a pipeline call: `Array([Arrow, Arrow, ...])`.
+
+/// A pipeline stage that is a bare `A && B` chain — `A && B | next` pipes
+/// only B. Wrap in a brace group.
+fn wrap_pipeline_stage(stg: &[IrStmt], s: &str) -> String {
+    if matches!(
+        stg,
+        [IrStmt::Expr(IrExpr::Call { func, .. })] if func == "and" || func == "or"
+    ) {
+        format!("{{ {s}; }}")
+    } else {
+        s.to_string()
+    }
+}
+
 /// A pipeline stage whose command carries a heredoc renders as a
 /// MULTI-LINE string ending in the `EOF` terminator — appending ` | next`
 /// after it is a syntax error. Wrap the stage in a brace group
