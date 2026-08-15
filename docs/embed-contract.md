@@ -95,6 +95,7 @@ deterministic, and the refusal scan replaces purify's rejections:
 | drop `chomp $_r;` in command substitution | `mode.backtick_newlines` | Perl `qx` does NOT strip trailing newlines; bash `$()` does — the enclosing Perl backtick's semantics win |
 | `$INPUT_RECORD_SEPARATOR → $/`, `$OS_ERROR/$ERRNO → $!`, `$EVAL_ERROR → $@` | `!mode.english_names` | host file may not `use English` |
 | prepend `our $CHILD_ERROR = 0;` | fragment references `$CHILD_ERROR` | `our` is package-wide; redeclaration is harmless |
+| prepend `use Carp;` | fragment references `carp`/`croak`/`cluck`/`confess` (command emulations do, on error paths) | the standalone preamble imports Carp; `use` is compile-time and package-wide, and a duplicate in a host that already imports it is a silent no-op (purify.pl's import-injection, minus the regex) |
 
 ### Refusals (the analysis-driven rejection class)
 
@@ -132,14 +133,30 @@ rewrites are fixed-string replacements. Gate: `embed_fragment_is_deterministic`.
 
 1. ✅ Stage 1: `shir_to_perl_embed` (Perl backtick profile) + unit tests +
    `parse --perl-embed` CLI hook (`PURIFY_SCOPE` env for manual testing).
-2. ⏳ otranspilerl surface: `--embed-perl` render mode + literal-source
-   snippet input; `EmbedConstruct::System`/`Popen` profiles.
-3. ⏳ purify.pl backtick swap: PPI-harvest `host_scope` per site → call the
-   embed renderer → drop the regex patches one at a time (each pinned by a
-   fixture).
+2. ✅ Stage 2: **otranspilerl `--embed-perl`** — `render_embed(a1, EmbedOpts)`
+   + CLI flags `--embed-perl` / `--scope-vars a,b,c` / `--backtick` /
+   `--english` (fragment on stdout, `REQUIRED`/`REFUSE` on stderr so stdout
+   stays splice-clean); 5 CLI tests (`embed_*` in `otranspilerl/src/lib.rs`),
+   `EmbedConstruct::System`/`Popen` still reserved.
+3. ⏳ purify.pl backtick swap: PPI-harvest `host_scope` per site → call
+   `otranspilerl-cli --embed-perl` → drop the regex patches one at a time
+   (each pinned by a fixture); Bug 3 (Perl vars in backticks) via the
+   marker protocol, not the skip.
 4. ⏳ shIR verdict upgrade: `required_host_bindings` from
    `var_lifetimes[].escapes` + lift sets (PassContext) instead of the
    read/write sets.
 5. ⏳ Generic profile: per-host-language construct finders + the
    construct-shaped fragment API (`--embed=<lang> --construct=…`) + the
    preservation gate for every host language.
+
+## 7. Known pre-existing limitation (not embed-specific)
+
+A command substitution whose INNER command the renderer falls back to the
+`bash -c` capture path can emit the emulated Perl body as the bash command
+(`open(my $__fh, '-|', 'bash', '-c', q(sub { … }))`) — bash reports
+`sub: command not found`. This reproduces byte-for-byte through the
+standalone `debashc file --perl` (it is a `shir_to_perl` capture-path bug,
+not the embed profile). The corpus does not currently exercise this shape
+(`$(…)` in the middle of a double-quoted string with an emulable inner
+command). Fixes live in the shared renderer; the embed smoke matrix marks
+it as an inherited limitation.
