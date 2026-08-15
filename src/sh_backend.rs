@@ -1138,7 +1138,16 @@ _cmp() {
         // the same needs_num walk fires for the arith Index reads and
         // the `$(( ))`-span rewrites in `[ ]` tests.)
         out.push_str("_arr_get() {\n");
-        out.push_str("    eval \"_v=\\${$1_$2}\"\n");
+        // the key arrives as an arithmetic WORD (the call sites emit
+        // `$((k))` / an expanded number) — evaluate it here; NEGATIVE
+        // keys (zsh: a[-1] is the LAST element, triage t84_arith_index)
+        // map onto len+k via the per-element len counter
+        out.push_str("    _k=$(( $2 ))\n");
+        out.push_str("    if [ \"$_k\" -lt 0 ]; then\n");
+        out.push_str("        _n=$(eval echo \"\\${$1_len}\"); _n=${_n:-0}\n");
+        out.push_str("        _k=$((_k + _n))\n");
+        out.push_str("    fi\n");
+        out.push_str("    eval \"_v=\\${$1_$_k}\"\n");
         out.push_str("    case \"$_v\" in\n");
         out.push_str("        ''|'-'|*[!0-9-]*|-*[!0-9]*) echo 0 ;;\n");
         out.push_str("        *) echo \"$_v\" ;;\n");
@@ -4088,7 +4097,12 @@ fn exec_line_to_sh(cmd: &IrExpr, args: &[IrExpr], env: Option<&[(String, IrExpr)
         let mut parts = Vec::new();
         for a in args {
             let e = match a {
-                IrExpr::Str(s, _) => arith_rewrite(s),
+                // the frontends wrap the WHOLE `(( ))` expression in the
+                // GLOB_MAGIC marker (unquoted-raw text) — the estree
+                // reference strips it before evaluating (builtins.let
+                // receives the bare expression); strip it here too
+                // (triage t78_arith_assign)
+                IrExpr::Str(s, _) => arith_rewrite(s.strip_prefix(GLOB_MAGIC).unwrap_or(s)),
                 other => arith_rewrite(&word_to_sh(other)?),
             };
             parts.push(format!("[ \"$(({e}))\" -ne 0 ]"));
@@ -6223,9 +6237,25 @@ fn arith_rewrite(t: &str) -> String {
             while k < b.len() && b[k].is_ascii_whitespace() {
                 k += 1;
             }
+            // an assignment LHS stays bare. Plain `=` (excluding `==` /
+            // `=~` comparisons) AND compound assignments (`*=`, `+=`,
+            // `<<=`, ...) — the compound forms previously wrapped the
+            // LHS in `$( _num ... )` (a non-variable assignment target:
+            // `$(( 3 *= 2 ))` is a bash error, so the side effect was
+            // silently lost — triage t78_arith_assign)
             let is_assign = k < b.len()
-                && b[k] == b'='
-                && !(k + 1 < b.len() && (b[k + 1] == b'=' || b[k + 1] == b'~'));
+                && (b[k] == b'='
+                    && !(k + 1 < b.len() && (b[k + 1] == b'=' || b[k + 1] == b'~'))
+                    || (k + 1 < b.len()
+                        && b[k + 1] == b'='
+                        && matches!(
+                            b[k],
+                            b'*' | b'/' | b'+' | b'-' | b'%' | b'&' | b'^' | b'|'
+                        ))
+                    || (k + 2 < b.len()
+                        && b[k + 2] == b'='
+                        && ((b[k] == b'<' && b[k + 1] == b'<')
+                            || (b[k] == b'>' && b[k + 1] == b'>'))));
             if is_assign {
                 out.push_str(name);
             } else {
@@ -6270,9 +6300,21 @@ fn arith_text_uses_var(t: &str) -> bool {
             while k < b.len() && b[k].is_ascii_whitespace() {
                 k += 1;
             }
+            // mirror arith_rewrite's assignment-LHS rule (plain `=` and
+            // compound `*=`, `+=`, `<<=`, ... — but not `<=`/`>=`/`==`)
             let is_assign = k < b.len()
-                && b[k] == b'='
-                && !(k + 1 < b.len() && (b[k + 1] == b'=' || b[k + 1] == b'~'));
+                && (b[k] == b'='
+                    && !(k + 1 < b.len() && (b[k + 1] == b'=' || b[k + 1] == b'~'))
+                    || (k + 1 < b.len()
+                        && b[k + 1] == b'='
+                        && matches!(
+                            b[k],
+                            b'*' | b'/' | b'+' | b'-' | b'%' | b'&' | b'^' | b'|'
+                        ))
+                    || (k + 2 < b.len()
+                        && b[k + 2] == b'='
+                        && ((b[k] == b'<' && b[k + 1] == b'<')
+                            || (b[k] == b'>' && b[k + 1] == b'>'))));
             if !is_assign {
                 return true;
             }
@@ -6428,13 +6470,18 @@ fn arith_to_sh(a: &ArithAst) -> String {
         ArithAst::Index { var, key } => {
             // the array is lowered per-element (arr_0, arr_1, ...); an
             // arithmetic READ of arr[K] is a read of the element var
-            // (dash cannot parse `arr[1]` in arithmetic). Static numeric
-            // keys map to the element var; dynamic keys go through
-            // `_arr_get` (eval: the per-element var name is only known
-            // at runtime — ${base}_${key}).
-            match key.as_ref() {
-                ArithAst::Num(k) => format!("$( _num \"${{{var}_{k}}}\" )"),
-                _ => format!("$( _arr_get \"{var}\" {} )", arith_to_sh(key)),
+            // (dash cannot parse `arr[1]` in arithmetic). STATIC keys
+            // map to the element var (const-folded: `a[1+2]` is static);
+            // NEGATIVE keys (zsh: a[-1] is the LAST element — triage
+            // t84_arith_index) and dynamic keys go through `_arr_get`,
+            // which evals the key arithmetic and maps negatives onto
+            // len+k. The dynamic key is wrapped in `$(( ))` so it is a
+            // single WORD at the call site (a parenthesized Bin/Un text
+            // would parse as a subshell).
+            match const_fold(key) {
+                Some(k) if k >= 0 => format!("$( _num \"${{{var}_{k}}}\" )"),
+                Some(k) => format!("$( _arr_get \"{var}\" {k} )"),
+                None => format!("$( _arr_get \"{var}\" $(( {} )) )", arith_to_sh(key)),
             }
         }
         ArithAst::Bin { op, lhs, rhs } => {
