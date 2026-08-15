@@ -497,7 +497,18 @@ impl Render {
             // var (children don't see it) unless it was exported earlier
             self.assigned_env.insert(name.to_string());
         }
-        if is_env_style_var_name(name) {
+        if self.arrays.contains(name) {
+            // A scalar write to an ARRAY var assigns ELEMENT 0 (bash's
+            // stores are unified: `x=(a b); x=c` → x[0]=c, x[1]=b, `$x`
+            // reads x[0]). Perl's `$x`/`@x` namespaces are separate, so
+            // the write must hit the array store or a later `$x[0]` read
+            // sees the STALE element (triage-perl-20260814-142814:
+            // c-sh-go t21_stdlib_more.c — sprintf→setVar on a setArray'd
+            // char buffer rendered `$buf = "n=7"` then read `$buf[0]`
+            // from the empty array → undef). The scalar `$x` is left
+            // untouched — reads of array-known vars go to `$x[0]`.
+            format!("${}[0]", ident(name))
+        } else if is_env_style_var_name(name) {
             if self.exported.contains(name) {
                 format!("$ENV{{{}}}", name)
             } else {
