@@ -17564,9 +17564,15 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             expression: sh2_call(
                 "background",
                 vec![if native_echo_sink_site(stmts) {
-                    arrow_native_echo(vec![], IrExpr::Arrow(stmts.clone()))
+                    arrow_native_echo(
+                        vec![Expr::Identifier { name: "sh2".to_string() }],
+                        IrExpr::Arrow(stmts.clone()),
+                    )
                 } else {
-                    arrow_sink(vec![], IrExpr::Arrow(stmts.clone()))
+                    arrow_sink(
+                        vec![Expr::Identifier { name: "sh2".to_string() }],
+                        IrExpr::Arrow(stmts.clone()),
+                    )
                 }],
             ),
         },
