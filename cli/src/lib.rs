@@ -971,10 +971,21 @@ exit $main_exit_code;
                 Ok(c) => c,
                 Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
             };
-            let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
+            // the shared core pipeline (mirrors the --shir-in-estree arm):
+            // strip_cfor lowers the C-style ForInit (splicing the step
+            // before every continue), restructure_goto_only folds
+            // goto/label pairs, and the process_subst transform
+            // materializes captures — the frontends emit the rich A1 and
+            // the python renderer (like every backend) renders the
+            // shell-flavored form (triage-python 20260814-1425xx cluster:
+            // t29_mixed2.bat Goto / t17_continue.cc ForInit continue).
+            debashl::shir_passes::strip_cfor(&mut prog);
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
             print!("{}", debashl::python_backend::shir_to_python(&prog));
         }
 "--shir-in-perl" => {

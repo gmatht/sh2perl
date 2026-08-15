@@ -40,6 +40,10 @@ pub struct Render {
     /// needs the `__sh_atoi` helper (printf %d/%i/%u args)
     need_atoi: bool,
     todo: usize,
+    /// needs the `__sh_rc` status var (a `$?` test operand)
+    need_rc: bool,
+    /// needs the `__sh_strip` helper (a `${x##pat}` test operand)
+    need_strip: bool,
     /// needs `import re` (the grepMatches lift)
     need_re: bool,
 }
@@ -88,7 +92,11 @@ impl Render {
         (
             "memLoad",
             concat!(
-                "def sh2_memLoad(h, offset, t):\n",
+                // the A1 calls may carry only the handle (slice-1 form
+                // `memLoad(h)` — t83_const_ptr.c, the estree reference's
+                // slice-2 override defaults offset/type the same way);
+                // the arena lookup fails on a null handle → "".
+                "def sh2_memLoad(h, offset=0, t=4):\n",
                 "    p = __sh_mem_parse(h)\n",
                 "    if p is None or p[0] not in __sh_mem:\n",
                 "        return \"\"\n",
@@ -100,7 +108,7 @@ impl Render {
         (
             "memStore",
             concat!(
-                "def sh2_memStore(h, offset, t, v):\n",
+                "def sh2_memStore(h, offset=0, t=4, v=None):\n",
                 "    p = __sh_mem_parse(h)\n",
                 "    if p is None or p[0] not in __sh_mem:\n",
                 "        return\n",
@@ -237,6 +245,123 @@ impl Render {
     /// Look up the preamble body for a sh2.* name or helper.
     fn runtime_body(name: &str) -> Option<&'static str> {
         Render::RUNTIME.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
+    }
+}
+
+fn scan_rc(stmts: &[IrStmt], out: &mut bool) {
+    for s in stmts {
+        match s {
+            IrStmt::Expr(e) | IrStmt::Assign { expr: e, .. } | IrStmt::Output { value: e, .. } => {
+                scan_rc_expr(e, out);
+            }
+            IrStmt::WriteFile { path, content, .. } => {
+                scan_rc_expr(path, out);
+                scan_rc_expr(content, out);
+            }
+            IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } => {
+                scan_rc_expr(cond, out);
+                scan_rc(then, out);
+                for (c, b) in elsifs {
+                    scan_rc_expr(c, out);
+                    scan_rc(b, out);
+                }
+                scan_rc(else_, out);
+            }
+            IrStmt::While { cond, body } => {
+                scan_rc_expr(cond, out);
+                scan_rc(body, out);
+            }
+            IrStmt::DoWhile { body, cond, .. } => {
+                scan_rc(body, out);
+                scan_rc_expr(cond, out);
+            }
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                scan_rc(init, out);
+                scan_rc_expr(cond, out);
+                scan_rc(step, out);
+                scan_rc(body, out);
+            }
+            IrStmt::For { iter, body, .. } => {
+                scan_rc_expr(iter, out);
+                scan_rc(body, out);
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                scan_rc(body, out);
+                for e in excepts {
+                    scan_rc(&e.body, out);
+                }
+                scan_rc(else_body, out);
+                scan_rc(finally_body, out);
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => scan_rc(b, out),
+            IrStmt::Function { body, .. } => scan_rc(body, out),
+            IrStmt::Exec { cmd, args, .. } => {
+                scan_rc_expr(cmd, out);
+                for a in args {
+                    scan_rc_expr(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_rc_expr(e: &IrExpr, out: &mut bool) {
+    if *out {
+        return;
+    }
+    match e {
+        IrExpr::Call { func, args } => {
+            if func == "test" {
+                if let Some(IrExpr::Str(s, _)) = args.first() {
+                    if s.contains("$?") {
+                        *out = true;
+                        return;
+                    }
+                }
+            }
+            for a in args {
+                scan_rc_expr(a, out);
+            }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            scan_rc_expr(lhs, out);
+            scan_rc_expr(rhs, out);
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            scan_rc_expr(obj, out);
+            for a in args {
+                scan_rc_expr(a, out);
+            }
+        }
+        IrExpr::Array(items) => {
+            for i in items {
+                scan_rc_expr(i, out);
+            }
+        }
+        IrExpr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ir::InterpPart::Expr(x) = p {
+                    scan_rc_expr(x, out);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -387,6 +512,24 @@ impl Render {
                     self.collect_writes(body);
                 }
                 IrStmt::Break | IrStmt::Continue => {}
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    self.collect_writes(body);
+                    for e in excepts {
+                        if let Some(asn) = &e.as_name {
+                            // the `as` binding writes the runtime store
+                            self.written.insert(asn.clone());
+                            self.store_written.insert(asn.clone());
+                        }
+                        self.collect_writes(&e.body);
+                    }
+                    self.collect_writes(else_body);
+                    self.collect_writes(finally_body);
+                }
                 IrStmt::Block(b) => self.collect_writes(b),
                 IrStmt::Function { body, .. } => self.collect_writes(body),
                 IrStmt::Exec { cmd, args, capture, .. } => {
@@ -780,6 +923,17 @@ impl Render {
             // semantics: space-separated args + trailing newline);
             // exec("printf", [fmt, args...]) → native sys.stdout.write
             "exec" => {
+                // exec("true") / exec("false") — the restructure pass's
+                // While(true) cond (a backward-goto loop) — lower to the
+                // python constants
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    if cmd == "true" {
+                        return "True".into();
+                    }
+                    if cmd == "false" {
+                        return "False".into();
+                    }
+                }
                 if let Some(IrExpr::Str(cmd, _)) = args.first() {
                     if cmd == "echo" {
                         if let Some(IrExpr::Array(items)) = args.get(1) {
@@ -1160,10 +1314,23 @@ impl Render {
 
     /// Mini `[ ... ]` evaluator for the common patterns; None → stub.
     fn test_render(&mut self, s: &str) -> Option<String> {
-        let toks: Vec<&str> = s.split_whitespace().collect();
+        let toks: Vec<String> = Self::test_tokens(s);
+        if let Some(r) = self.test_compound(&toks) {
+            return Some(r);
+        }
         match toks.as_slice() {
+            [a, op, b] if op == "=~" => {
+                // regex test (`[[ $x =~ pat ]]`): python re.search (bash's
+                // unanchored ERE search — 064_11_complex_test_expressions,
+                // regex-brace-in-test). The pattern is a RAW regex, not a
+                // test operand (no $-expansion of the rhs).
+                let va = self.test_value(a);
+                let pat = b.trim_matches('"');
+                self.need_re = true;
+                Some(format!("bool(re.search({}, str({va})))", Self::py_str(pat)))
+            }
             [a, op, b] => {
-                let py_op = match *op {
+                let py_op = match op.as_str() {
                     "-gt" => ">",
                     "-lt" => "<",
                     "-ge" => ">=",
@@ -1178,27 +1345,156 @@ impl Render {
                 // the C frontend's loop/if tests are all numeric): coerce
                 // both sides so a str-valued operand (a lifted temp holding
                 // a stringified number) compares numerically instead of
-                // raising a python str-vs-int TypeError. `=`/`==`/`!=` stay
-                // raw string comparisons.
-                if matches!(*op, "-gt" | "-lt" | "-ge" | "-le" | "-eq" | "-ne") {
+                // raising a python str-vs-int TypeError. `=`/`==`/`!=` are
+                // STRING comparisons (bash compares the expansions): str()
+                // both sides so a numeric-lifted var/literal compares as
+                // text (eq-string-num-var.sh — a bare `==` between a str
+                // var and the int literal 2 would always fail).
+                if matches!(op.as_str(), "-gt" | "-lt" | "-ge" | "-le" | "-eq" | "-ne") {
                     Some(format!("(int({va}) {py_op} int({vb}))"))
                 } else {
-                    Some(format!("({va} {py_op} {vb})"))
+                    Some(format!("(str({va}) {py_op} str({vb}))"))
                 }
             }
-            [flag, v] if *flag == "-n" => Some(format!("({})", self.test_value(v))),
-            [flag, v] if *flag == "-z" => Some(format!("(not {})", self.test_value(v))),
+            [flag, v] if flag == "-n" => Some(format!("({})", self.test_value(v))),
+            [flag, v] if flag == "-z" => Some(format!("(not {})", self.test_value(v))),
             [v] => Some(format!("({})", self.test_value(v))),
             _ => None,
         }
     }
 
+    /// Tokenize a test string the way the estree tokenizeTest does for the
+    /// operator part: the sh parser DROPS spaces around operator tokens
+    /// (`[[ $a == x ]]` emits `$a==x`), so `==`/`!=`/`=`/`<`/`>` split
+    /// even when adjacent to word chars; `-eq`-family/`-a`/`-o`/words stay
+    /// whole. A quoted operand keeps its quotes (`"$a"=="x"` →
+    /// [`"$a"`, `==`, `"x"`]).
+    fn test_tokens(s: &str) -> Vec<String> {
+        let mut toks: Vec<String> = Vec::new();
+        let mut word = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '=' => {
+                    if chars.peek() == Some(&'=') {
+                        chars.next();
+                        if !word.is_empty() {
+                            toks.push(std::mem::take(&mut word));
+                        }
+                        toks.push("==".into());
+                    } else if chars.peek() == Some(&'~') {
+                        chars.next();
+                        if !word.is_empty() {
+                            toks.push(std::mem::take(&mut word));
+                        }
+                        toks.push("=~".into());
+                    } else {
+                        if !word.is_empty() {
+                            toks.push(std::mem::take(&mut word));
+                        }
+                        toks.push("=".into());
+                    }
+                }
+                '!' if chars.peek() == Some(&'=') => {
+                    chars.next();
+                    if !word.is_empty() {
+                        toks.push(std::mem::take(&mut word));
+                    }
+                    toks.push("!=".into());
+                }
+                '<' | '>' => {
+                    if !word.is_empty() {
+                        toks.push(std::mem::take(&mut word));
+                    }
+                    toks.push(c.to_string());
+                }
+                c if c.is_whitespace() => {
+                    if !word.is_empty() {
+                        toks.push(std::mem::take(&mut word));
+                    }
+                }
+                c => word.push(c),
+            }
+        }
+        if !word.is_empty() {
+            toks.push(word);
+        }
+        toks
+    }
+
+    /// Compound `A -a B` / `A -o B` tests (`[ $a -ge 5 -a $b -le 5 ]` — the
+    /// C frontend's `&&`/`||` in a test cond; estree's parseTest and/or
+    /// nodes). `-a` binds tighter than `-o` in bash, so split at the LAST
+    /// `-o` (else the LAST `-a`); each side must itself render as a test
+    /// (recursing — the sides may be further compounds). A `-a` in operand
+    /// position (`[ -a file ]`, the unary exists-test) is never a split:
+    /// its left side is empty and is rejected.
+    fn test_compound(&mut self, toks: &[String]) -> Option<String> {
+        let mut candidates: Vec<usize> = Vec::new();
+        for (i, t) in toks.iter().enumerate() {
+            if t == "-o" {
+                candidates.push(i);
+            }
+        }
+        if candidates.is_empty() {
+            for (i, t) in toks.iter().enumerate() {
+                if t == "-a" {
+                    candidates.push(i);
+                }
+            }
+        }
+        for i in candidates {
+            let left = &toks[..i];
+            let right = &toks[i + 1..];
+            if left.is_empty() || right.is_empty() {
+                continue;
+            }
+            if let (Some(l), Some(r)) = (
+                self.test_render(&left.join(" ")),
+                self.test_render(&right.join(" ")),
+            ) {
+                let op = if toks[i] == "-a" { "and" } else { "or" };
+                return Some(format!("({l} {op} {r})"));
+            }
+        }
+        None
+    }
+
     /// A test operand: `"$y"`/`$y`/`y` (typed var) → ident; a number →
     /// literal; a native-written name (a lifted temp) → ident; otherwise a
     /// quoted string.
-    fn test_value(&self, t: &str) -> String {
+    fn test_value(&mut self, t: &str) -> String {
         let t = t.trim().trim_matches('"');
         let t = t.strip_prefix('$').unwrap_or(t);
+        if t == "?" {
+            // `$?` — the exit status of the last command. The python
+            // subset tracks no statement statuses; the runtime var defaults
+            // to 0 (success) and statement-position test/and/or/true/false
+            // expressions update it (bash-correct for the `cmd; [ $? -eq 0 ]`
+            // idiom — the corpus shape).
+            self.need_rc = true;
+            return "__sh_rc".into();
+        }
+        // `${name##pat}` / `${name#pat}` / `${name%%pat}` / `${name%pat}` —
+        // the parameter-expansion prefix/suffix strips (bash pattern
+        // removal). Render a native re.sub with the glob translated to a
+        // regex (greedy = longest removal, non-greedy = shortest).
+        if let Some(rest) = t.strip_prefix('{') {
+            if let Some(close) = rest.rfind('}') {
+                let inner = &rest[..close];
+                for (op, _longest) in [("##", true), ("#", false), ("%%", true), ("%", false)] {
+                    if let Some((name, pat)) = inner.split_once(op) {
+                        if Self::is_plain_name(name) {
+                            // native runtime strip (glob → regex at
+                            // runtime; greedy = longest removal)
+                            self.need_strip = true;
+                            let v = self.test_value(name);
+                            return format!("__sh_strip({}, {}, {})", Self::py_str(pat), Self::py_str(op), v);
+                        }
+                    }
+                }
+            }
+        }
         if self.var_types.contains_key(t) {
             self.py_ident(t)
         } else if self.written.contains(t) && !self.store_written.contains(t) && Self::is_plain_name(t) {
@@ -1267,13 +1563,22 @@ impl Render {
                     if let ArithAst::IncDec { var, delta, prefix: _ } = &**a {
                         let name = self.py_ident(var);
                         let d = delta.unsigned_abs();
-                        let op = if *delta >= 0 { "+=" } else { "-=" };
+                        let py_op = if *delta >= 0 { "+" } else { "-" };
                         let rhs = if d == 1 {
                             "1".to_string()
                         } else {
                             d.to_string()
                         };
-                        self.emit(&format!("{name} {op} {rhs}"));
+                        if self.is_num(var) {
+                            self.emit(&format!("{name} {py_op}= {rhs}"));
+                        } else {
+                            // untyped (shell) vars hold strings: coerce
+                            // the LHS like the arith() expression path
+                            // (`i += 1` on a str "1" would TypeError —
+                            // cpp-sh-go t05_arith_loop.cc's ForInit step).
+                            self.need_atoi = true;
+                            self.emit(&format!("{name} = __sh_atoi({name}) {py_op} {rhs}"));
+                        }
                         return;
                     }
                     if let ArithAst::Assign { var, op, rhs } = &**a {
@@ -1287,7 +1592,19 @@ impl Render {
                             "%=" => "%=",
                             _ => "=",
                         };
-                        self.emit(&format!("{name} {py_op} {r}"));
+                        if self.is_num(var) {
+                            self.emit(&format!("{name} {py_op} {r}"));
+                        } else {
+                            // same coercion as the IncDec arm: the compound
+                            // assign target may hold a string
+                            self.need_atoi = true;
+                            let bare = py_op.trim_end_matches('=');
+                            if py_op == "=" {
+                                self.emit(&format!("{name} = {r}"));
+                            } else {
+                                self.emit(&format!("{name} = __sh_atoi({name}) {bare} {r}"));
+                            }
+                        }
                         return;
                     }
                 }
@@ -1309,6 +1626,33 @@ impl Render {
                             self.emit("continue");
                             return;
                         }
+                    }
+                }
+                // `$?`-status tracking: a statement-position test / && ||
+                // chain / true / false IS the command whose exit status a
+                // later `$?` reads (bash). The truthiness of these renders
+                // IS the success verdict, so record it (only when the
+                // program actually reads `$?`).
+                if self.need_rc {
+                    let is_status = match e {
+                        IrExpr::Call { func, args } => match func.as_str() {
+                            "test" => true,
+                            "exec" => matches!(
+                                args.first(),
+                                Some(IrExpr::Str(s, _)) if s == "true" || s == "false"
+                            ),
+                            _ => false,
+                        },
+                        IrExpr::BinOp { op, .. } => matches!(
+                            op,
+                            crate::ir::BinOpKind::And | crate::ir::BinOpKind::Or
+                        ),
+                        _ => false,
+                    };
+                    if is_status {
+                        let x = self.expr(e);
+                        self.emit(&format!("__sh_rc = 0 if ({x}) else 1"));
+                        return;
                     }
                 }
                 let x = self.expr(e);
@@ -1345,7 +1689,18 @@ impl Render {
                                 "%=" => "%=",
                                 _ => "=",
                             };
-                            self.emit(&format!("{name} {py_op} {r}"));
+                            if self.is_num(&t.var) || py_op == "=" {
+                                self.emit(&format!("{name} {py_op} {r}"));
+                            } else {
+                                // untyped target: coerce the LHS (the arith
+                                // expr path coerces its operands; a bare
+                                // `x += 1` on a str would TypeError)
+                                self.need_atoi = true;
+                                self.emit(&format!(
+                                    "{name} = __sh_atoi({name}) {} {r}",
+                                    py_op.trim_end_matches('=')
+                                ));
+                            }
                             return;
                         }
                     }
@@ -1550,6 +1905,102 @@ impl Render {
                     self.stmt(s);
                 }
             }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                // Python's native try/except/else/finally — the A1 Try
+                // node (py-sh-go try_stmt) maps 1:1, mirroring estree's
+                // TryStatement lowering: a bare arm is `except Exception:`
+                // (the estree signal guard's Error-class equivalent —
+                // python control flow is native keywords, never caught),
+                // a getVar match (`except ValueError:`) lowers to the
+                // named class, `as` bindings write the caught value into
+                // the runtime store (sh2.setVar stringifies, like estree),
+                // `else` is python's native no-exception suite, `finally`
+                // the native finalizer. A bare arm must be LAST in python
+                // (it is in every parseable source); later arms are dead.
+                if excepts.is_empty() && finally_body.is_empty() {
+                    // no handler: the try adds nothing — emit the suites
+                    // plainly (else just follows the body), like estree
+                    for s in body {
+                        self.stmt(s);
+                    }
+                    for s in else_body {
+                        self.stmt(s);
+                    }
+                    return;
+                }
+                self.emit("try:");
+                self.block(body);
+                for (ei, e) in excepts.iter().enumerate() {
+                    let mut clause = match &e.match_expr {
+                        None => "except Exception:".to_string(),
+                        Some(IrExpr::Call { func, args }) if func == "getVar" => {
+                            match args.first() {
+                                Some(IrExpr::Str(name, _)) => format!("except {name}:"),
+                                _ => "except Exception:".to_string(),
+                            }
+                        }
+                        Some(other) => {
+                            self.mark_todo(&format!("except match {other:?}"));
+                            "except Exception:".to_string()
+                        }
+                    };
+                    if e.as_name.is_some() {
+                        // bind the caught value for the arm's `as` binding
+                        // (sh2_setVar below reads __sh_exc)
+                        clause = format!("{} as __sh_exc", clause.trim_end_matches(':'));
+                    }
+                    if e.match_expr.is_none() && ei + 1 < excepts.len() {
+                        // arms after a bare except are unreachable (python
+                        // itself forbids the syntax) — keep their bodies out
+                        self.emit(&format!("{clause}  # unreachable: later arms"));
+                    } else {
+                        self.emit(&clause);
+                    }
+                    // the arm body is a block; an `as` binding sits at its
+                    // top (the caught value into the runtime store, estree
+                    // parity — sh2.setVar stringifies)
+                    let mut body_out = Vec::new();
+                    std::mem::swap(&mut self.out, &mut body_out);
+                    self.depth += 1;
+                    if let Some(asn) = &e.as_name {
+                        self.sh2_calls.insert("setVar".into());
+                        self.emit(&format!(
+                            "sh2_setVar({}, str(__sh_exc))",
+                            Self::py_str(asn)
+                        ));
+                    }
+                    for s in &e.body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    std::mem::swap(&mut self.out, &mut body_out);
+                    let has_code = body_out.iter().any(|l| {
+                        let t = l.trim_start();
+                        !t.is_empty() && !t.starts_with('#')
+                    });
+                    if !has_code {
+                        self.out.extend(body_out);
+                        self.depth += 1;
+                        self.emit("pass");
+                        self.depth -= 1;
+                    } else {
+                        self.out.extend(body_out);
+                    }
+                }
+                if !else_body.is_empty() {
+                    self.emit("else:");
+                    self.block(else_body);
+                }
+                if !finally_body.is_empty() {
+                    self.emit("finally:");
+                    self.block(finally_body);
+                }
+            }
             other => self.mark_todo(&format!("stmt {:?}", other)),
         }
     }
@@ -1567,6 +2018,17 @@ impl Render {
         }
 
         // Pass 2: render the body first (helper flags known before preamble).
+        // Pre-scan for `$?` test reads so the FIRST such statement's status
+        // wrap (the Expr arm consults need_rc before rendering its own
+        // operands) is decided correctly.
+        if !self.need_rc {
+            let mut rc = false;
+            scan_rc(&prog.stmts, &mut rc);
+            for sub in &prog.subs {
+                scan_rc(&sub.body, &mut rc);
+            }
+            self.need_rc = rc;
+        }
         let mut body_out = Vec::new();
         std::mem::swap(&mut self.out, &mut body_out);
         for v in &vars {
@@ -1656,6 +2118,37 @@ impl Render {
             self.emit("        return int(str(s).strip(), 10)");
             self.emit("    except ValueError:");
             self.emit("        return 0");
+            self.emit("");
+        }
+        if self.need_rc {
+            // `$?` reads: statement-position test/and/or/true/false
+            // expressions update it (see the Expr arm); defaults to 0
+            // (success) — bash-correct for the `true; [ $? -eq 0 ]`
+            // idiom (the corpus shape).
+            self.emit("__sh_rc = 0");
+            self.emit("");
+        }
+        if self.need_strip {
+            // `${var#/##/%%/% pattern}` prefix/suffix removal (bash pattern
+            // removal; glob → regex at runtime). `#`/`%` remove the
+            // SHORTEST match (non-greedy), `##`/`%%` the LONGEST (greedy).
+            // Approximation: `*` → `.*`, `?` → `.`; the exact bash
+            // matching order for multi-star patterns is not reproduced.
+            self.emit("def __sh_strip(pat, op, s):");
+            self.emit("    import re as _re");
+            self.emit("    r = _re.escape(pat).replace(r'\\*', '.*').replace(r'\\?', '.')");
+            self.emit("    s = str(s)");
+            self.emit("    if op == '#':");
+            self.emit("        m = _re.match('^.*?' + r, s)");
+            self.emit("        return s[m.end():] if m else s");
+            self.emit("    if op == '##':");
+            self.emit("        m = _re.match('^' + r, s)");
+            self.emit("        return s[m.end():] if m else s");
+            self.emit("    if op == '%':");
+            self.emit("        m = _re.search('(.*)(' + r.replace('.*', '.*?') + ')$', s)");
+            self.emit("        return s[:m.start(2)] if m else s");
+            self.emit("    m = _re.search('(.*?)(' + r + ')$', s)");
+            self.emit("    return s[:m.start(2)] if m else s");
             self.emit("");
         }
         // Subroutine definitions (before the body that calls them).
@@ -1751,6 +2244,22 @@ fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 collect_vars(body, out);
             }
             IrStmt::Break | IrStmt::Continue => {}
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                collect_vars(body, out);
+                for e in excepts {
+                    if let Some(asn) = &e.as_name {
+                        out.insert(asn.clone());
+                    }
+                    collect_vars(&e.body, out);
+                }
+                collect_vars(else_body, out);
+                collect_vars(finally_body, out);
+            }
             IrStmt::Exit(e) => {
                 if let Some(x) = e {
                     collect_vars_expr(x, out);
