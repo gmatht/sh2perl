@@ -1301,6 +1301,18 @@ pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
     if out.contains("$CHILD_ERROR") {
         out.insert_str(0, "our $CHILD_ERROR = 0;\n");
     }
+    // Command emulations call Carp's carp/croak/cluck/confess on error
+    // paths; the STANDALONE preamble imports Carp, an embed fragment has
+    // no preamble. Emit the import at the fragment top — `use` is
+    // compile-time and package-wide, and a duplicate `use Carp;` in a
+    // host that already imports it is a silent no-op (purify.pl's
+    // import-injection heuristic, minus the regex detection).
+    if regex::Regex::new(r"\b(?:carp|croak|cluck|confess)\b")
+        .unwrap()
+        .is_match(&out)
+    {
+        out.insert_str(0, "use Carp;\n");
+    }
 
     // Standalone-only dependencies the fragment must not reference (the
     // preamble declares them in a full program; an embed has no preamble).
@@ -7280,6 +7292,25 @@ mod tests {
             "English name must be normalized: {}",
             r.fragment
         );
+    }
+
+    #[test]
+    fn embed_injects_carp_for_emulations() {
+        // command emulations call carp/croak on error paths; the standalone
+        // preamble imports Carp, an embed fragment must provide its own
+        let src = "cat /etc/hostname";
+        let r = render(src, &[]);
+        assert!(
+            r.fragment.contains("use Carp;"),
+            "Carp import must be injected: {}",
+            r.fragment
+        );
+        assert!(
+            r.fragment.contains("carp '"),
+            "the emulation's carp call is executable Perl: {}",
+            r.fragment
+        );
+        assert!(r.refusals.is_empty(), "refusals: {:?}", r.refusals);
     }
 
     #[test]
