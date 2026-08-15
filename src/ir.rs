@@ -3683,7 +3683,10 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
     // which is not bash — syntax error).
     if let Some(m) = target.strip_prefix('&') {
         let arrow = if op == "<" { "<&" } else { ">&" };
-        cmd.push_str(&format!(" {} {}{}", fd, arrow, m));
+        // NO space between the fd and the arrow: `2>&1` is the fd-dup
+        // redirect; `2 >&1` would make `2` a FILE argument (verified:
+        // mkdir got "cannot create directory '2'").
+        cmd.push_str(&format!(" {}{}{}", fd, arrow, m));
         return true;
     }
     let quoted = format!("'{}'", target.replace('\'', "'\\\\''"));
