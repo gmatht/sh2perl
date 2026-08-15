@@ -652,6 +652,27 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
     walk(&prog.stmts) || prog.subs.iter().any(|s| walk(&s.body))
 }
 
+/// Decode the shared core's marked-lossy PUA markers (U+E000+byte,
+/// `SharedUtils::bytes_to_marked_lossy` — see core request
+/// perl-20260814-175710) back into raw bytes at the output boundary.
+/// bash is byte-agnostic: a raw non-UTF-8 byte in the source passes
+/// through its stdout unchanged, so the rendered script must reproduce
+/// the byte itself (0xE9), never its UTF-8 replacement (U+FFFD) or the
+/// marker's own UTF-8 encoding. Every other char encodes as UTF-8.
+pub fn decode_pua_bytes(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let u = c as u32;
+        if (0xE000..=0xE0FF).contains(&u) {
+            out.push((u - 0xE000) as u8);
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
+}
+
 /// Render a ShIR program to `sh` source. `Err` on a construct outside the
 /// renderable subset (the gate reports it as a FAIL).
 pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
@@ -1079,6 +1100,21 @@ _cmp() {
         out.push_str("        _pw_a=$((_pw_a * _pw_b)); _pw_e=$((_pw_e - 1))\n");
         out.push_str("    done\n");
         out.push_str("    echo \"$_pw_a\"\n");
+        out.push_str("}\n");
+        // `_arr_get` — an ARITHMETIC read of an array element (arr[K]
+        // inside `$(( ))`): dash arithmetic cannot parse `arr[K]` (the
+        // array is lowered per-element), and the element var name is
+        // runtime-dynamic, so eval builds it (${base}_${key}). The
+        // _num-style coercion keeps dash's "Illegal number" away — bash
+        // coerces a non-numeric element read to 0. (Gated with _num:
+        // the same needs_num walk fires for the arith Index reads and
+        // the `$(( ))`-span rewrites in `[ ]` tests.)
+        out.push_str("_arr_get() {\n");
+        out.push_str("    eval \"_v=\\${$1_$2}\"\n");
+        out.push_str("    case \"$_v\" in\n");
+        out.push_str("        ''|'-'|*[!0-9-]*|-*[!0-9]*) echo 0 ;;\n");
+        out.push_str("        *) echo \"$_v\" ;;\n");
+        out.push_str("    esac\n");
         out.push_str("}\n\n");
     }
     if needs_arr_helper(prog) {
@@ -2080,6 +2116,11 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             "test" => {
                 let t = raw_arg(args, 0)?;
                 let t = t.trim();
+                // `$(( ... ))` spans in the raw test text may reference
+                // known arrays (`a[1]`) — dash arithmetic cannot parse
+                // them; rewrite the subscripts to `$( _arr_get ... )`
+                // element reads (the array is lowered per-element).
+                let t: &str = &test_arith_arrays_to_sh(t);
                 // the second arg is the `[[ ` marker when the source used
                 // `[[ ]]` — single `=` there is a PATTERN match, not the
                 // POSIX string comparison
@@ -2845,6 +2886,89 @@ fn needs_cmp(stmts: &[IrStmt]) -> bool {
     walk(stmts)
 }
 
+/// Rewrite known-array subscripts (`a[1]`) inside a raw `$(( ... ))`
+/// arithmetic SPAN to `$( _arr_get "a" 1 )` — dash arithmetic cannot
+/// parse `a[1]` (the array is lowered to per-element vars a_0, a_1, ...;
+/// the element var name is runtime-dynamic, so _arr_get evals it).
+/// Non-array arithmetic is left untouched (dash handles bare vars).
+fn rewrite_arith_arrays(s: &str) -> String {
+    let names = ARRAY_NAMES.lock().unwrap();
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            let mut j = i;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            let name = &s[i..j];
+            if j + 1 < b.len() && b[j] == b'[' && names.contains(name) {
+                let mut depth = 1i32;
+                let mut k = j + 1;
+                while k < b.len() && depth > 0 {
+                    if b[k] == b'[' {
+                        depth += 1;
+                    } else if b[k] == b']' {
+                        depth -= 1;
+                    }
+                    k += 1;
+                }
+                if k > j + 1 {
+                    out.push_str(&format!("$( _arr_get \"{name}\" {} )", &s[j + 1..k - 1]));
+                    i = k;
+                    continue;
+                }
+            }
+            out.push_str(name);
+            i = j;
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A `[ ]` test's raw string may carry `$(( ... ))` arithmetic spans
+/// with bash array subscripts (the parser keeps test strings raw — e.g.
+/// `[ "$n" -lt $(( a[1] + a[2] )) ]`). Rewrite the spans' known-array
+/// subscripts; everything else is copied verbatim.
+fn test_arith_arrays_to_sh(t: &str) -> String {
+    let b = t.as_bytes();
+    let mut out = String::with_capacity(t.len() + 16);
+    let mut i = 0;
+    while i < b.len() {
+        if i + 2 < b.len() && b[i] == b'$' && b[i + 1] == b'(' && b[i + 2] == b'(' {
+            out.push_str("$((");
+            let span_start = i + 3;
+            let mut depth = 1i32;
+            let mut j = span_start;
+            while j < b.len() && depth > 0 {
+                if b[j] == b'(' {
+                    depth += 1;
+                } else if b[j] == b')' {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            // j is past the first closer of the closing `))` — consume
+            // the second one too, then the span is [span_start, j-2)
+            if j < b.len() && b[j] == b')' {
+                j += 1;
+            }
+            let span_end = j.saturating_sub(2).max(span_start);
+            out.push_str(&rewrite_arith_arrays(&t[span_start..span_end]));
+            out.push_str("))");
+            i = j;
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// does the program's arithmetic read a bare variable? (`$( _num "$x" )`.)
 /// Walks every arith expression anywhere in the program.
 fn needs_num(stmts: &[IrStmt]) -> bool {
@@ -2876,6 +3000,16 @@ fn needs_num(stmts: &[IrStmt]) -> bool {
                 // arith_rewrite wraps bare vars in `$( _num ... )` there,
                 // so the polyfill is needed even though no ArithAst exists)
                 let f = func.as_str();
+                if f == "test" {
+                    // raw `$(( ... ))` spans inside `[ ]` tests may carry
+                    // array subscripts — test_arith_arrays_to_sh rewrites
+                    // them to `$( _arr_get ... )` (needs _num's block)
+                    if let Ok(s) = raw_arg(args, 0) {
+                        if test_arith_arrays_to_sh(&s) != s {
+                            return true;
+                        }
+                    }
+                }
                 if f == "arith" || f == "cstyleFor" {
                     if let Ok(s) = raw_arg(args, 0) {
                         if arith_text_uses_var(&s) {
@@ -5688,6 +5822,27 @@ fn arith_rewrite(t: &str) -> String {
                 j += 1;
             }
             let name = &t[i..j];
+            // bare ARRAY subscript (`arr[K]` in `let 'x = arr[i]'`-style
+            // raw arithmetic text): dash cannot parse the per-element
+            // vars as `arr[K]`, so go through `_arr_get` (the element
+            // var name is runtime-dynamic: ${base}_${key}).
+            if j + 1 < b.len() && b[j] == b'[' && ARRAY_NAMES.lock().unwrap().contains(name) {
+                let mut depth = 1i32;
+                let mut k = j + 1;
+                while k < b.len() && depth > 0 {
+                    if b[k] == b'[' {
+                        depth += 1;
+                    } else if b[k] == b']' {
+                        depth -= 1;
+                    }
+                    k += 1;
+                }
+                if k > j + 1 {
+                    out.push_str(&format!("$( _arr_get \"{name}\" {} )", &t[j + 1..k - 1]));
+                    i = k;
+                    continue;
+                }
+            }
             if j + 1 < b.len() && (b[j] == b'+' || b[j] == b'-') && b[j + 1] == b[j] {
                 let (inc, dec) = if b[j] == b'+' { ("+ 1", "- 1") } else { ("- 1", "+ 1") };
                 out.push_str(&format!("(({name} = {name} {inc}) {dec})"));
@@ -5904,13 +6059,12 @@ fn arith_to_sh(a: &ArithAst) -> String {
             // the array is lowered per-element (arr_0, arr_1, ...); an
             // arithmetic READ of arr[K] is a read of the element var
             // (dash cannot parse `arr[1]` in arithmetic). Static numeric
-            // keys map to the element var; dynamic keys fall back to the
-            // parseable-but-wrong `arr[K]` (no corpus hit yet — the
-            // per-element naming cannot express a computed subscript
-            // without ${!x}, which dash lacks).
+            // keys map to the element var; dynamic keys go through
+            // `_arr_get` (eval: the per-element var name is only known
+            // at runtime — ${base}_${key}).
             match key.as_ref() {
                 ArithAst::Num(k) => format!("$( _num \"${{{var}_{k}}}\" )"),
-                _ => format!("{var}[{}]", arith_to_sh(key)),
+                _ => format!("$( _arr_get \"{var}\" {} )", arith_to_sh(key)),
             }
         }
         ArithAst::Bin { op, lhs, rhs } => {

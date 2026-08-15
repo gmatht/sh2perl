@@ -975,7 +975,12 @@ exit $main_exit_code;
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
-            print!("{}", match debashl::sh_backend::shir_to_sh(&prog) { Ok(s) => s, Err(e) => { eprintln!("render: {}", e); std::process::exit(1); } });
+            // stdout is BYTES: decode the core's marked-lossy PUA markers
+            // (U+E000+byte — invalid-UTF-8 source bytes) back to raw
+            // bytes so the rendered script reproduces bash's byte-exact
+            // pass-through (utf8-non-utf8-content.sh).
+            let s = match debashl::sh_backend::shir_to_sh(&prog) { Ok(s) => s, Err(e) => { eprintln!("render: {}", e); std::process::exit(1); } };
+            { use std::io::Write; let _ = std::io::stdout().write_all(&debashl::sh_backend::decode_pua_bytes(&s)); }
         }
 "--shir-in-perl" => {
             if args.len() < 3 { println!("Error: --shir-in-perl requires input"); return; }
@@ -1025,10 +1030,14 @@ exit $main_exit_code;
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
-            print!("{}", match debashl::sh_backend::shir_to_sh(&prog) {
+            // stdout is BYTES: decode the core's marked-lossy PUA markers
+            // (U+E000+byte — invalid-UTF-8 source bytes) back to raw
+            // bytes (see the file --shir-in-sh arm above).
+            let s = match debashl::sh_backend::shir_to_sh(&prog) {
                 Ok(s) => s,
                 Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
-            });
+            };
+            { use std::io::Write; let _ = std::io::stdout().write_all(&debashl::sh_backend::decode_pua_bytes(&s)); }
         }
         "--mir" => {
             if args.len() < 3 {
