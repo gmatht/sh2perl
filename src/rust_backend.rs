@@ -89,6 +89,9 @@ pub struct Render {
     loop_depth: usize,
     /// gensym counter for loop/block temporaries (`__sh_t0`, …)
     gensym: usize,
+    /// inside a For-over-words body: the index var — a `continue` must
+    /// advance it first (bash's for-iteration)
+    for_index: Option<String>,
     /// the last var consumed by the arith-text parser (for ++/--)
     last_arith_var: Option<String>,
     todo: usize,
@@ -137,6 +140,15 @@ impl Render {
 
     fn mark_written(&mut self, name: &str) {
         self.written.insert(name.to_string());
+    }
+
+    /// Emit a `continue` — inside a For-over-words body the index must
+    /// advance first (bash's for-iteration).
+    fn emit_continue(&mut self) {
+        if let Some(idx) = self.for_index.clone() {
+            self.emit(&format!("{idx} += 1;"));
+        }
+        self.emit("continue;");
     }
 
     /// A function's Rust identifier — distinct from the var namespace
@@ -326,12 +338,13 @@ impl Render {
         format!("{m}.with(|v| v.borrow().get({key} as usize).cloned().unwrap_or_default())")
     }
 
-    /// Array element write (index arrays; grows as needed).
+    /// Array element write (index arrays; grows as needed). The value is
+    /// evaluated BEFORE the borrow (a self-referential read would panic).
     fn array_elem_set(&mut self, name: &str, key: &str, val: &str) -> String {
         let m = self.tls(name);
         format!(
-            "{m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
-             if b.len() <= i {{ b.resize(i + 1, String::new()); }} b[i] = {val}; }});"
+            "{{ let __val = {val}; {m}.with(|v| {{ let mut b = v.borrow_mut(); let i = {key} as usize; \
+             if b.len() <= i {{ b.resize(i + 1, String::new()); }} b[i] = __val; }}); }}"
         )
     }
 
@@ -1123,7 +1136,7 @@ impl Render {
             }
             "continue" => {
                 if self.loop_depth > 0 {
-                    self.emit("continue;");
+                    self.emit_continue();
                 }
             }
             "test" => {
@@ -1645,7 +1658,7 @@ impl Render {
             }
             IrExpr::Call { func, .. } if func == "continue" => {
                 if self.loop_depth > 0 {
-                    self.emit("continue;");
+                    self.emit_continue();
                 }
             }
             IrExpr::Call { func, .. } if func == "return" => {
@@ -1952,7 +1965,7 @@ impl Render {
                     };
                     let arr = self.read_arr(var);
                     return format!(
-                        "{{ let __v = {arr}; let __o = {off}; let __l = if {len} < 0 {{ __v.len() as i64 - __o }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize;                          __v[__s..__e].to_vec() }}"
+                        "{{ let __v = {arr}; let __o = if {off} < 0 {{ (__v.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __l = if {len} < 0 {{ __v.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize;                          __v[__s..__e].to_vec() }}"
                     );
                 }
                 return self.read_arr(var);
@@ -3105,7 +3118,7 @@ impl Render {
                 {
                     let arr = self.read_arr(&name.to_string());
                     return format!(
-                        "{{ let __v = {arr}; let __o = {off}; let __l = if {len} < 0 {{ __v.len() as i64 - __o }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize;                          __v[__s..__e].join(\" \") }}"
+                        "{{ let __v = {arr}; let __o = if {off} < 0 {{ (__v.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __l = if {len} < 0 {{ __v.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize;                          __v[__s..__e].join(\" \") }}"
                     );
                 }
                 self.add_helper("substr");
@@ -3426,6 +3439,16 @@ impl Render {
                     self.mark_todo("multi-target assign");
                 }
                 let has_capture = expr_mentions_capture(expr);
+                // `((i++))` arrives as Assign{i, Arith(IncDec)} — the
+                // arith block ALREADY writes the var; the outer write
+                // would clobber it with the OLD value
+                if arith_has_side_effects(expr) {
+                    let x = self.expr_any(expr);
+                    self.emit(&format!(
+                        "let _ = {{ let __v = {x}; let __n = __v.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __n != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v }};"
+                    ));
+                    return;
+                }
                 let rhs = self.expr_any(expr);
                 // `arr[i]=v` — the var text carries the index
                 if let Some(open) = t.var.find('[') {
@@ -3625,7 +3648,10 @@ impl Render {
                         let idx_g = self.gensym("__sh_i");
                         self.emit(&format!("let {items_g} = {items};"));
                         self.emit(&format!("let mut {idx_g}: usize = 0;"));
-                        self.emit(&format!("while {idx_g} < {items_g}.len() {{"));
+                        // `loop` so a body `continue` still runs the
+                        // index increment (bash's for-iteration)
+                        self.emit(&format!("loop {{"));
+                        self.emit(&format!("if !({idx_g} < {items_g}.len()) {{ break; }}"));
                         self.loop_depth += 1;
                         self.depth += 1;
                         if self.is_num(var) {
@@ -3635,9 +3661,11 @@ impl Render {
                             let st = self.write_str(var, &format!("{items_g}[{idx_g}].clone()"));
                             self.emit(&st);
                         }
+                        let old_for = self.for_index.replace(idx_g.clone());
                         for s in body {
                             self.stmt(s);
                         }
+                        self.for_index = old_for;
                         self.depth -= 1;
                         self.loop_depth -= 1;
                         self.emit(&format!("{idx_g} += 1;"));
@@ -3659,7 +3687,7 @@ impl Render {
             }
             IrStmt::Continue => {
                 if self.loop_depth > 0 {
-                    self.emit("continue;");
+                    self.emit_continue();
                 }
             }
             IrStmt::Break => {
@@ -5697,6 +5725,16 @@ impl Render {
         let mut i = 0;
         while i < ch.len() {
             if ch[i] == '$' && i + 1 < ch.len() {
+                if matches!(ch[i + 1], '?' | '#' | '@' | '*' | '$' | '!')
+                    || ch[i + 1].is_ascii_digit()
+                {
+                    // special vars ($? $# $@ $$ $!) and positionals
+                    let name: String = ch[i + 1..i + 2].iter().collect();
+                    fmt.push_str("{}");
+                    args.push(self.getvar_str(&name));
+                    i += 2;
+                    continue;
+                }
                 if ch[i + 1] == '\'' {
                     // $'...' ANSI-C string inside the text
                     let mut j = i + 2;
@@ -6896,6 +6934,32 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
 }
 
 /// `name[` inside a let/arith TEXT → the var name (hoisted arrays).
+fn arith_has_side_effects(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Arith(a) => arith_side_effects(a),
+        IrExpr::Call { func, args } if func == "assign" => true,
+        IrExpr::Call { func, args } if func == "arith" => args.iter().any(|a| {
+            matches!(a, IrExpr::Str(s, _) if s.contains('=') || s.contains("++") || s.contains("--"))
+        }),
+        IrExpr::Call { args, .. } => args.iter().any(arith_has_side_effects),
+        _ => false,
+    }
+}
+
+fn arith_side_effects(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Assign { .. } | ArithAst::IncDec { .. } => true,
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_side_effects(lhs) || arith_side_effects(rhs)
+        }
+        ArithAst::Un { arg, .. } => arith_side_effects(arg),
+        ArithAst::Cond { test, then, else_, .. } => {
+            arith_side_effects(test) || arith_side_effects(then) || arith_side_effects(else_)
+        }
+        _ => false,
+    }
+}
+
 fn expr_mentions_capture(e: &IrExpr) -> bool {
         match e {
             IrExpr::Capture { .. } => true,
