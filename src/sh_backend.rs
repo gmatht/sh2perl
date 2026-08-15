@@ -554,6 +554,7 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
             }
             IrExpr::Array(es) => es.iter().any(expr_uses_arr),
             IrExpr::Object(es) => es.iter().any(|(_, v)| expr_uses_arr(v)),
+            IrExpr::Capture { expr, .. } => expr_uses_arr(expr),
             IrExpr::Interpolate(parts) => parts
                 .iter()
                 .any(|p| matches!(p, InterpPart::Expr(x) if expr_uses_arr(x))),
@@ -2450,6 +2451,7 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
         match e {
             IrExpr::Array(es) => es.iter().any(has_grep_p),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_grep_p(v)),
+            IrExpr::Capture { expr, .. } => has_grep_p(expr),
             IrExpr::Arrow(stmts) => walk(stmts),
             IrExpr::BinOp { lhs, rhs, .. } => has_grep_p(lhs) || has_grep_p(rhs),
             IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
@@ -2525,6 +2527,8 @@ fn needs_printf_q(stmts: &[IrStmt]) -> bool {
                 }
             }
             args.iter().any(has_pq)
+        } else if let IrExpr::Capture { expr, .. } = e {
+            has_pq(expr)
         } else if let IrExpr::Arrow(stmts) = e {
             walk(stmts)
         } else if let IrExpr::Array(es) = e {
@@ -2587,6 +2591,7 @@ fn needs_hostname(stmts: &[IrStmt]) -> bool {
             }
             IrExpr::Array(es) => es.iter().any(has_hn),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_hn(v)),
+            IrExpr::Capture { expr, .. } => has_hn(expr),
             IrExpr::Arrow(stmts) => walk(stmts),
             IrExpr::BinOp { lhs, rhs, .. } => has_hn(lhs) || has_hn(rhs),
             IrExpr::Interpolate(parts) => parts
@@ -2645,6 +2650,7 @@ fn needs_pipestatus(stmts: &[IrStmt]) -> bool {
             }
             IrExpr::Array(es) => es.iter().any(has_ps),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_ps(v)),
+            IrExpr::Capture { expr, .. } => has_ps(expr),
             IrExpr::Arrow(stmts) => walk(stmts),
             IrExpr::BinOp { lhs, rhs, .. } => has_ps(lhs) || has_ps(rhs),
             IrExpr::Interpolate(parts) => parts
@@ -2714,6 +2720,11 @@ fn needs_ls(stmts: &[IrStmt]) -> bool {
                 }
             }
             args.iter().any(has_ls)
+        } else if let IrExpr::Capture { expr, .. } = e {
+            // a command substitution (`$(...)` / backticks) — the A1
+            // wraps the Arrow in a Capture node; without this arm the
+            // gated helpers were never emitted for cmdsub-internal calls
+            has_ls(expr)
         } else if let IrExpr::Arrow(stmts) = e {
             walk(stmts)
         } else if let IrExpr::Array(es) = e {
@@ -2789,6 +2800,7 @@ fn needs_readlink(stmts: &[IrStmt]) -> bool {
         match e {
             IrExpr::Array(es) => es.iter().any(has_readlink),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_readlink(v)),
+            IrExpr::Capture { expr, .. } => has_readlink(expr),
             IrExpr::Arrow(stmts) => walk(stmts),
             _ => false,
         }
@@ -2855,6 +2867,7 @@ fn needs_cmp(stmts: &[IrStmt]) -> bool {
         match e {
             IrExpr::Array(es) => es.iter().any(has_cmp),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_cmp(v)),
+            IrExpr::Capture { expr, .. } => has_cmp(expr),
             IrExpr::Arrow(stmts) => walk(stmts),
             _ => false,
         }
@@ -3046,6 +3059,7 @@ fn needs_num(stmts: &[IrStmt]) -> bool {
             }
             IrExpr::Array(es) => es.iter().any(has_num),
             IrExpr::Object(es) => es.iter().any(|(_, v)| has_num(v)),
+            IrExpr::Capture { expr, .. } => has_num(expr),
             IrExpr::Arrow(stmts) => walk(stmts),
             _ => false,
         }
