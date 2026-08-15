@@ -671,7 +671,13 @@ sub process_single_backtick_string {
                 . "if (\$__bt_pid == 0) { "
                 . "$expr; exit 0; } "
                 . "local \$/ = undef; my \$__bt_cap = <\$__bt_child_out>; "
-                . "close \$__bt_child_out; waitpid(\$__bt_pid, 0); \$__bt_cap }";
+                # close() on a '-|' pipe performs the child reap AND sets $?
+                # to the child's exit status (0, or 768 for `exit 3` — bash
+                # backtick $? semantics). An explicit waitpid first would
+                # leave close() with nothing to reap and CLOBBER $? to -1
+                # (the host's `$? == 0` check after a backtick failed on it
+                # — verified on examples/052).
+                . "close \$__bt_child_out; \$__bt_cap }";
             my $code = "__bt($captured)";
             print "DEBUG: embed fragment for [$command]: $code\n" if $verbose;
             return defined $var_name ? "$prefix$var_name = $code;" : $code;
@@ -2142,7 +2148,7 @@ sub convert_shell_to_perl_embed {
     $shell_command =~ s/\s+$//;
     return undef unless length $shell_command;
 
-    my @argv = ($OTRANSPILERL, '--embed-perl', '--backtick');
+    my @argv = ($OTRANSPILERL, '--embed-perl', '--backtick', '--literal');
     push @argv, ('--scope-vars', join(',', @EMBED_SCOPE)) if @EMBED_SCOPE;
     push @argv, $shell_command;
     print "DEBUG: Running: " . join(' ', @argv) . "\n" if $verbose;
