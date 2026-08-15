@@ -1061,6 +1061,233 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     out
 }
 
+// ── Embed profile (the purify design, PLAN §10) ───────────────────────
+//
+// A shell snippet rendered as a FRAGMENT inside a host program (purify:
+// replace `system("")` / backtick-like constructs with native code for any
+// host language). Statements only — no shebang, pragmas, imports, preamble,
+// or exit. Host-scope names are reused as bare `$x`; everything else is
+// declared locally with bash-subshell semantics (docs/embed-contract.md).
+
+/// Embedding context. Stage 1 implements the `Backtick` profile (`System` /
+/// `Popen` are reserved; the construct-visibility spec is in
+/// `docs/embed-contract.md`).
+#[derive(Default, Clone, Debug)]
+pub struct EmbedCtx {
+    /// Names the host program declares in the enclosing scope (the
+    /// harvester's membership list, v1: file-wide). A name the snippet
+    /// READS is reused as a bare `$x` when present here (bash subshells see
+    /// the parent's value); absent names are declared locally (`my $x = '';`
+    /// — bash unset = empty).
+    pub host_scope: Vec<String>,
+    /// Backtick semantics (Perl `qx`): trailing newlines are PRESERVED
+    /// (bash `$()` strips them). False keeps the standalone `$()`-style
+    /// stripping.
+    pub backtick_newlines: bool,
+    /// Emit English.pm names (`$INPUT_RECORD_SEPARATOR` …) or normalize to
+    /// the core vars (`$/` …) so the fragment is valid in host files that
+    /// don't `use English`.
+    pub english_names: bool,
+}
+
+/// What the enclosing host construct is — decides the var-visibility and
+/// IO semantics the fragment must reproduce (spec: docs/embed-contract.md).
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedConstruct {
+    /// `` `cmd` `` / `$(cmd)` — subshell: parent vars visible to reads,
+    /// writes discarded.
+    #[default]
+    Backtick,
+    /// `system("cmd")` — child process: only env visible. (Reserved.)
+    System,
+    /// `popen` / `open("|cmd")` — stream handle. (Reserved.)
+    Popen,
+}
+
+#[derive(Default, Debug)]
+pub struct EmbedResult {
+    pub fragment: String,
+    /// Names the fragment reads from the host scope (bare `$x` reuse or
+    /// `my $x = $x;` copy-in). The bindings gate —
+    /// `required_host_bindings ⊆ ctx.host_scope` — turns a renderer bug
+    /// (bare `$x` for a name the caller did not list) into a hard failure.
+    pub required_host_bindings: Vec<String>,
+    /// Snippet features the embed profile cannot render (preamble-var
+    /// dependencies, functions, `exit`, …). The caller falls back (e.g. to
+    /// `exec('sh', '-c', …)`), exactly like today's purify rejections — but
+    /// analysis-driven, not regex-driven.
+    pub refusals: Vec<String>,
+}
+
+/// Render a shell snippet as an embeddable Perl fragment. Deterministic:
+/// declaration order follows the Vec-based first-seen order of
+/// `collect_assigned_vars` / `collect_read_vars_stmts` — never hash order
+/// (the legacy `Generator`'s HashSet iteration was 30/30 flaky across
+/// processes).
+pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
+    let mut result = EmbedResult::default();
+
+    // The snippet is its own mini-program: the same lowering + optimize as
+    // the standalone renderer (strip_cfor is a no-op for embed inputs but
+    // keeps the shared pass honest).
+    let mut stripped = prog.clone();
+    crate::shir_passes::strip_cfor(&mut stripped);
+    let stmts = optimize_stmts(&stripped.stmts);
+
+    // Refuse constructs that only make sense in a standalone program (v1):
+    // an explicit `exit` would kill the HOST process; a function definition
+    // needs a host-scope binding (name collisions); a background job forks
+    // and exits.
+    for s in &stmts {
+        match s {
+            IrStmt::Exit { .. } => result.refusals.push("exit statement".into()),
+            IrStmt::Function { name, .. } => {
+                result.refusals.push(format!("function `{name}` definition"))
+            }
+            IrStmt::Background(_) => result.refusals.push("background job".into()),
+            _ => {}
+        }
+    }
+
+    // Bash-subshell declaration rules (spec: docs/embed-contract.md §"var
+    // visibility"): reads see the host value, writes are fragment-local.
+    //   read-only ∧ host → bare `$x` reuse                  (required binding)
+    //   read-only ∧ ¬host → `my $x = '';`   (bash unset = empty)
+    //   written  ∧ host → `my $x = $x;`     copy-in, writes stay local
+    //   written  ∧ ¬host → `my $x;`
+    // Order: assigned-first-then-read-only, mirroring the standalone
+    // preamble (Vec-based, deterministic).
+    let mut vars = Vec::new();
+    collect_assigned_vars(&stmts, &mut vars);
+    let mut read_vars = Vec::new();
+    collect_read_vars_stmts(&stmts, &mut read_vars);
+    for (n, s) in read_vars {
+        if !vars.iter().any(|(vn, _)| vn == &n) {
+            vars.push((n, s));
+        }
+    }
+    let mut decls = String::new();
+    for (name, sigil) in &vars {
+        let written = collect_assigned_vars_contains(&stmts, name);
+        let in_host = ctx.host_scope.iter().any(|h| h == name);
+        let sigil_str = match sigil {
+            Sigil::Scalar => "$",
+            Sigil::Array => "@",
+            Sigil::Hash => "%",
+        };
+        if written {
+            if in_host {
+                // copy-in: reads see the host value, writes stay local
+                decls.push_str(&format!(
+                    "my {sigil_str}{name} = {sigil_str}{name};\n"
+                ));
+                result.required_host_bindings.push(name.clone());
+            } else {
+                decls.push_str(&format!("my {sigil_str}{name};\n"));
+            }
+        } else if in_host {
+            // reuse: bare reads resolve to the enclosing scope
+            result.required_host_bindings.push(name.clone());
+        } else {
+            match sigil {
+                Sigil::Scalar => decls.push_str(&format!("my ${name} = '';\n")),
+                Sigil::Array => decls.push_str(&format!("my @{name};\n")),
+                Sigil::Hash => decls.push_str(&format!("my %{name};\n")),
+            }
+        }
+    }
+
+    let mut out = String::new();
+    // The whole fragment lives in a `do { … }` block: a fresh scope, so the
+    // copy-in declarations (`my $x = $x;`) get their OWN lexical — in the
+    // host's same scope a second `my $x` would mask-REUSE the host pad slot
+    // and the snippet's writes would leak out (bash subshell semantics:
+    // writes must not escape). This is the same shape purify.pl's `__bt(do
+    // { … })` wrapper already imposes.
+    out.push_str("do {\n");
+    if !decls.is_empty() {
+        for line in decls.lines() {
+            if !line.is_empty() {
+                out.push_str("    ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    for s in &stmts {
+        emit_stmt(&mut out, s, 1);
+    }
+    out.push_str("};\n");
+
+    // ── post-render rewrites (each mirrors a purify.pl heuristic that the
+    // renderer now owns; the refusal scan below is the analysis-driven
+    // replacement for purify's regex rejections) ──────────────────────
+
+    // `$main_exit_code = $CHILD_ERROR = X;` → `$CHILD_ERROR = X;` — the
+    // standalone exit tracker is dead in an embed (the host owns its own
+    // exit); the status mirror stays.
+    out = out.replace(
+        "$main_exit_code = $CHILD_ERROR = ",
+        "$CHILD_ERROR = ",
+    );
+
+    if ctx.backtick_newlines {
+        // Perl `qx` does NOT strip trailing newlines (bash `$()` does); the
+        // standalone's command-substitution chomp is wrong inside a Perl
+        // backtick replacement.
+        out = out.replace("chomp $_r; ", "");
+    }
+
+    if !ctx.english_names {
+        out = out
+            .replace("$INPUT_RECORD_SEPARATOR", "$/")
+            .replace("$OS_ERROR", "$!")
+            .replace("$ERRNO", "$!")
+            .replace("$EVAL_ERROR", "$@");
+    }
+
+    if out.contains("$CHILD_ERROR") {
+        out.insert_str(0, "our $CHILD_ERROR = 0;\n");
+    }
+
+    // Standalone-only dependencies the fragment must not reference (the
+    // preamble declares them in a full program; an embed has no preamble).
+    for needle in [
+        "$main_exit_code",
+        "$__argc",
+        "$__nocasematch",
+        "$ls_success",
+        "$DATE_SNAPSHOT",
+    ] {
+        if out.contains(needle) {
+            result
+                .refusals
+                .push(format!("fragment references {needle} (standalone-only)"));
+        }
+    }
+    if regex::Regex::new(r"\bsay\s+")
+        .unwrap()
+        .is_match(&out)
+    {
+        result
+            .refusals
+            .push("fragment uses `say` (host may lack `use feature 'say'`)".into());
+    }
+    // A bare `exit` statement would terminate the HOST process (the snippet's
+    // `exit N` lowers to an exec call the renderer emits as Perl `exit`).
+    if regex::Regex::new(r#"(?m)^\s*exit[\s"]"#)
+        .unwrap()
+        .is_match(&out)
+    {
+        result.refusals.push("fragment contains a bare `exit`".into());
+    }
+
+    result.fragment = out;
+    result.required_host_bindings.sort();
+    result.required_host_bindings.dedup();
+    result
+}
+
 // ── Statement emitter ────────────────────────────────────────────────
 
 pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
@@ -6814,6 +7041,153 @@ mod tests {
         assert!(
             perl.contains("printf(\"<%s>\\n\""),
             "bash printf backslash escapes decode: {perl}"
+        );
+    }
+
+    // ── embed profile (purify design, PLAN §10) ──────────────────────
+
+    fn embed_prog(src: &str) -> IrProgram {
+        let commands =
+            crate::Parser::new(src).parse().unwrap_or_else(|e| panic!("parse {src}: {e}"));
+        crate::shir::ast_to_ir(&commands)
+    }
+
+    fn render(src: &str, host_scope: &[&str]) -> EmbedResult {
+        shir_to_perl_embed(
+            &embed_prog(src),
+            &EmbedCtx {
+                host_scope: host_scope.iter().map(|s| s.to_string()).collect(),
+                backtick_newlines: true,
+                english_names: false,
+            },
+        )
+    }
+
+    #[test]
+    fn embed_fragment_is_deterministic() {
+        // the legacy `--inline` path was 30/30 flaky across processes (HashSet
+        // declaration order); the embed renderer must be byte-stable
+        let src = "echo hi; x=5; echo $x; for i in 1 2 3; do y=$((y+i)); done";
+        let a = render(src, &["x"]);
+        let b = render(src, &["x"]);
+        assert_eq!(a.fragment, b.fragment, "embed output must be byte-stable");
+    }
+
+    #[test]
+    fn embed_bindings_gate() {
+        // read-only ∧ host_scope → bare reuse + required binding
+        let r = render("echo $x", &["x"]);
+        assert_eq!(r.required_host_bindings, vec!["x"]);
+        assert!(r.refusals.is_empty(), "refusals: {:?}", r.refusals);
+        assert!(
+            !r.fragment.contains("my $x"),
+            "host-scope read must not be declared locally: {}",
+            r.fragment
+        );
+        // the gate: every required binding must be in host_scope
+        for b in &r.required_host_bindings {
+            assert!(
+                ["x"].contains(&b.as_str()),
+                "required binding {b} missing from host_scope"
+            );
+        }
+        // read-only ∧ ¬host_scope → local `my $x = '';` (bash unset = empty),
+        // nothing required from the host
+        let r2 = render("echo $x", &[]);
+        assert!(r2.required_host_bindings.is_empty());
+        assert!(r2.fragment.contains("my $x = '';"), "{}", r2.fragment);
+    }
+
+    #[test]
+    fn embed_copy_in_for_read_write() {
+        // written ∧ host_scope → `my $x = $x;` copy-in: reads see the host
+        // value, writes stay fragment-local (bash subshell semantics)
+        let r = render("x=$((x+1)); echo $x", &["x"]);
+        assert_eq!(r.required_host_bindings, vec!["x"]);
+        assert!(r.fragment.contains("my $x = $x;"), "{}", r.fragment);
+        // written ∧ ¬host_scope → plain local `my $x;`
+        let r2 = render("x=$((x+1)); echo $x", &[]);
+        assert!(r2.required_host_bindings.is_empty());
+        assert!(r2.fragment.contains("my $x;"), "{}", r2.fragment);
+    }
+
+    #[test]
+    fn embed_no_preamble() {
+        let r = render("echo hi; x=5; echo $x", &[]);
+        assert!(r.refusals.is_empty(), "refusals: {:?}", r.refusals);
+        for banned in [
+            "#!/usr/bin/env perl",
+            "use strict",
+            "use warnings",
+            "use Carp",
+            "use English",
+            "exit $main_exit_code",
+            "my $main_exit_code",
+        ] {
+            assert!(
+                !r.fragment.contains(banned),
+                "embed fragment must not contain {banned:?}: {}",
+                r.fragment
+            );
+        }
+    }
+
+    #[test]
+    fn embed_collapses_main_exit_writes() {
+        // an external command lowers to system('bash','-c',…); the standalone
+        // status tracker ($main_exit_code) is dead in an embed — the write is
+        // collapsed to the $CHILD_ERROR mirror, and CHILD_ERROR is declared
+        let src = "grep foo /tmp/nonexistent || echo no";
+        let r = render(src, &[]);
+        assert!(
+            r.refusals.is_empty(),
+            "refusals: {:?} fragment: {}",
+            r.refusals,
+            r.fragment
+        );
+        assert!(
+            !r.fragment.contains("$main_exit_code"),
+            "main_exit_code must be collapsed: {}",
+            r.fragment
+        );
+        assert!(
+            r.fragment.contains("our $CHILD_ERROR = 0;"),
+            "CHILD_ERROR declared in fragment: {}",
+            r.fragment
+        );
+        assert!(
+            r.fragment.contains("$CHILD_ERROR = $? >> 8"),
+            "status mirror kept: {}",
+            r.fragment
+        );
+    }
+
+    #[test]
+    fn embed_english_normalization() {
+        // the standalone emits $INPUT_RECORD_SEPARATOR (English.pm); an embed
+        // must normalize to $/ so host files without `use English` stay valid
+        let src = "IFS=: read -r a b < /dev/null; echo $a";
+        let r = render(src, &[]);
+        assert!(
+            !r.fragment.contains("$INPUT_RECORD_SEPARATOR"),
+            "English name must be normalized: {}",
+            r.fragment
+        );
+    }
+
+    #[test]
+    fn embed_refuses_exit_and_functions() {
+        let r = render("exit 3", &[]);
+        assert!(
+            r.refusals.iter().any(|x| x.contains("exit")),
+            "exit must be refused: {:?}",
+            r.refusals
+        );
+        let r2 = render("f() { echo hi; }; f", &[]);
+        assert!(
+            r2.refusals.iter().any(|x| x.contains("function")),
+            "function def must be refused: {:?}",
+            r2.refusals
         );
     }
 }
