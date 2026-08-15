@@ -2952,7 +2952,6 @@ impl Render {
                         IrExpr::Str(s, _) if s.starts_with('-') => flags.push(s.clone()),
                         _ => {
                             for f in self.word_items(w) {
-                                // word_items already renders a perl expr
                                 files.push(f);
                             }
                         }
@@ -2961,6 +2960,20 @@ impl Render {
                 if files.is_empty() {
                     return;
                 }
+                // a SH2GLOB-marked word is a shell glob the perl must
+                // expand at RUNTIME (the corpus creates the files first) —
+                // strip the marker and wrap in perl glob()
+                let files: Vec<String> = files
+                    .into_iter()
+                    .map(|f| {
+                        let plain = f.replace("\\x{1}SH2GLOB\\x{1}", "");
+                        if plain != f {
+                            format!("glob({plain})")
+                        } else {
+                            f
+                        }
+                    })
+                    .collect();
                 if flags.iter().any(|s| s.contains('r')) {
                     // recursive rm: unlink can't remove directories — the
                     // real `rm` binary is the faithful native lowering
