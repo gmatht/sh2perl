@@ -2464,7 +2464,7 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                     value
                 ))
             }
-            "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?, false)),
+            "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?.replace('.', "_"), false)),
             "capture" => Ok(capture_wrap(&arrow_to_sh(args)?, true)),
         "captureWords" => Ok(capture_wrap(&arrow_to_sh(args)?, false)),
             "contains" => {
@@ -2482,6 +2482,21 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                     }
                 }
                 Ok(line)
+            }
+            "setVar" => {
+                // the runtime's plain store write — re-emit as a shell
+                // assignment (the A1 store protocol the perl/posix
+                // frontends emit for return values / locals; triage
+                // cpp-sh-go t06_struct.cc / c-sh-go t83_const_ptr.c).
+                // Dotted names (the cpp/c struct-field protocol `p.x`)
+                // are not valid shell identifiers — sanitize to `p_x`
+                // (the getVar arm mirrors the same rewrite).
+                let name = raw_arg(args, 0)?;
+                let value = word_to_sh(
+                    args.get(1)
+                        .ok_or_else(|| format!("missing argument 1 in {args:?}"))?,
+                )?;
+                Ok(format!("{}={value}", name.replace('.', "_")))
             }
             other => Err(format!("command call not renderable: {other:?}")),
         },
@@ -4701,7 +4716,7 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
         // quote matters — bash `printf '%s' "$x"` passes the value as
         // ONE word, the unquoted form re-splits it (heredoc-apostrophe.sh
         // truncates at the first space without it).
-        "getVar" => Ok(format!("\"{}\"", var_ref_to_sh(&raw_arg(args, 0)?, false))),
+        "getVar" => Ok(format!("\"{}\"", var_ref_to_sh(&raw_arg(args, 0)?.replace('.', "_"), false))),
         // param expansions in word position are the QUOTED source form
         // (`echo "\"${x#p}\" "` — bash keeps interior spaces; the core
         // wraps only unquoted getVar in split(), param has no marker, so
@@ -5287,7 +5302,7 @@ fn interp_parts_to_sh(
 fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
     match e {
         IrExpr::Call { func, args } => match func.as_str() {
-            "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?, false)),
+            "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?.replace('.', "_"), false)),
             "param" => param_to_sh(args, false),
             "listVar" => {
                 let n = raw_arg(args, 0)?;
@@ -6071,6 +6086,56 @@ fn json_str(v: &serde_json::Value) -> String {
 
 // ── arithmetic ───────────────────────────────────────────────────────
 
+/// A zsh/mathfunc call in raw arith text: `name(ARG, …)` starting at
+/// `s[0] == '('`. Returns the awk expression and the number of bytes
+/// consumed (through the closing paren) when the call is in the
+/// deterministic subset with plain numeric args; None otherwise (the
+/// caller keeps the old identifier behavior).
+fn math_call_to_awk(name: &str, s: &str) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    debug_assert_eq!(b.first(), Some(&b'('));
+    let mut depth = 1i32;
+    let mut k = 1;
+    while k < b.len() && depth > 0 {
+        if b[k] == b'(' {
+            depth += 1;
+        } else if b[k] == b')' {
+            depth -= 1;
+        }
+        k += 1;
+    }
+    if depth != 0 {
+        return None; // unbalanced — leave for the shell to reject
+    }
+    let args_text = &s[1..k - 1];
+    // plain numeric args only (the corpus calls are literal); a var or
+    // nested call falls back to the old behavior rather than guessing.
+    let is_num = |a: &str| {
+        let a = a.trim();
+        !a.is_empty()
+            && a.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+')
+            && a.chars().filter(|c| *c == '.').count() <= 1
+    };
+    let args: Vec<&str> = args_text.split(',').collect();
+    if args.is_empty() || !args.iter().all(|a| is_num(a)) {
+        return None;
+    }
+    let a = |i: usize| args[i].trim().to_string();
+    let expr = match name {
+        "sqrt" if args.len() == 1 => format!("sqrt({})", a(0)),
+        "int" if args.len() == 1 => format!("int({})", a(0)), // awk int() truncates toward zero — matches zsh
+        "fmod" if args.len() == 2 => format!("{} % {}", a(0), a(1)), // awk % is fmod semantics
+        "hypot" if args.len() >= 2 => format!(
+            "sqrt({})",
+            args.iter()
+                .map(|x| format!("({})^2", x.trim()))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        ),
+        _ => return None,
+    };
+    Some((expr, k))
+}
 
 /// dash's arithmetic has NO ++/-- and NO `**` — rewrite the raw arith
 /// text (the `arith` call form carries a string, not the AST):
@@ -6206,6 +6271,22 @@ fn arith_rewrite(t: &str) -> String {
                 j += 1;
             }
             let name = &t[i..j];
+            // zsh/mathfunc arithmetic CALLS (`sqrt(9)`, `int(3.7)`,
+            // `hypot(3, 4)`, `fmod(7, 3)` — the deterministic subset the
+            // zsh corpus exercises; the estree reference resolves the
+            // same names through JS Math): bash arith has no function
+            // calls, so route the call through awk (POSIX; sqrt/int/%
+            // are awk-native, hypot = sqrt(a^2+b^2), % is fmod
+            // semantics). The awk result is a plain number, which bash
+            // then folds into the surrounding $(( )) / let evaluation
+            // (triage zsh-sh-go t89_arith_call).
+            if j + 1 < b.len() && b[j] == b'(' {
+                if let Some((awk_expr, consumed)) = math_call_to_awk(name, &t[j..]) {
+                    out.push_str(&format!("$(awk 'BEGIN{{print {awk_expr}}}')"));
+                    i = j + consumed;
+                    continue;
+                }
+            }
             // bare ARRAY subscript (`arr[K]` in `let 'x = arr[i]'`-style
             // raw arithmetic text): dash cannot parse the per-element
             // vars as `arr[K]`, so go through `_arr_get` (the element

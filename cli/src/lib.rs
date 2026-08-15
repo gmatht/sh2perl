@@ -980,10 +980,20 @@ exit $main_exit_code;
                 Ok(c) => c,
                 Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
             };
-            let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
+            // the shared core pipeline (mirrors the --shir-in-perl arm):
+            // the frontends emit the rich A1 — strip_cfor lowers the
+            // C-style ForInit (splicing the step before every continue),
+            // restructure_goto_only folds goto/label pairs, and the
+            // process_subst transform materializes captures. Without
+            // these the renderer refuses (triage t17_continue.cc: the
+            // unspliced step made `continue` skip the for-update).
+            debashl::shir_passes::strip_cfor(&mut prog);
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
             // stdout is BYTES: decode the core's marked-lossy PUA markers
             // (U+E000+byte — invalid-UTF-8 source bytes) back to raw
             // bytes so the rendered script reproduces bash's byte-exact
@@ -1015,38 +1025,6 @@ exit $main_exit_code;
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
             print!("{}", debashl::ir::shir_to_perl(&prog));
-        }
-        "--shir-in-sh" => {
-            if args.len() < 3 { println!("Error: --shir-in-sh requires input"); return; }
-            let input = &args[2];
-            let content = if input == "-" {
-                let mut s = String::new();
-                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
-                    eprintln!("stdin: {}", e); std::process::exit(1);
-                }
-                Ok(s)
-            } else {
-                fs::read_to_string(input)
-            };
-            let content = match content {
-                Ok(c) => c,
-                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
-            };
-            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
-                Ok(p) => p,
-                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
-            };
-            debashl::shir_passes::strip_cfor(&mut prog);
-            debashl::shir_passes::restructure_goto_only(&mut prog);
-            debashl::transforms::process_subst::transform_program(&mut prog);
-            // stdout is BYTES: decode the core's marked-lossy PUA markers
-            // (U+E000+byte — invalid-UTF-8 source bytes) back to raw
-            // bytes (see the file --shir-in-sh arm above).
-            let s = match debashl::sh_backend::shir_to_sh(&prog) {
-                Ok(s) => s,
-                Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
-            };
-            { use std::io::Write; let _ = std::io::stdout().write_all(&debashl::sh_backend::decode_pua_bytes(&s)); }
         }
         "--mir" => {
             if args.len() < 3 {
