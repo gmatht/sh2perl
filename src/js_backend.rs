@@ -30,10 +30,34 @@ pub struct Render {
     depth: usize,
     /// var name -> type verdict (A2); missing = Any (runtime store)
     var_types: HashMap<String, IrType>,
+    /// var names that may hold shell-env values (var_bash_env) — getVar
+    /// of these stays on the runtime stub (the native `let` binding does
+    /// not carry the env value)
+    env_vars: BTreeSet<String>,
+    /// every var name the program references (assign targets, declare
+    /// lists, reads, typed verdicts) — the getVar fold's "known" set: a
+    /// name never referenced reads as the constant "" (bash unset read,
+    /// mirroring the estree ref's SH2_ASSUME_NO_ENV fold)
+    known_vars: BTreeSet<String>,
     /// distinct sh2.* callee names that need stubs
     sh2_calls: BTreeSet<String>,
+    /// $1..$9 positional reads / fnCall present — emit the positional
+    /// array + call protocol
+    uses_positional: bool,
+    /// C memory arena (mem*) calls present — emit the mem helpers
+    uses_mem: bool,
     todo: usize,
     loop_depth: usize,
+}
+
+/// A plain shell/JS identifier (no `[idx]` baked names, no specials).
+fn is_plain_name(s: &str) -> bool {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Render an `IrProgram` to a Node-style JS script.
@@ -44,6 +68,7 @@ pub fn shir_to_js(prog: &IrProgram) -> String {
     prog.var_types = crate::shir::analyze_var_types(&prog);
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
+    r.env_vars = prog.var_bash_env.iter().cloned().collect();
     r.program(&prog);
     r.out.join("\n")
 }
@@ -217,6 +242,12 @@ impl Render {
             IrExpr::DefinedOr { expr, default } => {
                 format!("({} ?? {})", self.expr(expr), self.expr(default))
             }
+            IrExpr::Call { func, args } if func == "split" => {
+                if let Some(x) = args.first() {
+                    return self.expr(x);
+                }
+                self.sh2_stub("split", args, "split")
+            }
             IrExpr::Call { func, args } => self.call(func, args),
             IrExpr::Json(v) => match v {
                 serde_json::Value::String(s) => Self::js_str(s),
@@ -367,15 +398,114 @@ impl Render {
                 }
                 self.sh2_stub("exec", args, "exec")
             }
-            // getVar("y") — the ShIR's form of a `$y` read; typed vars
-            // lower to bare identifiers, mirroring the C renderer.
+            // getVar("y") — the ShIR's form of a `$y` read; known vars
+            // lower to the native binding, unset reads to "" (the estree
+            // ref's SH2_ASSUME_NO_ENV fold).
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    if self.var_types.contains_key(name) {
-                        return self.js_ident(name);
+                    if let Some(x) = self.getvar_expr(name) {
+                        return x;
                     }
                 }
                 self.sh2_stub("getVar", args, "getVar")
+            }
+            // `arith("$i")` — the C frontend's runtime-arith operand
+            // (dynamic array index / cond); plain reads fold natively.
+            "arith" => {
+                if let Some(IrExpr::Str(s, _)) = args.first() {
+                    if let Some(x) = self.arith_str(s) {
+                        return x;
+                    }
+                }
+                self.sh2_stub("arith", args, "arith")
+            }
+            // C array literal (`int a[3] = {..}` → setArray("a", [...]))
+            "setArray" => {
+                if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Array(items))) =
+                    (args.first(), args.get(1))
+                {
+                    if is_plain_name(name) {
+                        let elems: Vec<String> = items.iter().map(|e| self.expr(e)).collect();
+                        return format!("({} = [{}])", self.js_ident(name), elems.join(", "));
+                    }
+                }
+                self.sh2_stub("setArray", args, "setArray")
+            }
+            // C array element write (`a[i] = v` → arrayStore("a", i, v))
+            "arrayStore" => {
+                if let (Some(IrExpr::Str(name, _)), Some(idx), Some(val)) =
+                    (args.first(), args.get(1), args.get(2))
+                {
+                    if is_plain_name(name) {
+                        return format!(
+                            "({}[{}] = {})",
+                            self.js_ident(name),
+                            self.expr(idx),
+                            self.expr(val)
+                        );
+                    }
+                }
+                self.sh2_stub("arrayStore", args, "arrayStore")
+            }
+            // C array element read (`v = a[i]` → arrayIndex("a", i))
+            "arrayIndex" => {
+                if let (Some(IrExpr::Str(name, _)), Some(idx)) = (args.first(), args.get(1)) {
+                    if is_plain_name(name) {
+                        return format!("{}[{}]", self.js_ident(name), self.expr(idx));
+                    }
+                }
+                self.sh2_stub("arrayIndex", args, "arrayIndex")
+            }
+            // out-param protocol: capture a function call's stdout
+            // (literal-echo bodies fold to the text; anything else runs
+            // with fd-1 swapped into a buffer)
+            "capture" => {
+                if let Some(IrExpr::Arrow(body)) = args.first() {
+                    if let Some(text) = self.capture_echo_fold(body) {
+                        return Self::js_str(&text);
+                    }
+                    return self.capture_iife(body);
+                }
+                self.sh2_stub("capture", args, "capture")
+            }
+            // user function call with positional setup ($1..$9)
+            "fnCall" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if is_plain_name(name) {
+                        let fname = self.js_ident(name);
+                        let arg_exprs: Vec<String> = match args.get(1) {
+                            Some(IrExpr::Array(items)) => {
+                                items.iter().map(|a| self.expr(a)).collect()
+                            }
+                            _ => Vec::new(),
+                        };
+                        self.uses_positional = true;
+                        return format!(
+                            "(() => {{ const __saved = sh2_positional; sh2_positional = [{}]; try {{ return {}({}); }} finally {{ sh2_positional = __saved; }} }})()",
+                            arg_exprs.join(", "),
+                            fname,
+                            arg_exprs.join(", ")
+                        );
+                    }
+                }
+                self.sh2_stub("fnCall", args, "fnCall")
+            }
+            // multi-return line read (`line(cap, N)` → split("\n")[N])
+            "line" => {
+                if let (Some(text), Some(IrExpr::Str(i, _))) = (args.first(), args.get(1)) {
+                    let t = self.expr(text);
+                    let n = i.parse::<usize>().unwrap_or(0);
+                    return format!("({}.split(\"\\n\")[{}] ?? \"\")", t, n);
+                }
+                self.sh2_stub("line", args, "line")
+            }
+            // C memory arena (malloc/pointer arithmetic) — helper
+            // preamble mirrors the estree ref runtime's mem* slice-2
+            "memAlloc" | "memStore" | "memLoad" | "memAdvance" | "memFree" | "memTest"
+            | "memElemSize" => {
+                self.uses_mem = true;
+                let arg_exprs: Vec<String> = args.iter().map(|a| self.expr(a)).collect();
+                format!("sh2_{}({})", func, arg_exprs.join(", "))
             }
             // test("...") — mini evaluator for the common numeric/string
             // patterns; anything else → runtime stub.
@@ -392,6 +522,143 @@ impl Render {
         }
     }
 
+    /// A `$name` read (getVar("name")) → the native JS expression, or
+    /// None when the read must stay on the sh2.* stub (env/special vars).
+    /// Mirrors the estree ref's SH2_ASSUME_NO_ENV fold: a name never
+    /// written in the program is the constant "" (bash reads an unset
+    /// var as empty). `$1..$9` read the positional array the fnCall
+    /// protocol establishes (0-based, like the estree ref runtime).
+    fn getvar_expr(&mut self, name: &str) -> Option<String> {
+        if self.env_vars.contains(name) {
+            return None;
+        }
+        if matches!(
+            name,
+            "?" | "$"
+                | "#"
+                | "@"
+                | "*"
+                | "0"
+                | "-"
+                | "PWD"
+                | "HOSTNAME"
+                | "BASH_VERSION"
+                | "BASH"
+                | "SHELL"
+                | "EPOCHREALTIME"
+                | "EPOCHSECONDS"
+        ) {
+            return None;
+        }
+        if let Ok(n) = name.parse::<usize>() {
+            if (1..=9).contains(&n) {
+                self.uses_positional = true;
+                return Some(format!("(sh2_positional[{}] ?? \"\")", n - 1));
+            }
+            return None; // $0 → argv0 (no standalone equivalent)
+        }
+        if is_plain_name(name) {
+            if self.known_vars.contains(name) {
+                return Some(self.js_ident(name));
+            }
+            // never written (and not env): bash reads unset → ""
+            return Some("\"\"".into());
+        }
+        None
+    }
+
+    /// `arith("$i")` — the C frontend's runtime-arith operand (array
+    /// index/cond); a plain `$name` (or `$a op $b`) folds to the native
+    /// bindings. Anything else → None (runtime stub).
+    fn arith_str(&mut self, s: &str) -> Option<String> {
+        let toks: Vec<&str> = s.split_whitespace().collect();
+        match toks.as_slice() {
+            [t] => {
+                let rest = t.strip_prefix('$')?;
+                if is_plain_name(rest) {
+                    Some(self.js_ident(rest))
+                } else {
+                    None
+                }
+            }
+            [l, op, r] if matches!(*op, "+" | "-" | "*" | "/" | "%") => {
+                let l = l.strip_prefix('$').filter(|x| is_plain_name(x))?;
+                let rr = if let Some(n) = r.strip_prefix('$') {
+                    if is_plain_name(n) {
+                        self.js_ident(n)
+                    } else {
+                        return None;
+                    }
+                } else if let Ok(n) = r.parse::<i64>() {
+                    n.to_string()
+                } else {
+                    return None;
+                };
+                Some(format!("({} {} {})", self.js_ident(l), op, rr))
+            }
+            _ => None,
+        }
+    }
+
+    /// `$(echo <literal words>)` — a capture of a literal echo folds to
+    /// the captured text (mirrors the estree ref's echo-capture fold;
+    /// the capture strips the trailing newline the echo emits).
+    fn capture_echo_fold(&mut self, body: &[IrStmt]) -> Option<String> {
+        let [IrStmt::Expr(e)] = body else {
+            return None;
+        };
+        let IrExpr::Call { func, args } = e else {
+            return None;
+        };
+        if func != "exec" {
+            return None;
+        }
+        let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+            return None;
+        };
+        if cmd != "echo" {
+            return None;
+        }
+        let mut text = String::new();
+        for (i, w) in words.iter().enumerate() {
+            if i > 0 {
+                text.push(' ');
+            }
+            match w {
+                IrExpr::Str(s, _) => text.push_str(s),
+                IrExpr::Interpolate(parts) => {
+                    for p in parts {
+                        match p {
+                            InterpPart::Lit(s) => text.push_str(s),
+                            InterpPart::Expr(_) => return None,
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(text)
+    }
+
+    /// General capture: run the arrow body with fd-1 redirected into a
+    /// buffer (the estree ref runtime's captureSync semantics — NUL
+    /// strip + trailing-newline strip), as an IIFE.
+    fn capture_iife(&mut self, body: &[IrStmt]) -> String {
+        let mut saved = Vec::new();
+        std::mem::swap(&mut self.out, &mut saved);
+        let saved_depth = self.depth;
+        self.depth += 1;
+        for s in body {
+            self.stmt(s);
+        }
+        let body_src = std::mem::replace(&mut self.out, saved).join("\n");
+        self.depth = saved_depth;
+        format!(
+            "(() => {{ const __out = []; const __saved = process.stdout.write.bind(process.stdout); process.stdout.write = (s) => {{ __out.push(String(s)); }}; try {{ {} }} finally {{ process.stdout.write = __saved; }} return __out.join(\"\").replace(/\\u0000/g, \"\").replace(/\\n+$/, \"\"); }})()",
+            body_src
+        )
+    }
+
     /// Mini `[ ... ]` evaluator for the common patterns; None → stub.
     fn test_render(&mut self, s: &str) -> Option<String> {
         let toks: Vec<&str> = s.split_whitespace().collect();
@@ -406,30 +673,42 @@ impl Render {
                     "-ne" | "!=" => "!=",
                     _ => return None,
                 };
-                Some(format!(
-                    "({} {js_op} {})",
-                    self.test_value(a),
-                    self.test_value(b)
-                ))
+                // numeric operators coerce both operands (bash: a
+                // non-numeric operand is 0)
+                if matches!(*op, "-gt" | "-lt" | "-ge" | "-le" | "-eq" | "-ne") {
+                    Some(format!(
+                        "((Number({}) || 0) {js_op} (Number({}) || 0))",
+                        self.test_operand(a),
+                        self.test_operand(b)
+                    ))
+                } else {
+                    Some(format!(
+                        "({} {js_op} {})",
+                        self.test_operand(a),
+                        self.test_operand(b)
+                    ))
+                }
             }
-            [flag, v] if *flag == "-n" => Some(format!("({} !== \"\")", self.test_value(v))),
-            [flag, v] if *flag == "-z" => Some(format!("({} === \"\")", self.test_value(v))),
-            [v] => Some(format!("({})", self.test_value(v))),
+            [flag, v] if *flag == "-n" => Some(format!("({} !== \"\")", self.test_operand(v))),
+            [flag, v] if *flag == "-z" => Some(format!("({} === \"\")", self.test_operand(v))),
+            // `[ 0 ]` / `[ "" ]` — bash tests the non-emptiness
+            [v] => Some(format!("({} !== \"\")", self.test_operand(v))),
             _ => None,
         }
     }
 
-    /// A test operand: `"$y"`/`$y`/`y` (typed var) → ident; number →
-    /// literal; otherwise a quoted string.
-    fn test_value(&self, t: &str) -> String {
-        let t = t
-            .trim()
-            .trim_matches('"')
-            .strip_prefix('$')
-            .unwrap_or(t.trim().trim_matches('"'));
-        if self.var_types.contains_key(t) {
-            self.js_ident(t)
-        } else if let Ok(n) = t.parse::<i64>() {
+    /// A test operand: `$y` (optionally quoted) → the native var binding;
+    /// a number → a literal; anything else → a quoted string (bash only
+    /// expands `$`-prefixed operands).
+    fn test_operand(&self, t: &str) -> String {
+        let t = t.trim().trim_matches('"');
+        if let Some(rest) = t.strip_prefix('$') {
+            if is_plain_name(rest) {
+                return self.js_ident(rest);
+            }
+            return Self::js_str(t);
+        }
+        if let Ok(n) = t.parse::<i64>() {
             n.to_string()
         } else {
             Self::js_str(t)
@@ -459,17 +738,27 @@ impl Render {
             }
             IrExpr::Arith(a) => vec![Part::Arg(self.arith(a), true)],
             IrExpr::BinOp { .. } => vec![Part::Arg(self.expr(e), true)],
-            // `$y` reads arrive as getVar("y"); typed vars lower to the
-            // bare identifier, anything else → runtime stub.
+            // `$y` reads arrive as getVar("y"); known vars lower to the
+            // native binding, unset reads to "" (the estree ref's
+            // SH2_ASSUME_NO_ENV fold)
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    if self.var_types.contains_key(name) {
-                        return vec![Part::Arg(self.js_ident(name), self.is_num(name))];
+                    if let Some(x) = self.getvar_expr(name) {
+                        return vec![Part::Arg(x, self.expr_is_num(e))];
                     }
                 }
                 self.sh2_calls.insert("getVar".into());
                 self.mark_todo("echo arg getVar");
                 vec![Part::Arg("sh2_getVar()".into(), false)]
+            }
+            // `split(...)` — the A1's word-split marker on a read in
+            // echo position; the estree ref folds it to the read itself
+            IrExpr::Call { func, args } if func == "split" => {
+                if let Some(x) = args.first() {
+                    return self.parts_of(x);
+                }
+                self.mark_todo("echo arg split");
+                vec![Part::Arg("0".into(), true)]
             }
             other => {
                 self.mark_todo(&format!("echo arg {:?}", other));
@@ -749,6 +1038,41 @@ impl Render {
                         return;
                     }
                 }
+                // setVar("name", value) — the A1's store write; a plain
+                // name lowers to a native assignment (typed targets keep
+                // their numeric binding)
+                if let IrExpr::Call { func, args } = e {
+                    if func == "setVar" {
+                        if let (Some(IrExpr::Str(name, _)), Some(value)) =
+                            (args.first(), args.get(1))
+                        {
+                            if is_plain_name(name) {
+                                let nm = self.js_ident(name);
+                                let v = if self.is_num(name) {
+                                    self.expr_as_num(value)
+                                } else {
+                                    self.expr(value)
+                                };
+                                self.emit(&format!("{nm} = {v};"));
+                                return;
+                            }
+                        }
+                    }
+                    // setArray("name", [...]) — a C array literal
+                    if func == "setArray" {
+                        if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Array(items))) =
+                            (args.first(), args.get(1))
+                        {
+                            if is_plain_name(name) {
+                                let nm = self.js_ident(name);
+                                let elems: Vec<String> =
+                                    items.iter().map(|e2| self.expr(e2)).collect();
+                                self.emit(&format!("{nm} = [{}];", elems.join(", ")));
+                                return;
+                            }
+                        }
+                    }
+                }
                 // break()/continue() calls inside a loop lower natively
                 // (bash status verbs — the goto-restructure pass emits
                 // them as the loop exit); outside a loop they keep the stub
@@ -783,6 +1107,34 @@ impl Render {
                 if !t.indices.is_empty() {
                     self.mark_todo("array-index assign");
                     return;
+                }
+                // `s += n` arriving as a plain Assign (the C/zsh
+                // frontends' arith-step shape) — mirror the IrStmt::Expr
+                // arm's native lowering instead of the sh2.arith stub
+                if let IrExpr::Arith(a) = expr {
+                    if let ArithAst::Assign { var, op, rhs } = &**a {
+                        if t.var == *var {
+                            let name = self.js_ident(var);
+                            let r = self.arith(rhs);
+                            let js_op = match op.as_str() {
+                                "+=" => "+=",
+                                "-=" => "-=",
+                                "*=" => "*=",
+                                "/=" => "/=",
+                                "%=" => "%=",
+                                _ => "=",
+                            };
+                            if self.is_num(var) || js_op == "=" {
+                                self.emit(&format!("{name} {js_op} {r};"));
+                            } else {
+                                self.emit(&format!(
+                                    "{name} = (Number({name}) || 0) {} {r};",
+                                    js_op.trim_end_matches('=')
+                                ));
+                            }
+                            return;
+                        }
+                    }
                 }
                 let name = self.js_ident(&t.var);
                 let is_num = self.is_num(&t.var);
@@ -866,6 +1218,12 @@ impl Render {
                 let it = self.expr(iter);
                 self.emit(&format!("for (let {name} of {it}) {{"));
                 self.depth += 1;
+                if self.is_num(var) {
+                    // the for-of yields STRINGS; a numeric-lifted loop
+                    // var must be coerced before arith uses it (the
+                    // estree ref emits the same `n = Number(n)` step)
+                    self.emit(&format!("{name} = Number({name});"));
+                }
                 for s in body {
                     self.stmt(s);
                 }
@@ -983,9 +1341,13 @@ impl Render {
         // Var reads, for-loop vars) so declarations can be hoisted.
         let mut vars: BTreeSet<String> = BTreeSet::new();
         collect_vars(&prog.stmts, &mut vars);
+        for sub in &prog.subs {
+            collect_vars(&sub.body, &mut vars);
+        }
         for (n, _) in &prog.var_types {
             vars.insert(n.clone());
         }
+        self.known_vars = vars.clone();
 
         // Pass 2: render the body first (helper flags known before preamble).
         let mut body_out = Vec::new();
@@ -1059,6 +1421,12 @@ impl Render {
             }
             self.emit("");
         }
+        if self.uses_positional {
+            self.emit("let sh2_positional = [];");
+        }
+        if self.uses_mem {
+            self.emit(MEM_PREAMBLE);
+        }
         self.emit("function main() {");
         self.out.extend(body_out.iter().cloned());
         self.emit("}");
@@ -1073,8 +1441,65 @@ impl Render {
     }
 }
 
-/// Collect every variable name referenced by statements (assign targets,
-/// declare lists, Var reads, loop vars).
+/// C memory arena helpers — the estree ref runtime's mem* slice-2
+/// (harness/sh2-namespace.mjs), standalone: a flat byte-slot arena keyed
+/// by allocation id, handles as `\u0001mem:<id>:<offset>` tagged strings,
+/// element offsets scaled by the type's size at load/store.
+const MEM_PREAMBLE: &str = r#"/* C memory arena (the estree ref runtime's mem* slice-2, standalone) */
+let sh2_memSeq = 0;
+let sh2_memArena = {};
+function sh2_memPos(h) {
+    const m = /^\u0001mem:([^:]+):(-?\d+)$/.exec(String(h ?? ""));
+    if (m) return Number(m[2]) || 0;
+    return Number(h) || 0;
+}
+function sh2_memElemSize(type) {
+    if (typeof type === "number") return Math.max(1, Math.floor(type));
+    const t = String(type ?? "int");
+    const sizes = { char: 1, "signed char": 1, "unsigned char": 1, short: 2, "short int": 2, int: 4, "unsigned int": 4, unsigned: 4, long: 8, "long int": 8, "long long": 8, "unsigned long": 8, "unsigned long long": 8, float: 4, double: 8, "void*": 8, ptr: 8, pointer: 8, int8: 1, int16: 2, int32: 4, int64: 8, u32: 4, u64: 8 };
+    return sizes[t] ?? 1;
+}
+function sh2_memArenaOf(h) {
+    const m = /^\u0001mem:([^:]+):(-?\d+)$/.exec(String(h ?? ""));
+    if (!m) return null;
+    const id = m[1];
+    if (!/^\d+$/.test(id)) return null;
+    return (sh2_memArena ?? {})[Number(id)] ?? null;
+}
+function sh2_memAlloc(size) {
+    const id = (sh2_memSeq += 1);
+    const n = Math.max(0, Math.floor(Number(size) || 0));
+    sh2_memArena[id] = new Array(n).fill(0);
+    return "\u0001mem:" + id + ":0";
+}
+function sh2_memLoad(h, offset, type) {
+    const a = sh2_memArenaOf(h);
+    if (!a) return "";
+    const i = (sh2_memPos(h) + (Number(offset) || 0)) * sh2_memElemSize(type);
+    return i >= 0 && i < a.length ? String(a[i]) : "";
+}
+function sh2_memStore(h, offset, type, v) {
+    const a = sh2_memArenaOf(h);
+    if (!a) return;
+    const i = (sh2_memPos(h) + (Number(offset) || 0)) * sh2_memElemSize(type);
+    if (i >= 0 && i < a.length) a[i] = String(v ?? "");
+}
+function sh2_memAdvance(h, n) {
+    const m = /^(\u0001mem:[^:]+):(-?\d+)$/.exec(String(h ?? ""));
+    if (!m) return h;
+    return m[1] + ":" + (sh2_memPos(h) + (Number(n) || 0));
+}
+function sh2_memFree(h) {
+    const m = /^\u0001mem:([^:]+):(-?\d+)$/.exec(String(h ?? ""));
+    if (!m || !/^\d+$/.test(m[1])) return;
+    delete sh2_memArena[Number(m[1])];
+}
+function sh2_memTest(op, a, b) {
+    const pa = sh2_memPos(a);
+    const pb = sh2_memPos(b);
+    switch (op) { case "<": return pa < pb; case "<=": return pa <= pb; case ">": return pa > pb; case ">=": return pa >= pb; case "==": return pa === pb; case "!=": return pa !== pb; default: return false; }
+}"#;
+
 fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
@@ -1212,7 +1637,15 @@ fn collect_vars_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             collect_vars_expr(expr, out);
             collect_vars_expr(default, out);
         }
-        IrExpr::Call { args, .. } => {
+        IrExpr::Call { func, args } => {
+            // setVar/setArray carry the STORE name as their first Str
+            // arg — collect it so the var is declared and getVar reads
+            // of it fold to the native binding
+            if matches!(func.as_str(), "setVar" | "setArray") {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    out.insert(name.clone());
+                }
+            }
             for a in args {
                 collect_vars_expr(a, out);
             }
