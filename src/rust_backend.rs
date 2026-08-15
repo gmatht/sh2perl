@@ -2679,6 +2679,17 @@ impl Render {
                         "w" | "a" => {
                             if let Some(t) = &r.target {
                                 let te = self.expr_str(t);
+                                // `2>&1` — a dup target
+                                if let IrExpr::Str(ts, _) = t {
+                                    if let Some(rest) = ts.strip_prefix('&') {
+                                        full = format!(
+                                            "format!(\"{{}} {}&{{}}\", {full}, {})",
+                                            if r.fd == 2 { "2>" } else { ">" },
+                                            Self::rust_str(rest)
+                                        );
+                                        continue;
+                                    }
+                                }
                                 let op = if r.mode == "w" { ">" } else { ">>" };
                                 let fd = if r.fd == 2 { "2" } else { "" };
                                 full = format!("format!(\"{{}} {fd}{op} {{}}\", {full}, __sh_q(&{te}))");
@@ -2714,7 +2725,7 @@ impl Render {
                                 if let IrExpr::Str(ts, _) = t {
                                     if let Some(rest) = ts.strip_prefix('&') {
                                         full = format!(
-                                            "format!(\"{{}} {}{{}}\", {full}, {})",
+                                            "format!(\"{{}} {}&{{}}\", {full}, {})",
                                             if r.fd == 2 { "2>" } else { ">" },
                                             Self::rust_str(rest)
                                         );
@@ -5031,6 +5042,19 @@ impl Render {
                     let te = self.expr_str(r.target.as_ref().unwrap_or(&IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted)));
                     match mode.as_str() {
                         "w" | "a" => {
+                            // `2>&1` — a dup target
+                            if let Some(t) = r.target.as_ref() {
+                                if let IrExpr::Str(ts, _) = t {
+                                    if let Some(rest) = ts.strip_prefix('&') {
+                                        full = format!(
+                                            "format!(\"{{}} {}&{{}}\", {full}, {})",
+                                            if r.fd == 2 { "2>" } else { ">" },
+                                            Self::rust_str(rest)
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
                             let op = if mode == "w" { ">" } else { ">>" };
                             let fd = if r.fd == 2 { "2" } else { "" };
                             self.add_helper("q");
@@ -5049,7 +5073,7 @@ impl Render {
                                 if let IrExpr::Str(ts, _) = t {
                                     if let Some(rest) = ts.strip_prefix('&') {
                                         full = format!(
-                                            "format!(\"{{}} {}{{}}\", {full}, {})",
+                                            "format!(\"{{}} {}&{{}}\", {full}, {})",
                                             if r.fd == 2 { "2>" } else { ">" },
                                             Self::rust_str(rest)
                                         );
