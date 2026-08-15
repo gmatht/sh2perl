@@ -1525,7 +1525,7 @@ impl Render {
                     .collect();
                 self.add_helper("cat");
                 self.emit(&format!(
-                    "*__SH_ARGV.lock().unwrap() = __sh_cat(&[{}]);",
+                    "let __new = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __new;",
                     ws.join(", ")
                 ));
                 return;
@@ -1920,6 +1920,20 @@ impl Render {
         }
         let _ = op;
         if name == "@" || name == "*" {
+            if op == "slice" {
+                let off = args.get(2).map(|x| self.expr_num(x)).unwrap_or_else(|| "0".to_string());
+                let len = match args.get(3) {
+                    None => "-1".to_string(),
+                    Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
+                    Some(x) => self.expr_num(x),
+                };
+                return format!(
+                    "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = ({off} - 1).max(0) as usize; \
+                     let __l = if {len} < 0 {{ __v.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
+                     let __e = ((__o as i64 + __l).max(__o as i64)).min(__v.len() as i64) as usize; \
+                     __v[__o..__e].to_vec() }}"
+                );
+            }
             return "__SH_ARGV.lock().unwrap().clone()".to_string();
         }
         if (name_at || idx_at || off_num) && !name.is_empty() {
@@ -2043,7 +2057,15 @@ impl Render {
                 && ((t.starts_with('"') && t.ends_with('"'))
                     || (t.starts_with('\'') && t.ends_with('\'')))
             {
-                return Self::rust_str_expr(&t[1..t.len() - 1]);
+                let inner = &t[1..t.len() - 1];
+                if inner.contains('$') {
+                    return self.dollar_interp(inner);
+                }
+                return Self::rust_str_expr(inner);
+            }
+            if t.contains('$') {
+                // `${NAME:-${OTHER:-PC}}` — a nested expansion default
+                return self.dollar_interp(t);
             }
         }
         self.expr_str(x)
@@ -2795,7 +2817,7 @@ impl Render {
         let ws: Vec<String> = words.iter().map(|w| self.words_expr(w)).collect();
         self.add_helper("cat");
         format!(
-            "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = __sh_cat(&[{}]); {}(); *__SH_ARGV.lock().unwrap() = __old; }}",
+            "{{ let __old = __SH_ARGV.lock().unwrap().clone(); let __new = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __new; {}(); *__SH_ARGV.lock().unwrap() = __old; }}",
             ws.join(", "),
             self.fn_ident(name)
         )
@@ -2805,7 +2827,7 @@ impl Render {
         let ws: Vec<String> = words.iter().map(|w| self.words_expr(w)).collect();
         self.add_helper("cat");
         format!(
-            "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = __sh_cat(&[{}]); {}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RC.load(Ordering::SeqCst) == 0 }}",
+            "{{ let __old = __SH_ARGV.lock().unwrap().clone(); let __new = __sh_cat(&[{}]); *__SH_ARGV.lock().unwrap() = __new; {}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RC.load(Ordering::SeqCst) == 0 }}",
             ws.join(", "),
             self.fn_ident(name)
         )
@@ -3069,6 +3091,15 @@ impl Render {
                     Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
                     Some(x) => self.expr_num(x),
                 };
+                if name == "@" || name == "*" {
+                    // `${@:off:len}` — the positional params (1-based off)
+                    return format!(
+                        "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = ({off} - 1).max(0) as usize; \
+                         let __l = if {len} < 0 {{ __v.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
+                         let __e = ((__o as i64 + __l).max(__o as i64)).min(__v.len() as i64) as usize; \
+                         __v[__o..__e].join(\" \") }}"
+                    );
+                }
                 if !name.is_empty() && !name.starts_with('$')
                     && (self.is_array(&name.to_string()) || self.is_assoc(&name.to_string()))
                 {
