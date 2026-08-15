@@ -1729,6 +1729,27 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 } else if let Some((lhs, rhs)) = split_test_op(t, "=~") {
                     // regex match: grep -E ([[ =~ ]] semantics)
                     Ok(format!("printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"))
+                } else if let Some((lhs, rhs)) = split_test_op(t, "=") {
+                    // single `=` — the go-sh frontend's pattern tests
+                    // (`strings.HasPrefix/Contains` lower to `"$s"=h*`,
+                    // triage-sh-20260815-175001): the estree reference
+                    // treats `=` as a GLOB pattern match (its string-op
+                    // scan), so render the same case emulation as `==`.
+                    // `<=`/`>=` are NOT operators — the `=` inside them
+                    // must not split (fall back to the `[ ]` literal
+                    // form).
+                    if lhs.ends_with(['<', '>']) {
+                        let t = quote_test_expansions(&space_test_ops(t));
+                        Ok(format!("[ {t} ]"))
+                    } else if lhs.contains('~') || rhs.contains('~') {
+                        // tilde expansion: `[ ~ = "$HOME" ]` (043_home.sh) —
+                        // the case emulation QUOTES the lhs and would
+                        // suppress the tilde; `[ ]` tilde-expands natively.
+                        let t = quote_test_expansions(&space_test_ops(t));
+                        Ok(format!("[ {t} ]"))
+                    } else {
+                        Ok(format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac"))
+                    }
                 } else {
                     // quote bare $(...) and ${...} so word-splitting
                     // in `[ ]` does not shred cmdsub output
@@ -1829,6 +1850,16 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             "setArrayAppend" => {
                 let name = raw_arg(args, 0)?;
                 Ok(set_array_to_sh(&name, &array_items(args, 1)?, true))
+            }
+            "assocSet" => {
+                // the go-sh map-literal store (`m := map[K]V{...}` — one
+                // assocSet per pair, triage-sh-20260815-175002): the
+                // by-name associative-array write — the same POSIX
+                // per-element lowering as setArray (`m_c=C`).
+                let name = raw_arg(args, 0)?;
+                let key = raw_arg(args, 1)?;
+                let value = word_to_sh(arg(args, 2)?)?;
+                Ok(format!("{}_{}={}", arr_base(&name), key, value))
             }
             "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?, false)),
             "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
@@ -3210,8 +3241,34 @@ fn index_to_sh(var: &str, key: &IrExpr, quoted: bool) -> Result<String, String> 
                 Ok(format!("${{{var}_{k}}}"))
             }
         }
+        // a VARIABLE subscript (`a[i]`, triage-sh t83_array_index_read) —
+        // the dynamic-key eval form (indexed arrays evaluate the key as
+        // ARITHMETIC, assoc arrays on the expanded text).
+        IrExpr::Var(k, _) => Ok(index_var_key_to_sh(arr_base(var), k)),
+        // the getVar-wrapped form (`getVar(\"i\")` — the A1's dynamic key
+        // read, t83): same lowering.
+        IrExpr::Call { func, args }
+            if func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(k, _)] if !k.is_empty()) =>
+        {
+            let IrExpr::Str(k, _) = &args[0] else { unreachable!() };
+            Ok(index_var_key_to_sh(arr_base(var), k))
+        }
         _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
     }
+}
+
+/// A VARIABLE array subscript (`a[i]`) — the dynamic-key eval form the
+/// `$`-bearing Str arm uses: indexed arrays evaluate the key as
+/// ARITHMETIC (`$(( ${i:-0} ))`), assoc arrays on the EXPANDED text
+/// (`${i}` braced so the trailing `_` of the element name does not glue
+/// onto the key var).
+fn index_var_key_to_sh(base: &str, k: &str) -> String {
+    let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
+        format!("${{{k}}}")
+    } else {
+        format!("$(( ${{{k}:-0}} ))")
+    };
+    format!("$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")")
 }
 
 fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
@@ -3271,7 +3328,41 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
                     ))
                 }
                 IrExpr::Str(k, _) => Ok(format!("\"${{{name}_{k}}}\"")),
+                // a VARIABLE subscript (`arr[i]`) — the dynamic-key eval
+                // form (see `index_var_key_to_sh`).
+                IrExpr::Var(k, _) => Ok(index_var_key_to_sh(arr_base(&name), k)),
+                // the getVar-wrapped form (`getVar(\"i\")` — the A1's
+                // dynamic key read, triage-sh t83_array_index_read).
+                IrExpr::Call { func, args }
+                    if func == "getVar"
+                        && matches!(args.as_slice(), [IrExpr::Str(k, _)] if !k.is_empty()) =>
+                {
+                    let IrExpr::Str(k, _) = &args[0] else { unreachable!() };
+                    Ok(index_var_key_to_sh(arr_base(&name), k))
+                }
                 _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
+            }
+        }
+        "assocGet" => {
+            // the go-sh map read (`m[\"go\"]`, triage-sh-20260815-175002):
+            // the by-name associative read — the same POSIX per-element
+            // lowering as `arrayIndex` (`${m_go}`, quoted — one word).
+            let name = raw_arg(args, 0)?;
+            match arg(args, 1)? {
+                IrExpr::Str(k, _) if k.contains(['$', '(']) => Ok(format!(
+                    "$(eval \"printf '%s' \\\"\\${{{}_{k}}}\\\"\")",
+                    arr_base(&name)
+                )),
+                IrExpr::Str(k, _) => Ok(format!("\"${{{name}_{k}}}\"")),
+                IrExpr::Var(k, _) => Ok(index_var_key_to_sh(arr_base(&name), k)),
+                IrExpr::Call { func, args }
+                    if func == "getVar"
+                        && matches!(args.as_slice(), [IrExpr::Str(k, _)] if !k.is_empty()) =>
+                {
+                    let IrExpr::Str(k, _) = &args[0] else { unreachable!() };
+                    Ok(index_var_key_to_sh(arr_base(&name), k))
+                }
+                other => Err(format!("assocGet: key not renderable: {other:?}")),
             }
         }
         "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
@@ -3647,6 +3738,22 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
                     ))
                 } else {
                     Ok(format!("${{{name}_{key}}}"))
+                }
+            }
+            "assocGet" => {
+                // the go-sh map read (`m[\"go\"]`, triage-sh-20260815-175002):
+                // the by-name associative read — the same POSIX per-element
+                // lowering as `arrayIndex` (the bare `${m_go}`; the
+                // enclosing template supplies the quotes).
+                let name = raw_arg(args, 0)?;
+                match arg(args, 1)? {
+                    IrExpr::Str(k, _) if k.contains(['$', '(']) => Ok(format!(
+                        "$(eval \"printf '%s' \\\"\\${{{}_{k}}}\\\"\")",
+                        arr_base(&name)
+                    )),
+                    IrExpr::Str(k, _) => Ok(format!("${{{name}_{k}}}")),
+                    IrExpr::Var(k, _) => Ok(index_var_key_to_sh(arr_base(&name), k)),
+                    other => Err(format!("assocGet: key not renderable: {other:?}")),
                 }
             }
             "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
