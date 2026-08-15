@@ -138,10 +138,22 @@ rewrites are fixed-string replacements. Gate: `embed_fragment_is_deterministic`.
    `--english` (fragment on stdout, `REQUIRED`/`REFUSE` on stderr so stdout
    stays splice-clean); 5 CLI tests (`embed_*` in `otranspilerl/src/lib.rs`),
    `EmbedConstruct::System`/`Popen` still reserved.
-3. ⏳ purify.pl backtick swap: PPI-harvest `host_scope` per site → call
-   `otranspilerl-cli --embed-perl` → drop the regex patches one at a time
-   (each pinned by a fixture); Bug 3 (Perl vars in backticks) via the
-   marker protocol, not the skip.
+3. ✅ Stage 3: **purify.pl backtick swap (opt-in, `PURIFY_EMBED=1`)** —
+   `convert_shell_to_perl_embed` calls `otranspilerl-cli --embed-perl
+   --backtick --scope-vars <file-wide my/our harvest>`; on REFUSE it falls
+   back to the legacy path (graceful degradation). The fragment is wrapped
+   in `__bt(do { … })` and RUN IN A FORKED CHILD with stdout on a pipe
+   (`open '-|'`): external commands fork grandchildren that inherit the
+   pipe's fd 1 (a `local *STDOUT` scalar/file capture does NOT rebind fd 1
+   — verified `wc -l` leaked to real stdout), and the fork gives true
+   bash-subshell semantics for free. Fragment preamble (`our $CHILD_ERROR
+   = 0;` / `use …;`) is extracted and injected at FILE level (a `use`
+   inside the `__bt(do{…})` expression is a syntax error).
+   **Corpus A/B (examples.impurl, 33 purify-relevant files): legacy 8/33,
+   embed 22/33** — the remaining 11 are inherited shIR renderer emulation
+   gaps that reproduce via standalone `file --perl` (printf `\n` escapes,
+   `mkdir -m`, env-assign echo, …), NOT embed-profile bugs. Purified
+   output is byte-deterministic across runs (3/3 verified).
 4. ⏳ shIR verdict upgrade: `required_host_bindings` from
    `var_lifetimes[].escapes` + lift sets (PassContext) instead of the
    read/write sets.

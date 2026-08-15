@@ -12,8 +12,16 @@ my $verbose = 0;
 my $inplace = 0;
 my $output_file;
 my $debashc_path = -x 'target/debug/debashc' ? 'target/debug/debashc' : 'target/debug/debashc.exe';
+my $otranspilerl_path;
 # Counter used to generate unique temp vars when normalizing print qx{...} patterns
 my $PURIFY_PRINT_QX_COUNTER = 0;
+# Embed backend state (PLAN §10 Stage 2, opt-in via PURIFY_EMBED=1):
+# @EMBED_SCOPE = file-wide my/our harvest; $EMBED_PREAMBLE = fragment
+# preamble lines (our $CHILD_ERROR / use …) collected for file-level
+# injection; $OTRANSPILERL = resolved otranspilerl-cli path.
+my @EMBED_SCOPE;
+my $EMBED_PREAMBLE;
+my $OTRANSPILERL;
 
 GetOptions(
     'help|h' => \$help,
@@ -21,6 +29,7 @@ GetOptions(
     'inplace|i' => \$inplace,
     'output|o=s' => \$output_file,
     'debashc-path=s' => \$debashc_path,
+    'otranspilerl-path=s' => \$otranspilerl_path,
 ) or die "Error in command line arguments\n";
 
 if ($help) {
@@ -44,6 +53,19 @@ if (!$input_file) {
 
 if (!-f $input_file) {
     die "Error: Input file '$input_file' does not exist\n";
+}
+
+# Resolve the embed backend (PLAN §10 Stage 2): otranspilerl-cli renders
+# shell snippets as embeddable fragments. Explicit option / OTRANSPILERL_CLI
+# env / the sibling crate's debug binary. Absent ⇒ embed path disabled and
+# purify degrades to the legacy debashc path (unchanged behaviour).
+{
+    my $script_dir = $0 =~ m{(.*)[/\\]} ? $1 : '.';
+    my $candidate = $otranspilerl_path
+        || $ENV{OTRANSPILERL_CLI}
+        || "$script_dir/../otranspilerl/target/debug/otranspilerl-cli";
+    $OTRANSPILERL = (-x $candidate) ? $candidate : undef;
+    print "DEBUG: otranspilerl-cli: " . ($OTRANSPILERL || 'NOT FOUND') . "\n" if $verbose;
 }
 
 # Check if debashc exists
@@ -136,6 +158,11 @@ EOF
 
 sub purify_perl_code {
     my ($content) = @_;
+
+    # Per-run reset of the embed backend state (purify_perl_code can be
+    # called more than once per process).
+    @EMBED_SCOPE = ();
+    $EMBED_PREAMBLE = '';
 
     # Rewrite backticks before PPI parsing so standalone command substitution
     # statements are also converted.
@@ -249,6 +276,20 @@ sub purify_perl_code {
     if ($serialized =~ /\b__bt\s*\(/ && $serialized !~ /\bsub\s+__bt\b/) {
         my $bt_sub = "sub __bt { my \$s = join('', \@_); wantarray ? (split /^/, \$s, -1) : \$s }\n";
         $serialized = $bt_sub . $serialized;
+    }
+
+    # Inject the embed fragments' file-level preamble (PLAN §10): `our
+    # $CHILD_ERROR = 0;` and any `use …;` the renderer prepended (a `use` or
+    # `our` inside the __bt(do{…}) expression would be a syntax error).
+    # Deduplicated; prepending is safe — `use` is compile-time, `our` is
+    # package-wide and the assignments run before any fragment executes.
+    if (length $EMBED_PREAMBLE) {
+        my %seen;
+        my @uniq = grep { !$seen{$_}++ } split /\n/, $EMBED_PREAMBLE;
+        my $need = join("\n", @uniq) . "\n";
+        if ($serialized !~ /\Q$need\E/) {
+            $serialized = $need . $serialized;
+        }
     }
 
     return $serialized;
@@ -555,6 +596,17 @@ sub _escape_perl_fragment {
 sub process_backticks_string {
     my ($content) = @_;
 
+    # File-wide host-scope harvest (v1, conservative): every `my $x` / `our
+    # $x` in the file becomes a candidate host binding for the embed
+    # renderer (PLAN §10). Per-site visibility is the v2 refinement.
+    @EMBED_SCOPE = ();
+    while ($content =~ /\b(?:my|our)\s+(\$[A-Za-z_]\w*)/g) {
+        my $n = $1;
+        $n =~ s/^\$//;
+        push @EMBED_SCOPE, $n unless grep { $_ eq $n } @EMBED_SCOPE;
+    }
+    print "DEBUG: embed scope: " . join(',', @EMBED_SCOPE) . "\n" if $verbose && @EMBED_SCOPE;
+
     # Protect comment-only lines, then rewrite backticks across the whole file
     # so multiline command substitutions are handled correctly.
     my @lines = split /\n/, $content, -1;
@@ -593,6 +645,39 @@ sub process_single_backtick_string {
     if ($raw_command =~ /(?<!\\)\$[A-Za-z_]\w*/) {
         print "DEBUG: Command contains Perl variables; skipping debashc\n" if $verbose;
         # Leave $perl_result undef to trigger IPC::Open3 fallback
+    } elsif (embed_enabled()) {
+        # Embed backend (PLAN §10): otranspilerl-cli --embed-perl renders the
+        # snippet as a do{...} fragment. The fragment is PRINT-oriented
+        # (statements); a backtick replacement must be an EXPRESSION that
+        # evaluates to the captured stdout, so purify wraps it in the
+        # capture_stdout pattern (local *STDOUT; open STDOUT, '>', \$cap)
+        # + __bt (list/scalar context) — the same wrapper the generator's
+        # standalone capture_stdout uses.
+        my $embed = convert_shell_to_perl_embed($command);
+        if (defined $embed) {
+            my ($pre, $body) = split_embed_fragment($embed);
+            $EMBED_PREAMBLE .= $pre;
+            (my $expr = $body) =~ s/;\s*$//s;   # drop the do-block's trailing ;
+            # Run the fragment in a FORKED CHILD with stdout on a pipe
+            # (`open '-|'`): (a) external commands fork grandchildren that
+            # inherit the pipe's fd 1 — a `local *STDOUT` scalar/file capture
+            # does NOT rebind fd 1 (verified: `wc -l` leaked to real stdout);
+            # (b) it gives TRUE bash-subshell semantics — fragment writes
+            # cannot touch the host (fork copies the address space), stderr
+            # inherits the parent's. exit/function/background fragments are
+            # REFUSED by the renderer, so the child cannot escape.
+            my $captured = "do { my \$__bt_pid = open(my \$__bt_child_out, '-|'); "
+                . "if (!defined \$__bt_pid) { die \"purify: fork failed: \$!\\n\"; } "
+                . "if (\$__bt_pid == 0) { "
+                . "$expr; exit 0; } "
+                . "local \$/ = undef; my \$__bt_cap = <\$__bt_child_out>; "
+                . "close \$__bt_child_out; waitpid(\$__bt_pid, 0); \$__bt_cap }";
+            my $code = "__bt($captured)";
+            print "DEBUG: embed fragment for [$command]: $code\n" if $verbose;
+            return defined $var_name ? "$prefix$var_name = $code;" : $code;
+        }
+        print "DEBUG: embed refused; falling back to legacy debashc\n" if $verbose;
+        $perl_result = convert_shell_to_perl($command, 1);
     } else {
         $perl_result = convert_shell_to_perl($command, 1);
     }
@@ -1997,6 +2082,99 @@ sub replace_backtick_with_code {
     return unless $new_code;
 
     $backtick->replace($new_code);
+}
+
+# ── embed backend helpers (PLAN §10 Stage 2) ──────────────────────────
+
+sub embed_enabled {
+    return ($ENV{PURIFY_EMBED} && $ENV{PURIFY_EMBED} ne '0' && $OTRANSPILERL) ? 1 : 0;
+}
+
+# Spawn a CLI with an argv array (no shell quoting layer), capture stdout+
+# stderr. Returns ($stdout, $stderr, $exit_code) or undef on spawn failure.
+sub run_capture {
+    my (@argv) = @_;
+    my $out;
+    my $err = gensym;
+    my $pid;
+    eval {
+        $pid = open3(undef, $out, $err, @argv);
+        1;
+    } or do {
+        warn "Failed to invoke " . $argv[0] . ": $@\n";
+        return undef;
+    };
+    my $stdout = '';
+    my $stderr = '';
+    my $sel = IO::Select->new();
+    $sel->add($out) if defined $out;
+    $sel->add($err);
+    while ($sel->count) {
+        for my $fh ($sel->can_read) {
+            my $buf;
+            my $bytes = sysread($fh, $buf, 8192);
+            if (defined $bytes) {
+                if ($bytes == 0) {
+                    $sel->remove($fh);
+                    close $fh;
+                } else {
+                    if ($fh == $out) { $stdout .= $buf; }
+                    else { $stderr .= $buf; }
+                }
+            } else {
+                $sel->remove($fh);
+                close $fh;
+            }
+        }
+    }
+    waitpid($pid, 0);
+    my $exit_code = $? >> 8;
+    return ($stdout, $stderr, $exit_code);
+}
+
+# otranspilerl-cli --embed-perl --backtick --scope-vars … <snippet> → the
+# fragment (stdout) or undef when the renderer REFUSES (a verdict, not an
+# error: the caller falls back to the legacy path / exec).
+sub convert_shell_to_perl_embed {
+    my ($shell_command) = @_;
+    return undef unless embed_enabled();
+    $shell_command =~ s/^\s+//;
+    $shell_command =~ s/\s+$//;
+    return undef unless length $shell_command;
+
+    my @argv = ($OTRANSPILERL, '--embed-perl', '--backtick');
+    push @argv, ('--scope-vars', join(',', @EMBED_SCOPE)) if @EMBED_SCOPE;
+    push @argv, $shell_command;
+    print "DEBUG: Running: " . join(' ', @argv) . "\n" if $verbose;
+
+    my ($stdout, $stderr, $exit_code) = run_capture(@argv);
+    return undef unless defined $stdout;
+    if ($exit_code != 0) {
+        warn "otranspilerl-cli failed ($exit_code): $stderr\n" if $verbose;
+        return undef;
+    }
+    if ($stderr =~ /^REFUSE:/m) {
+        print "DEBUG: embed REFUSE: $stderr\n" if $verbose;
+        return undef;
+    }
+    if ($stderr =~ /^REQUIRED: (.+)$/m) {
+        my $required = $1;
+        print "DEBUG: embed REQUIRED: $required\n" if $verbose;
+    }
+    return $stdout;
+}
+
+# Split the fragment into (preamble, body): the leading `our $CHILD_ERROR = 0;`
+# / `use …;` lines (injected at FILE level — a `use` or `our` inside the
+# __bt(do{…}) expression would be a syntax error) and the `do { … };` body.
+sub split_embed_fragment {
+    my ($fragment) = @_;
+    my $f = $fragment;
+    $f =~ s/\A\s*//s;
+    if ($f =~ s/\A((?:(?:our|use) [^;]+;\s*)+)(?=do \{)//s) {
+        return ($1, $f);
+    }
+    return ('', $f);
 }
 
 sub convert_shell_to_perl {
