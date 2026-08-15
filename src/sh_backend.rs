@@ -1823,6 +1823,20 @@ fn dynamic_key_sh(idx: &str) -> String {
 /// characters that are invalid in a shell variable name (`matrix[0,0]` —
 /// the comma is part of the KEY), so the key is sanitized into the name
 /// (both the writer and every reader must use the SAME mangling).
+/// A VARIABLE array subscript (`a[i]`) — the dynamic-key eval form the
+/// `$`-bearing Str arm uses: indexed arrays evaluate the key as
+/// ARITHMETIC (`$(( ${i:-0} ))`), assoc arrays on the EXPANDED text
+/// (`${i}` braced so the trailing `_` of the element name does not glue
+/// onto the key var).
+fn index_var_key_to_sh(base: &str, k: &str) -> String {
+    let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
+        eval_key(&format!("${k}"))
+    } else {
+        format!("$(({}))", protect_key_arith(&format!("${k}")))
+    };
+    format!("$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")")
+}
+
 fn elem_name(base: &str, idx: &str) -> String {
     let mut s = String::with_capacity(base.len() + idx.len() + 1);
     s.push_str(base);
@@ -2149,8 +2163,9 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                         ))
                     } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
                         Ok(format!(
-                            "case \"{lhs}\" in {}) false ;; *) : ;; esac",
-                            ansi_c_quotes_to_sh(&rhs)
+                            "case {} in {}) false ;; *) : ;; esac",
+                            tilde_word_to_sh(&lhs),
+                            tilde_pattern_to_sh(&ansi_c_quotes_to_sh(&rhs))
                         ))
                     } else if let Some((lhs, rhs)) = split_test_op(t, "=") {
                         Ok(test_eq_to_sh(&lhs, &rhs))
@@ -2162,14 +2177,36 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                     }
                 } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
                     Ok(format!(
-                        "case \"{lhs}\" in {}) false ;; *) : ;; esac",
-                        ansi_c_quotes_to_sh(&rhs)
+                        "case {} in {}) false ;; *) : ;; esac",
+                        tilde_word_to_sh(&lhs),
+                        tilde_pattern_to_sh(&ansi_c_quotes_to_sh(&rhs))
                     ))
                 } else if let Some((lhs, rhs)) = split_test_op(t, "=~") {
                     // regex match: grep -E ([[ =~ ]] semantics)
                     Ok(format!(
                         "printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"
                     ))
+                } else if let Some((lhs, rhs)) = split_test_op(t, "=") {
+                    // single `=` — the go-sh frontend's pattern tests
+                    // (`strings.HasPrefix/Contains` lower to `"$s"=h*`,
+                    // triage-sh-20260815-175001): the estree reference
+                    // treats `=` as a GLOB pattern match (its string-op
+                    // scan), so render the same case emulation as `==`.
+                    // `<=`/`>=` are NOT operators — the `=` inside them
+                    // must not split (fall back to the `[ ]` literal
+                    // form, matching the reference's op-scan refusal).
+                    if lhs.ends_with(['<', '>']) {
+                        let t = escape_test_ltgt(&quote_test_expansions(&space_test_ops(t)));
+                        Ok(format!("[ {t} ]"))
+                    } else if lhs.contains('~') || rhs.contains('~') {
+                        // tilde expansion: `[ ~ = "$HOME" ]` (043_home.sh) —
+                        // the case emulation QUOTES the lhs and would
+                        // suppress the tilde; `[ ]` tilde-expands natively.
+                        let t = escape_test_ltgt(&quote_test_expansions(&space_test_ops(t)));
+                        Ok(format!("[ {t} ]"))
+                    } else {
+                        Ok(test_eq_to_sh(&lhs, &rhs))
+                    }
                 } else {
                     // quote bare $(...) and ${...} so word-splitting
                     // in `[ ]` does not shred cmdsub output
@@ -2348,6 +2385,20 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             "setArrayAppend" => {
                 let name = raw_arg(args, 0)?;
                 Ok(set_array_to_sh(&name, &array_items(args, 1)?, true))
+            }
+            "assocSet" => {
+                // the go-sh map-literal store (`m := map[K]V{...}` — one
+                // assocSet per pair, triage-sh-20260815-175002): the
+                // by-name associative-array write — the same POSIX
+                // per-element lowering as setArray (`m_c=C`).
+                let name = raw_arg(args, 0)?;
+                let key = raw_arg(args, 1)?;
+                let value = word_to_sh(arg(args, 2)?)?;
+                Ok(format!(
+                    "{}={}",
+                    elem_name(arr_base(&name), &key),
+                    value
+                ))
             }
             "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?, false)),
             "capture" => Ok(capture_wrap(&arrow_to_sh(args)?, true)),
@@ -4479,6 +4530,20 @@ fn word_to_sh(e: &IrExpr) -> Result<String, String> {
                 ))
             }
             IrExpr::Str(k, _) => Ok(format!("\"${{{}}}\"", elem_name(var, k))),
+            // a VARIABLE subscript (`a[i]`, triage-sh t83_array_index_read):
+            // the dynamic-key eval form — indexed arrays evaluate the key
+            // as ARITHMETIC, assoc arrays on the expanded text (same as
+            // the `$`-bearing Str arm).
+            IrExpr::Var(k, _) => Ok(index_var_key_to_sh(arr_base(var), k)),
+            // the getVar-wrapped form (`getVar("i")` — the A1's dynamic
+            // key read, t83): same lowering.
+            IrExpr::Call { func, args }
+                if func == "getVar"
+                    && matches!(args.as_slice(), [IrExpr::Str(k, _)] if !k.is_empty()) =>
+            {
+                let IrExpr::Str(k, _) = &args[0] else { unreachable!() };
+                Ok(index_var_key_to_sh(arr_base(var), k))
+            }
             _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
         },
         // The first-class Capture node (core request
@@ -4554,7 +4619,40 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
                     ))
                 }
                 IrExpr::Str(k, _) => Ok(format!("\"${{{}}}\"", elem_name(&name, &k))),
+                // a VARIABLE subscript (`arr[i]` via the call form) — the
+                // dynamic-key eval form (see `index_var_key_to_sh`).
+                IrExpr::Var(k, _) => Ok(index_var_key_to_sh(arr_base(&name), k)),
+                // the getVar-wrapped form (`getVar("i")` — t83): same.
+                IrExpr::Call { func, args }
+                    if func == "getVar"
+                        && matches!(args.as_slice(), [IrExpr::Str(k, _)] if !k.is_empty()) =>
+                {
+                    let IrExpr::Str(k, _) = &args[0] else { unreachable!() };
+                    Ok(index_var_key_to_sh(arr_base(&name), k))
+                }
                 _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
+            }
+        }
+        "assocGet" => {
+            // the go-sh map read (`m[\"go\"]`, triage-sh-20260815-175002):
+            // the by-name associative read — the same POSIX per-element
+            // lowering as `arrayIndex` (`${m_go}`, quoted — one word).
+            let name = raw_arg(args, 0)?;
+            let base = arr_base(&name);
+            match arg(args, 1)? {
+                IrExpr::Str(k, _) if k.contains(['$', '(']) => {
+                    let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
+                        eval_key(k)
+                    } else {
+                        format!("$(({}))", protect_key_arith(k))
+                    };
+                    Ok(format!(
+                        "$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")"
+                    ))
+                }
+                IrExpr::Str(k, _) => Ok(format!("\"${{{}}}\"", elem_name(base, k))),
+                IrExpr::Var(k, _) => Ok(index_var_key_to_sh(base, k)),
+                other => Err(format!("assocGet: key not renderable: {other:?}")),
             }
         }
         "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
@@ -5092,6 +5190,17 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
                 ))
             }
             IrExpr::Str(k, _) => Ok(format!("${{{}}}", elem_name(arr_base(var), k))),
+            // a VARIABLE subscript (`a[i]` inside a template) — the
+            // dynamic-key eval form (see `index_var_key_to_sh`).
+            IrExpr::Var(k, _) => Ok(index_var_key_to_sh(arr_base(var), k)),
+            // the getVar-wrapped form (`getVar("i")` — t83): same.
+            IrExpr::Call { func, args }
+                if func == "getVar"
+                    && matches!(args.as_slice(), [IrExpr::Str(k, _)] if !k.is_empty()) =>
+            {
+                let IrExpr::Str(k, _) = &args[0] else { unreachable!() };
+                Ok(index_var_key_to_sh(arr_base(var), k))
+            }
             _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
         },
         // The first-class Capture node (core request
@@ -5161,34 +5270,67 @@ fn escape_test_ltgt(s: &str) -> String {
     out
 }
 
+/// A `[ ]`/`[[ ]]` string-test operand arrives with its SOURCE quoting
+/// preserved. A word-initial UNQUOTED `~` is bash tilde expansion — in the
+/// case-emulation it must stay UNQUOTED in the case WORD: dash performs
+/// tilde expansion on unquoted word-initial `~` in case words too, but a
+/// `"~"`-quoted tilde stays literal on both sides (043_home.sh —
+/// `[ ~ = "$HOME" ]` must compare $HOME, not the text `~`). Case words
+/// never word-split or glob, so the rest of the text stays intact.
+fn tilde_word_to_sh(w: &str) -> String {
+    if w.starts_with('~') {
+        w.to_string()
+    } else {
+        format!("\"{w}\"")
+    }
+}
+
+/// The rhs of a string test is the case-emulation's PATTERN — and dash
+/// case patterns never tilde-expand (bash tilde-expands every `[ ]` word
+/// and the rhs of `[[ x == ~ ]]`). Fold a word-initial UNQUOTED `~` to
+/// `${HOME}` — parameter expansion DOES occur in patterns, so `~` ≡
+/// `${HOME}` and `~/x` ≡ `${HOME}/x`. (`~user` cannot be portably
+/// expanded — left literal; `"~"`-quoted tildes start with a quote and
+/// pass through untouched.)
+fn tilde_pattern_to_sh(w: &str) -> String {
+    if let Some(rest) = w.strip_prefix("~/") {
+        format!("${{HOME}}/{rest}")
+    } else if w == "~" {
+        "${HOME}".to_string()
+    } else {
+        w.to_string()
+    }
+}
+
 /// `[[ lhs == rhs ]]` / `[[ lhs = rhs ]]` — dash has no `==` in `[ ]`
 /// and no extglob patterns; lower to a case-emulation (a POSIX pattern
 /// match with the same semantics).
 fn test_eq_to_sh(lhs: &str, rhs: &str) -> String {
-    let rhs = ansi_c_quotes_to_sh(rhs);
+    let rhs = tilde_pattern_to_sh(&ansi_c_quotes_to_sh(rhs));
+    let lhs = tilde_word_to_sh(lhs);
     if let Some((neg, rest)) = rhs.strip_prefix("!(").and_then(|r| r.split_once(')')) {
         // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`:
         //   case "$s" in *Y) case "$s" in P Y) false;; *) :;; esac;; *) false;; esac
         format!(
-            "case \"{lhs}\" in *{rest}) case \"{lhs}\" in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
+            "case {lhs} in *{rest}) case {lhs} in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
         )
     } else if let Some(inner) = rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')')) {
         // extglob list match: `@(a|b)` == `a|b`
-        format!("case \"{lhs}\" in {inner}) : ;; *) false ;; esac")
+        format!("case {lhs} in {inner}) : ;; *) false ;; esac")
     } else if let Some(inner) = rhs.strip_prefix("?(").and_then(|r| r.strip_suffix(')')) {
         // optional: `?(a|b)` matches empty or a|b
-        format!("case \"{lhs}\" in |{inner}) : ;; *) false ;; esac")
+        format!("case {lhs} in |{inner}) : ;; *) false ;; esac")
     } else if *NOCASEMATCH.lock().unwrap() {
         // strip the source's quotes around the pattern before folding
         // (`[[ "ABC" == "abc" ]]` — the rhs arrives `"abc"`; the quote
         // chars would make the folded class literal)
         let rhs_clean = rhs.trim_matches(['"', '\'']);
         format!(
-            "case \"{lhs}\" in {}) : ;; *) false ;; esac",
+            "case {lhs} in {}) : ;; *) false ;; esac",
             fold_case_pattern(rhs_clean)
         )
     } else {
-        format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac")
+        format!("case {lhs} in {rhs}) : ;; *) false ;; esac")
     }
 }
 
