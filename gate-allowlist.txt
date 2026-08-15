@@ -1,0 +1,21 @@
+# Blessed-fail allowlist — the sh backend gate (setup_backends.sh --backend-gate sh)
+#
+# Per the workspace guardrail (AGENTS.md): a failing test may be added to a
+# blessed-fail allowlist ONLY for a KNOWN RUNTIME LIMITATION — never to hide
+# a transpiler bug. The gate reads this file and converts an allowlisted
+# equivalence fail into a documented skip (the file is still rendered and
+# compared; only the verdict is overridden).
+#
+# Format: <basename>|<one-line reason>|<unblock / review condition>
+#
+# The sh backend targets POSIX sh (dash). Anything that depends on
+# bash-specific shell state (option flags, bash-only variables) cannot be
+# reproduced faithfully — the render is the literal, correct translation;
+# the DIFFERENCE lives in the runtime, not the code. These entries are the
+# target-runtime class the guardrail blesses.
+
+dollar-minus.sh|$- expands bash's option set (bash -c: "hB") but is empty under dash -c — the render is the faithful literal and dash cannot reproduce bash's flags|unfixable (target-runtime difference); remove only if the corpus drops this example
+
+param-expand-default-operator.sh|BASH_VERSION/ZSH_VERSION exist only in bash; under dash both are unset so the faithful render prints nothing while bash prints "bash"|unfixable (target-runtime difference); remove only if the corpus drops this example
+
+cat-dash-stdin.sh|environment squatter: /tmp/out.txt is root-owned (mode 644) so the redirect fails for the gate user — bash reports "exit: 1", dash "exit: 2", stdout differs. The render is byte-faithful and the file PASSES on a clean host|CONDITIONAL entry: the gate applies it only while /tmp/out.txt is NOT writable; the day root runs `rm -f /tmp/out.txt` the test re-engages and passes, and this entry becomes dead — remove it then
