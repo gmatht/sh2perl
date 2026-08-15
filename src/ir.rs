@@ -3887,7 +3887,7 @@ fn word_iter_to_perl(iter: &IrExpr) -> String {
 
 /// Lower a modern-IR `exec` Call in statement position.
 fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
-    let (cmd, words) = match call {
+    let (cmd, mut words) = match call {
         IrExpr::Call { args, .. } => match exec_call_parts(args) {
             Some(p) => p,
             None => {
@@ -3899,6 +3899,22 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         },
         _ => return,
     };
+    // The env-prefix Object arg (`VAR1=x cmd`) is NOT a word. bash semantics:
+    // the assignment applies ONLY to the command's CHILD processes — argument
+    // expansion sees the OLD value (`VAR1=x echo "$VAR1"` prints EMPTY). So
+    // for the in-Perl emulations (no children) the assignment is DEAD and
+    // must NOT precede the emulation (it would leak into the arg reads); the
+    // bash-c fallback emits it before system() so the child inherits it.
+    let mut env_pre = String::new();
+    words.retain(|w| match w {
+        IrExpr::Object(props) => {
+            for (k, v) in props {
+                env_pre.push_str(&format!("$ENV{{{}}} = {};\n", k, render_word(v)));
+            }
+            false
+        }
+        _ => true,
+    });
     match cmd.as_str() {
         "echo" => emit_echo(out, &words, indent),
         "printf" => {
@@ -4203,6 +4219,12 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 }
             }
             let full = build_shell_cmd(&cmd, &words);
+            // the bash-c child inherits the env-prefix assignments
+            for line in env_pre.lines() {
+                emit_indent(out, indent);
+                out.push_str(line);
+                out.push('\n');
+            }
             emit_shell_cmd(out, indent, &full);
         }
     }
