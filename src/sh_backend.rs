@@ -1020,16 +1020,31 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("if ");
             out.push_str(&cmd_to_sh(cond)?);
             out.push_str("; then\n");
-            for b in then {
-                stmt_to_sh(b, d + 1, out)?;
+            if then.is_empty() {
+                // bash rejects an EMPTY then/elif branch (`if c; then\nelse`
+                // is a syntax error) — a `:` no-op keeps the structure. The
+                // goto-restructure pass emits exactly this shape (an inverted
+                // guarded goto: `if (c) {} else { skipped }` — t29_goto.cc,
+                // t31_goto_forward.c).
+                indent(out, d + 1);
+                out.push_str(":\n");
+            } else {
+                for b in then {
+                    stmt_to_sh(b, d + 1, out)?;
+                }
             }
             for (econd, ebody) in elsifs {
                 indent(out, d);
                 out.push_str("elif ");
                 out.push_str(&cmd_to_sh(econd)?);
                 out.push_str("; then\n");
-                for b in ebody {
-                    stmt_to_sh(b, d + 1, out)?;
+                if ebody.is_empty() {
+                    indent(out, d + 1);
+                    out.push_str(":\n");
+                } else {
+                    for b in ebody {
+                        stmt_to_sh(b, d + 1, out)?;
+                    }
                 }
             }
             if !else_.is_empty() {
@@ -4701,12 +4716,17 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             elsifs,
             else_,
         } => {
-            let mut out = format!("if {}; then {}", cmd_to_sh(cond)?, stmts_inline(then)?);
+            // empty branches need a `:` no-op (bash rejects `then ; else`)
+            let inline = |b: &[IrStmt]| -> Result<String, String> {
+                let s = stmts_inline(b)?;
+                Ok(if b.is_empty() { ":".to_string() } else { s })
+            };
+            let mut out = format!("if {}; then {}", cmd_to_sh(cond)?, inline(then)?);
             for (ec, body) in elsifs {
                 out.push_str(&format!(
                     "; elif {}; then {}",
                     cmd_to_sh(ec)?,
-                    stmts_inline(body)?
+                    inline(body)?
                 ));
             }
             if !else_.is_empty() {
