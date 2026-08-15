@@ -5312,6 +5312,167 @@ fn visit_stmt_exprs(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
     }
 }
 
+
+/// estree.js `returnInLoop` — a `return V` inside a `sh2.*Loop` body
+/// arrow is a SyntaxError-adjacent semantic break (the return exits the
+/// arrow, not the function) — rewrite to `throw new
+/// sh2.ReturnSignal(V)`; the runtime's loop rethrows + the fnCall/exec
+/// dispatch unwraps it as the function's value. The inLoop flag
+/// propagates exactly like the JS (including through nested functions).
+pub(crate) fn return_in_loop(mut prog: Program) -> Program {
+    fn is_loop_call(e: &Expr) -> bool {
+        matches!(e, Expr::CallExpression { callee, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, .. }
+                if matches!(&**object, Expr::Identifier { name } if name == "sh2")
+                    && matches!(&**property, Expr::Identifier { name }
+                        if name == "whileLoop" || name == "whileLoopSync" || name == "forLoop")))
+    }
+    fn rewrite_expr(e: &mut Expr, in_loop: bool) {
+        let is_loop = is_loop_call(e);
+        match e {
+            Expr::CallExpression { callee, arguments, .. } if is_loop && arguments.len() > 1 => {
+                for (i, a) in arguments.iter_mut().enumerate() {
+                    rewrite_expr(a, i == 1);
+                }
+                return;
+            }
+            Expr::TemplateLiteral { expressions, .. } => {
+                for x in expressions { rewrite_expr(x, in_loop); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                rewrite_expr(callee, in_loop);
+                for a in arguments { rewrite_expr(a, in_loop); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                rewrite_expr(object, in_loop);
+                rewrite_expr(property, in_loop);
+            }
+            Expr::AwaitExpression { argument } => rewrite_expr(argument, in_loop),
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params { rewrite_expr(p, in_loop); }
+                match body {
+                    ArrowBody::Expr(x) => rewrite_expr(x, in_loop),
+                    ArrowBody::Block(b) => rewrite_stmt(b, in_loop),
+                }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params { rewrite_expr(p, in_loop); }
+                rewrite_stmt(body, in_loop);
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties {
+                    rewrite_expr(&mut p.key, in_loop);
+                    rewrite_expr(&mut p.value, in_loop);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { rewrite_expr(el, in_loop); }
+            }
+            Expr::SpreadElement { argument } => rewrite_expr(argument, in_loop),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                rewrite_expr(left, in_loop);
+                rewrite_expr(right, in_loop);
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                rewrite_expr(test, in_loop);
+                rewrite_expr(consequent, in_loop);
+                rewrite_expr(alternate, in_loop);
+            }
+            Expr::UnaryExpression { argument, .. } => rewrite_expr(argument, in_loop),
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions { rewrite_expr(x, in_loop); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                rewrite_expr(callee, in_loop);
+                for a in arguments { rewrite_expr(a, in_loop); }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+    fn rewrite_stmt(s: &mut Stmt, in_loop: bool) {
+        match s {
+            Stmt::ReturnStatement { argument } if in_loop => {
+                if let Some(a) = argument.take() {
+                    let mut x = a;
+                    rewrite_expr(&mut x, false);
+                    *s = Stmt::ThrowStatement {
+                        argument: Expr::NewExpression {
+                            callee: Box::new(Expr::MemberExpression {
+                                object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                                property: Box::new(Expr::Identifier { name: "ReturnSignal".to_string() }),
+                                computed: false,
+                                optional: false,
+                            }),
+                            arguments: vec![x],
+                        },
+                    };
+                }
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument {
+                    rewrite_expr(a, in_loop);
+                }
+            }
+            Stmt::ExpressionStatement { expression } => rewrite_expr(expression, in_loop),
+            Stmt::BlockStatement { body } => {
+                for x in body { rewrite_stmt(x, in_loop); }
+            }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                rewrite_expr(test, in_loop);
+                rewrite_stmt(consequent, in_loop);
+                if let Some(a) = alternate { rewrite_stmt(a, in_loop); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                rewrite_stmt(block, in_loop);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { rewrite_expr(p, in_loop); }
+                    rewrite_stmt(&mut h.body, in_loop);
+                }
+                if let Some(f) = finalizer { rewrite_stmt(f, in_loop); }
+            }
+            Stmt::ThrowStatement { argument } => rewrite_expr(argument, in_loop),
+            Stmt::SwitchStatement { discriminant, cases } => {
+                rewrite_expr(discriminant, in_loop);
+                for c in cases {
+                    if let Some(t) = &mut c.test { rewrite_expr(t, in_loop); }
+                    for x in &mut c.consequent { rewrite_stmt(x, in_loop); }
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                rewrite_expr(test, in_loop);
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::ForStatement { init, test, update, body } => {
+                rewrite_stmt(init, in_loop);
+                rewrite_expr(test, in_loop);
+                rewrite_expr(update, in_loop);
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                rewrite_stmt(left, in_loop);
+                rewrite_expr(right, in_loop);
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { rewrite_expr(p, in_loop); }
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { rewrite_expr(i, in_loop); }
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    for s in &mut prog.body {
+        rewrite_stmt(s, false);
+    }
+    prog
+}
+
 pub fn compile_head_passes(mut prog: Program) -> Program {
     prog = strip_process_env(prog);          // #1
     prog = await_sync_fn_calls(prog);        // #2
