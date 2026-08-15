@@ -264,6 +264,27 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_widths = widths;
     r.program(&prog);
     r.trim_sh_runtime();
+    // _sh_rc models bash's `$?`: the renderer stores it after every
+    // command so a LATER read sees the right value. When nothing in
+    // the final program reads it (no `$?`, no surviving shell-out
+    // helper, no fn-call status), the stores are unobservable dead
+    // code — strip them and the definition.
+    r.strip_dead_rc();
+    // Only keep `#include`s whose symbols actually appear in the
+    // emitted program (after the runtime trim removed helpers).
+    r.trim_includes();
+    // A stripped runtime block can leave blank-line runs — keep at most
+    // two (the C convention between declarations/functions).
+    let mut blanks = 0usize;
+    r.out.retain(|l| {
+        if l.trim().is_empty() {
+            blanks += 1;
+            blanks <= 2
+        } else {
+            blanks = 0;
+            true
+        }
+    });
     r.out.join("\n")
 }
 
@@ -898,6 +919,107 @@ impl Render {
         if !full.contains("WIFEXITED") && !full.contains("WEXITSTATUS") {
             self.out.retain(|l| !l.trim_start().starts_with("#include <sys/wait.h>"));
         }
+    }
+
+    /// If nothing in the final program READS `_sh_rc` (no `$?`, no
+    /// surviving shell-out helper, no fn-call status), every `_sh_rc`
+    /// mention is a dead status write — strip the writes and the
+    /// definition so the output is as lean as the program's needs.
+    /// The reads are the `$?` lowering, the shell-out helpers' own
+    /// `return _sh_rc;`, and the fn-call status `(f(), …, _sh_rc)` —
+    /// all of which bail this cleanup out entirely.
+    fn strip_dead_rc(&mut self) {
+        let full = self.out.join("\n");
+        if rc_is_read(&full) {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.out.len());
+        for line in &self.out {
+            if let Some(stripped) = strip_rc_line(line) {
+                out.push(stripped);
+            }
+        }
+        self.out = out;
+    }
+
+    /// Drop `#include` lines nothing in the final program uses. stdio.h
+    /// stays (printf/fputs/fprintf are the output mechanism); every
+    /// other header is kept only while one of its trigger symbols
+    /// appears in the emitted text. The scan runs AFTER trim_sh_runtime
+    /// and strip_dead_rc, so a header that only fed a trimmed-away
+    /// helper (fnmatch.h for a dropped ${s#pat} helper, sys/wait.h for
+    /// a stripped _sh_capture rc write) disappears too. Only removes —
+    /// an unknown header or an incomplete trigger list keeps the line
+    /// (the emit-time need_* flags still gate the obvious ones).
+    fn trim_includes(&mut self) {
+        const HEADERS: &[(&str, &[&str])] = &[
+            (
+                "<stdlib.h>",
+                &[
+                    "exit(", "realloc(", "malloc(", "calloc(", "free(", "getenv(",
+                    "setenv(", "system(", "abort(", "atoll(", "atoi(", "atol(",
+                    "atof(", "strtol(", "abs(", "rand(", "qsort(",
+                ],
+            ),
+            (
+                "<string.h>",
+                &[
+                    "strlen(", "memcpy(", "memset(", "strcpy(", "strncpy(", "strcmp(",
+                    "strncmp(", "strchr(", "strstr(", "strcat(", "strdup(", "strtok(",
+                    "memcmp(", "strrchr(", "strncat(",
+                ],
+            ),
+            (
+                "<unistd.h>",
+                &[
+                    "chdir(", "getcwd(", "access(", "unlink(", "rmdir(", "getpid(",
+                    "getuid(", "getgid(", "isatty(", "dup(", "dup2(", "pipe(", "fork(",
+                    "read(", "write(", "close(", "usleep(", "fileno(",
+                ],
+            ),
+            (
+                "<ctype.h>",
+                &[
+                    "tolower(", "toupper(", "isalnum(", "isalpha(", "isdigit(",
+                    "isspace(", "isupper(", "islower(", "isprint(", "ispunct(",
+                    "isxdigit(",
+                ],
+            ),
+            ("<fnmatch.h>", &["fnmatch("]),
+            ("<regex.h>", &["regcomp(", "regexec(", "regfree(", "regmatch_t"]),
+            (
+                "<sys/stat.h>",
+                &["struct stat", "stat(", "fstat(", "lstat(", "mkdir(", "chmod("],
+            ),
+            ("<sys/wait.h>", &["WIFEXITED", "WEXITSTATUS"]),
+            (
+                "<time.h>",
+                &[
+                    "nanosleep(", "clock_gettime(", "struct timespec", "time(",
+                    "localtime(", "mktime(", "strftime(", "gettimeofday(",
+                ],
+            ),
+            (
+                "<math.h>",
+                &["pow(", "sqrt(", "floor(", "ceil(", "log(", "fabs(", "round(", "fmod("],
+            ),
+            ("<assert.h>", &["assert("]),
+        ];
+        let full = self.out.join("\n");
+        self.out.retain(|l| {
+            let t = l.trim_start();
+            if !t.starts_with("#include ") {
+                return true;
+            }
+            let hdr = t["#include ".len()..].trim();
+            if hdr == "<stdio.h>" {
+                return true;
+            }
+            match HEADERS.iter().find(|(h, _)| *h == hdr) {
+                Some((_, trigs)) => trigs.iter().any(|tr| full.contains(tr)),
+                None => true, // unknown header — keep
+            }
+        });
     }
 
     // ── expressions ──────────────────────────────────────────────────
@@ -5813,7 +5935,13 @@ impl Render {
             self.emit("");
         }
         self.emit("int main(void) {");
-        if self.need_sh || !self.sh2_calls.is_empty() {
+        // Only REAL shell-out sites (bash -c subprocesses) need the
+        // preamble: their children share fd 1 — unbuffered stdout keeps
+        // the interleave order — and write to our stderr — silenced to
+        // /dev/null (the gate diffs stdout only). A native-only program
+        // has no subprocess: buffered stdout cannot reorder anything and
+        // the script's own stderr (Die/Warn) must reach the terminal.
+        if !cap_ids.is_empty() || !site_ids.is_empty() || !self.sh2_calls.is_empty() {
             self.emit("  freopen(\"/dev/null\", \"w\", stderr);");
             // unbuffered stdout: bash -c children share fd 1 — buffered
             // stdio would reorder their output after ours at flush time
@@ -5828,6 +5956,104 @@ impl Render {
             ));
         }
     }
+}
+
+/// Does the generated text READ `_sh_rc` anywhere? A write is `_sh_rc =`
+/// (the definition and every status store, always space-padded); anything
+/// else (`return _sh_rc;`, `, _sh_rc)`, `long long q = _sh_rc;`) is a read.
+fn rc_is_read(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'_'
+            && s[i..].starts_with("_sh_rc")
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            let mut j = i + 6;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            if b.get(j) != Some(&b'=') {
+                return true;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// One line of the dead-rc cleanup (called only when nothing reads
+/// `_sh_rc`). Drops whole-line definitions/status stores, rewrites
+/// `(_sh_rc = N, X)` sequence wrappers to `X` (the store was the only
+/// thing the comma operator did), and removes inline `; _sh_rc = …;`
+/// stores (cd/sleep/test/grep status writes inside single-line blocks).
+/// Returns None when the whole line is dead. The output is ASCII, so
+/// byte indexing is safe.
+fn strip_rc_line(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    if t == "static int _sh_rc = 0;"
+        || t == "/* shell-out runtime: build a command line, run it via bash -c */"
+        || (t.starts_with("_sh_rc ") && t.trim_end().ends_with(';'))
+    {
+        return None;
+    }
+    let b = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < b.len() {
+        // `(_sh_rc = N, X)` sequence wrapper → X
+        if b[i] == b'(' && line[i..].starts_with("(_sh_rc = ") {
+            let mut depth = 1usize;
+            let mut j = i + 1;
+            while j < b.len() && depth > 0 {
+                match b[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                let inner = &line[i + 1..j - 1];
+                if let Some(comma) = inner.find(", ") {
+                    out.push_str(inner[comma + 2..].trim());
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        // inline `…; _sh_rc = …;` / `{ _sh_rc = …;` status store
+        if (line[i..].starts_with("_sh_rc ") || line[i..].starts_with("_sh_rc="))
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            let mut j = i + 6;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            if b.get(j) == Some(&b'=') {
+                // the store statement ends at the next `;` (the RHS
+                // forms the renderer emits never contain one)
+                let mut k = j + 1;
+                while k < b.len() && b[k] != b';' {
+                    k += 1;
+                }
+                let end = if k < b.len() { k + 1 } else { b.len() };
+                // inline store: eat the preceding separator so no
+                // `; ;` / `{ }`-with-gap remains
+                let out_t = out.trim_end();
+                if out_t.ends_with(';') || out_t.ends_with('{') {
+                    out.truncate(out_t.len());
+                }
+                i = end;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    Some(out)
 }
 
 /// Collect every variable name referenced by statements (assign targets,
