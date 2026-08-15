@@ -1314,6 +1314,18 @@ pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
         out.insert_str(0, "use Carp;\n");
     }
 
+    // Standalone status-tracker writes that are DEAD in an embed: the ls
+    // emulation emits `$ls_success = 0/1;` and `$main_exit_code =
+    // $CHILD_ERROR;` (status flags the standalone exit logic consumes). In
+    // a fragment they'd be undeclared-var failures under `use strict` —
+    // drop the lines (they have no output side effect).
+    let ls_re = regex::Regex::new(r"(?m)^[ \t]*\$ls_success\s*=\s*[01];[ \t]*\n")
+        .unwrap();
+    out = ls_re.replace_all(&out, "").to_string();
+    let me_re = regex::Regex::new(r"(?m)^[ \t]*\$main_exit_code\s*=\s*\$CHILD_ERROR;[ \t]*\n")
+        .unwrap();
+    out = me_re.replace_all(&out, "").to_string();
+
     // Standalone-only dependencies the fragment must not reference (the
     // preamble declares them in a full program; an embed has no preamble).
     for needle in [
@@ -1632,6 +1644,22 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     // (accepted divergence for this fallback).
                     let first_redirect = redirects.first();
                     match first_redirect {
+                        Some(r) if call_arg_str(&r.target).map_or(false, |t| t.starts_with('&')) => {
+                            // fd-dup redirect (`2>&1`, `1>&2`, …) on a
+                            // non-command inner (subshell block): dup stderr
+                            // to stdout — the backtick __bt capture pipe then
+                            // sees stderr too. The old code opened a FILE
+                            // named "&1" (mode w + the raw target).
+                            let mode = if r.mode == "r" { "'<&'" } else { "'>&'" };
+                            emit_indent(out, indent);
+                            out.push_str(&format!(
+                                "local *STDERR; open STDERR, {}, STDOUT or die \"Cannot dup stderr: $!\\n\";\n",
+                                mode
+                            ));
+                            for s in inner {
+                                emit_stmt(out, s, indent);
+                            }
+                        }
                         Some(r) if matches!(r.mode.as_str(), "w" | "a" | "r+") => {
                             let target = call_arg_str(&r.target).unwrap_or_default();
                             let mode = if r.mode == "a" { "'>>'" } else { "'>'" };
@@ -3692,8 +3720,10 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
     let quoted = format!("'{}'", target.replace('\'', "'\\\\''"));
     let frag = match fd {
         0 => format!(" < {}", quoted),
-        1 => format!(" > {}", quoted),
-        n => format!(" {}> {}", n, quoted),
+        // `op` not `>`: the old hardcode rebuilt `>>` (append) as `>`
+        // (overwrite) — `echo B >> f` clobbered f.
+        1 => format!(" {} {}", op, quoted),
+        n => format!(" {}{} {}", n, op, quoted),
     };
     cmd.push_str(&frag);
     true
@@ -3776,10 +3806,15 @@ fn block_call_to_cmd(call: &IrExpr) -> Option<String> {
 /// Find the shell command string inside a block of stmts (exec, pipeline,
 /// or `&&`/`||` chain) — shared by Arrow bodies and Redirect inners.
 fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
+    // Join ALL rebuildable statements with `;` — a first-match return would
+    // drop the rest: `(echo a; echo b) | cat` lost `echo b` (examples/039
+    // "Process 2").
+    let mut parts = Vec::new();
     for s in stmts {
         if let IrStmt::Expr(inner) = s {
             if let Some(cmd) = expr_to_cmd(inner) {
-                return Some(cmd);
+                parts.push(cmd);
+                continue;
             }
         }
         if let IrStmt::For { var, iter, body } = s {
@@ -3788,13 +3823,27 @@ fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
             // original script.
             let iter_cmd = bash_word_for(iter);
             let body_cmd = stmts_to_shell_cmd(body)?;
-            return Some(format!(
+            parts.push(format!(
                 "for {} in {}; do {}; done",
                 var, iter_cmd, body_cmd
             ));
+            continue;
         }
+        if let IrStmt::Subshell(body) = s {
+            // `( … )` as a pipeline stage: `(echo a; echo b) | cat` — the
+            // subshell rebuilds as a parenthesized group.
+            let inner_cmd = stmts_to_shell_cmd(body)?;
+            parts.push(format!("( {inner_cmd} )"));
+            continue;
+        }
+        // a statement the rebuild can't express kills the whole command
+        return None;
     }
-    None
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
 }
 
 /// Rebuild a shell command string from a `pipeline` Call:
@@ -6795,7 +6844,14 @@ pub fn is_env_style_var_name(name: &str) -> bool {
     if PERL_SPECIAL_VARS.contains(&name) {
         return false;
     }
-    !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+    // Env-style: uppercase letters, digits, underscore (VAR1, PATH, HOME —
+    // bash env names allow digits; the old all-uppercase check misread
+    // `VAR1` as a local, so `echo "$VAR1"` printed the empty preamble
+    // local instead of %ENV).
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
 }
 
 // ── Bridge helpers ────────────────────────────────────────────────────
