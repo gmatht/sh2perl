@@ -900,7 +900,11 @@ exit $main_exit_code;
                 // (U+FFFD) and the program parses. Err only fires for a
                 // genuinely absent file → direct-string fallback.
                 match fs::read(input) {
-                    Ok(bytes) => cli_commands::export_shir(&String::from_utf8_lossy(&bytes), raw),
+                    // marked-lossy (PUA U+E000+byte) decode, NOT U+FFFD —
+                    // core request sh-20260815-115501-utf8-toplevel-shir-arm:
+                    // the byte must survive into the A1 JSON so renderers can
+                    // recover it (the sh gate's utf8-non-utf8-content.sh).
+                    Ok(bytes) => cli_commands::export_shir(&SharedUtils::bytes_to_marked_lossy(&bytes), raw),
                     Err(_) => cli_commands::export_shir(input, raw),
                 }
             } else {
@@ -918,7 +922,9 @@ exit $main_exit_code;
                 cli_commands::export_shir_raw(&s);
             } else if input.contains(".sh") || !input.contains(' ') {
                 match fs::read(input) {
-                    Ok(bytes) => cli_commands::export_shir_raw(&String::from_utf8_lossy(&bytes)),
+                    // same marked-lossy treatment as the --shir arm (latent
+                    // U+FFFD issue noted in the utf8 core request).
+                    Ok(bytes) => cli_commands::export_shir_raw(&SharedUtils::bytes_to_marked_lossy(&bytes)),
                     Err(_) => cli_commands::export_shir_raw(input),
                 }
             } else { cli_commands::export_shir_raw(input); }
