@@ -13975,6 +13975,17 @@ fn call_is_always_true(e: &Expr) -> bool {
     }
 }
 
+/// The compile pipeline's estree entry: shir_to_estree + the control-flow
+/// legality pass + the moved JS-side head passes (estree.rs
+/// compile_head_passes — the first four estreeToJsMapped passes). The
+/// JS side continues at pass #5 (awaitAsyncDirectCalls) — see
+/// PLAN-wasm-estree-pipeline.md (a prefix is the only order-preserving
+/// composition).
+pub fn shir_to_estree_compiled(prog: &IrProgram) -> Program {
+    let estree = crate::estree::fix_control_flow(shir_to_estree(prog));
+    crate::estree::compile_head_passes(estree)
+}
+
 pub fn shir_to_estree_json(prog: &IrProgram) -> Result<String, serde_json::Error> {
     // the A1-ingress twin of estree.rs ast_to_estree_json: the control-flow
     // legality pass applies to frontend-emitted IR too — a bare `return`

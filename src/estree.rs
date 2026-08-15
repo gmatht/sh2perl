@@ -3015,7 +3015,7 @@ fn write_bool_field(out: &mut String, key: &str, b: bool) {
     push_bool(out, b);
 }
 
-pub(crate) fn estree_to_json(prog: &Program) -> String {
+pub fn estree_to_json(prog: &Program) -> String {
     let mut out = String::with_capacity(256 * 1024);
     write_program(&mut out, prog);
     out
@@ -3418,6 +3418,548 @@ fn write_template_element(out: &mut String, t: &TemplateElement) {
     out.push_str("},\"tail\":");
     push_bool(out, t.tail);
     out.push('}');
+}
+
+// ── the estreeToJs head passes, ported into the wasm ────────────────
+//
+// The JS-side estreeToJsMapped pipeline (estree.js/lower.js) normalizes
+// the wasm's sh2.*-targeted estree before the astring codegen. These are
+// the first passes of that pipeline, ported line-by-line so the compile
+// output stays byte-identical (the Node differential harness verifies the
+// composition: wasm-head + JS-suffix === the current full JS pipeline).
+//
+// The wasm runs a PREFIX of the pipeline; the JS side (estreeToJsMapped)
+// skips the moved prefix and continues at the next pass. The order is the
+// global pass order — a prefix is the only composition that preserves it.
+
+/// Generic mutable visitor over the ESTree (the Rust analog of the
+/// JS-side `walk`) — visits every Expr in the program (through stmts,
+/// arrows, template expressions, property keys/values, …), callback FIRST
+/// (top-down), then the children.
+pub(crate) fn visit_exprs(prog: &mut Program, f: &mut dyn FnMut(&mut Expr)) {
+    fn stmt(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
+        match s {
+            Stmt::ExpressionStatement { expression } => expr(expression, f),
+            Stmt::BlockStatement { body } => { for x in body { stmt(x, f); } }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                expr(test, f);
+                stmt(consequent, f);
+                if let Some(a) = alternate { stmt(a, f); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                stmt(block, f);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { expr(p, f); }
+                    stmt(&mut h.body, f);
+                }
+                if let Some(fin) = finalizer { stmt(fin, f); }
+            }
+            Stmt::ThrowStatement { argument } => expr(argument, f),
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr(discriminant, f);
+                for c in cases {
+                    if let Some(t) = &mut c.test { expr(t, f); }
+                    for x in &mut c.consequent { stmt(x, f); }
+                }
+            }
+            Stmt::WhileStatement { test, body } => { expr(test, f); stmt(body, f); }
+            Stmt::DoWhileStatement { test, body } => { expr(test, f); stmt(body, f); }
+            Stmt::ForStatement { init, test, update, body } => {
+                stmt(init, f);
+                expr(test, f);
+                expr(update, f);
+                stmt(body, f);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt(left, f);
+                expr(right, f);
+                stmt(body, f);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { expr(i, f); }
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { expr(a, f); }
+            }
+        }
+    }
+    fn expr(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+        f(e);
+        match e {
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            Expr::TemplateLiteral { quasis: _, expressions } => {
+                for x in expressions { expr(x, f); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                expr(callee, f);
+                for a in arguments { expr(a, f); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                expr(object, f);
+                expr(property, f);
+            }
+            Expr::AwaitExpression { argument } => expr(argument, f),
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params { expr(p, f); }
+                match body {
+                    ArrowBody::Expr(x) => expr(x, f),
+                    ArrowBody::Block(b) => stmt(b, f),
+                }
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties {
+                    expr(&mut p.key, f);
+                    expr(&mut p.value, f);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { expr(el, f); }
+            }
+            Expr::SpreadElement { argument } => expr(argument, f),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                expr(left, f);
+                expr(right, f);
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                expr(test, f);
+                expr(consequent, f);
+                expr(alternate, f);
+            }
+            Expr::UnaryExpression { argument, .. } => expr(argument, f),
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions { expr(x, f); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                expr(callee, f);
+                for a in arguments { expr(a, f); }
+            }
+        }
+    }
+    for s in &mut prog.body {
+        stmt(s, f);
+    }
+}
+
+/// Does the subtree contain an AwaitExpression?
+pub(crate) fn has_await_expr(e: &Expr) -> bool {
+    match e {
+        Expr::AwaitExpression { .. } => true,
+        Expr::Identifier { .. } | Expr::Literal { .. } => false,
+        Expr::TemplateLiteral { expressions, .. } => expressions.iter().any(has_await_expr),
+        Expr::CallExpression { callee, arguments, .. } => {
+            has_await_expr(callee) || arguments.iter().any(has_await_expr)
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            has_await_expr(object) || has_await_expr(property)
+        }
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            ArrowBody::Expr(x) => has_await_expr(x),
+            ArrowBody::Block(b) => has_await_stmt(b),
+        },
+        Expr::ObjectExpression { properties } => properties.iter().any(|p| {
+            has_await_expr(&p.value) || (p.computed && has_await_expr(&p.key))
+        }),
+        Expr::ArrayExpression { elements } => elements.iter().flatten().any(has_await_expr),
+        Expr::SpreadElement { argument } => has_await_expr(argument),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. }
+        | Expr::AssignmentExpression { left, right, .. } => {
+            has_await_expr(left) || has_await_expr(right)
+        }
+        Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+            has_await_expr(test) || has_await_expr(consequent) || has_await_expr(alternate)
+        }
+        Expr::UnaryExpression { argument, .. } => has_await_expr(argument),
+        Expr::SequenceExpression { expressions } => expressions.iter().any(has_await_expr),
+        Expr::NewExpression { callee, arguments, .. } => {
+            has_await_expr(callee) || arguments.iter().any(has_await_expr)
+        }
+    }
+}
+
+pub(crate) fn has_await_stmt(s: &Stmt) -> bool {
+    match s {
+        Stmt::ExpressionStatement { expression } => has_await_expr(expression),
+        Stmt::BlockStatement { body } => body.iter().any(has_await_stmt),
+        Stmt::IfStatement { test, consequent, alternate } => {
+            has_await_expr(test)
+                || has_await_stmt(consequent)
+                || alternate.as_ref().map(|a| has_await_stmt(a)).unwrap_or(false)
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            has_await_stmt(block)
+                || handler.as_ref().map(|h| has_await_stmt(&h.body)).unwrap_or(false)
+                || finalizer.as_ref().map(|f| has_await_stmt(f)).unwrap_or(false)
+        }
+        Stmt::ThrowStatement { argument } => has_await_expr(argument),
+        Stmt::SwitchStatement { discriminant, cases } => {
+            has_await_expr(discriminant)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().map(has_await_expr).unwrap_or(false)
+                        || c.consequent.iter().any(has_await_stmt)
+                })
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            has_await_expr(test) || has_await_stmt(body)
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            has_await_stmt(init) || has_await_expr(test) || has_await_expr(update) || has_await_stmt(body)
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            has_await_stmt(left) || has_await_expr(right) || has_await_stmt(body)
+        }
+        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
+            d.init.as_ref().map(has_await_expr).unwrap_or(false)
+        }),
+        Stmt::ReturnStatement { argument } => argument.as_ref().map(has_await_expr).unwrap_or(false),
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => false,
+    }
+}
+
+/// estree.js `markAsyncOnAwait` — a function whose body contains an
+/// AwaitExpression must be `async` (a non-async function with `await`
+/// inside is a SyntaxError).
+pub(crate) fn mark_async_on_await(mut prog: Program) -> Program {
+    fn mark_expr(e: &mut Expr) {
+        if let Expr::ArrowFunctionExpression { body, r#async, .. } = e {
+            let has = match body {
+                ArrowBody::Expr(x) => has_await_expr(x),
+                ArrowBody::Block(b) => has_await_stmt(b),
+            };
+            if has { *r#async = true; }
+        }
+    }
+    visit_exprs(&mut prog, &mut mark_expr);
+    prog
+}
+
+/// estree.js `stripProcessEnv` — `process.env.<name>` and the
+/// `process.env` member itself become the runtime's env accessor
+/// (`sh2.env` — the sh2runtime's contract; the accessor names are the
+/// environment config). Ported verbatim: branch 1 rewrites `process.env`
+/// (object=process, property=env) to `sh2.env`; branch 2 rewrites the
+/// inner `process.env` of `process.env.X`.
+pub(crate) fn strip_process_env(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::MemberExpression { object, property, .. } = e {
+            // branch 1: `process.env` itself → `sh2.env`
+            if is_ident(property, "env") && is_ident(object, "process") {
+                **object = Expr::Identifier { name: "sh2".to_string() };
+                return;
+            }
+            // branch 2: `process.env.X` → `sh2.env.X` (rewrite the inner)
+            if let Expr::MemberExpression { object: inner, property: inner_prop, .. } = &mut **object {
+                if is_ident(inner_prop, "env") && is_ident(inner, "process") {
+                    **inner = Expr::Identifier { name: "sh2".to_string() };
+                }
+            }
+        }
+    }
+    visit_exprs(&mut prog, &mut rewrite);
+    prog
+}
+
+/// estree.js `awaitSyncFnCalls` — the otranspilerl estree emits the
+/// PROVABLY-SYNC `sh2.fnCall(...)` form; a callee body containing a
+/// capture/whileLoop IS async, so the un-awaited call detaches. Await
+/// every `sh2.fnCall` not already inside an AwaitExpression (a no-op on
+/// a sync value, a correct sequencing fix on a promise). Also rewrites
+/// non-sync-table `sh2.builtin` calls to the async `sh2.exec` bridge.
+pub(crate) fn await_sync_fn_calls(mut prog: Program) -> Program {
+    // the JS-side SYNC_BUILTINS table (estree.js) — NOT the wider
+    // shir.rs table: the identity with the JS pipeline requires this list.
+    const JS_SYNC_BUILTINS: &[&str] = &[
+        "echo", "printf", "true", "false", "date", "pwd", "cat", "cd", "export", "ls", "test",
+    ];
+    fn sync_twin(name: &str) -> bool {
+        matches!(name,
+            "captureSync" | "redirectSync" | "pipelineSync" | "subshellSync"
+            | "blockSync" | "whileLoopSync" | "forLoopSync" | "cstyleForSync")
+    }
+    fn is_sh2_call(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::CallExpression { callee, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, .. }
+                if is_ident(object, "sh2") && is_ident(property, name)))
+    }
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite_expr(e: &mut Expr, in_await: bool, in_sync: bool) {
+        // the JS recurses into arrays first (bottom-up); the visitor is
+        // top-down — replicate by recursing the children HERE (except the
+        // wrapped cases) so the order matches the JS rebuild semantics.
+        match e {
+            Expr::AwaitExpression { argument } => {
+                rewrite_expr(argument, true, in_sync);
+                return;
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                // a *Sync twin's body arrow was PROVEN await-free — keep
+                // its fnCalls un-awaited (the sync twin would throw)
+                if let Expr::MemberExpression { object, property, .. } = &**callee {
+                    if is_ident(object, "sh2") {
+                        if let Expr::Identifier { name } = &**property {
+                            if sync_twin(name) {
+                                for a in arguments.iter_mut() {
+                                    rewrite_expr(a, false, true);
+                                }
+                                return;
+                            }
+                            if name == "fnCall" && !in_await && !in_sync {
+                                for a in arguments.iter_mut() {
+                                    rewrite_expr(a, false, in_sync);
+                                }
+                                let args = std::mem::take(arguments);
+                                *e = Expr::AwaitExpression {
+                                    argument: Box::new(Expr::CallExpression {
+                                        callee: callee.clone(),
+                                        arguments: args,
+                                        optional: false,
+                                    }),
+                                };
+                                return;
+                            }
+                            if name == "builtin" && !in_await {
+                                let rewired = arguments
+                                    .iter_mut()
+                                    .map(|a| { rewrite_expr(a, false, in_sync); a.clone() })
+                                    .collect::<Vec<_>>();
+                                if let Some(Expr::Literal { value, .. }) = rewired.first() {
+                                    if let Some(s) = value.as_str() {
+                                        if !JS_SYNC_BUILTINS.contains(&s) {
+                                            let arg0 = Expr::Literal { value: serde_json::json!(s), raw: None, regex: None };
+                                            let arg1 = if rewired.len() > 1 {
+                                                rewired[1].clone()
+                                            } else {
+                                                Expr::ArrayExpression { elements: vec![] }
+                                            };
+                                            *e = Expr::AwaitExpression {
+                                                argument: Box::new(Expr::CallExpression {
+                                                    callee: Box::new(Expr::MemberExpression {
+                                                        object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                                                        property: Box::new(Expr::Identifier { name: "exec".to_string() }),
+                                                        computed: false,
+                                                        optional: false,
+                                                    }),
+                                                    arguments: vec![arg0, arg1],
+                                                    optional: false,
+                                                }),
+                                            };
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for a in arguments.iter_mut() {
+                    rewrite_expr(a, false, in_sync);
+                }
+                rewrite_expr(callee, false, in_sync);
+                return;
+            }
+            _ => {}
+        }
+        // generic children — the JS recurses EVERY child with
+        // inAwait=false (only an AwaitExpression's own argument keeps
+        // inAwait=true); the Call/Await arms of rewrite_expr handle their
+        // own recursion before wrapping.
+        fn visit_children(e: &mut Expr, f: &mut dyn FnMut(&mut Expr, bool, bool)) {
+            match e {
+                Expr::CallExpression { callee, arguments, .. } => {
+                    f(callee, false, false);
+                    for a in arguments { f(a, false, false); }
+                }
+                Expr::AwaitExpression { argument } => f(argument, false, false),
+                Expr::TemplateLiteral { expressions, .. } => {
+                    for x in expressions { f(x, false, false); }
+                }
+                Expr::MemberExpression { object, property, .. } => {
+                    f(object, false, false);
+                    f(property, false, false);
+                }
+                Expr::ArrowFunctionExpression { params, body, .. } => {
+                    for p in params { f(p, false, false); }
+                    match body {
+                        ArrowBody::Expr(x) => f(x, false, false),
+                        ArrowBody::Block(b) => visit_stmt(b, f),
+                    }
+                }
+                Expr::ObjectExpression { properties } => {
+                    for p in properties { f(&mut p.key, false, false); f(&mut p.value, false, false); }
+                }
+                Expr::ArrayExpression { elements } => {
+                    for el in elements.iter_mut().flatten() { f(el, false, false); }
+                }
+                Expr::SpreadElement { argument } => f(argument, false, false),
+                Expr::LogicalExpression { left, right, .. }
+                | Expr::BinaryExpression { left, right, .. }
+                | Expr::AssignmentExpression { left, right, .. } => {
+                    f(left, false, false);
+                    f(right, false, false);
+                }
+                Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                    f(test, false, false);
+                    f(consequent, false, false);
+                    f(alternate, false, false);
+                }
+                Expr::UnaryExpression { argument, .. } => f(argument, false, false),
+                Expr::SequenceExpression { expressions } => {
+                    for x in expressions { f(x, false, false); }
+                }
+                Expr::NewExpression { callee, arguments, .. } => {
+                    f(callee, false, false);
+                    for a in arguments { f(a, false, false); }
+                }
+                Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            }
+        }
+        // the in-await flag resets for each child (the JS passes false)
+        visit_children(e, &mut |c, _, _| rewrite_expr(c, false, in_sync));
+    }
+    fn visit_stmt(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr, bool, bool)) {
+        match s {
+            Stmt::ExpressionStatement { expression } => f(expression, false, false),
+            Stmt::BlockStatement { body } => { for x in body { visit_stmt(x, f); } }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                f(test, false, false);
+                visit_stmt(consequent, f);
+                if let Some(a) = alternate { visit_stmt(a, f); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                visit_stmt(block, f);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { f(p, false, false); }
+                    visit_stmt(&mut h.body, f);
+                }
+                if let Some(fin) = finalizer { visit_stmt(fin, f); }
+            }
+            Stmt::ThrowStatement { argument } => f(argument, false, false),
+            Stmt::SwitchStatement { discriminant, cases } => {
+                f(discriminant, false, false);
+                for c in cases {
+                    if let Some(t) = &mut c.test { f(t, false, false); }
+                    for x in &mut c.consequent { visit_stmt(x, f); }
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                f(test, false, false);
+                visit_stmt(body, f);
+            }
+            Stmt::ForStatement { init, test, update, body } => {
+                visit_stmt(init, f);
+                f(test, false, false);
+                f(update, false, false);
+                visit_stmt(body, f);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                visit_stmt(left, f);
+                f(right, false, false);
+                visit_stmt(body, f);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { f(i, false, false); }
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { f(a, false, false); }
+            }
+        }
+    }
+    // the JS rebuilds bottom-up — replicate by recursing before the wrap
+    // decisions; the code above handles the wrapping after the recursion.
+    for s in &mut prog.body {
+        visit_stmt(s, &mut |e, in_a, in_s| rewrite_expr(e, in_a, in_s));
+    }
+    prog
+}
+
+/// estree.js `forceAsyncFileRedirects` — the runtime's `redirectSync`
+/// twin only handles fd-dup (`&N`) targets; a file/device target must go
+/// through the async `sh2.redirect` (wrapped in await).
+pub(crate) fn force_async_file_redirects(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::CallExpression { callee, arguments, optional } = e {
+            if let Expr::MemberExpression { object, property, .. } = &**callee {
+                if is_ident(object, "sh2") {
+                    if let Expr::Identifier { name } = &**property {
+                        if name == "redirectSync" && arguments.len() == 2 {
+                            let mut file_target = false;
+                            if let Expr::ArrayExpression { elements } = &arguments[1] {
+                                for el in elements {
+                                    if let Some(Expr::ObjectExpression { properties }) = el {
+                                        for p in properties {
+                                            let k = match &p.key {
+                                                Expr::Identifier { name } => name.as_str(),
+                                                Expr::Literal { value, .. } => value.as_str().unwrap_or(""),
+                                                _ => "",
+                                            };
+                                            if k != "target" { continue; }
+                                            let lit = match &p.value {
+                                                Expr::TemplateLiteral { expressions, quasis } if expressions.is_empty() && quasis.len() == 1 => {
+                                                    quasis[0].value.cooked.clone()
+                                                }
+                                                Expr::Literal { value, .. } => value.as_str().map(|s| s.to_string()),
+                                                _ => None,
+                                            };
+                                            if lit.as_deref().map(|s| !s.starts_with('&')).unwrap_or(true) {
+                                                file_target = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if file_target {
+                                let call = Expr::CallExpression {
+                                    callee: Box::new(Expr::MemberExpression {
+                                        object: object.clone(),
+                                        property: Box::new(Expr::Identifier { name: "redirect".to_string() }),
+                                        computed: false,
+                                        optional: false,
+                                    }),
+                                    arguments: arguments.clone(),
+                                    optional: *optional,
+                                };
+                                *e = Expr::AwaitExpression { argument: Box::new(call) };
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    visit_exprs(&mut prog, &mut rewrite);
+    prog
+}
+
+
+/// The compile pipeline's moved PREFIX — the first four estreeToJs
+/// passes, in the global order (the JS side starts at #5
+/// awaitAsyncDirectCalls). The env-coupled passes (#1 stripProcessEnv,
+/// #3 forceAsyncFileRedirects) use the default sh2runtime contract; the
+/// environment config (devices/fs-bridge/stdout/env-accessor) parameterizes
+/// them when the full env layer moves (see PLAN-wasm-estree-pipeline.md).
+pub fn compile_head_passes(mut prog: Program) -> Program {
+    prog = strip_process_env(prog);          // #1
+    prog = await_sync_fn_calls(prog);        // #2
+    prog = force_async_file_redirects(prog); // #3
+    prog = mark_async_on_await(prog);        // #4
+    prog
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
