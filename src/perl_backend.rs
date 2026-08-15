@@ -2964,7 +2964,9 @@ impl Render {
                     // real `rm` binary is the faithful native lowering
                     self.emit(&format!("system('rm', '-rf', {});", files.join(", ")));
                 } else {
-                    self.emit(&format!("unlink {};", files.join(", ")));
+                    // propagate the failure status (bash `rm` rc) — the
+                    // gate compares exit codes
+                    self.emit(&format!("unlink {} or $? = 256;", files.join(", ")));
                 }
             }
             "mapfile" | "readarray" => {
