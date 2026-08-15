@@ -1491,6 +1491,26 @@ fn set_array_to_sh(name: &str, items: &str, append: bool) -> String {
     if items.is_empty() {
         return format!("{name}_len=0");
     }
+    // the KEYED literal form — `d=([a]=1 [b]=2)` (Python dicts / bash
+    // assoc literals, triage-sh py-sh-go t73_dict): each item is `[k]=v`
+    // (arrives single-quoted) — write the per-key element + key list
+    // (the `${!map[@]}` / `${map[*]}` iterate the list)
+    let items_clean = items.trim().trim_start_matches(['\'', '"']);
+    if items_clean.starts_with('[') {
+        let mut parts = Vec::new();
+        for raw in items.split(' ') {
+            let it = raw
+                .trim()
+                .trim_start_matches(['\'', '"'])
+                .trim_end_matches(['\'', '"']);
+            let Some(rest) = it.strip_prefix('[') else { continue };
+            let Some((key, val)) = rest.split_once("]=") else { continue };
+            parts.push(format!("{name}_{key}={val}"));
+            parts.push(format!("{name}_len=$(( ${{{name}_len:-0}} + 1 ))"));
+            parts.push(format!("{name}_keys=\"${{{name}_keys:-}} {key}\""));
+        }
+        return parts.join("; ");
+    }
     if items.contains('$') && !append {
         return format!(
             "{name}_len=0; for _w in {items}; do eval \"{name}_${{{name}_len}}=\\\"\\$_w\\\"\"; {name}_len=$(({name}_len + 1)); done"
@@ -3153,8 +3173,44 @@ fn word_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Interpolate(parts) => interp_to_sh(parts),
         IrExpr::Arith(a) => Ok(format!("$(({}))", arith_to_sh(a))),
         IrExpr::Call { func, args } => call_word_to_sh(func, args),
+        // The A1 `Index` expr node (triage-sh py-sh-go cross-product pairs
+        // t21/t56/t73): array element read — render like the `arrayIndex`
+        // call arm (the POSIX per-element lowering `${name_key}`).
+        IrExpr::Index { var, key } => index_to_sh(var, key, true),
+        // The first-class Capture node (core request
+        // zsh-sh-go-20260814-230503): `$(...)`/backticks — same
+        // `"$(...)"` rendering as the `capture` call arm.
+        IrExpr::Capture { expr, .. } => Ok(format!(
+            "\"$({})\"",
+            arrow_to_sh(std::slice::from_ref(expr.as_ref()))?
+        )),
         IrExpr::Json(v) => Ok(json_str(v)),
         other => Err(format!("word not renderable: {other:?}")),
+    }
+}
+
+/// The A1 `Index` expr node (triage-sh py-sh-go cross-product pairs
+/// t21/t56/t73): an array element read — the same POSIX per-element
+/// shapes as the `arrayIndex` call arm: whole-array `@`/`*`, the
+/// dynamic-key eval form, and the literal `${name_key}` element. In
+/// word position (`quoted`) the element is ONE word (`"${name_k}"`);
+/// in interp position the bare `${name_k}` (the enclosing template
+/// supplies the quotes).
+fn index_to_sh(var: &str, key: &IrExpr, quoted: bool) -> Result<String, String> {
+    match key {
+        IrExpr::Str(k, _) if k == "@" || k == "*" => Ok(arr_expand_call(arr_base(var))),
+        IrExpr::Str(k, _) if k.contains(['$', '(']) => Ok(format!(
+            "$(eval \"printf '%s' \\\"\\${{{}_{k}}}\\\"\")",
+            arr_base(var)
+        )),
+        IrExpr::Str(k, _) => {
+            if quoted {
+                Ok(format!("\"${{{var}_{k}}}\""))
+            } else {
+                Ok(format!("${{{var}_{k}}}"))
+            }
+        }
+        _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
     }
 }
 
@@ -3618,6 +3674,17 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Var(name, _) => Ok(format!("${name}")),
         IrExpr::Str(s, _) => Ok(s.clone()),
+        // The A1 `Index` expr node (triage-sh py-sh-go cross-product pairs
+        // t21/t56/t73): array element read inside a double-quoted template
+        // — the bare `${name_key}` (the template supplies the quotes).
+        IrExpr::Index { var, key } => index_to_sh(var, key, false),
+        // The first-class Capture node (core request
+        // zsh-sh-go-20260814-230503): `$(...)`/backticks — same
+        // `"$(...)"` rendering as the `capture` call arm.
+        IrExpr::Capture { expr, .. } => Ok(format!(
+            "\"$({})\"",
+            arrow_to_sh(std::slice::from_ref(expr.as_ref()))?
+        )),
         other => Err(format!("interp expr not renderable: {other:?}")),
     }
 }

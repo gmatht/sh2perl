@@ -8732,8 +8732,17 @@ fn part_ir(part: &StringPart) -> IrExpr {
         StringPart::ParameterExpansion(pe) => {
             // `${arr[@]:off:len}` (ArraySlice) can return an ARRAY; inside a
             // template literal that would render with JS comma joins — wrap
-            // in sh2.join (idempotent for plain string slices).
-            if matches!(pe.operator, ParameterExpansionOperator::ArraySlice(..)) {
+            // in sh2.join (idempotent for plain string slices). The zsh
+            // `${(flags)var}` form (ZshFlags, core request
+            // zsh-sh-go-20260815-000728) is the same: the f/s/k flags
+            // return ARRAYS, and inside a double-quoted template zsh joins
+            // them with the first IFS char (space) — join() does exactly
+            // that (idempotent for the scalar-returning t/j/i/U/L flags).
+            if matches!(
+                pe.operator,
+                ParameterExpansionOperator::ArraySlice(..)
+                    | ParameterExpansionOperator::ZshFlags(..)
+            ) {
                 call("join", vec![param_ir(pe)])
             } else {
                 param_ir(pe)
@@ -18612,6 +18621,18 @@ fn exec_arg_is_array_valued(e: &IrExpr) -> bool {
                 Some(k) if k == "@" || k == "*"
             ),
             "param" => {
+                // zsh `${(flags)var}` — `param("", name, flags[, sep])` (the
+                // ZshFlags operator, core request zsh-sh-go-20260815-000728):
+                // the f/s/k flags return ARRAYS; a scalar result splices as
+                // one element, so the bare call is faithful for both — the
+                // runtime's arg flattener handles it exactly like the slice
+                // forms. (The QUOTED whole-word form arrives as
+                // `join(param(...))` via part_ir and stays a scalar.)
+                if matches!(args.first().and_then(static_str), Some(op) if op == "")
+                    && args.len() >= 3
+                {
+                    return true;
+                }
                 matches!(args.first().and_then(static_str), Some(op) if op == "slice")
                     && (matches!(args.get(1).and_then(static_str), Some(n) if n == "@")
                         || (matches!(
@@ -31726,7 +31747,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     if matches!(v, IrExpr::Call { func: f, args: a }
                         if f == "param"
                             && matches!(a.as_slice(),
-                                [IrExpr::Str(op, _), ..] if op != "slice"))
+                                [IrExpr::Str(op, _), ..]
+                                // the zsh `${(flags)var}` form (ZshFlags —
+                                // op "", flags at args[2..], core request
+                                // zsh-sh-go-20260815-000728) CAN return an
+                                // array (f/s/k), unlike every other
+                                // non-slice op: its join must stay a
+                                // runtime call (array → space-join, scalar
+                                // → identity).
+                                if op != "slice" && !(op == "" && a.len() >= 3)))
                     {
                         return ve;
                     }
