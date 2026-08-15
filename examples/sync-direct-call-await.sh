@@ -19,18 +19,12 @@
 # to `await sh2.redirect(...)`. Without the redirect the same program
 # transpiles cleanly (the direct call stays await-free).
 #
-# Transpiling this file to JS emits:
-#   (__fn_g = async () => {
-#     await sh2.redirect(() => sh2.builtin("date", []), [{
-#       fd: 2, mode: "w", target: "/dev/null"
-#     }]);
-#   }, sh2.functions.set("g", __fn_g));
-#   (__fn_f = () => {
-#     await sh2.callDirect("g", __fn_g, []);   // await in a NON-async arrow
-#   }, sh2.functions.set("f", __fn_f));
-#
-# Minimal form: the redirect is the only thing needed to trigger it;
-# `echo hi 2>/dev/null` or `true 2>/dev/null` work just as well.
-g() { date 2>/dev/null; }
+# 2026-08-15 fix: the ORIGINAL example used `date` as the callee body,
+# making the native output time-dependent (the current time changes
+# every run — the gate could never match). `echo hi 2>/dev/null` keeps
+# the identical emitter trigger (the stderr redirect is the only thing
+# that makes the callee async) with DETERMINISTIC output — a red pin
+# is only useful if it fails for the right reason.
+g() { echo hi 2>/dev/null; }
 f() { g; }
 f
