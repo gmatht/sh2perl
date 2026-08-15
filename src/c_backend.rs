@@ -877,12 +877,35 @@ impl Render {
         let mut segs: Vec<(Vec<String>, Vec<String>)> = Vec::new();
         for line in &runtime {
             let t = line.trim_start();
-            if t.starts_with("static ") {
-                segs.push((sh_tokens(t).into_iter().collect(), vec![line.clone()]));
+            // only FUNCTION declarations start a segment — a `static char
+            // sc[65536];` LOCAL inside a helper would otherwise split the
+            // helper in two and orphan its body. Lines appended to a
+            // segment still contribute their `_sh_*` names (the `static
+            // int _sh_rc = 0;` def has no paren).
+            let toks = sh_tokens(t);
+            if t.starts_with("static ") && t.contains('(') {
+                // names come from the DECLARATION only — a single-line
+                // function (`static void f(void) { g(); }`) puts its body
+                // on the same line; its body's calls must not count as
+                // declared names or the reachability cascades
+                let head = t.split('{').next().unwrap_or(t);
+                segs.push((sh_tokens(head).into_iter().collect(), vec![line.clone()]));
             } else if let Some(last) = segs.last_mut() {
+                // only `static` VARIABLE declarations contribute names
+                // (the `static int _sh_rc = 0;` def, `static char
+                // sc[65536];` locals) — a function BODY's calls must
+                // not, or the reachability cascades through the whole
+                // call graph
+                if t.starts_with("static ") {
+                    for tk in toks {
+                        if !last.0.contains(&tk) {
+                            last.0.push(tk);
+                        }
+                    }
+                }
                 last.1.push(line.clone());
             } else {
-                segs.push((Vec::new(), vec![line.clone()]));
+                segs.push((toks.into_iter().collect(), vec![line.clone()]));
             }
         }
 
@@ -5973,7 +5996,9 @@ fn rc_is_read(s: &str) -> bool {
             while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
                 j += 1;
             }
-            if b.get(j) != Some(&b'=') {
+            // a bare `_sh_rc =` store is a write; `_sh_rc == 0` /
+            // `_sh_rc != 0` (fn-call status comparisons) are READS
+            if b.get(j) != Some(&b'=') || b.get(j + 1) == Some(&b'=') {
                 return true;
             }
             i = j;
@@ -6032,7 +6057,8 @@ fn strip_rc_line(line: &str) -> Option<String> {
             while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
                 j += 1;
             }
-            if b.get(j) == Some(&b'=') {
+            // `_sh_rc == 0` comparisons are NOT stores
+            if b.get(j) == Some(&b'=') && b.get(j + 1) != Some(&b'=') {
                 // the store statement ends at the next `;` (the RHS
                 // forms the renderer emits never contain one)
                 let mut k = j + 1;
