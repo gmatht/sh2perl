@@ -18,7 +18,7 @@
 
 use crate::ast::*;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ── ESTree node model (standard subset) ─────────────────────────────
 
@@ -289,7 +289,7 @@ pub fn ast_to_estree(commands: &[Command]) -> Program {
 pub fn ast_to_estree_json(commands: &[Command]) -> Result<String, serde_json::Error> {
     let transformed: Vec<Command> = commands.iter().map(transform_cmd).collect();
     let ir = crate::shir::ast_to_ir(&transformed);
-    serde_json::to_string(&fix_control_flow(crate::shir::shir_to_estree(&ir)))
+    Ok(estree_to_json(&fix_control_flow(crate::shir::shir_to_estree(&ir))))
 }
 
 // ── control-flow legality pass ───────────────────────────────────────
@@ -1256,7 +1256,14 @@ fn lit_str<'a>(e: &'a Expr) -> Option<&'a str> {
 /// from a literal must keep its store binding — see the native-array
 /// fold's literal scan. Over-marking is safe; under-marking desyncs the
 /// store.
-fn bash_text_refs(s: &str, name: &str) -> bool {
+/// Mark `acc` entries for every `top_set_arrays` name referenced by
+/// `$name` / `${name…}` in `s` — ONE scan of the string instead of one
+/// scan per array name (the estree::bash_text_refs hotspot: the literal
+/// walk re-scanned every literal once per tracked array).
+fn mark_text_refs(s: &str, top: &HashSet<String>, acc: &mut HashMap<String, ArrayRefs>) {
+    if !s.contains('$') {
+        return;
+    }
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -1280,8 +1287,11 @@ fn bash_text_refs(s: &str, name: &str) -> bool {
                 .chars()
                 .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
                 .count();
-            if n > 0 && &r3[..n] == name {
-                return true;
+            if n > 0 {
+                let nm = &r3[..n];
+                if top.contains(nm) {
+                    acc.entry(nm.to_string()).or_default().writes = true;
+                }
             }
             i += 1;
             continue;
@@ -1290,12 +1300,14 @@ fn bash_text_refs(s: &str, name: &str) -> bool {
             .chars()
             .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
             .count();
-        if n > 0 && &rest[..n] == name {
-            return true;
+        if n > 0 {
+            let nm = &rest[..n];
+            if top.contains(nm) {
+                acc.entry(nm.to_string()).or_default().writes = true;
+            }
         }
         i += 1;
     }
-    false
 }
 
 /// `"name[idx]"` → (name, idx) for a Literal getVar/setVar arg;
@@ -1672,21 +1684,13 @@ pub(crate) fn lower_native_arrays(prog: Program) -> Program {
             // simply does not fire); under-marking is the corruption.
             if let Expr::Literal { value, .. } = e {
                 if let Some(s) = value.as_str() {
-                    for n in &top_set_arrays {
-                        if bash_text_refs(s, n) {
-                            acc.entry(n.clone()).or_default().writes = true;
-                        }
-                    }
+                    mark_text_refs(s, &top_set_arrays, &mut acc);
                 }
             }
             if let Expr::TemplateLiteral { quasis, .. } = e {
                 for q in quasis {
                     let s = q.value.cooked.as_deref().unwrap_or(&q.value.raw);
-                    for n in &top_set_arrays {
-                        if bash_text_refs(s, n) {
-                            acc.entry(n.clone()).or_default().writes = true;
-                        }
-                    }
+                    mark_text_refs(s, &top_set_arrays, &mut acc);
                 }
             }
             if let Expr::Identifier { name } = e {
@@ -2951,6 +2955,471 @@ pub(crate) fn escape_template_raw(s: &str) -> String {
     out
 }
 
+// ── hand-rolled JSON writer for the ESTree ──────────────────────────
+//
+// serde_json::to_string(&program) — one Serializer dispatch + string
+// escape per field — was the #1 transpile hotspot (serialize_str: 13.8M
+// block executions on the game workload, ~31% of the profile). This
+// writer emits the SAME JSON the derive produces (same keys, same
+// declaration order, compact) with direct push_str/escape loops. The
+// browser consumes it via JSON.parse (order-insensitive), and the corpus
+// tests compare rendered output (parsed), so the exact field order is
+// cosmetic — it is kept identical to serde's anyway.
+
+/// Escape a JSON string body (without the quotes) — the fast path is a
+/// single scan; only strings containing a special char pay the rewrite.
+fn push_json_string(out: &mut String, s: &str) {
+    if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
+        out.push_str(s);
+        return;
+    }
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+fn push_key(out: &mut String, k: &str, v: &str) {
+    out.push('"');
+    out.push_str(k);
+    out.push_str("\":\"");
+    push_json_string(out, v);
+    out.push('"');
+}
+
+fn push_bool(out: &mut String, b: bool) {
+    out.push_str(if b { "true" } else { "false" });
+}
+
+fn write_str_field(out: &mut String, key: &str, v: &str) {
+    out.push(',');
+    push_key(out, key, v);
+}
+
+fn write_bool_field(out: &mut String, key: &str, b: bool) {
+    out.push(',');
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":");
+    push_bool(out, b);
+}
+
+pub(crate) fn estree_to_json(prog: &Program) -> String {
+    let mut out = String::with_capacity(256 * 1024);
+    write_program(&mut out, prog);
+    out
+}
+
+fn write_program(out: &mut String, p: &Program) {
+    out.push('{');
+    push_key(out, "type", p.type_);
+    out.push(',');
+    push_key(out, "sourceType", p.source_type);
+    out.push_str(",\"body\":[");
+    for (i, st) in p.body.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_stmt(out, st);
+    }
+    out.push_str("]}");
+}
+
+fn write_stmt(out: &mut String, st: &Stmt) {
+    match st {
+        Stmt::ExpressionStatement { expression } => {
+            out.push_str("{\"type\":\"ExpressionStatement\",\"expression\":");
+            write_expr(out, expression);
+            out.push('}');
+        }
+        Stmt::BlockStatement { body } => {
+            out.push_str("{\"type\":\"BlockStatement\",\"body\":[");
+            for (i, s) in body.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_stmt(out, s);
+            }
+            out.push_str("]}");
+        }
+        Stmt::IfStatement { test, consequent, alternate } => {
+            out.push_str("{\"type\":\"IfStatement\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"consequent\":");
+            write_stmt(out, consequent);
+            out.push_str(",\"alternate\":");
+            match alternate {
+                Some(a) => write_stmt(out, a),
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            out.push_str("{\"type\":\"TryStatement\",\"block\":");
+            write_stmt(out, block);
+            out.push_str(",\"handler\":");
+            match handler {
+                Some(h) => write_catch_clause(out, h),
+                None => out.push_str("null"),
+            }
+            out.push_str(",\"finalizer\":");
+            match finalizer {
+                Some(f) => write_stmt(out, f),
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
+        Stmt::ThrowStatement { argument } => {
+            out.push_str("{\"type\":\"ThrowStatement\",\"argument\":");
+            write_expr(out, argument);
+            out.push('}');
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            out.push_str("{\"type\":\"SwitchStatement\",\"discriminant\":");
+            write_expr(out, discriminant);
+            out.push_str(",\"cases\":[");
+            for (i, c) in cases.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_switch_case(out, c);
+            }
+            out.push_str("]}");
+        }
+        Stmt::WhileStatement { test, body } => {
+            out.push_str("{\"type\":\"WhileStatement\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::DoWhileStatement { test, body } => {
+            out.push_str("{\"type\":\"DoWhileStatement\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            out.push_str("{\"type\":\"ForStatement\",\"init\":");
+            write_stmt(out, init);
+            out.push_str(",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"update\":");
+            write_expr(out, update);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            out.push_str("{\"type\":\"ForOfStatement\",\"left\":");
+            write_stmt(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::VariableDeclaration { declarations, kind } => {
+            out.push_str("{\"type\":\"VariableDeclaration\",\"declarations\":[");
+            for (i, d) in declarations.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_var_declarator(out, d);
+            }
+            out.push_str("],");
+            push_key(out, "kind", kind);
+            out.push('}');
+        }
+        Stmt::BreakStatement { label } => {
+            out.push_str("{\"type\":\"BreakStatement\",\"label\":");
+            write_opt_string(out, label.as_deref());
+            out.push('}');
+        }
+        Stmt::ContinueStatement { label } => {
+            out.push_str("{\"type\":\"ContinueStatement\",\"label\":");
+            write_opt_string(out, label.as_deref());
+            out.push('}');
+        }
+        Stmt::ReturnStatement { argument } => {
+            out.push_str("{\"type\":\"ReturnStatement\",\"argument\":");
+            match argument {
+                Some(a) => write_expr(out, a),
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn write_opt_string(out: &mut String, s: Option<&str>) {
+    match s {
+        Some(v) => {
+            out.push('"');
+            push_json_string(out, v);
+            out.push('"');
+        }
+        None => out.push_str("null"),
+    }
+}
+
+fn write_switch_case(out: &mut String, c: &SwitchCase) {
+    out.push_str("{\"type\":\"SwitchCase\",\"test\":");
+    match &c.test {
+        Some(t) => write_expr(out, t),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"consequent\":[");
+    for (i, s) in c.consequent.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_stmt(out, s);
+    }
+    out.push_str("]}");
+}
+
+fn write_catch_clause(out: &mut String, h: &CatchClause) {
+    out.push_str("{\"type\":\"CatchClause\",\"param\":");
+    match &h.param {
+        Some(p) => write_expr(out, p),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"body\":");
+    write_stmt(out, &h.body);
+    out.push('}');
+}
+
+fn write_var_declarator(out: &mut String, d: &VariableDeclarator) {
+    out.push_str("{\"type\":\"VariableDeclarator\",\"id\":");
+    write_expr(out, &d.id);
+    out.push_str(",\"init\":");
+    match &d.init {
+        Some(i) => write_expr(out, i),
+        None => out.push_str("null"),
+    }
+    out.push('}');
+}
+
+fn write_expr(out: &mut String, e: &Expr) {
+    match e {
+        Expr::Identifier { name } => {
+            out.push_str("{\"type\":\"Identifier\",");
+            push_key(out, "name", name);
+            out.push('}');
+        }
+        Expr::Literal { value, raw, regex } => {
+            out.push_str("{\"type\":\"Literal\",\"value\":");
+            out.push_str(&value.to_string());
+            out.push_str(",\"raw\":");
+            write_opt_string(out, raw.as_deref());
+            if let Some(r) = regex {
+                out.push_str(",\"regex\":{\"pattern\":\"");
+                push_json_string(out, &r.pattern);
+                out.push_str("\",\"flags\":\"");
+                push_json_string(out, &r.flags);
+                out.push_str("\"}");
+            }
+            out.push('}');
+        }
+        Expr::TemplateLiteral { quasis, expressions } => {
+            out.push_str("{\"type\":\"TemplateLiteral\",\"quasis\":[");
+            for (i, q) in quasis.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_template_element(out, q);
+            }
+            out.push_str("],\"expressions\":[");
+            for (i, x) in expressions.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, x);
+            }
+            out.push_str("]}");
+        }
+        Expr::CallExpression { callee, arguments, optional } => {
+            out.push_str("{\"type\":\"CallExpression\",\"callee\":");
+            write_expr(out, callee);
+            out.push_str(",\"arguments\":[");
+            for (i, a) in arguments.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, a);
+            }
+            out.push(']');
+            write_bool_field(out, "optional", *optional);
+            out.push('}');
+        }
+        Expr::MemberExpression { object, property, computed, optional } => {
+            out.push_str("{\"type\":\"MemberExpression\",\"object\":");
+            write_expr(out, object);
+            out.push_str(",\"property\":");
+            write_expr(out, property);
+            write_bool_field(out, "computed", *computed);
+            write_bool_field(out, "optional", *optional);
+            out.push('}');
+        }
+        Expr::AwaitExpression { argument } => {
+            out.push_str("{\"type\":\"AwaitExpression\",\"argument\":");
+            write_expr(out, argument);
+            out.push('}');
+        }
+        Expr::ArrowFunctionExpression { params, body, expression, r#async } => {
+            out.push_str("{\"type\":\"ArrowFunctionExpression\",\"params\":[");
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, p);
+            }
+            out.push_str("],\"body\":");
+            write_arrow_body(out, body);
+            write_bool_field(out, "expression", *expression);
+            write_bool_field(out, "async", *r#async);
+            out.push('}');
+        }
+        Expr::ObjectExpression { properties } => {
+            out.push_str("{\"type\":\"ObjectExpression\",\"properties\":[");
+            for (i, p) in properties.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_property(out, p);
+            }
+            out.push_str("]}");
+        }
+        Expr::ArrayExpression { elements } => {
+            out.push_str("{\"type\":\"ArrayExpression\",\"elements\":[");
+            for (i, el) in elements.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match el {
+                    Some(x) => write_expr(out, x),
+                    None => out.push_str("null"),
+                }
+            }
+            out.push_str("]}");
+        }
+        Expr::SpreadElement { argument } => {
+            out.push_str("{\"type\":\"SpreadElement\",\"argument\":");
+            write_expr(out, argument);
+            out.push('}');
+        }
+        Expr::LogicalExpression { operator, left, right } => {
+            out.push_str("{\"type\":\"LogicalExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"left\":");
+            write_expr(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push('}');
+        }
+        Expr::BinaryExpression { operator, left, right } => {
+            out.push_str("{\"type\":\"BinaryExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"left\":");
+            write_expr(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push('}');
+        }
+        Expr::AssignmentExpression { operator, left, right } => {
+            out.push_str("{\"type\":\"AssignmentExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"left\":");
+            write_expr(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push('}');
+        }
+        Expr::ConditionalExpression { test, consequent, alternate } => {
+            out.push_str("{\"type\":\"ConditionalExpression\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"consequent\":");
+            write_expr(out, consequent);
+            out.push_str(",\"alternate\":");
+            write_expr(out, alternate);
+            out.push('}');
+        }
+        Expr::UnaryExpression { operator, argument, prefix } => {
+            out.push_str("{\"type\":\"UnaryExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"argument\":");
+            write_expr(out, argument);
+            write_bool_field(out, "prefix", *prefix);
+            out.push('}');
+        }
+        Expr::SequenceExpression { expressions } => {
+            out.push_str("{\"type\":\"SequenceExpression\",\"expressions\":[");
+            for (i, x) in expressions.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, x);
+            }
+            out.push_str("]}");
+        }
+        Expr::NewExpression { callee, arguments } => {
+            out.push_str("{\"type\":\"NewExpression\",\"callee\":");
+            write_expr(out, callee);
+            out.push_str(",\"arguments\":[");
+            for (i, a) in arguments.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, a);
+            }
+            out.push_str("]}");
+        }
+    }
+}
+
+fn write_arrow_body(out: &mut String, body: &ArrowBody) {
+    match body {
+        ArrowBody::Expr(e) => write_expr(out, e),
+        ArrowBody::Block(b) => write_stmt(out, b),
+    }
+}
+
+fn write_property(out: &mut String, p: &Property) {
+    out.push_str("{\"type\":\"Property\",\"key\":");
+    write_expr(out, &p.key);
+    out.push_str(",\"value\":");
+    write_expr(out, &p.value);
+    out.push_str(",\"kind\":\"");
+    push_json_string(out, p.kind);
+    out.push('"');
+    write_bool_field(out, "computed", p.computed);
+    write_bool_field(out, "shorthand", p.shorthand);
+    out.push('}');
+}
+
+fn write_template_element(out: &mut String, t: &TemplateElement) {
+    out.push_str("{\"type\":\"TemplateElement\",\"value\":{\"raw\":\"");
+    push_json_string(out, &t.value.raw);
+    out.push_str("\",\"cooked\":");
+    write_opt_string(out, t.value.cooked.as_deref());
+    out.push_str("},\"tail\":");
+    push_bool(out, t.tail);
+    out.push('}');
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2961,6 +3430,34 @@ mod tests {
     fn to_json(input: &str) -> String {
         let commands = Parser::new(input).parse().unwrap();
         serde_json::to_string(&ast_to_estree(&commands)).unwrap()
+    }
+
+    #[test]
+    fn json_writer_matches_serde() {
+        // the hand-rolled writer must produce JSON the browser parses
+        // identically to serde's — compare the parsed VALUES (object
+        // key order is cosmetic) AND the raw bytes.
+        for input in [
+            "x=1; echo hi",
+            "case $1 in a) echo A;; *) echo B;; esac",
+            "for i in 1 2 3; do echo $i; done",
+            "if [ -f x ]; then cat x; else echo no; fi",
+            "f() { local a=1; return $a; }; f",
+            "x='a\\\"b\\\\c\\nd'; echo ${x:-$y}",
+            "a=(1 2 3); echo ${a[1]}",
+            "while true; do sleep 1; done",
+            "echo `echo nested`",
+            "cat <<EOF\\nhi\\nEOF",
+        ] {
+            let commands = Parser::new(input).parse().unwrap();
+            let prog = ast_to_estree(&commands);
+            let serde_out = serde_json::to_string(&prog).unwrap();
+            let mine = estree_to_json(&prog);
+            let a: serde_json::Value = serde_json::from_str(&serde_out).unwrap();
+            let b: serde_json::Value = serde_json::from_str(&mine).unwrap();
+            assert_eq!(a, b, "parsed mismatch for: {input}");
+            assert_eq!(serde_out, mine, "byte mismatch for: {input}");
+        }
     }
 
     #[test]
@@ -5068,19 +5565,43 @@ pub(crate) fn drop_dead_top_decls(prog: Program) -> Program {
     if decl_names.is_empty() {
         return Program { type_: prog.type_, source_type: prog.source_type, body };
     }
+    // Precompute each top-level statement's READ set (the names it reads,
+    // honouring arrow/catch/loop shadowing) and DECLARED names — ONE tree
+    // walk per statement, instead of the old per-(declaration, statement)
+    // walks that re-walked every expression tree once per leading name
+    // (the estree::expr_read hotspot — 16M block executions on the game).
+    let empty = ReadSet::new();
+    let read_sets: Vec<ReadSet> = body.iter().map(|st| stmt_read_set(st, &empty)).collect();
+    let declared_sets: Vec<ReadSet> = body.iter().map(|st| stmt_declared_set(st)).collect();
+    // per-name sorted read/declared positions (pushed in statement order)
+    let mut read_pos: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut decl_pos: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, rs) in read_sets.iter().enumerate() {
+        for n in rs {
+            read_pos.entry(n).or_default().push(i);
+        }
+    }
+    for (i, ds) in declared_sets.iter().enumerate() {
+        for n in ds {
+            decl_pos.entry(n).or_default().push(i);
+        }
+    }
     // Scan each leading declaration's name over the statements AFTER that
     // declaration: a `let x` later (nested, or a for-init) shadows the
     // top-level binding for its scope, but the declaration itself is the
     // binding under examination — counting it as a shadow would treat
     // every later `x = …` / `$x` as shadowed. The OTHER leading
     // declarations' initializers DO count as reads (`let middle =
-    // [].concat(numbers.slice(…))` reads `numbers`).
+    // [].concat(numbers.slice(…))` reads `numbers`). The name is read iff
+    // a read position r (k < r) exists before the FIRST shadowing
+    // declaration d after k (r < d) — the old `stmts_read(&body[k+1..],
+    // name, false)` semantics, via two sorted-position lookups per name.
     let mut keep_leading: Vec<bool> = Vec::with_capacity(decl_count);
     for (k, st) in body[..decl_count].iter().enumerate() {
         let any_read = match st {
             Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
                 matches!(&d.id, Expr::Identifier { name }
-                    if stmts_read(&body[k + 1..], name, false))
+                    if leading_decl_read(&read_pos, &decl_pos, name, k))
             }),
             _ => false,
         };
@@ -5103,182 +5624,279 @@ pub(crate) fn drop_dead_top_decls(prog: Program) -> Program {
     Program { type_: prog.type_, source_type: prog.source_type, body }
 }
 
-fn stmts_read(stmts: &[Stmt], name: &str, shadowed: bool) -> bool {
-    let mut sh = shadowed;
-    for st in stmts {
-        if stmt_read(st, name, sh) {
-            return true;
-        }
-        // a `let x` in this block shadows the remainder of it
-        if stmt_declares(st, name) {
-            sh = true;
-        }
+/// Is `name` read anywhere in `body[k+1..]` before its first shadowing
+/// declaration? (the old per-name `stmts_read(&body[k+1..], name, false)`.)
+fn leading_decl_read(
+    read_pos: &HashMap<&str, Vec<usize>>,
+    decl_pos: &HashMap<&str, Vec<usize>>,
+    name: &str,
+    k: usize,
+) -> bool {
+    let Some(reads) = read_pos.get(name) else { return false };
+    let Some(&r) = reads.iter().find(|&&r| r > k) else { return false };
+    match decl_pos.get(name) {
+        None => true,
+        Some(decls) => match decls.iter().find(|&&d| d > k) {
+            None => true,
+            Some(&d) => r < d,
+        },
     }
-    false
 }
 
-fn stmt_read(st: &Stmt, name: &str, shadowed: bool) -> bool {
+// Borrowed-name set: the identifiers live in the Program (alive for the
+// whole pass), so the read/declared sets hold &str — no per-identifier
+// String clones (the clone+drop churn showed up in the profile as the
+// sip/hash_one + Vec<u8> drop hotspots). RandomState (the std default)
+// is kept — the sets are keyed by script identifiers, and the std's
+// per-process seed is the deliberate hash-flooding defence.
+type ReadSet<'a> = std::collections::HashSet<&'a str>;
+
+/// The names a statement LIST reads, with the list-level shadowing: a
+/// `let x` shadows `x` for the remaining statements.
+fn stmts_read_set<'a>(stmts: &'a [Stmt], shadow: &ReadSet<'a>) -> ReadSet<'a> {
+    let mut out = ReadSet::new();
+    let mut sh = shadow.clone();
+    for st in stmts {
+        out.extend(stmt_read_set(st, &sh));
+        sh.extend(stmt_declared_set(st));
+    }
+    out
+}
+
+/// The names a statement subtree reads, honouring shadowing — the
+/// set-based twin of the per-name `stmt_read` walk (a `let x` in a block
+/// shadows the rest of the block; loop inits / for-of lefts shadow their
+/// bodies; a catch param shadows its handler).
+fn stmt_read_set<'a>(st: &'a Stmt, shadow: &ReadSet<'a>) -> ReadSet<'a> {
     match st {
-        Stmt::ExpressionStatement { expression } => expr_read(expression, name, shadowed),
-        Stmt::BlockStatement { body } => stmts_read(body, name, shadowed),
+        Stmt::ExpressionStatement { expression } => expr_read_set(expression, shadow),
+        Stmt::BlockStatement { body } => stmts_read_set(body, shadow),
         Stmt::IfStatement { test, consequent, alternate } => {
-            expr_read(test, name, shadowed)
-                || stmt_read(consequent, name, shadowed)
-                || alternate
-                    .as_ref()
-                    .map(|a| stmt_read(a, name, shadowed))
-                    .unwrap_or(false)
+            let mut out = expr_read_set(test, shadow);
+            out.extend(stmt_read_set(consequent, shadow));
+            if let Some(a) = alternate {
+                out.extend(stmt_read_set(a, shadow));
+            }
+            out
         }
         Stmt::SwitchStatement { discriminant, cases } => {
-            expr_read(discriminant, name, shadowed)
-                || cases.iter().any(|c| {
-                    c.test
-                        .as_ref()
-                        .map(|t| expr_read(t, name, shadowed))
-                        .unwrap_or(false)
-                        || stmts_read(&c.consequent, name, shadowed)
-                })
+            let mut out = expr_read_set(discriminant, shadow);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    out.extend(expr_read_set(t, shadow));
+                }
+                out.extend(stmts_read_set(&c.consequent, shadow));
+            }
+            out
         }
         Stmt::WhileStatement { test, body } => {
-            expr_read(test, name, shadowed) || stmt_read(body, name, shadowed)
+            let mut out = expr_read_set(test, shadow);
+            out.extend(stmt_read_set(body, shadow));
+            out
         }
         Stmt::DoWhileStatement { test, body } => {
-            expr_read(test, name, shadowed) || stmt_read(body, name, shadowed)
+            let mut out = expr_read_set(test, shadow);
+            out.extend(stmt_read_set(body, shadow));
+            out
         }
-        Stmt::TryStatement {
-            block,
-            handler,
-            finalizer,
-        } => {
-            stmt_read(block, name, shadowed)
-                || handler.as_ref().map(|h| {
-                    let param_shadows = h
-                        .param
-                        .as_ref()
-                        .map(|p| expr_read(p, name, false))
-                        .unwrap_or(false);
-                    stmt_read(&h.body, name, shadowed || param_shadows)
-                }).unwrap_or(false)
-                || finalizer
-                    .as_ref()
-                    .map(|f| stmt_read(f, name, shadowed))
-                    .unwrap_or(false)
+        Stmt::TryStatement { block, handler, finalizer } => {
+            let mut out = stmt_read_set(block, shadow);
+            if let Some(h) = handler {
+                let mut h_shadow = shadow.clone();
+                if let Some(p) = &h.param {
+                    // the catch param binds its own name — reads of that
+                    // name inside the handler are the handler's binding
+                    h_shadow.extend(expr_read_set(p, &ReadSet::new()));
+                }
+                out.extend(stmt_read_set(&h.body, &h_shadow));
+            }
+            if let Some(f) = finalizer {
+                out.extend(stmt_read_set(f, shadow));
+            }
+            out
         }
         Stmt::ForStatement { init, test, update, body } => {
-            let declares = stmt_declares(init, name);
-            stmt_read(init, name, shadowed)
-                || expr_read(test, name, shadowed || declares)
-                || expr_read(update, name, shadowed || declares)
-                || stmt_read(body, name, shadowed || declares)
+            let mut out = stmt_read_set(init, shadow);
+            let declares = stmt_declared_set(init);
+            let mut inner = shadow.clone();
+            inner.extend(declares);
+            out.extend(expr_read_set(test, &inner));
+            out.extend(expr_read_set(update, &inner));
+            out.extend(stmt_read_set(body, &inner));
+            out
         }
         Stmt::ForOfStatement { left, right, body } => {
-            let declares = stmt_declares(left, name);
-            stmt_read(left, name, shadowed)
-                || expr_read(right, name, shadowed)
-                || stmt_read(body, name, shadowed || declares)
+            let mut out = stmt_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            let declares = stmt_declared_set(left);
+            let mut inner = shadow.clone();
+            inner.extend(declares);
+            out.extend(stmt_read_set(body, &inner));
+            out
         }
-        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| match &d.init {
-            Some(init) => expr_read(init, name, shadowed),
-            None => false,
-        }),
-        Stmt::ReturnStatement { argument } => argument
-            .as_ref()
-            .map(|a| expr_read(a, name, shadowed))
-            .unwrap_or(false),
-        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => false,
-        Stmt::ThrowStatement { argument } => expr_read(argument, name, shadowed),
+        Stmt::VariableDeclaration { declarations, .. } => {
+            let mut out = ReadSet::new();
+            for d in declarations {
+                if let Some(init) = &d.init {
+                    out.extend(expr_read_set(init, shadow));
+                }
+            }
+            out
+        }
+        Stmt::ReturnStatement { argument } => match argument {
+            Some(a) => expr_read_set(a, shadow),
+            None => ReadSet::new(),
+        },
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => ReadSet::new(),
+        Stmt::ThrowStatement { argument } => expr_read_set(argument, shadow),
     }
 }
 
-fn stmt_declares(st: &Stmt, name: &str) -> bool {
-    match st {
-        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
-            matches!(&d.id, Expr::Identifier { name: n } if n == name)
-        }),
-        Stmt::ForStatement { init, .. } => stmt_declares(init, name),
-        Stmt::ForOfStatement { left, .. } => stmt_declares(left, name),
-        // The catch param shadows only INSIDE the handler (JS scoping) —
-        // it does not declare `name` for the enclosing list, so later
-        // statements' reads of a lifted `name` stay visible.
-        _ => false,
-    }
-}
-
-fn expr_read(e: &Expr, name: &str, shadowed: bool) -> bool {
+/// The names an expression subtree reads, honouring shadowing — the
+/// set-based twin of the per-name `expr_read` walk (arrow params and
+/// arrow-body declarations shadow inside the arrow).
+fn expr_read_set<'a>(e: &'a Expr, shadow: &ReadSet<'a>) -> ReadSet<'a> {
     match e {
-        Expr::Identifier { name: n } => !shadowed && n == name,
-        Expr::Literal { .. } => false,
+        Expr::Identifier { name } => {
+            let mut out = ReadSet::new();
+            if !shadow.contains(name.as_str()) {
+                out.insert(name.as_str());
+            }
+            out
+        }
+        Expr::Literal { .. } => ReadSet::new(),
         Expr::TemplateLiteral { expressions, .. } => {
-            expressions.iter().any(|x| expr_read(x, name, shadowed))
+            let mut out = ReadSet::new();
+            for x in expressions {
+                out.extend(expr_read_set(x, shadow));
+            }
+            out
         }
         Expr::CallExpression { callee, arguments, .. } => {
-            expr_read(callee, name, shadowed)
-                || arguments.iter().any(|a| expr_read(a, name, shadowed))
+            let mut out = expr_read_set(callee, shadow);
+            for a in arguments {
+                out.extend(expr_read_set(a, shadow));
+            }
+            out
         }
         Expr::MemberExpression { object, property, .. } => {
-            expr_read(object, name, shadowed) || expr_read(property, name, shadowed)
+            let mut out = expr_read_set(object, shadow);
+            out.extend(expr_read_set(property, shadow));
+            out
         }
-        Expr::AwaitExpression { argument } => expr_read(argument, name, shadowed),
+        Expr::AwaitExpression { argument } => expr_read_set(argument, shadow),
         Expr::ArrowFunctionExpression { params, body, .. } => {
-            let p_shadows = params
-                .iter()
-                .any(|p| matches!(p, Expr::Identifier { name: n } if n == name));
-            let b_shadows = arrow_body_declares(body, name);
-            arrow_body_read(body, name, shadowed || p_shadows || b_shadows)
+            let mut inner = shadow.clone();
+            for p in params {
+                inner.extend(expr_read_set(p, &ReadSet::new()));
+            }
+            inner.extend(arrow_body_declared_set(body));
+            arrow_body_read_set(body, &inner)
         }
-        Expr::ObjectExpression { properties } => properties.iter().any(|p| {
-            expr_read(&p.value, name, shadowed)
-                || (p.computed && expr_read(&p.key, name, shadowed))
-        }),
+        Expr::ObjectExpression { properties } => {
+            let mut out = ReadSet::new();
+            for p in properties {
+                out.extend(expr_read_set(&p.value, shadow));
+                if p.computed {
+                    out.extend(expr_read_set(&p.key, shadow));
+                }
+            }
+            out
+        }
         Expr::ArrayExpression { elements } => {
-            elements.iter().flatten().any(|x| expr_read(x, name, shadowed))
+            let mut out = ReadSet::new();
+            for x in elements.iter().flatten() {
+                out.extend(expr_read_set(x, shadow));
+            }
+            out
         }
-        Expr::SpreadElement { argument } => expr_read(argument, name, shadowed),
+        Expr::SpreadElement { argument } => expr_read_set(argument, shadow),
         Expr::LogicalExpression { left, right, .. } => {
-            expr_read(left, name, shadowed) || expr_read(right, name, shadowed)
+            let mut out = expr_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            out
         }
         Expr::BinaryExpression { left, right, .. } => {
-            expr_read(left, name, shadowed) || expr_read(right, name, shadowed)
+            let mut out = expr_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            out
         }
         Expr::AssignmentExpression { left, right, .. } => {
-            expr_read(left, name, shadowed) || expr_read(right, name, shadowed)
+            // the assignment target counts as a read (conservative —
+            // any reference keeps the declaration), matching the old walk
+            let mut out = expr_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            out
         }
         Expr::ConditionalExpression { test, consequent, alternate, .. } => {
-            expr_read(test, name, shadowed)
-                || expr_read(consequent, name, shadowed)
-                || expr_read(alternate, name, shadowed)
+            let mut out = expr_read_set(test, shadow);
+            out.extend(expr_read_set(consequent, shadow));
+            out.extend(expr_read_set(alternate, shadow));
+            out
         }
-        Expr::UnaryExpression { argument, .. } => expr_read(argument, name, shadowed),
+        Expr::UnaryExpression { argument, .. } => expr_read_set(argument, shadow),
         Expr::SequenceExpression { expressions } => {
-            expressions.iter().any(|x| expr_read(x, name, shadowed))
+            let mut out = ReadSet::new();
+            for x in expressions {
+                out.extend(expr_read_set(x, shadow));
+            }
+            out
         }
         Expr::NewExpression { callee, arguments, .. } => {
-            expr_read(callee, name, shadowed)
-                || arguments.iter().any(|a| expr_read(a, name, shadowed))
+            let mut out = expr_read_set(callee, shadow);
+            for a in arguments {
+                out.extend(expr_read_set(a, shadow));
+            }
+            out
         }
     }
 }
 
-fn arrow_body_read(body: &ArrowBody, name: &str, shadowed: bool) -> bool {
+fn arrow_body_read_set<'a>(body: &'a ArrowBody, shadow: &ReadSet<'a>) -> ReadSet<'a> {
     match body {
-        ArrowBody::Expr(e) => expr_read(e, name, shadowed),
-        ArrowBody::Block(b) => stmt_read(b, name, shadowed),
+        ArrowBody::Expr(e) => expr_read_set(e, shadow),
+        ArrowBody::Block(b) => stmt_read_set(b, shadow),
     }
 }
 
-fn arrow_body_declares(body: &ArrowBody, name: &str) -> bool {
+fn arrow_body_declared_set<'a>(body: &'a ArrowBody) -> ReadSet<'a> {
     match body {
-        ArrowBody::Expr(_) => false,
-        ArrowBody::Block(b) => block_declares(b, name),
+        ArrowBody::Expr(_) => ReadSet::new(),
+        ArrowBody::Block(b) => block_declared_set(b),
     }
 }
 
-fn block_declares(st: &Stmt, name: &str) -> bool {
+fn block_declared_set<'a>(st: &'a Stmt) -> ReadSet<'a> {
     match st {
-        Stmt::BlockStatement { body } => body.iter().any(|s| stmt_declares(s, name)),
-        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
-            matches!(&d.id, Expr::Identifier { name: n } if n == name)
-        }),
-        _ => false,
+        Stmt::BlockStatement { body } => {
+            let mut out = ReadSet::new();
+            for s in body {
+                out.extend(stmt_declared_set(s));
+            }
+            out
+        }
+        Stmt::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .filter_map(|d| match &d.id {
+                Expr::Identifier { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => ReadSet::new(),
+    }
+}
+
+fn stmt_declared_set<'a>(st: &'a Stmt) -> ReadSet<'a> {
+    match st {
+        Stmt::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .filter_map(|d| match &d.id {
+                Expr::Identifier { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect(),
+        Stmt::ForStatement { init, .. } => stmt_declared_set(init),
+        Stmt::ForOfStatement { left, .. } => stmt_declared_set(left),
+        _ => ReadSet::new(),
     }
 }

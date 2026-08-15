@@ -13984,7 +13984,7 @@ pub fn shir_to_estree_json(prog: &IrProgram) -> Result<String, serde_json::Error
     // the A1 path). The pass's return-conversion is now keyed on LOOP-BODY
     // arrows only (the in_loop flag), so frontend VALUE-returning arrows
     // (zig `__fn_f`, the py ArrayComp IIFE, C fnValue) keep native returns.
-    serde_json::to_string(&fix_control_flow(shir_to_estree(prog)))
+    Ok(crate::estree::estree_to_json(&fix_control_flow(shir_to_estree(prog))))
 }
 
 /// Classification of a case-pattern string for the native lowering.
@@ -14402,6 +14402,12 @@ fn try_native_case(discriminant: &IrExpr, clauses: &[IrCaseClause], nocase: bool
     // (one exec per case evaluation, exactly the runtime's per-evaluation
     // globMatch); the exec runs on the SAME coerced value string the
     // length compare uses, so that const is declared once too.
+    // The map keeps RandomState (the std per-process seed — a
+    // deliberate hash-flooding defence; the keys are script patterns).
+    // Iteration order is NOT used for the emitted code: the `$g{i}`
+    // const declarations are emitted sorted below so the transpiled
+    // OUTPUT is deterministic run-to-run (corpus pins, caches and the
+    // dead-decl pass all assume stable output).
     let glob_temps: HashMap<String, String> = pats
         .iter()
         .flatten()
@@ -14422,9 +14428,13 @@ fn try_native_case(discriminant: &IrExpr, clauses: &[IrCaseClause], nocase: bool
             init: Some(value_expr(CASE_TMP)),
         }],
     });
-    let glob_decls: Vec<Stmt> = glob_temps
-        .iter()
-        .map(|(re, temp)| Stmt::VariableDeclaration {
+    let mut glob_keys: Vec<&String> = glob_temps.keys().collect();
+    glob_keys.sort(); // deterministic output order (never the HashMap's)
+    let glob_decls: Vec<Stmt> = glob_keys
+        .into_iter()
+        .map(|re| {
+            let temp = glob_temps.get(re).expect("glob temp precomputed");
+            Stmt::VariableDeclaration {
             kind: "const",
             declarations: vec![VariableDeclarator {
                 type_: "VariableDeclarator",
@@ -14444,6 +14454,7 @@ fn try_native_case(discriminant: &IrExpr, clauses: &[IrCaseClause], nocase: bool
                     optional: false,
                 }),
             }],
+            }
         })
         .collect();
     let pat_test = |pat: &CasePat| -> Expr {
