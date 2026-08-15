@@ -915,18 +915,11 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
 
     // Imports (`use` statements).
     // Auto-derive `use feature 'say'` if any Output { newline: true } exists.
+    // The three modern-IR preamble imports (Carp / English / IPC::Open3) are
+    // appended AFTER the body is rendered, gated on the actual generated
+    // text (see below); the emission also happens after the body render so
+    // the gate has a complete view.
     let mut imports = prog.imports.clone();
-    if modern_ir {
-        // Modern-IR program (`--shir` → `--shir-in-perl`): the JSON contract
-        // carries no import list, so add the standard preamble the emitted
-        // Perl expects (mirrors the Generator's preamble).
-        imports.extend([
-            "Carp".to_string(),
-            "English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME)"
-                .to_string(),
-            "IPC::Open3".to_string(),
-        ]);
-    }
     if prog_uses_say(&stmts) {
         let needs_say = !imports.iter().any(|i| i.contains("feature"));
         if needs_say {
@@ -944,6 +937,89 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     if needs_hostname {
         imports.push("Sys::Hostname qw(hostname)".to_string());
     }
+
+    // ── Body ────────────────────────────────────────────────────────
+    // Render statements + subs + exit into a `body` buffer FIRST so the
+    // modern-IR preamble can be scanned against the ACTUAL generated text:
+    // the emitter splices the infrastructure vars (`$main_exit_code`,
+    // `$CHILD_ERROR`, `$__argc`, `$ls_success`, `$output`,
+    // `$__nocasematch`) into format strings, so a textual scan of the
+    // rendered body is the only reliable oracle for whether each preamble
+    // declaration is needed.
+    let mut body = String::new();
+    // Top-level statements
+    for (idx, stmt) in stmts.iter().enumerate() {
+        let line = prog
+            .stmt_lines
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, l)| *l);
+        let before = body.len();
+        emit_stmt(&mut body, stmt, 0);
+        if let Some(l) = line {
+            // a SHORT comment at the end of the statement's first line:
+            // `$sum += $i;  # line 7` — the source-mapping convention
+            let added = &body[before..];
+            if let Some(nl) = added.find('\n') {
+                body.insert_str(before + nl, &format!("  # line {l}"));
+            }
+        }
+    }
+    body.push('\n');
+
+    // Subroutines
+    for sub in &prog.subs {
+        emit_sub(&mut body, sub);
+        body.push('\n');
+    }
+
+    // Exit — only if $main_exit_code might be non-zero (i.e. if any
+    // statement references it).  For scripts that never touch it,
+    // omit the exit so Perl's default exit(0) applies.
+    let has_main_exit = modern_ir
+        || stmts.iter().any(|s| stmt_refers_to_main_exit(s))
+        || prog
+            .subs
+            .iter()
+            .any(|sub| sub.body.iter().any(|s| stmt_refers_to_main_exit(s)));
+    if has_main_exit {
+        body.push_str("exit $main_exit_code;\n");
+    }
+
+    if modern_ir {
+        // Modern-IR program (`--shir` → `--shir-in-perl`): the JSON contract
+        // carries no import list, so add the standard preamble imports ONLY
+        // when the rendered body actually uses them — `use Carp` for a
+        // carp/croak-style Warn/Die (the rm emulation emits
+        // `carp "rm: carping: …"`), `use English` for the long
+        // $OS_ERROR/$ERRNO/... names, `use IPC::Open3` for open3 (never
+        // emitted on the IR path today — shell-outs go through
+        // `system('bash','-c',…)`).
+        if body.contains("carp") || body.contains("croak") {
+            imports.push("Carp".to_string());
+        }
+        if [
+            "$ERRNO",
+            "$EVAL_ERROR",
+            "$INPUT_RECORD_SEPARATOR",
+            "$OS_ERROR",
+            "$PROGRAM_NAME",
+        ]
+        .iter()
+        .any(|n| body.contains(n))
+        {
+            imports.push(
+                "English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME)"
+                    .to_string(),
+            );
+        }
+        if body.contains("open3") {
+            imports.push("IPC::Open3".to_string());
+        }
+    }
+
+    // Emit the imports (every decision input — the body scan, `say`, and
+    // the hostname analysis — is computed by now).
     for import in &imports {
         out.push_str(&format!("use {};\n", import));
     }
@@ -962,21 +1038,33 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         out.push('\n');
     }
 
-    // Top-level variable declarations from usage analysis
-    // (emitted by generator as Declare stmts, handled below)
-
-    // Modern-IR preamble: the status-trackers the emitted statements use.
+    // Modern-IR preamble: only the infrastructure variables the rendered
+    // body actually references.  (The previous version emitted all of them
+    // unconditionally — `$ls_success`/`$output` are dead on the IR path,
+    // `$__argc` is only needed for `$#` reads, `$__nocasematch` only for
+    // shopt/case-nocasematch lowering.)
     if modern_ir {
-        out.push_str("my $main_exit_code = 0;\n");
-        out.push_str("our $CHILD_ERROR = 0;\n");
-        // Snapshot the positional-arg count BEFORE any $ARGV[n] read (the
-        // magic @ARGV extends on indexed reads, corrupting scalar(@ARGV)).
-        out.push_str("my $__argc = @ARGV;\n");
-        // Preamble vars the Generator's per-command emulations expect (ls
-        // tracks success; the pipeline machinery accumulates stdout).
-        out.push_str("my $ls_success = 0;\n");
-        out.push_str("my $output = '';\n");
-        out.push_str("my $__nocasematch = 0;\n");
+        if body.contains("$main_exit_code") {
+            out.push_str("my $main_exit_code = 0;\n");
+        }
+        if body.contains("$CHILD_ERROR") {
+            out.push_str("our $CHILD_ERROR = 0;\n");
+        }
+        if body.contains("$__argc") {
+            // Snapshot the positional-arg count BEFORE any $ARGV[n] read
+            // (the magic @ARGV extends on indexed reads, corrupting
+            // scalar(@ARGV)).
+            out.push_str("my $__argc = @ARGV;\n");
+        }
+        if body.contains("$ls_success") {
+            out.push_str("my $ls_success = 0;\n");
+        }
+        if body.contains("$output") {
+            out.push_str("my $output = '';\n");
+        }
+        if body.contains("$__nocasematch") {
+            out.push_str("my $__nocasematch = 0;\n");
+        }
         // Hoisted declarations for assigned variables (use strict).
         let mut vars = Vec::new();
         collect_assigned_vars(&stmts, &mut vars);
@@ -1006,44 +1094,8 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         out.push('\n');
     }
 
-    // Top-level statements
-    for (idx, stmt) in stmts.iter().enumerate() {
-        let line = prog
-            .stmt_lines
-            .iter()
-            .find(|(i, _)| *i == idx)
-            .map(|(_, l)| *l);
-        let before = out.len();
-        emit_stmt(&mut out, stmt, 0);
-        if let Some(l) = line {
-            // a SHORT comment at the end of the statement's first line:
-            // `$sum += $i;  # line 7` — the source-mapping convention
-            let added = &out[before..];
-            if let Some(nl) = added.find('\n') {
-                out.insert_str(before + nl, &format!("  # line {l}"));
-            }
-        }
-    }
-    out.push('\n');
-
-    // Subroutines
-    for sub in &prog.subs {
-        emit_sub(&mut out, sub);
-        out.push('\n');
-    }
-
-    // Exit — only if $main_exit_code might be non-zero (i.e. if any
-    // statement references it).  For scripts that never touch it,
-    // omit the exit so Perl's default exit(0) applies.
-    let has_main_exit = modern_ir
-        || stmts.iter().any(|s| stmt_refers_to_main_exit(s))
-        || prog
-            .subs
-            .iter()
-            .any(|sub| sub.body.iter().any(|s| stmt_refers_to_main_exit(s)));
-    if has_main_exit {
-        out.push_str("exit $main_exit_code;\n");
-    }
+    // Append the rendered body (statements + subs + exit).
+    out.push_str(&body);
 
     // Restore brace balance — some generated code paths may produce
     // unbalanced delimiters, so add missing closing braces as a safety net.
@@ -1059,6 +1111,257 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     }
 
     out
+}
+
+// ── Embed profile (the purify design, PLAN §10) ───────────────────────
+//
+// A shell snippet rendered as a FRAGMENT inside a host program (purify:
+// replace `system("")` / backtick-like constructs with native code for any
+// host language). Statements only — no shebang, pragmas, imports, preamble,
+// or exit. Host-scope names are reused as bare `$x`; everything else is
+// declared locally with bash-subshell semantics (docs/embed-contract.md).
+
+/// Embedding context. Stage 1 implements the `Backtick` profile (`System` /
+/// `Popen` are reserved; the construct-visibility spec is in
+/// `docs/embed-contract.md`).
+#[derive(Default, Clone, Debug)]
+pub struct EmbedCtx {
+    /// Names the host program declares in the enclosing scope (the
+    /// harvester's membership list, v1: file-wide). A name the snippet
+    /// READS is reused as a bare `$x` when present here (bash subshells see
+    /// the parent's value); absent names are declared locally (`my $x = '';`
+    /// — bash unset = empty).
+    pub host_scope: Vec<String>,
+    /// Backtick semantics (Perl `qx`): trailing newlines are PRESERVED
+    /// (bash `$()` strips them). False keeps the standalone `$()`-style
+    /// stripping.
+    pub backtick_newlines: bool,
+    /// Emit English.pm names (`$INPUT_RECORD_SEPARATOR` …) or normalize to
+    /// the core vars (`$/` …) so the fragment is valid in host files that
+    /// don't `use English`.
+    pub english_names: bool,
+}
+
+/// What the enclosing host construct is — decides the var-visibility and
+/// IO semantics the fragment must reproduce (spec: docs/embed-contract.md).
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedConstruct {
+    /// `` `cmd` `` / `$(cmd)` — subshell: parent vars visible to reads,
+    /// writes discarded.
+    #[default]
+    Backtick,
+    /// `system("cmd")` — child process: only env visible. (Reserved.)
+    System,
+    /// `popen` / `open("|cmd")` — stream handle. (Reserved.)
+    Popen,
+}
+
+#[derive(Default, Debug)]
+pub struct EmbedResult {
+    pub fragment: String,
+    /// Names the fragment reads from the host scope (bare `$x` reuse or
+    /// `my $x = $x;` copy-in). The bindings gate —
+    /// `required_host_bindings ⊆ ctx.host_scope` — turns a renderer bug
+    /// (bare `$x` for a name the caller did not list) into a hard failure.
+    pub required_host_bindings: Vec<String>,
+    /// Snippet features the embed profile cannot render (preamble-var
+    /// dependencies, functions, `exit`, …). The caller falls back (e.g. to
+    /// `exec('sh', '-c', …)`), exactly like today's purify rejections — but
+    /// analysis-driven, not regex-driven.
+    pub refusals: Vec<String>,
+}
+
+/// Render a shell snippet as an embeddable Perl fragment. Deterministic:
+/// declaration order follows the Vec-based first-seen order of
+/// `collect_assigned_vars` / `collect_read_vars_stmts` — never hash order
+/// (the legacy `Generator`'s HashSet iteration was 30/30 flaky across
+/// processes).
+pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
+    let mut result = EmbedResult::default();
+
+    // The snippet is its own mini-program: the same lowering + optimize as
+    // the standalone renderer (strip_cfor is a no-op for embed inputs but
+    // keeps the shared pass honest).
+    let mut stripped = prog.clone();
+    crate::shir_passes::strip_cfor(&mut stripped);
+    let stmts = optimize_stmts(&stripped.stmts);
+
+    // Refuse constructs that only make sense in a standalone program (v1):
+    // an explicit `exit` would kill the HOST process; a function definition
+    // needs a host-scope binding (name collisions); a background job forks
+    // and exits.
+    for s in &stmts {
+        match s {
+            IrStmt::Exit { .. } => result.refusals.push("exit statement".into()),
+            IrStmt::Function { name, .. } => {
+                result.refusals.push(format!("function `{name}` definition"))
+            }
+            IrStmt::Background(_) => result.refusals.push("background job".into()),
+            _ => {}
+        }
+    }
+
+    // Bash-subshell declaration rules (spec: docs/embed-contract.md §"var
+    // visibility"): reads see the host value, writes are fragment-local.
+    //   read-only ∧ host → bare `$x` reuse                  (required binding)
+    //   read-only ∧ ¬host → `my $x = '';`   (bash unset = empty)
+    //   written  ∧ host → `my $x = $x;`     copy-in, writes stay local
+    //   written  ∧ ¬host → `my $x;`
+    // Order: assigned-first-then-read-only, mirroring the standalone
+    // preamble (Vec-based, deterministic).
+    let mut vars = Vec::new();
+    collect_assigned_vars(&stmts, &mut vars);
+    let mut read_vars = Vec::new();
+    collect_read_vars_stmts(&stmts, &mut read_vars);
+    for (n, s) in read_vars {
+        if !vars.iter().any(|(vn, _)| vn == &n) {
+            vars.push((n, s));
+        }
+    }
+    let mut decls = String::new();
+    for (name, sigil) in &vars {
+        let written = collect_assigned_vars_contains(&stmts, name);
+        let in_host = ctx.host_scope.iter().any(|h| h == name);
+        let sigil_str = match sigil {
+            Sigil::Scalar => "$",
+            Sigil::Array => "@",
+            Sigil::Hash => "%",
+        };
+        if written {
+            if in_host {
+                // copy-in: reads see the host value, writes stay local
+                decls.push_str(&format!(
+                    "my {sigil_str}{name} = {sigil_str}{name};\n"
+                ));
+                result.required_host_bindings.push(name.clone());
+            } else {
+                decls.push_str(&format!("my {sigil_str}{name};\n"));
+            }
+        } else if in_host {
+            // reuse: bare reads resolve to the enclosing scope
+            result.required_host_bindings.push(name.clone());
+        } else {
+            match sigil {
+                Sigil::Scalar => decls.push_str(&format!("my ${name} = '';\n")),
+                Sigil::Array => decls.push_str(&format!("my @{name};\n")),
+                Sigil::Hash => decls.push_str(&format!("my %{name};\n")),
+            }
+        }
+    }
+
+    let mut out = String::new();
+    // The whole fragment lives in a `do { … }` block: a fresh scope, so the
+    // copy-in declarations (`my $x = $x;`) get their OWN lexical — in the
+    // host's same scope a second `my $x` would mask-REUSE the host pad slot
+    // and the snippet's writes would leak out (bash subshell semantics:
+    // writes must not escape). This is the same shape purify.pl's `__bt(do
+    // { … })` wrapper already imposes.
+    out.push_str("do {\n");
+    if !decls.is_empty() {
+        for line in decls.lines() {
+            if !line.is_empty() {
+                out.push_str("    ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    for s in &stmts {
+        emit_stmt(&mut out, s, 1);
+    }
+    out.push_str("};\n");
+
+    // ── post-render rewrites (each mirrors a purify.pl heuristic that the
+    // renderer now owns; the refusal scan below is the analysis-driven
+    // replacement for purify's regex rejections) ──────────────────────
+
+    // `$main_exit_code = $CHILD_ERROR = X;` → `$CHILD_ERROR = X;` — the
+    // standalone exit tracker is dead in an embed (the host owns its own
+    // exit); the status mirror stays.
+    out = out.replace(
+        "$main_exit_code = $CHILD_ERROR = ",
+        "$CHILD_ERROR = ",
+    );
+
+    if ctx.backtick_newlines {
+        // Perl `qx` does NOT strip trailing newlines (bash `$()` does); the
+        // standalone's command-substitution chomp is wrong inside a Perl
+        // backtick replacement.
+        out = out.replace("chomp $_r; ", "");
+    }
+
+    if !ctx.english_names {
+        out = out
+            .replace("$INPUT_RECORD_SEPARATOR", "$/")
+            .replace("$OS_ERROR", "$!")
+            .replace("$ERRNO", "$!")
+            .replace("$EVAL_ERROR", "$@");
+    }
+
+    if out.contains("$CHILD_ERROR") {
+        out.insert_str(0, "our $CHILD_ERROR = 0;\n");
+    }
+    // Command emulations call Carp's carp/croak/cluck/confess on error
+    // paths; the STANDALONE preamble imports Carp, an embed fragment has
+    // no preamble. Emit the import at the fragment top — `use` is
+    // compile-time and package-wide, and a duplicate `use Carp;` in a
+    // host that already imports it is a silent no-op (purify.pl's
+    // import-injection heuristic, minus the regex detection).
+    if regex::Regex::new(r"\b(?:carp|croak|cluck|confess)\b")
+        .unwrap()
+        .is_match(&out)
+    {
+        out.insert_str(0, "use Carp;\n");
+    }
+
+    // Standalone status-tracker writes that are DEAD in an embed: the ls
+    // emulation emits `$ls_success = 0/1;` and `$main_exit_code =
+    // $CHILD_ERROR;` (status flags the standalone exit logic consumes). In
+    // a fragment they'd be undeclared-var failures under `use strict` —
+    // drop the lines (they have no output side effect).
+    let ls_re = regex::Regex::new(r"(?m)^[ \t]*\$ls_success\s*=\s*[01];[ \t]*\n")
+        .unwrap();
+    out = ls_re.replace_all(&out, "").to_string();
+    let me_re = regex::Regex::new(r"(?m)^[ \t]*\$main_exit_code\s*=\s*\$CHILD_ERROR;[ \t]*\n")
+        .unwrap();
+    out = me_re.replace_all(&out, "").to_string();
+
+    // Standalone-only dependencies the fragment must not reference (the
+    // preamble declares them in a full program; an embed has no preamble).
+    for needle in [
+        "$main_exit_code",
+        "$__argc",
+        "$__nocasematch",
+        "$ls_success",
+        "$DATE_SNAPSHOT",
+    ] {
+        if out.contains(needle) {
+            result
+                .refusals
+                .push(format!("fragment references {needle} (standalone-only)"));
+        }
+    }
+    if regex::Regex::new(r"\bsay\s+")
+        .unwrap()
+        .is_match(&out)
+    {
+        result
+            .refusals
+            .push("fragment uses `say` (host may lack `use feature 'say'`)".into());
+    }
+    // A bare `exit` statement would terminate the HOST process (the snippet's
+    // `exit N` lowers to an exec call the renderer emits as Perl `exit`).
+    if regex::Regex::new(r#"(?m)^\s*exit[\s"]"#)
+        .unwrap()
+        .is_match(&out)
+    {
+        result.refusals.push("fragment contains a bare `exit`".into());
+    }
+
+    result.fragment = out;
+    result.required_host_bindings.sort();
+    result.required_host_bindings.dedup();
+    result
 }
 
 // ── Statement emitter ────────────────────────────────────────────────
@@ -1341,6 +1644,38 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     // (accepted divergence for this fallback).
                     let first_redirect = redirects.first();
                     match first_redirect {
+                        Some(r) if call_arg_str(&r.target).map_or(false, |t| t.starts_with('&')) => {
+                            // fd-dup redirect (`2>&1`, `1>&2`, …) on a
+                            // non-command inner (subshell block): dup stderr
+                            // to stdout — the backtick __bt capture pipe then
+                            // sees stderr too. The old code opened a FILE
+                            // named "&1" (mode w + the raw target).
+                            let mode = if r.mode == "r" { "'<&'" } else { "'>&'" };
+                            emit_indent(out, indent);
+                            out.push_str(&format!(
+                                "local *STDERR; open STDERR, {}, STDOUT or die \"Cannot dup stderr: $!\\n\";\n",
+                                mode
+                            ));
+                            for s in inner {
+                                emit_stmt(out, s, indent);
+                            }
+                        }
+                        Some(r) if call_arg_str(&r.target).map_or(false, |t| t.starts_with('&')) => {
+                            // fd-dup redirect (`2>&1`, `1>&2`, …) on a
+                            // non-command inner (subshell block): dup stderr
+                            // to stdout — the backtick __bt capture pipe then
+                            // sees stderr too. The old code opened a FILE
+                            // named "&1" (mode w + the raw target).
+                            let mode = if r.mode == "r" { "'<&'" } else { "'>&'" };
+                            emit_indent(out, indent);
+                            out.push_str(&format!(
+                                "local *STDERR; open STDERR, {}, STDOUT or die \"Cannot dup stderr: $!\\n\";\n",
+                                mode
+                            ));
+                            for s in inner {
+                                emit_stmt(out, s, indent);
+                            }
+                        }
                         Some(r) if matches!(r.mode.as_str(), "w" | "a" | "r+") => {
                             let target = call_arg_str(&r.target).unwrap_or_default();
                             let mode = if r.mode == "a" { "'>>'" } else { "'>'" };
@@ -1679,16 +2014,35 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         expr: inner_expr, ..
                     } = expr
                     {
-                        let mut inner_str = ir_expr_to_perl(inner_expr);
-                        // Strip surrounding backticks from StrStyle::Command rendering
-                        if inner_str.starts_with('`')
-                            && inner_str.ends_with('`')
-                            && inner_str.len() >= 2
-                        {
-                            inner_str = inner_str[1..inner_str.len() - 1].to_string();
-                        }
-                        // Use open()-based code instead of qx{...} to avoid check_qx violations
-                        let open_expr = cmd_str_to_open_perl(&inner_str);
+                        // Prefer the REBUILT SHELL TEXT for Arrow bodies: the
+                        // old fallback rendered the Arrow as a Perl anonymous
+                        // sub (`sub { … }`) and fed it to bash -c — which is
+                        // not shell. Bash reported `sub: command not found`
+                        // (verified via `x=$(printf "%s\n" …)` and
+                        // `$(echo hi)` — the pre-existing capture bug).
+                        let shell_cmd = match inner_expr.as_ref() {
+                            IrExpr::Arrow(stmts) => stmts_to_shell_cmd(stmts),
+                            _ => None,
+                        };
+                        let open_expr = if let Some(cmd) = shell_cmd {
+                            cmd_str_to_open_perl(&cmd)
+                        } else if matches!(inner_expr.as_ref(), IrExpr::Arrow(_)) {
+                            // A non-rebuildable closure (dynamic exec / assign
+                            // body): its Perl rendering is not shell — refuse
+                            // loudly rather than emit the broken `sub {}` text.
+                            "die \"debashc: shIR capture not expressible as shell (Perl backend)\\n\"".to_string()
+                        } else {
+                            let mut inner_str = ir_expr_to_perl(inner_expr);
+                            // Strip surrounding backticks from StrStyle::Command rendering
+                            if inner_str.starts_with('`')
+                                && inner_str.ends_with('`')
+                                && inner_str.len() >= 2
+                            {
+                                inner_str = inner_str[1..inner_str.len() - 1].to_string();
+                            }
+                            // Use open()-based code instead of qx{...} to avoid check_qx violations
+                            cmd_str_to_open_perl(&inner_str)
+                        };
                         emit_indent(out, indent);
                         out.push_str(&format!("{} = {};\n", lhs, open_expr));
                     } else {
@@ -2765,6 +3119,7 @@ fn bash_word_for(w: &IrExpr) -> String {
                                 '"' => s.push_str("\\\""),
                                 '$' => s.push_str("\\$"),
                                 '`' => s.push_str("\\`"),
+                                c if is_byte_marker(c) => s.push_str(&byte_marker_escape(c)),
                                 c => s.push(c),
                             }
                         }
@@ -3367,16 +3722,24 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
         "r" => "<",
         _ => return false,
     };
-    // fd N → target &M means N>&M (fd dup).
+    // fd N → target &M means N>&M / N<&M (fd dup) — the op is the DIRECTION
+    // arrow, never the file mode (mode "w"/"a" would wrongly emit `2>>&1`,
+    // which is not bash — syntax error).
     if let Some(m) = target.strip_prefix('&') {
-        cmd.push_str(&format!(" {}>{}&{}", fd, op.trim_start_matches('<'), m));
+        let arrow = if op == "<" { "<&" } else { ">&" };
+        // NO space between the fd and the arrow: `2>&1` is the fd-dup
+        // redirect; `2 >&1` would make `2` a FILE argument (verified:
+        // mkdir got "cannot create directory '2'").
+        cmd.push_str(&format!(" {}{}{}", fd, arrow, m));
         return true;
     }
     let quoted = format!("'{}'", target.replace('\'', "'\\\\''"));
     let frag = match fd {
         0 => format!(" < {}", quoted),
-        1 => format!(" > {}", quoted),
-        n => format!(" {}> {}", n, quoted),
+        // `op` not `>`: the old hardcode rebuilt `>>` (append) as `>`
+        // (overwrite) — `echo B >> f` clobbered f.
+        1 => format!(" {} {}", op, quoted),
+        n => format!(" {}{} {}", n, op, quoted),
     };
     cmd.push_str(&frag);
     true
@@ -3459,10 +3822,15 @@ fn block_call_to_cmd(call: &IrExpr) -> Option<String> {
 /// Find the shell command string inside a block of stmts (exec, pipeline,
 /// or `&&`/`||` chain) — shared by Arrow bodies and Redirect inners.
 fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
+    // Join ALL rebuildable statements with `;` — a first-match return would
+    // drop the rest: `(echo a; echo b) | cat` lost `echo b` (examples/039
+    // "Process 2").
+    let mut parts = Vec::new();
     for s in stmts {
         if let IrStmt::Expr(inner) = s {
             if let Some(cmd) = expr_to_cmd(inner) {
-                return Some(cmd);
+                parts.push(cmd);
+                continue;
             }
         }
         if let IrStmt::For { var, iter, body } = s {
@@ -3471,13 +3839,27 @@ fn stmts_to_shell_cmd(stmts: &[IrStmt]) -> Option<String> {
             // original script.
             let iter_cmd = bash_word_for(iter);
             let body_cmd = stmts_to_shell_cmd(body)?;
-            return Some(format!(
+            parts.push(format!(
                 "for {} in {}; do {}; done",
                 var, iter_cmd, body_cmd
             ));
+            continue;
         }
+        if let IrStmt::Subshell(body) = s {
+            // `( … )` as a pipeline stage: `(echo a; echo b) | cat` — the
+            // subshell rebuilds as a parenthesized group.
+            let inner_cmd = stmts_to_shell_cmd(body)?;
+            parts.push(format!("( {inner_cmd} )"));
+            continue;
+        }
+        // a statement the rebuild can't express kills the whole command
+        return None;
     }
-    None
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
 }
 
 /// Rebuild a shell command string from a `pipeline` Call:
@@ -3570,7 +3952,7 @@ fn word_iter_to_perl(iter: &IrExpr) -> String {
 
 /// Lower a modern-IR `exec` Call in statement position.
 fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
-    let (cmd, words) = match call {
+    let (cmd, mut words) = match call {
         IrExpr::Call { args, .. } => match exec_call_parts(args) {
             Some(p) => p,
             None => {
@@ -3582,6 +3964,22 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         },
         _ => return,
     };
+    // The env-prefix Object arg (`VAR1=x cmd`) is NOT a word. bash semantics:
+    // the assignment applies ONLY to the command's CHILD processes — argument
+    // expansion sees the OLD value (`VAR1=x echo "$VAR1"` prints EMPTY). So
+    // for the in-Perl emulations (no children) the assignment is DEAD and
+    // must NOT precede the emulation (it would leak into the arg reads); the
+    // bash-c fallback emits it before system() so the child inherits it.
+    let mut env_pre = String::new();
+    words.retain(|w| match w {
+        IrExpr::Object(props) => {
+            for (k, v) in props {
+                env_pre.push_str(&format!("$ENV{{{}}} = {};\n", k, render_word(v)));
+            }
+            false
+        }
+        _ => true,
+    });
     match cmd.as_str() {
         "echo" => emit_echo(out, &words, indent),
         "printf" => {
@@ -3603,6 +4001,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                             '"' => f.push_str("\\\""),
                             '$' => f.push_str("\\$"),
                             '@' => f.push_str("\\@"),
+                            c if is_byte_marker(c) => f.push_str(&byte_marker_escape(c)),
                             c => f.push(c),
                         }
                     }
@@ -3639,6 +4038,9 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                                         '"' => f.push_str("\\\""),
                                         '$' => f.push_str("\\$"),
                                         '@' => f.push_str("\\@"),
+                                        c if is_byte_marker(c) => {
+                                            f.push_str(&byte_marker_escape(c))
+                                        }
                                         c => f.push(c),
                                     }
                                 }
@@ -3658,37 +4060,48 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             let has_split = words[1..]
                 .iter()
                 .any(|w| matches!(w, IrExpr::Call { func, .. } if func == "split"));
+            // placeholder count in the (rendered) format: a `%` not part of
+            // a `%%` pair is one conversion. Computed on the RENDERED literal
+            // so Interpolate formats (`"%s-%s\n"` → Interpolate Lit) count
+            // too — call_arg_str only sees plain Str formats.
+            let p = {
+                let cs: Vec<char> = fmt.chars().collect();
+                let mut n = 0;
+                let mut i = 0;
+                while i < cs.len() {
+                    if cs[i] == '%' {
+                        if i + 1 < cs.len() && cs[i + 1] == '%' {
+                            i += 2;
+                            continue;
+                        }
+                        n += 1;
+                    }
+                    i += 1;
+                }
+                n
+            };
             emit_indent(out, indent);
-            if rest.is_empty() {
+            if rest.is_empty() || p == 0 {
+                // no args, or no conversions: bash printf prints the format
+                // ONCE, ignoring the args (GNU printf 'x' a b → "x"); Perl
+                // printf(fmt) also interprets `%%` (a bare print would leak
+                // the literal `%%`).
                 out.push_str(&format!("printf({});\n", fmt));
-            } else if has_split {
+            } else if has_split || rest.len() > p {
                 // bash printf CYCLES the format over the whole arg list;
                 // Perl printf applies the format ONCE and discards extra
                 // args. Flatten the args (a split word expands to its
                 // fields in list context) and emit one printf per
                 // format-application, chunked by the placeholder count P
                 // (triage-perl t62_word_split: `printf "<%s>\\n" $x`
-                // with x="a b" → two lines).
+                // with x="a b" → two lines; same for plain literal args:
+                // `printf '%s\\n' a b c` → three lines).
                 static PA_SEQ: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
                 let tmp = format!(
                     "__sh2_pa{}",
                     PA_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 );
-                // placeholder count in the (rendered) format: a `%` not
-                // followed by `%` is one conversion (%% is a literal %).
-                let p = words
-                    .first()
-                    .and_then(|w| call_arg_str(w))
-                    .map(|s| {
-                        let cs: Vec<char> = s.chars().collect();
-                        cs.iter()
-                            .enumerate()
-                            .filter(|(i, c)| **c == '%' && cs.get(i + 1) != Some(&'%'))
-                            .count()
-                            .max(1)
-                    })
-                    .unwrap_or(1);
                 out.push_str(&format!("my @{tmp} = ({});\n", rest.join(", ")));
                 out.push_str(&format!(
                     "my ${tmp}_n = @{tmp} || 1;\n"
@@ -3871,6 +4284,12 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
                 }
             }
             let full = build_shell_cmd(&cmd, &words);
+            // the bash-c child inherits the env-prefix assignments
+            for line in env_pre.lines() {
+                emit_indent(out, indent);
+                out.push_str(line);
+                out.push('\n');
+            }
             emit_shell_cmd(out, indent, &full);
         }
     }
@@ -3913,6 +4332,7 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
                 '$' => s.push_str("\\$"),
                 '@' => s.push_str("\\@"),
                 '\n' => s.push_str("\\n"),
+                c if is_byte_marker(c) => s.push_str(&byte_marker_escape(c)),
                 _ => s.push(ch),
             }
         }
@@ -4784,17 +5204,46 @@ fn render_test_operand(tok: &str) -> String {
             match ch {
                 '"' => s.push_str("\\\""),
                 '\\' => s.push_str("\\\\"),
+                c if is_byte_marker(c) => s.push_str(&byte_marker_escape(c)),
                 _ => s.push(ch),
             }
         }
         s.push('"');
         s
+    } else if tok.chars().any(is_byte_marker) {
+        // Invalid-UTF-8 byte in a bare test operand: split out \xNN
+        // byte escapes (single quotes would keep them literal).
+        let mut out = String::from("'");
+        for ch in tok.chars() {
+            if is_byte_marker(ch) {
+                out.push_str(&format!("' . \"{}\" . '", byte_marker_escape(ch)));
+            } else if ch == '\'' {
+                out.push_str("\\'");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('\'');
+        out
     } else {
         format!("'{}'", tok.replace('\'', "\\\\'"))
     }
 }
 
 /// Render a Str literal (shared by ir_expr_to_perl and render_word).
+/// Private-use marker chars (U+E000+byte, from
+/// SharedUtils::bytes_to_marked_lossy — the A1 emit's invalid-UTF-8
+/// preservation, core request perl-20260814-175710) become `\xNN` BYTE
+/// escapes so non-UTF-8 source bytes round-trip byte-for-byte (bash treats
+/// scripts as byte streams).
+fn is_byte_marker(c: char) -> bool {
+    (0xE000..=0xE0FF).contains(&(c as u32))
+}
+
+fn byte_marker_escape(c: char) -> String {
+    format!("\\x{:02X}", (c as u32 - 0xE000) as u8)
+}
+
 fn render_str_literal(s: &str, style: &StrStyle) -> String {
     match style {
         StrStyle::SingleQuoted => {
@@ -4802,10 +5251,22 @@ fn render_str_literal(s: &str, style: &StrStyle) -> String {
             // escape quotes.  Escaping only `'` → `\'` is wrong when the
             // source has `\` before a quote: `\'` in the output would be
             // read by Perl as escaped-backslash + string CLOSE.
-            format!(
-                "'{}'",
-                s.replace("\\", "\\\\").replace('\'', "\\'")
-            )
+            // Byte markers break out into a double-quoted `\xNN` escape
+            // (single quotes do not interpolate).
+            let mut out = String::from("'");
+            for ch in s.chars() {
+                if is_byte_marker(ch) {
+                    out.push_str(&format!("' . \"{}\" . '", byte_marker_escape(ch)));
+                } else if ch == '\\' {
+                    out.push_str("\\\\");
+                } else if ch == '\'' {
+                    out.push_str("\\'");
+                } else {
+                    out.push(ch);
+                }
+            }
+            out.push('\'');
+            out
         }
         StrStyle::DoubleQuoted | StrStyle::Heredoc => {
             let mut escaped = String::from("\"");
@@ -4818,13 +5279,27 @@ fn render_str_literal(s: &str, style: &StrStyle) -> String {
                     '\n' => escaped.push_str("\\n"),
                     '\t' => escaped.push_str("\\t"),
                     '\r' => escaped.push_str("\\r"),
+                    c if is_byte_marker(c) => escaped.push_str(&byte_marker_escape(c)),
                     c => escaped.push(c),
                 }
             }
             escaped.push('"');
             escaped
         }
-        StrStyle::Command => format!("`{}`", s),
+        StrStyle::Command => {
+            // Backticks interpolate like double quotes, so \xNN byte
+            // escapes work here too.
+            let mut out = String::from("`");
+            for ch in s.chars() {
+                if is_byte_marker(ch) {
+                    out.push_str(&byte_marker_escape(ch));
+                } else {
+                    out.push(ch);
+                }
+            }
+            out.push('`');
+            out
+        }
     }
 }
 
@@ -5070,20 +5545,44 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     found
                 };
                 if has_leading_zero {
-                    format!(
-                        "q{{{}}}",
-                        s.replace("\\", "\\\\")
-                            .replace("{", "\\{")
-                            .replace("}", "\\}")
-                    )
+                    // q{...} is literal (no interpolation): markers must
+                    // break out into a double-quoted \xNN byte escape.
+                    let mut out = String::from("q{");
+                    for ch in s.chars() {
+                        if is_byte_marker(ch) {
+                            out.push_str(&format!("}}\n\"{}\"\nq{{", byte_marker_escape(ch)));
+                        } else if ch == '\\' {
+                            out.push_str("\\\\");
+                        } else if ch == '{' {
+                            out.push_str("\\{");
+                        } else if ch == '}' {
+                            out.push_str("\\}");
+                        } else {
+                            out.push(ch);
+                        }
+                    }
+                    out.push('}');
+                    out
                 } else {
                     // Double backslashes FIRST, then escape quotes: `\\'` in
                     // the output would otherwise be read as escaped-backslash
                     // + string CLOSE (see render_str_literal).
-                    format!(
-                        "'{}'",
-                        s.replace("\\", "\\\\").replace('\'', "\\'")
-                    )
+                    // Markers break out into a double-quoted \xNN byte
+                    // escape (single quotes do not interpolate).
+                    let mut out = String::from("'");
+                    for ch in s.chars() {
+                        if is_byte_marker(ch) {
+                            out.push_str(&format!("' . \"{}\" . '", byte_marker_escape(ch)));
+                        } else if ch == '\\' {
+                            out.push_str("\\\\");
+                        } else if ch == '\'' {
+                            out.push_str("\\'");
+                        } else {
+                            out.push(ch);
+                        }
+                    }
+                    out.push('\'');
+                    out
                 }
             }
             StrStyle::DoubleQuoted => {
@@ -5101,13 +5600,28 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         '\n' => escaped.push_str("\\n"),
                         '\t' => escaped.push_str("\\t"),
                         '\r' => escaped.push_str("\\r"),
+                        c if is_byte_marker(c) => escaped.push_str(&byte_marker_escape(c)),
                         c => escaped.push(c),
                     }
                 }
                 escaped.push('"');
                 escaped
             }
-            StrStyle::Command => format!("`{}`", s),
+            StrStyle::Command => {
+                // Backticks interpolate like double quotes: \xNN byte
+                // escapes work directly.
+                let mut out = String::with_capacity(s.len() + 4);
+                out.push('`');
+                for ch in s.chars() {
+                    if is_byte_marker(ch) {
+                        out.push_str(&byte_marker_escape(ch));
+                    } else {
+                        out.push(ch);
+                    }
+                }
+                out.push('`');
+                out
+            }
             StrStyle::Heredoc => {
                 // Like DoubleQuoted but preserves $ and @ for Perl interpolation.
                 let mut escaped = String::with_capacity(s.len() + 4);
@@ -5120,6 +5634,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         '\n' => escaped.push_str("\\n"),
                         '\t' => escaped.push_str("\\t"),
                         '\r' => escaped.push_str("\\r"),
+                        c if is_byte_marker(c) => escaped.push_str(&byte_marker_escape(c)),
                         c => escaped.push(c),
                     }
                 }
@@ -5414,6 +5929,9 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                                     '\n' => s.push_str("\\n"),
                                     '\t' => s.push_str("\\t"),
                                     '\r' => s.push_str("\\r"),
+                                    c if is_byte_marker(c) => {
+                                        s.push_str(&byte_marker_escape(c))
+                                    }
                                     c => s.push(c),
                                 }
                             }
@@ -5451,6 +5969,9 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                                     '\n' => lit.push_str("\\n"),
                                     '\t' => lit.push_str("\\t"),
                                     '\r' => lit.push_str("\\r"),
+                                    c if is_byte_marker(c) => {
+                                        lit.push_str(&byte_marker_escape(c))
+                                    }
                                     c => lit.push(c),
                                 }
                             }
@@ -6339,7 +6860,14 @@ pub fn is_env_style_var_name(name: &str) -> bool {
     if PERL_SPECIAL_VARS.contains(&name) {
         return false;
     }
-    !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+    // Env-style: uppercase letters, digits, underscore (VAR1, PATH, HOME —
+    // bash env names allow digits; the old all-uppercase check misread
+    // `VAR1` as a local, so `echo "$VAR1"` printed the empty preamble
+    // local instead of %ENV).
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
 }
 
 // ── Bridge helpers ────────────────────────────────────────────────────
@@ -6605,6 +7133,61 @@ mod tests {
         );
     }
 
+    /// The modern-IR preamble only declares the infrastructure variables
+    /// the rendered body actually references: `$__argc` only for `$#`
+    /// reads, `$__nocasematch` only for the shopt lowering, and the
+    /// Carp/English/IPC::Open3 imports only when the body uses them.
+    /// `$ls_success`/`$output` are dead on the IR path (never emitted).
+    #[test]
+    fn preamble_gates_dead_boilerplate() {
+        let src = r##"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"#","style":"DoubleQuoted"}]}]}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"shopt","purity":"Emulable","args":[{"type":"Str","value":"nocasematch","style":"DoubleQuoted"},{"type":"Bool","value":true}]}}
+        ]}"##;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("gated-preamble A1 ingress");
+        let perl = shir_to_perl(&prog);
+        // needed (echo + shopt reference the status trackers, `$#` needs
+        // the argc snapshot, shopt needs the nocasematch flag)
+        assert!(perl.contains("my $main_exit_code = 0;"), "{perl}");
+        assert!(perl.contains("our $CHILD_ERROR = 0;"), "{perl}");
+        assert!(perl.contains("my $__argc = @ARGV;"), "{perl}");
+        assert!(perl.contains("my $__nocasematch = 0;"), "{perl}");
+        // dead on the IR path — never declared
+        assert!(!perl.contains("my $ls_success"), "{perl}");
+        assert!(!perl.contains("my $output"), "{perl}");
+        // no carp/croak, no long English names, no open3 — imports dropped
+        assert!(!perl.contains("use Carp"), "{perl}");
+        assert!(!perl.contains("use English"), "{perl}");
+        assert!(!perl.contains("use IPC::Open3"), "{perl}");
+    }
+
+    /// The rm emulation's `carp "rm: carping: …"` text and the
+    /// `$OS_ERROR` it embeds must pull `use Carp` + `use English` back in
+    /// (the gate scans the RENDERED body, which includes generator
+    /// emulation text spliced by the whitelisted-command path).
+    #[test]
+    fn preamble_keeps_carp_and_english_when_used() {
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::RawText(
+                "carp \"rm: carping: could not remove \", $file, \": $OS_ERROR\\n\";\n"
+                    .to_string(),
+            )],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let perl = shir_to_perl(&prog);
+        assert!(perl.contains("use Carp;"), "{perl}");
+        assert!(perl.contains("use English"), "{perl}");
+    }
+
     /// Declarator-position asm label (core request
     /// c-sh-go-toplevelasmargument-20260814-042952): the perl renderer
     /// refuses loudly (refuse > guess — the label names an object-file
@@ -6707,6 +7290,172 @@ mod tests {
         assert!(
             perl.contains("printf(\"<%s>\\n\""),
             "bash printf backslash escapes decode: {perl}"
+        );
+    }
+
+    // ── embed profile (purify design, PLAN §10) ──────────────────────
+
+    fn embed_prog(src: &str) -> IrProgram {
+        let commands =
+            crate::Parser::new(src).parse().unwrap_or_else(|e| panic!("parse {src}: {e}"));
+        crate::shir::ast_to_ir(&commands)
+    }
+
+    fn render(src: &str, host_scope: &[&str]) -> EmbedResult {
+        shir_to_perl_embed(
+            &embed_prog(src),
+            &EmbedCtx {
+                host_scope: host_scope.iter().map(|s| s.to_string()).collect(),
+                backtick_newlines: true,
+                english_names: false,
+            },
+        )
+    }
+
+    #[test]
+    fn embed_fragment_is_deterministic() {
+        // the legacy `--inline` path was 30/30 flaky across processes (HashSet
+        // declaration order); the embed renderer must be byte-stable
+        let src = "echo hi; x=5; echo $x; for i in 1 2 3; do y=$((y+i)); done";
+        let a = render(src, &["x"]);
+        let b = render(src, &["x"]);
+        assert_eq!(a.fragment, b.fragment, "embed output must be byte-stable");
+    }
+
+    #[test]
+    fn embed_bindings_gate() {
+        // read-only ∧ host_scope → bare reuse + required binding
+        let r = render("echo $x", &["x"]);
+        assert_eq!(r.required_host_bindings, vec!["x"]);
+        assert!(r.refusals.is_empty(), "refusals: {:?}", r.refusals);
+        assert!(
+            !r.fragment.contains("my $x"),
+            "host-scope read must not be declared locally: {}",
+            r.fragment
+        );
+        // the gate: every required binding must be in host_scope
+        for b in &r.required_host_bindings {
+            assert!(
+                ["x"].contains(&b.as_str()),
+                "required binding {b} missing from host_scope"
+            );
+        }
+        // read-only ∧ ¬host_scope → local `my $x = '';` (bash unset = empty),
+        // nothing required from the host
+        let r2 = render("echo $x", &[]);
+        assert!(r2.required_host_bindings.is_empty());
+        assert!(r2.fragment.contains("my $x = '';"), "{}", r2.fragment);
+    }
+
+    #[test]
+    fn embed_copy_in_for_read_write() {
+        // written ∧ host_scope → `my $x = $x;` copy-in: reads see the host
+        // value, writes stay fragment-local (bash subshell semantics)
+        let r = render("x=$((x+1)); echo $x", &["x"]);
+        assert_eq!(r.required_host_bindings, vec!["x"]);
+        assert!(r.fragment.contains("my $x = $x;"), "{}", r.fragment);
+        // written ∧ ¬host_scope → plain local `my $x;`
+        let r2 = render("x=$((x+1)); echo $x", &[]);
+        assert!(r2.required_host_bindings.is_empty());
+        assert!(r2.fragment.contains("my $x;"), "{}", r2.fragment);
+    }
+
+    #[test]
+    fn embed_no_preamble() {
+        let r = render("echo hi; x=5; echo $x", &[]);
+        assert!(r.refusals.is_empty(), "refusals: {:?}", r.refusals);
+        for banned in [
+            "#!/usr/bin/env perl",
+            "use strict",
+            "use warnings",
+            "use Carp",
+            "use English",
+            "exit $main_exit_code",
+            "my $main_exit_code",
+        ] {
+            assert!(
+                !r.fragment.contains(banned),
+                "embed fragment must not contain {banned:?}: {}",
+                r.fragment
+            );
+        }
+    }
+
+    #[test]
+    fn embed_collapses_main_exit_writes() {
+        // an external command lowers to system('bash','-c',…); the standalone
+        // status tracker ($main_exit_code) is dead in an embed — the write is
+        // collapsed to the $CHILD_ERROR mirror, and CHILD_ERROR is declared
+        let src = "grep foo /tmp/nonexistent || echo no";
+        let r = render(src, &[]);
+        assert!(
+            r.refusals.is_empty(),
+            "refusals: {:?} fragment: {}",
+            r.refusals,
+            r.fragment
+        );
+        assert!(
+            !r.fragment.contains("$main_exit_code"),
+            "main_exit_code must be collapsed: {}",
+            r.fragment
+        );
+        assert!(
+            r.fragment.contains("our $CHILD_ERROR = 0;"),
+            "CHILD_ERROR declared in fragment: {}",
+            r.fragment
+        );
+        assert!(
+            r.fragment.contains("$CHILD_ERROR = $? >> 8"),
+            "status mirror kept: {}",
+            r.fragment
+        );
+    }
+
+    #[test]
+    fn embed_english_normalization() {
+        // the standalone emits $INPUT_RECORD_SEPARATOR (English.pm); an embed
+        // must normalize to $/ so host files without `use English` stay valid
+        let src = "IFS=: read -r a b < /dev/null; echo $a";
+        let r = render(src, &[]);
+        assert!(
+            !r.fragment.contains("$INPUT_RECORD_SEPARATOR"),
+            "English name must be normalized: {}",
+            r.fragment
+        );
+    }
+
+    #[test]
+    fn embed_injects_carp_for_emulations() {
+        // command emulations call carp/croak on error paths; the standalone
+        // preamble imports Carp, an embed fragment must provide its own
+        let src = "cat /etc/hostname";
+        let r = render(src, &[]);
+        assert!(
+            r.fragment.contains("use Carp;"),
+            "Carp import must be injected: {}",
+            r.fragment
+        );
+        assert!(
+            r.fragment.contains("carp '"),
+            "the emulation's carp call is executable Perl: {}",
+            r.fragment
+        );
+        assert!(r.refusals.is_empty(), "refusals: {:?}", r.refusals);
+    }
+
+    #[test]
+    fn embed_refuses_exit_and_functions() {
+        let r = render("exit 3", &[]);
+        assert!(
+            r.refusals.iter().any(|x| x.contains("exit")),
+            "exit must be refused: {:?}",
+            r.refusals
+        );
+        let r2 = render("f() { echo hi; }; f", &[]);
+        assert!(
+            r2.refusals.iter().any(|x| x.contains("function")),
+            "function def must be refused: {:?}",
+            r2.refusals
         );
     }
 }

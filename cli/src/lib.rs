@@ -66,7 +66,7 @@ use crate::cli_commands::{
     export_mir, export_shir, interactive_mode, lex_input, parse_backticks_to_perl, parse_file,
     parse_file_to_estree, parse_file_to_perl, parse_file_to_shir, export_shir_raw, parse_shir_json_to_estree, parse_shir_json_to_js, parse_shir_json_to_perl, parse_file_to_estree_raw, parse_input, parse_system_to_perl,
     parse_to_perl,
-    parse_to_perl_inline, parse_to_perl_with_opts,
+    parse_to_perl_embed, parse_to_perl_inline, parse_to_perl_with_opts,
     run_generated,
 };
 use crate::help::show_help;
@@ -615,6 +615,13 @@ exit $main_exit_code;
                 }
                 let input = &args[3];
                 parse_to_perl_inline(input);
+            } else if args.len() >= 3 && args[2] == "--perl-embed" {
+                if args.len() < 4 {
+                    println!("Error: parse --perl-embed command requires input");
+                    return;
+                }
+                let input = &args[3];
+                parse_to_perl_embed(input);
             } else if args.len() >= 3 && args[2] == "--system" {
                 if args.len() < 4 {
                     println!("Error: parse --system command requires input");
@@ -898,8 +905,20 @@ exit $main_exit_code;
                 }
                 cli_commands::export_shir(&s, raw);
             } else if input.contains(".sh") || !input.contains(' ') {
-                match fs::read_to_string(input) {
-                    Ok(content) => cli_commands::export_shir(&content, raw),
+                // Bytes read + lossy decode (core requests
+                // sh-20260814-145955 / sh-utf8-20260814-140334): a file
+                // containing a non-UTF-8 byte must NOT fall back to
+                // parsing the FILE PATH as the script (read_to_string's
+                // Err was misread as "not a file"). read() succeeds for
+                // invalid-UTF-8 files; the lossy decode keeps the byte
+                // (U+FFFD) and the program parses. Err only fires for a
+                // genuinely absent file → direct-string fallback.
+                match fs::read(input) {
+                    // marked-lossy (PUA U+E000+byte) decode, NOT U+FFFD —
+                    // core request sh-20260815-115501-utf8-toplevel-shir-arm:
+                    // the byte must survive into the A1 JSON so renderers can
+                    // recover it (the sh gate's utf8-non-utf8-content.sh).
+                    Ok(bytes) => cli_commands::export_shir(&SharedUtils::bytes_to_marked_lossy(&bytes), raw),
                     Err(_) => cli_commands::export_shir(input, raw),
                 }
             } else {
@@ -916,8 +935,10 @@ exit $main_exit_code;
                 }
                 cli_commands::export_shir_raw(&s);
             } else if input.contains(".sh") || !input.contains(' ') {
-                match fs::read_to_string(input) {
-                    Ok(c) => cli_commands::export_shir_raw(&c),
+                match fs::read(input) {
+                    // same marked-lossy treatment as the --shir arm (latent
+                    // U+FFFD issue noted in the utf8 core request).
+                    Ok(bytes) => cli_commands::export_shir_raw(&SharedUtils::bytes_to_marked_lossy(&bytes)),
                     Err(_) => cli_commands::export_shir_raw(input),
                 }
             } else { cli_commands::export_shir_raw(input); }

@@ -172,6 +172,7 @@ pub struct Redirect {
 pub enum RedirectOperator {
     Input,                                   // <
     Output,                                  // >
+    ClobberOutput,                           // >| (truncate/create even under set -C)
     Append,                                  // >>
     InputOutput,                             // <>
     Heredoc,                                 // <<

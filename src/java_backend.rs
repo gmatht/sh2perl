@@ -218,12 +218,33 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
     }
 }
 
+/// A java string literal: escape backslash, quote, and control chars
+/// (a raw newline inside the literal is a compile error — cpp-sh-go
+/// t30_static_assert.cc's `printf "static assert ok\n"` carries a real
+/// \n in the A1 Str).
+fn java_str_lit(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn word_to_java(e: &IrExpr) -> Result<String, String> {
     match e {
-        IrExpr::Str(s, _) => Ok(format!(
-            "\"{}\"",
-            s.replace('\\', "\\\\").replace('"', "\\\"")
-        )),
+        IrExpr::Str(s, _) => Ok(java_str_lit(s)),
         IrExpr::Call { func, args, .. } if func == "getVar" => {
             if let Some(IrExpr::Str(name, _)) = args.first() {
                 Ok(format!("({name} == null ? \"\" : {name})"))
@@ -243,10 +264,7 @@ fn word_to_java(e: &IrExpr) -> Result<String, String> {
 fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
     match e {
         IrExpr::Str(s, _) => {
-            out.push_str(&format!(
-                "\"{}\"",
-                s.replace('\\', "\\\\").replace('"', "\\\"")
-            ));
+            out.push_str(&java_str_lit(s));
             Ok(())
         }
         IrExpr::Call { func, args, .. } if func == "getVar" => {
