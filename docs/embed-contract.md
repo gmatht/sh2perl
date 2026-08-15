@@ -149,11 +149,13 @@ rewrites are fixed-string replacements. Gate: `embed_fragment_is_deterministic`.
    bash-subshell semantics for free. Fragment preamble (`our $CHILD_ERROR
    = 0;` / `use …;`) is extracted and injected at FILE level (a `use`
    inside the `__bt(do{…})` expression is a syntax error).
-   **Corpus A/B (examples.impurl, 33 purify-relevant files): legacy 8/33,
-   embed 22/33** — the remaining 11 are inherited shIR renderer emulation
-   gaps that reproduce via standalone `file --perl` (printf `\n` escapes,
-   `mkdir -m`, env-assign echo, …), NOT embed-profile bugs. Purified
-   output is byte-deterministic across runs (3/3 verified).
+   **Corpus A/B (examples.impurl, 33 purify-relevant files): legacy 9/33
+   → embed 33/33** — the inherited shIR renderer emulation gaps were
+   fixed in the shared renderer (capture shell-text rebuild, printf
+   format cycling, tail/mkdir/basename/wc argument handling, `2>&1`/
+   `2>>` redirect rebuilds, subshell pipeline stages, env-prefix
+   semantics, `$ls_success` status-write drops). Purified output is
+   byte-deterministic across runs (3/3 verified).
 4. ⏳ shIR verdict upgrade: `required_host_bindings` from
    `var_lifetimes[].escapes` + lift sets (PassContext) instead of the
    read/write sets.
