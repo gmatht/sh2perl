@@ -172,6 +172,42 @@ pub fn parse_to_perl_with_opts(input: &str, no_magic_numbers: Option<bool>) {
     }
 }
 
+/// Embed profile (PLAN §10): render a shell snippet as an embeddable Perl
+/// fragment — statements only, no preamble/exit, host-scope reuse via the
+/// shIR renderer (deterministic; the legacy `parse --inline` Generator is
+/// hash-order flaky across processes). Host scope comes from the
+/// `PURIFY_SCOPE` env var (comma-separated) for manual testing; the
+/// future purify integration supplies it from the host file's PPI parse.
+pub fn parse_to_perl_embed(input: &str) {
+    let commands = match Parser::new(input).parse() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Parse error: {}", e);
+            return;
+        }
+    };
+    let prog = debashl::shir::ast_to_ir(&commands);
+    let host_scope: Vec<String> = std::env::var("PURIFY_SCOPE")
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let ctx = debashl::ir::EmbedCtx {
+        host_scope,
+        backtick_newlines: true,
+        english_names: false,
+    };
+    let res = debashl::ir::shir_to_perl_embed(&prog, &ctx);
+    println!("{}", res.fragment);
+    eprintln!("REQUIRED: {}", res.required_host_bindings.join(","));
+    for r in &res.refusals {
+        eprintln!("REFUSE: {}", r);
+    }
+}
+
 pub fn parse_to_perl_inline(input: &str) {
     let mut generator = Generator::new_inline_mode();
 

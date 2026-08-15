@@ -66,7 +66,7 @@ use crate::cli_commands::{
     export_mir, export_shir, interactive_mode, lex_input, parse_backticks_to_perl, parse_file,
     parse_file_to_estree, parse_file_to_perl, parse_file_to_shir, export_shir_raw, parse_shir_json_to_estree, parse_shir_json_to_perl, parse_file_to_estree_raw, parse_input, parse_system_to_perl,
     parse_to_perl,
-    parse_to_perl_inline, parse_to_perl_with_opts,
+    parse_to_perl_embed, parse_to_perl_inline, parse_to_perl_with_opts,
     run_generated,
 };
 use crate::help::show_help;
@@ -615,6 +615,13 @@ exit $main_exit_code;
                 }
                 let input = &args[3];
                 parse_to_perl_inline(input);
+            } else if args.len() >= 3 && args[2] == "--perl-embed" {
+                if args.len() < 4 {
+                    println!("Error: parse --perl-embed command requires input");
+                    return;
+                }
+                let input = &args[3];
+                parse_to_perl_embed(input);
             } else if args.len() >= 3 && args[2] == "--system" {
                 if args.len() < 4 {
                     println!("Error: parse --system command requires input");
