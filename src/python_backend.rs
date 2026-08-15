@@ -1465,6 +1465,14 @@ impl Render {
     /// quoted string.
     fn test_value(&mut self, t: &str) -> String {
         let t = t.trim().trim_matches('"');
+        // `$name` is ALWAYS a var read, never a literal — mirror the
+        // getVar arm: a store-written name reads the runtime store, a
+        // never-written plain name is unset at every read (→ ""). The
+        // old fallback rendered the bare name as a literal (go-sh
+        // t80_pointer_type.go: `test "$p"="$nil"` — `$nil` is an UNSET
+        // var → "" — the literal "nil" made the single-arg test false
+        // while the estree reference (and native) are true).
+        let dollar = t.starts_with('$');
         let t = t.strip_prefix('$').unwrap_or(t);
         if t == "?" {
             // `$?` — the exit status of the last command. The python
@@ -1501,6 +1509,15 @@ impl Render {
             self.py_ident(t)
         } else if let Ok(n) = t.parse::<i64>() {
             n.to_string()
+        } else if dollar {
+            if self.store_written.contains(t) {
+                self.sh2_calls.insert("getVar".into());
+                format!("sh2_getVar({})", Self::py_str(t))
+            } else if Self::is_plain_name(t) {
+                "\"\"".to_string()
+            } else {
+                Self::py_str(t)
+            }
         } else {
             Self::py_str(t)
         }
