@@ -2385,6 +2385,12 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             lhs,
             ..
         } => Ok(format!("! {}", cmd_to_sh(lhs)?)),
+        // a statement-position arith (`((n++))` — the perl frontend's
+        // increment statements and the cpp-sh-go t14_break loop step,
+        // triage-sh-20260815-153849): the arithmetic command, whose exit
+        // status is the value != 0 (bash `(( ))` semantics). Same arm as
+        // the main core's cmd_to_sh.
+        IrExpr::Arith(a) => Ok(format!("(( {} ))", arith_to_sh(a))),
         other => Err(format!("command expression not renderable: {other:?}")),
     }
 }
