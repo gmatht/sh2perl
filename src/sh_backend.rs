@@ -43,6 +43,13 @@ lazy_static::lazy_static! {
     /// The program reads ${PIPESTATUS[i]} — pipelines must capture the
     /// per-stage rcs into \$_psb.<i> files.
     static ref PIPESTATUS_NEEDED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    /// The program NEVER calls `wait`: a backgrounded job's output is
+    /// unobservable (the script exits without collecting it), and the
+    /// inherited stdout fd would otherwise leak a late writer into the
+    /// gate's shared capture file (048_subprocess's `(sleep 1; echo a)&
+    /// corrupted the next corpus file's output at a stale offset — the
+    /// 070/064 red gate). Detach such jobs to /dev/null.
+    static ref BACKGROUND_UNWAITED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 }
 
 /// Marker prefixes the core's lowering tags unquoted glob / process-
@@ -688,6 +695,11 @@ pub fn shir_to_sh(prog: &IrProgram) -> Result<String, String> {
     *FUNCTION_BODIES.lock().unwrap() = Default::default();
     *DECLARED_ATTRS.lock().unwrap() = Default::default();
     *PIPESTATUS_NEEDED.lock().unwrap() = needs_pipestatus(&prog.stmts);
+    // background jobs in a program that never waits outlive the script
+    // and would keep writing into the caller's stdout capture (the gate's
+    // shared eq file) — detach their fds (see needs_wait)
+    *BACKGROUND_UNWAITED.lock().unwrap() = !needs_wait(&prog.stmts)
+        && !prog.subs.iter().any(|s| needs_wait(&s.body));
     // bash-format function definitions (`typeset -f NAME` displays them)
 
     collect_function_bodies(prog);
@@ -833,6 +845,21 @@ _cmp_oct_char() {
     }'
 }
 _cmp() {
+    # fast path: delegate to NATIVE GNU cmp when present (the dev gate's
+    # Ubuntu toolchain) — stdout + rc are then identical to bash by
+    # construction, and the polyfill's ~1000-spawn bisect (~1s under
+    # load, the gate's 15s-timeout flake on 070_cmp_basic) is skipped.
+    # The chimera sandbox (busybox/BSD cmp: different diagnostics,
+    # missing -n/-i) fails the GNU probe and falls back to the polyfill
+    # below — byte-identical behavior preserved there. Probe result is
+    # cached: one `cmp --version` per shell, not per call.
+    if [ -z "${_cmp_gnu:-}" ]; then
+        if cmp --version 2>/dev/null | grep -q GNU; then _cmp_gnu=1; else _cmp_gnu=0; fi
+    fi
+    if [ "$_cmp_gnu" = 1 ]; then
+        cmp "$@"
+        return $?
+    fi
     (
         _b=0 _l=0 _s=0 _nlim=-1 _sk1=0 _sk2=0
         OPTIND=1
@@ -1252,7 +1279,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         IrStmt::If { cond, then, elsifs, else_ } => {
             indent(out, d);
             out.push_str("if ");
-            out.push_str(&cmd_to_sh(cond)?);
+            out.push_str(&cond_to_sh(cond)?);
             out.push_str("; then\n");
             for b in then {
                 stmt_to_sh(b, d + 1, out)?;
@@ -1260,7 +1287,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             for (econd, ebody) in elsifs {
                 indent(out, d);
                 out.push_str("elif ");
-                out.push_str(&cmd_to_sh(econd)?);
+                out.push_str(&cond_to_sh(econd)?);
                 out.push_str("; then\n");
                 for b in ebody {
                     stmt_to_sh(b, d + 1, out)?;
@@ -1310,7 +1337,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
         IrStmt::While { cond, body } => {
             indent(out, d);
             out.push_str("while ");
-            out.push_str(&cmd_to_sh(cond)?);
+            out.push_str(&cond_to_sh(cond)?);
             out.push_str("; do\n");
             for b in body {
                 stmt_to_sh(b, d + 1, out)?;
@@ -1327,7 +1354,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             }
             indent(out, d);
             out.push_str("while ");
-            out.push_str(&cmd_to_sh(cond)?);
+            out.push_str(&cond_to_sh(cond)?);
             out.push_str("; do\n");
             for b in body {
                 stmt_to_sh(b, d + 1, out)?;
@@ -1361,7 +1388,7 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             } else {
                 out.push_str("if ! ");
             }
-            out.push_str(&cmd_to_sh(cond)?);
+            out.push_str(&cond_to_sh(cond)?);
             out.push_str("; then break; fi\n");
             indent(out, d);
             out.push_str("done\n");
@@ -1437,11 +1464,16 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             Ok(())
         }
         IrStmt::Background(body) => {
+            let detach = *BACKGROUND_UNWAITED.lock().unwrap();
             if body.len() == 1 {
                 if let IrStmt::Expr(e) = &body[0] {
                     indent(out, d);
                     out.push_str(&cmd_to_sh(e)?);
-                    out.push_str(" &\n");
+                    if detach {
+                        out.push_str(" >/dev/null 2>&1 &\n");
+                    } else {
+                        out.push_str(" &\n");
+                    }
                     return Ok(());
                 }
             }
@@ -1451,7 +1483,11 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
                 stmt_to_sh(b, d + 1, out)?;
             }
             indent(out, d);
-            out.push_str(") &\n");
+            if detach {
+                out.push_str(") >/dev/null 2>&1 &\n");
+            } else {
+                out.push_str(") &\n");
+            }
             Ok(())
         }
         IrStmt::Block(body) => {
@@ -2112,6 +2148,25 @@ fn quote_test_expansions(s: &str) -> String {
         out.push(c); i += 1;
     }
     out
+}
+
+/// A condition in `if`/`while`/`until` position. A bare variable read
+/// (`while $x` — the powershell-sh-go while/ternary lowering, triage-sh
+/// t12_for_condition / t32_ternary) must NOT render as the bare `$x`:
+/// when x is empty the expansion leaves `while ; do` — a runtime SYNTAX
+/// ERROR that kills the whole script. getVar/param truthiness is
+/// non-empty (the estree reference's `sh2.getVar(x)` / runtime `$x`
+/// read), so the POSIX test `[ -n "$x" ]` is the exact rendering.
+fn cond_to_sh(cond: &IrExpr) -> Result<String, String> {
+    if let IrExpr::Call { func, args } = cond {
+        let bare = func == "getVar"
+            || (func == "param" && args.len() == 1);
+        if bare {
+            let v = var_ref_to_sh(&raw_arg(args, 0)?, true);
+            return Ok(format!("[ -n \"{v}\" ]"));
+        }
+    }
+    cmd_to_sh(cond)
 }
 
 fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
@@ -2948,6 +3003,74 @@ fn needs_cmp(stmts: &[IrStmt]) -> bool {
                     if has_cmp(iter) || walk(body) { return true; }
                 }
                 IrStmt::Assign { expr, .. } => { if has_cmp(expr) { return true; } }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
+/// Does the program ever call `wait` (so a background job's stdout is
+/// observable)? If not, backgrounded jobs may outlive the script — their
+/// inherited stdout fd would write into whatever file the CALLER has
+/// redirected to (the gate's shared per-run capture file) AFTER the run
+/// completed, corrupting the next corpus file's output at the stale
+/// fork-time offset (048_subprocess's `(sleep 1; echo a)&` — the sh
+/// gate's 070/064 red). Detach such jobs; with a wait present the job
+/// finishes before the script exits and no leak exists.
+fn needs_wait(stmts: &[IrStmt]) -> bool {
+    fn has_wait(e: &IrExpr) -> bool {
+        if let IrExpr::Call { func, args } = e {
+            if (func == "exec" || func == "wait") && !args.is_empty() {
+                if let IrExpr::Str(cn, _) = &args[0] {
+                    if cn == "wait" { return true; }
+                }
+            }
+            return args.iter().any(has_wait);
+        }
+        match e {
+            IrExpr::Array(es) => es.iter().any(has_wait),
+            IrExpr::Object(es) => es.iter().any(|(_, v)| has_wait(v)),
+            IrExpr::Capture { expr, .. } => has_wait(expr),
+            IrExpr::Arrow(stmts) => walk(stmts),
+            _ => false,
+        }
+    }
+    fn walk(sts: &[IrStmt]) -> bool {
+        for st in sts {
+            match st {
+                IrStmt::Expr(e) => { if has_wait(e) { return true; } }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                    if has_wait(cond) || walk(body) { return true; }
+                }
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    if has_wait(cond) || walk(then) || walk(else_)
+                        || elsifs.iter().any(|(c, b)| has_wait(c) || walk(b))
+                    { return true; }
+                }
+                IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                    if walk(body) { return true; }
+                }
+                IrStmt::For { iter, body, .. } => {
+                    if has_wait(iter) || walk(body) { return true; }
+                }
+                IrStmt::Assign { expr, .. } => { if has_wait(expr) { return true; } }
+                IrStmt::Redirect { inner, redirects } => {
+                    if walk(inner) { return true; }
+                    for r in redirects {
+                        if has_wait(&r.target) { return true; }
+                    }
+                }
+                IrStmt::Function { body, .. } => { if walk(body) { return true; } }
+                IrStmt::Case { discriminant, clauses, .. } => {
+                    if has_wait(discriminant) { return true; }
+                    for c in clauses { if walk(&c.body) { return true; } }
+                }
+                IrStmt::Pipeline { stages, .. } => { for s in stages { if walk(s) { return true; } } }
+                IrStmt::ForInit { init, cond, step, body } => {
+                    if walk(init) || has_wait(cond) || walk(step) || walk(body) { return true; }
+                }
                 _ => {}
             }
         }
@@ -5063,19 +5186,43 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
         }
         return Ok(str_word(&s));
     }
+    let mut out = String::new();
+    let mut open = false;
+    interp_parts_to_sh(parts, &mut out, &mut open)?;
+    if open {
+        out.push('"');
+    }
+    Ok(out)
+}
+
+/// Render a template's parts into `out`, tracking the open-quote state.
+/// A nested `Interpolate` part (the powershell-sh-go cast lowering wraps
+/// the quoted operand in an expandable string — t03_cast:
+/// Interpolate([Lit("[string]"), Expr(Interpolate([Lit("cast value")]))]))
+/// flattens INLINE with the outer quote state: its Lit parts get the
+/// outer's escaping, its Expr parts recurse. Rendering the inner as a
+/// standalone word instead would single-quote it (`'cast value'`), and
+/// inside the outer double quotes those quotes become literal text.
+fn interp_parts_to_sh(
+    parts: &[InterpPart],
+    out: &mut String,
+    open: &mut bool,
+) -> Result<(), String> {
     // emit adjacent quoted segments: an Expr closes the quote ONLY when
     // the next part is a literal that could extend the variable name
     // (`"$x"world` — `"$xworld"` would expand the var xworld). A trailing
     // Expr stays INSIDE the quotes (`"brace_expand: $result"`).
-    let mut out = String::new();
-    let mut open = false;
-    let mut it = parts.iter().peekable();
-    while let Some(p) = it.next() {
+    // Worklist of the parts still to render: a nested Interpolate part is
+    // SPLICED at the front, so the need_break lookahead sees the inner's
+    // parts and then the outer's continuation (a flattened trailing Expr
+    // still breaks before an alphanumeric outer Lit).
+    let mut q: std::collections::VecDeque<&InterpPart> = parts.iter().collect();
+    while let Some(p) = q.pop_front() {
         match p {
             InterpPart::Lit(t) => {
-                if !open {
+                if !*open {
                     out.push('"');
-                    open = true;
+                    *open = true;
                 }
                 for c in t.chars() {
                     match c {
@@ -5088,20 +5235,26 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
                 }
             }
             InterpPart::Expr(x) => {
+                if let IrExpr::Interpolate(inner) = &**x {
+                    for ip in inner.iter().rev() {
+                        q.push_front(ip);
+                    }
+                    continue;
+                }
                 let need_break = matches!(
-                    it.peek(),
+                    q.front(),
                     Some(InterpPart::Lit(n)) if n
                         .chars()
                         .next()
                         .map(|c| c.is_ascii_alphanumeric() || c == '_')
                         .unwrap_or(false)
                 );
-                if open && need_break {
+                if *open && need_break {
                     out.push('"');
-                    open = false;
+                    *open = false;
                 }
                 let e = interp_expr_to_sh(x)?;
-                if open {
+                if *open {
                     // the expr sits INSIDE the interp's quotes — strip its
                     // own quoting (param "" / capture render `"$x"` /
                     // `"$(...)"`; `"a ""$x"" b"` would leave $x
@@ -5113,10 +5266,7 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
             }
         }
     }
-    if open {
-        out.push('"');
-    }
-    Ok(out)
+    Ok(())
 }
 
 /// An expansion inside a double-quoted template.
@@ -5173,6 +5323,12 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Var(name, _) => Ok(format!("${name}")),
         IrExpr::Str(s, _) => Ok(s.clone()),
+        // A nested Interpolate as a template part (the powershell-sh-go
+        // cast lowering wraps the quoted operand in an expandable string:
+        // Interpolate([Lit("[string]"), Expr(Interpolate([Lit("cast value")]))]))
+        // — t03_cast). Flatten: render the inner template's parts inline.
+        // The outer quote logic strips the inner's own quoting.
+        IrExpr::Interpolate(parts) => interp_to_sh(parts),
         // The A1 `Index` expr node (triage-sh py-sh-go cross-product pairs
         // t21/t56/t73): array element read — render like the `arrayIndex`
         // call arm (the POSIX per-element lowering `${name_key}`).
@@ -6603,7 +6759,13 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             Ok(out)
         }
         IrStmt::Subshell(body) => Ok(format!("( {} )", stmts_inline(body)?)),
-        IrStmt::Background(body) => Ok(format!("( {} ) &", stmts_inline(body)?)),
+        IrStmt::Background(body) => {
+            if *BACKGROUND_UNWAITED.lock().unwrap() {
+                Ok(format!("( {} ) >/dev/null 2>&1 &", stmts_inline(body)?))
+            } else {
+                Ok(format!("( {} ) &", stmts_inline(body)?))
+            }
+        }
         IrStmt::Block(body) => Ok(format!("{{ {}; }}", stmts_inline(body)?)),
         IrStmt::Return(e) => match e {
             Some(x) => Ok(format!("return {}", word_to_sh(x)?)),
