@@ -1903,8 +1903,13 @@ impl Render {
             }
             IrExpr::DefinedOr { expr, .. } => self.expr_num(expr),
             IrExpr::Capture { expr, .. } => {
-                if let Some(s) = self.bc_capture(expr) {
-                    return format!("s2i({s})");
+                // the first-class Capture node (core request
+                // zsh-sh-go-20260814-230503) — unwrap the Arrow like the
+                // Call-capture arm below before the bc fold.
+                if let Some(pipe) = self.capture_pipeline(std::slice::from_ref(expr.as_ref())) {
+                    if let Some(s) = self.bc_capture(pipe) {
+                        return format!("s2i({s})");
+                    }
                 }
                 self.todo += 1;
                 "/* TODO(cmdsub num) */ 0".to_string()
@@ -2107,8 +2112,13 @@ impl Render {
             }
             IrExpr::DefinedOr { expr, .. } => self.expr_str(expr),
             IrExpr::Capture { expr, .. } => {
-                if let Some(s) = self.bc_capture(expr) {
-                    return s;
+                // the first-class Capture node (core request
+                // zsh-sh-go-20260814-230503) — unwrap the Arrow like the
+                // Call-capture arm below before the bc fold.
+                if let Some(pipe) = self.capture_pipeline(std::slice::from_ref(expr.as_ref())) {
+                    if let Some(s) = self.bc_capture(pipe) {
+                        return s;
+                    }
                 }
                 self.todo += 1;
                 "/* TODO(command substitution) */ ivec2(0, 0)".to_string()
@@ -2865,7 +2875,16 @@ impl Render {
     fn bc_float_expr(&mut self, pipe: &IrExpr) -> Option<String> {
         // unwrap the cmdsub wrapper: `$(…)` arrives as Capture/capture
         let pipe = match pipe {
-            IrExpr::Capture { expr, .. } => expr,
+            IrExpr::Capture { expr, .. } => {
+                // the first-class Capture node (core request
+                // zsh-sh-go-20260814-230503) — unwrap the Arrow like the
+                // Call-capture arm below (capture_pipeline does the
+                // Arrow → pipeline unwrap).
+                let Some(p) = self.capture_pipeline(std::slice::from_ref(expr.as_ref())) else {
+                    return None;
+                };
+                p
+            }
             IrExpr::Call { func, args } if func == "capture" || func == "captureWords" => {
                 self.capture_pipeline(args)?
             }
@@ -2931,7 +2950,15 @@ impl Render {
     /// (it only pattern-matches and clones — safe during collect).
     fn is_float_bc_capture(&mut self, pipe: &IrExpr) -> bool {
         let pipe = match pipe {
-            IrExpr::Capture { expr, .. } => expr,
+            IrExpr::Capture { expr, .. } => {
+                // the first-class Capture node (core request
+                // zsh-sh-go-20260814-230503) — unwrap the Arrow like the
+                // Call-capture arm below.
+                let Some(p) = self.capture_pipeline(std::slice::from_ref(expr.as_ref())) else {
+                    return false;
+                };
+                p
+            }
             IrExpr::Call { func, args }
                 if func == "capture" || func == "captureWords" =>
             {

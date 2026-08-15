@@ -76,12 +76,17 @@ fn lift_stmt(st: &mut IrStmt) -> bool {
 }
 
 fn lift_expr(e: &IrExpr) -> Option<IrExpr> {
-    // `$(echo ARGS | grep -o PAT)` — the capture wraps the pipeline
-    let IrExpr::Call { func, args } = e else {
-        return None;
+    // `$(echo ARGS | grep -o PAT)` — the capture wraps the pipeline.
+    // The first-class Capture node (core request
+    // zsh-sh-go-20260814-230503) carries the same Arrow payload as the
+    // legacy `Call capture`.
+    let inner = match e {
+        IrExpr::Call { func, args } if func == "capture" => args.first(),
+        IrExpr::Capture { expr, .. } => Some(expr.as_ref()),
+        _ => None,
     };
-    if func == "capture" {
-        if let Some(IrExpr::Arrow(stmts)) = args.first() {
+    if let Some(arrow) = inner {
+        if let IrExpr::Arrow(stmts) = arrow {
             let mut lifted = stmts.clone();
             for s in lifted.iter_mut() {
                 if let IrStmt::Expr(e2) = s {
@@ -97,6 +102,9 @@ fn lift_expr(e: &IrExpr) -> Option<IrExpr> {
         }
         return None;
     }
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
     if func != "pipeline" {
         return None;
     }

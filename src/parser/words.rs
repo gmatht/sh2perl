@@ -3396,11 +3396,19 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Get the double-quoted string content (this includes the quotes)
     let string_content = lexer.get_string_text()?;
 
-    // Remove the outer quotes
-    let content = if string_content.starts_with('"') && string_content.ends_with('"') {
-        &string_content[1..string_content.len() - 1]
+    // Remove the outer quotes. `$"..."` (the DollarDoubleQuotedString
+    // token — the bash/zsh translated string, core request
+    // zsh-sh-go-20260814-200005 + re-filing 20260815-003454) additionally
+    // strips the `$"` prefix; the word is then MARKED so word_ir lowers
+    // it as `translate(...)` (the runner resolves the language at the
+    // execution boundary: bash → content, zsh → `$` + content — this zsh
+    // build has no gettext catalog).
+    let (translated, content) = if let Some(inner) = string_content.strip_prefix("$\"") {
+        (true, inner.strip_suffix('"').unwrap_or(inner))
+    } else if string_content.starts_with('"') && string_content.ends_with('"') {
+        (false, &string_content[1..string_content.len() - 1])
     } else {
-        &string_content
+        (false, string_content.as_str())
     };
 
     let content = unescape_interpolation_content(content);
@@ -3417,7 +3425,7 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
 
     Ok(Word::StringInterpolation(
         StringInterpolation { parts },
-        None,
+        if translated { Some(()) } else { None },
     ))
 }
 
