@@ -1212,8 +1212,51 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("}\n");
             Ok(())
         }
-        // sh has no try/except — refuse (the gate reports it as a FAIL)
-        IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
+        // try/except/else/finally — Python-style exception handling. sh
+        // has no exceptions; the only failure signal is the exit status,
+        // so the except clause runs when the try body's LAST command
+        // failed, else_ runs when it succeeded, finally always runs (the
+        // corpus bodies are print-only — exact; a failing-command body is
+        // a documented approximation).
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            indent(out, d);
+            if body.is_empty() {
+                out.push_str("{ :; }\n");
+            } else {
+                out.push_str("{\n");
+                for b in body {
+                    stmt_to_sh(b, d + 1, out)?;
+                }
+                indent(out, d);
+                out.push_str("}\n");
+            }
+            if !excepts.is_empty() {
+                indent(out, d);
+                out.push_str("if [ $? -ne 0 ]; then\n");
+                for b in &excepts[0].body {
+                    stmt_to_sh(b, d + 1, out)?;
+                }
+                indent(out, d);
+                out.push_str("fi\n");
+            } else if !else_body.is_empty() {
+                indent(out, d);
+                out.push_str("if [ $? -eq 0 ]; then\n");
+                for b in else_body {
+                    stmt_to_sh(b, d + 1, out)?;
+                }
+                indent(out, d);
+                out.push_str("fi\n");
+            }
+            for b in finally_body {
+                stmt_to_sh(b, d, out)?;
+            }
+            Ok(())
+        }
         // sh has no select-on-channels — refuse loudly
         IrStmt::Select { .. } => Err("select has no sh rendering".into()),
         // inline asm has no sh rendering — refuse loudly
@@ -1664,6 +1707,84 @@ fn quote_test_expansions(s: &str) -> String {
     out
 }
 
+/// One comparison atom of a test string (`"$a" == "b"`, `"$s" =~ ^h`,
+/// `-f /x` …) → a single sh cond command. The `==`/`!=`/`=` forms lower
+/// to the case emulation (dash has no `==`), `=~` to a grep -E pipeline,
+/// everything else stays in `[ ]` (POSIX operators).
+fn test_cmp_to_sh(t: &str) -> Result<String, String> {
+    if let Some((lhs, rhs)) = split_test_op(t, "==") {
+        // pattern match: case emulation (dash has no == in test)
+        // A leading `!` negates the WHOLE match (`[[ ! "1" ==
+        // "2" ]]`) — strip it and prefix `! ` (valid before a
+        // case in dash and bash). Without this the `!` lands
+        // inside the quoted lhs (`"!"1"` — a literal).
+        let negate = lhs.starts_with('!');
+        let lhs = lhs.trim_start_matches('!');
+        let case: String = if let Some((neg, rest)) =
+            rhs.strip_prefix("!(").and_then(|r| r.split_once(')'))
+        {
+            // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`:
+            //   case "$s" in *Y) case "$s" in P Y) false;; *) :;; esac;; *) false;; esac
+            format!(
+                "case \"{lhs}\" in *{rest}) case \"{lhs}\" in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
+            )
+        } else if let Some(inner) =
+            rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')'))
+        {
+            // extglob list match: `@(a|b)` == `a|b`
+            format!("case \"{lhs}\" in {inner}) : ;; *) false ;; esac")
+        } else if let Some(inner) =
+            rhs.strip_prefix("?(").and_then(|r| r.strip_suffix(')'))
+        {
+            // optional: `?(a|b)` matches empty or a|b
+            format!("case \"{lhs}\" in |{inner}) : ;; *) false ;; esac")
+        } else if *NOCASEMATCH.lock().unwrap() {
+            format!(
+                "case \"{lhs}\" in {}) : ;; *) false ;; esac",
+                fold_case_pattern(&rhs)
+            )
+        } else {
+            format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac")
+        };
+        if negate {
+            Ok(format!("! {case}"))
+        } else {
+            Ok(case)
+        }
+    } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
+        Ok(format!("case \"{lhs}\" in {rhs}) false ;; *) : ;; esac"))
+    } else if let Some((lhs, rhs)) = split_test_op(t, "=~") {
+        // regex match: grep -E ([[ =~ ]] semantics)
+        Ok(format!("printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"))
+    } else if let Some((lhs, rhs)) = split_test_op(t, "=") {
+        // single `=` — the go-sh frontend's pattern tests
+        // (`strings.HasPrefix/Contains` lower to `"$s"=h*`,
+        // triage-sh-20260815-175001): the estree reference
+        // treats `=` as a GLOB pattern match (its string-op
+        // scan), so render the same case emulation as `==`.
+        // `<=`/`>=` are NOT operators — the `=` inside them
+        // must not split (fall back to the `[ ]` literal
+        // form).
+        if lhs.ends_with(['<', '>']) {
+            let t = quote_test_expansions(&space_test_ops(t));
+            Ok(format!("[ {t} ]"))
+        } else if lhs.contains('~') || rhs.contains('~') {
+            // tilde expansion: `[ ~ = "$HOME" ]` (043_home.sh) —
+            // the case emulation QUOTES the lhs and would
+            // suppress the tilde; `[ ]` tilde-expands natively.
+            let t = quote_test_expansions(&space_test_ops(t));
+            Ok(format!("[ {t} ]"))
+        } else {
+            Ok(format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac"))
+        }
+    } else {
+        // quote bare $(...) and ${...} so word-splitting
+        // in `[ ]` does not shred cmdsub output
+        let t = quote_test_expansions(&space_test_ops(t));
+        Ok(format!("[ {t} ]"))
+    }
+}
+
 fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
     match e {
         IrExpr::Call { func, args } => match func.as_str() {
@@ -1679,83 +1800,79 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 exec_line_to_sh(arg(args, 0)?, words, env)
             }
             "test" => {
-                let t = raw_arg(args, 0)?;
-                let t = t.trim();
+                let raw = raw_arg(args, 0)?;
+                let t = raw.trim();
                 // `[[ ... ]]`-style compound tests survive as raw text; `[ ]`
                 // cannot express &&/||, so keep those in [[ ]] form.
                 if t.contains("&&") || t.contains("||") {
-                    Ok(format!("[[ {t} ]]"))
-                } else if let Some((lhs, rhs)) = split_test_op(t, "==") {
-                    // pattern match: case emulation (dash has no == in test)
-                    // A leading `!` negates the WHOLE match (`[[ ! "1" ==
-                    // "2" ]]`) — strip it and prefix `! ` (valid before a
-                    // case in dash and bash). Without this the `!` lands
-                    // inside the quoted lhs (`"!"1"` — a literal).
-                    let negate = lhs.starts_with('!');
-                    let lhs = lhs.trim_start_matches('!');
-                    let case: String = if let Some((neg, rest)) =
-                        rhs.strip_prefix("!(").and_then(|r| r.split_once(')'))
-                    {
-                        // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`:
-                        //   case "$s" in *Y) case "$s" in P Y) false;; *) :;; esac;; *) false;; esac
-                        format!(
-                            "case \"{lhs}\" in *{rest}) case \"{lhs}\" in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
-                        )
-                    } else if let Some(inner) =
-                        rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')'))
-                    {
-                        // extglob list match: `@(a|b)` == `a|b`
-                        format!("case \"{lhs}\" in {inner}) : ;; *) false ;; esac")
-                    } else if let Some(inner) =
-                        rhs.strip_prefix("?(").and_then(|r| r.strip_suffix(')'))
-                    {
-                        // optional: `?(a|b)` matches empty or a|b
-                        format!("case \"{lhs}\" in |{inner}) : ;; *) false ;; esac")
-                    } else if *NOCASEMATCH.lock().unwrap() {
-                        format!(
-                            "case \"{lhs}\" in {}) : ;; *) false ;; esac",
-                            fold_case_pattern(&rhs)
-                        )
-                    } else {
-                        format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac")
-                    };
-                    if negate {
-                        Ok(format!("! {case}"))
-                    } else {
-                        Ok(case)
-                    }
-                } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
-                    Ok(format!("case \"{lhs}\" in {rhs}) false ;; *) : ;; esac"))
-                } else if let Some((lhs, rhs)) = split_test_op(t, "=~") {
-                    // regex match: grep -E ([[ =~ ]] semantics)
-                    Ok(format!("printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"))
-                } else if let Some((lhs, rhs)) = split_test_op(t, "=") {
-                    // single `=` — the go-sh frontend's pattern tests
-                    // (`strings.HasPrefix/Contains` lower to `"$s"=h*`,
-                    // triage-sh-20260815-175001): the estree reference
-                    // treats `=` as a GLOB pattern match (its string-op
-                    // scan), so render the same case emulation as `==`.
-                    // `<=`/`>=` are NOT operators — the `=` inside them
-                    // must not split (fall back to the `[ ]` literal
-                    // form).
-                    if lhs.ends_with(['<', '>']) {
-                        let t = quote_test_expansions(&space_test_ops(t));
-                        Ok(format!("[ {t} ]"))
-                    } else if lhs.contains('~') || rhs.contains('~') {
-                        // tilde expansion: `[ ~ = "$HOME" ]` (043_home.sh) —
-                        // the case emulation QUOTES the lhs and would
-                        // suppress the tilde; `[ ]` tilde-expands natively.
-                        let t = quote_test_expansions(&space_test_ops(t));
-                        Ok(format!("[ {t} ]"))
-                    } else {
-                        Ok(format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac"))
+                    return Ok(format!("[[ {t} ]]"));
+                }
+                // perl-frontend `! ( "$name" == "x" )` groups (unless/not,
+                // t02_control): the negation + paren wrapper must not leak
+                // into the op split. `[ ! a -o b ]` semantics: `!` negates
+                // the WHOLE expression — track parity, strip one outer
+                // paren group, and re-apply `! ` to the joined command.
+                let mut negate = false;
+                let mut tt = t;
+                while let Some(rest) = tt.strip_prefix('!') {
+                    negate = !negate;
+                    tt = rest.trim();
+                }
+                if let Some(inner) = tt.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+                    tt = inner.trim();
+                }
+                if tt.is_empty() {
+                    // degenerate `!` / `( )` — keep the raw literal form
+                    return Ok(format!("[ {t} ]"));
+                }
+                // `-o` / `-a` connectors with emulated comparison atoms
+                // (`"$s" =~ l -o "$s" =~ x` — the perl frontend lowers
+                // `||` to `-o`, t68_case_glob): POSIX `[ ]` cannot mix `=~`
+                // with `-o` and `[[ ]]` rejects `-o` — split into separate
+                // cond commands (`-a` binds tighter than `-o`). File-test
+                // connectors (`-f x -o -d y`, valid `[ ]` today) are
+                // untouched — the split only fires when a comparison op
+                // that needs the case/grep emulation is present.
+                let mut rendered;
+                if (tt.contains(" -o ") || tt.contains(" -a "))
+                    && (tt.contains("=~") || tt.contains("==") || tt.contains("!=") || tt.contains('='))
+                {
+                    rendered = String::new();
+                    for (i, orpart) in tt.split(" -o ").enumerate() {
+                        if i > 0 {
+                            rendered.push_str(" || ");
+                        }
+                        for (j, apart) in orpart.split(" -a ").enumerate() {
+                            if j > 0 {
+                                rendered.push_str(" && ");
+                            }
+                            rendered.push_str(&test_cmp_to_sh(apart.trim())?);
+                        }
                     }
                 } else {
-                    // quote bare $(...) and ${...} so word-splitting
-                    // in `[ ]` does not shred cmdsub output
-                    let t = quote_test_expansions(&space_test_ops(t));
-                    Ok(format!("[ {t} ]"))
+                    rendered = test_cmp_to_sh(tt)?;
                 }
+                if negate {
+                    rendered = format!("! {rendered}");
+                }
+                Ok(rendered)
+            }
+            // the py-sh-go pattern-dispatch cond (t68_case_glob): true
+            // when the word matches ANY of the case patterns — the same
+            // case emulation as the `==` test arm
+            "caseMatch" => {
+                let word = word_to_sh(arg(args, 0)?)?;
+                // patterns stay RAW — a quoted pattern in case is a
+                // LITERAL (`'h*'` never matches hello)
+                let mut out = format!("case \"{word}\" in ");
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for it in items {
+                        let p = str_arg(it)?;
+                        out.push_str(&format!("{p}) : ;; "));
+                    }
+                }
+                out.push_str("*) false ;; esac");
+                Ok(out)
             }
             "pipeline" => {
                 let stages = pipeline_stages(args)?;
@@ -3366,7 +3483,7 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
             }
         }
         "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
-        "arrayLen" => Ok(format!("${{{}}}_len", raw_arg(args, 0)?)),
+        "arrayLen" => Ok(format!("${{{}_len}}", raw_arg(args, 0)?)),
         "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
         "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
         "arith" => Ok(format!("$(({}))", arith_rewrite(&raw_arg(args, 0)?))),
@@ -3640,7 +3757,7 @@ fn join_to_sh(inner: &IrExpr, quoted: bool) -> Result<String, String> {
             format!("${{!{}[@]}}", raw_arg(args, 0)?)
         }
         IrExpr::Call { func, args } if func == "arrayLen" => {
-            format!("${{#{}[@]}}", raw_arg(args, 0)?)
+            format!("${{{}_len}}", raw_arg(args, 0)?)
         }
         _ => word_to_sh(inner)?,
     };
@@ -3694,6 +3811,17 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
                 }
             }
             InterpPart::Expr(x) => {
+                // a leading expansion (no open quote) must carry its own
+                // quotes — without them `"$s\n"` renders `$s"…"` with an
+                // UNQUOTED $s that word-splits (t70_quoted_single).
+                // Multi-word / already-quoted forms (cmdsub lists, brace
+                // expansion, whole-array helpers) stay bare.
+                if !open && interp_expr_self_quotes(x) {
+                    out.push('"');
+                    out.push_str(&interp_expr_to_sh(x)?);
+                    out.push('"');
+                    continue;
+                }
                 let need_break = matches!(
                     it.peek(),
                     Some(InterpPart::Lit(n)) if n
@@ -3714,6 +3842,21 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
         out.push('"');
     }
     Ok(out)
+}
+
+/// Multi-word or already-quoted interpolate expansions must not be
+/// wrapped in a fresh quote pair (capture already carries `"$(…)"`;
+/// brace / arrayItems / captureWords / whole-array forms are word LISTS).
+fn interp_expr_self_quotes(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } => match func.as_str() {
+            "capture" | "captureWords" | "brace" | "arrayItems" => false,
+            // the whole-array forms expand to multiple words
+            "arrayIndex" => !matches!(args.get(1), Some(IrExpr::Str(k, _)) if k == "@" || k == "*"),
+            _ => true,
+        },
+        _ => true,
+    }
 }
 
 /// An expansion inside a double-quoted template.
@@ -3757,7 +3900,7 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
                 }
             }
             "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
-            "arrayLen" => Ok(format!("${{#{}[@]}}", raw_arg(args, 0)?)),
+            "arrayLen" => Ok(format!("${{{}_len}}", raw_arg(args, 0)?)),
             "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
             "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
 
@@ -4702,7 +4845,7 @@ fn for_item_to_sh(e: &IrExpr) -> Result<String, String> {
             Ok(format!("${{!{}[@]}}", raw_arg(args, 0)?))
         }
         IrExpr::Call { func, args } if func == "arrayLen" => {
-            Ok(format!("${{#{}[@]}}", raw_arg(args, 0)?))
+            Ok(format!("${{{}_len}}", raw_arg(args, 0)?))
         }
         _ => word_to_sh(e),
     }
