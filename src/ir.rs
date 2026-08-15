@@ -915,18 +915,11 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
 
     // Imports (`use` statements).
     // Auto-derive `use feature 'say'` if any Output { newline: true } exists.
+    // The three modern-IR preamble imports (Carp / English / IPC::Open3) are
+    // appended AFTER the body is rendered, gated on the actual generated
+    // text (see below); the emission also happens after the body render so
+    // the gate has a complete view.
     let mut imports = prog.imports.clone();
-    if modern_ir {
-        // Modern-IR program (`--shir` → `--shir-in-perl`): the JSON contract
-        // carries no import list, so add the standard preamble the emitted
-        // Perl expects (mirrors the Generator's preamble).
-        imports.extend([
-            "Carp".to_string(),
-            "English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME)"
-                .to_string(),
-            "IPC::Open3".to_string(),
-        ]);
-    }
     if prog_uses_say(&stmts) {
         let needs_say = !imports.iter().any(|i| i.contains("feature"));
         if needs_say {
@@ -944,6 +937,89 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     if needs_hostname {
         imports.push("Sys::Hostname qw(hostname)".to_string());
     }
+
+    // ── Body ────────────────────────────────────────────────────────
+    // Render statements + subs + exit into a `body` buffer FIRST so the
+    // modern-IR preamble can be scanned against the ACTUAL generated text:
+    // the emitter splices the infrastructure vars (`$main_exit_code`,
+    // `$CHILD_ERROR`, `$__argc`, `$ls_success`, `$output`,
+    // `$__nocasematch`) into format strings, so a textual scan of the
+    // rendered body is the only reliable oracle for whether each preamble
+    // declaration is needed.
+    let mut body = String::new();
+    // Top-level statements
+    for (idx, stmt) in stmts.iter().enumerate() {
+        let line = prog
+            .stmt_lines
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, l)| *l);
+        let before = body.len();
+        emit_stmt(&mut body, stmt, 0);
+        if let Some(l) = line {
+            // a SHORT comment at the end of the statement's first line:
+            // `$sum += $i;  # line 7` — the source-mapping convention
+            let added = &body[before..];
+            if let Some(nl) = added.find('\n') {
+                body.insert_str(before + nl, &format!("  # line {l}"));
+            }
+        }
+    }
+    body.push('\n');
+
+    // Subroutines
+    for sub in &prog.subs {
+        emit_sub(&mut body, sub);
+        body.push('\n');
+    }
+
+    // Exit — only if $main_exit_code might be non-zero (i.e. if any
+    // statement references it).  For scripts that never touch it,
+    // omit the exit so Perl's default exit(0) applies.
+    let has_main_exit = modern_ir
+        || stmts.iter().any(|s| stmt_refers_to_main_exit(s))
+        || prog
+            .subs
+            .iter()
+            .any(|sub| sub.body.iter().any(|s| stmt_refers_to_main_exit(s)));
+    if has_main_exit {
+        body.push_str("exit $main_exit_code;\n");
+    }
+
+    if modern_ir {
+        // Modern-IR program (`--shir` → `--shir-in-perl`): the JSON contract
+        // carries no import list, so add the standard preamble imports ONLY
+        // when the rendered body actually uses them — `use Carp` for a
+        // carp/croak-style Warn/Die (the rm emulation emits
+        // `carp "rm: carping: …"`), `use English` for the long
+        // $OS_ERROR/$ERRNO/... names, `use IPC::Open3` for open3 (never
+        // emitted on the IR path today — shell-outs go through
+        // `system('bash','-c',…)`).
+        if body.contains("carp") || body.contains("croak") {
+            imports.push("Carp".to_string());
+        }
+        if [
+            "$ERRNO",
+            "$EVAL_ERROR",
+            "$INPUT_RECORD_SEPARATOR",
+            "$OS_ERROR",
+            "$PROGRAM_NAME",
+        ]
+        .iter()
+        .any(|n| body.contains(n))
+        {
+            imports.push(
+                "English qw(-no_match_vars $ERRNO $EVAL_ERROR $INPUT_RECORD_SEPARATOR $OS_ERROR $PROGRAM_NAME)"
+                    .to_string(),
+            );
+        }
+        if body.contains("open3") {
+            imports.push("IPC::Open3".to_string());
+        }
+    }
+
+    // Emit the imports (every decision input — the body scan, `say`, and
+    // the hostname analysis — is computed by now).
     for import in &imports {
         out.push_str(&format!("use {};\n", import));
     }
@@ -962,21 +1038,33 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         out.push('\n');
     }
 
-    // Top-level variable declarations from usage analysis
-    // (emitted by generator as Declare stmts, handled below)
-
-    // Modern-IR preamble: the status-trackers the emitted statements use.
+    // Modern-IR preamble: only the infrastructure variables the rendered
+    // body actually references.  (The previous version emitted all of them
+    // unconditionally — `$ls_success`/`$output` are dead on the IR path,
+    // `$__argc` is only needed for `$#` reads, `$__nocasematch` only for
+    // shopt/case-nocasematch lowering.)
     if modern_ir {
-        out.push_str("my $main_exit_code = 0;\n");
-        out.push_str("our $CHILD_ERROR = 0;\n");
-        // Snapshot the positional-arg count BEFORE any $ARGV[n] read (the
-        // magic @ARGV extends on indexed reads, corrupting scalar(@ARGV)).
-        out.push_str("my $__argc = @ARGV;\n");
-        // Preamble vars the Generator's per-command emulations expect (ls
-        // tracks success; the pipeline machinery accumulates stdout).
-        out.push_str("my $ls_success = 0;\n");
-        out.push_str("my $output = '';\n");
-        out.push_str("my $__nocasematch = 0;\n");
+        if body.contains("$main_exit_code") {
+            out.push_str("my $main_exit_code = 0;\n");
+        }
+        if body.contains("$CHILD_ERROR") {
+            out.push_str("our $CHILD_ERROR = 0;\n");
+        }
+        if body.contains("$__argc") {
+            // Snapshot the positional-arg count BEFORE any $ARGV[n] read
+            // (the magic @ARGV extends on indexed reads, corrupting
+            // scalar(@ARGV)).
+            out.push_str("my $__argc = @ARGV;\n");
+        }
+        if body.contains("$ls_success") {
+            out.push_str("my $ls_success = 0;\n");
+        }
+        if body.contains("$output") {
+            out.push_str("my $output = '';\n");
+        }
+        if body.contains("$__nocasematch") {
+            out.push_str("my $__nocasematch = 0;\n");
+        }
         // Hoisted declarations for assigned variables (use strict).
         let mut vars = Vec::new();
         collect_assigned_vars(&stmts, &mut vars);
@@ -1006,44 +1094,8 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         out.push('\n');
     }
 
-    // Top-level statements
-    for (idx, stmt) in stmts.iter().enumerate() {
-        let line = prog
-            .stmt_lines
-            .iter()
-            .find(|(i, _)| *i == idx)
-            .map(|(_, l)| *l);
-        let before = out.len();
-        emit_stmt(&mut out, stmt, 0);
-        if let Some(l) = line {
-            // a SHORT comment at the end of the statement's first line:
-            // `$sum += $i;  # line 7` — the source-mapping convention
-            let added = &out[before..];
-            if let Some(nl) = added.find('\n') {
-                out.insert_str(before + nl, &format!("  # line {l}"));
-            }
-        }
-    }
-    out.push('\n');
-
-    // Subroutines
-    for sub in &prog.subs {
-        emit_sub(&mut out, sub);
-        out.push('\n');
-    }
-
-    // Exit — only if $main_exit_code might be non-zero (i.e. if any
-    // statement references it).  For scripts that never touch it,
-    // omit the exit so Perl's default exit(0) applies.
-    let has_main_exit = modern_ir
-        || stmts.iter().any(|s| stmt_refers_to_main_exit(s))
-        || prog
-            .subs
-            .iter()
-            .any(|sub| sub.body.iter().any(|s| stmt_refers_to_main_exit(s)));
-    if has_main_exit {
-        out.push_str("exit $main_exit_code;\n");
-    }
+    // Append the rendered body (statements + subs + exit).
+    out.push_str(&body);
 
     // Restore brace balance — some generated code paths may produce
     // unbalanced delimiters, so add missing closing braces as a safety net.
@@ -6937,6 +6989,61 @@ mod tests {
             !perl.contains("contains("),
             "no bare contains() sub call: {perl}"
         );
+    }
+
+    /// The modern-IR preamble only declares the infrastructure variables
+    /// the rendered body actually references: `$__argc` only for `$#`
+    /// reads, `$__nocasematch` only for the shopt lowering, and the
+    /// Carp/English/IPC::Open3 imports only when the body uses them.
+    /// `$ls_success`/`$output` are dead on the IR path (never emitted).
+    #[test]
+    fn preamble_gates_dead_boilerplate() {
+        let src = r##"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Expr","expr":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Call","func":"getVar","purity":"Emulable","args":[{"type":"Str","value":"#","style":"DoubleQuoted"}]}]}]}},
+            {"type":"Expr","expr":{"type":"Call","func":"shopt","purity":"Emulable","args":[{"type":"Str","value":"nocasematch","style":"DoubleQuoted"},{"type":"Bool","value":true}]}}
+        ]}"##;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("gated-preamble A1 ingress");
+        let perl = shir_to_perl(&prog);
+        // needed (echo + shopt reference the status trackers, `$#` needs
+        // the argc snapshot, shopt needs the nocasematch flag)
+        assert!(perl.contains("my $main_exit_code = 0;"), "{perl}");
+        assert!(perl.contains("our $CHILD_ERROR = 0;"), "{perl}");
+        assert!(perl.contains("my $__argc = @ARGV;"), "{perl}");
+        assert!(perl.contains("my $__nocasematch = 0;"), "{perl}");
+        // dead on the IR path — never declared
+        assert!(!perl.contains("my $ls_success"), "{perl}");
+        assert!(!perl.contains("my $output"), "{perl}");
+        // no carp/croak, no long English names, no open3 — imports dropped
+        assert!(!perl.contains("use Carp"), "{perl}");
+        assert!(!perl.contains("use English"), "{perl}");
+        assert!(!perl.contains("use IPC::Open3"), "{perl}");
+    }
+
+    /// The rm emulation's `carp "rm: carping: …"` text and the
+    /// `$OS_ERROR` it embeds must pull `use Carp` + `use English` back in
+    /// (the gate scans the RENDERED body, which includes generator
+    /// emulation text spliced by the whitelisted-command path).
+    #[test]
+    fn preamble_keeps_carp_and_english_when_used() {
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![IrStmt::RawText(
+                "carp \"rm: carping: could not remove \", $file, \": $OS_ERROR\\n\";\n"
+                    .to_string(),
+            )],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let perl = shir_to_perl(&prog);
+        assert!(perl.contains("use Carp;"), "{perl}");
+        assert!(perl.contains("use English"), "{perl}");
     }
 
     /// Declarator-position asm label (core request
