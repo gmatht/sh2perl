@@ -32,6 +32,11 @@ pub struct Render {
     /// plain name folds to "" — the SH2_ASSUME_NO_ENV read fold, mirroring
     /// the estree emitter's collect_never_written)
     written: HashSet<String>,
+    /// names written ONLY through the runtime store (`setVar` calls — the
+    /// imperative frontends' handle temps `___hp_*` etc.): a getVar of one
+    /// of these must round-trip through the store, NOT the python binding
+    /// (which is only updated by native Assign/Declare statements).
+    store_written: HashSet<String>,
     /// needs the `__sh_atoi` helper (printf %d/%i/%u args)
     need_atoi: bool,
     todo: usize,
@@ -39,12 +44,217 @@ pub struct Render {
     need_re: bool,
 }
 
+impl Render {
+    /// Real runtime implementations for the sh2.* names the preamble can
+    /// emit (ported from harness/sh2-namespace.mjs — the C memory arena
+    /// slice 2, the var store, the array store, the test fallback). A name
+    /// MISSING from this table still gets the compile-able TODO-exit stub.
+    /// The mem handles are the tagged strings `\x01mem:<id>:<off>`; the
+    /// arena is a flat byte-slot array with the load/store offset scaled by
+    /// the type's element size (p + n gets its sizeof(*p) semantics).
+    const RUNTIME: &[(&str, &str)] = &[
+        (
+            "getVar",
+            "def sh2_getVar(name):\n    return __sh_store.get(name, \"\")\n",
+        ),
+        (
+            "setVar",
+            "def sh2_setVar(name, value):\n    __sh_store[name] = \"\" if value is None else str(value)\n",
+        ),
+        (
+            "memAlloc",
+            concat!(
+                "def sh2_memAlloc(size):\n",
+                "    global __sh_mem_seq\n",
+                "    __sh_mem_seq += 1\n",
+                "    n = int(float(str(size or 0)))\n",
+                "    n = n if n > 0 else 0\n",
+                "    __sh_mem[__sh_mem_seq] = [0] * n\n",
+                "    return \"\\x01mem:%d:0\" % __sh_mem_seq\n",
+            ),
+        ),
+        (
+            "memElemSize",
+            concat!(
+                "def sh2_memElemSize(t):\n",
+                "    sizes = {'char': 1, 'signed char': 1, 'unsigned char': 1, 'short': 2, ",
+                "'short int': 2, 'int': 4, 'unsigned int': 4, 'unsigned': 4, 'long': 8, ",
+                "'long int': 8, 'long long': 8, 'unsigned long': 8, 'unsigned long long': 8, ",
+                "'float': 4, 'double': 8, 'void*': 8, 'ptr': 8, 'pointer': 8, 'int8': 1, ",
+                "'int16': 2, 'int32': 4, 'int64': 8, 'u32': 4, 'u64': 8}\n",
+                "    return sizes.get(str(t), 1)\n",
+            ),
+        ),
+        (
+            "memLoad",
+            concat!(
+                "def sh2_memLoad(h, offset, t):\n",
+                "    p = __sh_mem_parse(h)\n",
+                "    if p is None or p[0] not in __sh_mem:\n",
+                "        return \"\"\n",
+                "    i = (p[1] + int(offset or 0)) * sh2_memElemSize(t)\n",
+                "    a = __sh_mem[p[0]]\n",
+                "    return str(a[i]) if 0 <= i < len(a) else \"\"\n",
+            ),
+        ),
+        (
+            "memStore",
+            concat!(
+                "def sh2_memStore(h, offset, t, v):\n",
+                "    p = __sh_mem_parse(h)\n",
+                "    if p is None or p[0] not in __sh_mem:\n",
+                "        return\n",
+                "    i = (p[1] + int(offset or 0)) * sh2_memElemSize(t)\n",
+                "    a = __sh_mem[p[0]]\n",
+                "    if 0 <= i < len(a):\n",
+                "        a[i] = \"\" if v is None else str(v)\n",
+            ),
+        ),
+        (
+            "memAdvance",
+            concat!(
+                "def sh2_memAdvance(h, n):\n",
+                "    p = __sh_mem_parse(h)\n",
+                "    if p is None:\n",
+                "        return h\n",
+                "    return \"\\x01mem:%d:%d\" % (p[0], p[1] + int(n or 0))\n",
+            ),
+        ),
+        (
+            "memFree",
+            concat!(
+                "def sh2_memFree(h):\n",
+                "    p = __sh_mem_parse(h)\n",
+                "    if p is not None and p[0] in __sh_mem:\n",
+                "        del __sh_mem[p[0]]\n",
+            ),
+        ),
+        (
+            "memTest",
+            concat!(
+                "def sh2_memTest(op, a, b):\n",
+                "    pa = __sh_mem_pos(a)\n",
+                "    pb = __sh_mem_pos(b)\n",
+                "    return {'<': pa < pb, '<=': pa <= pb, '>': pa > pb, '>=': pa >= pb, ",
+                "'==': pa == pb, '!=': pa != pb}.get(op, False)\n",
+            ),
+        ),
+        (
+            "setArray",
+            concat!(
+                "def sh2_setArray(name, elements, isAssoc):\n",
+                "    __sh_arrays[name] = list(elements or [])\n",
+            ),
+        ),
+        (
+            "arrayIndex",
+            concat!(
+                "def sh2_arrayIndex(name, key):\n",
+                "    try:\n",
+                "        return str(__sh_arrays.get(name, [])[int(key)])\n",
+                "    except Exception:\n",
+                "        return \"\"\n",
+            ),
+        ),
+        (
+            "test",
+            concat!(
+                "def sh2_test(s):\n",
+                "    t = str(s or \"\").split()\n",
+                "    if len(t) == 3:\n",
+                "        a, op, b = t\n",
+                "        va = __sh_test_val(a)\n",
+                "        vb = __sh_test_val(b)\n",
+                "        if op in ('-gt', '-lt', '-ge', '-le'):\n",
+                "            try:\n",
+                "                return {'-gt': va > vb, '-lt': va < vb, '-ge': va >= vb, ",
+                "'-le': va <= vb}[op]\n",
+                "            except TypeError:\n",
+                "                return False\n",
+                "        return {'-eq': va == vb, '=': va == vb, '==': va == vb, ",
+                "'-ne': va != vb, '!=': va != vb}.get(op, False)\n",
+                "    if len(t) == 2 and t[0] == '-n':\n",
+                "        return bool(__sh_test_val(t[1]))\n",
+                "    if len(t) == 2 and t[0] == '-z':\n",
+                "        return not bool(__sh_test_val(t[1]))\n",
+                "    if len(t) == 1:\n",
+                "        return bool(__sh_test_val(t[0]))\n",
+                "    return False\n",
+            ),
+        ),
+        (
+            "testVal",
+            concat!(
+                "def __sh_test_val(x):\n",
+                "    x = str(x).strip().strip(\"\\\"\")\n",
+                "    if x.startswith('$'):\n",
+                "        return sh2_getVar(x[1:])\n",
+                "    try:\n",
+                "        return int(x)\n",
+                "    except ValueError:\n",
+                "        return x\n",
+            ),
+        ),
+        (
+            "memParse",
+            concat!(
+                "def __sh_mem_parse(h):\n",
+                "    h = str(h or \"\")\n",
+                "    if not h.startswith(\"\\x01mem:\"):\n",
+                "        return None\n",
+                "    r = h[5:].split(':')\n",
+                "    if len(r) != 2:\n",
+                "        return None\n",
+                "    try:\n",
+                "        return int(r[0]), int(r[1])\n",
+                "    except ValueError:\n",
+                "        return None\n",
+            ),
+        ),
+        (
+            "memPos",
+            concat!(
+                "def __sh_mem_pos(h):\n",
+                "    p = __sh_mem_parse(h)\n",
+                "    if p is not None:\n",
+                "        return p[1]\n",
+                "    try:\n",
+                "        return int(h) or 0\n",
+                "    except (TypeError, ValueError):\n",
+                "        return 0\n",
+            ),
+        ),
+    ];
+
+    /// Emit one runtime body (multi-line python, depth 0) plus a blank line.
+    fn emit_runtime_body(&mut self, body: &str) {
+        for line in body.lines() {
+            self.emit(line);
+        }
+        self.emit("");
+    }
+
+    /// Look up the preamble body for a sh2.* name or helper.
+    fn runtime_body(name: &str) -> Option<&'static str> {
+        Render::RUNTIME.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
+    }
+}
+
 /// Render an `IrProgram` to python source (a runnable script).
 pub fn shir_to_python(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
     // A2: the type verdicts are computed at serialization time in the JSON
-    // path; the library path must run the same analysis.
-    prog.var_types = crate::shir::analyze_var_types(&prog);
+    // path; the library path must run the same analysis. A frontend that
+    // EMITTED typed var_types (the imperative C-family frontends: Int32/
+    // Int64/UInt32/UInt64/Float verdicts, `analyze_var_types` never
+    // produces those) keeps them — discarding them (as this did) lost the
+    // frontend's authoritative types and re-derived shell verdicts that
+    // miss C-typed vars (triage-python 20260814-1425xx cluster: getVar
+    // stubs for Int32 vars the analysis never lifted). Mirror of the
+    // shir_json.rs serialization rule: analyze only when empty.
+    if prog.var_types.is_empty() {
+        prog.var_types = crate::shir::analyze_var_types(&prog);
+    }
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.collect_writes(&prog.stmts);
@@ -100,8 +310,15 @@ impl Render {
         out
     }
 
+    /// Numeric-typed vars default to `0` and assign through `expr_as_num`
+    /// (C semantics — the imperative frontends type ints as Int32/Int64/
+    /// UInt32/UInt64, and a bare `x = "10"` would make `x > 3` a python
+    /// str-vs-int TypeError).
     fn is_num(&self, name: &str) -> bool {
-        self.var_types.get(name).copied() == Some(IrType::Int)
+        matches!(
+            self.var_types.get(name),
+            Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
+        )
     }
 
     // ── never-written scan ──────────────────────────────────────────
@@ -158,6 +375,18 @@ impl Render {
                     self.collect_writes(body);
                     self.collect_writes_expr(cond);
                 }
+                IrStmt::ForInit {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    self.collect_writes(init);
+                    self.collect_writes_expr(cond);
+                    self.collect_writes(step);
+                    self.collect_writes(body);
+                }
+                IrStmt::Break | IrStmt::Continue => {}
                 IrStmt::Block(b) => self.collect_writes(b),
                 IrStmt::Function { body, .. } => self.collect_writes(body),
                 IrStmt::Exec { cmd, args, capture, .. } => {
@@ -181,6 +410,10 @@ impl Render {
                     "setVar" => {
                         if let Some(IrExpr::Str(name, _)) = args.first() {
                             self.written.insert(name.clone());
+                            // setVar writes go through the runtime STORE,
+                            // not a python binding — getVar of the same
+                            // name must read the store back.
+                            self.store_written.insert(name.clone());
                         }
                     }
                     // read/readarray/mapfile/getLine: every Str arg is a
@@ -522,11 +755,23 @@ impl Render {
         inner[1..inner.len() - 1].to_string()
     }
 
-    fn sh2_stub(&mut self, name: &str, _args: &[IrExpr], note: &str) -> String {
+    /// A runtime-store call the preamble implements (the sh2.* subset for
+    /// the imperative frontends): register the name and emit the call WITH
+    /// its rendered args (the runtime functions take real arguments — the
+    /// old zero-arg stubs could never be implemented).
+    fn sh2_call(&mut self, name: &str, args: &[IrExpr]) -> String {
+        let safe = name.replace('.', "_");
+        self.sh2_calls.insert(safe.clone());
+        let rendered: Vec<String> = args.iter().map(|a| self.expr(a)).collect();
+        format!("sh2_{safe}({})", rendered.join(", "))
+    }
+
+    fn sh2_stub(&mut self, name: &str, args: &[IrExpr], note: &str) -> String {
         let safe = name.replace('.', "_");
         self.sh2_calls.insert(safe.clone());
         self.mark_todo(&format!("{note} → sh2.{name}"));
-        format!("sh2_{safe}()")
+        let rendered: Vec<String> = args.iter().map(|a| self.expr(a)).collect();
+        format!("sh2_{safe}({})", rendered.join(", "))
     }
 
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
@@ -553,12 +798,21 @@ impl Render {
                 self.sh2_stub("exec", args, "exec")
             }
             // getVar("y") — the ShIR's form of a `$y` read; typed vars are
-            // plain python names, a never-written plain name is unset at
-            // every read (→ "", the SH2_ASSUME_NO_ENV fold), anything else
-            // → runtime stub
+            // plain python names, a store-written name (the imperative
+            // frontends' handle temps) reads the runtime store, a
+            // never-written plain name is unset at every read (→ "", the
+            // SH2_ASSUME_NO_ENV fold), a native-written plain name is the
+            // python binding; anything else → runtime stub
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     if self.var_types.contains_key(name) {
+                        return self.py_ident(name);
+                    }
+                    if self.store_written.contains(name) {
+                        self.sh2_calls.insert("getVar".into());
+                        return format!("sh2_getVar({})", Self::py_str(name));
+                    }
+                    if self.written.contains(name) && Self::is_plain_name(name) {
                         return self.py_ident(name);
                     }
                     if !self.written.contains(name) && Self::is_plain_name(name) {
@@ -566,6 +820,102 @@ impl Render {
                     }
                 }
                 self.sh2_stub("getVar", args, "getVar")
+            }
+            // setVar(name, value) — typed var → native assignment (the
+            // getVar mirror); store-written name → runtime store write;
+            // anything else → runtime stub.
+            "setVar" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    let value = args
+                        .get(1)
+                        .map(|a| self.expr(a))
+                        .unwrap_or_else(|| "\"\"".into());
+                    if self.var_types.contains_key(name) {
+                        return format!("{} = {value}", self.py_ident(name));
+                    }
+                    if self.store_written.contains(name) && Self::is_plain_name(name) {
+                        self.sh2_calls.insert("setVar".into());
+                        return format!("sh2_setVar({}, {value})", Self::py_str(name));
+                    }
+                }
+                self.sh2_stub("setVar", args, "setVar")
+            }
+            // ternary(cond, a, b) — the C frontend's `cond ? a : b`: the
+            // cond is a test STRING (evaluated with the same native-first
+            // policy as the A1 `test` call), the branches are lowered A1
+            // values — pure, eager evaluation is sound.
+            "ternary" => {
+                let cond = match args.first() {
+                    Some(IrExpr::Str(s, _)) => self.test_render(s).unwrap_or_else(|| {
+                        // unrenderable test string: the runtime fallback
+                        self.sh2_calls.insert("test".into());
+                        format!("sh2_test({})", Self::py_str(s))
+                    }),
+                    _ => return self.sh2_stub("ternary", args, "ternary"),
+                };
+                let then = args
+                    .get(1)
+                    .map(|a| self.expr(a))
+                    .unwrap_or_else(|| "\"\"".into());
+                let else_ = args
+                    .get(2)
+                    .map(|a| self.expr(a))
+                    .unwrap_or_else(|| "\"\"".into());
+                format!("({then} if {cond} else {else_})")
+            }
+            // param(op, name, ..) — the C frontend's strlen lowering is the
+            // `${#name}` len op on a native var: `param("len", "s")`.
+            "param" => {
+                if let Some(IrExpr::Str(op, _)) = args.first() {
+                    if op == "len" {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            return format!("str(len({}))", self.py_ident(name));
+                        }
+                    }
+                }
+                self.sh2_stub("param", args, "param")
+            }
+            // arith("$i") — the imperative frontends' arith-text reads; the
+            // common `$name` form is a native int() read of the binding.
+            "arith" => {
+                if let Some(IrExpr::Str(s, _)) = args.first() {
+                    if let Some(name) = s.strip_prefix('$') {
+                        if Self::is_plain_name(name) && !self.store_written.contains(name) {
+                            return format!("int({})", self.py_ident(name));
+                        }
+                    }
+                }
+                self.sh2_stub("arith", args, "arith")
+            }
+            // the C memory model (malloc/pointer arithmetic): the arena
+            // runtime (subset of sh2-namespace.mjs slice 2).
+            "memAlloc" | "memStore" | "memLoad" | "memAdvance" | "memFree"
+            | "memTest" | "memElemSize" => self.sh2_call(func, args),
+            // setArray/arrayIndex — a typed name is a native python list
+            // (the C array `a[4]`); untyped names keep the runtime store.
+            "setArray" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if self.var_types.contains_key(name) {
+                        let elems = args
+                            .get(1)
+                            .map(|a| self.expr(a))
+                            .unwrap_or_else(|| "[]".into());
+                        return format!("{} = {elems}", self.py_ident(name));
+                    }
+                }
+                self.sh2_call("setArray", args)
+            }
+            "arrayIndex" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if self.var_types.contains_key(name) {
+                        let key = args
+                            .get(1)
+                            .map(|a| self.expr(a))
+                            .unwrap_or_else(|| "0".into());
+                        return format!("{}[int({key})]", self.py_ident(name));
+                    }
+                }
+                self.sh2_call("arrayIndex", args)
             }
             // test("...") — mini evaluator for the common numeric/string
             // patterns; anything else → runtime stub.
@@ -822,11 +1172,19 @@ impl Render {
                     "-ne" | "!=" => "!=",
                     _ => return None,
                 };
-                Some(format!(
-                    "({} {py_op} {})",
-                    self.test_value(a),
-                    self.test_value(b)
-                ))
+                let va = self.test_value(a);
+                let vb = self.test_value(b);
+                // the -gt/-lt/-ge/-le/-eq/-ne ops are NUMERIC in bash (and
+                // the C frontend's loop/if tests are all numeric): coerce
+                // both sides so a str-valued operand (a lifted temp holding
+                // a stringified number) compares numerically instead of
+                // raising a python str-vs-int TypeError. `=`/`==`/`!=` stay
+                // raw string comparisons.
+                if matches!(*op, "-gt" | "-lt" | "-ge" | "-le" | "-eq" | "-ne") {
+                    Some(format!("(int({va}) {py_op} int({vb}))"))
+                } else {
+                    Some(format!("({va} {py_op} {vb})"))
+                }
             }
             [flag, v] if *flag == "-n" => Some(format!("({})", self.test_value(v))),
             [flag, v] if *flag == "-z" => Some(format!("(not {})", self.test_value(v))),
@@ -835,12 +1193,15 @@ impl Render {
         }
     }
 
-    /// A test operand: `"$y"`/`$y`/`y` (typed var) → ident; number →
-    /// literal; otherwise a quoted string.
+    /// A test operand: `"$y"`/`$y`/`y` (typed var) → ident; a number →
+    /// literal; a native-written name (a lifted temp) → ident; otherwise a
+    /// quoted string.
     fn test_value(&self, t: &str) -> String {
         let t = t.trim().trim_matches('"');
         let t = t.strip_prefix('$').unwrap_or(t);
         if self.var_types.contains_key(t) {
+            self.py_ident(t)
+        } else if self.written.contains(t) && !self.store_written.contains(t) && Self::is_plain_name(t) {
             self.py_ident(t)
         } else if let Ok(n) = t.parse::<i64>() {
             n.to_string()
@@ -897,6 +1258,39 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => {
+                // statement-position arith: `i++` / `x += n` (the C-style
+                // frontends' loop steps) render natively — python has no
+                // expression-assignment, so the Expr(Arith) form must
+                // become a real statement (the arith() expression path can
+                // only stub it).
+                if let IrExpr::Arith(a) = e {
+                    if let ArithAst::IncDec { var, delta, prefix: _ } = &**a {
+                        let name = self.py_ident(var);
+                        let d = delta.unsigned_abs();
+                        let op = if *delta >= 0 { "+=" } else { "-=" };
+                        let rhs = if d == 1 {
+                            "1".to_string()
+                        } else {
+                            d.to_string()
+                        };
+                        self.emit(&format!("{name} {op} {rhs}"));
+                        return;
+                    }
+                    if let ArithAst::Assign { var, op, rhs } = &**a {
+                        let name = self.py_ident(var);
+                        let r = self.arith(rhs);
+                        let py_op = match op.as_str() {
+                            "+=" => "+=",
+                            "-=" => "-=",
+                            "*=" => "*=",
+                            "/=" => "/=",
+                            "%=" => "%=",
+                            _ => "=",
+                        };
+                        self.emit(&format!("{name} {py_op} {r}"));
+                        return;
+                    }
+                }
                 if let IrExpr::Call { func, .. } = e {
                     if func == "grepMatches" {
                         // statement position: the matches are the output
@@ -1050,11 +1444,52 @@ impl Render {
                 self.block(body);
                 self.loop_depth -= 1;
             }
+            // C-style `for (init; cond; step)` — the imperative frontends'
+            // rich form (the shell path lowers it via strip_cfor). Render
+            // natively as `init; while (cond) { body; step }` (the step
+            // re-runs at the end of every iteration).
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                for s in init {
+                    self.stmt(s);
+                }
+                let c = self.expr(cond);
+                self.emit(&format!("while {c}:"));
+                self.loop_depth += 1;
+                self.block(body);
+                // the step runs at the loop-body depth, after the body
+                self.depth += 1;
+                for s in step {
+                    self.stmt(s);
+                }
+                self.depth -= 1;
+                self.loop_depth -= 1;
+            }
+            IrStmt::Break => {
+                if self.loop_depth > 0 {
+                    self.emit("break");
+                } else {
+                    self.mark_todo("top-level break");
+                }
+            }
+            IrStmt::Continue => {
+                if self.loop_depth > 0 {
+                    self.emit("continue");
+                } else {
+                    self.mark_todo("top-level continue");
+                }
+            }
             IrStmt::DoWhile { body, cond, until } => {
                 self.emit("while True:");
                 self.loop_depth += 1;
                 self.block(body);
-                self.loop_depth -= 1;
+                // the cond check + break live INSIDE the loop body — block()
+                // restored depth 0, so raise it back to loop-body depth.
+                self.depth += 1;
                 let c = self.expr(cond);
                 if *until {
                     self.emit(&format!("if {c}:"));
@@ -1064,6 +1499,8 @@ impl Render {
                 self.depth += 1;
                 self.emit("break");
                 self.depth -= 1;
+                self.depth -= 1;
+                self.loop_depth -= 1;
             }
             IrStmt::Exit(e) => {
                 let code = e
@@ -1167,13 +1604,49 @@ impl Render {
         }
         self.emit("");
         if !self.sh2_calls.is_empty() {
-            self.emit("# sh2.* runtime stubs — TODO: implement (harness/sh2-namespace.json)");
+            self.emit("# sh2.* runtime — subset of harness/sh2-namespace.mjs");
+            self.emit("# (the C memory arena, the var store, arrays, tests)");
+            self.emit("__sh_store = {}");
+            self.emit("__sh_mem = {}");
+            self.emit("__sh_mem_seq = 0");
+            self.emit("__sh_arrays = {}");
+            self.emit("");
+            // the arena/test helpers ride along with their users (python
+            // resolves names at call time, so order is irrelevant)
+            let has_mem = self.sh2_calls.iter().any(|n| {
+                matches!(
+                    n.as_str(),
+                    "memAlloc" | "memStore" | "memLoad" | "memAdvance" | "memFree"
+                        | "memTest"
+                )
+            });
+            if has_mem {
+                if let Some(b) = Render::runtime_body("memElemSize") {
+                    self.emit_runtime_body(b);
+                }
+                if let Some(b) = Render::runtime_body("memParse") {
+                    self.emit_runtime_body(b);
+                }
+                if let Some(b) = Render::runtime_body("memPos") {
+                    self.emit_runtime_body(b);
+                }
+            }
+            if self.sh2_calls.contains("test") {
+                if let Some(b) = Render::runtime_body("testVal") {
+                    self.emit_runtime_body(b);
+                }
+            }
             let names: Vec<String> = self.sh2_calls.iter().cloned().collect();
-            for name in names {
-                self.emit(&format!("def sh2_{name}(*args):"));
-                self.emit(&format!("    print(\"TODO sh2.{name}\", file=sys.stderr)"));
-                self.emit("    sys.exit(2)");
-                self.emit("");
+            for name in &names {
+                match Render::runtime_body(name) {
+                    Some(body) => self.emit_runtime_body(body),
+                    None => {
+                        self.emit(&format!("def sh2_{name}(*args):"));
+                        self.emit(&format!("    print(\"TODO sh2.{name}\", file=sys.stderr)"));
+                        self.emit("    sys.exit(2)");
+                        self.emit("");
+                    }
+                }
             }
         }
         if self.need_atoi {
@@ -1266,6 +1739,18 @@ fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 collect_vars(body, out);
                 collect_vars_expr(cond, out);
             }
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                collect_vars(init, out);
+                collect_vars_expr(cond, out);
+                collect_vars(step, out);
+                collect_vars(body, out);
+            }
+            IrStmt::Break | IrStmt::Continue => {}
             IrStmt::Exit(e) => {
                 if let Some(x) = e {
                     collect_vars_expr(x, out);
