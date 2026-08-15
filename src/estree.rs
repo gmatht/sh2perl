@@ -1366,9 +1366,14 @@ fn classify_array_call(
             let Some(target_arg) = args.get(1) else { return };
             let Some(target) = lit_str(target_arg) else { return };
             let Some(op) = lit_str(first) else { return };
-            // slice-of-a-name is an array ref; other params are not
+            // zsh `${(flags)var}` (core requests zsh-sh-go-20260814-183409 /
+            // 193615 + re-filings): the flag/separator ride the extra args
+            // and the runtime's zshParamFlags reads the STORE array — the
+            // name is an array touch (never native-foldable).
             if op == "slice" {
                 target.trim_start_matches('#')
+            } else if op.is_empty() && args.len() >= 3 {
+                target
             } else {
                 return;
             }
@@ -1442,6 +1447,10 @@ fn classify_array_call(
             if op == "slice" && mode == "@" {
                 // len (#name) or join (name) — both reads
                 entry.read_stmt_idxs.push(stmt_idx);
+            } else if op.is_empty() && args.len() >= 3 {
+                // zsh flags — the runtime zshParamFlags reads the STORE
+                // array (the native fold would desync it)
+                entry.writes = true;
             } else {
                 entry.writes = true;
             }

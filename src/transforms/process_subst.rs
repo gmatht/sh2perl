@@ -309,6 +309,11 @@ fn materialize_expr(e: &mut IrExpr, n: &mut usize) -> bool {
             c
         }
         IrExpr::Index { key, .. } => materialize_expr(key, n),
+        // the first-class Capture node (core request
+        // zsh-sh-go-20260814-230503): a process substitution inside a
+        // command substitution (`x=$(diff <(a) <(b))`) lives under the
+        // Capture's Arrow — materialize it like the Call-capture form.
+        IrExpr::Capture { expr, .. } => materialize_expr(expr, n),
         _ => false,
     }
 }

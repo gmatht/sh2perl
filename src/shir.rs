@@ -7230,8 +7230,20 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
             rhs: Box::new(command_to_ir(r)),
         }),
         Command::Not(c) => IrStmt::Expr(not_ir(command_to_ir(c))),
-        Command::Break(_) => IrStmt::Expr(call("break", vec![])),
-        Command::Continue(_) => IrStmt::Expr(call("continue", vec![])),
+        // First-class A1 nodes instead of the opaque builtin calls (core
+        // requests zsh-sh-go-20260814-225040 / zsh-sh-go-20260815-015459
+        // [Break] and zsh-sh-go-20260813-003026 [Continue]): every
+        // renderer already lowers `IrStmt::Break`/`IrStmt::Continue` to
+        // the SAME runtime calls as the legacy `Call break/continue`
+        // forms (sh2.break()/sh2.continue(), `last;`/`next;`,
+        // break;/continue;), so the emitted code is byte-identical. The
+        // LEVEL argument (`break 2`/`continue 2`) is dropped exactly as
+        // before (the A1 nodes have no level field); the expression-
+        // context arm below keeps the call forms for `&&`/`||`/`!`
+        // operands.
+        Command::Break(_) => IrStmt::Break,
+        Command::Continue(None) => IrStmt::Continue,
+        Command::Continue(Some(_)) => IrStmt::Expr(call("continue", vec![])),
         Command::Return(w) => IrStmt::Return(w.as_ref().map(word_ir_quoted)),
         other => IrStmt::Expr(call("unsupported", vec![st(&format!("{other:?}"))])),
     })
@@ -8108,7 +8120,16 @@ fn word_ir_quoted(w: &Word) -> IrExpr {
                 Some(a) => IrExpr::Arith(Box::new(a)),
                 None => call("arith", vec![st(t)]),
             },
-            None => call("capture", vec![IrExpr::Arrow(command_arrow_stmts(cmd))]),
+            None => IrExpr::Capture {
+                // The first-class A1 Capture node (core request
+                // zsh-sh-go-20260814-230503): `$(...)`/backticks lower to
+                // `Capture { expr: Arrow, native: false }` instead of the
+                // opaque `call("capture")` — the contract node whose
+                // analysis arms all exist and whose estree render arm
+                // rewrites to the same runtime sh2.capture call.
+                expr: Box::new(IrExpr::Arrow(command_arrow_stmts(cmd))),
+                native: false,
+            },
         },
         _ => word_ir(w),
     }
@@ -8221,11 +8242,21 @@ fn word_ir(w: &Word) -> IrExpr {
                 st(length.as_deref().unwrap_or("")),
             ],
         ),
-        Word::StringInterpolation(interp, _) => {
-            if let Some(part) = pure_template_part(interp) {
+        Word::StringInterpolation(interp, translated) => {
+            let ir = if let Some(part) = pure_template_part(interp) {
                 part
             } else {
                 interpolate_ir(&interp.parts)
+            };
+            // `$"..."` — the translated-string marker set by
+            // parse_string_interpolation (core request
+            // zsh-sh-go-20260814-200005): lower to `translate(...)`; the
+            // runner resolves the language (bash → content, zsh → `$` +
+            // content).
+            if translated.is_some() {
+                call("translate", vec![ir])
+            } else {
+                ir
             }
         }
         other => call("unsupported", vec![st(&other.to_string())]),
@@ -8739,7 +8770,10 @@ fn part_ir(part: &StringPart) -> IrExpr {
                 Some(a) => IrExpr::Arith(Box::new(a)),
                 None => call("arith", vec![st(t)]),
             },
-            None => call("capture", vec![IrExpr::Arrow(command_arrow_stmts(cmd))]),
+            None => IrExpr::Capture {
+                expr: Box::new(IrExpr::Arrow(command_arrow_stmts(cmd))),
+                native: false,
+            },
         },
         other => call("unsupported", vec![st(&format!("{other:?}"))]),
     }
@@ -8759,10 +8793,15 @@ fn for_item_ir(w: &Word) -> IrExpr {
         // native whitespace field-split; `$@`/`$*` keep listVar above (the
         // runtime's per-positional flatten, never IFS-split).
         Word::Variable(name, _, _) => call("split", vec![call("getVar", vec![st(name)])]),
-        Word::StringInterpolation(interp, _) => {
+        Word::StringInterpolation(interp, translated) => {
             if let Some(part) = pure_part(interp) {
                 // Un-joined: `for x in "${!map[@]}"` iterates each element.
-                return part_ir_flat(part);
+                let ir = part_ir_flat(part);
+                return if translated.is_some() {
+                    call("translate", vec![ir])
+                } else {
+                    ir
+                };
             }
             word_ir(w)
         }
@@ -16165,6 +16204,15 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         expr_to_estree(&IrExpr::Call {
                             func: func.clone(),
                             args: args.clone(),
+                        })
+                    }
+                    // the first-class Capture node (core request
+                    // zsh-sh-go-20260814-230503) — same runtime lowering
+                    // as the legacy call form above.
+                    IrExpr::Capture { expr, .. } => {
+                        expr_to_estree(&IrExpr::Call {
+                            func: "capture".to_string(),
+                            args: vec![expr.as_ref().clone()],
                         })
                     }
                     // the for-loop numeric coercion (`i = Number(i)`)
@@ -27068,6 +27116,14 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args else {
         return None;
     };
+    // zsh `${(flags)var}` / `${(flag:sep:)var}` — the flag/separator
+    // ride the extra args (core requests zsh-sh-go-20260814-183409 /
+    // 193615 + re-filings 20260815-000728 / 001515): the native getVar
+    // read below would DROP them, so the runtime param dispatch (the
+    // runner's zshParamFlags) must handle the shape.
+    if op.is_empty() && args.len() > 2 {
+        return None;
+    }
     // Value source: a LIFTED binding (bare identifier — the runtime cannot
     // read it from the store), a POSITIONAL ($0/$1..$9/$@/$*/$# — a direct
     // read of the runtime's positional state, the exact value its getVar
@@ -29177,6 +29233,10 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
                 IrExpr::Call { func, args } if func == "capture" => {
                     matches!(args.as_slice(), [IrExpr::Arrow(_)])
                 }
+                // the first-class Capture node (core request
+                // zsh-sh-go-20260814-230503) — same string verdict as the
+                // legacy call form above.
+                IrExpr::Capture { expr, .. } => matches!(expr.as_ref(), IrExpr::Arrow(_)),
                 _ => false,
             });
             if all_string {
@@ -32923,6 +32983,16 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         // the same ESTree shape — a `Literal` with the `regex` property
         // (printed `/pattern/flags`, executed as a native RegExp).
         IrExpr::Regex { pattern, flags } => regex_lit_flags(pattern, flags),
+        // The first-class `Capture` expr node (core request
+        // zsh-sh-go-20260814-230503): the shell frontend's `$(...)`/
+        // backticks lower here (word_ir / parse_string_interpolation).
+        // Render EXACTLY like the legacy `Call capture` — the runtime
+        // sh2.capture machinery (native tr/mktemp/echo-bc folds
+        // included) — so the emitted code is byte-identical to before.
+        IrExpr::Capture { expr, .. } => expr_to_estree(&IrExpr::Call {
+            func: "capture".to_string(),
+            args: vec![expr.as_ref().clone()],
+        }),
         // The A1 `Index` expr node (core requests go-sh-20260814-132037 /
         // py-sh-go-20260814-125405): array element read — the contract's
         // rich form of the `arrayIndex` call. The key is a full expr
