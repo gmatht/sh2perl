@@ -253,10 +253,12 @@ pub fn shir_to_perl_src(prog: &IrProgram, source: Option<&str>) -> String {
     // exit. When it doesn't (a while/if block, say — $? would be stale),
     // keep the perl default 0 (the explicit `exit N` stmts already
     // exited mid-body; this trailing exit is unreachable for them).
-    if body_out
-        .last()
-        .map_or(false, |l| l.trim_start().starts_with("$? = "))
-    {
+    if body_out.last().map_or(false, |l| {
+        let t = l.trim_start();
+        // the statement's rendering ends by SETTING `$?` (its status is
+        // tracked) — or is a status-propagating unlink/rm
+        t.starts_with("$? = ") || t.starts_with("unlink ")
+    }) {
         r.emit("exit(($? >> 8));");
     }
     if r.todo > 0 {
@@ -2963,6 +2965,12 @@ impl Render {
                     // recursive rm: unlink can't remove directories — the
                     // real `rm` binary is the faithful native lowering
                     self.emit(&format!("system('rm', '-rf', {});", files.join(", ")));
+                } else if flags.iter().any(|s| s.contains('f')) {
+                    // `rm -f`: missing files are NOT a failure (bash rc 0);
+                    // an existing-but-unremovable file (permission) IS
+                    for f in files {
+                        self.emit(&format!("unlink {f} or (-e {f} ? ($? = 256) : ($? = 0));"));
+                    }
                 } else {
                     // propagate the failure status (bash `rm` rc) — the
                     // gate compares exit codes
