@@ -94,6 +94,18 @@ pub enum Stmt {
         right: Expr,
         body: Box<Stmt>,
     },
+    /// A native function declaration — the normalize_functions port's
+    /// output (the JS-side estreeToJsMapped normalizes the sh2.functions
+    /// registrations into plain `function x(...)` declarations before the
+    /// astring codegen).
+    FunctionDeclaration {
+        id: Expr,
+        params: Vec<Expr>,
+        body: Box<Stmt>,
+        generator: bool,
+        expression: bool,
+        r#async: bool,
+    },
     VariableDeclaration {
         declarations: Vec<VariableDeclarator>,
         kind: &'static str,
@@ -149,6 +161,16 @@ pub struct RegexLiteral {
 pub enum Expr {
     Identifier {
         name: String,
+    },
+    /// A native function expression — the normalize_functions port's
+    /// sequence-form output (`(__fn_x = function x(...) {…}, …)`).
+    FunctionExpression {
+        id: Box<Expr>,
+        params: Vec<Expr>,
+        body: Box<Stmt>,
+        generator: bool,
+        expression: bool,
+        r#async: bool,
     },
     Literal {
         value: serde_json::Value,
@@ -1534,6 +1556,12 @@ fn walk_stmt_exprs(stmt: &Stmt, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
             walk_expr(right, in_fn, f);
             walk_stmt_exprs(body, in_fn, f);
         }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            for p in params {
+                walk_expr(p, true, f);
+            }
+            walk_stmt_exprs(body, true, f);
+        }
         Stmt::VariableDeclaration { declarations, .. } => {
             for d in declarations {
                 walk_expr(&d.id, in_fn, f);
@@ -1578,6 +1606,12 @@ fn walk_expr(e: &Expr, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
             walk_expr(property, in_fn, f);
         }
         Expr::AwaitExpression { argument } => walk_expr(argument, in_fn, f),
+        Expr::FunctionExpression { params, body, .. } => {
+            for p in params {
+                walk_expr(p, true, f);
+            }
+            walk_stmt_exprs(body, true, f);
+        }
         Expr::ArrowFunctionExpression { params, body, .. } => {
             for p in params {
                 walk_expr(p, in_fn, f);
@@ -1880,6 +1914,14 @@ fn lower_stmt(stmt: Stmt, natives: &std::collections::HashSet<String>) -> Stmt {
             right: lower_expr(right, natives),
             body: Box::new(lower_stmt(*body, natives)),
         },
+        Stmt::FunctionDeclaration { id, params, body, generator, expression, r#async } => Stmt::FunctionDeclaration {
+            id: lower_expr(id, natives),
+            params: params.into_iter().map(|p| lower_expr(p, natives)).collect(),
+            body: Box::new(lower_stmt(*body, natives)),
+            generator,
+            expression,
+            r#async,
+        },
         Stmt::VariableDeclaration { declarations, kind } => Stmt::VariableDeclaration {
             declarations: declarations
                 .into_iter()
@@ -1956,6 +1998,14 @@ fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
         },
         Expr::AwaitExpression { argument } => Expr::AwaitExpression {
             argument: Box::new(lower_expr(*argument, natives)),
+        },
+        Expr::FunctionExpression { id, params, body, generator, expression, r#async } => Expr::FunctionExpression {
+            id: Box::new(lower_expr(*id, natives)),
+            params: params.into_iter().map(|p| lower_expr(p, natives)).collect(),
+            body: Box::new(lower_stmt(*body, natives)),
+            generator,
+            expression,
+            r#async,
         },
         Expr::ArrowFunctionExpression { params, body, expression, r#async } => {
             Expr::ArrowFunctionExpression {
@@ -2325,6 +2375,12 @@ fn drop_nested_flags(stmt: &mut Stmt) {
             drop_expr_flags(right);
             drop_stmt_flags(body);
         }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            for p in params {
+                drop_expr_flags(p);
+            }
+            drop_stmt_flags(body);
+        }
         Stmt::VariableDeclaration { declarations, .. } => {
             for d in declarations {
                 drop_expr_flags(&mut d.id);
@@ -2362,6 +2418,12 @@ fn drop_expr_flags(e: &mut Expr) {
             drop_expr_flags(property);
         }
         Expr::AwaitExpression { argument } => drop_expr_flags(argument),
+        Expr::FunctionExpression { params, body, .. } => {
+            for p in params {
+                drop_expr_flags(p);
+            }
+            drop_stmt_flags(body);
+        }
         Expr::ArrowFunctionExpression { body, .. } => match body {
             ArrowBody::Expr(e) => drop_expr_flags(e),
             ArrowBody::Block(s) => drop_nested_flags(s),
@@ -3131,6 +3193,24 @@ fn write_stmt(out: &mut String, st: &Stmt) {
             write_stmt(out, body);
             out.push('}');
         }
+        Stmt::FunctionDeclaration { id, params, body, generator, expression, r#async } => {
+            out.push_str("{\"type\":\"FunctionDeclaration\",\"id\":");
+            write_expr(out, id);
+            out.push_str(",\"params\":[");
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_expr(out, p);
+            }
+            out.push_str("],\"body\":");
+            write_stmt(out, body);
+            out.push_str(",\"generator\":");
+            push_bool(out, *generator);
+            out.push_str(",\"expression\":");
+            push_bool(out, *expression);
+            out.push_str(",\"async\":");
+            push_bool(out, *r#async);
+            out.push('}');
+        }
         Stmt::VariableDeclaration { declarations, kind } => {
             out.push_str("{\"type\":\"VariableDeclaration\",\"declarations\":[");
             for (i, d) in declarations.iter().enumerate() {
@@ -3277,6 +3357,24 @@ fn write_expr(out: &mut String, e: &Expr) {
         Expr::AwaitExpression { argument } => {
             out.push_str("{\"type\":\"AwaitExpression\",\"argument\":");
             write_expr(out, argument);
+            out.push('}');
+        }
+        Expr::FunctionExpression { id, params, body, generator, expression, r#async } => {
+            out.push_str("{\"type\":\"FunctionExpression\",\"id\":");
+            write_expr(out, id);
+            out.push_str(",\"params\":[");
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_expr(out, p);
+            }
+            out.push_str("],\"body\":");
+            write_stmt(out, body);
+            out.push_str(",\"generator\":");
+            push_bool(out, *generator);
+            out.push_str(",\"expression\":");
+            push_bool(out, *expression);
+            out.push_str(",\"async\":");
+            push_bool(out, *r#async);
             out.push('}');
         }
         Expr::ArrowFunctionExpression { params, body, expression, r#async } => {
@@ -3475,6 +3573,10 @@ pub(crate) fn visit_exprs(prog: &mut Program, f: &mut dyn FnMut(&mut Expr)) {
                 expr(right, f);
                 stmt(body, f);
             }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
+            }
             Stmt::VariableDeclaration { declarations, .. } => {
                 for d in declarations {
                     if let Some(i) = &mut d.init { expr(i, f); }
@@ -3508,6 +3610,10 @@ pub(crate) fn visit_exprs(prog: &mut Program, f: &mut dyn FnMut(&mut Expr)) {
                     ArrowBody::Expr(x) => expr(x, f),
                     ArrowBody::Block(b) => stmt(b, f),
                 }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
             }
             Expr::ObjectExpression { properties } => {
                 for p in properties {
@@ -3561,6 +3667,7 @@ pub(crate) fn has_await_expr(e: &Expr) -> bool {
             ArrowBody::Expr(x) => has_await_expr(x),
             ArrowBody::Block(b) => has_await_stmt(b),
         },
+        Expr::FunctionExpression { body, .. } => has_await_stmt(body),
         Expr::ObjectExpression { properties } => properties.iter().any(|p| {
             has_await_expr(&p.value) || (p.computed && has_await_expr(&p.key))
         }),
@@ -3613,6 +3720,7 @@ pub(crate) fn has_await_stmt(s: &Stmt) -> bool {
         Stmt::ForOfStatement { left, right, body } => {
             has_await_stmt(left) || has_await_expr(right) || has_await_stmt(body)
         }
+        Stmt::FunctionDeclaration { body, .. } => has_await_stmt(body),
         Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
             d.init.as_ref().map(has_await_expr).unwrap_or(false)
         }),
@@ -3780,6 +3888,10 @@ pub(crate) fn await_sync_fn_calls(mut prog: Program) -> Program {
                     for a in arguments { f(a, false, false); }
                 }
                 Expr::AwaitExpression { argument } => f(argument, false, false),
+                Expr::FunctionExpression { params, body, .. } => {
+                    for p in params { f(p, false, false); }
+                    visit_stmt(body, f);
+                }
                 Expr::TemplateLiteral { expressions, .. } => {
                     for x in expressions { f(x, false, false); }
                 }
@@ -3864,6 +3976,10 @@ pub(crate) fn await_sync_fn_calls(mut prog: Program) -> Program {
             Stmt::ForOfStatement { left, right, body } => {
                 visit_stmt(left, f);
                 f(right, false, false);
+                visit_stmt(body, f);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { f(p, false, false); }
                 visit_stmt(body, f);
             }
             Stmt::VariableDeclaration { declarations, .. } => {
@@ -3997,6 +4113,10 @@ pub(crate) fn visit_exprs_post(prog: &mut Program, f: &mut dyn FnMut(&mut Expr))
                 expr(right, f);
                 stmt(body, f);
             }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
+            }
             Stmt::VariableDeclaration { declarations, .. } => {
                 for d in declarations {
                     if let Some(i) = &mut d.init { expr(i, f); }
@@ -4029,6 +4149,10 @@ pub(crate) fn visit_exprs_post(prog: &mut Program, f: &mut dyn FnMut(&mut Expr))
                     ArrowBody::Expr(x) => expr(x, f),
                     ArrowBody::Block(b) => stmt(b, f),
                 }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
             }
             Expr::ObjectExpression { properties } => {
                 for p in properties {
@@ -4108,12 +4232,1095 @@ pub(crate) fn await_async_direct_calls(mut prog: Program) -> Program {
     prog
 }
 
+// ── the estreeToJs head passes, part 2: #6 normalizeFunctions, #7
+// unwrapStoreString, #8 nullSentinel (ported from estree.js) ──────────
+
+/// estree.js `unwrapStoreString` — the C frontend's assign lowering wraps
+/// every rhs store read in `String(sh2.vars.x)`; a BOXED pointer would
+/// stringify to "[object Object]". Rewrite `String(sh2.vars.x)` (and the
+/// `?? (sh2.env.x ?? "")` fallback chain) to the read value itself.
+pub(crate) fn unwrap_store_string(mut prog: Program) -> Program {
+    fn is_store_read(e: &Expr) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                if matches!(&**o, Expr::Identifier { name } if name == "sh2")
+                    && matches!(&**p, Expr::Identifier { name } if name == "vars"))
+                && matches!(&**property, Expr::Identifier { .. }))
+    }
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::CallExpression { callee, arguments, .. } = e {
+            if is_ident(callee, "String") && arguments.len() == 1 {
+                let a = &arguments[0];
+                let matches = match a {
+                    Expr::LogicalExpression { operator, left, .. } if operator == "??" => {
+                        is_store_read(left)
+                    }
+                    _ => false,
+                };
+                if matches {
+                    let a2 = arguments[0].clone();
+                    *e = a2;
+                    return;
+                }
+            }
+        }
+    }
+    visit_exprs_post(&mut prog, &mut rewrite);
+    prog
+}
+
+/// estree.js `nullSentinel` — a C pointer NULL check renders as
+/// `String(p) !== ""`, but a chain tail stores the literal "0" (the
+/// frontend seeds `p = 0`), so the comparison must treat "0" as NULL
+/// too: `String(p) !== "" && String(p) !== "0"` / the `==` twin.
+pub(crate) fn null_sentinel(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::BinaryExpression { operator, left, right, .. } = e {
+            if (operator == "!==" || operator == "==")
+                && matches!(&**right, Expr::Literal { value, .. } if value == "")
+                && matches!(&**left, Expr::CallExpression { callee, .. } if is_ident(callee, "String"))
+            {
+                let is_ne = operator == "!==";
+                let op = if is_ne { "&&" } else { "||" };
+                let mk = |v: &str| Expr::BinaryExpression {
+                    operator: operator.clone(),
+                    left: (*left).clone(),
+                    right: Box::new(Expr::Literal {
+                        value: if v == "" { serde_json::json!("") } else { serde_json::json!("0") },
+                        raw: None,
+                        regex: None,
+                    }),
+                };
+                *e = Expr::LogicalExpression {
+                    operator: op.to_string(),
+                    left: Box::new(mk("")),
+                    right: Box::new(mk("0")),
+                };
+                return;
+            }
+        }
+    }
+    visit_exprs_post(&mut prog, &mut rewrite);
+    prog
+}
+
+// ── #6 normalizeFunctions ────────────────────────────────────────────
+// estree.js `normalizeFunctions`: converts `sh2.functions.set("x",
+// arrow)` registrations (the C frontend's param protocol) into plain
+// `function x(...)` declarations + an adapter arrow, rewrites the body's
+// store access to the native parameters/locals, and strips the moved
+// names from the top-level `let`.
+
+pub(crate) fn normalize_functions(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn is_sh2_member(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if is_ident(object, "sh2") && is_ident(property, name))
+    }
+    fn is_functions_set_callee(e: &Expr) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                if is_ident(o, "sh2") && is_ident(p, "functions"))
+                && is_ident(property, "set"))
+    }
+    fn is_sh2_vars(e: &Expr) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                if is_ident(o, "sh2") && is_ident(p, "vars"))
+                && matches!(&**property, Expr::Identifier { .. }))
+    }
+    fn lit_str(e: &Expr) -> Option<&str> {
+        match e {
+            Expr::Literal { value, .. } => value.as_str(),
+            _ => None,
+        }
+    }
+    fn lit_string(e: &Expr) -> Option<String> {
+        lit_str(e).map(|s| s.to_string())
+    }
+    fn is_sh2_positional_read(e: &Expr) -> Option<i64> {
+        // `sh2.positional[N]` (computed literal index)
+        match e {
+            Expr::MemberExpression { object, property, computed: true, .. } => {
+                if is_sh2_member(object, "positional") {
+                    if let Expr::Literal { value, .. } = &**property {
+                        if let Some(n) = value.as_i64() { return Some(n); }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    fn is_store_name_target(e: &Expr) -> Option<String> {
+        // `sh2.vars.X` → the identifier name (as an assignment LEFT)
+        match e {
+            Expr::MemberExpression { object, property, computed: false, .. } => {
+                if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                    if is_ident(o, "sh2") && is_ident(p, "vars"))
+                {
+                    if let Expr::Identifier { name } = &**property {
+                        return Some(name.clone());
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    struct Reg {
+        fn_name: String,
+        direct: bool,
+        // for the direct form: the stmt index in new_body + the arrow
+        arrow: Expr,
+        // for the sequence form: the sequence expression index
+        seq_idx: usize,
+    }
+
+    // 1. locate the registrations
+    let mut registrations: Vec<Reg> = Vec::new();
+    let mut new_body: Vec<Stmt> = Vec::with_capacity(prog.body.len());
+    for st in std::mem::take(&mut prog.body) {
+        if let Stmt::ExpressionStatement { expression } = &st {
+            let e = expression;
+            // direct form: sh2.functions.set("x", arrow)
+            if let Expr::CallExpression { callee, arguments, .. } = e {
+                if is_functions_set_callee(callee)
+                    && arguments.len() >= 2
+                    && matches!(&arguments[0], Expr::Literal { .. })
+                    && matches!(&arguments[1], Expr::ArrowFunctionExpression { .. })
+                {
+                    if let Some(name) = lit_string(&arguments[0]) {
+                        registrations.push(Reg {
+                            fn_name: name,
+                            direct: true,
+                            arrow: arguments[1].clone(),
+                            seq_idx: usize::MAX,
+                        });
+                        new_body.push(st);
+                        continue;
+                    }
+                }
+            }
+            // sequence form: (__fn_x = arrow, set("x", __fn_x), true)
+            if let Expr::SequenceExpression { expressions } = e {
+                let mut arrow: Option<Expr> = None;
+                let mut fn_name: Option<String> = None;
+                let mut seq_idx = usize::MAX;
+                for (i, x) in expressions.iter().enumerate() {
+                    if let Expr::AssignmentExpression { operator, left, right, .. } = x {
+                        if operator == "="
+                            && matches!(&**left, Expr::Identifier { name } if name.starts_with("__fn_"))
+                            && matches!(&**right, Expr::ArrowFunctionExpression { .. })
+                        {
+                            arrow = Some((**right).clone());
+                            seq_idx = i;
+                        }
+                    }
+                    if let Expr::CallExpression { callee, arguments, .. } = x {
+                        if is_functions_set_callee(callee)
+                            && !arguments.is_empty()
+                            && matches!(&arguments[0], Expr::Literal { .. })
+                        {
+                            fn_name = lit_string(&arguments[0]);
+                        }
+                    }
+                }
+                if arrow.is_some() && fn_name.is_some() {
+                    registrations.push(Reg {
+                        fn_name: fn_name.unwrap(),
+                        direct: false,
+                        arrow: arrow.unwrap(),
+                        seq_idx,
+                    });
+                }
+            }
+        }
+        new_body.push(st);
+    }
+    if registrations.is_empty() {
+        prog.body = new_body;
+        return prog;
+    }
+    let mut out_body: Vec<Stmt> = new_body;
+
+    // 2. the usage analysis (walkUsage): sh2.vars.X owners + the
+    //    runtime-by-name getLine/getVar string names
+    let mut usage: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        Default::default();
+    let mut runtime_by_name: std::collections::HashSet<String> = Default::default();
+    {
+        fn walk_usage(
+            node: &Expr,
+            owner: &str,
+            usage: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+            runtime_by_name: &mut std::collections::HashSet<String>,
+        ) {
+            match node {
+                Expr::Identifier { .. } | Expr::Literal { .. } => {}
+                Expr::TemplateLiteral { expressions, .. } => {
+                    for x in expressions { walk_usage(x, owner, usage, runtime_by_name); }
+                }
+                Expr::CallExpression { callee, arguments, .. } => {
+                    if let Expr::MemberExpression { object, property, .. } = &**callee {
+                        if is_ident(object, "sh2") {
+                            if let Expr::Identifier { name } = &**property {
+                                if (name == "getLine" || name == "getVar") && !arguments.is_empty() {
+                                    if let Some(s) = lit_str(&arguments[0]) {
+                                        if !s.is_empty()
+                                            && s.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+                                            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                        {
+                                            runtime_by_name.insert(s.to_string());
+                                        }
+                                    }
+                                    if let Expr::TemplateLiteral { quasis, .. } = &arguments[0] {
+                                        if let Some(head) = quasis.first().and_then(|q| q.value.cooked.clone()) {
+                                            let mut chars = head.chars();
+                                            let first = chars.next();
+                                            let rest = chars.as_str();
+                                            if first.map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+                                                && head.ends_with('[')
+                                            {
+                                                let nm = head.trim_end_matches('[').to_string();
+                                                if nm.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                                                    runtime_by_name.insert(nm);
+                                                }
+                                            }
+                                            let _ = rest;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    walk_usage(callee, owner, usage, runtime_by_name);
+                    for a in arguments { walk_usage(a, owner, usage, runtime_by_name); }
+                }
+                Expr::MemberExpression { object, property, .. } => {
+                    if is_sh2_vars(node) {
+                        if let Expr::Identifier { name } = &**property {
+                            usage.entry(name.clone()).or_default().insert(owner.to_string());
+                        }
+                    }
+                    walk_usage(object, owner, usage, runtime_by_name);
+                    walk_usage(property, owner, usage, runtime_by_name);
+                }
+                Expr::AwaitExpression { argument } => walk_usage(argument, owner, usage, runtime_by_name),
+                Expr::FunctionExpression { params, body, .. } => {
+                    for p in params { walk_usage(p, owner, usage, runtime_by_name); }
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Expr::ArrowFunctionExpression { params, body, .. } => {
+                    for p in params { walk_usage(p, owner, usage, runtime_by_name); }
+                    match body {
+                        ArrowBody::Expr(x) => walk_usage(x, owner, usage, runtime_by_name),
+                        ArrowBody::Block(b) => walk_usage_stmt(b, owner, usage, runtime_by_name),
+                    }
+                }
+                Expr::ObjectExpression { properties } => {
+                    for p in properties {
+                        walk_usage(&p.key, owner, usage, runtime_by_name);
+                        walk_usage(&p.value, owner, usage, runtime_by_name);
+                    }
+                }
+                Expr::ArrayExpression { elements } => {
+                    for el in elements.iter().flatten() { walk_usage(el, owner, usage, runtime_by_name); }
+                }
+                Expr::SpreadElement { argument } => walk_usage(argument, owner, usage, runtime_by_name),
+                Expr::LogicalExpression { left, right, .. }
+                | Expr::BinaryExpression { left, right, .. }
+                | Expr::AssignmentExpression { left, right, .. } => {
+                    walk_usage(left, owner, usage, runtime_by_name);
+                    walk_usage(right, owner, usage, runtime_by_name);
+                }
+                Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage(consequent, owner, usage, runtime_by_name);
+                    walk_usage(alternate, owner, usage, runtime_by_name);
+                }
+                Expr::UnaryExpression { argument, .. } => walk_usage(argument, owner, usage, runtime_by_name),
+                Expr::SequenceExpression { expressions } => {
+                    for x in expressions { walk_usage(x, owner, usage, runtime_by_name); }
+                }
+                Expr::NewExpression { callee, arguments, .. } => {
+                    walk_usage(callee, owner, usage, runtime_by_name);
+                    for a in arguments { walk_usage(a, owner, usage, runtime_by_name); }
+                }
+            }
+        }
+        fn walk_usage_stmt(
+            s: &Stmt,
+            owner: &str,
+            usage: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+            runtime_by_name: &mut std::collections::HashSet<String>,
+        ) {
+            match s {
+                Stmt::ExpressionStatement { expression } => walk_usage(expression, owner, usage, runtime_by_name),
+                Stmt::BlockStatement { body } => {
+                    for x in body { walk_usage_stmt(x, owner, usage, runtime_by_name); }
+                }
+                Stmt::IfStatement { test, consequent, alternate } => {
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage_stmt(consequent, owner, usage, runtime_by_name);
+                    if let Some(a) = alternate { walk_usage_stmt(a, owner, usage, runtime_by_name); }
+                }
+                Stmt::TryStatement { block, handler, finalizer } => {
+                    walk_usage_stmt(block, owner, usage, runtime_by_name);
+                    if let Some(h) = handler {
+                        if let Some(p) = &h.param { walk_usage(p, owner, usage, runtime_by_name); }
+                        walk_usage_stmt(&h.body, owner, usage, runtime_by_name);
+                    }
+                    if let Some(f) = finalizer { walk_usage_stmt(f, owner, usage, runtime_by_name); }
+                }
+                Stmt::ThrowStatement { argument } => walk_usage(argument, owner, usage, runtime_by_name),
+                Stmt::SwitchStatement { discriminant, cases } => {
+                    walk_usage(discriminant, owner, usage, runtime_by_name);
+                    for c in cases {
+                        if let Some(t) = &c.test { walk_usage(t, owner, usage, runtime_by_name); }
+                        for x in &c.consequent { walk_usage_stmt(x, owner, usage, runtime_by_name); }
+                    }
+                }
+                Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::ForStatement { init, test, update, body } => {
+                    walk_usage_stmt(init, owner, usage, runtime_by_name);
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage(update, owner, usage, runtime_by_name);
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::ForOfStatement { left, right, body } => {
+                    walk_usage_stmt(left, owner, usage, runtime_by_name);
+                    walk_usage(right, owner, usage, runtime_by_name);
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::FunctionDeclaration { params, body, .. } => {
+                    for p in params { walk_usage(p, owner, usage, runtime_by_name); }
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::VariableDeclaration { declarations, .. } => {
+                    for d in declarations {
+                        if let Some(i) = &d.init { walk_usage(i, owner, usage, runtime_by_name); }
+                    }
+                }
+                Stmt::ReturnStatement { argument } => {
+                    if let Some(a) = argument { walk_usage(a, owner, usage, runtime_by_name); }
+                }
+                Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            }
+        }
+        // the registration arrows are skipped for the "top" scan
+        for st in &out_body {
+            if let Stmt::ExpressionStatement { expression } = st {
+                walk_usage(expression, "top", &mut usage, &mut runtime_by_name);
+            }
+        }
+        for r in &registrations {
+            let arrow = r.arrow.clone();
+            walk_usage(&arrow, &r.fn_name, &mut usage, &mut runtime_by_name);
+        }
+    }
+
+    // 3. transform each registration (the param protocol + the rewrites)
+    struct Param { name: String, n: i64, cast: bool }
+    // the transform consumes r.arrow (it becomes a placeholder) — the
+    // step-4 let-strip needs the ORIGINAL arrows
+    let registration_arrows: Vec<Expr> = registrations.iter().map(|r| r.arrow.clone()).collect();
+    for r in &mut registrations {
+        let arrow = std::mem::replace(&mut r.arrow, Expr::Identifier { name: "__ph".into() });
+        let arrow_async = match &arrow {
+            Expr::ArrowFunctionExpression { r#async, .. } => *r#async,
+            _ => false,
+        };
+        let body = match arrow {
+            Expr::ArrowFunctionExpression { body, .. } => match body {
+                ArrowBody::Block(b) => *b,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let block = match body {
+            Stmt::BlockStatement { body } => body,
+            _ => continue,
+        };
+        // leading param bindings: `sh2.setVar("p", sh2.arith("$N"))` casts
+        // or `p = sh2.positional[N] ?? ""` (with the store-target or
+        // String-wrapped forms)
+        let mut params: Vec<Param> = Vec::new();
+        let mut idx = 0usize;
+        let mut consumed = 0usize;
+        while consumed < block.len() {
+            let s = &block[consumed];
+            let ok = match s {
+                Stmt::ExpressionStatement { expression } => {
+                    let a = expression;
+                    // cast: sh2.setVar("p", sh2.arith("$N"))
+                    let mut cast_done = false;
+                    if let Expr::CallExpression { callee, arguments, .. } = a {
+                        let arith_args: Option<&Vec<Expr>> = if is_sh2_member(callee, "setVar") && arguments.len() == 2
+                            && matches!(&arguments[0], Expr::Literal { .. })
+                        {
+                            match &arguments[1] {
+                                Expr::CallExpression { callee: c2, arguments: a2, .. }
+                                    if is_sh2_member(c2, "arith") && !a2.is_empty()
+                                        && matches!(&a2[0], Expr::Literal { .. }) =>
+                                    Some(a2),
+                                _ => None,
+                            }
+                        } else { None };
+                        if let Some(a2) = arith_args {
+                            let nm = lit_string(&arguments[0]).unwrap_or_default();
+                            if let Some(Expr::Literal { value, .. }) = a2.first() {
+                                if let Some(s) = value.as_str() {
+                                    let s2 = s.strip_prefix('$').unwrap_or(s);
+                                    if let Ok(n) = s2.parse::<i64>() {
+                                        if n >= 1 {
+                                            params.push(Param { name: nm, n: n - 1, cast: true });
+                                            consumed += 1;
+                                            cast_done = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if cast_done {
+                        true
+                    } else if let Expr::AssignmentExpression { operator, left, right, .. } = a {
+                        if operator != "=" { false } else {
+                            let name = match &**left {
+                                Expr::Identifier { name } => Some(name.clone()),
+                                l => is_store_name_target(l),
+                            };
+                            match name {
+                                None => false,
+                                Some(nm) => {
+                                    // unwrap a String(...) coercion
+                                    let inner = match &**right {
+                                        Expr::CallExpression { callee, arguments, .. }
+                                            if is_ident(callee, "String") && !arguments.is_empty() =>
+                                            Some(&arguments[0]),
+                                        _ => None,
+                                    };
+                                    let base = inner.unwrap_or(right);
+                                    let pos = match base {
+                                        Expr::LogicalExpression { operator, left, right: r2, .. }
+                                            if operator == "??" =>
+                                        {
+                                            if let Some(n) = is_sh2_positional_read(left) {
+                                                if matches!(&**r2, Expr::Literal { value, .. } if value == "") {
+                                                    Some(n)
+                                                } else { None }
+                                            } else { None }
+                                        }
+                                        _ => None,
+                                    };
+                                    match pos {
+                                        Some(n) => { params.push(Param { name: nm, n, cast: false }); consumed += 1; true }
+                                        None => false,
+                                    }
+                                }
+                            }
+                        }
+                    } else { false }
+                }
+                _ => false,
+            };
+            if !ok { break; }
+        }
+        idx = consumed;
+        if params.is_empty() { continue; } // not the C frontend's protocol
+        params.sort_by_key(|p| p.n);
+        let rest = block[idx..].to_vec();
+        let param_names: std::collections::HashSet<String> =
+            params.iter().map(|p| p.name.clone()).collect();
+        // function-locals: store vars used ONLY in this arrow, not
+        // runtime-written by name
+        let mut locals: std::collections::HashSet<String> = Default::default();
+        for (name, owners) in &usage {
+            if runtime_by_name.contains(name) { continue; }
+            if owners.len() == 1 && owners.contains(&r.fn_name) && !param_names.contains(name) {
+                locals.insert(name.clone());
+            }
+        }
+        for p in &params {
+            if p.cast { locals.insert(p.name.clone()); continue; }
+            if !runtime_by_name.contains(&p.name) { locals.insert(p.name.clone()); }
+        }
+        let param_by_pos: std::collections::HashMap<i64, String> = params
+            .iter()
+            .filter(|p| !p.cast)
+            .map(|p| (p.n, p.name.clone()))
+            .collect();
+        // `"$X"` / `"map[$X]"` — interpolate a param/local by name
+        fn interpolate_dollar_vars(
+            str_: &str,
+            param_names: &std::collections::HashSet<String>,
+            locals: &std::collections::HashSet<String>,
+            param_by_pos: &std::collections::HashMap<i64, String>,
+        ) -> Option<Expr> {
+            // manual scan for `$($|[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]*)`
+            let bytes = str_.as_bytes();
+            let mut segments: Vec<String> = Vec::new(); // text segments
+            let mut exprs: Vec<Expr> = Vec::new();
+            let mut last = 0usize;
+            let mut hit = false;
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i] != b'$' { i += 1; continue; }
+                let rest = &str_[i + 1..];
+                if rest.starts_with('$') { i += 2; continue; } // `$$`
+                let mut n = 0usize;
+                let c0 = rest.chars().next();
+                let is_ident = c0.map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false);
+                let is_digit = c0.map(|c| c.is_ascii_digit() && c != '0').unwrap_or(false);
+                if is_ident {
+                    n = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+                } else if is_digit {
+                    n = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+                }
+                if n == 0 { i += 1; continue; }
+                let nm = &rest[..n];
+                let resolved: Option<String> = if is_ident {
+                    if param_names.contains(nm) || locals.contains(nm) { Some(nm.to_string()) } else { None }
+                } else {
+                    match nm.parse::<i64>() {
+                        Ok(num) => param_by_pos.get(&(num - 1)).cloned(),
+                        Err(_) => None,
+                    }
+                };
+                if let Some(res) = resolved {
+                    hit = true;
+                    segments.push(str_[last..i].to_string());
+                    exprs.push(Expr::Identifier { name: res });
+                    i += 1 + n;
+                    last = i;
+                } else {
+                    i += 1;
+                }
+            }
+            if !hit { return None; }
+            segments.push(str_[last..].to_string());
+            let mut quasis: Vec<TemplateElement> = Vec::new();
+            for (k, t) in segments.iter().enumerate() {
+                quasis.push(TemplateElement {
+                    type_: "TemplateElement",
+                    value: TemplateElementValue { raw: t.clone(), cooked: Some(t.clone()) },
+                    tail: k == segments.len() - 1,
+                });
+            }
+            Some(Expr::TemplateLiteral { quasis, expressions: exprs })
+        }
+        // rewrite store access → native identifiers inside the body
+        let mut new_rest = rest;
+        {
+            let param_names = &param_names;
+            let locals = &locals;
+            let param_by_pos = &param_by_pos;
+            fn rewrite_expr(
+                e: &mut Expr,
+                param_names: &std::collections::HashSet<String>,
+                locals: &std::collections::HashSet<String>,
+                param_by_pos: &std::collections::HashMap<i64, String>,
+            ) {
+                visit_exprs_single(e, &mut |n| {
+                    // `$X` literal → the interpolated template
+                    if let Expr::Literal { value, .. } = n {
+                        if let Some(s) = value.as_str() {
+                            if let Some(tpl) = interpolate_dollar_vars(s, param_names, locals, param_by_pos) {
+                                *n = tpl;
+                                return;
+                            }
+                        }
+                    }
+                    // `sh2.positional[N] ?? ""` naming a param → the identifier
+                    let positional_name = |x: &Expr| -> Option<String> {
+                        if let Expr::LogicalExpression { operator, left, right, .. } = x {
+                            if operator == "??" {
+                                if let Some(pn) = is_sh2_positional_read(left) {
+                                    if matches!(&**right, Expr::Literal { value, .. } if value == "") {
+                                        return param_by_pos.get(&pn).cloned();
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    };
+                    let pos_wrap = match n {
+                        Expr::CallExpression { callee, arguments, .. }
+                            if is_ident(callee, "String") && !arguments.is_empty() =>
+                            Some(&arguments[0]),
+                        _ => None,
+                    };
+                    let pname = match pos_wrap {
+                        Some(inner) => positional_name(inner),
+                        None => positional_name(n),
+                    };
+                    if pname.is_some() {
+                        *n = Expr::Identifier { name: pname.unwrap() };
+                        return;
+                    }
+                    // sh2.vars.X → X (locals)
+                    if is_sh2_vars(n) {
+                        if let Expr::MemberExpression { property, .. } = n {
+                            if let Expr::Identifier { name } = &**property {
+                                if locals.contains(name) {
+                                    *n = Expr::Identifier { name: name.clone() };
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // sh2.vars.X ?? (process.env.X ?? "") → X
+                    if let Expr::LogicalExpression { operator, left, right, .. } = n {
+                        if operator == "??" && is_sh2_vars(left) {
+                            let lname = match &**left {
+                                Expr::MemberExpression { property, .. } => match &**property {
+                                    Expr::Identifier { name } => Some(name.clone()),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            if let Some(lname) = lname {
+                                if locals.contains(&lname) {
+                                    let env_chain = matches!(&**right, Expr::LogicalExpression { operator: o2, left: l2, .. }
+                                        if o2 == "??"
+                                            && matches!(&**l2, Expr::MemberExpression { object, property: p2, computed: false, .. }
+                                                if matches!(&**object, Expr::MemberExpression { object: o3, property: p3, computed: false, .. }
+                                                    if is_ident(o3, "process") && is_ident(p3, "env"))
+                                                    && matches!(&**p2, Expr::Identifier { .. })));
+                                    if env_chain {
+                                        *n = Expr::Identifier { name: lname };
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // sh2.vars.X = V → X = V
+                    if let Expr::AssignmentExpression { operator, left, right, .. } = n {
+                        if operator == "=" {
+                            if let Some(lname) = is_store_name_target(left) {
+                                if locals.contains(&lname) {
+                                    let r = (**right).clone();
+                                    *n = Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(Expr::Identifier { name: lname }),
+                                        right: Box::new(r),
+                                    };
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // sh2.setVar("X", V) → X = V (simple literal names)
+                    if let Expr::CallExpression { callee, arguments, .. } = n {
+                        if is_sh2_member(callee, "setVar") && arguments.len() == 2
+                            && matches!(&arguments[0], Expr::Literal { .. })
+                        {
+                            if let Some(lname) = lit_string(&arguments[0]) {
+                                if locals.contains(&lname) {
+                                    let r = arguments[1].clone();
+                                    *n = Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(Expr::Identifier { name: lname }),
+                                        right: Box::new(r),
+                                    };
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            // run the rewrite over the rest statements' exprs
+            let mut f = |e: &mut Expr| rewrite_expr(e, param_names, locals, param_by_pos);
+            for s in &mut new_rest {
+                visit_stmt_exprs(s, &mut f);
+            }
+        }
+        // build the plain function
+        let mut local_decls: Vec<&String> = locals.iter().filter(|n| !param_names.contains(*n)).collect();
+        local_decls.sort();
+        let mut param_store_prologue: Vec<Stmt> = Vec::new();
+        if !params.is_empty() {
+            let mut calls: Vec<Expr> = Vec::new();
+            for p in &params {
+                calls.push(Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                        property: Box::new(Expr::Identifier { name: "setVar".to_string() }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![
+                        Expr::Literal { value: serde_json::json!(p.name), raw: None, regex: None },
+                        Expr::Identifier { name: p.name.clone() },
+                    ],
+                    optional: false,
+                });
+            }
+            param_store_prologue.push(Stmt::ExpressionStatement {
+                expression: Expr::SequenceExpression { expressions: calls },
+            });
+        }
+        let mut fn_body: Vec<Stmt> = Vec::new();
+        if !local_decls.is_empty() {
+            fn_body.push(Stmt::VariableDeclaration {
+                declarations: local_decls
+                    .iter()
+                    .map(|n| VariableDeclarator {
+                        type_: "VariableDeclarator",
+                        id: Expr::Identifier { name: (*n).clone() },
+                        init: Some(Expr::Literal { value: serde_json::json!(""), raw: None, regex: None }),
+                    })
+                    .collect(),
+                kind: "let",
+            });
+        }
+        fn_body.extend(param_store_prologue);
+        fn_body.extend(new_rest);
+        let fn_block = Stmt::BlockStatement { body: fn_body };
+        let fn_async = arrow_async || has_await_stmt(&fn_block);
+        let fn_params: Vec<Expr> = params.iter().map(|p| Expr::Identifier { name: p.name.clone() }).collect();
+        // the adapter
+        let mut adapter_args: Vec<Expr> = Vec::new();
+        for p in &params {
+            let pos = Expr::MemberExpression {
+                object: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                    property: Box::new(Expr::Identifier { name: "positional".to_string() }),
+                    computed: false,
+                    optional: false,
+                }),
+                property: Box::new(Expr::Literal { value: serde_json::json!(p.n), raw: None, regex: None }),
+                computed: true,
+                optional: false,
+            };
+            if p.cast {
+                adapter_args.push(Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier { name: "Number".to_string() }),
+                    arguments: vec![pos],
+                    optional: false,
+                });
+            } else {
+                adapter_args.push(pos);
+            }
+        }
+        let adapter = Expr::ArrowFunctionExpression {
+            params: vec![],
+            body: ArrowBody::Expr(Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier { name: r.fn_name.clone() }),
+                arguments: adapter_args,
+                optional: false,
+            })),
+            expression: true,
+            r#async: false,
+        };
+        let set_call = Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                    property: Box::new(Expr::Identifier { name: "functions".to_string() }),
+                    computed: false,
+                    optional: false,
+                }),
+                property: Box::new(Expr::Identifier { name: "set".to_string() }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![
+                Expr::Literal { value: serde_json::json!(r.fn_name), raw: None, regex: None },
+                adapter,
+            ],
+            optional: false,
+        };
+        if r.direct {
+            // replace the registration stmt with the function declaration
+            // + the adapter registration — find it by the fn name
+            let fn_decl = Stmt::FunctionDeclaration {
+                id: Expr::Identifier { name: r.fn_name.clone() },
+                params: fn_params,
+                body: Box::new(fn_block),
+                generator: false,
+                expression: false,
+                r#async: fn_async,
+            };
+            for i in 0..out_body.len() {
+                if let Stmt::ExpressionStatement { expression } = &out_body[i] {
+                    let is_reg = matches!(expression, Expr::CallExpression { callee, arguments, .. }
+                        if is_functions_set_callee(callee)
+                            && !arguments.is_empty()
+                            && lit_string(&arguments[0]).as_deref() == Some(r.fn_name.as_str()));
+                    if is_reg {
+                        out_body[i] = fn_decl.clone();
+                        out_body.insert(
+                            i + 1,
+                            Stmt::ExpressionStatement { expression: set_call.clone() },
+                        );
+                        break;
+                    }
+                }
+            }
+        } else {
+            // sequence form: patch the assignment + the set call
+            for st in &mut out_body {
+                if let Stmt::ExpressionStatement { expression } = st {
+                    if let Expr::SequenceExpression { expressions } = expression {
+                        let mut fn_expr: Option<Expr> = None;
+                        for (k, x) in expressions.iter_mut().enumerate() {
+                            if k == r.seq_idx {
+                                if let Expr::AssignmentExpression { left, right, .. } = x {
+                                    let l = (**left).clone();
+                                    let block = fn_block.clone();
+                                    let params2 = fn_params.clone();
+                                    let async2 = fn_async;
+                                    let body = Stmt::BlockStatement { body: match block {
+                                        Stmt::BlockStatement { body } => body,
+                                        _ => unreachable!(),
+                                    } };
+                                    let fe = Expr::FunctionExpression {
+                                        id: Box::new(Expr::Identifier { name: r.fn_name.clone() }),
+                                        params: params2,
+                                        body: Box::new(body),
+                                        generator: false,
+                                        expression: false,
+                                        r#async: async2,
+                                    };
+                                    fn_expr = Some(fe.clone());
+                                    *x = Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(l),
+                                        right: Box::new(fe),
+                                    };
+                                }
+                            }
+                            if let Expr::CallExpression { callee, arguments, .. } = x {
+                                if is_functions_set_callee(callee)
+                                    && !arguments.is_empty()
+                                    && lit_string(&arguments[0]).as_deref() == Some(r.fn_name.as_str())
+                                {
+                                    *x = set_call.clone();
+                                }
+                            }
+                        }
+                        let _ = fn_expr;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. strip the moved param/local names from the top-level `let`
+    let mut moved: std::collections::HashSet<String> = Default::default();
+    for arrow in &registration_arrows {
+        if let Expr::ArrowFunctionExpression { body, .. } = arrow {
+            if let ArrowBody::Block(b) = body {
+                if let Stmt::BlockStatement { body: block } = &**b {
+                    let mut i = 0usize;
+                    while i < block.len() {
+                        let ok = match &block[i] {
+                            Stmt::ExpressionStatement { expression } => {
+                                matches!(expression, Expr::AssignmentExpression { operator, left, right, .. }
+                                    if operator == "="
+                                        && matches!(&**left, Expr::Identifier { .. })
+                                        && matches!(&**right, Expr::LogicalExpression { operator: o, left: l, .. }
+                                            if o == "??" && is_sh2_positional_read(l).is_some()))
+                            }
+                            _ => false,
+                        };
+                        if !ok { break; }
+                        if let Stmt::ExpressionStatement { expression } = &block[i] {
+                            if let Expr::AssignmentExpression { left, .. } = expression {
+                                if let Expr::Identifier { name } = &**left {
+                                    moved.insert(name.clone());
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+    if !moved.is_empty() {
+        let mut filtered: Vec<Stmt> = Vec::with_capacity(out_body.len());
+        for st in out_body {
+            if let Stmt::VariableDeclaration { declarations, kind } = st {
+                let kept: Vec<VariableDeclarator> = declarations
+                    .into_iter()
+                    .filter(|d| !matches!(&d.id, Expr::Identifier { name } if moved.contains(name)))
+                    .collect();
+                if !kept.is_empty() {
+                    filtered.push(Stmt::VariableDeclaration { declarations: kept, kind });
+                }
+            } else {
+                filtered.push(st);
+            }
+        }
+        prog.body = filtered;
+    } else {
+        prog.body = out_body;
+    }
+    prog
+}
+
+/// Visit every Expr in a single expression (pre-order, callback first).
+fn visit_exprs_single(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+    let mut stack: Vec<&mut Expr> = Vec::new();
+    stack.push(e);
+    while let Some(n) = stack.pop() {
+        f(n);
+        match n {
+            Expr::TemplateLiteral { expressions, .. } => {
+                for x in expressions.iter_mut() { stack.push(x); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                stack.push(callee);
+                for a in arguments.iter_mut() { stack.push(a); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                stack.push(object);
+                stack.push(property);
+            }
+            Expr::AwaitExpression { argument } => stack.push(argument),
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params.iter_mut() { stack.push(p); }
+                let mut v: Vec<&mut Expr> = Vec::new();
+                collect_stmt_exprs(body, &mut v);
+                stack.extend(v);
+            }
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params.iter_mut() { stack.push(p); }
+                match body {
+                    ArrowBody::Expr(x) => stack.push(x),
+                    ArrowBody::Block(b) => {
+                        let mut v: Vec<&mut Expr> = Vec::new();
+                        collect_stmt_exprs(b, &mut v);
+                        stack.extend(v);
+                    }
+                }
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties.iter_mut() {
+                    stack.push(&mut p.key);
+                    stack.push(&mut p.value);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { stack.push(el); }
+            }
+            Expr::SpreadElement { argument } => stack.push(argument),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                stack.push(test);
+                stack.push(consequent);
+                stack.push(alternate);
+            }
+            Expr::UnaryExpression { argument, .. } => stack.push(argument),
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions.iter_mut() { stack.push(x); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                stack.push(callee);
+                for a in arguments.iter_mut() { stack.push(a); }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+}
+
+fn collect_stmt_exprs<'a>(s: &'a mut Stmt, out: &mut Vec<&'a mut Expr>) {
+    match s {
+        Stmt::ExpressionStatement { expression } => out.push(expression),
+        Stmt::BlockStatement { body } => {
+            for x in body.iter_mut() { collect_stmt_exprs(x, out); }
+        }
+        Stmt::IfStatement { test, consequent, alternate } => {
+            out.push(test);
+            collect_stmt_exprs(consequent, out);
+            if let Some(a) = alternate { collect_stmt_exprs(a, out); }
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            collect_stmt_exprs(block, out);
+            if let Some(h) = handler {
+                if let Some(p) = &mut h.param { out.push(p); }
+                collect_stmt_exprs(&mut h.body, out);
+            }
+            if let Some(f) = finalizer { collect_stmt_exprs(f, out); }
+        }
+        Stmt::ThrowStatement { argument } => out.push(argument),
+        Stmt::SwitchStatement { discriminant, cases } => {
+            out.push(discriminant);
+            for c in cases.iter_mut() {
+                if let Some(t) = &mut c.test { out.push(t); }
+                for x in c.consequent.iter_mut() { collect_stmt_exprs(x, out); }
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            out.push(test);
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            collect_stmt_exprs(init, out);
+            out.push(test);
+            out.push(update);
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            collect_stmt_exprs(left, out);
+            out.push(right);
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            for p in params.iter_mut() { out.push(p); }
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations.iter_mut() {
+                if let Some(i) = &mut d.init { out.push(i); }
+            }
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(a) = argument { out.push(a); }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+fn visit_stmt_exprs(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
+    let mut v: Vec<&mut Expr> = Vec::new();
+    collect_stmt_exprs(s, &mut v);
+    for e in v {
+        visit_exprs_single(e, f);
+    }
+}
+
 pub fn compile_head_passes(mut prog: Program) -> Program {
     prog = strip_process_env(prog);          // #1
     prog = await_sync_fn_calls(prog);        // #2
     prog = force_async_file_redirects(prog); // #3
     prog = mark_async_on_await(prog);        // #4
     prog = await_async_direct_calls(prog);    // #5
+    prog = normalize_functions(prog);         // #6
+    prog = unwrap_store_string(prog);         // #7
+    prog = null_sentinel(prog);               // #8
     prog
 }
 
@@ -6431,6 +7638,14 @@ fn stmt_read_set<'a>(st: &'a Stmt, shadow: &ReadSet<'a>) -> ReadSet<'a> {
             out.extend(stmt_read_set(body, &inner));
             out
         }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            let mut out = ReadSet::new();
+            for p in params {
+                out.extend(expr_read_set(p, &ReadSet::new()));
+            }
+            out.extend(stmt_read_set(body, shadow));
+            out
+        }
         Stmt::VariableDeclaration { declarations, .. } => {
             let mut out = ReadSet::new();
             for d in declarations {
@@ -6489,6 +7704,14 @@ fn expr_read_set<'a>(e: &'a Expr, shadow: &ReadSet<'a>) -> ReadSet<'a> {
             }
             inner.extend(arrow_body_declared_set(body));
             arrow_body_read_set(body, &inner)
+        }
+        Expr::FunctionExpression { params, body, .. } => {
+            let mut inner = shadow.clone();
+            for p in params {
+                inner.extend(expr_read_set(p, &ReadSet::new()));
+            }
+            inner.extend(stmt_read_set(body, &inner));
+            inner
         }
         Expr::ObjectExpression { properties } => {
             let mut out = ReadSet::new();
