@@ -1660,6 +1660,22 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 emit_stmt(out, s, indent);
                             }
                         }
+                        Some(r) if call_arg_str(&r.target).map_or(false, |t| t.starts_with('&')) => {
+                            // fd-dup redirect (`2>&1`, `1>&2`, …) on a
+                            // non-command inner (subshell block): dup stderr
+                            // to stdout — the backtick __bt capture pipe then
+                            // sees stderr too. The old code opened a FILE
+                            // named "&1" (mode w + the raw target).
+                            let mode = if r.mode == "r" { "'<&'" } else { "'>&'" };
+                            emit_indent(out, indent);
+                            out.push_str(&format!(
+                                "local *STDERR; open STDERR, {}, STDOUT or die \"Cannot dup stderr: $!\\n\";\n",
+                                mode
+                            ));
+                            for s in inner {
+                                emit_stmt(out, s, indent);
+                            }
+                        }
                         Some(r) if matches!(r.mode.as_str(), "w" | "a" | "r+") => {
                             let target = call_arg_str(&r.target).unwrap_or_default();
                             let mode = if r.mode == "a" { "'>>'" } else { "'>'" };
