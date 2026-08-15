@@ -891,8 +891,17 @@ exit $main_exit_code;
                 }
                 cli_commands::export_shir(&s, raw);
             } else if input.contains(".sh") || !input.contains(' ') {
-                match fs::read_to_string(input) {
-                    Ok(content) => cli_commands::export_shir(&content, raw),
+                // Bytes read + marked-lossy decode (the A1 convention, same
+                // as parse_file_to_shir): an invalid-UTF-8 source byte is
+                // carried through the JSON as a PUA marker (U+E000+byte),
+                // never collapsed to U+FFFD — the --shir-in-sh boundary
+                // decodes the marker back to the raw byte so the rendered
+                // script reproduces bash's byte-exact pass-through
+                // (utf8-non-utf8-content.sh). read_to_string would Err on
+                // the byte and fall back to parsing the FILE PATH as the
+                // script (the sh-20260814-145955 bug class).
+                match fs::read(input) {
+                    Ok(bytes) => cli_commands::export_shir(&SharedUtils::bytes_to_marked_lossy(&bytes), raw),
                     Err(_) => cli_commands::export_shir(input, raw),
                 }
             } else {
