@@ -2842,6 +2842,9 @@ fn estree_reads_positional(e: &Expr) -> bool {
             estree_reads_positional(object) || estree_reads_positional(property)
         }
         Expr::AwaitExpression { argument } => estree_reads_positional(argument),
+        Expr::FunctionExpression { params, body, .. } => {
+            params.iter().any(estree_reads_positional) || estree_stmt_reads_positional(body)
+        }
         Expr::ArrowFunctionExpression { params, body, .. } => {
             // nested closure bodies (redirect/capture/pipeline/loop/…)
             // run under the CURRENT positional state — walk them
@@ -2942,6 +2945,9 @@ fn estree_stmt_reads_positional(s: &Stmt) -> bool {
         }
         Stmt::ForOfStatement { left, right, body } => {
             estree_reads_positional(right) || estree_stmt_reads_positional(body)
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            params.iter().any(estree_reads_positional) || estree_stmt_reads_positional(body)
         }
         Stmt::VariableDeclaration { declarations, .. } => declarations
             .iter()
@@ -15537,6 +15543,9 @@ fn lowered_stmts_have_signals(stmts: &[Stmt]) -> bool {
             | Stmt::DoWhileStatement { body, .. }
             | Stmt::ForOfStatement { body, .. } => stmt_has_signal(body, false),
             Stmt::ForStatement { body, .. } => stmt_has_signal(body, false),
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                params.iter().any(expr_has_signal) || stmt_has_signal(body, false)
+            }
             Stmt::VariableDeclaration { declarations, .. } => declarations
                 .iter()
                 .any(|d| d.init.as_ref().map(expr_has_signal).unwrap_or(false)),
@@ -33273,6 +33282,14 @@ fn sync_arrow_flip(arrow: Expr) -> Expr {
 /// would only allocate a discarded promise.
 fn sync_arrow_flip_deep(e: Expr) -> Expr {
     match e {
+        Expr::FunctionExpression { id, params, body, generator, expression, r#async } => Expr::FunctionExpression {
+            id: Box::new(sync_arrow_flip_deep(*id)),
+            params: params.into_iter().map(sync_arrow_flip_deep).collect(),
+            body,
+            generator,
+            expression,
+            r#async,
+        },
         Expr::ArrowFunctionExpression {
             params,
             body,
@@ -33858,6 +33875,10 @@ fn expr_sh2_call_count(e: &Expr) -> usize {
                     walk(a, n);
                 }
             }
+                Expr::FunctionExpression { params, body, .. } => {
+                    for p in params { walk(p, n); }
+                    walk_stmt(body, n);
+                }
             Expr::Identifier { .. } | Expr::Literal { .. } => {}
             Expr::TemplateLiteral {
                 quasis: _,
@@ -33925,6 +33946,56 @@ fn expr_sh2_call_count(e: &Expr) -> usize {
         }
     }
     let mut n = 0usize;
+    fn walk_stmt(s: &Stmt, n: &mut usize) {
+        match s {
+            Stmt::ExpressionStatement { expression } => walk(expression, n),
+            Stmt::BlockStatement { body } => { for x in body { walk_stmt(x, n); } }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { walk(p, n); }
+                walk_stmt(body, n);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations { if let Some(i) = &d.init { walk(i, n); } }
+            }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                walk(test, n);
+                walk_stmt(consequent, n);
+                if let Some(a) = alternate { walk_stmt(a, n); }
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { walk(a, n); }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                walk(test, n);
+                walk_stmt(body, n);
+            }
+            Stmt::ForStatement { init, test, update, body } => {
+                walk_stmt(init, n);
+                walk(test, n);
+                walk(update, n);
+                walk_stmt(body, n);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                walk_stmt(left, n);
+                walk(right, n);
+                walk_stmt(body, n);
+            }
+            Stmt::SwitchStatement { discriminant, cases } => {
+                walk(discriminant, n);
+                for c in cases {
+                    if let Some(t) = &c.test { walk(t, n); }
+                    for x in &c.consequent { walk_stmt(x, n); }
+                }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                walk_stmt(block, n);
+                if let Some(h) = handler { walk_stmt(&h.body, n); }
+                if let Some(f) = finalizer { walk_stmt(f, n); }
+            }
+            Stmt::ThrowStatement { argument } => walk(argument, n),
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
     walk(e, &mut n);
     n
 }
@@ -34649,6 +34720,9 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
             Stmt::ForOfStatement { left, right, body } => {
                 stmt_ok(left, var) && expr_ok(right, var) && stmt_ok(body, var)
             }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                params.iter().all(|p| expr_ok(p, var)) && stmt_ok(body, var)
+            }
             Stmt::VariableDeclaration { declarations, .. } => declarations
                 .iter()
                 .all(|d| d.init.as_ref().map_or(true, |i| expr_ok(i, var))),
@@ -34900,6 +34974,12 @@ fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
             Stmt::ForOfStatement { left, right, body } => {
                 stmt_rewrite(left, var, js_var);
                 expr_rewrite(right, var, js_var);
+                stmt_rewrite(body, var, js_var);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params.iter_mut() {
+                    expr_rewrite(p, var, js_var);
+                }
                 stmt_rewrite(body, var, js_var);
             }
             Stmt::VariableDeclaration { declarations, .. } => {
