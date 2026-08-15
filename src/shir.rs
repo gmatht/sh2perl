@@ -89,7 +89,13 @@ pub fn arith_mentions_true64(a: &ArithAst) -> bool {
             ArithAst::Cond { test, then, else_, .. } => {
                 mentions(test) || mentions(then) || mentions(else_)
             }
-            ArithAst::Assign { rhs, .. } => mentions(rhs),
+            ArithAst::Assign { var, rhs, .. } => {
+                // the TARGET matters too: `((x = 5))` on an Int64 x must
+                // wrap the RHS literal (BigInt("5")) — the assignment's
+                // value is the RHS, and a plain Number literal would round
+                // past 2^53
+                mentions(rhs) || true64_int_var(var) || slot_var_index(var).is_some()
+            }
             ArithAst::IncDec { var, .. } => true64_int_var(var) || slot_var_index(var).is_some(),
             ArithAst::Sizeof(_) | ArithAst::Num(_) => false,
             ArithAst::Cast { arg, .. } => mentions(arg),
@@ -109,7 +115,16 @@ pub fn wrap_true64_arith_ast(a: &mut ArithAst) {
             ArithAst::Cond { test, then, else_, .. } => {
                 mentions(test) || mentions(then) || mentions(else_)
             }
-            ArithAst::Assign { rhs, .. } => mentions(rhs),
+            ArithAst::Assign { var, rhs, .. } => {
+                // the TARGET matters too (mirror of the guard
+                // `arith_mentions_true64`'s Assign arm): `((x = 5))` on an
+                // Int64 x must wrap the RHS literal (BigInt("5")) — the
+                // guard and the wrapper must agree or the guard fires, the
+                // wrapper no-ops, and the RHS keeps its Number leaf (a
+                // mixed BigInt/Number assignment throws). Core request
+                // zsh-sh-go-20260814-134501.
+                mentions(rhs) || true64_int_var(var) || slot_var_index(var).is_some()
+            }
             ArithAst::IncDec { var, .. } => true64_int_var(var) || slot_var_index(var).is_some(),
             ArithAst::Sizeof(_) | ArithAst::Num(_) => false,
             ArithAst::Cast { arg, .. } => mentions(arg),
@@ -294,6 +309,10 @@ static AND_OR_DEPTH: Mutex<usize> = Mutex::new(0);
 /// +/- into the arithEval boundary) can go fully native — NaN reaches
 /// the wrapper and converts to the bash empty result.
 static ARITH_POISON_DEPTH: Mutex<usize> = Mutex::new(0);
+/// The render-time i53/`--true64` leaf-wrap depth (see
+/// [`arith_to_estree_wrapped`]): 0 = the top-level call, which owns the
+/// mention-wrap; nested calls skip it (the tree is already wrapped).
+static ARITH_WRAP_DEPTH: Mutex<usize> = Mutex::new(0);
 /// Native-echo emission depth: >0 while lowering inside a construct whose
 /// runtime stdout sink differs from the module's stdout — `redirect` /
 /// `pipeline` / `capture` / `captureWords` calls (the runtime swaps
@@ -893,6 +912,23 @@ fn lastexit_scan_top_read(stmts: &[IrStmt], end_live: bool) -> bool {
 /// reaches the ESTree emitter (the renderer's catch-all refuses it); the
 /// cond must be a direct `test` Call (a `!`/`&&`/`||`-wrapped cond keeps
 /// the statused form — its value/status flow is chain-shaped).
+/// A condition that is a pure chain of `[ ]`-style tests: an `And`/`Or`
+/// tree whose leaves are all `test` calls (a test's VALUE equals its exit
+/// status, so a native JS `&&`/`||` on the test values matches bash — the
+/// reason the chain's status protocol is droppable when unread).
+fn is_pure_test_chain(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, .. } => func == "test",
+        IrExpr::BinOp { op, lhs, rhs } => {
+            (matches!(op, BinOpKind::And | BinOpKind::Or)
+                && is_pure_test_chain(lhs)
+                && is_pure_test_chain(rhs))
+                || (matches!(op, BinOpKind::Not) && is_pure_test_chain(lhs))
+        }
+        _ => false,
+    }
+}
+
 fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMap<usize, bool> {
     fn mark(stmts: &[IrStmt], live: &HashSet<usize>, dead: &mut HashMap<usize, bool>) {
         for stmt in stmts {
@@ -905,7 +941,7 @@ fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMa
                     else_,
                     ..
                 } => {
-                    if matches!(cond, IrExpr::Call { func, .. } if func == "test") {
+                    if is_pure_test_chain(cond) {
                         let mut top = lastexit_scan_top_read(then, self_live);
                         for (_, arm) in elsifs {
                             top |= lastexit_scan_top_read(arm, self_live);
@@ -917,7 +953,7 @@ fn compute_test_cond_deadness(stmts: &[IrStmt], live: &HashSet<usize>) -> HashMa
                     }
                 }
                 IrStmt::While { cond, body, .. } => {
-                    if matches!(cond, IrExpr::Call { func, .. } if func == "test") {
+                    if is_pure_test_chain(cond) {
                         if !lastexit_scan_top_read(body, self_live) {
                             dead.insert(stmt as *const IrStmt as usize, true);
                         }
@@ -2806,6 +2842,9 @@ fn estree_reads_positional(e: &Expr) -> bool {
             estree_reads_positional(object) || estree_reads_positional(property)
         }
         Expr::AwaitExpression { argument } => estree_reads_positional(argument),
+        Expr::FunctionExpression { params, body, .. } => {
+            params.iter().any(estree_reads_positional) || estree_stmt_reads_positional(body)
+        }
         Expr::ArrowFunctionExpression { params, body, .. } => {
             // nested closure bodies (redirect/capture/pipeline/loop/…)
             // run under the CURRENT positional state — walk them
@@ -2875,6 +2914,9 @@ fn estree_stmt_reads_positional(s: &Stmt) -> bool {
         Stmt::WhileStatement { test, body } => {
             estree_reads_positional(test) || estree_stmt_reads_positional(body)
         }
+        Stmt::DoWhileStatement { test, body } => {
+            estree_reads_positional(test) || estree_stmt_reads_positional(body)
+        }
         Stmt::TryStatement {
             block,
             handler,
@@ -2903,6 +2945,9 @@ fn estree_stmt_reads_positional(s: &Stmt) -> bool {
         }
         Stmt::ForOfStatement { left, right, body } => {
             estree_reads_positional(right) || estree_stmt_reads_positional(body)
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            params.iter().any(estree_reads_positional) || estree_stmt_reads_positional(body)
         }
         Stmt::VariableDeclaration { declarations, .. } => declarations
             .iter()
@@ -5248,6 +5293,513 @@ pub fn analyze_true64(prog: &IrProgram) -> (HashSet<String>, HashMap<String, usi
         }
     }
     (int_vars, slots)
+}
+
+/// The i53 ESCALATION analysis (Task 1 — the optimistic width rule):
+/// which vars' ranges are PROVEN out of ±2^53 (so JS Number would round
+/// them — `x=9007199254740993; echo $((x+1))` prints 9007199254740992
+/// today) and whose every write is a PROVEN-INTEGER write, so the BigInt
+/// home (`--true64`'s non-slot Int64 machinery) never sees a non-integer
+/// runtime value — `BigInt("")`/`BigInt("abc")` would THROW where
+/// `Number(x)||0` coerces to 0. This is the "escalate" tier of
+/// `choose_width`: vars NOT proven big stay JS Numbers (the optimistic
+/// default — the SH2_ASSUME_I53 assumption, see [`i53_escalation_enabled`]);
+/// `--true64`'s analyze_true64 is the CONSERVATIVE superset (every
+/// unproven numeric var escalates).
+///
+/// Proven-integer writes: `Assign`/`setVar` with Int / integer-string /
+/// Arith sources (bash arith ALWAYS yields an integer — non-numeric
+/// operands coerce to 0), the runtime `assign` compound form, and
+/// `local x=<int>`-style exec args (the `name=value` shape). EVERY other
+/// write rejects the var: unproven-string sources (getVar/param/capture/
+/// Interpolate), `read`/`getopts`/`unset`/`eval` args, indexed assigns,
+/// and any write inside a Function/Subshell/Background/Pipeline body (the
+/// JS closure binding is shared — a non-integer write there would poison
+/// the BigInt home too). Case/Redirect/Try/loop bodies are parent-scope
+/// and classify normally.
+pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
+    let ranges = analyze_var_ranges(prog);
+    let mut candidates: HashSet<String> = ranges
+        .iter()
+        .filter(|(_, (lo, hi))| {
+            // PROVEN big only (core request estree-20260814-175715): a
+            // range endpoint that is a loop-fixpoint WIDENING extreme
+            // (i64::MIN/MAX) is an over-approximation, not a proof — the
+            // optimistic default keeps such vars as Numbers (the
+            // SH2_ASSUME_I53 assumption: "vars NOT proven big stay JS
+            // Numbers"). A loop counter compared against a small bound
+            // (cond_bound_resolved) lands in a provably small interval
+            // and stays plain Number instead of leaking BigInt into
+            // mixed arithmetic.
+            (*lo < -SAFE_NUMBER || *hi > SAFE_NUMBER)
+                && *lo != INT_DOMAIN.0
+                && *hi != INT_DOMAIN.1
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    if candidates.is_empty() {
+        return candidates;
+    }
+
+    // a write's value class: ProvenInt (always an integer), Reject
+    // (unproven — the var may hold a non-integer at runtime)
+    enum W {
+        ProvenInt,
+        Reject,
+    }
+    fn write_val(e: &IrExpr, candidates: &HashSet<String>) -> Option<W> {
+        match e {
+            IrExpr::Int(_) => Some(W::ProvenInt),
+            // an integer string literal
+            IrExpr::Str(sv, _) => {
+                if sv.trim().parse::<i64>().is_ok() {
+                    Some(W::ProvenInt)
+                } else {
+                    Some(W::Reject)
+                }
+            }
+            // bash arith ALWAYS yields an integer (non-numeric operands
+            // coerce to 0)
+            IrExpr::Arith(_) => Some(W::ProvenInt),
+            // a read of another candidate: the BigInt home holds an
+            // integer; any other var's value is unproven
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                if candidates.contains(n) {
+                    Some(W::ProvenInt)
+                } else {
+                    Some(W::Reject)
+                }
+            }
+            _ => Some(W::Reject),
+        }
+    }
+
+    // per-var write verdicts: false = a reject write was seen
+    fn mark_ok(ok: &mut HashMap<String, bool>, name: &str, w: W) {
+        match w {
+            W::ProvenInt => {
+                ok.entry(name.to_string()).or_insert(true);
+            }
+            W::Reject => {
+                ok.insert(name.to_string(), false);
+            }
+        }
+    }
+    // mark every var written by the exec arg list: `name` (read-builtin /
+    // unset / bare word — the runtime may store anything) rejects,
+    // `name=<int>` (local x=5) proves, `name=<non-int>` rejects. Over-
+    // marking is conservative (a non-write marked Reject only blocks an
+    // escalation, never unsound).
+    fn exec_write_args(args: &[IrExpr], ok: &mut HashMap<String, bool>) {
+        for a in args {
+            match a {
+                IrExpr::Array(elems) => exec_write_args(elems, ok),
+                IrExpr::Object(props) => {
+                    for (_, v) in props {
+                        exec_write_args(std::slice::from_ref(v), ok);
+                    }
+                }
+                IrExpr::Str(sv, _) => {
+                    let mut it = sv.splitn(2, '=');
+                    let name = it.next().unwrap_or("");
+                    if name.is_empty()
+                        || !name
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        continue;
+                    }
+                    let w = match it.next() {
+                        None => W::Reject, // `read x` / `unset x` / bare word
+                        Some(v) => {
+                            if v.trim().parse::<i64>().is_ok() {
+                                W::ProvenInt
+                            } else {
+                                W::Reject
+                            }
+                        }
+                    };
+                    match w {
+                        W::ProvenInt => {
+                            ok.entry(name.to_string()).or_insert(true);
+                        }
+                        W::Reject => {
+                            ok.insert(name.to_string(), false);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    fn reject(ok: &mut HashMap<String, bool>, names: &[String]) {
+        for n in names {
+            ok.insert(n.clone(), false);
+        }
+    }
+    fn reject_assigned(s: &IrStmt, ok: &mut HashMap<String, bool>) {
+        match s {
+            IrStmt::Assign { targets, .. } => {
+                for t in targets {
+                    ok.insert(t.var.clone(), false);
+                }
+            }
+            IrStmt::Expr(IrExpr::Call { func, args }) => {
+                if func == "setVar" || func == "assign" {
+                    if let [IrExpr::Str(n, _), ..] = args.as_slice() {
+                        ok.insert(n.clone(), false);
+                    }
+                } else if func == "exec" {
+                    exec_write_args(args, ok);
+                } else if func == "arith" {
+                    // the runtime evaluates the arith text — every ident
+                    // may be written with an unproven value
+                    for a in args {
+                        if let IrExpr::Str(t, _) = a {
+                            for w in t.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                                if !w.is_empty()
+                                    && w.chars().next().is_some_and(|c| {
+                                        c.is_ascii_alphabetic() || c == '_'
+                                    })
+                                {
+                                    ok.insert(w.to_string(), false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Redirect { inner: b, .. } => {
+                for s in b {
+                    reject_assigned(s, ok);
+                }
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                for s in then {
+                    reject_assigned(s, ok);
+                }
+                for (_, arm) in elsifs {
+                    for s in arm {
+                        reject_assigned(s, ok);
+                    }
+                }
+                for s in else_ {
+                    reject_assigned(s, ok);
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::DoWhile { body, .. } => {
+                for s in body {
+                    reject_assigned(s, ok);
+                }
+            }
+            IrStmt::ForInit {
+                init, step, body, ..
+            } => {
+                for s in init {
+                    reject_assigned(s, ok);
+                }
+                for s in step {
+                    reject_assigned(s, ok);
+                }
+                for s in body {
+                    reject_assigned(s, ok);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for s in &c.body {
+                        reject_assigned(s, ok);
+                    }
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for s in body {
+                    reject_assigned(s, ok);
+                }
+                for e in excepts {
+                    for s in &e.body {
+                        reject_assigned(s, ok);
+                    }
+                }
+                for s in else_body {
+                    reject_assigned(s, ok);
+                }
+                for s in finally_body {
+                    reject_assigned(s, ok);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // one walk: classify every write site; record the write VALUES so
+    // the context-consistency closure can see which vars' writes read a
+    // candidate (a var holding a BigInt value must join the BigInt home
+    // or mixed BigInt/Number arithmetic throws — core request
+    // estree-20260814-175715).
+    fn walk(
+        s: &IrStmt,
+        ok: &mut HashMap<String, bool>,
+        candidates: &HashSet<String>,
+        writes: &mut HashMap<String, Vec<IrExpr>>,
+    ) {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                if targets.len() == 1 && targets[0].indices.is_empty() {
+                    let w = write_val(expr, candidates);
+                    let name = &targets[0].var;
+                    writes.entry(name.clone()).or_default().push(expr.clone());
+                    match w {
+                        Some(W::ProvenInt) => {
+                            ok.entry(name.clone()).or_insert(true);
+                        }
+                        _ => {
+                            ok.insert(name.clone(), false);
+                        }
+                    }
+                } else {
+                    reject(ok, &targets.iter().map(|t| t.var.clone()).collect::<Vec<_>>());
+                }
+            }
+            IrStmt::Expr(IrExpr::Call { func, args }) => {
+                if func == "setVar" {
+                    if let [IrExpr::Str(name, _), e] = args.as_slice() {
+                        writes.entry(name.clone()).or_default().push((*e).clone());
+                        match write_val(e, candidates) {
+                            Some(W::ProvenInt) => {
+                                ok.entry(name.clone()).or_insert(true);
+                            }
+                            _ => {
+                                ok.insert(name.clone(), false);
+                            }
+                        }
+                    }
+                } else if func == "assign" {
+                    // the runtime compound arith form always stores an
+                    // integer
+                    if let [IrExpr::Str(name, _), ..] = args.as_slice() {
+                        ok.entry(name.clone()).or_insert(true);
+                    }
+                } else if func == "exec" {
+                    exec_write_args(args, ok);
+                } else if func == "arith" {
+                    for a in args {
+                        if let IrExpr::Str(t, _) = a {
+                            for w in t.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                                if !w.is_empty()
+                                    && w.chars().next().is_some_and(|c| {
+                                        c.is_ascii_alphabetic() || c == '_'
+                                    })
+                                {
+                                    ok.insert(w.to_string(), false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            IrStmt::Function { body, .. } => {
+                // a function body may write the global binding (dynamic
+                // scope) — every write there rejects (locals, unproven
+                // values, shadowing all possible)
+                let mut fok: HashMap<String, bool> = HashMap::new();
+                for s in body {
+                    reject_assigned(s, &mut fok);
+                }
+                reject(ok, &fok.keys().cloned().collect::<Vec<_>>());
+            }
+            IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                // the JS closure shares the binding — a child-scope write
+                // of a non-integer would poison the BigInt home
+                let mut bok: HashMap<String, bool> = HashMap::new();
+                for s in b {
+                    reject_assigned(s, &mut bok);
+                }
+                reject(ok, &bok.keys().cloned().collect::<Vec<_>>());
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    let mut pok: HashMap<String, bool> = HashMap::new();
+                    for s in st {
+                        reject_assigned(s, &mut pok);
+                    }
+                    reject(ok, &pok.keys().cloned().collect::<Vec<_>>());
+                }
+            }
+            IrStmt::Select { clauses } => {
+                for c in clauses {
+                    for s in &c.body {
+                        reject_assigned(s, ok);
+                    }
+                }
+            }
+            IrStmt::Declare { vars, .. } => {
+                reject(ok, &vars.iter().map(|v| v.name.clone()).collect::<Vec<_>>());
+            }
+            IrStmt::DeclareArray { var, .. } => {
+                ok.insert(var.clone(), false);
+            }
+            IrStmt::Exec { env, .. } => {
+                for (n, _) in env {
+                    ok.insert(n.clone(), false);
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Redirect { inner: b, .. } => {
+                for s in b {
+                    walk(s, ok, candidates, writes);
+                }
+            }
+            IrStmt::If {
+                then,
+                elsifs,
+                else_,
+                ..
+            } => {
+                for s in then {
+                    walk(s, ok, candidates, writes);
+                }
+                for (_, arm) in elsifs {
+                    for s in arm {
+                        walk(s, ok, candidates, writes);
+                    }
+                }
+                for s in else_ {
+                    walk(s, ok, candidates, writes);
+                }
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::DoWhile { body, .. } => {
+                for s in body {
+                    walk(s, ok, candidates, writes);
+                }
+            }
+            IrStmt::ForInit {
+                init, step, body, ..
+            } => {
+                for s in init {
+                    walk(s, ok, candidates, writes);
+                }
+                for s in step {
+                    walk(s, ok, candidates, writes);
+                }
+                for s in body {
+                    walk(s, ok, candidates, writes);
+                }
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    for s in &c.body {
+                        walk(s, ok, candidates, writes);
+                    }
+                }
+            }
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                for s in body {
+                    walk(s, ok, candidates, writes);
+                }
+                for e in excepts {
+                    for s in &e.body {
+                        walk(s, ok, candidates, writes);
+                    }
+                }
+                for s in else_body {
+                    walk(s, ok, candidates, writes);
+                }
+                for s in finally_body {
+                    walk(s, ok, candidates, writes);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ok: HashMap<String, bool> = HashMap::new();
+    let mut writes: HashMap<String, Vec<IrExpr>> = HashMap::new();
+    for s in &prog.stmts {
+        walk(s, &mut ok, &candidates, &mut writes);
+    }
+    candidates.retain(|v| ok.get(v).copied().unwrap_or(false));
+    // Context-consistency closure (core request estree-20260814-175715):
+    // the leaf-wrap fires on ANY arith that mentions a candidate, so a
+    // var assigned `dy=$(( y - 7 ))` from an escalated `y` HOLDS a BigInt
+    // value at runtime — if dy is not itself escalated, a later `dy * 2`
+    // mixes BigInt and Number and throws. Every var whose writes are all
+    // proven-integer and whose write READS a candidate (directly or
+    // through arith) must join the BigInt home so all its reads wrap too.
+    // Re-walk on each growth: a Var read of a newly-added candidate is a
+    // proven-int write for the next round.
+    loop {
+        let mut added = false;
+        for (v, ws) in &writes {
+            if candidates.contains(v) || !ok.get(v).copied().unwrap_or(false) {
+                continue;
+            }
+            if ws.iter().any(|e| write_reads_candidate(e, &candidates)) {
+                candidates.insert(v.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+        ok.clear();
+        for s in &prog.stmts {
+            walk(s, &mut ok, &candidates, &mut writes);
+        }
+    }
+    candidates
+}
+
+/// Does a write's value read a candidate (a BigInt-typed var)?
+fn write_reads_candidate(e: &IrExpr, cand: &HashSet<String>) -> bool {
+    match e {
+        IrExpr::Arith(a) => arith_reads_candidate(a, cand),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => cand.contains(n),
+        _ => false,
+    }
+}
+
+fn arith_reads_candidate(a: &ArithAst, cand: &HashSet<String>) -> bool {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => cand.contains(n),
+        ArithAst::Index { key, .. } => arith_reads_candidate(key, cand),
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_reads_candidate(lhs, cand) || arith_reads_candidate(rhs, cand)
+        }
+        ArithAst::Un { arg, .. } => arith_reads_candidate(arg, cand),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => {
+            arith_reads_candidate(test, cand)
+                || arith_reads_candidate(then, cand)
+                || arith_reads_candidate(else_, cand)
+        }
+        ArithAst::Assign { var, rhs, .. } => {
+            arith_reads_candidate(rhs, cand) || cand.contains(var)
+        }
+        ArithAst::IncDec { var, .. } => cand.contains(var),
+        ArithAst::Cast { arg, .. } => arith_reads_candidate(arg, cand),
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => false,
+    }
 }/// The FRONTEND's integer arithmetic domain, not the storage width:
 /// bash is signed-64-bit wrapped, so a provable range never leaves
 /// [i64::MIN, i64::MAX] — an op/literal that can cross it is top (None).
@@ -5377,6 +5929,120 @@ fn cond_bound(cond: &IrExpr) -> Option<(String, Cmp, i128)> {
             lhs,
             ..
         } => cond_bound(lhs).map(|(v, c, n)| (v, cmp_flip(c), n)),
+        _ => None,
+    }
+}
+
+/// Like [`cond_bound`], but a `$VAR` bound operand is resolved against
+/// the pre-loop state when it is a provable constant (a point range) and
+/// the var is not assigned in the loop body — `while [ "$y" -lt "$SIZE" ]`
+/// with `SIZE=32` pins the literal bound 32 (core request
+/// estree-20260814-175715: the i53 escalation only widens counters that
+/// are PROVEN to escape ±2^53; an unresolvable bound over-widened the
+/// counter to the full i64 domain and homed it as BigInt, which then
+/// leaked into mixed arithmetic and threw in the browser). A bound var
+/// with a WIDE range, or one written inside the loop body (the cond
+/// re-reads it every iteration), is NOT resolved — conservative.
+fn cond_bound_resolved(
+    cond: &IrExpr,
+    pre: &HashMap<String, Range>,
+    carried: &HashSet<String>,
+) -> Option<(String, Cmp, i128)> {
+    // `$VAR` (test form) / `VAR` (let form) → the constant value, when
+    // provable and loop-invariant.
+    let resolve = |s: &str| -> Option<i128> {
+        let n = s.strip_prefix('$')?;
+        if carried.contains(n) {
+            return None;
+        }
+        let (lo, hi) = pre.get(n).copied().flatten()?;
+        (lo == hi).then_some(lo)
+    };
+    match cond {
+        IrExpr::Call { func, args } if func == "test" => match args.as_slice() {
+            [IrExpr::Str(text, _)] => {
+                let parts: Vec<&str> = text.split_whitespace().collect();
+                if parts.len() != 3 {
+                    return None;
+                }
+                let var = |s: &str| {
+                    s.strip_prefix('$')
+                        .filter(|n| !n.is_empty())
+                        .map(str::to_string)
+                };
+                let num = |s: &str| s.parse::<i128>().ok().or_else(|| resolve(s));
+                let cmp = |s: &str| match s {
+                    "-lt" => Some(Cmp::Lt),
+                    "-le" => Some(Cmp::Le),
+                    "-gt" => Some(Cmp::Gt),
+                    "-ge" => Some(Cmp::Ge),
+                    "-eq" => Some(Cmp::Eq),
+                    _ => None,
+                };
+                if let (Some(v), Some(c), Some(n)) = (var(parts[0]), cmp(parts[1]), num(parts[2]))
+                {
+                    Some((v, c, n))
+                } else if let (Some(n), Some(c), Some(v)) =
+                    (num(parts[0]), cmp(parts[1]), var(parts[2]))
+                {
+                    Some((v, cmp_flip(c), n))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        // `while (( y < SIZE ))` — the parser emits `let "y < SIZE"`
+        IrExpr::Call { func, args } if func == "exec" => match args.as_slice() {
+            [IrExpr::Str(name, _), IrExpr::Array(items)] if name == "let" => {
+                match items.as_slice() {
+                    [IrExpr::Str(text, _)] => {
+                        let parts: Vec<&str> = text.split_whitespace().collect();
+                        if parts.len() != 3 {
+                            return None;
+                        }
+                        let var = |s: &str| {
+                            if !s.is_empty()
+                                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            {
+                                Some(s.to_string())
+                            } else {
+                                None
+                            }
+                        };
+                        let num = |s: &str| s.parse::<i128>().ok().or_else(|| resolve(s));
+                        let cmp = |s: &str| match s {
+                            "<" => Some(Cmp::Lt),
+                            "<=" => Some(Cmp::Le),
+                            ">" => Some(Cmp::Gt),
+                            ">=" => Some(Cmp::Ge),
+                            "==" => Some(Cmp::Eq),
+                            "=" => Some(Cmp::Eq),
+                            "!=" => None,
+                            _ => None,
+                        };
+                        if let (Some(v), Some(c), Some(n)) = (var(parts[0]), cmp(parts[1]), num(parts[2]))
+                        {
+                            Some((v, c, n))
+                        } else if let (Some(n), Some(c), Some(v)) =
+                            (num(parts[0]), cmp(parts[1]), var(parts[2]))
+                        {
+                            Some((v, cmp_flip(c), n))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        // `until cond` wraps the cond in BinOp(Not, cond, cond)
+        IrExpr::BinOp {
+            op: BinOpKind::Not,
+            lhs,
+            ..
+        } => cond_bound_resolved(lhs, pre, carried).map(|(v, c, n)| (v, cmp_flip(c), n)),
         _ => None,
     }
 }
@@ -5748,14 +6414,51 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
         IrStmt::Assign { targets, expr, .. } if targets.len() == 1 && targets[0].indices.is_empty() => {
             let name = targets[0].var.clone();
             state.insert(name, ir_range(expr, state));
+            // in-expression arith writes (`x=$((x++))`, `((x+=1))` — the
+            // Assign's RANGE is the expression's VALUE; the write updates
+            // the var's post-statement state (the IncDec postfix value is
+            // the OLD value, the var's own state the NEW one)
+            if let IrExpr::Arith(a) = expr {
+                arith_stmt_writes(a, state);
+            }
         }
         // multi-target / indexed assignments — no single-variable range
         IrStmt::Assign { .. } => {}
-        IrStmt::Expr(IrExpr::Call { func, args })
-            if func == "setVar" && matches!(args.as_slice(), [IrExpr::Str(_, _), _]) =>
-        {
-            if let [IrExpr::Str(name, _), e] = args.as_slice() {
-                state.insert(name.clone(), ir_range(e, state));
+        // setVar(name, v) — the plain write; `assign(name, op, v)` — the
+        // runtime compound form (v+=1, a && v=x): both name the target
+        // first and store the ARITHMETIC result (always an integer).
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" || func == "assign" => {
+            if let [IrExpr::Str(name, _), ..] = args.as_slice() {
+                state.insert(name.clone(), ir_range(args.last().unwrap(), state));
+                if let Some(IrExpr::Arith(a)) = args.last() {
+                    arith_stmt_writes(a, state);
+                }
+            }
+        }
+        // `local x=<int>` / `declare x=<int>` — the exec name=value shape:
+        // a provable integer write (the same parsing the escalation's
+        // write-provenance walker uses).
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+            if let [IrExpr::Str(name, _), IrExpr::Array(items)] = args.as_slice() {
+                if matches!(name.as_str(), "local" | "declare" | "readonly" | "export" | "typeset") {
+                    for it in items {
+                        if let IrExpr::Str(sv, _) = it {
+                            let mut parts = sv.splitn(2, '=');
+                            if let (Some(n), Some(v)) = (parts.next(), parts.next()) {
+                                if let Ok(nv) = v.trim().parse::<i64>() {
+                                    if !n.is_empty()
+                                        && n.chars().next().is_some_and(|c| {
+                                            c.is_ascii_alphabetic() || c == '_'
+                                        })
+                                        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                    {
+                                        state.insert(n.to_string(), Some((nv as i128, nv as i128)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         IrStmt::Block(stmts) => {
@@ -5812,7 +6515,16 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             *state = merged;
         }
         IrStmt::While { cond, body } => {
-            loop_fixpoint(state, body, None, cond_bound(cond));
+            // `$VAR` bound operands resolve against the pre-loop state (a
+            // provable constant not written in the body) so a
+            // small-bounded counter stays provably small — the i53
+            // escalation's "proven big" gate (core request
+            // estree-20260814-175715).
+            let mut carried = HashSet::new();
+            for s in body {
+                collect_assigned(s, &mut carried);
+            }
+            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried));
         }
         IrStmt::ForInit { init, cond, step, body } => {
             for i in init {
@@ -5821,11 +6533,19 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
             for st in step {
                 walk_stmt_ranges(st, state);
             }
-            loop_fixpoint(state, body, None, cond_bound(cond));
+            let mut carried = HashSet::new();
+            for s in body {
+                collect_assigned(s, &mut carried);
+            }
+            loop_fixpoint(state, body, None, cond_bound_resolved(cond, state, &carried));
         }
         IrStmt::Continue | IrStmt::Break => {}
         IrStmt::DoWhile { body, cond, until } => {
-            let b = cond_bound(cond);
+            let mut carried = HashSet::new();
+            for s in body {
+                collect_assigned(s, &mut carried);
+            }
+            let b = cond_bound_resolved(cond, state, &carried);
             let b = if *until {
                 b.map(|(v, c, n)| (v, cmp_flip(c), n))
             } else {
@@ -5978,28 +6698,89 @@ fn ir_range(e: &IrExpr, state: &HashMap<String, Range>) -> Range {
     }
 }
 
+/// bash's 64-bit wrap: the SIGNED value of `v mod 2^64` (bash arithmetic
+/// is intmax_t, wrapping at 2^64 — `$((2**63))` is -2^63).
+fn wrap64(v: i128) -> i64 {
+    let m = 1i128 << 64;
+    let w = v.rem_euclid(m); // [0, 2^64)
+    if w >= (1i128 << 63) {
+        (w - m) as i64
+    } else {
+        w as i64
+    }
+}
+
+/// The wrapped interval of a TRUE-value interval [lo, hi] (bash int64
+/// wrap): exact when the interval spans < 2^64 and contains no wrap
+/// point (a value ≡ 2^63 mod 2^64 — the signedness fold, where the
+/// sawtooth jumps 2^63-1 → -2^63); a point is always exact. Otherwise
+/// the full i64 domain (sound — the wrapped set straddles the fold).
+fn wrap_interval(lo: i128, hi: i128) -> (i128, i128) {
+    if lo == hi {
+        let w = wrap64(lo);
+        return (w as i128, w as i128);
+    }
+    let p = 1i128 << 64;
+    let m = 1i128 << 63;
+    if hi - lo >= p {
+        return (i64::MIN as i128, i64::MAX as i128);
+    }
+    // count of integers ≡ m (mod p) inside [lo, hi]
+    let cnt = (hi - m).div_euclid(p) - (lo - m - 1).div_euclid(p);
+    if cnt > 0 {
+        (i64::MIN as i128, i64::MAX as i128)
+    } else {
+        (wrap64(lo) as i128, wrap64(hi) as i128)
+    }
+}
+
+/// `b**e` in i128 (checked): the exact true value, or None when it does
+/// not fit i128 (the wrapped interval is then provably any i64 — the
+/// caller's full-domain fallback).
+fn pow_i128(b: i128, e: i128) -> Option<i128> {
+    if e == 0 {
+        return Some(1);
+    }
+    if b == 0 || b == 1 {
+        return Some(b);
+    }
+    if b == -1 {
+        return Some(if e % 2 == 0 { 1 } else { -1 });
+    }
+    // |b| >= 2: b^e fits i128 only for e <= 127 (2^127 max); a larger
+    // exponent is provably out of the wrapped domain (full i64).
+    if e > 127 {
+        return None;
+    }
+    b.checked_pow(e as u32)
+}
+
+/// The exact wrapped interval of `x op y` over range operands whose true
+/// interval is [lo, hi] (all ops: + - * are monotone in each endpoint;
+/// the wrapped interval is exact when it contains no fold point).
 fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
     match a {
         ArithAst::Num(i) => Some((*i as i128, *i as i128)),
         ArithAst::Var(n) => state.get(n).copied().flatten(),
+        // a lifted binding read (A1 Ident) — same state lookup as Var
+        ArithAst::Ident(n) => state.get(n).copied().flatten(),
         ArithAst::Bin { op, lhs, rhs } => {
             let (l, r) = (arith_range(lhs, state)?, arith_range(rhs, state)?);
             let (l0, l1, r0, r1) = (l.0, l.1, r.0, r.1);
-            // the interval of the op, provably within the frontend's
-            // integer domain; a result that can leave it (wrap) is top
-            let res = match op.as_str() {
-                "+" => Some((l0.checked_add(r0)?, l1.checked_add(r1)?)),
-                "-" => Some((l0.checked_sub(r1)?, l1.checked_sub(r0)?)),
+            let res: Range = match op.as_str() {
+                "+" => Some(wrap_interval(l0 + r0, l1 + r1)),
+                "-" => Some(wrap_interval(l0 - r1, l1 - r0)),
                 "*" => {
-                    // min/max over all four endpoint products; None on overflow
-                    let ps = [
-                        l0.checked_mul(r0)?,
-                        l0.checked_mul(r1)?,
-                        l1.checked_mul(r0)?,
-                        l1.checked_mul(r1)?,
-                    ];
-                    Some((*ps.iter().min()?, *ps.iter().max()?))
+                    // min/max over all four endpoint products
+                    let ps = [l0 * r0, l0 * r1, l1 * r0, l1 * r1];
+                    Some(wrap_interval(*ps.iter().min()?, *ps.iter().max()?))
                 }
+                // integer division truncates toward zero (Rust i128 /
+                // matches bash); the quotient of two i64 values fits i64
+                // (no wrap), and the extrema sit at the endpoints (div is
+                // monotone in each operand while the divisor keeps its
+                // sign). MIN / -1 = 2^63 is bash's "division by -1" abort
+                // (not representable) — None.
                 "/" => {
                     if r0 <= 0 && r1 >= 0 {
                         return None; // possible division by zero
@@ -6010,22 +6791,283 @@ fn arith_range(a: &ArithAst, state: &HashMap<String, Range>) -> Range {
                         l1.checked_div(r0)?,
                         l1.checked_div(r1)?,
                     ];
-                    Some((*qs.iter().min()?, *qs.iter().max()?))
+                    let (lo, hi) = (*qs.iter().min()?, *qs.iter().max()?);
+                    in_domain((lo, hi)).then_some((lo, hi))
                 }
-                _ => None, // % , ^, ... conservative
+                // modulo: |x % d| < |d|, sign follows the dividend
+                // (truncated); a point dividend and divisor compute the
+                // exact wrapped value
+                "%" => {
+                    if r0 <= 0 && r1 >= 0 {
+                        return None; // possible division by zero (abort)
+                    }
+                    if l0 == l1 && r0 == r1 {
+                        let q = if r0 == 0 { return None; } else { l0 % r0 };
+                        return Some((q, q));
+                    }
+                    let m = r0.abs().max(r1.abs());
+                    if l0 >= 0 {
+                        Some((0, m - 1))
+                    } else if l1 <= 0 {
+                        Some((-(m - 1), 0))
+                    } else {
+                        Some((-(m - 1), m - 1))
+                    }
+                }
+                // exponentiation: bash wraps mod 2^64; a negative
+                // exponent aborts the expansion (None). Point base/exp
+                // compute the exact wrapped value; a nonneg point base
+                // over an exponent range is monotone (checked i128 pow);
+                // a negative point base takes the two largest exponents
+                // (the parity extremes).
+                "**" => {
+                    if r0 < 0 {
+                        return None; // exponent less than 0 — bash aborts
+                    }
+                    match (l0 == l1, r0 == r1) {
+                        (true, true) => {
+                            let v = pow_i128(l0, r0)?;
+                            Some(wrap_interval(v, v))
+                        }
+                        (true, false) => {
+                            let b = l0;
+                            let (e0, e1) = (r0, r1);
+                            match b {
+                                0 => Some(if e0 == 0 { (0, 1) } else { (0, 0) }),
+                                1 => Some((1, 1)),
+                                -1 => Some(if e0 == e1 {
+                                    let v = if e0 % 2 == 0 { 1 } else { -1 };
+                                    (v, v)
+                                } else {
+                                    (-1, 1)
+                                }),
+                                b if b > 1 => {
+                                    let hi = pow_i128(b, e1)?;
+                                    Some(wrap_interval(pow_i128(b, e0)?, hi))
+                                }
+                                b => {
+                                    // b <= -2: the magnitude extremes are
+                                    // the two largest exponents (opposite
+                                    // parities)
+                                    let hi = pow_i128(b, e1)?;
+                                    let lo = pow_i128(b, e1 - 1)?;
+                                    Some(wrap_interval(lo.min(hi), lo.max(hi)))
+                                }
+                            }
+                        }
+                        (false, true) => {
+                            let e = r0;
+                            if l0 >= 0 {
+                                let hi = pow_i128(l1, e)?;
+                                Some(wrap_interval(pow_i128(l0, e)?, hi))
+                            } else if l1 < 0 {
+                                if e % 2 == 1 {
+                                    // odd exponent: x^e is increasing
+                                    let hi = pow_i128(l1, e)?;
+                                    Some(wrap_interval(pow_i128(l0, e)?, hi))
+                                } else {
+                                    // even exponent: b^e = |b|^e, and
+                                    // |b| ∈ [|l1|, |l0|] (l0 ≤ l1 < 0)
+                                    let lo = pow_i128(l1.abs(), e)?;
+                                    let mx = pow_i128(l0.abs(), e)?;
+                                    Some(wrap_interval(lo, mx))
+                                }
+                            } else {
+                                // 0 ∈ [l0, l1]: even e → [0, max^e]; odd
+                                // e → increasing over the sign change
+                                let mx = pow_i128(l0.abs().max(l1.abs()), e)?;
+                                if e % 2 == 1 {
+                                    Some(wrap_interval(pow_i128(l0, e)?, pow_i128(l1, e)?))
+                                } else {
+                                    Some(wrap_interval(0, mx))
+                                }
+                            }
+                        }
+                        (false, false) => None, // conservative
+                    }
+                }
+                // shifts: bash masks the count mod 64 (1<<64 = 1,
+                // 1<<-1 = 1<<63) — arithmetic << on the wrapped value;
+                // >> is sign-extending (arithmetic). A point count over
+                // a range is monotone; a range count is conservative.
+                "<<" => {
+                    if r0 != r1 {
+                        return None;
+                    }
+                    let c = r0.rem_euclid(64) as u32;
+                    Some(wrap_interval(l0 << c, l1 << c))
+                }
+                ">>" => {
+                    if r0 != r1 {
+                        return None;
+                    }
+                    let c = r0.rem_euclid(64) as u32;
+                    Some((l0 >> c, l1 >> c))
+                }
+                // bitwise ops on wrapped values: points are exact; the
+                // nonneg-interval forms are sound (AND: result ≤ both
+                // operands, ≥ 0; OR: ≥ both, ≤ the OR of the maxima —
+                // OR is monotone in the numeric order; XOR: between 0
+                // and the OR of the maxima). Negatives: conservative.
+                "&" => {
+                    if l0 == l1 && r0 == r1 {
+                        return Some((wrap64(l0 & r0) as i128, wrap64(l0 & r0) as i128));
+                    }
+                    if l0 >= 0 && r0 >= 0 {
+                        Some((0, l1.min(r1)))
+                    } else {
+                        None
+                    }
+                }
+                "|" => {
+                    if l0 == l1 && r0 == r1 {
+                        return Some((wrap64(l0 | r0) as i128, wrap64(l0 | r0) as i128));
+                    }
+                    if l0 >= 0 && r0 >= 0 {
+                        Some((l0.max(r0), l1 | r1))
+                    } else {
+                        None
+                    }
+                }
+                "^" => {
+                    if l0 == l1 && r0 == r1 {
+                        return Some((wrap64(l0 ^ r0) as i128, wrap64(l0 ^ r0) as i128));
+                    }
+                    if l0 >= 0 && r0 >= 0 {
+                        Some((0, l1 | r1))
+                    } else {
+                        None
+                    }
+                }
+                // comparisons and logicals yield bash's 0/1
+                "<" | "<=" | ">" | ">=" | "==" | "!=" | "&&" | "||" => Some((0, 1)),
+                _ => None,
             };
             res.filter(|&r| in_domain(r))
         }
         ArithAst::Un { op, arg } => {
             let (lo, hi) = arith_range(arg, state)?;
-            let res = match op.as_str() {
-                "-" => Some((-hi, -lo)),
+            let res: Range = match op.as_str() {
+                // ~x = -x-1 (two's complement, any width) — fits i64
+                "~" => Some((-hi - 1, -lo - 1)),
+                "!" => Some((0, 1)),
+                "-" => Some(wrap_interval(-hi, -lo)),
                 "+" => Some((lo, hi)),
                 _ => None,
             };
             res.filter(|&r| in_domain(r))
         }
-        _ => None, // Index / Cond / Assign / IncDec — step 2
+        // lazy conditional: the result is the taken branch's value — a
+        // provably-constant test picks the branch, else the join
+        ArithAst::Cond { test, then, else_ } => {
+            match arith_range(test, state) {
+                Some((0, 0)) => arith_range(else_, state),
+                Some((lo, hi)) if lo >= 1 || hi <= -1 => arith_range(then, state),
+                _ => join(arith_range(then, state), arith_range(else_, state)),
+            }
+        }
+        // the assignment's VALUE is the new value (bash semantics): the
+        // rhs for `=`; the current value op the rhs for the compound ops
+        ArithAst::Assign { var, op, rhs } => {
+            let r = arith_range(rhs, state)?;
+            match op.as_str() {
+                "=" => Some(r),
+                "+=" => {
+                    let (lo, hi) = state.get(var).copied().flatten()?;
+                    Some(wrap_interval(lo + r.0, hi + r.1))
+                }
+                "-=" => {
+                    let (lo, hi) = state.get(var).copied().flatten()?;
+                    Some(wrap_interval(lo - r.1, hi - r.0))
+                }
+                "*=" => {
+                    let (lo, hi) = state.get(var).copied().flatten()?;
+                    let ps = [lo * r.0, lo * r.1, hi * r.0, hi * r.1];
+                    Some(wrap_interval(*ps.iter().min()?, *ps.iter().max()?))
+                }
+                _ => None,
+            }
+        }
+        // ++/--: the expression's VALUE is the old value (postfix) or the
+        // new one (prefix); the var's own post-state is always new (the
+        // caller's [`arith_stmt_writes`] applies it)
+        ArithAst::IncDec { var, delta, prefix } => {
+            let (lo, hi) = state.get(var).copied().flatten()?;
+            if *prefix {
+                Some(wrap_interval(lo + *delta as i128, hi + *delta as i128))
+            } else {
+                Some((lo, hi))
+            }
+        }
+        // an array element read is unprovable
+        ArithAst::Index { .. } => None,
+        // C-frontend casts: the wrapped value of the inner expression
+        ArithAst::Cast { arg, .. } => arith_range(arg, state),
+        ArithAst::Sizeof(ty) => {
+            let n = ty.c_sizeof().unwrap_or(4) as i128;
+            Some((n, n))
+        }
+    }
+}
+
+/// Apply the WRITES an arith expression performs (`x=…`, `x+=…`, `x++`)
+/// to the statement-level range state (pre-order — an outer write's RHS
+/// may read a var an inner write changes, but the common shapes are
+/// sequential). The expression's own VALUE is arith_range's job; this is
+/// the var's post-statement state.
+fn arith_stmt_writes(a: &ArithAst, state: &mut HashMap<String, Range>) {
+    match a {
+        ArithAst::Assign { var, op, rhs } => {
+            let r = arith_range(rhs, state);
+            let next: Range = match op.as_str() {
+                "=" => r,
+                "+=" => match (state.get(var).copied().flatten(), r) {
+                    (Some((lo, hi)), Some(r)) => Some(wrap_interval(lo + r.0, hi + r.1)),
+                    _ => None,
+                },
+                "-=" => match (state.get(var).copied().flatten(), r) {
+                    (Some((lo, hi)), Some(r)) => Some(wrap_interval(lo - r.1, hi - r.0)),
+                    _ => None,
+                },
+                "*=" => match (state.get(var).copied().flatten(), r) {
+                    (Some((lo, hi)), Some(r)) => {
+                        let ps = [lo * r.0, lo * r.1, hi * r.0, hi * r.1];
+                        Some(wrap_interval(
+                            *ps.iter().min().unwrap_or(&0),
+                            *ps.iter().max().unwrap_or(&0),
+                        ))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(nv) = next {
+                state.insert(var.clone(), Some(nv));
+            } else {
+                state.insert(var.clone(), None);
+            }
+            arith_stmt_writes(rhs, state);
+        }
+        ArithAst::IncDec { var, delta, .. } => {
+            let next = match state.get(var).copied().flatten() {
+                Some((lo, hi)) => Some(wrap_interval(lo + *delta as i128, hi + *delta as i128)),
+                None => None,
+            };
+            state.insert(var.clone(), next);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            arith_stmt_writes(lhs, state);
+            arith_stmt_writes(rhs, state);
+        }
+        ArithAst::Un { arg, .. } => arith_stmt_writes(arg, state),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_stmt_writes(test, state);
+            arith_stmt_writes(then, state);
+            arith_stmt_writes(else_, state);
+        }
+        ArithAst::Cast { arg, .. } => arith_stmt_writes(arg, state),
+        ArithAst::Index { key, .. } => arith_stmt_writes(key, state),
+        _ => {}
     }
 }
 
@@ -6194,8 +7236,20 @@ pub(crate) fn stmt_for_command(cmd: &Command) -> Option<IrStmt> {
             rhs: Box::new(command_to_ir(r)),
         }),
         Command::Not(c) => IrStmt::Expr(not_ir(command_to_ir(c))),
-        Command::Break(_) => IrStmt::Expr(call("break", vec![])),
-        Command::Continue(_) => IrStmt::Expr(call("continue", vec![])),
+        // First-class A1 nodes instead of the opaque builtin calls (core
+        // requests zsh-sh-go-20260814-225040 / zsh-sh-go-20260815-015459
+        // [Break] and zsh-sh-go-20260813-003026 [Continue]): every
+        // renderer already lowers `IrStmt::Break`/`IrStmt::Continue` to
+        // the SAME runtime calls as the legacy `Call break/continue`
+        // forms (sh2.break()/sh2.continue(), `last;`/`next;`,
+        // break;/continue;), so the emitted code is byte-identical. The
+        // LEVEL argument (`break 2`/`continue 2`) is dropped exactly as
+        // before (the A1 nodes have no level field); the expression-
+        // context arm below keeps the call forms for `&&`/`||`/`!`
+        // operands.
+        Command::Break(_) => IrStmt::Break,
+        Command::Continue(None) => IrStmt::Continue,
+        Command::Continue(Some(_)) => IrStmt::Expr(call("continue", vec![])),
         Command::Return(w) => IrStmt::Return(w.as_ref().map(word_ir_quoted)),
         other => IrStmt::Expr(call("unsupported", vec![st(&format!("{other:?}"))])),
     })
@@ -6661,6 +7715,7 @@ fn redirect_shell_text(r: &Redirect) -> String {
     match &r.operator {
         RedirectOperator::Input => format!("< {}", word_shell_text(&r.target)),
         RedirectOperator::Output => format!("> {}", word_shell_text(&r.target)),
+        RedirectOperator::ClobberOutput => format!(">| {}", word_shell_text(&r.target)),
         RedirectOperator::Append => format!(">> {}", word_shell_text(&r.target)),
         RedirectOperator::ProcessSubstitutionInput(c) => {
             format!("<({})", command_to_shell_text(c))
@@ -6685,6 +7740,11 @@ fn redirect_to_ir(r: &Redirect) -> IrRedirect {
     let (mode, default_fd) = match &r.operator {
         RedirectOperator::Input => ("r", 0),
         RedirectOperator::Output => ("w", 1),
+        // `>|` — noclobber-bypassing output. Distinct mode string "wc"
+        // (documented alongside "r"/"w"/"a"/"r+" in ir.rs IrRedirect.mode)
+        // so backends can render `>|` faithfully under `set -C` (core
+        // requests sh-20260814-140334 / sh-20260814-150110).
+        RedirectOperator::ClobberOutput => ("wc", 1),
         RedirectOperator::Append => ("a", 1),
         RedirectOperator::InputOutput => ("r+", 0),
         RedirectOperator::Heredoc => ("heredoc", 0),
@@ -7066,7 +8126,16 @@ fn word_ir_quoted(w: &Word) -> IrExpr {
                 Some(a) => IrExpr::Arith(Box::new(a)),
                 None => call("arith", vec![st(t)]),
             },
-            None => call("capture", vec![IrExpr::Arrow(command_arrow_stmts(cmd))]),
+            None => IrExpr::Capture {
+                // The first-class A1 Capture node (core request
+                // zsh-sh-go-20260814-230503): `$(...)`/backticks lower to
+                // `Capture { expr: Arrow, native: false }` instead of the
+                // opaque `call("capture")` — the contract node whose
+                // analysis arms all exist and whose estree render arm
+                // rewrites to the same runtime sh2.capture call.
+                expr: Box::new(IrExpr::Arrow(command_arrow_stmts(cmd))),
+                native: false,
+            },
         },
         _ => word_ir(w),
     }
@@ -7179,11 +8248,21 @@ fn word_ir(w: &Word) -> IrExpr {
                 st(length.as_deref().unwrap_or("")),
             ],
         ),
-        Word::StringInterpolation(interp, _) => {
-            if let Some(part) = pure_template_part(interp) {
+        Word::StringInterpolation(interp, translated) => {
+            let ir = if let Some(part) = pure_template_part(interp) {
                 part
             } else {
                 interpolate_ir(&interp.parts)
+            };
+            // `$"..."` — the translated-string marker set by
+            // parse_string_interpolation (core request
+            // zsh-sh-go-20260814-200005): lower to `translate(...)`; the
+            // runner resolves the language (bash → content, zsh → `$` +
+            // content).
+            if translated.is_some() {
+                call("translate", vec![ir])
+            } else {
+                ir
             }
         }
         other => call("unsupported", vec![st(&other.to_string())]),
@@ -7211,6 +8290,15 @@ fn param_ir(pe: &ParameterExpansion) -> IrExpr {
         ParameterExpansionOperator::DefaultValue(d) => (":-".into(), vec![st(d)]),
         ParameterExpansionOperator::AssignDefault(d) => (":=".into(), vec![st(d)]),
         ParameterExpansionOperator::ErrorIfUnset(e) => (":?".into(), vec![st(e)]),
+        ParameterExpansionOperator::ZshFlags(flags, sep) => {
+            // zsh `${(flags)var}` / `${(flag:sep:)var}` — the zsh-only
+            // flag expansion; the A1 `param("", name, flags[, sep])`
+            // shape (the request's documented lowering).
+            let mut args = vec![st(""), st(pe.variable.as_str())];
+            if !flags.is_empty() { args.push(st(flags.as_str())); }
+            if let Some(s) = sep { args.push(st(s.as_str())); }
+            return call("param", args);
+        }
         ParameterExpansionOperator::BadSubstitution => ("badsub".into(), vec![]),
         ParameterExpansionOperator::Basename => ("basename".into(), vec![]),
         ParameterExpansionOperator::Dirname => ("dirname".into(), vec![]),
@@ -7650,8 +8738,17 @@ fn part_ir(part: &StringPart) -> IrExpr {
         StringPart::ParameterExpansion(pe) => {
             // `${arr[@]:off:len}` (ArraySlice) can return an ARRAY; inside a
             // template literal that would render with JS comma joins — wrap
-            // in sh2.join (idempotent for plain string slices).
-            if matches!(pe.operator, ParameterExpansionOperator::ArraySlice(..)) {
+            // in sh2.join (idempotent for plain string slices). The zsh
+            // `${(flags)var}` form (ZshFlags, core request
+            // zsh-sh-go-20260815-000728) is the same: the f/s/k flags
+            // return ARRAYS, and inside a double-quoted template zsh joins
+            // them with the first IFS char (space) — join() does exactly
+            // that (idempotent for the scalar-returning t/j/i/U/L flags).
+            if matches!(
+                pe.operator,
+                ParameterExpansionOperator::ArraySlice(..)
+                    | ParameterExpansionOperator::ZshFlags(..)
+            ) {
                 call("join", vec![param_ir(pe)])
             } else {
                 param_ir(pe)
@@ -7688,7 +8785,10 @@ fn part_ir(part: &StringPart) -> IrExpr {
                 Some(a) => IrExpr::Arith(Box::new(a)),
                 None => call("arith", vec![st(t)]),
             },
-            None => call("capture", vec![IrExpr::Arrow(command_arrow_stmts(cmd))]),
+            None => IrExpr::Capture {
+                expr: Box::new(IrExpr::Arrow(command_arrow_stmts(cmd))),
+                native: false,
+            },
         },
         other => call("unsupported", vec![st(&format!("{other:?}"))]),
     }
@@ -7708,10 +8808,15 @@ fn for_item_ir(w: &Word) -> IrExpr {
         // native whitespace field-split; `$@`/`$*` keep listVar above (the
         // runtime's per-positional flatten, never IFS-split).
         Word::Variable(name, _, _) => call("split", vec![call("getVar", vec![st(name)])]),
-        Word::StringInterpolation(interp, _) => {
+        Word::StringInterpolation(interp, translated) => {
             if let Some(part) = pure_part(interp) {
                 // Un-joined: `for x in "${!map[@]}"` iterates each element.
-                return part_ir_flat(part);
+                let ir = part_ir_flat(part);
+                return if translated.is_some() {
+                    call("translate", vec![ir])
+                } else {
+                    ir
+                };
             }
             word_ir(w)
         }
@@ -8403,7 +9508,24 @@ fn arith_has_poison(a: &ArithAst) -> bool {
 /// assignments, `let`/`(( ))` statements, array keys) lowers the WHOLE
 /// expression through this wrapper so the depth reflects the root's
 /// poison-ness for every nested div/mod.
+///
+/// The i53-escalation / `--true64` leaf wrap also happens HERE at the
+/// top level: the pre-pass [`wrap_true64_arith`] only reaches top-level
+/// Assign/Expr trees — an Arith nested in an interpolation, an exec arg
+/// or a test string (the `$((...))` inside `echo "$((x+1))"`) renders
+/// through this entry and gets its Int64 leaves wrapped on the spot (a
+/// mixed BigInt/Number binary op would THROW). Trees that already carry
+/// a Cast (pre-wrapped, C-frontend-typed) skip the re-wrap (idempotent
+/// emission).
 fn arith_to_estree_wrapped(a: &ArithAst) -> Expr {
+    if *ARITH_WRAP_DEPTH.lock().unwrap() == 0 && arith_mentions_true64(a) && !arith_has_cast(a) {
+        let mut c = a.clone();
+        wrap_true64_arith_ast(&mut c);
+        *ARITH_WRAP_DEPTH.lock().unwrap() += 1;
+        let out = arith_to_estree(&c);
+        *ARITH_WRAP_DEPTH.lock().unwrap() -= 1;
+        return out;
+    }
     if arith_has_poison(a) {
         *ARITH_POISON_DEPTH.lock().unwrap() += 1;
         let out = arith_to_estree(a);
@@ -8411,6 +9533,24 @@ fn arith_to_estree_wrapped(a: &ArithAst) -> Expr {
         out
     } else {
         arith_to_estree(a)
+    }
+}
+
+/// Does an ArithAst already carry an Int64/UInt64 cast (pre-wrapped by
+/// [`wrap_true64_arith`], or C-frontend-typed)? Re-wrapping would nest
+/// redundant `BigInt.asIntN(64, BigInt(...))` layers.
+fn arith_has_cast(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Cast { ty, .. } => matches!(ty, IrType::Int64 | IrType::UInt64),
+        ArithAst::Bin { lhs, rhs, .. } => arith_has_cast(lhs) || arith_has_cast(rhs),
+        ArithAst::Un { arg, .. } => arith_has_cast(arg),
+        ArithAst::Cond {
+            test, then, else_, ..
+        } => arith_has_cast(test) || arith_has_cast(then) || arith_has_cast(else_),
+        ArithAst::Assign { rhs, .. } => arith_has_cast(rhs),
+        ArithAst::IncDec { .. } => false,
+        ArithAst::Index { key, .. } => arith_has_cast(key),
+        _ => false,
     }
 }
 
@@ -8450,6 +9590,34 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
         // (see arith_lowerable).
         ArithAst::Assign { var, op, rhs } => {
             let rhs_e = arith_to_estree(rhs);
+            // `--true64` slot target: the native int64 element IS the
+            // home — write the new value straight to the slot (the
+            // store-write + read-back seq below would read the slot
+            // BEFORE the enclosing `__t64[k] = …` write — a stale
+            // no-op that never advances the accumulator). The JS
+            // assignment's value is the new element value, so the
+            // expression-position semantics (bash: the assignment's
+            // value is the RHS) hold too.
+            if let Some(k) = slot_var_index(var) {
+                let cur = slot_read(k);
+                let bin = |op: &'static str, l: Expr, r: Expr| Expr::BinaryExpression {
+                    operator: op.to_string(),
+                    left: Box::new(l),
+                    right: Box::new(r),
+                };
+                let new_val = match op.as_str() {
+                    "=" => rhs_e,
+                    "+=" => bin("+", cur, rhs_e.clone()),
+                    "-=" => bin("-", cur, rhs_e.clone()),
+                    "*=" => bin("*", cur, rhs_e.clone()),
+                    _ => unreachable!("parse_arith only emits = += -= *="),
+                };
+                return Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(slot_read(k)),
+                    right: Box::new(new_val),
+                };
+            }
             if is_lifted_num(var) {
                 return Expr::AssignmentExpression {
                     operator: op.to_string(),
@@ -8540,10 +9708,20 @@ fn arith_to_estree(a: &ArithAst) -> Expr {
                 };
             }
             let cur = arith_var_read(var);
-            let int1 = || Expr::Literal {
-                value: serde_json::Value::from(1),
-                raw: None,
-                regex: None,
+            // i53 escalation / `--true64` BigInt home: the ±1 delta must
+            // be a BigInt literal — `BigInt(x) + 1` mixes types and
+            // throws (the cstyle-for step / `((i++))` on an escalated
+            // var; core request zsh-sh-go-20260814-134501).
+            let int1 = || {
+                if true64_int_var(var) {
+                    bigint_lit_expr(1)
+                } else {
+                    Expr::Literal {
+                        value: serde_json::Value::from(1),
+                        raw: None,
+                        regex: None,
+                    }
+                }
             };
             let new_val = Expr::BinaryExpression {
                 operator: if *delta > 0 {
@@ -8894,6 +10072,21 @@ fn collect_true64_divisors(a: &ArithAst, out: &mut Vec<ArithAst>) {
 /// A `memLoad` read from a 64-bit-elem heap pointer (the C frontend passes
 /// the element C type name as the third arg): the value is a store string
 /// — `parseInt` would round it past 2^53, so printf renders it directly.
+/// Is an IrExpr's RENDERED value a BigInt (so a `parseInt(...)` coercion
+/// would throw and Number(...) would round)? C-frontend i64 arith casts,
+/// 64-bit-elem memLoad reads, and the i53 escalation's Int64-typed var
+/// reads (a lifted binding or a store getVar — both render BigInt in
+/// arith contexts).
+fn ir_arg_is_bigint(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Arith(a) => arith_is_bigint(a) || arith_mentions_true64(a),
+        IrExpr::Call { func, args } if func == "getVar" => {
+            matches!(args.as_slice(), [IrExpr::Str(n, _)] if var_type_of(n) == Some(IrType::Int64))
+        }
+        _ => mem_load_is_64(e),
+    }
+}
+
 fn mem_load_is_64(e: &IrExpr) -> bool {
     if let IrExpr::Call { func, args } = e {
         if func == "memLoad" && args.len() >= 3 {
@@ -10085,13 +11278,22 @@ fn mktemp_native_enabled() -> bool {
 /// STRING bash stores (positional reads via the native `sh2.positional`
 /// access — the exact value the runtime's expandWord yields).
 fn decl_source_to_estree(name: &str, src: &IrExpr) -> Expr {
+    // i53 escalation / `--true64`: an Int64 target homes the EXACT
+    // literal (a Number literal would round past 2^53)
+    let int64 = var_type_of(name) == Some(IrType::Int64);
     match src {
+        IrExpr::Int(i) if int64 => bigint_lit_expr(*i),
         IrExpr::Str(sv, _) => {
             if is_lifted_num(name) {
-                Expr::Literal {
-                    value: serde_json::Value::from(sv.trim().parse::<i64>().unwrap_or(0)),
-                    raw: None,
-                    regex: None,
+                let n = sv.trim().parse::<i64>().unwrap_or(0);
+                if int64 {
+                    bigint_lit_expr(n)
+                } else {
+                    Expr::Literal {
+                        value: serde_json::Value::from(n),
+                        raw: None,
+                        regex: None,
+                    }
                 }
             } else {
                 str_lit(sv)
@@ -10835,6 +12037,30 @@ fn bc_exact_enabled() -> bool {
     std::env::var("SH2_BC_NATIVE").map_or(false, |v| v == "exact")
 }
 
+/// SH2_ASSUME_I53=0 — turn off the i53 BigInt escalation (Task 1).
+///
+/// Documented assumption (default ON): bash arithmetic is 64-bit
+/// wrapped; JS `Number` is exact only to ±2^53 — `x=9007199254740993;
+/// echo $((x+1))` prints 9007199254740992 under the plain Number
+/// lowering (the literal rounds). The range analysis (Task 1) PROVES a
+/// var's final value interval; a var proven outside ±2^53 homes as BigInt
+/// (the `--true64` non-slot Int64 machinery — exact literals via
+/// `BigInt("...")`, pure-BigInt arithmetic, `BigInt.asIntN(64, …)`
+/// wraps on assignment). The ASSUMPTION: every var the analysis CANNOT
+/// prove out of ±2^53 stays within it at runtime — so the Number
+/// lowering stays exact for them (unproven-provenance vars — reads,
+/// captures, unset strings — stay Numbers, and the escalation only
+/// admits vars whose every write is a proven-integer write, so the
+/// BigInt home never sees a non-integer: `BigInt("")` would throw where
+/// `Number("")||0` coerces to 0). A script that feeds a >2^53 value
+/// through an UNPROVEN path (a read, a capture) diverges — set
+/// SH2_ASSUME_I53=0 for the old Number-everything emission, or run
+/// `--true64` (the conservative mode: every unproven numeric var homes
+/// as BigInt) for full 64-bit fidelity.
+fn i53_escalation_enabled() -> bool {
+    std::env::var("SH2_ASSUME_I53").map_or(true, |v| v != "0")
+}
+
 fn mark_store_refs(s: &str, out: &mut HashSet<String>) {
     fn is_ident(s: &str) -> bool {
         let mut cs = s.chars();
@@ -11025,7 +12251,14 @@ fn mark_store_refs(s: &str, out: &mut HashSet<String>) {
 fn arith_has_div_mod(a: &ArithAst) -> bool {
     match a {
         ArithAst::Bin { op, lhs, rhs } => {
-            *op == "/" || *op == "%" || arith_has_div_mod(lhs) || arith_has_div_mod(rhs)
+            // Only a div/mod whose divisor could be ZERO aborts the
+            // expansion — a provably-nonzero divisor (a nonzero numeric
+            // literal, optionally sign-flipped) emits the plain native
+            // operation (see arith_to_estree's Bin arm), so its
+            // arithEval wrapper is dead weight and does not count.
+            ((*op == "/" || *op == "%") && !arith_is_nonzero(rhs))
+                || arith_has_div_mod(lhs)
+                || arith_has_div_mod(rhs)
         }
         ArithAst::Un { arg, .. } => arith_has_div_mod(arg),
         ArithAst::Cond {
@@ -12289,11 +13522,18 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // BigInt values (Int64, the C-path lowering). The analysis runs on
     // the ORIGINAL arith shapes (the RMW detection needs the unwrapped
     // trees); the wrap below then rewrites the leaves on the clone.
-    let (true64_int, true64_slots) = if true64_enabled() {
+    let (mut true64_int, true64_slots) = if true64_enabled() {
         analyze_true64(prog)
     } else {
         (HashSet::new(), HashMap::new())
     };
+    // i53 escalation (Task 1 — SH2_ASSUME_I53, default ON): range-PROVEN
+    // out-of-±2^53 vars home as BigInt (Int64) even without `--true64`.
+    // Optimistic: unproven vars stay Numbers. Under `--true64` the
+    // conservative set already covers them (the union is a no-op).
+    if i53_escalation_enabled() {
+        true64_int.extend(analyze_big_i53(prog));
+    }
     *TRUE64_INT.lock().unwrap() = Some(true64_int.clone());
     *TRUE64_SLOTS.lock().unwrap() = Some(true64_slots.clone());
     // StoreToNative (core request shir-passes-store-to-native-20260806):
@@ -12313,10 +13553,12 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
             &crate::shir_passes::PassContext::default(),
         );
     }
-    // `--true64` leaf wrapping: Num leaves -> Cast(Int64, Num) (exact
-    // BigInt("N")), non-slot Var leaves -> Cast(Int64, Var); slot reads
-    // stay RAW (the native int64 element fast path).
-    if true64_enabled() {
+    // Int64 leaf wrapping (the `--true64` machinery, now also the i53
+    // escalation's): Num leaves -> Cast(Int64, Num) (exact BigInt("N")),
+    // non-slot Var leaves -> Cast(Int64, Var); slot reads stay RAW (the
+    // native int64 element fast path). Nested arith (interpolations,
+    // exec args) is wrapped at RENDER time by [`arith_to_estree_wrapped`].
+    if true64_enabled() || i53_escalation_enabled() {
         wrap_true64_arith(&mut store_to_native);
     }
     let prog = &store_to_native;
@@ -12482,16 +13724,26 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // requires a deterministic order (JS let decls are order-independent,
     // so sorting is behavior-neutral).
     for name in sorted_set(&LIFTED_NUMERIC) {
+        // i53 escalation / `--true64`: an Int64 home declares the
+        // binding as BigInt (the exact 0 — Number 0 would round a
+        // BigInt read only past 2^53, but the binding's TYPE must stay
+        // consistent with every write: mixed BigInt/Number arithmetic
+        // throws)
+        let init = if var_type_of(&name) == Some(IrType::Int64) {
+            bigint_lit_expr(0)
+        } else {
+            Expr::Literal {
+                value: serde_json::Value::from(0),
+                raw: None,
+                regex: None,
+            }
+        };
         body.push(Stmt::VariableDeclaration {
             kind: "let",
             declarations: vec![VariableDeclarator {
                 type_: "VariableDeclarator",
                 id: Expr::Identifier { name: name.clone() },
-                init: Some(Expr::Literal {
-                    value: serde_json::Value::from(0),
-                    raw: None,
-                    regex: None,
-                }),
+                init: Some(init),
             }],
         });
     }
@@ -12729,8 +13981,27 @@ fn call_is_always_true(e: &Expr) -> bool {
     }
 }
 
+/// The compile pipeline's estree entry: shir_to_estree + the control-flow
+/// legality pass + the moved JS-side head passes (estree.rs
+/// compile_head_passes — the first four estreeToJsMapped passes). The
+/// JS side continues at pass #5 (awaitAsyncDirectCalls) — see
+/// PLAN-wasm-estree-pipeline.md (a prefix is the only order-preserving
+/// composition).
+pub fn shir_to_estree_compiled(prog: &IrProgram) -> Program {
+    let estree = crate::estree::fix_control_flow(shir_to_estree(prog));
+    crate::estree::compile_head_passes(estree)
+}
+
 pub fn shir_to_estree_json(prog: &IrProgram) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&shir_to_estree(prog))
+    // the A1-ingress twin of estree.rs ast_to_estree_json: the control-flow
+    // legality pass applies to frontend-emitted IR too — a bare `return`
+    // inside an sh2.*Loop body arrow exits the callback, not the function,
+    // and the loop spins forever (the bat shift-loop t51 exposed it; bash's
+    // own `if c; then return; fi` inside a loop had the same latent bug on
+    // the A1 path). The pass's return-conversion is now keyed on LOOP-BODY
+    // arrows only (the in_loop flag), so frontend VALUE-returning arrows
+    // (zig `__fn_f`, the py ArrayComp IIFE, C fnValue) keep native returns.
+    Ok(crate::estree::estree_to_json(&fix_control_flow(shir_to_estree(prog))))
 }
 
 /// Classification of a case-pattern string for the native lowering.
@@ -13148,6 +14419,12 @@ fn try_native_case(discriminant: &IrExpr, clauses: &[IrCaseClause], nocase: bool
     // (one exec per case evaluation, exactly the runtime's per-evaluation
     // globMatch); the exec runs on the SAME coerced value string the
     // length compare uses, so that const is declared once too.
+    // The map keeps RandomState (the std per-process seed — a
+    // deliberate hash-flooding defence; the keys are script patterns).
+    // Iteration order is NOT used for the emitted code: the `$g{i}`
+    // const declarations are emitted sorted below so the transpiled
+    // OUTPUT is deterministic run-to-run (corpus pins, caches and the
+    // dead-decl pass all assume stable output).
     let glob_temps: HashMap<String, String> = pats
         .iter()
         .flatten()
@@ -13168,9 +14445,13 @@ fn try_native_case(discriminant: &IrExpr, clauses: &[IrCaseClause], nocase: bool
             init: Some(value_expr(CASE_TMP)),
         }],
     });
-    let glob_decls: Vec<Stmt> = glob_temps
-        .iter()
-        .map(|(re, temp)| Stmt::VariableDeclaration {
+    let mut glob_keys: Vec<&String> = glob_temps.keys().collect();
+    glob_keys.sort(); // deterministic output order (never the HashMap's)
+    let glob_decls: Vec<Stmt> = glob_keys
+        .into_iter()
+        .map(|re| {
+            let temp = glob_temps.get(re).expect("glob temp precomputed");
+            Stmt::VariableDeclaration {
             kind: "const",
             declarations: vec![VariableDeclarator {
                 type_: "VariableDeclarator",
@@ -13190,6 +14471,7 @@ fn try_native_case(discriminant: &IrExpr, clauses: &[IrCaseClause], nocase: bool
                     optional: false,
                 }),
             }],
+            }
         })
         .collect();
     let pat_test = |pat: &CasePat| -> Expr {
@@ -14257,10 +15539,13 @@ fn lowered_stmts_have_signals(stmts: &[Stmt]) -> bool {
             Stmt::SwitchStatement { cases, .. } => cases
                 .iter()
                 .any(|c| c.consequent.iter().any(|x| stmt_has_signal(x, true))),
-            Stmt::WhileStatement { body, .. } | Stmt::ForOfStatement { body, .. } => {
-                stmt_has_signal(body, false)
-            }
+            Stmt::WhileStatement { body, .. }
+            | Stmt::DoWhileStatement { body, .. }
+            | Stmt::ForOfStatement { body, .. } => stmt_has_signal(body, false),
             Stmt::ForStatement { body, .. } => stmt_has_signal(body, false),
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                params.iter().any(expr_has_signal) || stmt_has_signal(body, false)
+            }
             Stmt::VariableDeclaration { declarations, .. } => declarations
                 .iter()
                 .any(|d| d.init.as_ref().map(expr_has_signal).unwrap_or(false)),
@@ -14416,6 +15701,21 @@ fn range_items_array(lo: i64, hi: i64) -> IrExpr {
 /// `let` shadows the module `let i = 0` (numeric lift) exactly like the
 /// for-of binding.
 fn native_range_for(js_var: String, lo: i64, hi: i64, body: Vec<Stmt>) -> Stmt {
+    // i53 escalation: an Int64 loop var (a provably out-of-±2^53 range)
+    // homes the exact BigInt literals — the rounded Number would break
+    // the counter, the comparison and the String() of the final value
+    let int64 = var_type_of(&js_var) == Some(IrType::Int64);
+    let lit = |v: i64| {
+        if int64 {
+            bigint_lit_expr(v)
+        } else {
+            Expr::Literal {
+                value: serde_json::Value::from(v),
+                raw: None,
+                regex: None,
+            }
+        }
+    };
     Stmt::ForStatement {
         init: Box::new(Stmt::VariableDeclaration {
             kind: "let",
@@ -14424,11 +15724,7 @@ fn native_range_for(js_var: String, lo: i64, hi: i64, body: Vec<Stmt>) -> Stmt {
                 id: Expr::Identifier {
                     name: js_var.clone(),
                 },
-                init: Some(Expr::Literal {
-                    value: serde_json::Value::from(lo),
-                    raw: None,
-                    regex: None,
-                }),
+                init: Some(lit(lo)),
             }],
         }),
         test: Expr::BinaryExpression {
@@ -14436,11 +15732,7 @@ fn native_range_for(js_var: String, lo: i64, hi: i64, body: Vec<Stmt>) -> Stmt {
             left: Box::new(Expr::Identifier {
                 name: js_var.clone(),
             }),
-            right: Box::new(Expr::Literal {
-                value: serde_json::Value::from(hi),
-                raw: None,
-                regex: None,
-            }),
+            right: Box::new(lit(hi)),
         },
         update: Expr::UnaryExpression {
             operator: "++".to_string(),
@@ -14899,16 +16191,33 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             inner
                         }
                     }
-                    IrExpr::Int(i) => Expr::Literal {
-                        value: serde_json::Value::from(*i),
-                        raw: None,
-                        regex: None,
-                    },
-                    IrExpr::Str(sv, _) if is_lifted_num(&target.var) => Expr::Literal {
-                        value: serde_json::Value::from(sv.trim().parse::<i64>().unwrap_or(0)),
-                        raw: None,
-                        regex: None,
-                    },
+                    IrExpr::Int(i) => {
+                        // i53 escalation / `--true64`: an Int64 target
+                        // homes the EXACT literal — a Number literal would
+                        // round past 2^53 (the Task 1 bug:
+                        // x=9007199254740993 → 9007199254740992)
+                        if var_type_of(&target.var) == Some(IrType::Int64) {
+                            bigint_lit_expr(*i)
+                        } else {
+                            Expr::Literal {
+                                value: serde_json::Value::from(*i),
+                                raw: None,
+                                regex: None,
+                            }
+                        }
+                    }
+                    IrExpr::Str(sv, _) if is_lifted_num(&target.var) => {
+                        let n = sv.trim().parse::<i64>().unwrap_or(0);
+                        if var_type_of(&target.var) == Some(IrType::Int64) {
+                            bigint_lit_expr(n)
+                        } else {
+                            Expr::Literal {
+                                value: serde_json::Value::from(n),
+                                raw: None,
+                                regex: None,
+                            }
+                        }
+                    }
                     // string-lifted source
                     IrExpr::Str(sv, _) => Expr::Literal {
                         value: serde_json::Value::String(sv.clone()),
@@ -14935,6 +16244,15 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         expr_to_estree(&IrExpr::Call {
                             func: func.clone(),
                             args: args.clone(),
+                        })
+                    }
+                    // the first-class Capture node (core request
+                    // zsh-sh-go-20260814-230503) — same runtime lowering
+                    // as the legacy call form above.
+                    IrExpr::Capture { expr, .. } => {
+                        expr_to_estree(&IrExpr::Call {
+                            func: "capture".to_string(),
+                            args: vec![expr.as_ref().clone()],
                         })
                     }
                     // the for-loop numeric coercion (`i = Number(i)`)
@@ -15004,7 +16322,21 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     // call-free RHS). String()-wrap only non-string RHS
                     // (native arith numbers) — the store must stay
                     // string-typed (the runtime String()s every value).
-                    let ve = expr_to_estree(expr);
+                    let ve = match expr {
+                        // i53 escalation: an Int64 store target keeps the
+                        // EXACT digits — a Number literal would round past
+                        // 2^53 before String() sees it
+                        IrExpr::Int(i) if var_type_of(&target.var) == Some(IrType::Int64) => {
+                            bigint_lit_expr(*i)
+                        }
+                        IrExpr::Str(sv, _)
+                            if var_type_of(&target.var) == Some(IrType::Int64)
+                                && sv.trim().parse::<i64>().is_ok() =>
+                        {
+                            bigint_lit_expr(sv.trim().parse::<i64>().unwrap_or(0))
+                        }
+                        _ => expr_to_estree(expr),
+                    };
                     // `i=$((i+2))` / `((i=5))` / cstyle init/step with a
                     // STORE-BOUND target: the arith-assign expr lowers to
                     // `(sh2.setVar(n, String(v)), <read-back>)` — the inner
@@ -15651,6 +16983,43 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 ),
             }
         }
+        IrStmt::DoWhile { body, cond, until } => {
+            // The A1 contract's post-test loop (core request
+            // c-sh-go-20260814-111815): `do { body } while (test)` — the
+            // body runs at least once, THEN the condition is re-checked
+            // (the While arm's pre-test shape). The c-sh-go frontend
+            // emits this for C `do-while`; `until` (the contract's
+            // repeat-until form) negates the test, mirroring
+            // js_backend.rs's `until → while (!(cond))` lowering. The
+            // cond rendering is the While arm's (a test-string Call →
+            // native/runtime test). Native do-while: the body provably
+            // runs at least once, so no `ran`-flag / runtime-loop
+            // machinery is needed.
+            let cond_e = {
+                if test_cond_write_is_dead(stmt) {
+                    *TEST_UNSTATUSED_DEPTH.lock().unwrap() += 1;
+                    let c = expr_to_estree(cond);
+                    *TEST_UNSTATUSED_DEPTH.lock().unwrap() -= 1;
+                    c
+                } else {
+                    expr_to_estree(cond)
+                }
+            };
+            let test = if *until {
+                Expr::UnaryExpression {
+                    operator: "!".to_string(),
+                    argument: Box::new(cond_e),
+                    prefix: true,
+                }
+            } else {
+                cond_e
+            };
+            let body_stmts: Vec<Stmt> = body.iter().filter_map(stmt_to_estree).collect();
+            Stmt::DoWhileStatement {
+                test,
+                body: Box::new(Stmt::BlockStatement { body: body_stmts }),
+            }
+        }
         IrStmt::For { var, iter, body } => {
             let js_var = safe_ident(var);
             // The `seq_range_for` transform's native-range iterable (a
@@ -16283,9 +17652,15 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             expression: sh2_call(
                 "background",
                 vec![if native_echo_sink_site(stmts) {
-                    arrow_native_echo(vec![], IrExpr::Arrow(stmts.clone()))
+                    arrow_native_echo(
+                        vec![Expr::Identifier { name: "sh2".to_string() }],
+                        IrExpr::Arrow(stmts.clone()),
+                    )
                 } else {
-                    arrow_sink(vec![], IrExpr::Arrow(stmts.clone()))
+                    arrow_sink(
+                        vec![Expr::Identifier { name: "sh2".to_string() }],
+                        IrExpr::Arrow(stmts.clone()),
+                    )
                 }],
             ),
         },
@@ -16889,6 +18264,62 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 },
             }),
         },
+        // A1 `Pipeline` statement (contract node; core request
+        // py-sh-go-20260814-164552): render the stages as arrows EXACTLY
+        // the way the expression-form `$(a | b)` / the bash corpus's
+        // statement-level `Call("pipeline", [Array([Arrow, …])])` lower —
+        // construct the expression-form call and route it through
+        // `expr_to_estree`, so the native folds (echo|bc /
+        // echo|head|tail|wc / tr / grep / cut / the echo-stage string
+        // collapse), the ECHO_SINK_DEPTH discipline and the *Sync-twin
+        // verdict (`expr_has_await` + `sync_arrow_flip_deep`) apply
+        // identically. The runtime `pipeline`/`pipelineSync` helpers
+        // (harness/sh2-namespace.mjs) run each stage with fd 0 = the
+        // previous stage's captured output, write non-last stages into a
+        // capture buffer and the LAST stage through the current fd-1
+        // sink, record PIPESTATUS, and restore `fdTargets` in a finally
+        // — so the statement is self-contained (the expression form is
+        // already awaited when any stage awaits; the await-free form is
+        // the sync twin).
+        IrStmt::Pipeline { stages, capture, .. } => {
+            let pipeline_call = IrExpr::Call {
+                func: "pipeline".to_string(),
+                args: vec![IrExpr::Array(
+                    stages
+                        .iter()
+                        .map(|s| IrExpr::Arrow(s.clone()))
+                        .collect(),
+                )],
+            };
+            match capture {
+                // Side-effect pipeline (`capture: null`): the last
+                // stage's output lands on the current fd-1 sink (module
+                // stdout at top level).
+                None => Stmt::ExpressionStatement {
+                    expression: expr_to_estree(&pipeline_call),
+                },
+                // Capture pipeline (`capture: "var"`): the pipeline's
+                // output is captured with the same machinery the `$(a |
+                // b)` command-substitution form uses (the capture wraps
+                // the pipeline call; the runtime strips trailing
+                // newlines, the command-substitution convention) and
+                // stored in var via the store.
+                Some(var) => Stmt::ExpressionStatement {
+                    expression: sh2_call(
+                        "setVar",
+                        vec![
+                            str_lit(var),
+                            expr_to_estree(&IrExpr::Call {
+                                func: "capture".to_string(),
+                                args: vec![IrExpr::Arrow(vec![IrStmt::Expr(
+                                    pipeline_call,
+                                )])],
+                            }),
+                        ],
+                    ),
+                },
+            }
+        }
         other => unreachable!("Perl-only IR statement reached the ESTree renderer: {other:?}"),
     })
 }
@@ -17221,6 +18652,18 @@ fn exec_arg_is_array_valued(e: &IrExpr) -> bool {
                 Some(k) if k == "@" || k == "*"
             ),
             "param" => {
+                // zsh `${(flags)var}` — `param("", name, flags[, sep])` (the
+                // ZshFlags operator, core request zsh-sh-go-20260815-000728):
+                // the f/s/k flags return ARRAYS; a scalar result splices as
+                // one element, so the bare call is faithful for both — the
+                // runtime's arg flattener handles it exactly like the slice
+                // forms. (The QUOTED whole-word form arrives as
+                // `join(param(...))` via part_ir and stays a scalar.)
+                if matches!(args.first().and_then(static_str), Some(op) if op == "")
+                    && args.len() >= 3
+                {
+                    return true;
+                }
                 matches!(args.first().and_then(static_str), Some(op) if op == "slice")
                     && (matches!(args.get(1).and_then(static_str), Some(n) if n == "@")
                         || (matches!(
@@ -20101,11 +21544,10 @@ fn try_native_printf(args: &[IrExpr]) -> Option<Expr> {
                     // template stringifies the BigInt exactly). Same for
                     // memLoad reads from 64-bit-elem heap pointers: the
                     // value is a store string — parseInt would round it
-                    // past 2^53.
-                    arg_is_bigint.push(
-                        matches!(other, IrExpr::Arith(a) if arith_is_bigint(a))
-                            || mem_load_is_64(other),
-                    );
+                    // past 2^53. The i53 escalation's Int64 vars read as
+                    // BigInt too (getVar-of-Int64, or an arith mentioning
+                    // one).
+                    arg_is_bigint.push(ir_arg_is_bigint(other));
                 }
             }
         }
@@ -24367,12 +25809,14 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                 // arith semantics — the test sees a number, never NaN).
                 if let Some(inner) = e.strip_prefix("$((").and_then(|x| x.strip_suffix("))")) {
                     let mut a = parse_arith(inner)?;
-                    // `--true64`: a test operand touching a slot/Int64 var
-                    // must render pure BigInt arithmetic (mixed ops throw).
-                    let bigint = true64_enabled() && arith_mentions_true64(&a);
+                    // `--true64` / i53 escalation: a test operand touching
+                    // a slot/Int64 var must render pure BigInt arithmetic
+                    // (mixed ops throw).
+                    let bigint = (true64_enabled() || i53_escalation_enabled())
+                        && arith_mentions_true64(&a);
                     wrap_true64_arith_ast(&mut a);
                     let rendered = arith_to_estree_wrapped(&a);
-                    if true64_enabled() && arith_has_div_mod(&a) {
+                    if (true64_enabled() || i53_escalation_enabled()) && arith_has_div_mod(&a) {
                         // BigInt % 0 throws (Number % 0 -> NaN); bash
                         // ABORTS the expansion on a zero divisor (empty ->
                         // test false). Guard each divisor: `(d ===
@@ -24413,24 +25857,35 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                     // the runtime's intVal semantics). Reading the bare
                     // binding is EXACTLY the value the runtime's test
                     // would see with the value inlined (lifted vars are
-                    // not in the store — a getVar would read '').
+                    // not in the store — a getVar would read ''). An
+                    // Int64 (BigInt) home marks the operand big — the
+                    // equality arms then compare BigInt-to-BigInt exactly
+                    // (Number(BigInt) would round past 2^53).
                     return Some((
                         Expr::Identifier {
                             name: bare.to_string(),
                         },
                         !is_lifted_num(bare),
-                        false,
+                        var_type_of(bare) == Some(IrType::Int64),
                     ));
                 }
                 if let Ok(v) = e.parse::<i64>() {
+                    // a literal past ±2^53 cannot be a JS Number (it
+                    // would round) — exact BigInt literal, marked big
+                    let vi = v as i128;
+                    let big = vi < -(SAFE_NUMBER) || vi > SAFE_NUMBER;
                     return Some((
-                        Expr::Literal {
-                            value: serde_json::Value::from(v),
-                            raw: None,
-                            regex: None,
+                        if big {
+                            bigint_lit_expr(v)
+                        } else {
+                            Expr::Literal {
+                                value: serde_json::Value::from(v),
+                                raw: None,
+                                regex: None,
+                            }
                         },
                         false,
-                        false,
+                        big,
                     ));
                 }
                 // `$?` / `$#` / `$$` are the runtime's own numeric state
@@ -24457,23 +25912,21 @@ fn try_native_test_unstatused(s: &str) -> Option<Expr> {
                 continue;
             };
             if !l_risky && !r_risky {
-                // `--true64` BigInt operands: `0n === 0` is FALSE (strict
-                // equality does not coerce BigInt/Number) — equality ops
-                // wrap the BigInt operand in Number() (exact: Number of a
-                // nonzero BigInt is never 0). Relational ops keep the raw
-                // BigInt (exact — BigInt vs Number comparisons are legal).
+                // BigInt/Number strict equality does not coerce: a
+                // one-sided BigInt operand wraps the NUMBER side in
+                // BigInt() (exact — BigInt of a small Number is exact,
+                // where Number of a BIG BigInt would round); when BOTH
+                // sides are big the raw `===` is exact BigInt-vs-BigInt.
                 let eq = js == "===" || js == "!==";
-                let numof = |e: Expr| -> Expr {
-                    Expr::CallExpression {
-                        callee: Box::new(Expr::Identifier {
-                            name: "Number".to_string(),
-                        }),
-                        arguments: vec![e],
-                        optional: false,
-                    }
+                let bigof = |e: Expr| Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier {
+                        name: "BigInt".to_string(),
+                    }),
+                    arguments: vec![e],
+                    optional: false,
                 };
-                let l = if eq && l_big { numof(l) } else { l };
-                let r = if eq && r_big { numof(r) } else { r };
+                let l = if eq && !l_big && r_big { bigof(l) } else { l };
+                let r = if eq && l_big && !r_big { bigof(r) } else { r };
                 return Some(Expr::BinaryExpression {
                     operator: js.to_string(),
                     left: Box::new(l),
@@ -25715,6 +27168,14 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     let [IrExpr::Str(op, _), IrExpr::Str(name, _), ..] = args else {
         return None;
     };
+    // zsh `${(flags)var}` / `${(flag:sep:)var}` — the flag/separator
+    // ride the extra args (core requests zsh-sh-go-20260814-183409 /
+    // 193615 + re-filings 20260815-000728 / 001515): the native getVar
+    // read below would DROP them, so the runtime param dispatch (the
+    // runner's zshParamFlags) must handle the shape.
+    if op.is_empty() && args.len() > 2 {
+        return None;
+    }
     // Value source: a LIFTED binding (bare identifier — the runtime cannot
     // read it from the store), a POSITIONAL ($0/$1..$9/$@/$*/$# — a direct
     // read of the runtime's positional state, the exact value its getVar
@@ -27824,6 +29285,10 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
                 IrExpr::Call { func, args } if func == "capture" => {
                     matches!(args.as_slice(), [IrExpr::Arrow(_)])
                 }
+                // the first-class Capture node (core request
+                // zsh-sh-go-20260814-230503) — same string verdict as the
+                // legacy call form above.
+                IrExpr::Capture { expr, .. } => matches!(expr.as_ref(), IrExpr::Arrow(_)),
                 _ => false,
             });
             if all_string {
@@ -30313,7 +31778,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                     if matches!(v, IrExpr::Call { func: f, args: a }
                         if f == "param"
                             && matches!(a.as_slice(),
-                                [IrExpr::Str(op, _), ..] if op != "slice"))
+                                [IrExpr::Str(op, _), ..]
+                                // the zsh `${(flags)var}` form (ZshFlags —
+                                // op "", flags at args[2..], core request
+                                // zsh-sh-go-20260815-000728) CAN return an
+                                // array (f/s/k), unlike every other
+                                // non-slice op: its join must stay a
+                                // runtime call (array → space-join, scalar
+                                // → identity).
+                                if op != "slice" && !(op == "" && a.len() >= 3)))
                     {
                         return ve;
                     }
@@ -30370,6 +31843,15 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
                                 return native;
                             }
                         } else if let Some(native) = try_native_test(sv) {
+                            return native;
+                        }
+                    } else if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+                        // Inside `&&`/`||` BUT the whole chain's status is
+                        // provably unread (a pure test-chain if/while
+                        // guard — compute_test_cond_deadness): the
+                        // operands stay UNSTATUSED and the chain emits
+                        // plain JS `&&`/`||` (native_and_or_unstatused).
+                        if let Some(native) = try_native_test_unstatused(sv) {
                             return native;
                         }
                     } else if let Some(native) = try_native_test(sv) {
@@ -30536,25 +32018,39 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // builtins — keep the pipeline then (the runtime dispatches
             // to the function).
             if func == "pipeline" {
-                if !program_defines_function("echo") && !program_defines_function("bc") {
-                    if let Some(native) = try_native_echo_bc_stmt(e) {
-                        return native;
+                // BOTH folds emit a DIRECT `process.stdout.write` of the
+                // folded text — the module's DEFAULT stdout sink only.
+                // The ECHO_SINK_DEPTH gate (the same discipline every
+                // native-echo lowering follows) is REQUIRED: inside a
+                // capture arrow the fd-1 target is a capture buffer, and
+                // a direct write would LEAK the folded output to the real
+                // stdout (the posix-sh-go t03_pipeline divergence —
+                // `x=$(echo one; echo two | wc -l)` printed the `1`
+                // before `x=one`, the pipeline's output bypassing the
+                // capture). When the depth is > 0 the pipeline stays on
+                // the runtime path (pipeline/pipelineSync write the last
+                // stage through the CURRENT fd-1 target).
+                if *ECHO_SINK_DEPTH.lock().unwrap() == 0 {
+                    if !program_defines_function("echo") && !program_defines_function("bc") {
+                        if let Some(native) = try_native_echo_bc_stmt(e) {
+                            return native;
+                        }
                     }
-                }
-                // `echo ARGS | head -N` / `printf FMT | head -N` / `... |
-                // tail -N` / `... | wc FLAGS` — a static producer feeding
-                // a static consumer: the whole pipeline folds to a native
-                // stdout write (see try_native_echo_pipe_stmt) — no
-                // pipeline machinery, no builtin dispatch. Script-defined
-                // functions shadow the builtins — keep the pipeline then.
-                if !program_defines_function("echo")
-                    && !program_defines_function("printf")
-                    && !program_defines_function("head")
-                    && !program_defines_function("tail")
-                    && !program_defines_function("wc")
-                {
-                    if let Some(native) = try_native_echo_pipe_stmt(e) {
-                        return native;
+                    // `echo ARGS | head -N` / `printf FMT | head -N` / `... |
+                    // tail -N` / `... | wc FLAGS` — a static producer feeding
+                    // a static consumer: the whole pipeline folds to a native
+                    // stdout write (see try_native_echo_pipe_stmt) — no
+                    // pipeline machinery, no builtin dispatch. Script-defined
+                    // functions shadow the builtins — keep the pipeline then.
+                    if !program_defines_function("echo")
+                        && !program_defines_function("printf")
+                        && !program_defines_function("head")
+                        && !program_defines_function("tail")
+                        && !program_defines_function("wc")
+                    {
+                        if let Some(native) = try_native_echo_pipe_stmt(e) {
+                            return native;
+                        }
                     }
                 }
             }
@@ -31298,7 +32794,16 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             let l = expr_to_estree(lhs);
             let r = expr_to_estree(rhs);
             *AND_OR_DEPTH.lock().unwrap() -= 1;
-            native_and_or(BinOpKind::And, l, r)
+            // A test-CHAIN in a dead-status condition (an if/while guard
+            // whose `$?` write is provably unread — see
+            // compute_test_cond_deadness): the operands lowered unstatused
+            // (pure tests), so the chain is plain JS `&&` — no lastExit
+            // reads/writes per operand.
+            if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+                native_and_or_unstatused(BinOpKind::And, l, r)
+            } else {
+                native_and_or(BinOpKind::And, l, r)
+            }
         }
         IrExpr::BinOp {
             op: BinOpKind::Or,
@@ -31309,7 +32814,11 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             let l = expr_to_estree(lhs);
             let r = expr_to_estree(rhs);
             *AND_OR_DEPTH.lock().unwrap() -= 1;
-            native_and_or(BinOpKind::Or, l, r)
+            if *TEST_UNSTATUSED_DEPTH.lock().unwrap() > 0 {
+                native_and_or_unstatused(BinOpKind::Or, l, r)
+            } else {
+                native_and_or(BinOpKind::Or, l, r)
+            }
         }
         // `! cmd` — bash inverts the exit STATUS (so `$?` flips too); a pure
         // JS negation would leave lastExit untouched. The native lowering
@@ -31534,6 +33043,50 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         // the same ESTree shape — a `Literal` with the `regex` property
         // (printed `/pattern/flags`, executed as a native RegExp).
         IrExpr::Regex { pattern, flags } => regex_lit_flags(pattern, flags),
+        // The first-class `Capture` expr node (core request
+        // zsh-sh-go-20260814-230503): the shell frontend's `$(...)`/
+        // backticks lower here (word_ir / parse_string_interpolation).
+        // Render EXACTLY like the legacy `Call capture` — the runtime
+        // sh2.capture machinery (native tr/mktemp/echo-bc folds
+        // included) — so the emitted code is byte-identical to before.
+        IrExpr::Capture { expr, .. } => expr_to_estree(&IrExpr::Call {
+            func: "capture".to_string(),
+            args: vec![expr.as_ref().clone()],
+        }),
+        // The A1 `Index` expr node (core requests go-sh-20260814-132037 /
+        // py-sh-go-20260814-125405): array element read — the contract's
+        // rich form of the `arrayIndex` call. The key is a full expr
+        // (Str/Int/...). The arith variant renders at `ArithAst::Index`,
+        // and go/rust/zig/perl backends already render IrExpr::Index.
+        IrExpr::Index { var, key } => {
+            let key_e = expr_to_estree(key);
+            sh2_call("arrayIndex", vec![str_lit(var), key_e])
+        }
+        // The A1 `MethodCall` expr node (core request
+        // py-sh-go-20260814-152409): `obj.method(args)` — the contract's
+        // generic member call for non-shell frontends (Python method
+        // calls, JS String.prototype equivalents). The ESTree-side
+        // analysis passes handle the resulting MemberExpression/
+        // CallExpression shapes already (the runtime itself is full of
+        // `String(s).slice(...)` / `sh2.arrayIndex(...)` chains); which
+        // methods a frontend MAY emit (native JS String.prototype names
+        // or a runtime mapping for Python-only names) is a frontend-side
+        // emit decision.
+        IrExpr::MethodCall { obj, method, args } => {
+            let callee = Expr::MemberExpression {
+                object: Box::new(expr_to_estree(obj)),
+                property: Box::new(Expr::Identifier {
+                    name: method.clone(),
+                }),
+                computed: false,
+                optional: false,
+            };
+            Expr::CallExpression {
+                callee: Box::new(callee),
+                arguments: args.iter().map(expr_to_estree).collect(),
+                optional: false,
+            }
+        }
         other => unreachable!("Perl-only IR expression reached the ESTree renderer: {other:?}"),
     }
 }
@@ -31729,6 +33282,14 @@ fn sync_arrow_flip(arrow: Expr) -> Expr {
 /// would only allocate a discarded promise.
 fn sync_arrow_flip_deep(e: Expr) -> Expr {
     match e {
+        Expr::FunctionExpression { id, params, body, generator, expression, r#async } => Expr::FunctionExpression {
+            id: Box::new(sync_arrow_flip_deep(*id)),
+            params: params.into_iter().map(sync_arrow_flip_deep).collect(),
+            body,
+            generator,
+            expression,
+            r#async,
+        },
         Expr::ArrowFunctionExpression {
             params,
             body,
@@ -32314,6 +33875,10 @@ fn expr_sh2_call_count(e: &Expr) -> usize {
                     walk(a, n);
                 }
             }
+                Expr::FunctionExpression { params, body, .. } => {
+                    for p in params { walk(p, n); }
+                    walk_stmt(body, n);
+                }
             Expr::Identifier { .. } | Expr::Literal { .. } => {}
             Expr::TemplateLiteral {
                 quasis: _,
@@ -32381,6 +33946,56 @@ fn expr_sh2_call_count(e: &Expr) -> usize {
         }
     }
     let mut n = 0usize;
+    fn walk_stmt(s: &Stmt, n: &mut usize) {
+        match s {
+            Stmt::ExpressionStatement { expression } => walk(expression, n),
+            Stmt::BlockStatement { body } => { for x in body { walk_stmt(x, n); } }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { walk(p, n); }
+                walk_stmt(body, n);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations { if let Some(i) = &d.init { walk(i, n); } }
+            }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                walk(test, n);
+                walk_stmt(consequent, n);
+                if let Some(a) = alternate { walk_stmt(a, n); }
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { walk(a, n); }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                walk(test, n);
+                walk_stmt(body, n);
+            }
+            Stmt::ForStatement { init, test, update, body } => {
+                walk_stmt(init, n);
+                walk(test, n);
+                walk(update, n);
+                walk_stmt(body, n);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                walk_stmt(left, n);
+                walk(right, n);
+                walk_stmt(body, n);
+            }
+            Stmt::SwitchStatement { discriminant, cases } => {
+                walk(discriminant, n);
+                for c in cases {
+                    if let Some(t) = &c.test { walk(t, n); }
+                    for x in &c.consequent { walk_stmt(x, n); }
+                }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                walk_stmt(block, n);
+                if let Some(h) = handler { walk_stmt(&h.body, n); }
+                if let Some(f) = finalizer { walk_stmt(f, n); }
+            }
+            Stmt::ThrowStatement { argument } => walk(argument, n),
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
     walk(e, &mut n);
     n
 }
@@ -32763,6 +34378,17 @@ fn native_and_or(op: BinOpKind, l: Expr, r: Expr) -> Expr {
     }
 }
 
+/// The plain-JS form of a test chain in a dead-status condition: `a && b`
+/// / `a || b` where the operands are pure unstatused tests (their VALUE
+/// equals their exit status, so the boolean short-circuit matches bash).
+fn native_and_or_unstatused(op: BinOpKind, l: Expr, r: Expr) -> Expr {
+    Expr::LogicalExpression {
+        operator: (if op == BinOpKind::And { "&&" } else { "||" }).to_string(),
+        left: Box::new(l),
+        right: Box::new(r),
+    }
+}
+
 /// sh2-callee name of a lowered CallExpression (`sh2.getVar` → `"getVar"`),
 /// or None for any other callee shape.
 fn sh2_callee_name(e: &Expr) -> Option<&str> {
@@ -33077,6 +34703,9 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
                     })
             }
             Stmt::WhileStatement { test, body } => expr_ok(test, var) && stmt_ok(body, var),
+            Stmt::DoWhileStatement { test, body } => {
+                expr_ok(test, var) && stmt_ok(body, var)
+            }
             Stmt::ForStatement {
                 init,
                 test,
@@ -33090,6 +34719,9 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
             }
             Stmt::ForOfStatement { left, right, body } => {
                 stmt_ok(left, var) && expr_ok(right, var) && stmt_ok(body, var)
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                params.iter().all(|p| expr_ok(p, var)) && stmt_ok(body, var)
             }
             Stmt::VariableDeclaration { declarations, .. } => declarations
                 .iter()
@@ -33133,6 +34765,50 @@ fn forof_sync_elim_ok(stmts: &[Stmt], var: &str) -> bool {
 /// store sync would have written). Only exact literal-name matches are
 /// touched.
 fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
+    // `sh2.vars.<var>` — the plain-object store member read.
+    fn is_vars_member(e: &Expr, var: &str) -> bool {
+        matches!(
+            e,
+            Expr::MemberExpression {
+                object,
+                property,
+                computed: false,
+                ..
+            } if matches!(property.as_ref(), Expr::Identifier { name } if name == var)
+                && matches!(
+                    object.as_ref(),
+                    Expr::MemberExpression {
+                        object: o2,
+                        property: p2,
+                        computed: false,
+                        ..
+                    } if matches!(p2.as_ref(), Expr::Identifier { name } if name == "vars")
+                        && matches!(o2.as_ref(), Expr::Identifier { name } if name == "sh2")
+                )
+        )
+    }
+    // `process.env.<var>` — the env fallback member read.
+    fn is_env_member(e: &Expr, var: &str) -> bool {
+        matches!(
+            e,
+            Expr::MemberExpression {
+                object,
+                property,
+                computed: false,
+                ..
+            } if matches!(property.as_ref(), Expr::Identifier { name } if name == var)
+                && matches!(
+                    object.as_ref(),
+                    Expr::MemberExpression {
+                        object: o2,
+                        property: p2,
+                        computed: false,
+                        ..
+                    } if matches!(p2.as_ref(), Expr::Identifier { name } if name == "env")
+                        && matches!(o2.as_ref(), Expr::Identifier { name } if name == "process")
+                )
+        )
+    }
     fn expr_rewrite(e: &mut Expr, var: &str, js_var: &str) {
         let callee_name = sh2_callee_name(e).map(|s| s.to_string());
         match e {
@@ -33193,6 +34869,37 @@ fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
                 }
             }
             Expr::SpreadElement { argument } => expr_rewrite(argument, var, js_var),
+            Expr::LogicalExpression { operator, left, right } if operator == "??" => {
+                // `(sh2.vars.<var> ?? (process.env.<var> ?? ""))` — the
+                // native_store_read lowering of a store-bound `getVar`
+                // (the sync-elim ok-check admits it, so the rewrite must
+                // cover it too: the store is STALE during a
+                // sync-eliminated loop — the pre-loop read holds the
+                // PRIOR value, the per-iteration writes go to the native
+                // binding only).
+                if is_vars_member(left, var)
+                    && matches!(
+                        right.as_ref(),
+                        Expr::LogicalExpression {
+                            operator: r_op,
+                            left: rl,
+                            right: rr,
+                        } if r_op == "??"
+                            && is_env_member(rl, var)
+                            && matches!(
+                                rr.as_ref(),
+                                Expr::Literal { value, .. } if value.as_str() == Some("")
+                            )
+                    )
+                {
+                    *e = Expr::Identifier {
+                        name: js_var.to_string(),
+                    };
+                    return;
+                }
+                expr_rewrite(left, var, js_var);
+                expr_rewrite(right, var, js_var);
+            }
             Expr::LogicalExpression { left, right, .. }
             | Expr::BinaryExpression { left, right, .. }
             | Expr::AssignmentExpression { left, right, .. } => {
@@ -33249,6 +34956,10 @@ fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
                 expr_rewrite(test, var, js_var);
                 stmt_rewrite(body, var, js_var);
             }
+            Stmt::DoWhileStatement { test, body } => {
+                expr_rewrite(test, var, js_var);
+                stmt_rewrite(body, var, js_var);
+            }
             Stmt::ForStatement {
                 init,
                 test,
@@ -33263,6 +34974,12 @@ fn forof_rewrite_getvar(stmts: &mut [Stmt], var: &str, js_var: &str) {
             Stmt::ForOfStatement { left, right, body } => {
                 stmt_rewrite(left, var, js_var);
                 expr_rewrite(right, var, js_var);
+                stmt_rewrite(body, var, js_var);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params.iter_mut() {
+                    expr_rewrite(p, var, js_var);
+                }
                 stmt_rewrite(body, var, js_var);
             }
             Stmt::VariableDeclaration { declarations, .. } => {
@@ -33616,11 +35333,20 @@ mod range_analysis_tests {
         let r3 = ranges_of("i=1\nj=2\nwhile [ $i -lt 5 ]; do i=$((i+1)); done");
         assert_eq!(r3.get("j"), Some(&(2, 2)));
         // a non-counter loop (body doesn't prove monotone +1) — the
-        // entry invariant cannot be pinned: the widening hits the i64
-        // arithmetic extremes, i+1 overflows it, and the invariant goes
-        // Any (sound: the loop could run unboundedly)
+        // entry invariant cannot be pinned, and the widening hits the i64
+        // arithmetic extremes. With the WRAPPED `+` (bash int64 wrap) the
+        // fixpoint then converges: the counter is PROVABLY in [i64::MIN,
+        // i64::MAX] (the widening's soundness — bash arithmetic never
+        // leaves i64), so the var stays in the map at the full domain
+        // (the old checked_add overflowed to None — Any; the wrap made
+        // the extreme PROVABLE, which is exactly the i53 escalation's
+        // trigger: the value can exceed ±2^53, so it must home as BigInt).
         let r4 = ranges_of("i=1\nwhile :; do i=$((i+1)); done");
-        assert!(!r4.contains_key("i"));
+        assert_eq!(
+            r4.get("i"),
+            Some(&(i64::MIN as i128, i64::MAX as i128)),
+            "wrapped arithmetic keeps the counter provably in i64"
+        );
     }
 
     #[test]
@@ -33663,6 +35389,136 @@ mod range_analysis_tests {
 
     #[test]
     #[ignore] // corpus-wide tally — run on demand: cargo test -- --ignored --nocapture
+    /// The wrapped-interval completion (Task 1): Pow / IncDec / Cond /
+    /// Assign / Index + the previously-punted Bin ops, all with EXACT
+    /// bash int64 wrap semantics (`$((2**62))` is a precise value, not
+    /// Any; `MAX+1` wraps to MIN).
+    #[test]
+    fn wrapped_arith_ops() {
+        // bash wraps at 2^64: 2**62 is exact, 2**63 wraps to -2^63,
+        // MAX+1 wraps to MIN
+        let r = ranges_of(
+            "a=$((2**62))\nb=$((2**63))\nc=$((9223372036854775807+1))\nd=$((1<<62))\ne=$((1<<64))\nf=$((-1>>1))\ng=$((7%3))\nh=$((-7%3))\ni=$((5&3))\nj=$((5|2))\nk=$((5^3))\nl=$((~5))\nm=$((7<3))\nn=$((1&&0))\no=$((-2**2))\n",
+        );
+        assert_eq!(r.get("a"), Some(&(4611686018427387904, 4611686018427387904)));
+        assert_eq!(r.get("b"), Some(&(-9223372036854775808, -9223372036854775808)));
+        assert_eq!(r.get("c"), Some(&(-9223372036854775808, -9223372036854775808)));
+        assert_eq!(r.get("d"), Some(&(4611686018427387904, 4611686018427387904)));
+        // bash masks the shift count mod 64: 1<<64 = 1
+        assert_eq!(r.get("e"), Some(&(1, 1)));
+        assert_eq!(r.get("f"), Some(&(-1, -1)));
+        assert_eq!(r.get("g"), Some(&(1, 1)));
+        assert_eq!(r.get("h"), Some(&(-1, -1)));
+        assert_eq!(r.get("i"), Some(&(1, 1)));
+        assert_eq!(r.get("j"), Some(&(7, 7)));
+        assert_eq!(r.get("k"), Some(&(6, 6)));
+        assert_eq!(r.get("l"), Some(&(-6, -6)));
+        assert_eq!(r.get("m"), Some(&(0, 1)));
+        assert_eq!(r.get("n"), Some(&(0, 1)));
+        assert_eq!(r.get("o"), Some(&(4, 4)));
+        // a negative exponent aborts the expansion (bash error) — Any
+        let r2 = ranges_of("a=$((2**-1))");
+        assert!(!r2.contains_key("a"));
+    }
+
+    /// IncDec / Assign / Cond ranges: the value of the node (bash
+    /// semantics — the assign's value is the new value).
+    #[test]
+    fn arith_assign_incdec_cond_ranges() {
+        let r = ranges_of("x=5\ny=$((x++))\nz=$((x+=10))\nw=$((1 ? 7 : 100))");
+        // x++: value 5 (the OLD value), x becomes 6 — the RANGE walker
+        // tracks x's final value from the last write
+        assert_eq!(r.get("y"), Some(&(5, 5)));
+        assert_eq!(r.get("x"), Some(&(16, 16)));
+        assert_eq!(r.get("z"), Some(&(16, 16)));
+        assert_eq!(r.get("w"), Some(&(7, 7)));
+        // an IncDec past the domain wraps exactly (bash: i++ at MAX → MIN)
+        let r2 = ranges_of("i=9223372036854775807\nj=$((i++))");
+        assert_eq!(r2.get("j"), Some(&(9223372036854775807, 9223372036854775807)));
+        assert_eq!(r2.get("i"), Some(&(-9223372036854775808, -9223372036854775808)));
+    }
+
+    /// The i53 escalation set: proven out-of-±2^53 vars with all-integer
+    /// writes escalate; unproven-string writes / read-builtins / function
+    /// bodies / captures reject.
+    #[test]
+    fn big_i53_escalation() {
+        // x: literal 2^53+1, arith read — escalates
+        let prog = ast_to_ir(&crate::Parser::new("x=9007199254740993\necho $((x+1))")
+            .parse()
+            .expect("parse"));
+        assert!(analyze_big_i53(&prog).contains("x"));
+        // y = x + 1: arith-proven, the write is an integer arith — but y's
+        // range comes from x's (proven big) — both escalate
+        let prog2 = ast_to_ir(
+            &crate::Parser::new("x=9007199254740993\ny=$((x+1))\necho $y")
+                .parse()
+                .expect("parse"),
+        );
+        let big = analyze_big_i53(&prog2);
+        assert!(big.contains("x"));
+        assert!(big.contains("y"));
+        // a string write mixed in rejects the escalation (the BigInt home
+        // must never see a non-integer: BigInt("") throws)
+        let prog3 = ast_to_ir(
+            &crate::Parser::new("x=abc\nx=9007199254740993\necho $((x+1))")
+                .parse()
+                .expect("parse"),
+        );
+        assert!(!analyze_big_i53(&prog3).contains("x"));
+        // read-builtin arg rejects
+        let prog4 = ast_to_ir(
+            &crate::Parser::new("x=9007199254740993\nread x\necho $((x+1))")
+                .parse()
+                .expect("parse"),
+        );
+        assert!(!analyze_big_i53(&prog4).contains("x"));
+        // a capture write rejects
+        let prog5 = ast_to_ir(
+            &crate::Parser::new("x=9007199254740993\nx=$(echo hi)\necho $((x+1))")
+                .parse()
+                .expect("parse"),
+        );
+        assert!(!analyze_big_i53(&prog5).contains("x"));
+        // a function-body write rejects (dynamic scope)
+        let prog6 = ast_to_ir(
+            &crate::Parser::new("x=9007199254740993\nf() { x=5; }\nf\necho $((x+1))")
+                .parse()
+                .expect("parse"),
+        );
+        assert!(!analyze_big_i53(&prog6).contains("x"));
+        // `local x=<int>` (the exec name=value shape) is a proven write
+        let prog7 = ast_to_ir(
+            &crate::Parser::new("local x=9007199254740993\necho $((x+1))")
+                .parse()
+                .expect("parse"),
+        );
+        assert!(analyze_big_i53(&prog7).contains("x"));
+    }
+
+    /// The Task 1 acceptance case, end to end: `x=9007199254740993;
+    /// echo $((x+1))` must emit BigInt literals/ops (bash prints
+    /// 9007199254740994; Number would print 9007199254740992).
+    #[test]
+    fn big_i53_emission() {
+        let src = "x=9007199254740993\necho $((x+1))";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        // the emission runs on a clone with the escalation active
+        let json = shir_to_estree(&prog);
+        let s = serde_json::to_string(&json).unwrap();
+        assert!(s.contains("9007199254740993"), "exact literal: {s}");
+        assert!(
+            s.contains("BigInt")
+                && s.contains("9007199254740993")
+                && s.contains("asIntN"),
+            "BigInt literal + wrap: {s}"
+        );
+        // and the number must not appear as a rounding literal
+        assert!(!s.contains("9007199254740992"), "no rounded literal: {s}");
+    }
+
+    #[test]
     fn corpus_var_width_tally() {
         let mut widths: HashMap<&'static str, usize> = HashMap::new();
         widths.insert("u32", 0);
@@ -33866,5 +35722,55 @@ mod struct_member_tests {
         let prog2 = crate::shir_json_in::shir_json_to_ir(plain).expect("ingress");
         let json2 = serde_json::to_string(&shir_to_estree(&prog2)).unwrap();
         assert!(json2.contains("\"name\":\"x\""), "plain name should lift: {json2}");
+    }
+}
+
+#[cfg(test)]
+mod methodcall_estree_tests {
+    use super::*;
+
+    /// The A1 `MethodCall` expr node renders through the ESTree renderer
+    /// (core request py-sh-go-20260814-152409): the generic member call
+    /// `obj.method(args)` — previously the catch-all
+    /// "Perl-only IR expression reached the ESTree renderer" panic
+    /// (src/shir.rs expr_to_estree) blocked any frontend from emitting
+    /// the contract's own node.
+    #[test]
+    fn methodcall_renders_member_call() {
+        let a1 = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"var_types":[],"subs":[],"stmts":[{"type":"Expr","expr":{"type":"Call","func":"echo","args":[{"type":"MethodCall","object":{"type":"Var","name":"s","sigil":null},"method":"strip","args":[]}]}}]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(a1).expect("ingress accepts MethodCall");
+        let js = crate::shir::shir_to_estree_json(&prog).expect("render");
+        // the member call must survive: `s.strip()` (the var read folds to
+        // "" — never written — but the member shape stays)
+        assert!(
+            js.contains("\"name\":\"strip\"") && js.contains("\"type\":\"MemberExpression\""),
+            "member call lost in render: {js}"
+        );
+        assert!(
+            js.contains("\"type\":\"CallExpression\""),
+            "call shape lost in render: {js}"
+        );
+    }
+}
+
+mod clobber_redirect_tests {
+    use super::*;
+
+    /// `>|` survives parse → shIR → A1 with the distinct "wc" mode
+    /// (core requests sh-20260814-140334 / sh-20260814-150110): the
+    /// parser must NOT collapse it to plain Output, or no backend can
+    /// render the noclobber-bypassing operator under `set -C`.
+    #[test]
+    fn clobber_redirect_keeps_wc_mode() {
+        let cmds = crate::Parser::new(": >| \"$tmpf\"").parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        // shir_to_shir_json returns the serialized A1 JSON string (compact)
+        let s = crate::shir_json::shir_to_shir_json(&prog);
+        assert!(s.contains("\"mode\":\"wc\""), "clobber mode lost: {s}");
+        assert!(s.contains("\"fd\":1"), "default fd should be stdout: {s}");
+        // and the A1 round-trip accepts it (shir_json_in reads mode generically)
+        let back = crate::shir_json_in::shir_json_to_ir(&s).expect("ingress");
+        let s2 = crate::shir_json::shir_to_shir_json(&back);
+        assert!(s2.contains("\"mode\":\"wc\""), "round-trip lost clobber: {s2}");
     }
 }
