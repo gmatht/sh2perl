@@ -1970,16 +1970,35 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         expr: inner_expr, ..
                     } = expr
                     {
-                        let mut inner_str = ir_expr_to_perl(inner_expr);
-                        // Strip surrounding backticks from StrStyle::Command rendering
-                        if inner_str.starts_with('`')
-                            && inner_str.ends_with('`')
-                            && inner_str.len() >= 2
-                        {
-                            inner_str = inner_str[1..inner_str.len() - 1].to_string();
-                        }
-                        // Use open()-based code instead of qx{...} to avoid check_qx violations
-                        let open_expr = cmd_str_to_open_perl(&inner_str);
+                        // Prefer the REBUILT SHELL TEXT for Arrow bodies: the
+                        // old fallback rendered the Arrow as a Perl anonymous
+                        // sub (`sub { … }`) and fed it to bash -c — which is
+                        // not shell. Bash reported `sub: command not found`
+                        // (verified via `x=$(printf "%s\n" …)` and
+                        // `$(echo hi)` — the pre-existing capture bug).
+                        let shell_cmd = match inner_expr.as_ref() {
+                            IrExpr::Arrow(stmts) => stmts_to_shell_cmd(stmts),
+                            _ => None,
+                        };
+                        let open_expr = if let Some(cmd) = shell_cmd {
+                            cmd_str_to_open_perl(&cmd)
+                        } else if matches!(inner_expr.as_ref(), IrExpr::Arrow(_)) {
+                            // A non-rebuildable closure (dynamic exec / assign
+                            // body): its Perl rendering is not shell — refuse
+                            // loudly rather than emit the broken `sub {}` text.
+                            "die \"debashc: shIR capture not expressible as shell (Perl backend)\\n\"".to_string()
+                        } else {
+                            let mut inner_str = ir_expr_to_perl(inner_expr);
+                            // Strip surrounding backticks from StrStyle::Command rendering
+                            if inner_str.starts_with('`')
+                                && inner_str.ends_with('`')
+                                && inner_str.len() >= 2
+                            {
+                                inner_str = inner_str[1..inner_str.len() - 1].to_string();
+                            }
+                            // Use open()-based code instead of qx{...} to avoid check_qx violations
+                            cmd_str_to_open_perl(&inner_str)
+                        };
                         emit_indent(out, indent);
                         out.push_str(&format!("{} = {};\n", lhs, open_expr));
                     } else {
@@ -3659,9 +3678,12 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
         "r" => "<",
         _ => return false,
     };
-    // fd N → target &M means N>&M (fd dup).
+    // fd N → target &M means N>&M / N<&M (fd dup) — the op is the DIRECTION
+    // arrow, never the file mode (mode "w"/"a" would wrongly emit `2>>&1`,
+    // which is not bash — syntax error).
     if let Some(m) = target.strip_prefix('&') {
-        cmd.push_str(&format!(" {}>{}&{}", fd, op.trim_start_matches('<'), m));
+        let arrow = if op == "<" { "<&" } else { ">&" };
+        cmd.push_str(&format!(" {} {}{}", fd, arrow, m));
         return true;
     }
     let quoted = format!("'{}'", target.replace('\'', "'\\\\''"));
@@ -3954,37 +3976,48 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             let has_split = words[1..]
                 .iter()
                 .any(|w| matches!(w, IrExpr::Call { func, .. } if func == "split"));
+            // placeholder count in the (rendered) format: a `%` not part of
+            // a `%%` pair is one conversion. Computed on the RENDERED literal
+            // so Interpolate formats (`"%s-%s\n"` → Interpolate Lit) count
+            // too — call_arg_str only sees plain Str formats.
+            let p = {
+                let cs: Vec<char> = fmt.chars().collect();
+                let mut n = 0;
+                let mut i = 0;
+                while i < cs.len() {
+                    if cs[i] == '%' {
+                        if i + 1 < cs.len() && cs[i + 1] == '%' {
+                            i += 2;
+                            continue;
+                        }
+                        n += 1;
+                    }
+                    i += 1;
+                }
+                n
+            };
             emit_indent(out, indent);
-            if rest.is_empty() {
+            if rest.is_empty() || p == 0 {
+                // no args, or no conversions: bash printf prints the format
+                // ONCE, ignoring the args (GNU printf 'x' a b → "x"); Perl
+                // printf(fmt) also interprets `%%` (a bare print would leak
+                // the literal `%%`).
                 out.push_str(&format!("printf({});\n", fmt));
-            } else if has_split {
+            } else if has_split || rest.len() > p {
                 // bash printf CYCLES the format over the whole arg list;
                 // Perl printf applies the format ONCE and discards extra
                 // args. Flatten the args (a split word expands to its
                 // fields in list context) and emit one printf per
                 // format-application, chunked by the placeholder count P
                 // (triage-perl t62_word_split: `printf "<%s>\\n" $x`
-                // with x="a b" → two lines).
+                // with x="a b" → two lines; same for plain literal args:
+                // `printf '%s\\n' a b c` → three lines).
                 static PA_SEQ: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
                 let tmp = format!(
                     "__sh2_pa{}",
                     PA_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 );
-                // placeholder count in the (rendered) format: a `%` not
-                // followed by `%` is one conversion (%% is a literal %).
-                let p = words
-                    .first()
-                    .and_then(|w| call_arg_str(w))
-                    .map(|s| {
-                        let cs: Vec<char> = s.chars().collect();
-                        cs.iter()
-                            .enumerate()
-                            .filter(|(i, c)| **c == '%' && cs.get(i + 1) != Some(&'%'))
-                            .count()
-                            .max(1)
-                    })
-                    .unwrap_or(1);
                 out.push_str(&format!("my @{tmp} = ({});\n", rest.join(", ")));
                 out.push_str(&format!(
                     "my ${tmp}_n = @{tmp} || 1;\n"

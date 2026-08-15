@@ -741,6 +741,12 @@ pub fn generate_generic_builtin(
         "tail" => {
             if input_var.is_empty() {
                 // Native Perl tail: read files and extract last N lines.
+                // Refuse flags the emulation can't express (bytes `-c`, follow
+                // `-f`, `-q`, `-s`, `--`) by returning EMPTY — ir.rs's
+                // generator_emulate_command treats empty as "not emulatable"
+                // and falls back to the real `bash -c` tail (which handles
+                // `tail -c 100` byte windows; the old code treated `-c`/its
+                // arg as FILE names — "tail: 100: No such file").
                 let mut num_lines = 10;
                 let mut file_args: Vec<String> = Vec::new();
                 let mut i = 0;
@@ -754,13 +760,18 @@ pub fn generate_generic_builtin(
                                 i += 2;
                                 continue;
                             }
-                        } else if s.starts_with("-n") {
+                        } else if s.starts_with("-n") && s.len() > 2 {
                             if let Ok(v) = s[2..].parse::<usize>() {
                                 num_lines = v;
                             }
                         } else if s.starts_with('-') && s.len() > 1 {
                             if let Ok(v) = s[1..].parse::<usize>() {
+                                // bare `-N`: last N lines
                                 num_lines = v;
+                            } else {
+                                // unsupported flag (`-c`, `-f`, `-q`, …) —
+                                // hand the command back to bash
+                                return String::new();
                             }
                         } else {
                             file_args.push(generator.word_to_perl(&cmd.args[i]));
@@ -772,25 +783,37 @@ pub fn generate_generic_builtin(
                 }
                 let files_joined = file_args.join(", ");
                 let n = num_lines;
+                // bash `tail -n N`: last N lines, or ALL when the input has
+                // fewer (the old `>= N` guard dropped the whole tail for
+                // `tail -n 15` on a 10-line file).
+                let tail_sel = |n: usize| {
+                    format!("@__lines > {n} ? @__lines[-{n}..-1] : @__lines")
+                };
                 if output_var.is_empty() {
                     if file_args.is_empty() {
-                        format!("do {{ my @__lines = <STDIN>; my @__tail = @__lines[-{}..-1] if @__lines >= {}; print @__tail; }};\n", n, n)
+                        format!(
+                            "do {{ my @__lines = <STDIN>; my @__tail = {}; print @__tail; }};\n",
+                            tail_sel(n)
+                        )
                     } else {
                         format!(
-                            "do {{ for my $__f ({}) {{ open(my $__fh, '<', $__f) or croak \"tail: $__f: $ERRNO\"; my @__lines = <$__fh>; close $__fh; my @__tail = @__lines[-{}..-1] if @__lines >= {}; print @__tail; }} }};\n",
-                            files_joined, n, n
+                            "do {{ for my $__f ({}) {{ open(my $__fh, '<', $__f) or croak \"tail: $__f: $ERRNO\"; my @__lines = <$__fh>; close $__fh; my @__tail = {}; print @__tail; }} }};\n",
+                            files_joined, tail_sel(n)
                         )
                     }
                 } else {
                     if file_args.is_empty() {
                         format!(
-                            "do {{ my @__lines = <STDIN>; my @__tail = @__lines[-{}..-1] if @__lines >= {}; ${} = join q{{}}, @__tail; }};\n",
-                            n, n, output_var
+                            "do {{ my @__lines = <STDIN>; my @__tail = {}; ${} = join q{{}}, @__tail; }};\n",
+                            tail_sel(n),
+                            output_var
                         )
                     } else {
                         format!(
-                            "do {{ my $__out = q{{}}; for my $__f ({}) {{ open(my $__fh, '<', $__f) or croak \"tail: $__f: $ERRNO\"; my @__lines = <$__fh>; close $__fh; my @__tail = @__lines[-{}..-1] if @__lines >= {}; $__out .= join q{{}}, @__tail; }} ${} = $__out; }};\n",
-                            files_joined, n, n, output_var
+                            "do {{ my $__out = q{{}}; for my $__f ({}) {{ open(my $__fh, '<', $__f) or croak \"tail: $__f: $ERRNO\"; my @__lines = <$__fh>; close $__fh; my @__tail = {}; $__out .= join q{{}}, @__tail; }} ${} = $__out; }};\n",
+                            files_joined,
+                            tail_sel(n),
+                            output_var
                         )
                     }
                 }

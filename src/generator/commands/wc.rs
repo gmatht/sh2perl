@@ -153,22 +153,66 @@ pub fn generate_wc_command_with_output(
     .iter()
     .filter(|&&x| x)
     .count();
+    // GNU wc field width: a SINGLE count is unpadded (`5 file`); MULTIPLE
+    // counts are right-aligned to max(3, digits of the largest count) —
+    // ` 5  8 48 file` for (5,8,48), `100000 588895` for six-digit counts.
+    // The old `%7d` over-padded (`      5      8     48 file `). The width
+    // is a RUNTIME value, so emit a width computation + `%*d` fields.
     let use_padding = num_cols > 1;
-    let pad = if use_padding { "%7d" } else { "%d" };
+    let pad = if use_padding { "%*d" } else { "%d" };
+    let count_vars: Vec<&str> = {
+        let mut v = Vec::new();
+        if count_lines {
+            v.push("_wc_lines");
+        }
+        if count_words {
+            v.push("_wc_words");
+        }
+        if count_chars || count_bytes {
+            v.push(if count_chars { "_wc_chars" } else { "_wc_bytes" });
+        }
+        if longest_line {
+            v.push("_wc_longest");
+        }
+        v
+    };
+    if use_padding {
+        output.push_str("my $_wc_w = 3;\n");
+        output.push_str(&format!(
+            "for my $_wc_c ({}) {{\n",
+            count_vars
+                .iter()
+                .map(|v| format!("${v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        output.push_str("    my $_wc_d = length($_wc_c);\n");
+        output.push_str("    $_wc_w = $_wc_d if $_wc_d > $_wc_w;\n");
+        output.push_str("}\n");
+    }
 
     let mut fmt_parts: Vec<String> = Vec::new();
     let mut sprintf_args: Vec<IrExpr> = Vec::new();
 
     if count_lines {
         fmt_parts.push(pad.to_string());
+        if use_padding {
+            sprintf_args.push(IrExpr::Var("_wc_w".to_string(), Some(Sigil::Scalar)));
+        }
         sprintf_args.push(IrExpr::Var("_wc_lines".to_string(), Some(Sigil::Scalar)));
     }
     if count_words {
         fmt_parts.push(pad.to_string());
+        if use_padding {
+            sprintf_args.push(IrExpr::Var("_wc_w".to_string(), Some(Sigil::Scalar)));
+        }
         sprintf_args.push(IrExpr::Var("_wc_words".to_string(), Some(Sigil::Scalar)));
     }
     if count_chars || count_bytes {
         fmt_parts.push(pad.to_string());
+        if use_padding {
+            sprintf_args.push(IrExpr::Var("_wc_w".to_string(), Some(Sigil::Scalar)));
+        }
         let var_name = if count_chars {
             "_wc_chars"
         } else {
@@ -178,22 +222,20 @@ pub fn generate_wc_command_with_output(
     }
     if longest_line {
         fmt_parts.push(pad.to_string());
+        if use_padding {
+            sprintf_args.push(IrExpr::Var("_wc_w".to_string(), Some(Sigil::Scalar)));
+        }
         sprintf_args.push(IrExpr::Var("_wc_longest".to_string(), Some(Sigil::Scalar)));
     }
 
-    // Append filename if provided
+    // Columns joined with single spaces; the filename (if any) follows with
+    // ONE space and NO trailing space (GNU wc: `… file\n`, not `… file \n`).
+    let mut fmt_str = fmt_parts.join(" ");
     if let Some(ref filename) = file_arg {
-        fmt_parts.push(filename.clone());
+        fmt_str.push(' ');
+        fmt_str.push_str(filename);
     }
-
-    // Use literal newline; DoubleQuoted handler will escape it to \\n
-    fmt_parts.push("\n".to_string());
-    let fmt_str = if num_cols <= 1 && file_arg.is_none() {
-        // Single column, no filename: just join without extra spacing
-        fmt_parts.join("")
-    } else {
-        fmt_parts.join(" ")
-    };
+    fmt_str.push_str("\n");
 
     let mut all_args = vec![IrExpr::Str(fmt_str, StrStyle::DoubleQuoted)];
     all_args.extend(sprintf_args);

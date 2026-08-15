@@ -21,11 +21,20 @@ pub fn generate_mkdir_command(generator: &mut Generator, cmd: &SimpleCommand) ->
     let mut directories = Vec::new();
 
     // Parse mkdir options
+    let mut skip_next = false;
     for arg in &cmd.args {
         let arg_str = word_text(arg);
+        if skip_next {
+            // `-m MODE` (and any flag with a separate argument): the mode is
+            // NOT a directory — the old code pushed `755` from `mkdir -m 755
+            // dir` as a directory name ("mkdir: cannot create directory 755").
+            skip_next = false;
+            continue;
+        }
         match arg_str.as_str() {
             "-p" | "--parents" => create_parents = true,
             "-v" | "--verbose" => verbose = true,
+            "-m" | "--mode" => skip_next = true,
             _ => {
                 if !arg_str.starts_with('-') {
                     directories.push(generator.perl_string_literal(arg));
