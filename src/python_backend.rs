@@ -13,7 +13,7 @@
 //! backend's runtime-store convention).
 
 use crate::ir::{ArithAst, InterpPart, IrExpr, IrProgram, IrStmt, IrType};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Default)]
 pub struct Render {
@@ -26,6 +26,14 @@ pub struct Render {
     /// >0 while rendering a function body (top-level `return` is a python
     /// syntax error, so Return outside a function lowers to a TODO)
     in_function: usize,
+    /// >0 while rendering a loop body (break/continue lower natively)
+    loop_depth: usize,
+    /// names WRITTEN anywhere in the program (a getVar of an unwritten
+    /// plain name folds to "" — the SH2_ASSUME_NO_ENV read fold, mirroring
+    /// the estree emitter's collect_never_written)
+    written: HashSet<String>,
+    /// needs the `__sh_atoi` helper (printf %d/%i/%u args)
+    need_atoi: bool,
     todo: usize,
     /// needs `import re` (the grepMatches lift)
     need_re: bool,
@@ -39,6 +47,7 @@ pub fn shir_to_python(prog: &IrProgram) -> String {
     prog.var_types = crate::shir::analyze_var_types(&prog);
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
+    r.collect_writes(&prog.stmts);
     r.program(&prog);
     r.out.join("\n")
 }
@@ -95,6 +104,184 @@ impl Render {
         self.var_types.get(name).copied() == Some(IrType::Int)
     }
 
+    // ── never-written scan ──────────────────────────────────────────
+
+    /// Collect every name WRITTEN anywhere in the program (assign targets,
+    /// declares, loop vars, setVar/unset/read targets, capture vars, arith
+    /// assigns). getVar of a name outside this set is an unset read and
+    /// folds to "" under SH2_ASSUME_NO_ENV (see `call`).
+    fn collect_writes(&mut self, stmts: &[IrStmt]) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    for t in targets {
+                        self.written.insert(t.var.clone());
+                    }
+                    self.collect_writes_expr(expr);
+                }
+                IrStmt::Declare { vars, .. } => {
+                    for d in vars {
+                        self.written.insert(d.name.clone());
+                    }
+                }
+                IrStmt::DeclareArray { var, elements, .. } => {
+                    self.written.insert(var.clone());
+                    for e in elements {
+                        self.collect_writes_expr(e);
+                    }
+                }
+                IrStmt::For { var, iter, body } => {
+                    self.written.insert(var.clone());
+                    self.collect_writes_expr(iter);
+                    self.collect_writes(body);
+                }
+                IrStmt::Expr(e) => self.collect_writes_expr(e),
+                IrStmt::Output { value, .. } => self.collect_writes_expr(value),
+                IrStmt::WriteFile { path, content, .. } => {
+                    self.collect_writes_expr(path);
+                    self.collect_writes_expr(content);
+                }
+                IrStmt::If { cond, then, elsifs, else_ } => {
+                    self.collect_writes_expr(cond);
+                    self.collect_writes(then);
+                    for (c, b) in elsifs {
+                        self.collect_writes_expr(c);
+                        self.collect_writes(b);
+                    }
+                    self.collect_writes(else_);
+                }
+                IrStmt::While { cond, body } => {
+                    self.collect_writes_expr(cond);
+                    self.collect_writes(body);
+                }
+                IrStmt::DoWhile { body, cond, .. } => {
+                    self.collect_writes(body);
+                    self.collect_writes_expr(cond);
+                }
+                IrStmt::Block(b) => self.collect_writes(b),
+                IrStmt::Function { body, .. } => self.collect_writes(body),
+                IrStmt::Exec { cmd, args, capture, .. } => {
+                    if let Some(v) = capture {
+                        self.written.insert(v.clone());
+                    }
+                    self.collect_writes_expr(cmd);
+                    for a in args {
+                        self.collect_writes_expr(a);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_writes_expr(&mut self, e: &IrExpr) {
+        match e {
+            IrExpr::Call { func, args } => {
+                match func.as_str() {
+                    "setVar" => {
+                        if let Some(IrExpr::Str(name, _)) = args.first() {
+                            self.written.insert(name.clone());
+                        }
+                    }
+                    // read/readarray/mapfile/getLine: every Str arg is a
+                    // target name
+                    "unset" | "read" | "readarray" | "mapfile" | "getLine" => {
+                        for a in args {
+                            if let IrExpr::Str(name, _) = a {
+                                self.written.insert(name.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for a in args {
+                    self.collect_writes_expr(a);
+                }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                self.collect_writes_expr(lhs);
+                self.collect_writes_expr(rhs);
+            }
+            IrExpr::Ternary { cond, then, else_ } => {
+                self.collect_writes_expr(cond);
+                self.collect_writes_expr(then);
+                self.collect_writes_expr(else_);
+            }
+            IrExpr::DefinedOr { expr, default } => {
+                self.collect_writes_expr(expr);
+                self.collect_writes_expr(default);
+            }
+            IrExpr::Index { key, .. } => {
+                self.collect_writes_expr(key);
+            }
+            IrExpr::Interpolate(parts) => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        self.collect_writes_expr(x);
+                    }
+                }
+            }
+            IrExpr::Arith(a) => self.collect_writes_arith(a),
+            IrExpr::MethodCall { obj, args, .. } => {
+                self.collect_writes_expr(obj);
+                for a in args {
+                    self.collect_writes_expr(a);
+                }
+            }
+            IrExpr::Array(items) => {
+                for a in items {
+                    self.collect_writes_expr(a);
+                }
+            }
+            IrExpr::Object(fields) => {
+                for (_, v) in fields {
+                    self.collect_writes_expr(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_writes_arith(&mut self, a: &ArithAst) {
+        match a {
+            ArithAst::Assign { var, rhs, .. } => {
+                self.written.insert(var.clone());
+                self.collect_writes_arith(rhs);
+            }
+            ArithAst::Index { var, key, .. } => {
+                self.written.insert(var.clone());
+                self.collect_writes_arith(key);
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                self.collect_writes_arith(lhs);
+                self.collect_writes_arith(rhs);
+            }
+            ArithAst::Un { arg, .. } => self.collect_writes_arith(arg),
+            ArithAst::Cond { test, then, else_, .. } => {
+                self.collect_writes_arith(test);
+                self.collect_writes_arith(then);
+                self.collect_writes_arith(else_);
+            }
+            ArithAst::Cast { arg, .. } => self.collect_writes_arith(arg),
+            ArithAst::IncDec { var, .. } => {
+                self.written.insert(var.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// A plain identifier-shaped name (excludes `?`/`$`/`#`/`@`/`*`/`-`,
+    /// positionals `1`-`9` and index reads `arr[1]`) — the only names the
+    /// unset-read fold may flatten to "".
+    fn is_plain_name(name: &str) -> bool {
+        let mut cs = name.chars();
+        match cs.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
     // ── expressions ──────────────────────────────────────────────────
 
     fn expr(&mut self, e: &IrExpr) -> String {
@@ -147,6 +334,20 @@ impl Render {
                         "?".into()
                     }
                 };
+                if matches!(op, crate::ir::BinOpKind::And | crate::ir::BinOpKind::Or) {
+                    // side-effecting call operands (exec → print(...)) return
+                    // None; the truthy wrapper keeps `&&`/`||` status chaining
+                    // bash-faithful (a successful echo always proceeds). Test/
+                    // value operands stay as-is (`""` stays falsy).
+                    let wrap = |x: &IrExpr, s: String| -> String {
+                        if matches!(x, IrExpr::Call { func, .. } if func == "exec") {
+                            format!("({s} or 1)")
+                        } else {
+                            s
+                        }
+                    };
+                    return format!("({} {py_op} {})", wrap(lhs, l), wrap(rhs, r));
+                }
                 format!("({l} {py_op} {r})")
             }
             IrExpr::Arith(a) => self.arith(a),
@@ -212,7 +413,12 @@ impl Render {
     fn arith(&mut self, a: &ArithAst) -> String {
         match a {
             ArithAst::Num(n) => n.to_string(),
-            ArithAst::Var(name) | ArithAst::Ident(name) => self.py_ident(name),
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
+                // bash coerces arith operands to integers; python would
+                // string-repeat/double a str loop var, so wrap the read.
+                // (int() of an int-typed var is a no-op.)
+                format!("int({})", self.py_ident(name))
+            }
             ArithAst::Index { .. } => {
                 self.mark_todo("arith Index");
                 "0".into()
@@ -326,7 +532,8 @@ impl Render {
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
             // exec("echo", [args...]) → native print (python's print IS echo
-            // semantics: space-separated args + trailing newline)
+            // semantics: space-separated args + trailing newline);
+            // exec("printf", [fmt, args...]) → native sys.stdout.write
             "exec" => {
                 if let Some(IrExpr::Str(cmd, _)) = args.first() {
                     if cmd == "echo" {
@@ -339,15 +546,23 @@ impl Render {
                             return format!("print({})", rendered.join(", "));
                         }
                     }
+                    if cmd == "printf" {
+                        return self.printf_call(args);
+                    }
                 }
                 self.sh2_stub("exec", args, "exec")
             }
             // getVar("y") — the ShIR's form of a `$y` read; typed vars are
-            // plain python names, anything else → runtime stub
+            // plain python names, a never-written plain name is unset at
+            // every read (→ "", the SH2_ASSUME_NO_ENV fold), anything else
+            // → runtime stub
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     if self.var_types.contains_key(name) {
                         return self.py_ident(name);
+                    }
+                    if !self.written.contains(name) && Self::is_plain_name(name) {
+                        return "\"\"".into();
                     }
                 }
                 self.sh2_stub("getVar", args, "getVar")
@@ -361,6 +576,17 @@ impl Render {
                     }
                 }
                 self.sh2_stub("test", args, "test")
+            }
+            // split(getVar(name)) — IFS field-split of a scalar read is a
+            // no-op (mirrors the estree nospace fold); the read's own
+            // rendering is the value
+            "split" => {
+                if let Some(IrExpr::Call { func, args: inner }) = args.first() {
+                    if func == "getVar" {
+                        return self.call("getVar", inner);
+                    }
+                }
+                self.sh2_stub("split", args, "split")
             }
             // everything else → compile-able sh2.* stub
             // `grepMatches(text, pattern, flags)` — the `grep -o` lift:
@@ -398,6 +624,188 @@ impl Render {
             }
             _ => self.sh2_stub(func, args, func),
         }
+    }
+
+    /// `exec printf FMT ARGS...` → native `sys.stdout.write`, mirroring
+    /// the core's try_native_printf (shir.rs): supported conversions
+    /// s/d/i/u, `%%` literal, text backslash-unescape, args cycle across
+    /// passes, spec-less formats repeat once per arg. Flags/width/prec or
+    /// array args → stub (the core keeps the runtime dispatch there too).
+    fn printf_call(&mut self, args: &[IrExpr]) -> String {
+        let Some(IrExpr::Array(items)) = args.get(1) else {
+            return self.sh2_stub("exec", args, "exec");
+        };
+        let Some(IrExpr::Str(fmt, _)) = items.first() else {
+            return self.sh2_stub("exec", args, "exec");
+        };
+        let parsed = match Self::printf_parse(fmt) {
+            Some(p) => p,
+            None => return self.sh2_stub("exec", args, "exec"),
+        };
+        let (els, n_specs) = parsed;
+        let fmt_args: Vec<&IrExpr> = items[1..].iter().collect();
+        if fmt_args.iter().any(|a| matches!(a, IrExpr::Array(_))) {
+            return self.sh2_stub("exec", args, "exec");
+        }
+        let arg_exprs: Vec<String> = fmt_args.iter().map(|a| self.expr(a)).collect();
+        // a spec with flags/width/prec must keep the runtime builtin
+        let complex = els.iter().any(|(_, s)| match s {
+            Some((flags, width, prec, _)) => {
+                !flags.is_empty() || *width > 0 || prec.is_some()
+            }
+            None => false,
+        });
+        if complex {
+            return self.sh2_stub("exec", args, "exec");
+        }
+        let passes = if n_specs == 0 {
+            arg_exprs.len().max(1)
+        } else if arg_exprs.is_empty() {
+            1
+        } else {
+            (arg_exprs.len() + n_specs - 1) / n_specs
+        };
+        let mut pieces: Vec<String> = Vec::new();
+        if n_specs == 0 {
+            // no specs: the format text repeats once per arg
+            let text = Self::py_str(&Self::printf_unescape(fmt));
+            if passes > 1 {
+                pieces.push(format!("({text} * {passes})"));
+            } else {
+                pieces.push(text);
+            }
+        } else {
+            let mut ai = 0usize;
+            for _pass in 0..passes {
+                for (text, spec) in &els {
+                    if let Some((_, _, _, conv)) = spec {
+                        let arg = arg_exprs.get(ai).cloned().unwrap_or_else(|| "\"\"".into());
+                        ai += 1;
+                        match conv {
+                            's' => pieces.push(format!("str({arg})")),
+                            'd' | 'i' | 'u' => {
+                                self.need_atoi = true;
+                                pieces.push(format!("str(__sh_atoi({arg}))"));
+                            }
+                            _ => unreachable!("printf_parse gates the conversions"),
+                        }
+                    } else {
+                        pieces.push(Self::py_str(&Self::printf_unescape(text)));
+                    }
+                }
+            }
+        }
+        format!("sys.stdout.write({})", pieces.join(" + "))
+    }
+
+    /// Parse a printf format into (text-or-spec elements, n_specs); each
+    /// element is (text, Some((flags, width, prec, conv))) for a spec.
+    /// None when a conversion outside s/d/i/u/%% appears (the core gates
+    /// the same set — never a wrong byte).
+    fn printf_parse(fmt: &str) -> Option<(Vec<(String, Option<(String, usize, Option<usize>, char)>)>, usize)> {
+        let chars: Vec<char> = fmt.chars().collect();
+        let mut els: Vec<(String, Option<(String, usize, Option<usize>, char)>)> = Vec::new();
+        let mut text = String::new();
+        let mut pos = 0usize;
+        let mut n_specs = 0usize;
+        while pos < chars.len() {
+            if chars[pos] == '%' {
+                let mut i = pos + 1;
+                while i < chars.len() && matches!(chars[i], '-' | '+' | ' ' | '0' | '#') {
+                    i += 1;
+                }
+                let flags: String = chars[pos + 1..i].iter().collect();
+                let wstart = i;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let width: usize = if i > wstart {
+                    chars[wstart..i].iter().collect::<String>().parse().ok()?
+                } else {
+                    0
+                };
+                let mut prec = None;
+                if i < chars.len() && chars[i] == '.' {
+                    i += 1;
+                    let pstart = i;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if i > pstart {
+                        prec = Some(chars[pstart..i].iter().collect::<String>().parse().ok()?);
+                    } else {
+                        return None;
+                    }
+                }
+                while i < chars.len() && (chars[i] == 'l' || chars[i] == 'L') {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None;
+                }
+                let conv = chars[i];
+                if conv == '%' {
+                    text.push('%');
+                } else if matches!(conv, 's' | 'd' | 'i' | 'u') {
+                    if !text.is_empty() {
+                        els.push((std::mem::take(&mut text), None));
+                    }
+                    els.push((String::new(), Some((flags, width, prec, conv))));
+                    n_specs += 1;
+                } else {
+                    return None;
+                }
+                pos = i + 1;
+                continue;
+            }
+            text.push(chars[pos]);
+            pos += 1;
+        }
+        if !text.is_empty() {
+            els.push((text, None));
+        }
+        Some((els, n_specs))
+    }
+
+    /// Text-run backslash escapes (\n \t \r \a \b \f \v \\ and octal)
+    /// — mirrors printf_unescape in shir.rs.
+    fn printf_unescape(s: &str) -> String {
+        let mut out = s.to_string();
+        for (from, to) in [
+            ("\\n", "\n"),
+            ("\\t", "\t"),
+            ("\\r", "\r"),
+            ("\\a", "\x07"),
+            ("\\b", "\x08"),
+            ("\\f", "\x0c"),
+            ("\\v", "\x0b"),
+            ("\\\\", "\\"),
+        ] {
+            out = out.replace(from, to);
+        }
+        let chars: Vec<char> = out.chars().collect();
+        let mut res = String::with_capacity(out.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '\\' && i + 1 < chars.len() {
+                let mut oct = String::new();
+                let mut j = i + 1;
+                while j < chars.len() && oct.len() < 3 && matches!(chars[j], '0'..='7') {
+                    oct.push(chars[j]);
+                    j += 1;
+                }
+                if !oct.is_empty() {
+                    if let Some(c) = u32::from_str_radix(&oct, 8).ok().and_then(char::from_u32) {
+                        res.push(c);
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            res.push(chars[i]);
+            i += 1;
+        }
+        res
     }
 
     /// Mini `[ ... ]` evaluator for the common patterns; None → stub.
@@ -478,7 +886,9 @@ impl Render {
         });
         if !has_code {
             self.out.extend(scratch);
+            self.depth += 1;
             self.emit("pass");
+            self.depth -= 1;
         } else {
             self.out.extend(scratch);
         }
@@ -493,6 +903,18 @@ impl Render {
                         let v = self.expr(e);
                         self.emit(&format!("print({v})"));
                         return;
+                    }
+                    // break/continue calls inside a loop lower natively
+                    // (bash status verbs); outside a loop they keep the stub
+                    if self.loop_depth > 0 {
+                        if func == "break" {
+                            self.emit("break");
+                            return;
+                        }
+                        if func == "continue" {
+                            self.emit("continue");
+                            return;
+                        }
                     }
                 }
                 let x = self.expr(e);
@@ -515,6 +937,25 @@ impl Render {
                     return;
                 }
                 let name = self.py_ident(&t.var);
+                // `s = s += n` (arith Assign on the same target) → `s += n`
+                // (python forbids assignment inside an expression)
+                if let IrExpr::Arith(a) = expr {
+                    if let ArithAst::Assign { var, op, rhs } = &**a {
+                        if var == &t.var {
+                            let r = self.arith(rhs);
+                            let py_op = match op.as_str() {
+                                "+=" => "+=",
+                                "-=" => "-=",
+                                "*=" => "*=",
+                                "/=" => "/=",
+                                "%=" => "%=",
+                                _ => "=",
+                            };
+                            self.emit(&format!("{name} {py_op} {r}"));
+                            return;
+                        }
+                    }
+                }
                 let rhs = if self.is_num(&t.var) {
                     self.expr_as_num(expr)
                 } else {
@@ -598,16 +1039,22 @@ impl Render {
                 let v = self.py_ident(var);
                 let it = self.expr(iter);
                 self.emit(&format!("for {v} in {it}:"));
+                self.loop_depth += 1;
                 self.block(body);
+                self.loop_depth -= 1;
             }
             IrStmt::While { cond, body } => {
                 let c = self.expr(cond);
                 self.emit(&format!("while {c}:"));
+                self.loop_depth += 1;
                 self.block(body);
+                self.loop_depth -= 1;
             }
             IrStmt::DoWhile { body, cond, until } => {
                 self.emit("while True:");
+                self.loop_depth += 1;
                 self.block(body);
+                self.loop_depth -= 1;
                 let c = self.expr(cond);
                 if *until {
                     self.emit(&format!("if {c}:"));
@@ -728,6 +1175,15 @@ impl Render {
                 self.emit("    sys.exit(2)");
                 self.emit("");
             }
+        }
+        if self.need_atoi {
+            // printf %d/%i/%u args: parseInt(s, 10) || 0 semantics
+            self.emit("def __sh_atoi(s):");
+            self.emit("    try:");
+            self.emit("        return int(str(s).strip(), 10)");
+            self.emit("    except ValueError:");
+            self.emit("        return 0");
+            self.emit("");
         }
         // Subroutine definitions (before the body that calls them).
         for sub in &prog.subs {
