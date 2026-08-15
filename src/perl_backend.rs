@@ -3897,15 +3897,40 @@ impl Render {
         // bash `%q` (shell-quote the argument) — perl printf has no %q:
         // replace with %s and quote the value at runtime (the ANSI-C
         // `$'...'` form bash emits for non-printables)
-        let has_q = matches!(fmt, IrExpr::Str(s, _) if s.contains("%q"));
+        // the fmt arrives as Str or all-Lit Interpolate — normalize to text
+        let fmt_text: String = match fmt {
+            IrExpr::Str(s, _) => s.clone(),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                parts
+                    .iter()
+                    .map(|p| match p {
+                        InterpPart::Lit(s) => s.clone(),
+                        _ => String::new(),
+                    })
+                    .collect()
+            }
+            _ => String::new(),
+        };
+        let has_q = fmt_text.contains("%q");
         // bash `%b` interprets backslash escapes in the ARGUMENT; perl
         // has no %b — unescape literal args so the output matches
-        let has_b = matches!(fmt, IrExpr::Str(s, _) if s.contains("%b"));
-        let has_b = matches!(fmt, IrExpr::Str(s, _) if s.contains("%b"));
-        let words: Vec<IrExpr> = if has_q {
+        let has_b = fmt_text.contains("%b");
+        let words: Vec<IrExpr> = if has_q || has_b {
             let mut ws = words.to_vec();
-            if let IrExpr::Str(s, _) = &mut ws[0] {
-                *s = s.replace("%q", "%s");
+            match &mut ws[0] {
+                IrExpr::Str(s, _) => {
+                    *s = s.replace("%q", "%s").replace("%b", "%s");
+                }
+                IrExpr::Interpolate(parts) => {
+                    for p in parts.iter_mut() {
+                        if let InterpPart::Lit(s) = p {
+                            *s = s.replace("%q", "%s").replace("%b", "%s");
+                        }
+                    }
+                }
+                _ => {}
             }
             ws
         } else {
@@ -3950,10 +3975,26 @@ impl Render {
             .map(|(idx, w)| {
                 let e = self.expr(w);
                 if has_b {
-                    if let IrExpr::Str(s, _) = w {
-                        Self::perl_str(&bash_printf_unescape(s))
-                    } else {
-                        e
+                    let lit: Option<String> = match w {
+                        IrExpr::Str(s, _) => Some(s.clone()),
+                        IrExpr::Interpolate(parts)
+                            if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+                        {
+                            Some(
+                                parts
+                                    .iter()
+                                    .map(|p| match p {
+                                        InterpPart::Lit(s) => s.clone(),
+                                        _ => String::new(),
+                                    })
+                                    .collect(),
+                            )
+                        }
+                        _ => None,
+                    };
+                    match lit {
+                        Some(s) => Self::perl_str(&bash_printf_unescape(&s)),
+                        None => e,
                     }
                 } else if has_q && idx == 0 {
                     format!(
