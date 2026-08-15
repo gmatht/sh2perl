@@ -74,6 +74,12 @@ pub struct Render {
     assoc: BTreeSet<String>,
     /// shell functions defined in the program
     functions: BTreeSet<String>,
+    /// `typeset -i` vars (integer attribute — text assigns are arith)
+    int_vars: BTreeSet<String>,
+    /// `typeset -l` vars (lowercase attribute)
+    lower_vars: BTreeSet<String>,
+    /// `typeset -u` vars (uppercase attribute)
+    upper_vars: BTreeSet<String>,
     /// var -> captured local (background-thread bodies)
     captured: HashMap<String, String>,
     /// runtime helper fns needed (dependency closure)
@@ -131,6 +137,23 @@ impl Render {
 
     fn mark_written(&mut self, name: &str) {
         self.written.insert(name.to_string());
+    }
+
+    /// A function's Rust identifier — distinct from the var namespace
+    /// (`myfunc` the var vs `myfunc()` the function can coexist).
+    /// Wrap a value expr with the var's -l/-u attribute conversion.
+    fn case_attr(&mut self, name: &str, v: &str) -> String {
+        if self.lower_vars.contains(name) {
+            format!("({v}).to_lowercase()")
+        } else if self.upper_vars.contains(name) {
+            format!("({v}).to_uppercase()")
+        } else {
+            v.to_string()
+        }
+    }
+
+    fn fn_ident(&mut self, name: &str) -> String {
+        format!("{}_fn", self.rust_ident(name))
     }
 
     /// Write an i64 value to a var (num cell, str cell or array elem 0).
@@ -216,7 +239,7 @@ impl Render {
     // ── var classification ───────────────────────────────────────────
 
     fn is_num(&self, name: &str) -> bool {
-        self.var_types.get(name).copied() == Some(IrType::Int)
+        self.var_types.get(name).copied() == Some(IrType::Int) || self.int_vars.contains(name)
     }
 
     fn is_array(&self, name: &str) -> bool {
@@ -693,7 +716,10 @@ impl Render {
                 }
             }
             IrExpr::Call { func, args } if func == "assign" => {
-                format!("({} != 0)", self.assign_call_str(args))
+                // run the assignment; the lhs's rc (e.g. a capture's)
+                // decides the condition
+                let block = self.assign_call_str(args);
+                format!("{{ let _ = {block}; __SH_RC.load(Ordering::SeqCst) == 0 }}")
             }
             IrExpr::Call { func, args } if func == "return" => {
                 "{ __SH_RC.store(0, Ordering::SeqCst); return; }".to_string()
@@ -890,7 +916,8 @@ impl Render {
             ArithAst::Var(name) | ArithAst::Ident(name) => self.getvar_num(name),
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
-                self.array_elem(var, &k)
+                let e = self.array_elem(var, &k);
+                format!("{e}.trim().parse::<i64>().unwrap_or(0)")
             }
             ArithAst::Bin { op, lhs, rhs } => {
                 let l = self.arith(lhs);
@@ -1288,7 +1315,16 @@ impl Render {
 
     /// bash `cd` — chdir + PWD sync; returns a bool block expr.
     fn cd_expr(&mut self, words: &[&IrExpr]) -> String {
-        let dir = match words.first() {
+        // `cd -- dir` / `cd -` — skip the flag words
+        let mut rest = words;
+        while let Some(IrExpr::Str(f, _)) = rest.first().copied() {
+            if f == "--" || f == "-" {
+                rest = &rest[1..];
+            } else {
+                break;
+            }
+        }
+        let dir = match rest.first() {
             Some(w) => self.expr_str(w),
             None => {
                 self.add_helper("env");
@@ -1310,16 +1346,24 @@ impl Render {
         while i < words.len() {
             if let Some(ws) = str_arg(&[(*words[i]).clone()], 0) {
                 if ws.starts_with('-') {
-                    // -a / -A / -x / -r / -i / -n / -p — the -a/-A mark the
-                    // NEXT name as an array/assoc; the rest are no-ops.
-                    if ws == "-a" || ws == "-A" {
+                    // -a / -A / -x / -r / -i / -l / -u / -n / -p — the
+                    // -a/-A mark the NEXT name as an array/assoc; -i/-l/-u
+                    // set attributes.
+                    if ws == "-a" || ws == "-A" || ws == "-i" || ws == "-l" || ws == "-u" {
                         if let Some(n) = words.get(i + 1).and_then(|w| {
-                            str_arg(&[(*w).clone()], 0).map(|s| s.to_string())
+                            str_arg(&[(*w).clone()], 0)
+                                .map(|s| s.split('=').next().unwrap_or(s).to_string())
                         }) {
                             if ws == "-A" {
                                 self.assoc.insert(n.clone());
-                            } else {
+                            } else if ws == "-a" {
                                 self.arrays.insert(n.clone());
+                            } else if ws == "-i" {
+                                self.int_vars.insert(n.clone());
+                            } else if ws == "-l" {
+                                self.lower_vars.insert(n.clone());
+                            } else if ws == "-u" {
+                                self.upper_vars.insert(n.clone());
                             }
                             self.mark_written(&n);
                         }
@@ -1363,7 +1407,14 @@ impl Render {
                             self.mark_todo("array word assign");
                             String::new()
                         } else {
-                            self.write_str(&name, &Self::rust_str_expr(val))
+                            let v = if val.contains('$') {
+                                // `local file=$1` — the value is source text
+                                self.dollar_interp(val)
+                            } else {
+                                Self::rust_str_expr(val)
+                            };
+                            let cv = self.case_attr(&name, &v);
+                            self.write_str(&name, &cv)
                         };
                         self.emit(&stmt);
                         self.mark_written(&name.to_string());
@@ -2655,7 +2706,7 @@ impl Render {
         format!(
             "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = __sh_cat(&[{}]); {}(); *__SH_ARGV.lock().unwrap() = __old; }}",
             ws.join(", "),
-            self.rust_ident(name)
+            self.fn_ident(name)
         )
     }
 
@@ -2665,7 +2716,7 @@ impl Render {
         format!(
             "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = __sh_cat(&[{}]); {}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RC.load(Ordering::SeqCst) == 0 }}",
             ws.join(", "),
-            self.rust_ident(name)
+            self.fn_ident(name)
         )
     }
 
@@ -3096,7 +3147,27 @@ impl Render {
     }
 
     fn assign_call_str(&mut self, args: &[IrExpr]) -> String {
-        format!("({}).to_string()", self.assign_call_num(args))
+        let Some(name) = str_arg(args, 0).map(|s| s.to_string()) else {
+            return "String::new()".to_string();
+        };
+        let op = str_arg(args, 1).unwrap_or("=").to_string();
+        let val = args
+            .get(2)
+            .map(|v| self.expr_str(v))
+            .unwrap_or_else(|| "String::new()".to_string());
+        self.mark_written(&name);
+        // a num-typed target keeps the arith write (`x=$(…)` where x is
+        // Int); everything else gets the string value
+        if self.is_num(&name) || op != "=" {
+            let n = self.assign_call_num(args);
+            format!("({n}).to_string()")
+        } else if self.is_array(&name) {
+            let stmt = self.array_elem_set(&name, "0", &val);
+            format!("{{ let __v = {val}; {stmt} __v }}")
+        } else {
+            let stmt = self.write_str(&name, &val);
+            format!("{{ let __v = {val}; {stmt} __v }}")
+        }
     }
 
     /// setArray as a bool block.
@@ -3222,6 +3293,7 @@ impl Render {
                 if targets.len() > 1 {
                     self.mark_todo("multi-target assign");
                 }
+                let has_capture = expr_mentions_capture(expr);
                 let rhs = self.expr_any(expr);
                 // `arr[i]=v` — the var text carries the index
                 if let Some(open) = t.var.find('[') {
@@ -3239,7 +3311,9 @@ impl Render {
                             let st = self.array_elem_set(&var, &k, &rhs);
                             self.emit(&st);
                         }
-                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        if !has_capture {
+                            self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        }
                         return;
                     }
                 }
@@ -3256,14 +3330,28 @@ impl Render {
                 } else if self.is_assoc(&t.var) {
                     self.mark_todo("assoc bare assign");
                 } else if self.is_num(&t.var) {
-                    let n = self.expr_num(expr);
+                    // `typeset -i n; n='n+1'` — the -i attribute makes the
+                    // text an arithmetic expression
+                    let n = match expr {
+                        IrExpr::Str(s, _) => {
+                            if let Some(e) = self.arith_text(s) {
+                                e
+                            } else {
+                                self.expr_num(expr)
+                            }
+                        }
+                        _ => self.expr_num(expr),
+                    };
                     let st = self.write_num(&t.var, &n);
                     self.emit(&st);
                 } else {
-                    let st = self.write_str(&t.var, &rhs);
+                    let v = self.case_attr(&t.var, &rhs);
+                    let st = self.write_str(&t.var, &v);
                     self.emit(&st);
                 }
-                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                if !has_capture {
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                }
             }
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
@@ -3336,6 +3424,12 @@ impl Render {
                     for s in else_ {
                         self.stmt(s);
                     }
+                    self.depth -= 1;
+                } else {
+                    // no branch ran — bash's if rc is 0
+                    self.emit("} else {");
+                    self.depth += 1;
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                     self.depth -= 1;
                 }
                 self.emit("}");
@@ -3622,8 +3716,10 @@ impl Render {
         for p in pre {
             self.emit(&p);
         }
+        // detached thread — the body runs on a copy (bash `{ ... } &`
+        // forks; the handle is dropped, the thread is never joined)
         self.emit(&format!(
-            "__SH_BG.lock().unwrap().push(std::thread::spawn(move || {{\n{body_src}\n}}));"
+            "let _ = std::thread::spawn(move || {{\n{body_src}\n}});"
         ));
     }
 
@@ -3634,6 +3730,7 @@ impl Render {
         let mut written: BTreeSet<String> = BTreeSet::new();
         collect_written(&prog.stmts, &mut written);
         collect_arrays(&prog.stmts, &mut self.arrays, &mut self.assoc);
+        collect_attrs(&prog.stmts, &mut self.int_vars, &mut self.lower_vars, &mut self.upper_vars);
         collect_functions(&prog.stmts, &mut self.functions);
         for (n, _) in &prog.var_types {
             written.insert(n.clone());
@@ -3685,7 +3782,7 @@ impl Render {
             if *named {
                 self.mark_todo(&format!("function {name} named blocks"));
             }
-            let m = self.rust_ident(name);
+            let m = self.fn_ident(name);
             self.emit(&format!("fn {m}() {{"));
             self.depth += 1;
             for st in body {
@@ -3774,7 +3871,8 @@ impl Render {
             self.write_num(name, &n)
         } else {
             let v = self.expr_any(e);
-            self.write_str(name, &v)
+            let cv = self.case_attr(name, &v);
+            self.write_str(name, &cv)
         }
     }
 }
@@ -4797,7 +4895,11 @@ impl Render {
                     })
                     .collect();
                 if parts.len() == b.len() {
-                    Some(format!("format!(\"({{}}; {{}})\", {})", parts.join(", ")))
+                    if parts.len() == 1 {
+                        Some(format!("format!(\"({{}})\", {})", parts[0]))
+                    } else {
+                        Some(format!("format!(\"({{}}; {{}})\", {})", parts.join(", ")))
+                    }
                 } else {
                     None
                 }
@@ -5286,6 +5388,10 @@ impl<'a, 'r> TestParser<'a, 'r> {
             "-N" => {
                 self.render.add_helper("fnewer");
                 format!("__sh_fnewer(&{operand})")
+            }
+            "-t" => {
+                // `[ -t N ]` — a TTY test; the gate's fds are not TTYs
+                "false".to_string()
             }
             _ => format!("(!{operand}.is_empty())"),
         }
@@ -6148,6 +6254,25 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             }
         }
         IrExpr::Call { func, args } => {
+            // `assign(name, op, val)` — the arith-assignment writes name
+            if func == "assign" {
+                if let Some(name) = str_arg(args, 0) {
+                    out.insert(name.to_string());
+                }
+            }
+            // `${x:=default}` — the assignment writes x
+            if func == "param" {
+                let op = str_arg(args, 0).unwrap_or("");
+                if op == "=" || op == ":=" {
+                    if let Some(name) = str_arg(args, 1) {
+                        if !name.is_empty()
+                            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        {
+                            out.insert(name.to_string());
+                        }
+                    }
+                }
+            }
             // exec builtins that WRITE vars: read targets, let targets,
             // declaration word-assigns, unset — the hoist must know them
             if func == "exec" {
@@ -6161,6 +6286,17 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                                 if let Some(n) = str_arg(&[(*w).clone()], 0) {
                                     if !n.starts_with('-') && !n.is_empty() {
                                         out.insert(n.to_string());
+                                    }
+                                }
+                            }
+                        } else if cmd == "printf" {
+                            // `printf -v name ...` — the target is written
+                            if let Some(IrExpr::Str(f, _)) = words.first() {
+                                if f == "-v" {
+                                    if let Some(n) = words.get(1).and_then(|w| {
+                                        str_arg(&[(*w).clone()], 0).map(|s| s.to_string())
+                                    }) {
+                                        out.insert(n);
                                     }
                                 }
                             }
@@ -6340,11 +6476,9 @@ fn collect_arrays(stmts: &[IrStmt], arrays: &mut BTreeSet<String>, assoc: &mut B
                     if let Some(open) = t.var.find('[') {
                         if t.var.ends_with(']') {
                             let var = t.var[..open].to_string();
-                            // only index arrays when the key looks numeric
-                            let key = &t.var[open + 1..t.var.len() - 1];
-                            if key.parse::<i64>().is_ok() || key.starts_with('$') {
-                                arrays.insert(var);
-                            }
+                            // an index-array write (the assoc set, built
+                            // from `declare -A`, decides the map flavor)
+                            arrays.insert(var);
                         }
                     }
                 }
@@ -6458,6 +6592,27 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
                                 }
                             }
                         }
+                        // `declare -A map` / `local -A map` / `declare -a arr`
+                        if let Some(IrExpr::Array(words)) = args.get(1) {
+                            let mut flags: Vec<String> = Vec::new();
+                            let mut names: Vec<String> = Vec::new();
+                            for w in words {
+                                if let Some(t) = str_arg(&[(*w).clone()], 0) {
+                                    if t.starts_with('-') {
+                                        flags.push(t.to_string());
+                                    } else {
+                                        names.push(t.to_string());
+                                    }
+                                }
+                            }
+                            for n in names {
+                                if flags.iter().any(|f| f == "-A" || f == "-aA") {
+                                    assoc.insert(n);
+                                } else if flags.iter().any(|f| f == "-a") {
+                                    arrays.insert(n);
+                                }
+                            }
+                        }
                     }
                 }
                 "param" => {
@@ -6512,7 +6667,27 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
 }
 
 /// `name[` inside a let/arith TEXT → the var name (hoisted arrays).
-fn collect_array_names_from_text(t: &str, out: &mut BTreeSet<String>) {
+fn expr_mentions_capture(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Capture { .. } => true,
+            IrExpr::Call { args, .. } => args.iter().any(expr_mentions_capture),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                expr_mentions_capture(lhs) || expr_mentions_capture(rhs)
+            }
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                InterpPart::Expr(x) => expr_mentions_capture(x),
+                InterpPart::Lit(_) => false,
+            }),
+            IrExpr::Ternary { cond, then, else_ } => {
+                expr_mentions_capture(cond)
+                    || expr_mentions_capture(then)
+                    || expr_mentions_capture(else_)
+            }
+            _ => false,
+        }
+    }
+
+    fn collect_array_names_from_text(t: &str, out: &mut BTreeSet<String>) {
     let ch: Vec<char> = t.chars().collect();
     let mut i = 0;
     while i < ch.len() {
@@ -6583,6 +6758,79 @@ fn collect_functions(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     collect_functions(st, out);
                 }
             }
+            _ => {}
+        }
+    }
+}
+
+/// `typeset -i/-l/-u name` — the attribute flags, collected up front
+/// so the DECLARATION (and any earlier statement) sees the right type.
+fn collect_attrs(
+    stmts: &[IrStmt],
+    ints: &mut BTreeSet<String>,
+    lowers: &mut BTreeSet<String>,
+    uppers: &mut BTreeSet<String>,
+) {
+    for s in stmts {
+        match s {
+            IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+                if let Some(cmd) = str_arg(args, 0) {
+                    if matches!(cmd, "declare" | "typeset" | "local") {
+                        if let Some(IrExpr::Array(words)) = args.get(1) {
+                            let mut flags: Vec<String> = Vec::new();
+                            for w in words {
+                                if let Some(t) = str_arg(&[(*w).clone()], 0) {
+                                    if t.starts_with('-') {
+                                        flags.push(t.to_string());
+                                    } else {
+                                        let n = t.split('=').next().unwrap_or(t).to_string();
+                                        if flags.iter().any(|f| f == "-i") {
+                                            ints.insert(n.clone());
+                                        }
+                                        if flags.iter().any(|f| f == "-l") {
+                                            lowers.insert(n.clone());
+                                        }
+                                        if flags.iter().any(|f| f == "-u") {
+                                            uppers.insert(n);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                collect_attrs(b, ints, lowers, uppers)
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_attrs(then, ints, lowers, uppers);
+                for (_, b) in elsifs {
+                    collect_attrs(b, ints, lowers, uppers);
+                }
+                collect_attrs(else_, ints, lowers, uppers);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                collect_attrs(body, ints, lowers, uppers)
+            }
+            IrStmt::For { body, .. } => collect_attrs(body, ints, lowers, uppers),
+            IrStmt::ForInit { init, step, body, .. } => {
+                collect_attrs(init, ints, lowers, uppers);
+                collect_attrs(step, ints, lowers, uppers);
+                collect_attrs(body, ints, lowers, uppers);
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_attrs(&c.body, ints, lowers, uppers);
+                }
+            }
+            IrStmt::Redirect { inner, .. } => collect_attrs(inner, ints, lowers, uppers),
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_attrs(st, ints, lowers, uppers);
+                }
+            }
+            IrStmt::Function { body, .. } => collect_attrs(body, ints, lowers, uppers),
             _ => {}
         }
     }
