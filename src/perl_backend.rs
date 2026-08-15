@@ -2391,7 +2391,14 @@ impl Render {
                     self.mark_todo("setArray args");
                     return "0".into();
                 };
-                let is_assoc = matches!(args.get(2), Some(IrExpr::Bool(true)));
+                // assoc-ness comes from EITHER the explicit third arg (the
+                // core's `declare -A map=(...)` literal form) OR a prior
+                // `declare -A name` statement (standalone `map=([k]=v)`
+                // setArray carries no flag — py-sh-go t73_dict.py, and the
+                // core emits the same shape). Mirrors the estree runtime's
+                // `isAssoc || assocNames.has(nm)`.
+                let is_assoc = matches!(args.get(2), Some(IrExpr::Bool(true)))
+                    || self.hashes.contains(&name);
                 // a capture element that yields EMPTY contributes NO element
                 // (bash: `arr=(`empty-cmd`)` → zero elements)
                 // bash word-splits a cmdsub's output into array elements
