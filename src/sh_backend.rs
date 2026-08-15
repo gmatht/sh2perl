@@ -1020,16 +1020,31 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("if ");
             out.push_str(&cmd_to_sh(cond)?);
             out.push_str("; then\n");
-            for b in then {
-                stmt_to_sh(b, d + 1, out)?;
+            if then.is_empty() {
+                // bash rejects an EMPTY then/elif branch (`if c; then\nelse`
+                // is a syntax error) — a `:` no-op keeps the structure. The
+                // goto-restructure pass emits exactly this shape (an inverted
+                // guarded goto: `if (c) {} else { skipped }` — t29_goto.cc,
+                // t31_goto_forward.c).
+                indent(out, d + 1);
+                out.push_str(":\n");
+            } else {
+                for b in then {
+                    stmt_to_sh(b, d + 1, out)?;
+                }
             }
             for (econd, ebody) in elsifs {
                 indent(out, d);
                 out.push_str("elif ");
                 out.push_str(&cmd_to_sh(econd)?);
                 out.push_str("; then\n");
-                for b in ebody {
-                    stmt_to_sh(b, d + 1, out)?;
+                if ebody.is_empty() {
+                    indent(out, d + 1);
+                    out.push_str(":\n");
+                } else {
+                    for b in ebody {
+                        stmt_to_sh(b, d + 1, out)?;
+                    }
                 }
             }
             if !else_.is_empty() {
@@ -1212,8 +1227,51 @@ fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
             out.push_str("}\n");
             Ok(())
         }
-        // sh has no try/except — refuse (the gate reports it as a FAIL)
-        IrStmt::Try { .. } => Err("try/except has no sh rendering".into()),
+        // try/except/else/finally — Python-style exception handling. sh
+        // has no exceptions; the only failure signal is the exit status,
+        // so the except clause runs when the try body's LAST command
+        // failed, else_ runs when it succeeded, finally always runs (the
+        // corpus bodies are print-only — exact; a failing-command body is
+        // a documented approximation).
+        IrStmt::Try {
+            body,
+            excepts,
+            else_body,
+            finally_body,
+        } => {
+            indent(out, d);
+            if body.is_empty() {
+                out.push_str("{ :; }\n");
+            } else {
+                out.push_str("{\n");
+                for b in body {
+                    stmt_to_sh(b, d + 1, out)?;
+                }
+                indent(out, d);
+                out.push_str("}\n");
+            }
+            if !excepts.is_empty() {
+                indent(out, d);
+                out.push_str("if [ $? -ne 0 ]; then\n");
+                for b in &excepts[0].body {
+                    stmt_to_sh(b, d + 1, out)?;
+                }
+                indent(out, d);
+                out.push_str("fi\n");
+            } else if !else_body.is_empty() {
+                indent(out, d);
+                out.push_str("if [ $? -eq 0 ]; then\n");
+                for b in else_body {
+                    stmt_to_sh(b, d + 1, out)?;
+                }
+                indent(out, d);
+                out.push_str("fi\n");
+            }
+            for b in finally_body {
+                stmt_to_sh(b, d, out)?;
+            }
+            Ok(())
+        }
         // sh has no select-on-channels — refuse loudly
         IrStmt::Select { .. } => Err("select has no sh rendering".into()),
         // inline asm has no sh rendering — refuse loudly
@@ -1491,6 +1549,26 @@ fn set_array_to_sh(name: &str, items: &str, append: bool) -> String {
     if items.is_empty() {
         return format!("{name}_len=0");
     }
+    // the KEYED literal form — `d=([a]=1 [b]=2)` (Python dicts / bash
+    // assoc literals, triage-sh py-sh-go t73_dict): each item is `[k]=v`
+    // (arrives single-quoted) — write the per-key element + key list
+    // (the `${!map[@]}` / `${map[*]}` iterate the list)
+    let items_clean = items.trim().trim_start_matches(['\'', '"']);
+    if items_clean.starts_with('[') {
+        let mut parts = Vec::new();
+        for raw in items.split(' ') {
+            let it = raw
+                .trim()
+                .trim_start_matches(['\'', '"'])
+                .trim_end_matches(['\'', '"']);
+            let Some(rest) = it.strip_prefix('[') else { continue };
+            let Some((key, val)) = rest.split_once("]=") else { continue };
+            parts.push(format!("{name}_{key}={val}"));
+            parts.push(format!("{name}_len=$(( ${{{name}_len:-0}} + 1 ))"));
+            parts.push(format!("{name}_keys=\"${{{name}_keys:-}} {key}\""));
+        }
+        return parts.join("; ");
+    }
     if items.contains('$') && !append {
         return format!(
             "{name}_len=0; for _w in {items}; do eval \"{name}_${{{name}_len}}=\\\"\\$_w\\\"\"; {name}_len=$(({name}_len + 1)); done"
@@ -1644,6 +1722,84 @@ fn quote_test_expansions(s: &str) -> String {
     out
 }
 
+/// One comparison atom of a test string (`"$a" == "b"`, `"$s" =~ ^h`,
+/// `-f /x` …) → a single sh cond command. The `==`/`!=`/`=` forms lower
+/// to the case emulation (dash has no `==`), `=~` to a grep -E pipeline,
+/// everything else stays in `[ ]` (POSIX operators).
+fn test_cmp_to_sh(t: &str) -> Result<String, String> {
+    if let Some((lhs, rhs)) = split_test_op(t, "==") {
+        // pattern match: case emulation (dash has no == in test)
+        // A leading `!` negates the WHOLE match (`[[ ! "1" ==
+        // "2" ]]`) — strip it and prefix `! ` (valid before a
+        // case in dash and bash). Without this the `!` lands
+        // inside the quoted lhs (`"!"1"` — a literal).
+        let negate = lhs.starts_with('!');
+        let lhs = lhs.trim_start_matches('!');
+        let case: String = if let Some((neg, rest)) =
+            rhs.strip_prefix("!(").and_then(|r| r.split_once(')'))
+        {
+            // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`:
+            //   case "$s" in *Y) case "$s" in P Y) false;; *) :;; esac;; *) false;; esac
+            format!(
+                "case \"{lhs}\" in *{rest}) case \"{lhs}\" in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
+            )
+        } else if let Some(inner) =
+            rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')'))
+        {
+            // extglob list match: `@(a|b)` == `a|b`
+            format!("case \"{lhs}\" in {inner}) : ;; *) false ;; esac")
+        } else if let Some(inner) =
+            rhs.strip_prefix("?(").and_then(|r| r.strip_suffix(')'))
+        {
+            // optional: `?(a|b)` matches empty or a|b
+            format!("case \"{lhs}\" in |{inner}) : ;; *) false ;; esac")
+        } else if *NOCASEMATCH.lock().unwrap() {
+            format!(
+                "case \"{lhs}\" in {}) : ;; *) false ;; esac",
+                fold_case_pattern(&rhs)
+            )
+        } else {
+            format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac")
+        };
+        if negate {
+            Ok(format!("! {case}"))
+        } else {
+            Ok(case)
+        }
+    } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
+        Ok(format!("case \"{lhs}\" in {rhs}) false ;; *) : ;; esac"))
+    } else if let Some((lhs, rhs)) = split_test_op(t, "=~") {
+        // regex match: grep -E ([[ =~ ]] semantics)
+        Ok(format!("printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"))
+    } else if let Some((lhs, rhs)) = split_test_op(t, "=") {
+        // single `=` — the go-sh frontend's pattern tests
+        // (`strings.HasPrefix/Contains` lower to `"$s"=h*`,
+        // triage-sh-20260815-175001): the estree reference
+        // treats `=` as a GLOB pattern match (its string-op
+        // scan), so render the same case emulation as `==`.
+        // `<=`/`>=` are NOT operators — the `=` inside them
+        // must not split (fall back to the `[ ]` literal
+        // form).
+        if lhs.ends_with(['<', '>']) {
+            let t = quote_test_expansions(&space_test_ops(t));
+            Ok(format!("[ {t} ]"))
+        } else if lhs.contains('~') || rhs.contains('~') {
+            // tilde expansion: `[ ~ = "$HOME" ]` (043_home.sh) —
+            // the case emulation QUOTES the lhs and would
+            // suppress the tilde; `[ ]` tilde-expands natively.
+            let t = quote_test_expansions(&space_test_ops(t));
+            Ok(format!("[ {t} ]"))
+        } else {
+            Ok(format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac"))
+        }
+    } else {
+        // quote bare $(...) and ${...} so word-splitting
+        // in `[ ]` does not shred cmdsub output
+        let t = quote_test_expansions(&space_test_ops(t));
+        Ok(format!("[ {t} ]"))
+    }
+}
+
 fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
     match e {
         IrExpr::Call { func, args } => match func.as_str() {
@@ -1659,62 +1815,79 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 exec_line_to_sh(arg(args, 0)?, words, env)
             }
             "test" => {
-                let t = raw_arg(args, 0)?;
-                let t = t.trim();
+                let raw = raw_arg(args, 0)?;
+                let t = raw.trim();
                 // `[[ ... ]]`-style compound tests survive as raw text; `[ ]`
                 // cannot express &&/||, so keep those in [[ ]] form.
                 if t.contains("&&") || t.contains("||") {
-                    Ok(format!("[[ {t} ]]"))
-                } else if let Some((lhs, rhs)) = split_test_op(t, "==") {
-                    // pattern match: case emulation (dash has no == in test)
-                    // A leading `!` negates the WHOLE match (`[[ ! "1" ==
-                    // "2" ]]`) — strip it and prefix `! ` (valid before a
-                    // case in dash and bash). Without this the `!` lands
-                    // inside the quoted lhs (`"!"1"` — a literal).
-                    let negate = lhs.starts_with('!');
-                    let lhs = lhs.trim_start_matches('!');
-                    let case: String = if let Some((neg, rest)) =
-                        rhs.strip_prefix("!(").and_then(|r| r.split_once(')'))
-                    {
-                        // extglob negation `!(P)Y` ≡ `*Y` minus `P Y`:
-                        //   case "$s" in *Y) case "$s" in P Y) false;; *) :;; esac;; *) false;; esac
-                        format!(
-                            "case \"{lhs}\" in *{rest}) case \"{lhs}\" in {neg}{rest}) false ;; *) : ;; esac ;; *) false ;; esac"
-                        )
-                    } else if let Some(inner) =
-                        rhs.strip_prefix("@(").and_then(|r| r.strip_suffix(')'))
-                    {
-                        // extglob list match: `@(a|b)` == `a|b`
-                        format!("case \"{lhs}\" in {inner}) : ;; *) false ;; esac")
-                    } else if let Some(inner) =
-                        rhs.strip_prefix("?(").and_then(|r| r.strip_suffix(')'))
-                    {
-                        // optional: `?(a|b)` matches empty or a|b
-                        format!("case \"{lhs}\" in |{inner}) : ;; *) false ;; esac")
-                    } else if *NOCASEMATCH.lock().unwrap() {
-                        format!(
-                            "case \"{lhs}\" in {}) : ;; *) false ;; esac",
-                            fold_case_pattern(&rhs)
-                        )
-                    } else {
-                        format!("case \"{lhs}\" in {rhs}) : ;; *) false ;; esac")
-                    };
-                    if negate {
-                        Ok(format!("! {case}"))
-                    } else {
-                        Ok(case)
-                    }
-                } else if let Some((lhs, rhs)) = split_test_op(t, "!=") {
-                    Ok(format!("case \"{lhs}\" in {rhs}) false ;; *) : ;; esac"))
-                } else if let Some((lhs, rhs)) = split_test_op(t, "=~") {
-                    // regex match: grep -E ([[ =~ ]] semantics)
-                    Ok(format!("printf '%s\\n' \"{lhs}\" | grep -Eq '{rhs}'"))
-                } else {
-                    // quote bare $(...) and ${...} so word-splitting
-                    // in `[ ]` does not shred cmdsub output
-                    let t = quote_test_expansions(&space_test_ops(t));
-                    Ok(format!("[ {t} ]"))
+                    return Ok(format!("[[ {t} ]]"));
                 }
+                // perl-frontend `! ( "$name" == "x" )` groups (unless/not,
+                // t02_control): the negation + paren wrapper must not leak
+                // into the op split. `[ ! a -o b ]` semantics: `!` negates
+                // the WHOLE expression — track parity, strip one outer
+                // paren group, and re-apply `! ` to the joined command.
+                let mut negate = false;
+                let mut tt = t;
+                while let Some(rest) = tt.strip_prefix('!') {
+                    negate = !negate;
+                    tt = rest.trim();
+                }
+                if let Some(inner) = tt.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+                    tt = inner.trim();
+                }
+                if tt.is_empty() {
+                    // degenerate `!` / `( )` — keep the raw literal form
+                    return Ok(format!("[ {t} ]"));
+                }
+                // `-o` / `-a` connectors with emulated comparison atoms
+                // (`"$s" =~ l -o "$s" =~ x` — the perl frontend lowers
+                // `||` to `-o`, t68_case_glob): POSIX `[ ]` cannot mix `=~`
+                // with `-o` and `[[ ]]` rejects `-o` — split into separate
+                // cond commands (`-a` binds tighter than `-o`). File-test
+                // connectors (`-f x -o -d y`, valid `[ ]` today) are
+                // untouched — the split only fires when a comparison op
+                // that needs the case/grep emulation is present.
+                let mut rendered;
+                if (tt.contains(" -o ") || tt.contains(" -a "))
+                    && (tt.contains("=~") || tt.contains("==") || tt.contains("!=") || tt.contains('='))
+                {
+                    rendered = String::new();
+                    for (i, orpart) in tt.split(" -o ").enumerate() {
+                        if i > 0 {
+                            rendered.push_str(" || ");
+                        }
+                        for (j, apart) in orpart.split(" -a ").enumerate() {
+                            if j > 0 {
+                                rendered.push_str(" && ");
+                            }
+                            rendered.push_str(&test_cmp_to_sh(apart.trim())?);
+                        }
+                    }
+                } else {
+                    rendered = test_cmp_to_sh(tt)?;
+                }
+                if negate {
+                    rendered = format!("! {rendered}");
+                }
+                Ok(rendered)
+            }
+            // the py-sh-go pattern-dispatch cond (t68_case_glob): true
+            // when the word matches ANY of the case patterns — the same
+            // case emulation as the `==` test arm
+            "caseMatch" => {
+                let word = word_to_sh(arg(args, 0)?)?;
+                // patterns stay RAW — a quoted pattern in case is a
+                // LITERAL (`'h*'` never matches hello)
+                let mut out = format!("case \"{word}\" in ");
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for it in items {
+                        let p = str_arg(it)?;
+                        out.push_str(&format!("{p}) : ;; "));
+                    }
+                }
+                out.push_str("*) false ;; esac");
+                Ok(out)
             }
             "pipeline" => {
                 let stages = pipeline_stages(args)?;
@@ -1810,7 +1983,17 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
                 let name = raw_arg(args, 0)?;
                 Ok(set_array_to_sh(&name, &array_items(args, 1)?, true))
             }
-            "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?, false)),
+            "assocSet" => {
+                // the go-sh map-literal store (`m := map[K]V{...}` — one
+                // assocSet per pair, triage-sh-20260815-175002): the
+                // by-name associative-array write — the same POSIX
+                // per-element lowering as setArray (`m_c=C`).
+                let name = raw_arg(args, 0)?;
+                let key = raw_arg(args, 1)?;
+                let value = word_to_sh(arg(args, 2)?)?;
+                Ok(format!("{}_{}={}", arr_base(&name), key, value))
+            }
+            "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?.replace('.', "_"), false)),
             "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
             "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
             "contains" => {
@@ -1877,10 +2060,13 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
             "setVar" => {
                 // the runtime's plain store write — re-emit as a shell
                 // assignment (the A1 store protocol the perl/posix
-                // frontends emit for return values / locals)
+                // frontends emit for return values / locals). Dotted
+                // names (the cpp/c struct-field protocol `p.x`) are not
+                // valid shell identifiers — sanitize to `p_x` (the
+                // getVar arms mirror the same rewrite).
                 let name = raw_arg(args, 0)?;
                 let value = word_to_sh(arg(args, 1)?)?;
-                Ok(format!("{name}={value}"))
+                Ok(format!("{}={value}", name.replace('.', "_")))
             }
             other => Err(format!("command call not renderable: {other:?}")),
         },
@@ -3153,9 +3339,71 @@ fn word_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Interpolate(parts) => interp_to_sh(parts),
         IrExpr::Arith(a) => Ok(format!("$(({}))", arith_to_sh(a))),
         IrExpr::Call { func, args } => call_word_to_sh(func, args),
+        // The A1 `Index` expr node (triage-sh py-sh-go cross-product pairs
+        // t21/t56/t73): array element read — render like the `arrayIndex`
+        // call arm (the POSIX per-element lowering `${name_key}`).
+        IrExpr::Index { var, key } => index_to_sh(var, key, true),
+        // The first-class Capture node (core request
+        // zsh-sh-go-20260814-230503): `$(...)`/backticks — same
+        // `"$(...)"` rendering as the `capture` call arm.
+        IrExpr::Capture { expr, .. } => Ok(format!(
+            "\"$({})\"",
+            arrow_to_sh(std::slice::from_ref(expr.as_ref()))?
+        )),
         IrExpr::Json(v) => Ok(json_str(v)),
         other => Err(format!("word not renderable: {other:?}")),
     }
+}
+
+/// The A1 `Index` expr node (triage-sh py-sh-go cross-product pairs
+/// t21/t56/t73): an array element read — the same POSIX per-element
+/// shapes as the `arrayIndex` call arm: whole-array `@`/`*`, the
+/// dynamic-key eval form, and the literal `${name_key}` element. In
+/// word position (`quoted`) the element is ONE word (`"${name_k}"`);
+/// in interp position the bare `${name_k}` (the enclosing template
+/// supplies the quotes).
+fn index_to_sh(var: &str, key: &IrExpr, quoted: bool) -> Result<String, String> {
+    match key {
+        IrExpr::Str(k, _) if k == "@" || k == "*" => Ok(arr_expand_call(arr_base(var))),
+        IrExpr::Str(k, _) if k.contains(['$', '(']) => Ok(format!(
+            "$(eval \"printf '%s' \\\"\\${{{}_{k}}}\\\"\")",
+            arr_base(var)
+        )),
+        IrExpr::Str(k, _) => {
+            if quoted {
+                Ok(format!("\"${{{var}_{k}}}\""))
+            } else {
+                Ok(format!("${{{var}_{k}}}"))
+            }
+        }
+        // a VARIABLE subscript (`a[i]`, triage-sh t83_array_index_read) —
+        // the dynamic-key eval form (indexed arrays evaluate the key as
+        // ARITHMETIC, assoc arrays on the expanded text).
+        IrExpr::Var(k, _) => Ok(index_var_key_to_sh(arr_base(var), k)),
+        // the getVar-wrapped form (`getVar(\"i\")` — the A1's dynamic key
+        // read, t83): same lowering.
+        IrExpr::Call { func, args }
+            if func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(k, _)] if !k.is_empty()) =>
+        {
+            let IrExpr::Str(k, _) = &args[0] else { unreachable!() };
+            Ok(index_var_key_to_sh(arr_base(var), k))
+        }
+        _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
+    }
+}
+
+/// A VARIABLE array subscript (`a[i]`) — the dynamic-key eval form the
+/// `$`-bearing Str arm uses: indexed arrays evaluate the key as
+/// ARITHMETIC (`$(( ${i:-0} ))`), assoc arrays on the EXPANDED text
+/// (`${i}` braced so the trailing `_` of the element name does not glue
+/// onto the key var).
+fn index_var_key_to_sh(base: &str, k: &str) -> String {
+    let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
+        format!("${{{k}}}")
+    } else {
+        format!("$(( ${{{k}:-0}} ))")
+    };
+    format!("$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")")
 }
 
 fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
@@ -3165,7 +3413,7 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
         // quote matters — bash `printf '%s' "$x"` passes the value as
         // ONE word, the unquoted form re-splits it (heredoc-apostrophe.sh
         // truncates at the first space without it).
-        "getVar" => Ok(format!("\"{}\"", var_ref_to_sh(&raw_arg(args, 0)?, false))),
+        "getVar" => Ok(format!("\"{}\"", var_ref_to_sh(&raw_arg(args, 0)?.replace('.', "_"), false))),
         // param expansions in word position are the QUOTED source form
         // (`echo "\"${x#p}\" "` — bash keeps interior spaces; the core
         // wraps only unquoted getVar in split(), param has no marker, so
@@ -3215,11 +3463,45 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
                     ))
                 }
                 IrExpr::Str(k, _) => Ok(format!("\"${{{name}_{k}}}\"")),
+                // a VARIABLE subscript (`arr[i]`) — the dynamic-key eval
+                // form (see `index_var_key_to_sh`).
+                IrExpr::Var(k, _) => Ok(index_var_key_to_sh(arr_base(&name), k)),
+                // the getVar-wrapped form (`getVar(\"i\")` — the A1's
+                // dynamic key read, triage-sh t83_array_index_read).
+                IrExpr::Call { func, args }
+                    if func == "getVar"
+                        && matches!(args.as_slice(), [IrExpr::Str(k, _)] if !k.is_empty()) =>
+                {
+                    let IrExpr::Str(k, _) = &args[0] else { unreachable!() };
+                    Ok(index_var_key_to_sh(arr_base(&name), k))
+                }
                 _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
             }
         }
+        "assocGet" => {
+            // the go-sh map read (`m[\"go\"]`, triage-sh-20260815-175002):
+            // the by-name associative read — the same POSIX per-element
+            // lowering as `arrayIndex` (`${m_go}`, quoted — one word).
+            let name = raw_arg(args, 0)?;
+            match arg(args, 1)? {
+                IrExpr::Str(k, _) if k.contains(['$', '(']) => Ok(format!(
+                    "$(eval \"printf '%s' \\\"\\${{{}_{k}}}\\\"\")",
+                    arr_base(&name)
+                )),
+                IrExpr::Str(k, _) => Ok(format!("\"${{{name}_{k}}}\"")),
+                IrExpr::Var(k, _) => Ok(index_var_key_to_sh(arr_base(&name), k)),
+                IrExpr::Call { func, args }
+                    if func == "getVar"
+                        && matches!(args.as_slice(), [IrExpr::Str(k, _)] if !k.is_empty()) =>
+                {
+                    let IrExpr::Str(k, _) = &args[0] else { unreachable!() };
+                    Ok(index_var_key_to_sh(arr_base(&name), k))
+                }
+                other => Err(format!("assocGet: key not renderable: {other:?}")),
+            }
+        }
         "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
-        "arrayLen" => Ok(format!("${{{}}}_len", raw_arg(args, 0)?)),
+        "arrayLen" => Ok(format!("${{{}_len}}", raw_arg(args, 0)?)),
         "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
         "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
         "arith" => Ok(format!("$(({}))", arith_rewrite(&raw_arg(args, 0)?))),
@@ -3493,7 +3775,7 @@ fn join_to_sh(inner: &IrExpr, quoted: bool) -> Result<String, String> {
             format!("${{!{}[@]}}", raw_arg(args, 0)?)
         }
         IrExpr::Call { func, args } if func == "arrayLen" => {
-            format!("${{#{}[@]}}", raw_arg(args, 0)?)
+            format!("${{{}_len}}", raw_arg(args, 0)?)
         }
         _ => word_to_sh(inner)?,
     };
@@ -3547,6 +3829,17 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
                 }
             }
             InterpPart::Expr(x) => {
+                // a leading expansion (no open quote) must carry its own
+                // quotes — without them `"$s\n"` renders `$s"…"` with an
+                // UNQUOTED $s that word-splits (t70_quoted_single).
+                // Multi-word / already-quoted forms (cmdsub lists, brace
+                // expansion, whole-array helpers) stay bare.
+                if !open && interp_expr_self_quotes(x) {
+                    out.push('"');
+                    out.push_str(&interp_expr_to_sh(x)?);
+                    out.push('"');
+                    continue;
+                }
                 let need_break = matches!(
                     it.peek(),
                     Some(InterpPart::Lit(n)) if n
@@ -3569,11 +3862,26 @@ fn interp_to_sh(parts: &[InterpPart]) -> Result<String, String> {
     Ok(out)
 }
 
+/// Multi-word or already-quoted interpolate expansions must not be
+/// wrapped in a fresh quote pair (capture already carries `"$(…)"`;
+/// brace / arrayItems / captureWords / whole-array forms are word LISTS).
+fn interp_expr_self_quotes(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } => match func.as_str() {
+            "capture" | "captureWords" | "brace" | "arrayItems" => false,
+            // the whole-array forms expand to multiple words
+            "arrayIndex" => !matches!(args.get(1), Some(IrExpr::Str(k, _)) if k == "@" || k == "*"),
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
 /// An expansion inside a double-quoted template.
 fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
     match e {
         IrExpr::Call { func, args } => match func.as_str() {
-            "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?, false)),
+            "getVar" => Ok(var_ref_to_sh(&raw_arg(args, 0)?.replace('.', "_"), false)),
             "param" => param_to_sh(args, false),
             "listVar" => {
                 let n = raw_arg(args, 0)?;
@@ -3593,8 +3901,24 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
                     Ok(format!("${{{name}_{key}}}"))
                 }
             }
+            "assocGet" => {
+                // the go-sh map read (`m[\"go\"]`, triage-sh-20260815-175002):
+                // the by-name associative read — the same POSIX per-element
+                // lowering as `arrayIndex` (the bare `${m_go}`; the
+                // enclosing template supplies the quotes).
+                let name = raw_arg(args, 0)?;
+                match arg(args, 1)? {
+                    IrExpr::Str(k, _) if k.contains(['$', '(']) => Ok(format!(
+                        "$(eval \"printf '%s' \\\"\\${{{}_{k}}}\\\"\")",
+                        arr_base(&name)
+                    )),
+                    IrExpr::Str(k, _) => Ok(format!("${{{name}_{k}}}")),
+                    IrExpr::Var(k, _) => Ok(index_var_key_to_sh(arr_base(&name), k)),
+                    other => Err(format!("assocGet: key not renderable: {other:?}")),
+                }
+            }
             "arrayItems" => Ok(arr_keys_call(arr_base(&raw_arg(args, 0)?))),
-            "arrayLen" => Ok(format!("${{#{}[@]}}", raw_arg(args, 0)?)),
+            "arrayLen" => Ok(format!("${{{}_len}}", raw_arg(args, 0)?)),
             "capture" => Ok(format!("\"$({})\"", arrow_to_sh(args)?)),
             "captureWords" => Ok(format!("$({})", arrow_to_sh(args)?)),
 
@@ -3618,6 +3942,17 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Var(name, _) => Ok(format!("${name}")),
         IrExpr::Str(s, _) => Ok(s.clone()),
+        // The A1 `Index` expr node (triage-sh py-sh-go cross-product pairs
+        // t21/t56/t73): array element read inside a double-quoted template
+        // — the bare `${name_key}` (the template supplies the quotes).
+        IrExpr::Index { var, key } => index_to_sh(var, key, false),
+        // The first-class Capture node (core request
+        // zsh-sh-go-20260814-230503): `$(...)`/backticks — same
+        // `"$(...)"` rendering as the `capture` call arm.
+        IrExpr::Capture { expr, .. } => Ok(format!(
+            "\"$({})\"",
+            arrow_to_sh(std::slice::from_ref(expr.as_ref()))?
+        )),
         other => Err(format!("interp expr not renderable: {other:?}")),
     }
 }
@@ -4020,6 +4355,54 @@ fn json_str(v: &serde_json::Value) -> String {
 ///   `i++` -> `((i = i + 1) - 1)`   `++i` -> `(i = i + 1)`
 ///   `i--` -> `((i = i - 1) + 1)`   `--i` -> `(i = i - 1)`
 ///   `2 ** 3` -> `8` (literal powers fold)
+
+/// A zsh/mathfunc call in raw arith text: `name(ARG, …)` starting at
+/// `s[0] == '('`. Returns the awk expression and the number of bytes
+/// consumed (through the closing paren) when the call is in the
+/// deterministic subset with plain numeric args; None otherwise.
+fn math_call_to_awk(name: &str, s: &str) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    debug_assert_eq!(b.first(), Some(&b'('));
+    let mut depth = 1i32;
+    let mut k = 1;
+    while k < b.len() && depth > 0 {
+        if b[k] == b'(' {
+            depth += 1;
+        } else if b[k] == b')' {
+            depth -= 1;
+        }
+        k += 1;
+    }
+    if depth != 0 {
+        return None;
+    }
+    let args_text = &s[1..k - 1];
+    let is_num = |a: &str| {
+        let a = a.trim();
+        !a.is_empty()
+            && a.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+')
+            && a.chars().filter(|c| *c == '.').count() <= 1
+    };
+    let args: Vec<&str> = args_text.split(',').collect();
+    if args.is_empty() || !args.iter().all(|a| is_num(a)) {
+        return None;
+    }
+    let a = |i: usize| args[i].trim().to_string();
+    let expr = match name {
+        "sqrt" if args.len() == 1 => format!("sqrt({})", a(0)),
+        "int" if args.len() == 1 => format!("int({})", a(0)),
+        "fmod" if args.len() == 2 => format!("{} % {}", a(0), a(1)),
+        "hypot" if args.len() >= 2 => format!(
+            "sqrt({})",
+            args.iter()
+                .map(|x| format!("({})^2", x.trim()))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        ),
+        _ => return None,
+    };
+    Some((expr, k))
+}
 fn arith_rewrite(t: &str) -> String {
     let b = t.as_bytes();
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -4096,6 +4479,21 @@ fn arith_rewrite(t: &str) -> String {
                 j += 1;
             }
             let name = &t[i..j];
+            // zsh/mathfunc arithmetic CALLS (`sqrt(9)`, `int(3.7)`,
+            // `hypot(3, 4)`, `fmod(7, 3)` — the deterministic subset the
+            // zsh corpus exercises; the estree reference resolves the
+            // same names through JS Math): bash arith has no function
+            // calls, so route the call through awk (POSIX; sqrt/int/%
+            // are awk-native, hypot = sqrt(a^2+b^2), % is fmod
+            // semantics). Mirror of the backend/sh worktree arm
+            // (triage zsh-sh-go t89_arith_call).
+            if j + 1 < b.len() && b[j] == b'(' {
+                if let Some((awk_expr, consumed)) = math_call_to_awk(name, &t[j..]) {
+                    out.push_str(&format!("$(awk 'BEGIN{{print {awk_expr}}}')"));
+                    i = j + consumed;
+                    continue;
+                }
+            }
             if j + 1 < b.len() && (b[j] == b'+' || b[j] == b'-') && b[j + 1] == b[j] {
                 let (inc, dec) = if b[j] == b'+' {
                     ("+ 1", "- 1")
@@ -4318,12 +4716,17 @@ fn stmt_inline(st: &IrStmt) -> Result<String, String> {
             elsifs,
             else_,
         } => {
-            let mut out = format!("if {}; then {}", cmd_to_sh(cond)?, stmts_inline(then)?);
+            // empty branches need a `:` no-op (bash rejects `then ; else`)
+            let inline = |b: &[IrStmt]| -> Result<String, String> {
+                let s = stmts_inline(b)?;
+                Ok(if b.is_empty() { ":".to_string() } else { s })
+            };
+            let mut out = format!("if {}; then {}", cmd_to_sh(cond)?, inline(then)?);
             for (ec, body) in elsifs {
                 out.push_str(&format!(
                     "; elif {}; then {}",
                     cmd_to_sh(ec)?,
-                    stmts_inline(body)?
+                    inline(body)?
                 ));
             }
             if !else_.is_empty() {
@@ -4528,7 +4931,7 @@ fn for_item_to_sh(e: &IrExpr) -> Result<String, String> {
             Ok(format!("${{!{}[@]}}", raw_arg(args, 0)?))
         }
         IrExpr::Call { func, args } if func == "arrayLen" => {
-            Ok(format!("${{#{}[@]}}", raw_arg(args, 0)?))
+            Ok(format!("${{{}_len}}", raw_arg(args, 0)?))
         }
         _ => word_to_sh(e),
     }

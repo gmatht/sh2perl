@@ -33,6 +33,7 @@ pub struct Render {
     /// distinct sh2.* callee names that need stubs
     sh2_calls: BTreeSet<String>,
     todo: usize,
+    loop_depth: usize,
 }
 
 /// Render an `IrProgram` to a Node-style JS script.
@@ -338,6 +339,14 @@ impl Render {
             // exec("echo", [words...]) → native process.stdout.write
             "exec" => {
                 if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    // exec("true") / exec("false") — the restructure
+                    // pass's While(true) cond (a backward-goto loop)
+                    if cmd == "true" {
+                        return "true".into();
+                    }
+                    if cmd == "false" {
+                        return "false".into();
+                    }
                     if cmd == "echo" {
                         // argv = the Array of words; join with spaces + "\n"
                         let mut parts = Vec::new();
@@ -351,6 +360,9 @@ impl Render {
                         }
                         parts.push(Part::Lit("\n".to_string()));
                         return self.write_from_parts(parts);
+                    }
+                    if cmd == "printf" {
+                        return self.printf_call(args);
                     }
                 }
                 self.sh2_stub("exec", args, "exec")
@@ -509,11 +521,249 @@ impl Render {
         format!("process.stdout.write({joined})")
     }
 
+    /// exec("printf", [fmt, args...]) → native process.stdout.write with
+    /// the %s/%d/%i/%u conversions (the C-family frontends' stdout —
+    /// cpp-sh-go t30_static_assert.cc, t29_goto.cc). Complex specs
+    /// (flags/width/precision) and unknown conversions fall back to the
+    /// sh2.exec stub.
+    fn printf_call(&mut self, args: &[IrExpr]) -> String {
+        let Some(IrExpr::Array(items)) = args.get(1) else {
+            return self.sh2_stub("exec", args, "exec");
+        };
+        let Some(IrExpr::Str(fmt, _)) = items.first() else {
+            return self.sh2_stub("exec", args, "exec");
+        };
+        let parsed = match Self::printf_parse(fmt) {
+            Some(p) => p,
+            None => return self.sh2_stub("exec", args, "exec"),
+        };
+        let (els, n_specs) = parsed;
+        let fmt_args: Vec<&IrExpr> = items[1..].iter().collect();
+        if fmt_args.iter().any(|a| matches!(a, IrExpr::Array(_))) {
+            return self.sh2_stub("exec", args, "exec");
+        }
+        let arg_exprs: Vec<String> = fmt_args.iter().map(|a| self.expr(a)).collect();
+        // a spec with flags/width/prec must keep the runtime builtin
+        let complex = els.iter().any(|(_, s)| match s {
+            Some((flags, width, prec, _)) => {
+                !flags.is_empty() || *width > 0 || prec.is_some()
+            }
+            None => false,
+        });
+        if complex {
+            return self.sh2_stub("exec", args, "exec");
+        }
+        let passes = if n_specs == 0 {
+            arg_exprs.len().max(1)
+        } else if arg_exprs.is_empty() {
+            1
+        } else {
+            (arg_exprs.len() + n_specs - 1) / n_specs
+        };
+        let mut pieces: Vec<String> = Vec::new();
+        if n_specs == 0 {
+            // no specs: the format text repeats once per arg
+            let text = Self::js_str(&Self::printf_unescape(fmt));
+            if passes > 1 {
+                pieces.push(format!("({text}).repeat({passes})"));
+            } else {
+                pieces.push(text);
+            }
+        } else {
+            let mut ai = 0usize;
+            for _pass in 0..passes {
+                for (text, spec) in &els {
+                    if let Some((_, _, _, conv)) = spec {
+                        let arg = arg_exprs.get(ai).cloned().unwrap_or_else(|| "\"\"".into());
+                        ai += 1;
+                        match conv {
+                            's' => pieces.push(format!("String({arg})")),
+                            'd' | 'i' | 'u' => {
+                                // parseInt(s, 10) || 0 — bash coerces a
+                                // non-numeric arg to 0
+                                pieces.push(format!("String(parseInt({arg}, 10) || 0)"));
+                            }
+                            _ => unreachable!("printf_parse gates the conversions"),
+                        }
+                    } else {
+                        pieces.push(Self::js_str(&Self::printf_unescape(text)));
+                    }
+                }
+            }
+        }
+        format!("process.stdout.write({})", pieces.join(" + "))
+    }
+
+    /// printf(1) format parsing — mirrors python_backend::printf_parse
+    /// (the flags/width/precision scan; %s/%d/%i/%u conversions).
+    fn printf_parse(fmt: &str) -> Option<(Vec<(String, Option<(String, usize, Option<usize>, char)>)>, usize)> {
+        let chars: Vec<char> = fmt.chars().collect();
+        let mut els: Vec<(String, Option<(String, usize, Option<usize>, char)>)> = Vec::new();
+        let mut text = String::new();
+        let mut pos = 0usize;
+        let mut n_specs = 0usize;
+        while pos < chars.len() {
+            if chars[pos] == '%' {
+                let mut i = pos + 1;
+                while i < chars.len() && matches!(chars[i], '-' | '+' | ' ' | '0' | '#') {
+                    i += 1;
+                }
+                let flags: String = chars[pos + 1..i].iter().collect();
+                let wstart = i;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let width: usize = if i > wstart {
+                    chars[wstart..i].iter().collect::<String>().parse().ok()?
+                } else {
+                    0
+                };
+                let mut prec = None;
+                if i < chars.len() && chars[i] == '.' {
+                    i += 1;
+                    let pstart = i;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if i > pstart {
+                        prec = Some(chars[pstart..i].iter().collect::<String>().parse().ok()?);
+                    } else {
+                        return None;
+                    }
+                }
+                while i < chars.len() && (chars[i] == 'l' || chars[i] == 'L') {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None;
+                }
+                let conv = chars[i];
+                if conv == '%' {
+                    text.push('%');
+                } else if matches!(conv, 's' | 'd' | 'i' | 'u') {
+                    if !text.is_empty() {
+                        els.push((std::mem::take(&mut text), None));
+                    }
+                    els.push((String::new(), Some((flags, width, prec, conv))));
+                    n_specs += 1;
+                } else {
+                    return None;
+                }
+                pos = i + 1;
+                continue;
+            }
+            text.push(chars[pos]);
+            pos += 1;
+        }
+        if !text.is_empty() {
+            els.push((text, None));
+        }
+        Some((els, n_specs))
+    }
+
+    /// Text-run backslash escapes (\n \t \r \a \b \f \v and octal).
+    fn printf_unescape(s: &str) -> String {
+        let mut out = s.to_string();
+        for (from, to) in [
+            ("\\n", "\n"),
+            ("\\t", "\t"),
+            ("\\r", "\r"),
+            ("\\a", "\x07"),
+            ("\\b", "\x08"),
+            ("\\f", "\x0c"),
+            ("\\v", "\x0b"),
+            ("\\\\", "\\"),
+        ] {
+            out = out.replace(from, to);
+        }
+        let chars: Vec<char> = out.chars().collect();
+        let mut res = String::with_capacity(out.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '\\' && i + 1 < chars.len() {
+                let mut oct = String::new();
+                let mut j = i + 1;
+                while j < chars.len() && oct.len() < 3 && matches!(chars[j], '0'..='7') {
+                    oct.push(chars[j]);
+                    j += 1;
+                }
+                if !oct.is_empty() {
+                    if let Some(c) = u32::from_str_radix(&oct, 8).ok().and_then(char::from_u32) {
+                        res.push(c);
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            res.push(chars[i]);
+            i += 1;
+        }
+        res
+    }
+
     // ── statements ───────────────────────────────────────────────────
 
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => {
+                // statement-position arith: `i++` / `x += n` (the
+                // C-style frontends' loop steps) render natively — the
+                // arith() expression path can only stub them (no JS
+                // expression-assignment) — cpp-sh-go t29_goto.cc's
+                // backward-goto loop step.
+                if let IrExpr::Arith(a) = e {
+                    if let ArithAst::IncDec { var, delta, .. } = &**a {
+                        let name = self.js_ident(var);
+                        let d = delta.unsigned_abs();
+                        let sign = if *delta >= 0 { "+" } else { "-" };
+                        if self.is_num(var) {
+                            self.emit(&format!("{name} {sign}= {d};"));
+                        } else {
+                            // untyped (shell) vars hold strings: coerce
+                            // like the arith() Var arm (Number(x) || 0)
+                            self.emit(&format!(
+                                "{name} = (Number({name}) || 0) {sign} {d};"
+                            ));
+                        }
+                        return;
+                    }
+                    if let ArithAst::Assign { var, op, rhs } = &**a {
+                        let name = self.js_ident(var);
+                        let r = self.arith(rhs);
+                        let js_op = match op.as_str() {
+                            "+=" => "+=",
+                            "-=" => "-=",
+                            "*=" => "*=",
+                            "/=" => "/=",
+                            "%=" => "%=",
+                            _ => "=",
+                        };
+                        if self.is_num(var) || js_op == "=" {
+                            self.emit(&format!("{name} {js_op} {r};"));
+                        } else {
+                            self.emit(&format!(
+                                "{name} = (Number({name}) || 0) {} {r};",
+                                js_op.trim_end_matches('=')
+                            ));
+                        }
+                        return;
+                    }
+                }
+                // break()/continue() calls inside a loop lower natively
+                // (bash status verbs — the goto-restructure pass emits
+                // them as the loop exit); outside a loop they keep the stub
+                if let IrExpr::Call { func, .. } = e {
+                    if self.loop_depth > 0 {
+                        if func == "break" {
+                            self.emit("break;");
+                            return;
+                        }
+                        if func == "continue" {
+                            self.emit("continue;");
+                            return;
+                        }
+                    }
+                }
                 let x = self.expr(e);
                 self.emit(&format!("{x};"));
             }
@@ -625,11 +875,13 @@ impl Render {
             IrStmt::While { cond, body } => {
                 let c = self.expr(cond);
                 self.emit(&format!("while ({c}) {{"));
+                self.loop_depth += 1;
                 self.depth += 1;
                 for s in body {
                     self.stmt(s);
                 }
                 self.depth -= 1;
+                self.loop_depth -= 1;
                 self.emit("}");
             }
             IrStmt::DoWhile { body, cond, until } => {
@@ -685,6 +937,23 @@ impl Render {
                 }
                 self.depth -= 1;
                 self.emit("}");
+            }
+            IrStmt::Break => {
+                // the restructure pass's inverted guarded goto
+                // (`while (true) { … if (c) {} else { break } }`) lowers
+                // to a plain break — cpp-sh-go t29_goto.cc
+                if self.loop_depth > 0 {
+                    self.emit("break;");
+                } else {
+                    self.mark_todo("top-level break");
+                }
+            }
+            IrStmt::Continue => {
+                if self.loop_depth > 0 {
+                    self.emit("continue;");
+                } else {
+                    self.mark_todo("top-level continue");
+                }
             }
             other => self.mark_todo(&format!("stmt {:?}", other)),
         }

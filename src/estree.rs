@@ -18,7 +18,7 @@
 
 use crate::ast::*;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ── ESTree node model (standard subset) ─────────────────────────────
 
@@ -69,6 +69,16 @@ pub enum Stmt {
         test: Expr,
         body: Box<Stmt>,
     },
+    /// The A1 contract's post-test loop (core request
+    /// c-sh-go-20260814-111815): `do { body } while (test)` — the body
+    /// runs at least once, then the condition is re-checked (the While
+    /// arm's pre-test shape). Emitted by the c-sh-go frontend for C
+    /// `do-while` / `repeat-until` (until=true → the test is the
+    /// negated cond).
+    DoWhileStatement {
+        test: Expr,
+        body: Box<Stmt>,
+    },
     /// The native numeric-range loop — `for (let i = lo; i <= hi; i++)`
     /// — the `seq_range_for` transform's target (the hand-js ideal for
     /// `for i in $(seq lo hi)`). init is a `VariableDeclaration`
@@ -83,6 +93,18 @@ pub enum Stmt {
         left: Box<Stmt>,
         right: Expr,
         body: Box<Stmt>,
+    },
+    /// A native function declaration — the normalize_functions port's
+    /// output (the JS-side estreeToJsMapped normalizes the sh2.functions
+    /// registrations into plain `function x(...)` declarations before the
+    /// astring codegen).
+    FunctionDeclaration {
+        id: Expr,
+        params: Vec<Expr>,
+        body: Box<Stmt>,
+        generator: bool,
+        expression: bool,
+        r#async: bool,
     },
     VariableDeclaration {
         declarations: Vec<VariableDeclarator>,
@@ -139,6 +161,16 @@ pub struct RegexLiteral {
 pub enum Expr {
     Identifier {
         name: String,
+    },
+    /// A native function expression — the normalize_functions port's
+    /// sequence-form output (`(__fn_x = function x(...) {…}, …)`).
+    FunctionExpression {
+        id: Box<Expr>,
+        params: Vec<Expr>,
+        body: Box<Stmt>,
+        generator: bool,
+        expression: bool,
+        r#async: bool,
     },
     Literal {
         value: serde_json::Value,
@@ -279,7 +311,7 @@ pub fn ast_to_estree(commands: &[Command]) -> Program {
 pub fn ast_to_estree_json(commands: &[Command]) -> Result<String, serde_json::Error> {
     let transformed: Vec<Command> = commands.iter().map(transform_cmd).collect();
     let ir = crate::shir::ast_to_ir(&transformed);
-    serde_json::to_string(&fix_control_flow(crate::shir::shir_to_estree(&ir)))
+    Ok(estree_to_json(&fix_control_flow(crate::shir::shir_to_estree(&ir))))
 }
 
 // ── control-flow legality pass ───────────────────────────────────────
@@ -293,14 +325,14 @@ pub fn ast_to_estree_json(commands: &[Command]) -> Result<String, serde_json::Er
 // `break` inside a `switch` (case clauses) and `return` inside a function
 // arrow stay native (both legal).
 
-fn fix_control_flow(prog: Program) -> Program {
+pub(crate) fn fix_control_flow(prog: Program) -> Program {
     Program {
         type_: prog.type_,
         source_type: prog.source_type,
         body: prog
             .body
             .into_iter()
-            .filter_map(|s| fix_stmt(s, false, false, false))
+            .filter_map(|s| fix_stmt(s, false, false, false, false))
             .collect(),
     }
 }
@@ -339,7 +371,7 @@ fn map_raw_bytes(s: &str) -> String {
     out
 }
 
-fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Option<Stmt> {
+fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop: bool) -> Option<Stmt> {
     Some(match stmt {
         Stmt::BreakStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
             expression: sh2_call("break", vec![]),
@@ -347,7 +379,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
         Stmt::ContinueStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
             expression: sh2_call("continue", vec![]),
         },
-        Stmt::ReturnStatement { argument } if !in_arrow || !in_func => {
+        Stmt::ReturnStatement { argument } if !in_arrow || in_loop => {
             let mut args = vec![];
             if let Some(a) = argument {
                 args.push(a);
@@ -357,12 +389,12 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
             }
         }
         Stmt::ExpressionStatement { expression } => Stmt::ExpressionStatement {
-            expression: fix_expr(expression, in_arrow, in_func),
+            expression: fix_expr(expression, in_arrow, in_func, in_loop),
         },
         Stmt::BlockStatement { body } => Stmt::BlockStatement {
             body: body
                 .into_iter()
-                .filter_map(|s| fix_stmt(s, in_arrow, in_func, false))
+                .filter_map(|s| fix_stmt(s, in_arrow, in_func, false, in_loop))
                 .collect(),
         },
         Stmt::IfStatement {
@@ -370,14 +402,14 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
             consequent,
             alternate,
         } => Stmt::IfStatement {
-            test: fix_expr(test, in_arrow, in_func),
+            test: fix_expr(test, in_arrow, in_func, in_loop),
             consequent: Box::new(
-                fix_stmt(*consequent, in_arrow, in_func, false)
+                fix_stmt(*consequent, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
             alternate: alternate.map(|a| {
                 Box::new(
-                    fix_stmt(*a, in_arrow, in_func, false)
+                    fix_stmt(*a, in_arrow, in_func, false, in_loop)
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )
             }),
@@ -393,57 +425,64 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
             finalizer,
         } => Stmt::TryStatement {
             block: Box::new(
-                fix_stmt(*block, in_arrow, in_func, false)
+                fix_stmt(*block, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
             handler: handler.map(|h| CatchClause {
                 type_: h.type_,
                 param: h.param,
                 body: Box::new(
-                    fix_stmt(*h.body, in_arrow, in_func, false)
+                    fix_stmt(*h.body, in_arrow, in_func, false, in_loop)
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 ),
             }),
             finalizer: finalizer.map(|f| {
                 Box::new(
-                    fix_stmt(*f, in_arrow, in_func, false)
+                    fix_stmt(*f, in_arrow, in_func, false, in_loop)
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )
             }),
         },
         Stmt::ThrowStatement { argument } => Stmt::ThrowStatement {
-            argument: fix_expr(argument, in_arrow, in_func),
+            argument: fix_expr(argument, in_arrow, in_func, in_loop),
         },
         Stmt::SwitchStatement {
             discriminant,
             cases,
         } => Stmt::SwitchStatement {
-            discriminant: fix_expr(discriminant, in_arrow, in_func),
+            discriminant: fix_expr(discriminant, in_arrow, in_func, in_loop),
             cases: cases
                 .into_iter()
                 .map(|c| SwitchCase {
                     type_: c.type_,
-                    test: c.test.map(|t| fix_expr(t, in_arrow, in_func)),
+                    test: c.test.map(|t| fix_expr(t, in_arrow, in_func, in_loop)),
                     consequent: c
                         .consequent
                         .into_iter()
-                        .filter_map(|s| fix_stmt(s, in_arrow, in_func, true))
+                        .filter_map(|s| fix_stmt(s, in_arrow, in_func, true, in_loop))
                         .collect(),
                 })
                 .collect(),
         },
         Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
-            test: fix_expr(test, in_arrow, in_func),
+            test: fix_expr(test, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false)
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+            ),
+        },
+        Stmt::DoWhileStatement { test, body } => Stmt::DoWhileStatement {
+            test: fix_expr(test, in_arrow, in_func, in_loop),
+            body: Box::new(
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
         Stmt::ForOfStatement { left, right, body } => Stmt::ForOfStatement {
             left,
-            right: fix_expr(right, in_arrow, in_func),
+            right: fix_expr(right, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false)
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
@@ -454,13 +493,13 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
             body,
         } => Stmt::ForStatement {
             init: Box::new(
-                fix_stmt(*init, in_arrow, in_func, false)
+                fix_stmt(*init, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
-            test: fix_expr(test, in_arrow, in_func),
-            update: fix_expr(update, in_arrow, in_func),
+            test: fix_expr(test, in_arrow, in_func, in_loop),
+            update: fix_expr(update, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false)
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
                     .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
@@ -470,7 +509,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
                 .map(|d| VariableDeclarator {
                     type_: d.type_,
                     id: d.id,
-                    init: d.init.map(|i| fix_expr(i, in_arrow, in_func)),
+                    init: d.init.map(|i| fix_expr(i, in_arrow, in_func, in_loop)),
                 })
                 .collect(),
             kind,
@@ -479,7 +518,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
     })
 }
 
-fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
+fn fix_expr(e: Expr, in_arrow: bool, in_func: bool, in_loop: bool) -> Expr {
     match e {
         Expr::CallExpression {
             callee,
@@ -487,19 +526,74 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             optional,
         } => {
             // Arrows are bash-return contexts (loop bodies, pipeline stages,
-            // subshells) EXCEPT the sh2.define function arrow, where a
-            // native `return` is legal (and keeps the function's value).
-            let is_define = matches!(
-                callee.as_ref(),
-                Expr::MemberExpression { object, property, .. }
+            // subshells) EXCEPT the function arrows — `sh2.define` (the
+            // bash/posix frontends) and `sh2.functions.set` (the A1
+            // IrStmt::Function rendering — bat-sh-go, c-sh-go's fnValue
+            // VALUE-returning functions) — where a native `return` is
+            // legal (and keeps the function's value). Without the
+            // functions.set arm, the A1-ingress fix_control_flow pass
+            // converted the C frontend's value returns to sh2.return()
+            // signals and fnValue lost the value (c-sh-go t58/t73 DIFF,
+            // 2026-08-14).
+            let is_define = match callee.as_ref() {
+                Expr::MemberExpression { object, property, .. } => {
+                    // `sh2.define`
                     if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2")
                         && matches!(property.as_ref(), Expr::Identifier { name } if name == "define")
-            );
+                    {
+                        true
+                    } else if matches!(property.as_ref(), Expr::Identifier { name } if name == "set") {
+                        // `sh2.functions.set` — the A1 IrStmt::Function
+                        // rendering (object = sh2.functions)
+                        matches!(
+                            object.as_ref(),
+                            Expr::MemberExpression { object: o2, property: p2, .. }
+                                if matches!(o2.as_ref(), Expr::Identifier { name } if name == "sh2")
+                                    && matches!(p2.as_ref(), Expr::Identifier { name } if name == "functions")
+                        )
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            let is_loop_helper = match callee.as_ref() {
+                Expr::MemberExpression { object, property, .. }
+                    if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2") =>
+                {
+                    matches!(
+                        property.as_ref(),
+                        Expr::Identifier { name }
+                            if matches!(
+                                name.as_str(),
+                                "whileLoop" | "whileLoopSync" | "whileLoopBatch" | "forLoop"
+                                    | "forLoopSync" | "forLoopBatch" | "cstyleFor"
+                                    | "cstyleForSync"
+                            )
+                    )
+                }
+                _ => false,
+            };
+            // the loop-BODY arrow (the LAST argument of an sh2 loop
+            // helper) is a LOOP-BODY context: a `return` inside it must
+            // signal (a native return would exit the callback and the
+            // loop would spin on). The other args (cond/items/init/update/
+            // batch) descend with the inherited flag. This is the precise
+            // replacement for the old blanket `!in_func` rule, which
+            // over-converted frontend VALUE-returning arrows (the zig
+            // `__fn_f = async () => ...` function defs, the py ArrayComp
+            // IIFE, the C fnValue bodies) — only loop-body arrows need
+            // the signal conversion.
+            let n_args = arguments.len();
             Expr::CallExpression {
-                callee: Box::new(fix_expr(*callee, in_arrow, in_func)),
+                callee: Box::new(fix_expr(*callee, in_arrow, in_func, in_loop)),
                 arguments: arguments
                     .into_iter()
-                    .map(|a| fix_expr(a, in_arrow, if is_define { true } else { false }))
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let a_loop = in_loop || (is_loop_helper && i + 1 == n_args);
+                        fix_expr(a, in_arrow, if is_define { true } else { false }, a_loop)
+                    })
                     .collect(),
                 optional,
             }
@@ -510,13 +604,13 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             computed,
             optional,
         } => Expr::MemberExpression {
-            object: Box::new(fix_expr(*object, in_arrow, in_func)),
-            property: Box::new(fix_expr(*property, in_arrow, in_func)),
+            object: Box::new(fix_expr(*object, in_arrow, in_func, in_loop)),
+            property: Box::new(fix_expr(*property, in_arrow, in_func, in_loop)),
             computed,
             optional,
         },
         Expr::AwaitExpression { argument } => Expr::AwaitExpression {
-            argument: Box::new(fix_expr(*argument, in_arrow, in_func)),
+            argument: Box::new(fix_expr(*argument, in_arrow, in_func, in_loop)),
         },
         Expr::ArrowFunctionExpression {
             params,
@@ -527,10 +621,10 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             params,
             body: match body {
                 ArrowBody::Expr(inner) => {
-                    ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func)))
+                    ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func, in_loop)))
                 }
                 ArrowBody::Block(b) => ArrowBody::Block(Box::new(
-                    fix_stmt(*b, true, in_func, false)
+                    fix_stmt(*b, true, in_func, false, in_loop)
                         .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )),
             },
@@ -543,7 +637,7 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
                 .map(|p| Property {
                     type_: p.type_,
                     key: p.key,
-                    value: fix_expr(p.value, in_arrow, in_func),
+                    value: fix_expr(p.value, in_arrow, in_func, in_loop),
                     kind: p.kind,
                     computed: p.computed,
                     shorthand: p.shorthand,
@@ -553,7 +647,7 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
         Expr::ArrayExpression { elements } => Expr::ArrayExpression {
             elements: elements
                 .into_iter()
-                .map(|el| el.map(|e| fix_expr(e, in_arrow, in_func)))
+                .map(|el| el.map(|e| fix_expr(e, in_arrow, in_func, in_loop)))
                 .collect(),
         },
         Expr::Literal { value, raw, regex } => Expr::Literal {
@@ -581,7 +675,7 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
                 .collect(),
             expressions: expressions
                 .into_iter()
-                .map(|e| fix_expr(e, in_arrow, in_func))
+                .map(|e| fix_expr(e, in_arrow, in_func, in_loop))
                 .collect(),
         },
         Expr::LogicalExpression {
@@ -590,8 +684,8 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             right,
         } => Expr::LogicalExpression {
             operator,
-            left: Box::new(fix_expr(*left, in_arrow, in_func)),
-            right: Box::new(fix_expr(*right, in_arrow, in_func)),
+            left: Box::new(fix_expr(*left, in_arrow, in_func, in_loop)),
+            right: Box::new(fix_expr(*right, in_arrow, in_func, in_loop)),
         },
         Expr::UnaryExpression {
             operator,
@@ -599,13 +693,13 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             prefix,
         } => Expr::UnaryExpression {
             operator,
-            argument: Box::new(fix_expr(*argument, in_arrow, in_func)),
+            argument: Box::new(fix_expr(*argument, in_arrow, in_func, in_loop)),
             prefix,
         },
         Expr::SequenceExpression { expressions } => Expr::SequenceExpression {
             expressions: expressions
                 .into_iter()
-                .map(|e| fix_expr(e, in_arrow, in_func))
+                .map(|e| fix_expr(e, in_arrow, in_func, in_loop))
                 .collect(),
         },
         // the errexit-guard wrapper (`sh2._g = await sh2.forLoop(...)`)
@@ -617,8 +711,8 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             right,
         } => Expr::AssignmentExpression {
             operator,
-            left: Box::new(fix_expr(*left, in_arrow, in_func)),
-            right: Box::new(fix_expr(*right, in_arrow, in_func)),
+            left: Box::new(fix_expr(*left, in_arrow, in_func, in_loop)),
+            right: Box::new(fix_expr(*right, in_arrow, in_func, in_loop)),
         },
         other => other,
     }
@@ -845,6 +939,10 @@ fn hoist_stmt(stmt: Stmt) -> Stmt {
             test,
             body: Box::new(hoist_stmt(*body)),
         },
+        Stmt::DoWhileStatement { test, body } => Stmt::DoWhileStatement {
+            test,
+            body: Box::new(hoist_stmt(*body)),
+        },
         Stmt::TryStatement {
             block,
             handler,
@@ -941,6 +1039,9 @@ fn body_tail_write(body: &Stmt) -> Option<i64> {
 fn loop_tail_hoist(stmt: &Stmt) -> Option<(Stmt, i64)> {
     let (body, n) = match stmt {
         Stmt::WhileStatement { body, .. } => (body, body_tail_write(body)?),
+        // a do-while body provably runs at least once — the tail hoist
+        // is valid exactly as for the (provably-runs) For loops
+        Stmt::DoWhileStatement { body, .. } => (body, body_tail_write(body)?),
         Stmt::ForStatement { body, .. } => {
             let n = body_tail_write(body)?;
             if !for_provably_runs(stmt) {
@@ -965,6 +1066,10 @@ fn loop_tail_hoist(stmt: &Stmt) -> Option<(Stmt, i64)> {
     }
     let new_stmt = match stmt {
         Stmt::WhileStatement { test, .. } => Stmt::WhileStatement {
+            test: test.clone(),
+            body: Box::new(stripped),
+        },
+        Stmt::DoWhileStatement { test, .. } => Stmt::DoWhileStatement {
             test: test.clone(),
             body: Box::new(stripped),
         },
@@ -1173,7 +1278,14 @@ fn lit_str<'a>(e: &'a Expr) -> Option<&'a str> {
 /// from a literal must keep its store binding — see the native-array
 /// fold's literal scan. Over-marking is safe; under-marking desyncs the
 /// store.
-fn bash_text_refs(s: &str, name: &str) -> bool {
+/// Mark `acc` entries for every `top_set_arrays` name referenced by
+/// `$name` / `${name…}` in `s` — ONE scan of the string instead of one
+/// scan per array name (the estree::bash_text_refs hotspot: the literal
+/// walk re-scanned every literal once per tracked array).
+fn mark_text_refs(s: &str, top: &HashSet<String>, acc: &mut HashMap<String, ArrayRefs>) {
+    if !s.contains('$') {
+        return;
+    }
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -1197,8 +1309,11 @@ fn bash_text_refs(s: &str, name: &str) -> bool {
                 .chars()
                 .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
                 .count();
-            if n > 0 && &r3[..n] == name {
-                return true;
+            if n > 0 {
+                let nm = &r3[..n];
+                if top.contains(nm) {
+                    acc.entry(nm.to_string()).or_default().writes = true;
+                }
             }
             i += 1;
             continue;
@@ -1207,12 +1322,14 @@ fn bash_text_refs(s: &str, name: &str) -> bool {
             .chars()
             .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
             .count();
-        if n > 0 && &rest[..n] == name {
-            return true;
+        if n > 0 {
+            let nm = &rest[..n];
+            if top.contains(nm) {
+                acc.entry(nm.to_string()).or_default().writes = true;
+            }
         }
         i += 1;
     }
-    false
 }
 
 /// `"name[idx]"` → (name, idx) for a Literal getVar/setVar arg;
@@ -1283,9 +1400,14 @@ fn classify_array_call(
             let Some(target_arg) = args.get(1) else { return };
             let Some(target) = lit_str(target_arg) else { return };
             let Some(op) = lit_str(first) else { return };
-            // slice-of-a-name is an array ref; other params are not
+            // zsh `${(flags)var}` (core requests zsh-sh-go-20260814-183409 /
+            // 193615 + re-filings): the flag/separator ride the extra args
+            // and the runtime's zshParamFlags reads the STORE array — the
+            // name is an array touch (never native-foldable).
             if op == "slice" {
                 target.trim_start_matches('#')
+            } else if op.is_empty() && args.len() >= 3 {
+                target
             } else {
                 return;
             }
@@ -1311,8 +1433,10 @@ fn classify_array_call(
         "getVar" => match args.first() {
             Some(Expr::Literal { value, .. }) => {
                 if let Some((_, Some(idx))) = parse_var_arg_str(value.as_str().unwrap_or("")) {
-                    if idx.parse::<i64>().map(|v| v >= 0).unwrap_or(false) {
-                        // plain literal element read — OK
+                    if idx.parse::<i64>().map(|v| v >= 0).unwrap_or(false)
+                        || parse_dollar_var(idx).is_some()
+                    {
+                        // plain literal or `$var` element read — OK
                         entry.read_stmt_idxs.push(stmt_idx);
                     } else {
                         entry.index_bad = true;
@@ -1334,6 +1458,15 @@ fn classify_array_call(
                 {
                     // plain literal element read — OK
                     entry.read_stmt_idxs.push(stmt_idx);
+                } else if value
+                    .as_str()
+                    .and_then(parse_dollar_var)
+                    .is_some()
+                {
+                    // `$var` element read — the runtime expands it
+                    // through the store; the native rewrite reads the
+                    // SAME store path (no dispatch / expansion)
+                    entry.read_stmt_idxs.push(stmt_idx);
                 } else {
                     entry.index_bad = true;
                 }
@@ -1348,6 +1481,10 @@ fn classify_array_call(
             if op == "slice" && mode == "@" {
                 // len (#name) or join (name) — both reads
                 entry.read_stmt_idxs.push(stmt_idx);
+            } else if op.is_empty() && args.len() >= 3 {
+                // zsh flags — the runtime zshParamFlags reads the STORE
+                // array (the native fold would desync it)
+                entry.writes = true;
             } else {
                 entry.writes = true;
             }
@@ -1387,6 +1524,10 @@ fn walk_stmt_exprs(stmt: &Stmt, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
             walk_expr(test, in_fn, f);
             walk_stmt_exprs(body, in_fn, f);
         }
+        Stmt::DoWhileStatement { test, body, .. } => {
+            walk_expr(test, in_fn, f);
+            walk_stmt_exprs(body, in_fn, f);
+        }
         Stmt::TryStatement {
             block,
             handler,
@@ -1414,6 +1555,12 @@ fn walk_stmt_exprs(stmt: &Stmt, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
             walk_stmt_exprs(left, in_fn, f);
             walk_expr(right, in_fn, f);
             walk_stmt_exprs(body, in_fn, f);
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            for p in params {
+                walk_expr(p, true, f);
+            }
+            walk_stmt_exprs(body, true, f);
         }
         Stmt::VariableDeclaration { declarations, .. } => {
             for d in declarations {
@@ -1459,6 +1606,12 @@ fn walk_expr(e: &Expr, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
             walk_expr(property, in_fn, f);
         }
         Expr::AwaitExpression { argument } => walk_expr(argument, in_fn, f),
+        Expr::FunctionExpression { params, body, .. } => {
+            for p in params {
+                walk_expr(p, true, f);
+            }
+            walk_stmt_exprs(body, true, f);
+        }
         Expr::ArrowFunctionExpression { params, body, .. } => {
             for p in params {
                 walk_expr(p, in_fn, f);
@@ -1565,21 +1718,13 @@ pub(crate) fn lower_native_arrays(prog: Program) -> Program {
             // simply does not fire); under-marking is the corruption.
             if let Expr::Literal { value, .. } = e {
                 if let Some(s) = value.as_str() {
-                    for n in &top_set_arrays {
-                        if bash_text_refs(s, n) {
-                            acc.entry(n.clone()).or_default().writes = true;
-                        }
-                    }
+                    mark_text_refs(s, &top_set_arrays, &mut acc);
                 }
             }
             if let Expr::TemplateLiteral { quasis, .. } = e {
                 for q in quasis {
                     let s = q.value.cooked.as_deref().unwrap_or(&q.value.raw);
-                    for n in &top_set_arrays {
-                        if bash_text_refs(s, n) {
-                            acc.entry(n.clone()).or_default().writes = true;
-                        }
-                    }
+                    mark_text_refs(s, &top_set_arrays, &mut acc);
                 }
             }
             if let Expr::Identifier { name } = e {
@@ -1588,8 +1733,16 @@ pub(crate) fn lower_native_arrays(prog: Program) -> Program {
         });
     }
     // Decide: exactly one top-level array-valued setArray; read-only
-    // literal-index refs; nothing whole/write/unset/computed/in-function;
-    // no other bare use of the name anywhere.
+    // literal/`$var`-index refs; nothing whole/write/unset/computed/
+    // in-function-before-init; no other bare use of the name anywhere.
+    // The `in_fn` reads are SAFE when the function declaration comes
+    // after the setArray (the order guard below): the `let` initializes
+    // before the function can exist or run (a `let __fn_` is in the TDZ
+    // until its declaration), and a function-local that SHADOWS the
+    // array name surfaces as a bare declarator identifier in `declared`
+    // (disqualifying it). The old blanket `in_fn` ban dropped the game's
+    // direction tables (DIR_X/DIR_Z — read per frame) just because
+    // `shoot()` also reads them.
     let natives: std::collections::HashSet<String> = acc
         .iter()
         .filter(|(name, a)| {
@@ -1601,7 +1754,6 @@ pub(crate) fn lower_native_arrays(prog: Program) -> Program {
                     .all(|i| a.set_array_idx.unwrap() < *i)
                 && !a.whole
                 && !a.writes
-                && !a.in_fn
                 && !a.index_bad
                 && !declared.contains(*name)
         })
@@ -1734,6 +1886,10 @@ fn lower_stmt(stmt: Stmt, natives: &std::collections::HashSet<String>) -> Stmt {
             test: lower_expr(test, natives),
             body: Box::new(lower_stmt(*body, natives)),
         },
+        Stmt::DoWhileStatement { test, body } => Stmt::DoWhileStatement {
+            test: lower_expr(test, natives),
+            body: Box::new(lower_stmt(*body, natives)),
+        },
         Stmt::TryStatement {
             block,
             handler,
@@ -1757,6 +1913,14 @@ fn lower_stmt(stmt: Stmt, natives: &std::collections::HashSet<String>) -> Stmt {
             left: Box::new(lower_stmt(*left, natives)),
             right: lower_expr(right, natives),
             body: Box::new(lower_stmt(*body, natives)),
+        },
+        Stmt::FunctionDeclaration { id, params, body, generator, expression, r#async } => Stmt::FunctionDeclaration {
+            id: lower_expr(id, natives),
+            params: params.into_iter().map(|p| lower_expr(p, natives)).collect(),
+            body: Box::new(lower_stmt(*body, natives)),
+            generator,
+            expression,
+            r#async,
         },
         Stmt::VariableDeclaration { declarations, kind } => Stmt::VariableDeclaration {
             declarations: declarations
@@ -1835,6 +1999,14 @@ fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
         Expr::AwaitExpression { argument } => Expr::AwaitExpression {
             argument: Box::new(lower_expr(*argument, natives)),
         },
+        Expr::FunctionExpression { id, params, body, generator, expression, r#async } => Expr::FunctionExpression {
+            id: Box::new(lower_expr(*id, natives)),
+            params: params.into_iter().map(|p| lower_expr(p, natives)).collect(),
+            body: Box::new(lower_stmt(*body, natives)),
+            generator,
+            expression,
+            r#async,
+        },
         Expr::ArrowFunctionExpression { params, body, expression, r#async } => {
             Expr::ArrowFunctionExpression {
                 params: params.into_iter().map(|p| lower_expr(p, natives)).collect(),
@@ -1905,16 +2077,50 @@ fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
 
 /// `sh2.getVar("arr[1]")` / `sh2.arrayIndex("arr", "1")` → (name, Some(idx))
 /// for a LITERAL non-negative integer index; None for anything else.
-fn array_read_index<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, Option<i64>)> {
+/// A native-array read index: a literal non-negative integer, or a
+/// `$var` store read. The runtime expands `$name` indexes through the
+/// store (`arrayIndex("DIR_X", "$yaw")` — the game's direction tables,
+/// read every frame); the native rewrite reads the SAME store path, so
+/// it is byte-equivalent and skips the per-read dispatch + expansion.
+enum NativeIdx {
+    Lit(i64),
+    Var(String),
+}
+
+/// `$yaw` → `Some("yaw")` for a simple store-var index (no `${…}`).
+fn parse_dollar_var(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('$')?;
+    match rest.chars().next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return None,
+    }
+    rest.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        .then_some(rest)
+}
+
+/// `sh2.getVar("arr[1])")` / `sh2.arrayIndex("arr", "1")` → (name, Some(idx))
+/// for a LITERAL non-negative integer index, or a `$var` (store) index;
+/// None for anything else.
+fn array_read_index<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, Option<NativeIdx>)> {
     let name = lit_str(args.first()?)?;
     if fn_name == "getVar" {
         let (n, idx) = parse_var_arg_str(name)?;
         let idx = idx?;
+        if let Some(v) = parse_dollar_var(idx) {
+            return Some((n, Some(NativeIdx::Var(v.to_string()))));
+        }
         let v = idx.parse::<i64>().ok()?;
-        (v >= 0).then_some((n, Some(v)))
+        (v >= 0).then_some((n, Some(NativeIdx::Lit(v))))
     } else {
-        let v = args.get(1)?.as_literal_i64()?;
-        (v >= 0).then_some((name, Some(v)))
+        if let Some(v) = args.get(1)?.as_literal_i64() {
+            return (v >= 0).then_some((name, Some(NativeIdx::Lit(v))));
+        }
+        if let Some(s) = lit_str(args.get(1)?) {
+            if let Some(v) = parse_dollar_var(s) {
+                return Some((name, Some(NativeIdx::Var(v.to_string()))));
+            }
+        }
+        None
     }
 }
 
@@ -1939,33 +2145,98 @@ fn array_len_join<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, bool)
     }
 }
 
-fn native_element_read(name: &str, idx: i64) -> Expr {
-    let elem = Expr::MemberExpression {
-        object: Box::new(Expr::Identifier {
-            name: name.to_string(),
-        }),
-        property: Box::new(Expr::Literal {
-            value: serde_json::Value::from(idx),
-            raw: None,
-            regex: None,
-        }),
-        computed: true,
-        optional: false,
-    };
-    Expr::ConditionalExpression {
-        test: Box::new(Expr::BinaryExpression {
-            operator: "!==".to_string(),
-            left: Box::new(elem.clone()),
-            right: Box::new(Expr::Identifier {
-                name: "undefined".to_string(),
-            }),
-        }),
-        consequent: Box::new(elem),
-        alternate: Box::new(Expr::Literal {
-            value: serde_json::Value::String(String::new()),
-            raw: None,
-            regex: None,
-        }),
+fn native_element_read(name: &str, idx: NativeIdx) -> Expr {
+    match idx {
+        NativeIdx::Lit(v) => {
+            let elem = Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: name.to_string(),
+                }),
+                property: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(v),
+                    raw: None,
+                    regex: None,
+                }),
+                computed: true,
+                optional: false,
+            };
+            Expr::ConditionalExpression {
+                test: Box::new(Expr::BinaryExpression {
+                    operator: "!==".to_string(),
+                    left: Box::new(elem.clone()),
+                    right: Box::new(Expr::Identifier {
+                        name: "undefined".to_string(),
+                    }),
+                }),
+                consequent: Box::new(elem),
+                alternate: Box::new(Expr::Literal {
+                    value: serde_json::Value::String(String::new()),
+                    raw: None,
+                    regex: None,
+                }),
+            }
+        }
+        NativeIdx::Var(var) => {
+            // `String(<name>[Number(sh2.vars.<var> ?? "")] ?? "")` — the
+            // runtime's arrayIndex for a `$var` index does
+            // `String(v[Number(expand("$" + var))] ?? "")`; reading the
+            // SAME store path natively is byte-equivalent without the
+            // dispatch + operand-expansion machinery.
+            let vars = Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "sh2".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "vars".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            };
+            let store_read = Expr::MemberExpression {
+                object: Box::new(vars),
+                property: Box::new(Expr::Identifier { name: var }),
+                computed: false,
+                optional: false,
+            };
+            let idx_expr = Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "Number".to_string(),
+                }),
+                arguments: vec![Expr::LogicalExpression {
+                    operator: "??".to_string(),
+                    left: Box::new(store_read),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::String(String::new()),
+                        raw: None,
+                        regex: None,
+                    }),
+                }],
+                optional: false,
+            };
+            let elem = Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: name.to_string(),
+                }),
+                property: Box::new(idx_expr),
+                computed: true,
+                optional: false,
+            };
+            Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "String".to_string(),
+                }),
+                arguments: vec![Expr::LogicalExpression {
+                    operator: "??".to_string(),
+                    left: Box::new(elem),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::String(String::new()),
+                        raw: None,
+                        regex: None,
+                    }),
+                }],
+                optional: false,
+            }
+        }
     }
 }
 
@@ -2075,6 +2346,10 @@ fn drop_nested_flags(stmt: &mut Stmt) {
             drop_expr_flags(test);
             drop_stmt_flags(body);
         }
+        Stmt::DoWhileStatement { test, body } => {
+            drop_expr_flags(test);
+            drop_stmt_flags(body);
+        }
         Stmt::TryStatement {
             block,
             handler,
@@ -2098,6 +2373,12 @@ fn drop_nested_flags(stmt: &mut Stmt) {
         Stmt::ForOfStatement { left, right, body } => {
             drop_stmt_flags(left);
             drop_expr_flags(right);
+            drop_stmt_flags(body);
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            for p in params {
+                drop_expr_flags(p);
+            }
             drop_stmt_flags(body);
         }
         Stmt::VariableDeclaration { declarations, .. } => {
@@ -2137,6 +2418,12 @@ fn drop_expr_flags(e: &mut Expr) {
             drop_expr_flags(property);
         }
         Expr::AwaitExpression { argument } => drop_expr_flags(argument),
+        Expr::FunctionExpression { params, body, .. } => {
+            for p in params {
+                drop_expr_flags(p);
+            }
+            drop_stmt_flags(body);
+        }
         Expr::ArrowFunctionExpression { body, .. } => match body {
             ArrowBody::Expr(e) => drop_expr_flags(e),
             ArrowBody::Block(s) => drop_nested_flags(s),
@@ -2730,6 +3017,2474 @@ pub(crate) fn escape_template_raw(s: &str) -> String {
     out
 }
 
+// ── hand-rolled JSON writer for the ESTree ──────────────────────────
+//
+// serde_json::to_string(&program) — one Serializer dispatch + string
+// escape per field — was the #1 transpile hotspot (serialize_str: 13.8M
+// block executions on the game workload, ~31% of the profile). This
+// writer emits the SAME JSON the derive produces (same keys, same
+// declaration order, compact) with direct push_str/escape loops. The
+// browser consumes it via JSON.parse (order-insensitive), and the corpus
+// tests compare rendered output (parsed), so the exact field order is
+// cosmetic — it is kept identical to serde's anyway.
+
+/// Escape a JSON string body (without the quotes) — the fast path is a
+/// single scan; only strings containing a special char pay the rewrite.
+fn push_json_string(out: &mut String, s: &str) {
+    if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
+        out.push_str(s);
+        return;
+    }
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+fn push_key(out: &mut String, k: &str, v: &str) {
+    out.push('"');
+    out.push_str(k);
+    out.push_str("\":\"");
+    push_json_string(out, v);
+    out.push('"');
+}
+
+fn push_bool(out: &mut String, b: bool) {
+    out.push_str(if b { "true" } else { "false" });
+}
+
+fn write_str_field(out: &mut String, key: &str, v: &str) {
+    out.push(',');
+    push_key(out, key, v);
+}
+
+fn write_bool_field(out: &mut String, key: &str, b: bool) {
+    out.push(',');
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":");
+    push_bool(out, b);
+}
+
+pub fn estree_to_json(prog: &Program) -> String {
+    let mut out = String::with_capacity(256 * 1024);
+    write_program(&mut out, prog);
+    out
+}
+
+fn write_program(out: &mut String, p: &Program) {
+    out.push('{');
+    push_key(out, "type", p.type_);
+    out.push(',');
+    push_key(out, "sourceType", p.source_type);
+    out.push_str(",\"body\":[");
+    for (i, st) in p.body.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_stmt(out, st);
+    }
+    out.push_str("]}");
+}
+
+fn write_stmt(out: &mut String, st: &Stmt) {
+    match st {
+        Stmt::ExpressionStatement { expression } => {
+            out.push_str("{\"type\":\"ExpressionStatement\",\"expression\":");
+            write_expr(out, expression);
+            out.push('}');
+        }
+        Stmt::BlockStatement { body } => {
+            out.push_str("{\"type\":\"BlockStatement\",\"body\":[");
+            for (i, s) in body.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_stmt(out, s);
+            }
+            out.push_str("]}");
+        }
+        Stmt::IfStatement { test, consequent, alternate } => {
+            out.push_str("{\"type\":\"IfStatement\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"consequent\":");
+            write_stmt(out, consequent);
+            out.push_str(",\"alternate\":");
+            match alternate {
+                Some(a) => write_stmt(out, a),
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            out.push_str("{\"type\":\"TryStatement\",\"block\":");
+            write_stmt(out, block);
+            out.push_str(",\"handler\":");
+            match handler {
+                Some(h) => write_catch_clause(out, h),
+                None => out.push_str("null"),
+            }
+            out.push_str(",\"finalizer\":");
+            match finalizer {
+                Some(f) => write_stmt(out, f),
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
+        Stmt::ThrowStatement { argument } => {
+            out.push_str("{\"type\":\"ThrowStatement\",\"argument\":");
+            write_expr(out, argument);
+            out.push('}');
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            out.push_str("{\"type\":\"SwitchStatement\",\"discriminant\":");
+            write_expr(out, discriminant);
+            out.push_str(",\"cases\":[");
+            for (i, c) in cases.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_switch_case(out, c);
+            }
+            out.push_str("]}");
+        }
+        Stmt::WhileStatement { test, body } => {
+            out.push_str("{\"type\":\"WhileStatement\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::DoWhileStatement { test, body } => {
+            out.push_str("{\"type\":\"DoWhileStatement\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            out.push_str("{\"type\":\"ForStatement\",\"init\":");
+            write_stmt(out, init);
+            out.push_str(",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"update\":");
+            write_expr(out, update);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            out.push_str("{\"type\":\"ForOfStatement\",\"left\":");
+            write_stmt(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::FunctionDeclaration { id, params, body, generator, expression, r#async } => {
+            out.push_str("{\"type\":\"FunctionDeclaration\",\"id\":");
+            write_expr(out, id);
+            out.push_str(",\"params\":[");
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_expr(out, p);
+            }
+            out.push_str("],\"body\":");
+            write_stmt(out, body);
+            out.push_str(",\"generator\":");
+            push_bool(out, *generator);
+            out.push_str(",\"expression\":");
+            push_bool(out, *expression);
+            out.push_str(",\"async\":");
+            push_bool(out, *r#async);
+            out.push('}');
+        }
+        Stmt::VariableDeclaration { declarations, kind } => {
+            out.push_str("{\"type\":\"VariableDeclaration\",\"declarations\":[");
+            for (i, d) in declarations.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_var_declarator(out, d);
+            }
+            out.push_str("],");
+            push_key(out, "kind", kind);
+            out.push('}');
+        }
+        Stmt::BreakStatement { label } => {
+            out.push_str("{\"type\":\"BreakStatement\",\"label\":");
+            write_opt_string(out, label.as_deref());
+            out.push('}');
+        }
+        Stmt::ContinueStatement { label } => {
+            out.push_str("{\"type\":\"ContinueStatement\",\"label\":");
+            write_opt_string(out, label.as_deref());
+            out.push('}');
+        }
+        Stmt::ReturnStatement { argument } => {
+            out.push_str("{\"type\":\"ReturnStatement\",\"argument\":");
+            match argument {
+                Some(a) => write_expr(out, a),
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn write_opt_string(out: &mut String, s: Option<&str>) {
+    match s {
+        Some(v) => {
+            out.push('"');
+            push_json_string(out, v);
+            out.push('"');
+        }
+        None => out.push_str("null"),
+    }
+}
+
+fn write_switch_case(out: &mut String, c: &SwitchCase) {
+    out.push_str("{\"type\":\"SwitchCase\",\"test\":");
+    match &c.test {
+        Some(t) => write_expr(out, t),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"consequent\":[");
+    for (i, s) in c.consequent.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_stmt(out, s);
+    }
+    out.push_str("]}");
+}
+
+fn write_catch_clause(out: &mut String, h: &CatchClause) {
+    out.push_str("{\"type\":\"CatchClause\",\"param\":");
+    match &h.param {
+        Some(p) => write_expr(out, p),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"body\":");
+    write_stmt(out, &h.body);
+    out.push('}');
+}
+
+fn write_var_declarator(out: &mut String, d: &VariableDeclarator) {
+    out.push_str("{\"type\":\"VariableDeclarator\",\"id\":");
+    write_expr(out, &d.id);
+    out.push_str(",\"init\":");
+    match &d.init {
+        Some(i) => write_expr(out, i),
+        None => out.push_str("null"),
+    }
+    out.push('}');
+}
+
+fn write_expr(out: &mut String, e: &Expr) {
+    match e {
+        Expr::Identifier { name } => {
+            out.push_str("{\"type\":\"Identifier\",");
+            push_key(out, "name", name);
+            out.push('}');
+        }
+        Expr::Literal { value, raw, regex } => {
+            out.push_str("{\"type\":\"Literal\",\"value\":");
+            out.push_str(&value.to_string());
+            out.push_str(",\"raw\":");
+            write_opt_string(out, raw.as_deref());
+            if let Some(r) = regex {
+                out.push_str(",\"regex\":{\"pattern\":\"");
+                push_json_string(out, &r.pattern);
+                out.push_str("\",\"flags\":\"");
+                push_json_string(out, &r.flags);
+                out.push_str("\"}");
+            }
+            out.push('}');
+        }
+        Expr::TemplateLiteral { quasis, expressions } => {
+            out.push_str("{\"type\":\"TemplateLiteral\",\"quasis\":[");
+            for (i, q) in quasis.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_template_element(out, q);
+            }
+            out.push_str("],\"expressions\":[");
+            for (i, x) in expressions.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, x);
+            }
+            out.push_str("]}");
+        }
+        Expr::CallExpression { callee, arguments, optional } => {
+            out.push_str("{\"type\":\"CallExpression\",\"callee\":");
+            write_expr(out, callee);
+            out.push_str(",\"arguments\":[");
+            for (i, a) in arguments.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, a);
+            }
+            out.push(']');
+            write_bool_field(out, "optional", *optional);
+            out.push('}');
+        }
+        Expr::MemberExpression { object, property, computed, optional } => {
+            out.push_str("{\"type\":\"MemberExpression\",\"object\":");
+            write_expr(out, object);
+            out.push_str(",\"property\":");
+            write_expr(out, property);
+            write_bool_field(out, "computed", *computed);
+            write_bool_field(out, "optional", *optional);
+            out.push('}');
+        }
+        Expr::AwaitExpression { argument } => {
+            out.push_str("{\"type\":\"AwaitExpression\",\"argument\":");
+            write_expr(out, argument);
+            out.push('}');
+        }
+        Expr::FunctionExpression { id, params, body, generator, expression, r#async } => {
+            out.push_str("{\"type\":\"FunctionExpression\",\"id\":");
+            write_expr(out, id);
+            out.push_str(",\"params\":[");
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_expr(out, p);
+            }
+            out.push_str("],\"body\":");
+            write_stmt(out, body);
+            out.push_str(",\"generator\":");
+            push_bool(out, *generator);
+            out.push_str(",\"expression\":");
+            push_bool(out, *expression);
+            out.push_str(",\"async\":");
+            push_bool(out, *r#async);
+            out.push('}');
+        }
+        Expr::ArrowFunctionExpression { params, body, expression, r#async } => {
+            out.push_str("{\"type\":\"ArrowFunctionExpression\",\"params\":[");
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, p);
+            }
+            out.push_str("],\"body\":");
+            write_arrow_body(out, body);
+            write_bool_field(out, "expression", *expression);
+            write_bool_field(out, "async", *r#async);
+            out.push('}');
+        }
+        Expr::ObjectExpression { properties } => {
+            out.push_str("{\"type\":\"ObjectExpression\",\"properties\":[");
+            for (i, p) in properties.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_property(out, p);
+            }
+            out.push_str("]}");
+        }
+        Expr::ArrayExpression { elements } => {
+            out.push_str("{\"type\":\"ArrayExpression\",\"elements\":[");
+            for (i, el) in elements.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match el {
+                    Some(x) => write_expr(out, x),
+                    None => out.push_str("null"),
+                }
+            }
+            out.push_str("]}");
+        }
+        Expr::SpreadElement { argument } => {
+            out.push_str("{\"type\":\"SpreadElement\",\"argument\":");
+            write_expr(out, argument);
+            out.push('}');
+        }
+        Expr::LogicalExpression { operator, left, right } => {
+            out.push_str("{\"type\":\"LogicalExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"left\":");
+            write_expr(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push('}');
+        }
+        Expr::BinaryExpression { operator, left, right } => {
+            out.push_str("{\"type\":\"BinaryExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"left\":");
+            write_expr(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push('}');
+        }
+        Expr::AssignmentExpression { operator, left, right } => {
+            out.push_str("{\"type\":\"AssignmentExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"left\":");
+            write_expr(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push('}');
+        }
+        Expr::ConditionalExpression { test, consequent, alternate } => {
+            out.push_str("{\"type\":\"ConditionalExpression\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"consequent\":");
+            write_expr(out, consequent);
+            out.push_str(",\"alternate\":");
+            write_expr(out, alternate);
+            out.push('}');
+        }
+        Expr::UnaryExpression { operator, argument, prefix } => {
+            out.push_str("{\"type\":\"UnaryExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"argument\":");
+            write_expr(out, argument);
+            write_bool_field(out, "prefix", *prefix);
+            out.push('}');
+        }
+        Expr::SequenceExpression { expressions } => {
+            out.push_str("{\"type\":\"SequenceExpression\",\"expressions\":[");
+            for (i, x) in expressions.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, x);
+            }
+            out.push_str("]}");
+        }
+        Expr::NewExpression { callee, arguments } => {
+            out.push_str("{\"type\":\"NewExpression\",\"callee\":");
+            write_expr(out, callee);
+            out.push_str(",\"arguments\":[");
+            for (i, a) in arguments.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, a);
+            }
+            out.push_str("]}");
+        }
+    }
+}
+
+fn write_arrow_body(out: &mut String, body: &ArrowBody) {
+    match body {
+        ArrowBody::Expr(e) => write_expr(out, e),
+        ArrowBody::Block(b) => write_stmt(out, b),
+    }
+}
+
+fn write_property(out: &mut String, p: &Property) {
+    out.push_str("{\"type\":\"Property\",\"key\":");
+    write_expr(out, &p.key);
+    out.push_str(",\"value\":");
+    write_expr(out, &p.value);
+    out.push_str(",\"kind\":\"");
+    push_json_string(out, p.kind);
+    out.push('"');
+    write_bool_field(out, "computed", p.computed);
+    write_bool_field(out, "shorthand", p.shorthand);
+    out.push('}');
+}
+
+fn write_template_element(out: &mut String, t: &TemplateElement) {
+    out.push_str("{\"type\":\"TemplateElement\",\"value\":{\"raw\":\"");
+    push_json_string(out, &t.value.raw);
+    out.push_str("\",\"cooked\":");
+    write_opt_string(out, t.value.cooked.as_deref());
+    out.push_str("},\"tail\":");
+    push_bool(out, t.tail);
+    out.push('}');
+}
+
+// ── the estreeToJs head passes, ported into the wasm ────────────────
+//
+// The JS-side estreeToJsMapped pipeline (estree.js/lower.js) normalizes
+// the wasm's sh2.*-targeted estree before the astring codegen. These are
+// the first passes of that pipeline, ported line-by-line so the compile
+// output stays byte-identical (the Node differential harness verifies the
+// composition: wasm-head + JS-suffix === the current full JS pipeline).
+//
+// The wasm runs a PREFIX of the pipeline; the JS side (estreeToJsMapped)
+// skips the moved prefix and continues at the next pass. The order is the
+// global pass order — a prefix is the only composition that preserves it.
+
+/// Generic mutable visitor over the ESTree (the Rust analog of the
+/// JS-side `walk`) — visits every Expr in the program (through stmts,
+/// arrows, template expressions, property keys/values, …), callback FIRST
+/// (top-down), then the children.
+pub(crate) fn visit_exprs(prog: &mut Program, f: &mut dyn FnMut(&mut Expr)) {
+    fn stmt(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
+        match s {
+            Stmt::ExpressionStatement { expression } => expr(expression, f),
+            Stmt::BlockStatement { body } => { for x in body { stmt(x, f); } }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                expr(test, f);
+                stmt(consequent, f);
+                if let Some(a) = alternate { stmt(a, f); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                stmt(block, f);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { expr(p, f); }
+                    stmt(&mut h.body, f);
+                }
+                if let Some(fin) = finalizer { stmt(fin, f); }
+            }
+            Stmt::ThrowStatement { argument } => expr(argument, f),
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr(discriminant, f);
+                for c in cases {
+                    if let Some(t) = &mut c.test { expr(t, f); }
+                    for x in &mut c.consequent { stmt(x, f); }
+                }
+            }
+            Stmt::WhileStatement { test, body } => { expr(test, f); stmt(body, f); }
+            Stmt::DoWhileStatement { test, body } => { expr(test, f); stmt(body, f); }
+            Stmt::ForStatement { init, test, update, body } => {
+                stmt(init, f);
+                expr(test, f);
+                expr(update, f);
+                stmt(body, f);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt(left, f);
+                expr(right, f);
+                stmt(body, f);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { expr(i, f); }
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { expr(a, f); }
+            }
+        }
+    }
+    fn expr(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+        f(e);
+        match e {
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            Expr::TemplateLiteral { quasis: _, expressions } => {
+                for x in expressions { expr(x, f); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                expr(callee, f);
+                for a in arguments { expr(a, f); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                expr(object, f);
+                expr(property, f);
+            }
+            Expr::AwaitExpression { argument } => expr(argument, f),
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params { expr(p, f); }
+                match body {
+                    ArrowBody::Expr(x) => expr(x, f),
+                    ArrowBody::Block(b) => stmt(b, f),
+                }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties {
+                    expr(&mut p.key, f);
+                    expr(&mut p.value, f);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { expr(el, f); }
+            }
+            Expr::SpreadElement { argument } => expr(argument, f),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                expr(left, f);
+                expr(right, f);
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                expr(test, f);
+                expr(consequent, f);
+                expr(alternate, f);
+            }
+            Expr::UnaryExpression { argument, .. } => expr(argument, f),
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions { expr(x, f); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                expr(callee, f);
+                for a in arguments { expr(a, f); }
+            }
+        }
+    }
+    for s in &mut prog.body {
+        stmt(s, f);
+    }
+}
+
+/// Does the subtree contain an AwaitExpression?
+pub(crate) fn has_await_expr(e: &Expr) -> bool {
+    match e {
+        Expr::AwaitExpression { .. } => true,
+        Expr::Identifier { .. } | Expr::Literal { .. } => false,
+        Expr::TemplateLiteral { expressions, .. } => expressions.iter().any(has_await_expr),
+        Expr::CallExpression { callee, arguments, .. } => {
+            has_await_expr(callee) || arguments.iter().any(has_await_expr)
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            has_await_expr(object) || has_await_expr(property)
+        }
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            ArrowBody::Expr(x) => has_await_expr(x),
+            ArrowBody::Block(b) => has_await_stmt(b),
+        },
+        Expr::FunctionExpression { body, .. } => has_await_stmt(body),
+        Expr::ObjectExpression { properties } => properties.iter().any(|p| {
+            has_await_expr(&p.value) || (p.computed && has_await_expr(&p.key))
+        }),
+        Expr::ArrayExpression { elements } => elements.iter().flatten().any(has_await_expr),
+        Expr::SpreadElement { argument } => has_await_expr(argument),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. }
+        | Expr::AssignmentExpression { left, right, .. } => {
+            has_await_expr(left) || has_await_expr(right)
+        }
+        Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+            has_await_expr(test) || has_await_expr(consequent) || has_await_expr(alternate)
+        }
+        Expr::UnaryExpression { argument, .. } => has_await_expr(argument),
+        Expr::SequenceExpression { expressions } => expressions.iter().any(has_await_expr),
+        Expr::NewExpression { callee, arguments, .. } => {
+            has_await_expr(callee) || arguments.iter().any(has_await_expr)
+        }
+    }
+}
+
+pub(crate) fn has_await_stmt(s: &Stmt) -> bool {
+    match s {
+        Stmt::ExpressionStatement { expression } => has_await_expr(expression),
+        Stmt::BlockStatement { body } => body.iter().any(has_await_stmt),
+        Stmt::IfStatement { test, consequent, alternate } => {
+            has_await_expr(test)
+                || has_await_stmt(consequent)
+                || alternate.as_ref().map(|a| has_await_stmt(a)).unwrap_or(false)
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            has_await_stmt(block)
+                || handler.as_ref().map(|h| has_await_stmt(&h.body)).unwrap_or(false)
+                || finalizer.as_ref().map(|f| has_await_stmt(f)).unwrap_or(false)
+        }
+        Stmt::ThrowStatement { argument } => has_await_expr(argument),
+        Stmt::SwitchStatement { discriminant, cases } => {
+            has_await_expr(discriminant)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().map(has_await_expr).unwrap_or(false)
+                        || c.consequent.iter().any(has_await_stmt)
+                })
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            has_await_expr(test) || has_await_stmt(body)
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            has_await_stmt(init) || has_await_expr(test) || has_await_expr(update) || has_await_stmt(body)
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            has_await_stmt(left) || has_await_expr(right) || has_await_stmt(body)
+        }
+        Stmt::FunctionDeclaration { body, .. } => has_await_stmt(body),
+        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
+            d.init.as_ref().map(has_await_expr).unwrap_or(false)
+        }),
+        Stmt::ReturnStatement { argument } => argument.as_ref().map(has_await_expr).unwrap_or(false),
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => false,
+    }
+}
+
+/// estree.js `markAsyncOnAwait` — a function whose body contains an
+/// AwaitExpression must be `async` (a non-async function with `await`
+/// inside is a SyntaxError).
+pub(crate) fn mark_async_on_await(mut prog: Program) -> Program {
+    fn mark_expr(e: &mut Expr) {
+        if let Expr::ArrowFunctionExpression { body, r#async, .. } = e {
+            let has = match body {
+                ArrowBody::Expr(x) => has_await_expr(x),
+                ArrowBody::Block(b) => has_await_stmt(b),
+            };
+            if has { *r#async = true; }
+        }
+    }
+    visit_exprs(&mut prog, &mut mark_expr);
+    prog
+}
+
+/// estree.js `stripProcessEnv` — `process.env.<name>` and the
+/// `process.env` member itself become the runtime's env accessor
+/// (`sh2.env` — the sh2runtime's contract; the accessor names are the
+/// environment config). Ported verbatim: branch 1 rewrites `process.env`
+/// (object=process, property=env) to `sh2.env`; branch 2 rewrites the
+/// inner `process.env` of `process.env.X`.
+pub(crate) fn strip_process_env(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::MemberExpression { object, property, .. } = e {
+            // branch 1: `process.env` itself → `sh2.env`
+            if is_ident(property, "env") && is_ident(object, "process") {
+                **object = Expr::Identifier { name: "sh2".to_string() };
+                return;
+            }
+            // branch 2: `process.env.X` → `sh2.env.X` (rewrite the inner)
+            if let Expr::MemberExpression { object: inner, property: inner_prop, .. } = &mut **object {
+                if is_ident(inner_prop, "env") && is_ident(inner, "process") {
+                    **inner = Expr::Identifier { name: "sh2".to_string() };
+                }
+            }
+        }
+    }
+    visit_exprs(&mut prog, &mut rewrite);
+    prog
+}
+
+/// estree.js `awaitSyncFnCalls` — the otranspilerl estree emits the
+/// PROVABLY-SYNC `sh2.fnCall(...)` form; a callee body containing a
+/// capture/whileLoop IS async, so the un-awaited call detaches. Await
+/// every `sh2.fnCall` not already inside an AwaitExpression (a no-op on
+/// a sync value, a correct sequencing fix on a promise). Also rewrites
+/// non-sync-table `sh2.builtin` calls to the async `sh2.exec` bridge.
+pub(crate) fn await_sync_fn_calls(mut prog: Program) -> Program {
+    // the JS-side SYNC_BUILTINS table (estree.js) — NOT the wider
+    // shir.rs table: the identity with the JS pipeline requires this list.
+    const JS_SYNC_BUILTINS: &[&str] = &[
+        "echo", "printf", "true", "false", "date", "pwd", "cat", "cd", "export", "ls", "test",
+    ];
+    fn sync_twin(name: &str) -> bool {
+        matches!(name,
+            "captureSync" | "redirectSync" | "pipelineSync" | "subshellSync"
+            | "blockSync" | "whileLoopSync" | "forLoopSync" | "cstyleForSync")
+    }
+    fn is_sh2_call(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::CallExpression { callee, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, .. }
+                if is_ident(object, "sh2") && is_ident(property, name)))
+    }
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite_expr(e: &mut Expr, in_await: bool, in_sync: bool) {
+        // the JS recurses into arrays first (bottom-up); the visitor is
+        // top-down — replicate by recursing the children HERE (except the
+        // wrapped cases) so the order matches the JS rebuild semantics.
+        match e {
+            Expr::AwaitExpression { argument } => {
+                rewrite_expr(argument, true, in_sync);
+                return;
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                // a *Sync twin's body arrow was PROVEN await-free — keep
+                // its fnCalls un-awaited (the sync twin would throw)
+                if let Expr::MemberExpression { object, property, .. } = &**callee {
+                    if is_ident(object, "sh2") {
+                        if let Expr::Identifier { name } = &**property {
+                            if sync_twin(name) {
+                                for a in arguments.iter_mut() {
+                                    rewrite_expr(a, false, true);
+                                }
+                                return;
+                            }
+                            if name == "fnCall" && !in_await && !in_sync {
+                                for a in arguments.iter_mut() {
+                                    rewrite_expr(a, false, in_sync);
+                                }
+                                let args = std::mem::take(arguments);
+                                *e = Expr::AwaitExpression {
+                                    argument: Box::new(Expr::CallExpression {
+                                        callee: callee.clone(),
+                                        arguments: args,
+                                        optional: false,
+                                    }),
+                                };
+                                return;
+                            }
+                            if name == "builtin" && !in_await {
+                                let rewired = arguments
+                                    .iter_mut()
+                                    .map(|a| { rewrite_expr(a, false, in_sync); a.clone() })
+                                    .collect::<Vec<_>>();
+                                if let Some(Expr::Literal { value, .. }) = rewired.first() {
+                                    if let Some(s) = value.as_str() {
+                                        if !JS_SYNC_BUILTINS.contains(&s) {
+                                            let arg0 = Expr::Literal { value: serde_json::json!(s), raw: None, regex: None };
+                                            let arg1 = if rewired.len() > 1 {
+                                                rewired[1].clone()
+                                            } else {
+                                                Expr::ArrayExpression { elements: vec![] }
+                                            };
+                                            *e = Expr::AwaitExpression {
+                                                argument: Box::new(Expr::CallExpression {
+                                                    callee: Box::new(Expr::MemberExpression {
+                                                        object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                                                        property: Box::new(Expr::Identifier { name: "exec".to_string() }),
+                                                        computed: false,
+                                                        optional: false,
+                                                    }),
+                                                    arguments: vec![arg0, arg1],
+                                                    optional: false,
+                                                }),
+                                            };
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for a in arguments.iter_mut() {
+                    rewrite_expr(a, false, in_sync);
+                }
+                rewrite_expr(callee, false, in_sync);
+                return;
+            }
+            _ => {}
+        }
+        // generic children — the JS recurses EVERY child with
+        // inAwait=false (only an AwaitExpression's own argument keeps
+        // inAwait=true); the Call/Await arms of rewrite_expr handle their
+        // own recursion before wrapping.
+        fn visit_children(e: &mut Expr, f: &mut dyn FnMut(&mut Expr, bool, bool)) {
+            match e {
+                Expr::CallExpression { callee, arguments, .. } => {
+                    f(callee, false, false);
+                    for a in arguments { f(a, false, false); }
+                }
+                Expr::AwaitExpression { argument } => f(argument, false, false),
+                Expr::FunctionExpression { params, body, .. } => {
+                    for p in params { f(p, false, false); }
+                    visit_stmt(body, f);
+                }
+                Expr::TemplateLiteral { expressions, .. } => {
+                    for x in expressions { f(x, false, false); }
+                }
+                Expr::MemberExpression { object, property, .. } => {
+                    f(object, false, false);
+                    f(property, false, false);
+                }
+                Expr::ArrowFunctionExpression { params, body, .. } => {
+                    for p in params { f(p, false, false); }
+                    match body {
+                        ArrowBody::Expr(x) => f(x, false, false),
+                        ArrowBody::Block(b) => visit_stmt(b, f),
+                    }
+                }
+                Expr::ObjectExpression { properties } => {
+                    for p in properties { f(&mut p.key, false, false); f(&mut p.value, false, false); }
+                }
+                Expr::ArrayExpression { elements } => {
+                    for el in elements.iter_mut().flatten() { f(el, false, false); }
+                }
+                Expr::SpreadElement { argument } => f(argument, false, false),
+                Expr::LogicalExpression { left, right, .. }
+                | Expr::BinaryExpression { left, right, .. }
+                | Expr::AssignmentExpression { left, right, .. } => {
+                    f(left, false, false);
+                    f(right, false, false);
+                }
+                Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                    f(test, false, false);
+                    f(consequent, false, false);
+                    f(alternate, false, false);
+                }
+                Expr::UnaryExpression { argument, .. } => f(argument, false, false),
+                Expr::SequenceExpression { expressions } => {
+                    for x in expressions { f(x, false, false); }
+                }
+                Expr::NewExpression { callee, arguments, .. } => {
+                    f(callee, false, false);
+                    for a in arguments { f(a, false, false); }
+                }
+                Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            }
+        }
+        // the in-await flag resets for each child (the JS passes false)
+        visit_children(e, &mut |c, _, _| rewrite_expr(c, false, in_sync));
+    }
+    fn visit_stmt(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr, bool, bool)) {
+        match s {
+            Stmt::ExpressionStatement { expression } => f(expression, false, false),
+            Stmt::BlockStatement { body } => { for x in body { visit_stmt(x, f); } }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                f(test, false, false);
+                visit_stmt(consequent, f);
+                if let Some(a) = alternate { visit_stmt(a, f); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                visit_stmt(block, f);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { f(p, false, false); }
+                    visit_stmt(&mut h.body, f);
+                }
+                if let Some(fin) = finalizer { visit_stmt(fin, f); }
+            }
+            Stmt::ThrowStatement { argument } => f(argument, false, false),
+            Stmt::SwitchStatement { discriminant, cases } => {
+                f(discriminant, false, false);
+                for c in cases {
+                    if let Some(t) = &mut c.test { f(t, false, false); }
+                    for x in &mut c.consequent { visit_stmt(x, f); }
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                f(test, false, false);
+                visit_stmt(body, f);
+            }
+            Stmt::ForStatement { init, test, update, body } => {
+                visit_stmt(init, f);
+                f(test, false, false);
+                f(update, false, false);
+                visit_stmt(body, f);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                visit_stmt(left, f);
+                f(right, false, false);
+                visit_stmt(body, f);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { f(p, false, false); }
+                visit_stmt(body, f);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { f(i, false, false); }
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { f(a, false, false); }
+            }
+        }
+    }
+    // the JS rebuilds bottom-up — replicate by recursing before the wrap
+    // decisions; the code above handles the wrapping after the recursion.
+    for s in &mut prog.body {
+        visit_stmt(s, &mut |e, in_a, in_s| rewrite_expr(e, in_a, in_s));
+    }
+    prog
+}
+
+/// estree.js `forceAsyncFileRedirects` — the runtime's `redirectSync`
+/// twin only handles fd-dup (`&N`) targets; a file/device target must go
+/// through the async `sh2.redirect` (wrapped in await).
+pub(crate) fn force_async_file_redirects(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::CallExpression { callee, arguments, optional } = e {
+            if let Expr::MemberExpression { object, property, .. } = &**callee {
+                if is_ident(object, "sh2") {
+                    if let Expr::Identifier { name } = &**property {
+                        if name == "redirectSync" && arguments.len() == 2 {
+                            let mut file_target = false;
+                            if let Expr::ArrayExpression { elements } = &arguments[1] {
+                                for el in elements {
+                                    if let Some(Expr::ObjectExpression { properties }) = el {
+                                        for p in properties {
+                                            let k = match &p.key {
+                                                Expr::Identifier { name } => name.as_str(),
+                                                Expr::Literal { value, .. } => value.as_str().unwrap_or(""),
+                                                _ => "",
+                                            };
+                                            if k != "target" { continue; }
+                                            let lit = match &p.value {
+                                                Expr::TemplateLiteral { expressions, quasis } if expressions.is_empty() && quasis.len() == 1 => {
+                                                    quasis[0].value.cooked.clone()
+                                                }
+                                                Expr::Literal { value, .. } => value.as_str().map(|s| s.to_string()),
+                                                _ => None,
+                                            };
+                                            if lit.as_deref().map(|s| !s.starts_with('&')).unwrap_or(true) {
+                                                file_target = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if file_target {
+                                let call = Expr::CallExpression {
+                                    callee: Box::new(Expr::MemberExpression {
+                                        object: object.clone(),
+                                        property: Box::new(Expr::Identifier { name: "redirect".to_string() }),
+                                        computed: false,
+                                        optional: false,
+                                    }),
+                                    arguments: arguments.clone(),
+                                    optional: *optional,
+                                };
+                                *e = Expr::AwaitExpression { argument: Box::new(call) };
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    visit_exprs(&mut prog, &mut rewrite);
+    prog
+}
+
+
+/// The compile pipeline's moved PREFIX — the first four estreeToJs
+/// passes, in the global order (the JS side starts at #5
+/// awaitAsyncDirectCalls). The env-coupled passes (#1 stripProcessEnv,
+/// #3 forceAsyncFileRedirects) use the default sh2runtime contract; the
+/// environment config (devices/fs-bridge/stdout/env-accessor) parameterizes
+/// them when the full env layer moves (see PLAN-wasm-estree-pipeline.md).
+/// Post-order visitor (children first, then the callback) — the Rust
+/// twin of the JS rebuild passes (`{...node, ...}` bottom-up): a parent's
+/// rewrite decision must see its already-rewritten children, and a node
+/// replaced by its own rewrite is never revisited (no double-wrap).
+pub(crate) fn visit_exprs_post(prog: &mut Program, f: &mut dyn FnMut(&mut Expr)) {
+    fn stmt(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
+        match s {
+            Stmt::ExpressionStatement { expression } => expr(expression, f),
+            Stmt::BlockStatement { body } => { for x in body { stmt(x, f); } }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                expr(test, f);
+                stmt(consequent, f);
+                if let Some(a) = alternate { stmt(a, f); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                stmt(block, f);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { expr(p, f); }
+                    stmt(&mut h.body, f);
+                }
+                if let Some(fin) = finalizer { stmt(fin, f); }
+            }
+            Stmt::ThrowStatement { argument } => expr(argument, f),
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr(discriminant, f);
+                for c in cases {
+                    if let Some(t) = &mut c.test { expr(t, f); }
+                    for x in &mut c.consequent { stmt(x, f); }
+                }
+            }
+            Stmt::WhileStatement { test, body } => { expr(test, f); stmt(body, f); }
+            Stmt::DoWhileStatement { test, body } => { expr(test, f); stmt(body, f); }
+            Stmt::ForStatement { init, test, update, body } => {
+                stmt(init, f);
+                expr(test, f);
+                expr(update, f);
+                stmt(body, f);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt(left, f);
+                expr(right, f);
+                stmt(body, f);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { expr(i, f); }
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { expr(a, f); }
+            }
+        }
+    }
+    fn expr(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+        match e {
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            Expr::TemplateLiteral { quasis: _, expressions } => {
+                for x in expressions { expr(x, f); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                expr(callee, f);
+                for a in arguments { expr(a, f); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                expr(object, f);
+                expr(property, f);
+            }
+            Expr::AwaitExpression { argument } => expr(argument, f),
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params { expr(p, f); }
+                match body {
+                    ArrowBody::Expr(x) => expr(x, f),
+                    ArrowBody::Block(b) => stmt(b, f),
+                }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties {
+                    expr(&mut p.key, f);
+                    expr(&mut p.value, f);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { expr(el, f); }
+            }
+            Expr::SpreadElement { argument } => expr(argument, f),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                expr(left, f);
+                expr(right, f);
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                expr(test, f);
+                expr(consequent, f);
+                expr(alternate, f);
+            }
+            Expr::UnaryExpression { argument, .. } => expr(argument, f),
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions { expr(x, f); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                expr(callee, f);
+                for a in arguments { expr(a, f); }
+            }
+        }
+        f(e);
+    }
+    for s in &mut prog.body {
+        stmt(s, f);
+    }
+}
+
+/// estree.js `awaitAsyncDirectCalls` — the async-direct fn set + the
+/// `sh2.callDirect` await wrap (post-order — a wrapped call is never
+/// revisited).
+pub(crate) fn await_async_direct_calls(mut prog: Program) -> Program {
+    let mut async_direct: std::collections::HashSet<String> = Default::default();
+    visit_exprs(&mut prog, &mut |e| {
+        if let Expr::AssignmentExpression { operator, left, right, .. } = e {
+            if operator == "=" {
+                if let Expr::Identifier { name } = &**left {
+                    if name.starts_with("__fn_") {
+                        if let Expr::ArrowFunctionExpression { r#async: true, .. } = &**right {
+                            async_direct.insert(name[5..].to_string());
+                        }
+                    }
+                }
+            }
+        }
+    });
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    visit_exprs_post(&mut prog, &mut |e| {
+        if let Expr::CallExpression { callee, arguments, .. } = e {
+            if let Expr::MemberExpression { object, property, .. } = &**callee {
+                if is_ident(object, "sh2") && is_ident(property, "callDirect") {
+                    if let Some(Expr::Literal { value, .. }) = arguments.first() {
+                        if let Some(s) = value.as_str() {
+                            if async_direct.contains(s) {
+                                let mut call = Expr::Identifier { name: "__ph".to_string() };
+                                std::mem::swap(e, &mut call);
+                                *e = Expr::AwaitExpression { argument: Box::new(call) };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    prog
+}
+
+// ── the estreeToJs head passes, part 2: #6 normalizeFunctions, #7
+// unwrapStoreString, #8 nullSentinel (ported from estree.js) ──────────
+
+/// estree.js `unwrapStoreString` — the C frontend's assign lowering wraps
+/// every rhs store read in `String(sh2.vars.x)`; a BOXED pointer would
+/// stringify to "[object Object]". Rewrite `String(sh2.vars.x)` (and the
+/// `?? (sh2.env.x ?? "")` fallback chain) to the read value itself.
+pub(crate) fn unwrap_store_string(mut prog: Program) -> Program {
+    fn is_store_read(e: &Expr) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                if matches!(&**o, Expr::Identifier { name } if name == "sh2")
+                    && matches!(&**p, Expr::Identifier { name } if name == "vars"))
+                && matches!(&**property, Expr::Identifier { .. }))
+    }
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::CallExpression { callee, arguments, .. } = e {
+            if is_ident(callee, "String") && arguments.len() == 1 {
+                let a = &arguments[0];
+                let matches = match a {
+                    Expr::LogicalExpression { operator, left, .. } if operator == "??" => {
+                        is_store_read(left)
+                    }
+                    _ => false,
+                };
+                if matches {
+                    let a2 = arguments[0].clone();
+                    *e = a2;
+                    return;
+                }
+            }
+        }
+    }
+    visit_exprs_post(&mut prog, &mut rewrite);
+    prog
+}
+
+/// estree.js `nullSentinel` — a C pointer NULL check renders as
+/// `String(p) !== ""`, but a chain tail stores the literal "0" (the
+/// frontend seeds `p = 0`), so the comparison must treat "0" as NULL
+/// too: `String(p) !== "" && String(p) !== "0"` / the `==` twin.
+pub(crate) fn null_sentinel(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::BinaryExpression { operator, left, right, .. } = e {
+            if (operator == "!==" || operator == "==")
+                && matches!(&**right, Expr::Literal { value, .. } if value == "")
+                && matches!(&**left, Expr::CallExpression { callee, .. } if is_ident(callee, "String"))
+            {
+                let is_ne = operator == "!==";
+                let op = if is_ne { "&&" } else { "||" };
+                let mk = |v: &str| Expr::BinaryExpression {
+                    operator: operator.clone(),
+                    left: (*left).clone(),
+                    right: Box::new(Expr::Literal {
+                        value: if v == "" { serde_json::json!("") } else { serde_json::json!("0") },
+                        raw: None,
+                        regex: None,
+                    }),
+                };
+                *e = Expr::LogicalExpression {
+                    operator: op.to_string(),
+                    left: Box::new(mk("")),
+                    right: Box::new(mk("0")),
+                };
+                return;
+            }
+        }
+    }
+    visit_exprs_post(&mut prog, &mut rewrite);
+    prog
+}
+
+// ── #6 normalizeFunctions ────────────────────────────────────────────
+// estree.js `normalizeFunctions`: converts `sh2.functions.set("x",
+// arrow)` registrations (the C frontend's param protocol) into plain
+// `function x(...)` declarations + an adapter arrow, rewrites the body's
+// store access to the native parameters/locals, and strips the moved
+// names from the top-level `let`.
+
+pub(crate) fn normalize_functions(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn is_sh2_member(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if is_ident(object, "sh2") && is_ident(property, name))
+    }
+    fn is_functions_set_callee(e: &Expr) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                if is_ident(o, "sh2") && is_ident(p, "functions"))
+                && is_ident(property, "set"))
+    }
+    fn is_sh2_vars(e: &Expr) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                if is_ident(o, "sh2") && is_ident(p, "vars"))
+                && matches!(&**property, Expr::Identifier { .. }))
+    }
+    fn lit_str(e: &Expr) -> Option<&str> {
+        match e {
+            Expr::Literal { value, .. } => value.as_str(),
+            _ => None,
+        }
+    }
+    fn lit_string(e: &Expr) -> Option<String> {
+        lit_str(e).map(|s| s.to_string())
+    }
+    fn is_sh2_positional_read(e: &Expr) -> Option<i64> {
+        // `sh2.positional[N]` (computed literal index)
+        match e {
+            Expr::MemberExpression { object, property, computed: true, .. } => {
+                if is_sh2_member(object, "positional") {
+                    if let Expr::Literal { value, .. } = &**property {
+                        if let Some(n) = value.as_i64() { return Some(n); }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    fn is_store_name_target(e: &Expr) -> Option<String> {
+        // `sh2.vars.X` → the identifier name (as an assignment LEFT)
+        match e {
+            Expr::MemberExpression { object, property, computed: false, .. } => {
+                if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                    if is_ident(o, "sh2") && is_ident(p, "vars"))
+                {
+                    if let Expr::Identifier { name } = &**property {
+                        return Some(name.clone());
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    struct Reg {
+        fn_name: String,
+        direct: bool,
+        // for the direct form: the stmt index in new_body + the arrow
+        arrow: Expr,
+        // for the sequence form: the sequence expression index
+        seq_idx: usize,
+    }
+
+    // 1. locate the registrations
+    let mut registrations: Vec<Reg> = Vec::new();
+    let mut new_body: Vec<Stmt> = Vec::with_capacity(prog.body.len());
+    for st in std::mem::take(&mut prog.body) {
+        if let Stmt::ExpressionStatement { expression } = &st {
+            let e = expression;
+            // direct form: sh2.functions.set("x", arrow)
+            if let Expr::CallExpression { callee, arguments, .. } = e {
+                if is_functions_set_callee(callee)
+                    && arguments.len() >= 2
+                    && matches!(&arguments[0], Expr::Literal { .. })
+                    && matches!(&arguments[1], Expr::ArrowFunctionExpression { .. })
+                {
+                    if let Some(name) = lit_string(&arguments[0]) {
+                        registrations.push(Reg {
+                            fn_name: name,
+                            direct: true,
+                            arrow: arguments[1].clone(),
+                            seq_idx: usize::MAX,
+                        });
+                        new_body.push(st);
+                        continue;
+                    }
+                }
+            }
+            // sequence form: (__fn_x = arrow, set("x", __fn_x), true)
+            if let Expr::SequenceExpression { expressions } = e {
+                let mut arrow: Option<Expr> = None;
+                let mut fn_name: Option<String> = None;
+                let mut seq_idx = usize::MAX;
+                for (i, x) in expressions.iter().enumerate() {
+                    if let Expr::AssignmentExpression { operator, left, right, .. } = x {
+                        if operator == "="
+                            && matches!(&**left, Expr::Identifier { name } if name.starts_with("__fn_"))
+                            && matches!(&**right, Expr::ArrowFunctionExpression { .. })
+                        {
+                            arrow = Some((**right).clone());
+                            seq_idx = i;
+                        }
+                    }
+                    if let Expr::CallExpression { callee, arguments, .. } = x {
+                        if is_functions_set_callee(callee)
+                            && !arguments.is_empty()
+                            && matches!(&arguments[0], Expr::Literal { .. })
+                        {
+                            fn_name = lit_string(&arguments[0]);
+                        }
+                    }
+                }
+                if arrow.is_some() && fn_name.is_some() {
+                    registrations.push(Reg {
+                        fn_name: fn_name.unwrap(),
+                        direct: false,
+                        arrow: arrow.unwrap(),
+                        seq_idx,
+                    });
+                }
+            }
+        }
+        new_body.push(st);
+    }
+    if registrations.is_empty() {
+        prog.body = new_body;
+        return prog;
+    }
+    let mut out_body: Vec<Stmt> = new_body;
+
+    // 2. the usage analysis (walkUsage): sh2.vars.X owners + the
+    //    runtime-by-name getLine/getVar string names
+    let mut usage: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        Default::default();
+    let mut runtime_by_name: std::collections::HashSet<String> = Default::default();
+    {
+        fn walk_usage(
+            node: &Expr,
+            owner: &str,
+            usage: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+            runtime_by_name: &mut std::collections::HashSet<String>,
+        ) {
+            match node {
+                Expr::Identifier { .. } | Expr::Literal { .. } => {}
+                Expr::TemplateLiteral { expressions, .. } => {
+                    for x in expressions { walk_usage(x, owner, usage, runtime_by_name); }
+                }
+                Expr::CallExpression { callee, arguments, .. } => {
+                    if let Expr::MemberExpression { object, property, .. } = &**callee {
+                        if is_ident(object, "sh2") {
+                            if let Expr::Identifier { name } = &**property {
+                                if (name == "getLine" || name == "getVar") && !arguments.is_empty() {
+                                    if let Some(s) = lit_str(&arguments[0]) {
+                                        if !s.is_empty()
+                                            && s.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+                                            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                        {
+                                            runtime_by_name.insert(s.to_string());
+                                        }
+                                    }
+                                    if let Expr::TemplateLiteral { quasis, .. } = &arguments[0] {
+                                        if let Some(head) = quasis.first().and_then(|q| q.value.cooked.clone()) {
+                                            let mut chars = head.chars();
+                                            let first = chars.next();
+                                            let rest = chars.as_str();
+                                            if first.map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+                                                && head.ends_with('[')
+                                            {
+                                                let nm = head.trim_end_matches('[').to_string();
+                                                if nm.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                                                    runtime_by_name.insert(nm);
+                                                }
+                                            }
+                                            let _ = rest;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    walk_usage(callee, owner, usage, runtime_by_name);
+                    for a in arguments { walk_usage(a, owner, usage, runtime_by_name); }
+                }
+                Expr::MemberExpression { object, property, .. } => {
+                    if is_sh2_vars(node) {
+                        if let Expr::Identifier { name } = &**property {
+                            usage.entry(name.clone()).or_default().insert(owner.to_string());
+                        }
+                    }
+                    walk_usage(object, owner, usage, runtime_by_name);
+                    walk_usage(property, owner, usage, runtime_by_name);
+                }
+                Expr::AwaitExpression { argument } => walk_usage(argument, owner, usage, runtime_by_name),
+                Expr::FunctionExpression { params, body, .. } => {
+                    for p in params { walk_usage(p, owner, usage, runtime_by_name); }
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Expr::ArrowFunctionExpression { params, body, .. } => {
+                    for p in params { walk_usage(p, owner, usage, runtime_by_name); }
+                    match body {
+                        ArrowBody::Expr(x) => walk_usage(x, owner, usage, runtime_by_name),
+                        ArrowBody::Block(b) => walk_usage_stmt(b, owner, usage, runtime_by_name),
+                    }
+                }
+                Expr::ObjectExpression { properties } => {
+                    for p in properties {
+                        walk_usage(&p.key, owner, usage, runtime_by_name);
+                        walk_usage(&p.value, owner, usage, runtime_by_name);
+                    }
+                }
+                Expr::ArrayExpression { elements } => {
+                    for el in elements.iter().flatten() { walk_usage(el, owner, usage, runtime_by_name); }
+                }
+                Expr::SpreadElement { argument } => walk_usage(argument, owner, usage, runtime_by_name),
+                Expr::LogicalExpression { left, right, .. }
+                | Expr::BinaryExpression { left, right, .. }
+                | Expr::AssignmentExpression { left, right, .. } => {
+                    walk_usage(left, owner, usage, runtime_by_name);
+                    walk_usage(right, owner, usage, runtime_by_name);
+                }
+                Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage(consequent, owner, usage, runtime_by_name);
+                    walk_usage(alternate, owner, usage, runtime_by_name);
+                }
+                Expr::UnaryExpression { argument, .. } => walk_usage(argument, owner, usage, runtime_by_name),
+                Expr::SequenceExpression { expressions } => {
+                    for x in expressions { walk_usage(x, owner, usage, runtime_by_name); }
+                }
+                Expr::NewExpression { callee, arguments, .. } => {
+                    walk_usage(callee, owner, usage, runtime_by_name);
+                    for a in arguments { walk_usage(a, owner, usage, runtime_by_name); }
+                }
+            }
+        }
+        fn walk_usage_stmt(
+            s: &Stmt,
+            owner: &str,
+            usage: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+            runtime_by_name: &mut std::collections::HashSet<String>,
+        ) {
+            match s {
+                Stmt::ExpressionStatement { expression } => walk_usage(expression, owner, usage, runtime_by_name),
+                Stmt::BlockStatement { body } => {
+                    for x in body { walk_usage_stmt(x, owner, usage, runtime_by_name); }
+                }
+                Stmt::IfStatement { test, consequent, alternate } => {
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage_stmt(consequent, owner, usage, runtime_by_name);
+                    if let Some(a) = alternate { walk_usage_stmt(a, owner, usage, runtime_by_name); }
+                }
+                Stmt::TryStatement { block, handler, finalizer } => {
+                    walk_usage_stmt(block, owner, usage, runtime_by_name);
+                    if let Some(h) = handler {
+                        if let Some(p) = &h.param { walk_usage(p, owner, usage, runtime_by_name); }
+                        walk_usage_stmt(&h.body, owner, usage, runtime_by_name);
+                    }
+                    if let Some(f) = finalizer { walk_usage_stmt(f, owner, usage, runtime_by_name); }
+                }
+                Stmt::ThrowStatement { argument } => walk_usage(argument, owner, usage, runtime_by_name),
+                Stmt::SwitchStatement { discriminant, cases } => {
+                    walk_usage(discriminant, owner, usage, runtime_by_name);
+                    for c in cases {
+                        if let Some(t) = &c.test { walk_usage(t, owner, usage, runtime_by_name); }
+                        for x in &c.consequent { walk_usage_stmt(x, owner, usage, runtime_by_name); }
+                    }
+                }
+                Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::ForStatement { init, test, update, body } => {
+                    walk_usage_stmt(init, owner, usage, runtime_by_name);
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage(update, owner, usage, runtime_by_name);
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::ForOfStatement { left, right, body } => {
+                    walk_usage_stmt(left, owner, usage, runtime_by_name);
+                    walk_usage(right, owner, usage, runtime_by_name);
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::FunctionDeclaration { params, body, .. } => {
+                    for p in params { walk_usage(p, owner, usage, runtime_by_name); }
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::VariableDeclaration { declarations, .. } => {
+                    for d in declarations {
+                        if let Some(i) = &d.init { walk_usage(i, owner, usage, runtime_by_name); }
+                    }
+                }
+                Stmt::ReturnStatement { argument } => {
+                    if let Some(a) = argument { walk_usage(a, owner, usage, runtime_by_name); }
+                }
+                Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            }
+        }
+        // the registration arrows are skipped for the "top" scan
+        for st in &out_body {
+            if let Stmt::ExpressionStatement { expression } = st {
+                walk_usage(expression, "top", &mut usage, &mut runtime_by_name);
+            }
+        }
+        for r in &registrations {
+            let arrow = r.arrow.clone();
+            walk_usage(&arrow, &r.fn_name, &mut usage, &mut runtime_by_name);
+        }
+    }
+
+    // 3. transform each registration (the param protocol + the rewrites)
+    struct Param { name: String, n: i64, cast: bool }
+    // the transform consumes r.arrow (it becomes a placeholder) — the
+    // step-4 let-strip needs the ORIGINAL arrows
+    let registration_arrows: Vec<Expr> = registrations.iter().map(|r| r.arrow.clone()).collect();
+    for r in &mut registrations {
+        let arrow = std::mem::replace(&mut r.arrow, Expr::Identifier { name: "__ph".into() });
+        let arrow_async = match &arrow {
+            Expr::ArrowFunctionExpression { r#async, .. } => *r#async,
+            _ => false,
+        };
+        let body = match arrow {
+            Expr::ArrowFunctionExpression { body, .. } => match body {
+                ArrowBody::Block(b) => *b,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let block = match body {
+            Stmt::BlockStatement { body } => body,
+            _ => continue,
+        };
+        // leading param bindings: `sh2.setVar("p", sh2.arith("$N"))` casts
+        // or `p = sh2.positional[N] ?? ""` (with the store-target or
+        // String-wrapped forms)
+        let mut params: Vec<Param> = Vec::new();
+        let mut idx = 0usize;
+        let mut consumed = 0usize;
+        while consumed < block.len() {
+            let s = &block[consumed];
+            let ok = match s {
+                Stmt::ExpressionStatement { expression } => {
+                    let a = expression;
+                    // cast: sh2.setVar("p", sh2.arith("$N"))
+                    let mut cast_done = false;
+                    if let Expr::CallExpression { callee, arguments, .. } = a {
+                        let arith_args: Option<&Vec<Expr>> = if is_sh2_member(callee, "setVar") && arguments.len() == 2
+                            && matches!(&arguments[0], Expr::Literal { .. })
+                        {
+                            match &arguments[1] {
+                                Expr::CallExpression { callee: c2, arguments: a2, .. }
+                                    if is_sh2_member(c2, "arith") && !a2.is_empty()
+                                        && matches!(&a2[0], Expr::Literal { .. }) =>
+                                    Some(a2),
+                                _ => None,
+                            }
+                        } else { None };
+                        if let Some(a2) = arith_args {
+                            let nm = lit_string(&arguments[0]).unwrap_or_default();
+                            if let Some(Expr::Literal { value, .. }) = a2.first() {
+                                if let Some(s) = value.as_str() {
+                                    let s2 = s.strip_prefix('$').unwrap_or(s);
+                                    if let Ok(n) = s2.parse::<i64>() {
+                                        if n >= 1 {
+                                            params.push(Param { name: nm, n: n - 1, cast: true });
+                                            consumed += 1;
+                                            cast_done = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if cast_done {
+                        true
+                    } else if let Expr::AssignmentExpression { operator, left, right, .. } = a {
+                        if operator != "=" { false } else {
+                            let name = match &**left {
+                                Expr::Identifier { name } => Some(name.clone()),
+                                l => is_store_name_target(l),
+                            };
+                            match name {
+                                None => false,
+                                Some(nm) => {
+                                    // unwrap a String(...) coercion
+                                    let inner = match &**right {
+                                        Expr::CallExpression { callee, arguments, .. }
+                                            if is_ident(callee, "String") && !arguments.is_empty() =>
+                                            Some(&arguments[0]),
+                                        _ => None,
+                                    };
+                                    let base = inner.unwrap_or(right);
+                                    let pos = match base {
+                                        Expr::LogicalExpression { operator, left, right: r2, .. }
+                                            if operator == "??" =>
+                                        {
+                                            if let Some(n) = is_sh2_positional_read(left) {
+                                                if matches!(&**r2, Expr::Literal { value, .. } if value == "") {
+                                                    Some(n)
+                                                } else { None }
+                                            } else { None }
+                                        }
+                                        _ => None,
+                                    };
+                                    match pos {
+                                        Some(n) => { params.push(Param { name: nm, n, cast: false }); consumed += 1; true }
+                                        None => false,
+                                    }
+                                }
+                            }
+                        }
+                    } else { false }
+                }
+                _ => false,
+            };
+            if !ok { break; }
+        }
+        idx = consumed;
+        if params.is_empty() { continue; } // not the C frontend's protocol
+        params.sort_by_key(|p| p.n);
+        let rest = block[idx..].to_vec();
+        let param_names: std::collections::HashSet<String> =
+            params.iter().map(|p| p.name.clone()).collect();
+        // function-locals: store vars used ONLY in this arrow, not
+        // runtime-written by name
+        let mut locals: std::collections::HashSet<String> = Default::default();
+        for (name, owners) in &usage {
+            if runtime_by_name.contains(name) { continue; }
+            if owners.len() == 1 && owners.contains(&r.fn_name) && !param_names.contains(name) {
+                locals.insert(name.clone());
+            }
+        }
+        for p in &params {
+            if p.cast { locals.insert(p.name.clone()); continue; }
+            if !runtime_by_name.contains(&p.name) { locals.insert(p.name.clone()); }
+        }
+        let param_by_pos: std::collections::HashMap<i64, String> = params
+            .iter()
+            .filter(|p| !p.cast)
+            .map(|p| (p.n, p.name.clone()))
+            .collect();
+        // `"$X"` / `"map[$X]"` — interpolate a param/local by name
+        fn interpolate_dollar_vars(
+            str_: &str,
+            param_names: &std::collections::HashSet<String>,
+            locals: &std::collections::HashSet<String>,
+            param_by_pos: &std::collections::HashMap<i64, String>,
+        ) -> Option<Expr> {
+            // manual scan for `$($|[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]*)`
+            let bytes = str_.as_bytes();
+            let mut segments: Vec<String> = Vec::new(); // text segments
+            let mut exprs: Vec<Expr> = Vec::new();
+            let mut last = 0usize;
+            let mut hit = false;
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i] != b'$' { i += 1; continue; }
+                let rest = &str_[i + 1..];
+                if rest.starts_with('$') { i += 2; continue; } // `$$`
+                let mut n = 0usize;
+                let c0 = rest.chars().next();
+                let is_ident = c0.map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false);
+                let is_digit = c0.map(|c| c.is_ascii_digit() && c != '0').unwrap_or(false);
+                if is_ident {
+                    n = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+                } else if is_digit {
+                    n = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+                }
+                if n == 0 { i += 1; continue; }
+                let nm = &rest[..n];
+                let resolved: Option<String> = if is_ident {
+                    if param_names.contains(nm) || locals.contains(nm) { Some(nm.to_string()) } else { None }
+                } else {
+                    match nm.parse::<i64>() {
+                        Ok(num) => param_by_pos.get(&(num - 1)).cloned(),
+                        Err(_) => None,
+                    }
+                };
+                if let Some(res) = resolved {
+                    hit = true;
+                    segments.push(str_[last..i].to_string());
+                    exprs.push(Expr::Identifier { name: res });
+                    i += 1 + n;
+                    last = i;
+                } else {
+                    i += 1;
+                }
+            }
+            if !hit { return None; }
+            segments.push(str_[last..].to_string());
+            let mut quasis: Vec<TemplateElement> = Vec::new();
+            for (k, t) in segments.iter().enumerate() {
+                quasis.push(TemplateElement {
+                    type_: "TemplateElement",
+                    value: TemplateElementValue { raw: t.clone(), cooked: Some(t.clone()) },
+                    tail: k == segments.len() - 1,
+                });
+            }
+            Some(Expr::TemplateLiteral { quasis, expressions: exprs })
+        }
+        // rewrite store access → native identifiers inside the body
+        let mut new_rest = rest;
+        {
+            let param_names = &param_names;
+            let locals = &locals;
+            let param_by_pos = &param_by_pos;
+            fn rewrite_expr(
+                e: &mut Expr,
+                param_names: &std::collections::HashSet<String>,
+                locals: &std::collections::HashSet<String>,
+                param_by_pos: &std::collections::HashMap<i64, String>,
+            ) {
+                visit_exprs_single(e, &mut |n| {
+                    // `$X` literal → the interpolated template
+                    if let Expr::Literal { value, .. } = n {
+                        if let Some(s) = value.as_str() {
+                            if let Some(tpl) = interpolate_dollar_vars(s, param_names, locals, param_by_pos) {
+                                *n = tpl;
+                                return;
+                            }
+                        }
+                    }
+                    // `sh2.positional[N] ?? ""` naming a param → the identifier
+                    let positional_name = |x: &Expr| -> Option<String> {
+                        if let Expr::LogicalExpression { operator, left, right, .. } = x {
+                            if operator == "??" {
+                                if let Some(pn) = is_sh2_positional_read(left) {
+                                    if matches!(&**right, Expr::Literal { value, .. } if value == "") {
+                                        return param_by_pos.get(&pn).cloned();
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    };
+                    let pos_wrap = match n {
+                        Expr::CallExpression { callee, arguments, .. }
+                            if is_ident(callee, "String") && !arguments.is_empty() =>
+                            Some(&arguments[0]),
+                        _ => None,
+                    };
+                    let pname = match pos_wrap {
+                        Some(inner) => positional_name(inner),
+                        None => positional_name(n),
+                    };
+                    if pname.is_some() {
+                        *n = Expr::Identifier { name: pname.unwrap() };
+                        return;
+                    }
+                    // sh2.vars.X → X (locals)
+                    if is_sh2_vars(n) {
+                        if let Expr::MemberExpression { property, .. } = n {
+                            if let Expr::Identifier { name } = &**property {
+                                if locals.contains(name) {
+                                    *n = Expr::Identifier { name: name.clone() };
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // sh2.vars.X ?? (process.env.X ?? "") → X
+                    if let Expr::LogicalExpression { operator, left, right, .. } = n {
+                        if operator == "??" && is_sh2_vars(left) {
+                            let lname = match &**left {
+                                Expr::MemberExpression { property, .. } => match &**property {
+                                    Expr::Identifier { name } => Some(name.clone()),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            if let Some(lname) = lname {
+                                if locals.contains(&lname) {
+                                    let env_chain = matches!(&**right, Expr::LogicalExpression { operator: o2, left: l2, .. }
+                                        if o2 == "??"
+                                            && matches!(&**l2, Expr::MemberExpression { object, property: p2, computed: false, .. }
+                                                if matches!(&**object, Expr::MemberExpression { object: o3, property: p3, computed: false, .. }
+                                                    if is_ident(o3, "process") && is_ident(p3, "env"))
+                                                    && matches!(&**p2, Expr::Identifier { .. })));
+                                    if env_chain {
+                                        *n = Expr::Identifier { name: lname };
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // sh2.vars.X = V → X = V
+                    if let Expr::AssignmentExpression { operator, left, right, .. } = n {
+                        if operator == "=" {
+                            if let Some(lname) = is_store_name_target(left) {
+                                if locals.contains(&lname) {
+                                    let r = (**right).clone();
+                                    *n = Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(Expr::Identifier { name: lname }),
+                                        right: Box::new(r),
+                                    };
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // sh2.setVar("X", V) → X = V (simple literal names)
+                    if let Expr::CallExpression { callee, arguments, .. } = n {
+                        if is_sh2_member(callee, "setVar") && arguments.len() == 2
+                            && matches!(&arguments[0], Expr::Literal { .. })
+                        {
+                            if let Some(lname) = lit_string(&arguments[0]) {
+                                if locals.contains(&lname) {
+                                    let r = arguments[1].clone();
+                                    *n = Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(Expr::Identifier { name: lname }),
+                                        right: Box::new(r),
+                                    };
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            // run the rewrite over the rest statements' exprs
+            let mut f = |e: &mut Expr| rewrite_expr(e, param_names, locals, param_by_pos);
+            for s in &mut new_rest {
+                visit_stmt_exprs(s, &mut f);
+            }
+        }
+        // build the plain function
+        let mut local_decls: Vec<&String> = locals.iter().filter(|n| !param_names.contains(*n)).collect();
+        local_decls.sort();
+        let mut param_store_prologue: Vec<Stmt> = Vec::new();
+        if !params.is_empty() {
+            let mut calls: Vec<Expr> = Vec::new();
+            for p in &params {
+                calls.push(Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                        property: Box::new(Expr::Identifier { name: "setVar".to_string() }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![
+                        Expr::Literal { value: serde_json::json!(p.name), raw: None, regex: None },
+                        Expr::Identifier { name: p.name.clone() },
+                    ],
+                    optional: false,
+                });
+            }
+            param_store_prologue.push(Stmt::ExpressionStatement {
+                expression: Expr::SequenceExpression { expressions: calls },
+            });
+        }
+        let mut fn_body: Vec<Stmt> = Vec::new();
+        if !local_decls.is_empty() {
+            fn_body.push(Stmt::VariableDeclaration {
+                declarations: local_decls
+                    .iter()
+                    .map(|n| VariableDeclarator {
+                        type_: "VariableDeclarator",
+                        id: Expr::Identifier { name: (*n).clone() },
+                        init: Some(Expr::Literal { value: serde_json::json!(""), raw: None, regex: None }),
+                    })
+                    .collect(),
+                kind: "let",
+            });
+        }
+        fn_body.extend(param_store_prologue);
+        fn_body.extend(new_rest);
+        let fn_block = Stmt::BlockStatement { body: fn_body };
+        let fn_async = arrow_async || has_await_stmt(&fn_block);
+        let fn_params: Vec<Expr> = params.iter().map(|p| Expr::Identifier { name: p.name.clone() }).collect();
+        // the adapter
+        let mut adapter_args: Vec<Expr> = Vec::new();
+        for p in &params {
+            let pos = Expr::MemberExpression {
+                object: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                    property: Box::new(Expr::Identifier { name: "positional".to_string() }),
+                    computed: false,
+                    optional: false,
+                }),
+                property: Box::new(Expr::Literal { value: serde_json::json!(p.n), raw: None, regex: None }),
+                computed: true,
+                optional: false,
+            };
+            if p.cast {
+                adapter_args.push(Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier { name: "Number".to_string() }),
+                    arguments: vec![pos],
+                    optional: false,
+                });
+            } else {
+                adapter_args.push(pos);
+            }
+        }
+        let adapter = Expr::ArrowFunctionExpression {
+            params: vec![],
+            body: ArrowBody::Expr(Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier { name: r.fn_name.clone() }),
+                arguments: adapter_args,
+                optional: false,
+            })),
+            expression: true,
+            r#async: false,
+        };
+        let set_call = Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                    property: Box::new(Expr::Identifier { name: "functions".to_string() }),
+                    computed: false,
+                    optional: false,
+                }),
+                property: Box::new(Expr::Identifier { name: "set".to_string() }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![
+                Expr::Literal { value: serde_json::json!(r.fn_name), raw: None, regex: None },
+                adapter,
+            ],
+            optional: false,
+        };
+        if r.direct {
+            // replace the registration stmt with the function declaration
+            // + the adapter registration — find it by the fn name
+            let fn_decl = Stmt::FunctionDeclaration {
+                id: Expr::Identifier { name: r.fn_name.clone() },
+                params: fn_params,
+                body: Box::new(fn_block),
+                generator: false,
+                expression: false,
+                r#async: fn_async,
+            };
+            for i in 0..out_body.len() {
+                if let Stmt::ExpressionStatement { expression } = &out_body[i] {
+                    let is_reg = matches!(expression, Expr::CallExpression { callee, arguments, .. }
+                        if is_functions_set_callee(callee)
+                            && !arguments.is_empty()
+                            && lit_string(&arguments[0]).as_deref() == Some(r.fn_name.as_str()));
+                    if is_reg {
+                        out_body[i] = fn_decl.clone();
+                        out_body.insert(
+                            i + 1,
+                            Stmt::ExpressionStatement { expression: set_call.clone() },
+                        );
+                        break;
+                    }
+                }
+            }
+        } else {
+            // sequence form: patch the assignment + the set call
+            for st in &mut out_body {
+                if let Stmt::ExpressionStatement { expression } = st {
+                    if let Expr::SequenceExpression { expressions } = expression {
+                        let mut fn_expr: Option<Expr> = None;
+                        for (k, x) in expressions.iter_mut().enumerate() {
+                            if k == r.seq_idx {
+                                if let Expr::AssignmentExpression { left, right, .. } = x {
+                                    let l = (**left).clone();
+                                    let block = fn_block.clone();
+                                    let params2 = fn_params.clone();
+                                    let async2 = fn_async;
+                                    let body = Stmt::BlockStatement { body: match block {
+                                        Stmt::BlockStatement { body } => body,
+                                        _ => unreachable!(),
+                                    } };
+                                    let fe = Expr::FunctionExpression {
+                                        id: Box::new(Expr::Identifier { name: r.fn_name.clone() }),
+                                        params: params2,
+                                        body: Box::new(body),
+                                        generator: false,
+                                        expression: false,
+                                        r#async: async2,
+                                    };
+                                    fn_expr = Some(fe.clone());
+                                    *x = Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(l),
+                                        right: Box::new(fe),
+                                    };
+                                }
+                            }
+                            if let Expr::CallExpression { callee, arguments, .. } = x {
+                                if is_functions_set_callee(callee)
+                                    && !arguments.is_empty()
+                                    && lit_string(&arguments[0]).as_deref() == Some(r.fn_name.as_str())
+                                {
+                                    *x = set_call.clone();
+                                }
+                            }
+                        }
+                        let _ = fn_expr;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. strip the moved param/local names from the top-level `let`
+    let mut moved: std::collections::HashSet<String> = Default::default();
+    for arrow in &registration_arrows {
+        if let Expr::ArrowFunctionExpression { body, .. } = arrow {
+            if let ArrowBody::Block(b) = body {
+                if let Stmt::BlockStatement { body: block } = &**b {
+                    let mut i = 0usize;
+                    while i < block.len() {
+                        let ok = match &block[i] {
+                            Stmt::ExpressionStatement { expression } => {
+                                matches!(expression, Expr::AssignmentExpression { operator, left, right, .. }
+                                    if operator == "="
+                                        && matches!(&**left, Expr::Identifier { .. })
+                                        && matches!(&**right, Expr::LogicalExpression { operator: o, left: l, .. }
+                                            if o == "??" && is_sh2_positional_read(l).is_some()))
+                            }
+                            _ => false,
+                        };
+                        if !ok { break; }
+                        if let Stmt::ExpressionStatement { expression } = &block[i] {
+                            if let Expr::AssignmentExpression { left, .. } = expression {
+                                if let Expr::Identifier { name } = &**left {
+                                    moved.insert(name.clone());
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+    if !moved.is_empty() {
+        let mut filtered: Vec<Stmt> = Vec::with_capacity(out_body.len());
+        for st in out_body {
+            if let Stmt::VariableDeclaration { declarations, kind } = st {
+                let kept: Vec<VariableDeclarator> = declarations
+                    .into_iter()
+                    .filter(|d| !matches!(&d.id, Expr::Identifier { name } if moved.contains(name)))
+                    .collect();
+                if !kept.is_empty() {
+                    filtered.push(Stmt::VariableDeclaration { declarations: kept, kind });
+                }
+            } else {
+                filtered.push(st);
+            }
+        }
+        prog.body = filtered;
+    } else {
+        prog.body = out_body;
+    }
+    prog
+}
+
+/// Visit every Expr in a single expression (pre-order, callback first).
+fn visit_exprs_single(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+    let mut stack: Vec<&mut Expr> = Vec::new();
+    stack.push(e);
+    while let Some(n) = stack.pop() {
+        f(n);
+        match n {
+            Expr::TemplateLiteral { expressions, .. } => {
+                for x in expressions.iter_mut() { stack.push(x); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                stack.push(callee);
+                for a in arguments.iter_mut() { stack.push(a); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                stack.push(object);
+                stack.push(property);
+            }
+            Expr::AwaitExpression { argument } => stack.push(argument),
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params.iter_mut() { stack.push(p); }
+                let mut v: Vec<&mut Expr> = Vec::new();
+                collect_stmt_exprs(body, &mut v);
+                stack.extend(v);
+            }
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params.iter_mut() { stack.push(p); }
+                match body {
+                    ArrowBody::Expr(x) => stack.push(x),
+                    ArrowBody::Block(b) => {
+                        let mut v: Vec<&mut Expr> = Vec::new();
+                        collect_stmt_exprs(b, &mut v);
+                        stack.extend(v);
+                    }
+                }
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties.iter_mut() {
+                    stack.push(&mut p.key);
+                    stack.push(&mut p.value);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { stack.push(el); }
+            }
+            Expr::SpreadElement { argument } => stack.push(argument),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                stack.push(test);
+                stack.push(consequent);
+                stack.push(alternate);
+            }
+            Expr::UnaryExpression { argument, .. } => stack.push(argument),
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions.iter_mut() { stack.push(x); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                stack.push(callee);
+                for a in arguments.iter_mut() { stack.push(a); }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+}
+
+fn collect_stmt_exprs<'a>(s: &'a mut Stmt, out: &mut Vec<&'a mut Expr>) {
+    match s {
+        Stmt::ExpressionStatement { expression } => out.push(expression),
+        Stmt::BlockStatement { body } => {
+            for x in body.iter_mut() { collect_stmt_exprs(x, out); }
+        }
+        Stmt::IfStatement { test, consequent, alternate } => {
+            out.push(test);
+            collect_stmt_exprs(consequent, out);
+            if let Some(a) = alternate { collect_stmt_exprs(a, out); }
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            collect_stmt_exprs(block, out);
+            if let Some(h) = handler {
+                if let Some(p) = &mut h.param { out.push(p); }
+                collect_stmt_exprs(&mut h.body, out);
+            }
+            if let Some(f) = finalizer { collect_stmt_exprs(f, out); }
+        }
+        Stmt::ThrowStatement { argument } => out.push(argument),
+        Stmt::SwitchStatement { discriminant, cases } => {
+            out.push(discriminant);
+            for c in cases.iter_mut() {
+                if let Some(t) = &mut c.test { out.push(t); }
+                for x in c.consequent.iter_mut() { collect_stmt_exprs(x, out); }
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            out.push(test);
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            collect_stmt_exprs(init, out);
+            out.push(test);
+            out.push(update);
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            collect_stmt_exprs(left, out);
+            out.push(right);
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            for p in params.iter_mut() { out.push(p); }
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations.iter_mut() {
+                if let Some(i) = &mut d.init { out.push(i); }
+            }
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(a) = argument { out.push(a); }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+fn visit_stmt_exprs(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
+    let mut v: Vec<&mut Expr> = Vec::new();
+    collect_stmt_exprs(s, &mut v);
+    for e in v {
+        visit_exprs_single(e, f);
+    }
+}
+
+
+/// estree.js `returnInLoop` — a `return V` inside a `sh2.*Loop` body
+/// arrow is a SyntaxError-adjacent semantic break (the return exits the
+/// arrow, not the function) — rewrite to `throw new
+/// sh2.ReturnSignal(V)`; the runtime's loop rethrows + the fnCall/exec
+/// dispatch unwraps it as the function's value. The inLoop flag
+/// propagates exactly like the JS (including through nested functions).
+pub(crate) fn return_in_loop(mut prog: Program) -> Program {
+    fn is_loop_call(e: &Expr) -> bool {
+        matches!(e, Expr::CallExpression { callee, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, .. }
+                if matches!(&**object, Expr::Identifier { name } if name == "sh2")
+                    && matches!(&**property, Expr::Identifier { name }
+                        if name == "whileLoop" || name == "whileLoopSync" || name == "forLoop")))
+    }
+    fn rewrite_expr(e: &mut Expr, in_loop: bool) {
+        let is_loop = is_loop_call(e);
+        match e {
+            Expr::CallExpression { callee, arguments, .. } if is_loop && arguments.len() > 1 => {
+                for (i, a) in arguments.iter_mut().enumerate() {
+                    rewrite_expr(a, i == 1);
+                }
+                return;
+            }
+            Expr::TemplateLiteral { expressions, .. } => {
+                for x in expressions { rewrite_expr(x, in_loop); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                rewrite_expr(callee, in_loop);
+                for a in arguments { rewrite_expr(a, in_loop); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                rewrite_expr(object, in_loop);
+                rewrite_expr(property, in_loop);
+            }
+            Expr::AwaitExpression { argument } => rewrite_expr(argument, in_loop),
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params { rewrite_expr(p, in_loop); }
+                match body {
+                    ArrowBody::Expr(x) => rewrite_expr(x, in_loop),
+                    ArrowBody::Block(b) => rewrite_stmt(b, in_loop),
+                }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params { rewrite_expr(p, in_loop); }
+                rewrite_stmt(body, in_loop);
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties {
+                    rewrite_expr(&mut p.key, in_loop);
+                    rewrite_expr(&mut p.value, in_loop);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { rewrite_expr(el, in_loop); }
+            }
+            Expr::SpreadElement { argument } => rewrite_expr(argument, in_loop),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                rewrite_expr(left, in_loop);
+                rewrite_expr(right, in_loop);
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                rewrite_expr(test, in_loop);
+                rewrite_expr(consequent, in_loop);
+                rewrite_expr(alternate, in_loop);
+            }
+            Expr::UnaryExpression { argument, .. } => rewrite_expr(argument, in_loop),
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions { rewrite_expr(x, in_loop); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                rewrite_expr(callee, in_loop);
+                for a in arguments { rewrite_expr(a, in_loop); }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+    fn rewrite_stmt(s: &mut Stmt, in_loop: bool) {
+        match s {
+            Stmt::ReturnStatement { argument } if in_loop => {
+                if let Some(a) = argument.take() {
+                    let mut x = a;
+                    rewrite_expr(&mut x, false);
+                    *s = Stmt::ThrowStatement {
+                        argument: Expr::NewExpression {
+                            callee: Box::new(Expr::MemberExpression {
+                                object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                                property: Box::new(Expr::Identifier { name: "ReturnSignal".to_string() }),
+                                computed: false,
+                                optional: false,
+                            }),
+                            arguments: vec![x],
+                        },
+                    };
+                }
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument {
+                    rewrite_expr(a, in_loop);
+                }
+            }
+            Stmt::ExpressionStatement { expression } => rewrite_expr(expression, in_loop),
+            Stmt::BlockStatement { body } => {
+                for x in body { rewrite_stmt(x, in_loop); }
+            }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                rewrite_expr(test, in_loop);
+                rewrite_stmt(consequent, in_loop);
+                if let Some(a) = alternate { rewrite_stmt(a, in_loop); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                rewrite_stmt(block, in_loop);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { rewrite_expr(p, in_loop); }
+                    rewrite_stmt(&mut h.body, in_loop);
+                }
+                if let Some(f) = finalizer { rewrite_stmt(f, in_loop); }
+            }
+            Stmt::ThrowStatement { argument } => rewrite_expr(argument, in_loop),
+            Stmt::SwitchStatement { discriminant, cases } => {
+                rewrite_expr(discriminant, in_loop);
+                for c in cases {
+                    if let Some(t) = &mut c.test { rewrite_expr(t, in_loop); }
+                    for x in &mut c.consequent { rewrite_stmt(x, in_loop); }
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                rewrite_expr(test, in_loop);
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::ForStatement { init, test, update, body } => {
+                rewrite_stmt(init, in_loop);
+                rewrite_expr(test, in_loop);
+                rewrite_expr(update, in_loop);
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                rewrite_stmt(left, in_loop);
+                rewrite_expr(right, in_loop);
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { rewrite_expr(p, in_loop); }
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { rewrite_expr(i, in_loop); }
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    for s in &mut prog.body {
+        rewrite_stmt(s, false);
+    }
+    prog
+}
+
+pub fn compile_head_passes(mut prog: Program) -> Program {
+    prog = strip_process_env(prog);          // #1
+    prog = await_sync_fn_calls(prog);        // #2
+    prog = force_async_file_redirects(prog); // #3
+    prog = mark_async_on_await(prog);        // #4
+    prog = await_async_direct_calls(prog);    // #5
+    prog = normalize_functions(prog);         // #6
+    prog = unwrap_store_string(prog);         // #7
+    prog = null_sentinel(prog);               // #8
+    prog
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2740,6 +5495,34 @@ mod tests {
     fn to_json(input: &str) -> String {
         let commands = Parser::new(input).parse().unwrap();
         serde_json::to_string(&ast_to_estree(&commands)).unwrap()
+    }
+
+    #[test]
+    fn json_writer_matches_serde() {
+        // the hand-rolled writer must produce JSON the browser parses
+        // identically to serde's — compare the parsed VALUES (object
+        // key order is cosmetic) AND the raw bytes.
+        for input in [
+            "x=1; echo hi",
+            "case $1 in a) echo A;; *) echo B;; esac",
+            "for i in 1 2 3; do echo $i; done",
+            "if [ -f x ]; then cat x; else echo no; fi",
+            "f() { local a=1; return $a; }; f",
+            "x='a\\\"b\\\\c\\nd'; echo ${x:-$y}",
+            "a=(1 2 3); echo ${a[1]}",
+            "while true; do sleep 1; done",
+            "echo `echo nested`",
+            "cat <<EOF\\nhi\\nEOF",
+        ] {
+            let commands = Parser::new(input).parse().unwrap();
+            let prog = ast_to_estree(&commands);
+            let serde_out = serde_json::to_string(&prog).unwrap();
+            let mine = estree_to_json(&prog);
+            let a: serde_json::Value = serde_json::from_str(&serde_out).unwrap();
+            let b: serde_json::Value = serde_json::from_str(&mine).unwrap();
+            assert_eq!(a, b, "parsed mismatch for: {input}");
+            assert_eq!(serde_out, mine, "byte mismatch for: {input}");
+        }
     }
 
     #[test]
@@ -4735,9 +7518,14 @@ mod migrated_passes_tests {
         // ref inside a script function (deferred invocation / shadowing)
         let j3 = to_json("f() { echo ${arr[1]}; }; arr=(a b c); f");
         assert_eq!(count(&j3, "\"name\":\"setArray\""), 1, "in-function keeps runtime: {j3}");
-        // computed subscript (runtime evalArith + negative wrap)
+        // computed subscript: `$var` indexes (the game's direction tables
+        // — `DIR_X[$yaw]` per frame) now lower to a NATIVE array read
+        // with the store index (String(arr[Number(sh2.vars.i ?? "")] ??
+        // "") — byte-equivalent to the runtime's expansion)
         let j4 = to_json("arr=(a b c); i=1; echo ${arr[$i]}");
-        assert_eq!(count(&j4, "\"name\":\"setArray\""), 1, "computed index keeps runtime: {j4}");
+        assert_eq!(count(&j4, "\"name\":\"setArray\""), 0, "computed $var index goes native: {j4}");
+        assert_eq!(count(&j4, "arrayIndex"), 0, "no arrayIndex dispatch: {j4}");
+        assert!(j4.contains("\"name\":\"arr\""), "native array identifier: {j4}");
         // a nested (conditional) setArray can't become a top-level `let`
         let j5 = to_json("if true; then arr=(a b); fi; echo ${arr[1]}");
         assert_eq!(count(&j5, "\"name\":\"setArray\""), 1, "nested setArray keeps runtime: {j5}");
@@ -4842,19 +7630,43 @@ pub(crate) fn drop_dead_top_decls(prog: Program) -> Program {
     if decl_names.is_empty() {
         return Program { type_: prog.type_, source_type: prog.source_type, body };
     }
+    // Precompute each top-level statement's READ set (the names it reads,
+    // honouring arrow/catch/loop shadowing) and DECLARED names — ONE tree
+    // walk per statement, instead of the old per-(declaration, statement)
+    // walks that re-walked every expression tree once per leading name
+    // (the estree::expr_read hotspot — 16M block executions on the game).
+    let empty = ReadSet::new();
+    let read_sets: Vec<ReadSet> = body.iter().map(|st| stmt_read_set(st, &empty)).collect();
+    let declared_sets: Vec<ReadSet> = body.iter().map(|st| stmt_declared_set(st)).collect();
+    // per-name sorted read/declared positions (pushed in statement order)
+    let mut read_pos: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut decl_pos: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, rs) in read_sets.iter().enumerate() {
+        for n in rs {
+            read_pos.entry(n).or_default().push(i);
+        }
+    }
+    for (i, ds) in declared_sets.iter().enumerate() {
+        for n in ds {
+            decl_pos.entry(n).or_default().push(i);
+        }
+    }
     // Scan each leading declaration's name over the statements AFTER that
     // declaration: a `let x` later (nested, or a for-init) shadows the
     // top-level binding for its scope, but the declaration itself is the
     // binding under examination — counting it as a shadow would treat
     // every later `x = …` / `$x` as shadowed. The OTHER leading
     // declarations' initializers DO count as reads (`let middle =
-    // [].concat(numbers.slice(…))` reads `numbers`).
+    // [].concat(numbers.slice(…))` reads `numbers`). The name is read iff
+    // a read position r (k < r) exists before the FIRST shadowing
+    // declaration d after k (r < d) — the old `stmts_read(&body[k+1..],
+    // name, false)` semantics, via two sorted-position lookups per name.
     let mut keep_leading: Vec<bool> = Vec::with_capacity(decl_count);
     for (k, st) in body[..decl_count].iter().enumerate() {
         let any_read = match st {
             Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
                 matches!(&d.id, Expr::Identifier { name }
-                    if stmts_read(&body[k + 1..], name, false))
+                    if leading_decl_read(&read_pos, &decl_pos, name, k))
             }),
             _ => false,
         };
@@ -4877,179 +7689,295 @@ pub(crate) fn drop_dead_top_decls(prog: Program) -> Program {
     Program { type_: prog.type_, source_type: prog.source_type, body }
 }
 
-fn stmts_read(stmts: &[Stmt], name: &str, shadowed: bool) -> bool {
-    let mut sh = shadowed;
-    for st in stmts {
-        if stmt_read(st, name, sh) {
-            return true;
-        }
-        // a `let x` in this block shadows the remainder of it
-        if stmt_declares(st, name) {
-            sh = true;
-        }
+/// Is `name` read anywhere in `body[k+1..]` before its first shadowing
+/// declaration? (the old per-name `stmts_read(&body[k+1..], name, false)`.)
+fn leading_decl_read(
+    read_pos: &HashMap<&str, Vec<usize>>,
+    decl_pos: &HashMap<&str, Vec<usize>>,
+    name: &str,
+    k: usize,
+) -> bool {
+    let Some(reads) = read_pos.get(name) else { return false };
+    let Some(&r) = reads.iter().find(|&&r| r > k) else { return false };
+    match decl_pos.get(name) {
+        None => true,
+        Some(decls) => match decls.iter().find(|&&d| d > k) {
+            None => true,
+            Some(&d) => r < d,
+        },
     }
-    false
 }
 
-fn stmt_read(st: &Stmt, name: &str, shadowed: bool) -> bool {
+// Borrowed-name set: the identifiers live in the Program (alive for the
+// whole pass), so the read/declared sets hold &str — no per-identifier
+// String clones (the clone+drop churn showed up in the profile as the
+// sip/hash_one + Vec<u8> drop hotspots). RandomState (the std default)
+// is kept — the sets are keyed by script identifiers, and the std's
+// per-process seed is the deliberate hash-flooding defence.
+type ReadSet<'a> = std::collections::HashSet<&'a str>;
+
+/// The names a statement LIST reads, with the list-level shadowing: a
+/// `let x` shadows `x` for the remaining statements.
+fn stmts_read_set<'a>(stmts: &'a [Stmt], shadow: &ReadSet<'a>) -> ReadSet<'a> {
+    let mut out = ReadSet::new();
+    let mut sh = shadow.clone();
+    for st in stmts {
+        out.extend(stmt_read_set(st, &sh));
+        sh.extend(stmt_declared_set(st));
+    }
+    out
+}
+
+/// The names a statement subtree reads, honouring shadowing — the
+/// set-based twin of the per-name `stmt_read` walk (a `let x` in a block
+/// shadows the rest of the block; loop inits / for-of lefts shadow their
+/// bodies; a catch param shadows its handler).
+fn stmt_read_set<'a>(st: &'a Stmt, shadow: &ReadSet<'a>) -> ReadSet<'a> {
     match st {
-        Stmt::ExpressionStatement { expression } => expr_read(expression, name, shadowed),
-        Stmt::BlockStatement { body } => stmts_read(body, name, shadowed),
+        Stmt::ExpressionStatement { expression } => expr_read_set(expression, shadow),
+        Stmt::BlockStatement { body } => stmts_read_set(body, shadow),
         Stmt::IfStatement { test, consequent, alternate } => {
-            expr_read(test, name, shadowed)
-                || stmt_read(consequent, name, shadowed)
-                || alternate
-                    .as_ref()
-                    .map(|a| stmt_read(a, name, shadowed))
-                    .unwrap_or(false)
+            let mut out = expr_read_set(test, shadow);
+            out.extend(stmt_read_set(consequent, shadow));
+            if let Some(a) = alternate {
+                out.extend(stmt_read_set(a, shadow));
+            }
+            out
         }
         Stmt::SwitchStatement { discriminant, cases } => {
-            expr_read(discriminant, name, shadowed)
-                || cases.iter().any(|c| {
-                    c.test
-                        .as_ref()
-                        .map(|t| expr_read(t, name, shadowed))
-                        .unwrap_or(false)
-                        || stmts_read(&c.consequent, name, shadowed)
-                })
+            let mut out = expr_read_set(discriminant, shadow);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    out.extend(expr_read_set(t, shadow));
+                }
+                out.extend(stmts_read_set(&c.consequent, shadow));
+            }
+            out
         }
         Stmt::WhileStatement { test, body } => {
-            expr_read(test, name, shadowed) || stmt_read(body, name, shadowed)
+            let mut out = expr_read_set(test, shadow);
+            out.extend(stmt_read_set(body, shadow));
+            out
         }
-        Stmt::TryStatement {
-            block,
-            handler,
-            finalizer,
-        } => {
-            stmt_read(block, name, shadowed)
-                || handler.as_ref().map(|h| {
-                    let param_shadows = h
-                        .param
-                        .as_ref()
-                        .map(|p| expr_read(p, name, false))
-                        .unwrap_or(false);
-                    stmt_read(&h.body, name, shadowed || param_shadows)
-                }).unwrap_or(false)
-                || finalizer
-                    .as_ref()
-                    .map(|f| stmt_read(f, name, shadowed))
-                    .unwrap_or(false)
+        Stmt::DoWhileStatement { test, body } => {
+            let mut out = expr_read_set(test, shadow);
+            out.extend(stmt_read_set(body, shadow));
+            out
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            let mut out = stmt_read_set(block, shadow);
+            if let Some(h) = handler {
+                let mut h_shadow = shadow.clone();
+                if let Some(p) = &h.param {
+                    // the catch param binds its own name — reads of that
+                    // name inside the handler are the handler's binding
+                    h_shadow.extend(expr_read_set(p, &ReadSet::new()));
+                }
+                out.extend(stmt_read_set(&h.body, &h_shadow));
+            }
+            if let Some(f) = finalizer {
+                out.extend(stmt_read_set(f, shadow));
+            }
+            out
         }
         Stmt::ForStatement { init, test, update, body } => {
-            let declares = stmt_declares(init, name);
-            stmt_read(init, name, shadowed)
-                || expr_read(test, name, shadowed || declares)
-                || expr_read(update, name, shadowed || declares)
-                || stmt_read(body, name, shadowed || declares)
+            let mut out = stmt_read_set(init, shadow);
+            let declares = stmt_declared_set(init);
+            let mut inner = shadow.clone();
+            inner.extend(declares);
+            out.extend(expr_read_set(test, &inner));
+            out.extend(expr_read_set(update, &inner));
+            out.extend(stmt_read_set(body, &inner));
+            out
         }
         Stmt::ForOfStatement { left, right, body } => {
-            let declares = stmt_declares(left, name);
-            stmt_read(left, name, shadowed)
-                || expr_read(right, name, shadowed)
-                || stmt_read(body, name, shadowed || declares)
+            let mut out = stmt_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            let declares = stmt_declared_set(left);
+            let mut inner = shadow.clone();
+            inner.extend(declares);
+            out.extend(stmt_read_set(body, &inner));
+            out
         }
-        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| match &d.init {
-            Some(init) => expr_read(init, name, shadowed),
-            None => false,
-        }),
-        Stmt::ReturnStatement { argument } => argument
-            .as_ref()
-            .map(|a| expr_read(a, name, shadowed))
-            .unwrap_or(false),
-        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => false,
-        Stmt::ThrowStatement { argument } => expr_read(argument, name, shadowed),
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            let mut out = ReadSet::new();
+            for p in params {
+                out.extend(expr_read_set(p, &ReadSet::new()));
+            }
+            out.extend(stmt_read_set(body, shadow));
+            out
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            let mut out = ReadSet::new();
+            for d in declarations {
+                if let Some(init) = &d.init {
+                    out.extend(expr_read_set(init, shadow));
+                }
+            }
+            out
+        }
+        Stmt::ReturnStatement { argument } => match argument {
+            Some(a) => expr_read_set(a, shadow),
+            None => ReadSet::new(),
+        },
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => ReadSet::new(),
+        Stmt::ThrowStatement { argument } => expr_read_set(argument, shadow),
     }
 }
 
-fn stmt_declares(st: &Stmt, name: &str) -> bool {
-    match st {
-        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
-            matches!(&d.id, Expr::Identifier { name: n } if n == name)
-        }),
-        Stmt::ForStatement { init, .. } => stmt_declares(init, name),
-        Stmt::ForOfStatement { left, .. } => stmt_declares(left, name),
-        // The catch param shadows only INSIDE the handler (JS scoping) —
-        // it does not declare `name` for the enclosing list, so later
-        // statements' reads of a lifted `name` stay visible.
-        _ => false,
-    }
-}
-
-fn expr_read(e: &Expr, name: &str, shadowed: bool) -> bool {
+/// The names an expression subtree reads, honouring shadowing — the
+/// set-based twin of the per-name `expr_read` walk (arrow params and
+/// arrow-body declarations shadow inside the arrow).
+fn expr_read_set<'a>(e: &'a Expr, shadow: &ReadSet<'a>) -> ReadSet<'a> {
     match e {
-        Expr::Identifier { name: n } => !shadowed && n == name,
-        Expr::Literal { .. } => false,
+        Expr::Identifier { name } => {
+            let mut out = ReadSet::new();
+            if !shadow.contains(name.as_str()) {
+                out.insert(name.as_str());
+            }
+            out
+        }
+        Expr::Literal { .. } => ReadSet::new(),
         Expr::TemplateLiteral { expressions, .. } => {
-            expressions.iter().any(|x| expr_read(x, name, shadowed))
+            let mut out = ReadSet::new();
+            for x in expressions {
+                out.extend(expr_read_set(x, shadow));
+            }
+            out
         }
         Expr::CallExpression { callee, arguments, .. } => {
-            expr_read(callee, name, shadowed)
-                || arguments.iter().any(|a| expr_read(a, name, shadowed))
+            let mut out = expr_read_set(callee, shadow);
+            for a in arguments {
+                out.extend(expr_read_set(a, shadow));
+            }
+            out
         }
         Expr::MemberExpression { object, property, .. } => {
-            expr_read(object, name, shadowed) || expr_read(property, name, shadowed)
+            let mut out = expr_read_set(object, shadow);
+            out.extend(expr_read_set(property, shadow));
+            out
         }
-        Expr::AwaitExpression { argument } => expr_read(argument, name, shadowed),
+        Expr::AwaitExpression { argument } => expr_read_set(argument, shadow),
         Expr::ArrowFunctionExpression { params, body, .. } => {
-            let p_shadows = params
-                .iter()
-                .any(|p| matches!(p, Expr::Identifier { name: n } if n == name));
-            let b_shadows = arrow_body_declares(body, name);
-            arrow_body_read(body, name, shadowed || p_shadows || b_shadows)
+            let mut inner = shadow.clone();
+            for p in params {
+                inner.extend(expr_read_set(p, &ReadSet::new()));
+            }
+            inner.extend(arrow_body_declared_set(body));
+            arrow_body_read_set(body, &inner)
         }
-        Expr::ObjectExpression { properties } => properties.iter().any(|p| {
-            expr_read(&p.value, name, shadowed)
-                || (p.computed && expr_read(&p.key, name, shadowed))
-        }),
+        Expr::FunctionExpression { params, body, .. } => {
+            let mut inner = shadow.clone();
+            for p in params {
+                inner.extend(expr_read_set(p, &ReadSet::new()));
+            }
+            inner.extend(stmt_read_set(body, &inner));
+            inner
+        }
+        Expr::ObjectExpression { properties } => {
+            let mut out = ReadSet::new();
+            for p in properties {
+                out.extend(expr_read_set(&p.value, shadow));
+                if p.computed {
+                    out.extend(expr_read_set(&p.key, shadow));
+                }
+            }
+            out
+        }
         Expr::ArrayExpression { elements } => {
-            elements.iter().flatten().any(|x| expr_read(x, name, shadowed))
+            let mut out = ReadSet::new();
+            for x in elements.iter().flatten() {
+                out.extend(expr_read_set(x, shadow));
+            }
+            out
         }
-        Expr::SpreadElement { argument } => expr_read(argument, name, shadowed),
+        Expr::SpreadElement { argument } => expr_read_set(argument, shadow),
         Expr::LogicalExpression { left, right, .. } => {
-            expr_read(left, name, shadowed) || expr_read(right, name, shadowed)
+            let mut out = expr_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            out
         }
         Expr::BinaryExpression { left, right, .. } => {
-            expr_read(left, name, shadowed) || expr_read(right, name, shadowed)
+            let mut out = expr_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            out
         }
         Expr::AssignmentExpression { left, right, .. } => {
-            expr_read(left, name, shadowed) || expr_read(right, name, shadowed)
+            // the assignment target counts as a read (conservative —
+            // any reference keeps the declaration), matching the old walk
+            let mut out = expr_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            out
         }
         Expr::ConditionalExpression { test, consequent, alternate, .. } => {
-            expr_read(test, name, shadowed)
-                || expr_read(consequent, name, shadowed)
-                || expr_read(alternate, name, shadowed)
+            let mut out = expr_read_set(test, shadow);
+            out.extend(expr_read_set(consequent, shadow));
+            out.extend(expr_read_set(alternate, shadow));
+            out
         }
-        Expr::UnaryExpression { argument, .. } => expr_read(argument, name, shadowed),
+        Expr::UnaryExpression { argument, .. } => expr_read_set(argument, shadow),
         Expr::SequenceExpression { expressions } => {
-            expressions.iter().any(|x| expr_read(x, name, shadowed))
+            let mut out = ReadSet::new();
+            for x in expressions {
+                out.extend(expr_read_set(x, shadow));
+            }
+            out
         }
         Expr::NewExpression { callee, arguments, .. } => {
-            expr_read(callee, name, shadowed)
-                || arguments.iter().any(|a| expr_read(a, name, shadowed))
+            let mut out = expr_read_set(callee, shadow);
+            for a in arguments {
+                out.extend(expr_read_set(a, shadow));
+            }
+            out
         }
     }
 }
 
-fn arrow_body_read(body: &ArrowBody, name: &str, shadowed: bool) -> bool {
+fn arrow_body_read_set<'a>(body: &'a ArrowBody, shadow: &ReadSet<'a>) -> ReadSet<'a> {
     match body {
-        ArrowBody::Expr(e) => expr_read(e, name, shadowed),
-        ArrowBody::Block(b) => stmt_read(b, name, shadowed),
+        ArrowBody::Expr(e) => expr_read_set(e, shadow),
+        ArrowBody::Block(b) => stmt_read_set(b, shadow),
     }
 }
 
-fn arrow_body_declares(body: &ArrowBody, name: &str) -> bool {
+fn arrow_body_declared_set<'a>(body: &'a ArrowBody) -> ReadSet<'a> {
     match body {
-        ArrowBody::Expr(_) => false,
-        ArrowBody::Block(b) => block_declares(b, name),
+        ArrowBody::Expr(_) => ReadSet::new(),
+        ArrowBody::Block(b) => block_declared_set(b),
     }
 }
 
-fn block_declares(st: &Stmt, name: &str) -> bool {
+fn block_declared_set<'a>(st: &'a Stmt) -> ReadSet<'a> {
     match st {
-        Stmt::BlockStatement { body } => body.iter().any(|s| stmt_declares(s, name)),
-        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
-            matches!(&d.id, Expr::Identifier { name: n } if n == name)
-        }),
-        _ => false,
+        Stmt::BlockStatement { body } => {
+            let mut out = ReadSet::new();
+            for s in body {
+                out.extend(stmt_declared_set(s));
+            }
+            out
+        }
+        Stmt::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .filter_map(|d| match &d.id {
+                Expr::Identifier { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => ReadSet::new(),
+    }
+}
+
+fn stmt_declared_set<'a>(st: &'a Stmt) -> ReadSet<'a> {
+    match st {
+        Stmt::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .filter_map(|d| match &d.id {
+                Expr::Identifier { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect(),
+        Stmt::ForStatement { init, .. } => stmt_declared_set(init),
+        Stmt::ForOfStatement { left, .. } => stmt_declared_set(left),
+        _ => ReadSet::new(),
     }
 }
