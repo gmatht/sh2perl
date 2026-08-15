@@ -4440,6 +4440,33 @@ fn word_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Interpolate(parts) => interp_to_sh(parts),
         IrExpr::Arith(a) => Ok(arith_ast_value_to_sh(a)),
         IrExpr::Call { func, args } => call_word_to_sh(func, args),
+        // The A1 `Index` expr node (triage-sh py-sh-go cross-product pairs
+        // t21/t56/t73): array element read — render like the `arrayIndex`
+        // call arm (the POSIX per-element lowering `${name_key}`).
+        IrExpr::Index { var, key } => match key.as_ref() {
+            IrExpr::Str(k, _) if k == "@" || k == "*" => {
+                Ok(arr_expand_call(arr_base(var)))
+            }
+            IrExpr::Str(k, _) if k.contains(['$', '(']) => {
+                let base = arr_base(var);
+                let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
+                    eval_key(k)
+                } else {
+                    format!("$(({}))", protect_key_arith(k))
+                };
+                Ok(format!(
+                        "$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")"
+                ))
+            }
+            IrExpr::Str(k, _) => Ok(format!("\"${{{}}}\"", elem_name(var, k))),
+            _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
+        },
+        // The first-class Capture node (core request
+        // zsh-sh-go-20260814-230503): `$(...)`/backticks — same `"$(...)"`
+        // rendering as the `capture` call arm.
+        IrExpr::Capture { expr, .. } => {
+            Ok(capture_wrap(&arrow_to_sh(std::slice::from_ref(expr.as_ref()))?, true))
+        }
         IrExpr::Json(v) => Ok(json_str(v)),
         other => Err(format!("word not renderable: {other:?}")),
     }
@@ -5028,6 +5055,31 @@ fn interp_expr_to_sh(e: &IrExpr) -> Result<String, String> {
         IrExpr::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
         IrExpr::Var(name, _) => Ok(format!("${name}")),
         IrExpr::Str(s, _) => Ok(s.clone()),
+        // The A1 `Index` expr node (triage-sh py-sh-go cross-product pairs
+        // t21/t56/t73): array element read — render like the `arrayIndex`
+        // call arm (the POSIX per-element lowering `${name_key}`).
+        IrExpr::Index { var, key } => match key.as_ref() {
+            IrExpr::Str(k, _) if k == "@" || k == "*" => Ok(arr_expand_call(arr_base(var))),
+            IrExpr::Str(k, _) if k.contains(['$', '(']) => {
+                let base = arr_base(var);
+                let key_sh = if ASSOC_VARS.lock().unwrap().contains(base) {
+                    eval_key(k)
+                } else {
+                    format!("$(({}))", protect_key_arith(k))
+                };
+                Ok(format!(
+                        "$(eval \"printf '%s' \\\"\\${{{base}_{key_sh}}}\\\"\")"
+                ))
+            }
+            IrExpr::Str(k, _) => Ok(format!("${{{}}}", elem_name(arr_base(var), k))),
+            _ => Err("dynamic array indices are not yet POSIX-lowered — refusing".into()),
+        },
+        // The first-class Capture node (core request
+        // zsh-sh-go-20260814-230503): `$(...)`/backticks — same `"$(...)"`
+        // rendering as the `capture` call arm.
+        IrExpr::Capture { expr, .. } => {
+            Ok(capture_wrap(&arrow_to_sh(std::slice::from_ref(expr.as_ref()))?, true))
+        }
         other => Err(format!("interp expr not renderable: {other:?}")),
     }
 }
