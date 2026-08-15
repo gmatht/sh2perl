@@ -394,7 +394,10 @@ impl Render {
                 "#" => "__SH_ARGV.lock().unwrap().len().to_string()".to_string(),
                 "@" | "*" => "__SH_ARGV.lock().unwrap().join(\" \")".to_string(),
                 "0" => "std::env::args().next().unwrap_or_default()".to_string(),
-                "!" => "__SH_BGPID.load(Ordering::SeqCst).to_string()".to_string(),
+                "!" => {
+                    // empty until a background job starts (bash's $!)
+                    "{{ let __p = __SH_BGPID.load(Ordering::SeqCst); if __p == 0 {{ String::new() }} else {{ __p.to_string() }} }}".to_string()
+                }
                 "RANDOM" => {
                     self.add_helper("rand");
                     "__sh_rand()".to_string()
@@ -403,6 +406,7 @@ impl Render {
                     self.add_helper("capture");
                     "__sh_capture(\"id -u\")".to_string()
                 }
+                "-" => "\"hB\".to_string()".to_string(),
                 "LINENO" | "SECONDS" | "BASH_VERSION" | "BASH_SOURCE" | "FUNCNAME"
                 | "BASH_LINENO" | "PPID" | "EPOCHSECONDS" | "EPOCHREALTIME"
                 | "BASHPID" | "GROUPS" | "HOSTTYPE" | "MACHTYPE" | "OSTYPE"
@@ -1137,7 +1141,37 @@ impl Render {
                     self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                 }
             }
-            "eval" | "command" => {
+            "eval" => {
+                // `eval "y=$x+1"` — a plain assignment string evaluates
+                // in the CURRENT shell (a shell-out would lose it)
+                let joined = words
+                    .iter()
+                    .map(|w| word_source_text(w))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if let Some((name, rest)) = joined.trim().split_once('=') {
+                    if !name.is_empty()
+                        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    {
+                        let v = self.dollar_interp(rest);
+                        self.mark_written(name);
+                        let st = if self.is_num(name) {
+                            self.write_num(name, &format!("{v}.trim().parse::<i64>().unwrap_or(0)"))
+                        } else if self.is_array(name) {
+                            self.array_elem_set(name, "0", &v)
+                        } else {
+                            self.write_str(name, &v)
+                        };
+                        self.emit(&st);
+                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        return;
+                    }
+                }
+                let text = self.cmd_text(&words, None);
+                self.add_helper("run");
+                self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::SeqCst);"));
+            }
+            "command" => {
                 let text = self.cmd_text(&words, None);
                 self.add_helper("run");
                 self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::SeqCst);"));
@@ -1539,6 +1573,10 @@ impl Render {
                     continue;
                 }
                 self.mark_written(name);
+                if self.is_assoc(name) || self.is_array(name) {
+                    // a map/array var can't take a read line — skip
+                    continue;
+                }
                 let get = format!("__f.get({idx}).cloned().unwrap_or_default()");
                 if self.is_num(name) {
                     lines.push(self.write_num(name, &format!("{get}.trim().parse::<i64>().unwrap_or(0)")));
@@ -1853,6 +1891,7 @@ impl Render {
         let op = str_arg(args, 0).unwrap_or("");
         let name = str_arg(args, 1).unwrap_or("");
         let idx_at = matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
+        let off_num = matches!(args.get(2), Some(IrExpr::Str(s, _)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
         let name_at = name.ends_with("[@]") || name.ends_with("[*]");
         if let Some(keys) = name.strip_prefix('!') {
             let keys = array_base_name(keys);
@@ -1882,6 +1921,28 @@ impl Render {
         let _ = op;
         if name == "@" || name == "*" {
             return "__SH_ARGV.lock().unwrap().clone()".to_string();
+        }
+        if (name_at || idx_at || off_num) && !name.is_empty() {
+            let var = name
+                .strip_suffix("[@]")
+                .or_else(|| name.strip_suffix("[*]"))
+                .unwrap_or(name);
+            if self.is_array(var) || self.is_assoc(var) {
+                self.mark_written(var);
+                if op == "slice" {
+                    let off = args.get(2).map(|x| self.expr_num(x)).unwrap_or_else(|| "0".to_string());
+                    let len = match args.get(3) {
+                        None => "-1".to_string(),
+                        Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
+                        Some(x) => self.expr_num(x),
+                    };
+                    let arr = self.read_arr(var);
+                    return format!(
+                        "{{ let __v = {arr}; let __o = {off}; let __l = if {len} < 0 {{ __v.len() as i64 - __o }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize;                          __v[__s..__e].to_vec() }}"
+                    );
+                }
+                return self.read_arr(var);
+            }
         }
         if name_at || idx_at {
             let var = name
@@ -1957,7 +2018,11 @@ impl Render {
             return "String::new()".to_string();
         };
         self.mark_written(name);
-        let key = args.get(1).map(|k| self.expr_num(k)).unwrap_or_else(|| "0".to_string());
+        let key = match args.get(1) {
+            Some(IrExpr::Str(k, _)) => self.key_num_expr(k),
+            Some(k) => self.expr_num(k),
+            None => "0".to_string(),
+        };
         if self.is_assoc(name) {
             // assoc read with a numeric-looking key — use the literal text
             if let Some(IrExpr::Str(k, _)) = args.get(1) {
@@ -1967,6 +2032,21 @@ impl Render {
         } else {
             self.array_elem(name, &key)
         }
+    }
+
+    /// A param default/value text — strip the source quoting
+    /// (`${@:-"default"}` carries the quotes in the Str).
+    fn param_val_str(&mut self, x: &IrExpr) -> String {
+        if let IrExpr::Str(s, _) = x {
+            let t = s.trim();
+            if t.len() >= 2
+                && ((t.starts_with('"') && t.ends_with('"'))
+                    || (t.starts_with('\'') && t.ends_with('\'')))
+            {
+                return Self::rust_str_expr(&t[1..t.len() - 1]);
+            }
+        }
+        self.expr_str(x)
     }
 
     /// `${arr[i]}` / `${info[$key]}` element read by name/key text.
@@ -1987,11 +2067,20 @@ impl Render {
         "String::new()".to_string()
     }
 
-    /// A numeric key expr from source text (may be `$var` / `${x}`).
+    /// A numeric key expr from source text (may be `$var` / `${x}` /
+    /// an arithmetic expression like `(2*$i)-1`).
     fn key_num_expr(&mut self, key: &str) -> String {
         let k = key.trim();
         if let Ok(n) = k.parse::<i64>() {
             return n.to_string();
+        }
+        if k.contains('$') || k.contains('*') || k.contains('+') || k.contains('-')
+            || k.contains('/') || k.contains('%') || k.starts_with('(')
+        {
+            // an arithmetic index expression
+            if let Some(e) = self.arith_text(k) {
+                return e;
+            }
         }
         let k = k.strip_prefix('$').unwrap_or(k);
         let k = k.strip_prefix('{').and_then(|s| s.strip_suffix('}')).unwrap_or(k);
@@ -2556,14 +2645,16 @@ impl Render {
                             if let Some(t) = &r.target {
                                 let te = self.expr_str(t);
                                 let op = if r.mode == "w" { ">" } else { ">>" };
-                                full = format!("format!(\"{{}} {op} {{}}\", {full}, __sh_q(&{te}))");
+                                let fd = if r.fd == 2 { "2" } else { "" };
+                                full = format!("format!(\"{{}} {fd}{op} {{}}\", {full}, __sh_q(&{te}))");
                                 self.add_helper("q");
                             }
                         }
                         "r" => {
                             if let Some(t) = &r.target {
                                 let te = self.expr_str(t);
-                                full = format!("format!(\"{{}} < {{}}\", {full}, __sh_q(&{te}))");
+                                let fd = if r.fd == 2 { "2" } else { "" };
+                                full = format!("format!(\"{{}} {fd}< {{}}\", {full}, __sh_q(&{te}))");
                                 self.add_helper("q");
                             }
                         }
@@ -2855,6 +2946,7 @@ impl Render {
         let name = str_arg(args, 1).unwrap_or("");
         // array-length / keys forms first
         let idx_at = matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
+        let off_num = matches!(args.get(2), Some(IrExpr::Str(s, _)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
         let name_at = name.ends_with("[@]") || name.ends_with("[*]");
         if let Some(keys) = name.strip_prefix('!') {
             let keys = array_base_name(keys);
@@ -2916,8 +3008,8 @@ impl Render {
             self.add_helper("len");
             return format!("__sh_len(&{var_expr}).to_string()");
         }
-        let val = args.get(2).map(|x| self.expr_str(x)).unwrap_or_else(|| "String::new()".to_string());
-        let repl = args.get(3).map(|x| self.expr_str(x)).unwrap_or_else(|| "String::new()".to_string());
+        let val = args.get(2).map(|x| self.param_val_str(x)).unwrap_or_else(|| "String::new()".to_string());
+        let repl = args.get(3).map(|x| self.param_val_str(x)).unwrap_or_else(|| "String::new()".to_string());
         match op {
             "" => var_expr,
             ":" | "+" | ":+" => {
@@ -2969,13 +3061,22 @@ impl Render {
                 format!("__sh_replace(&{var_expr}, {}, &{repl}, {all})", Self::rust_str(pat))
             }
             "slice" => {
-                // scalar char slice ${x:off:len}
+                // `${arr[@]:off:len}` — an element slice; scalar strings
+                // get a char slice
                 let off = args.get(2).map(|x| self.expr_num(x)).unwrap_or_else(|| "0".to_string());
                 let len = match args.get(3) {
                     None => "-1".to_string(),
                     Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
                     Some(x) => self.expr_num(x),
                 };
+                if !name.is_empty() && !name.starts_with('$')
+                    && (self.is_array(&name.to_string()) || self.is_assoc(&name.to_string()))
+                {
+                    let arr = self.read_arr(&name.to_string());
+                    return format!(
+                        "{{ let __v = {arr}; let __o = {off}; let __l = if {len} < 0 {{ __v.len() as i64 - __o }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize;                          __v[__s..__e].join(\" \") }}"
+                    );
+                }
                 self.add_helper("substr");
                 format!("__sh_substr(&{var_expr}, {off}, {len})")
             }
@@ -4844,6 +4945,63 @@ impl Render {
     fn stage_text(&mut self, stmts: &[IrStmt]) -> Option<String> {
         match stmts {
             [] => Some(":".to_string()),
+            [IrStmt::Expr(IrExpr::Call { func, args })] if func == "redirect" => {
+                // the redirect CALL form (`cmd > file` as a stage)
+                let mut inner: Vec<IrStmt> = Vec::new();
+                let mut redirs: Vec<IrRedirectInfo> = Vec::new();
+                if let Some(IrExpr::Arrow(b)) = args.first() {
+                    inner = b.clone();
+                }
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for it in items {
+                        if let Some(r) = self.redirect_info(it) {
+                            redirs.push(r);
+                        }
+                    }
+                }
+                // a heredoc/herestring needs its content as stdin — route
+                // through the native path (which passes it as input)
+                if redirs.iter().any(|r| {
+                    matches!(r.mode.as_str(), "heredoc" | "heredoc-tabs" | "herestring")
+                }) {
+                    return None;
+                }
+                let mut full = self.stage_text(&inner)?;
+                for r in &redirs {
+                    let mode = r.mode.clone();
+                    let te = self.expr_str(r.target.as_ref().unwrap_or(&IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted)));
+                    match mode.as_str() {
+                        "w" | "a" => {
+                            let op = if mode == "w" { ">" } else { ">>" };
+                            let fd = if r.fd == 2 { "2" } else { "" };
+                            self.add_helper("q");
+                            full = format!("format!(\"{{}} {fd}{op} {{}}\", {full}, __sh_q(&{te}))");
+                        }
+                        "r" => {
+                            let fd = if r.fd == 2 { "2" } else { "" };
+                            self.add_helper("q");
+                            full = format!("format!(\"{{}} {fd}< {{}}\", {full}, __sh_q(&{te}))");
+                        }
+                        "process-in" => {
+                            full = format!("format!(\"{{}} < <({{}})\", {full}, {te})");
+                        }
+                        _ => {
+                            if let Some(t) = r.target.as_ref() {
+                                if let IrExpr::Str(ts, _) = t {
+                                    if let Some(rest) = ts.strip_prefix('&') {
+                                        full = format!(
+                                            "format!(\"{{}} {}{{}}\", {full}, {})",
+                                            if r.fd == 2 { "2>" } else { ">" },
+                                            Self::rust_str(rest)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(full)
+            }
             [IrStmt::Expr(e)] => single_exec_text(self, e),
             [IrStmt::Redirect { inner, redirects }] => {
                 // a heredoc/herestring stage needs its content as stdin —
@@ -4861,12 +5019,14 @@ impl Render {
                     match mode.as_str() {
                         "w" | "a" => {
                             let op = if mode == "w" { ">" } else { ">>" };
+                            let fd = if r.fd == Some(2) { "2" } else { "" };
                             self.add_helper("q");
-                            full = format!("format!(\"{{}} {op} {{}}\", {full}, __sh_q(&{te}))");
+                            full = format!("format!(\"{{}} {fd}{op} {{}}\", {full}, __sh_q(&{te}))");
                         }
                         "r" => {
+                            let fd = if r.fd == Some(2) { "2" } else { "" };
                             self.add_helper("q");
-                            full = format!("format!(\"{{}} < {{}}\", {full}, __sh_q(&{te}))");
+                            full = format!("format!(\"{{}} {fd}< {{}}\", {full}, __sh_q(&{te}))");
                         }
                         "process-in" => {
                             full = format!("format!(\"{{}} < <({{}})\", {full}, {te})");
@@ -5542,14 +5702,19 @@ impl Render {
                     // `$(( arith ))` — arithmetic expansion
                     if i + 2 < ch.len() && ch[i + 2] == '(' {
                         let start = i + 3;
-                        let mut depth = 2;
+                        // the two openers are consumed — find the first
+                        // closer at depth 0 (the body has none of its own)
+                        let mut depth = 0;
                         let mut j = start;
-                        while j < ch.len() && depth > 0 {
+                        while j < ch.len() {
                             if ch[j] == '(' { depth += 1; }
-                            else if ch[j] == ')' { depth -= 1; if depth == 0 { break; } }
+                            else if ch[j] == ')' {
+                                if depth == 0 { break; }
+                                depth -= 1;
+                            }
                             j += 1;
                         }
-                        if depth == 0 {
+                        if j < ch.len() {
                             let body: String = ch[start..j].iter().collect();
                             fmt.push_str("{}");
                             if let Some(e) = self.arith_text(&body) {
@@ -5557,7 +5722,7 @@ impl Render {
                             } else {
                                 args.push("String::new()".to_string());
                             }
-                            i = j + 1;
+                            i = j + 2;
                             continue;
                         }
                     }
@@ -6289,6 +6454,20 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                                     }
                                 }
                             }
+                        } else if cmd == "eval" {
+                            // `eval "y=$x+1"` — the native-assign target
+                            for w in &words {
+                                let t = word_source_text(w);
+                                if !t.is_empty() {
+                                    if let Some((name, _)) = t.trim().split_once('=') {
+                                        if !name.is_empty()
+                                            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                                        {
+                                            out.insert(name.to_string());
+                                        }
+                                    }
+                                }
+                            }
                         } else if cmd == "printf" {
                             // `printf -v name ...` — the target is written
                             if let Some(IrExpr::Str(f, _)) = words.first() {
@@ -6616,15 +6795,34 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
                     }
                 }
                 "param" => {
-                    if let Some(name) = str_arg(args, 1) {
-                        // the base name — before any `[index]` and without
-                        // the `@`/`*` suffix (`prefix*`, `array[$i]`)
-                        let base = array_base_name(name);
-                        if !base.is_empty() && !base.starts_with('$') && !base.chars().all(|c| c.is_ascii_digit()) {
-                            if base.starts_with('#') {
-                                arrays.insert(base[1..].to_string());
-                            } else {
-                                arrays.insert(base);
+                    let raw = str_arg(args, 1).unwrap_or("");
+                    let idx_at = matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
+                    // only ARRAY-shaped params (`${arr[@]}`, `${!map[@]}`,
+                    // `${arr[i]}`, `${#arr[@]}`) hoist an array var — a
+                    // bare scalar `${x}` / `${x:2:3}` is just a var read
+                    // (the element-slice decision is the renderer's, based
+                    // on the OTHER array evidence)
+                    let array_shaped = raw.contains('[')
+                        || raw.ends_with("[@]")
+                        || raw.ends_with("[*]")
+                        || raw.starts_with('!')
+                        || raw.starts_with('#')
+                        || idx_at;
+                    if array_shaped {
+                        if let Some(name) = str_arg(args, 1) {
+                            // the base name — before any `[index]` and
+                            // without the `@`/`*` suffix (`prefix*`,
+                            // `array[$i]`)
+                            let base = array_base_name(name);
+                            if !base.is_empty()
+                                && !base.starts_with('$')
+                                && !base.chars().all(|c| c.is_ascii_digit())
+                            {
+                                if base.starts_with('#') {
+                                    arrays.insert(base[1..].to_string());
+                                } else {
+                                    arrays.insert(base);
+                                }
                             }
                         }
                     }
@@ -7112,6 +7310,53 @@ mod tok_tests {
     fn arith_text_parses() {
         let out = render("x=5\nif (( x > 3 && x < 10 )); then echo m; fi\n");
         assert!(!out.contains("TODO"), "{out}");
+    }
+
+    #[test]
+    fn key_arith_probe() {
+        let toks = arith_tokens("(2*$i)-1").unwrap();
+        eprintln!("TOKS: {:?}", toks);
+        let mut r = Render::default();
+        let mut p = ArithParser { render: &mut r, toks: &toks, pos: 0 };
+        let e = p.parse_ternary();
+        eprintln!("PARSE: {:?} pos={} len={}", e.is_some(), p.pos, toks.len());
+        assert!(e.is_some() && p.pos == toks.len(), "key arith failed");
+    }
+
+    #[test]
+    fn hard_arith_probe() {
+        let toks = arith_tokens(" result[i] + $(wc -l < \"${files[i]}\") ").unwrap();
+        eprintln!("TOKS: {:?}", toks);
+        let mut r = Render::default();
+        let mut p = ArithParser { render: &mut r, toks: &toks, pos: 0 };
+        let e = p.parse_ternary();
+        eprintln!("PARSE: {:?} pos={} len={}", e.is_some(), p.pos, toks.len());
+        assert!(e.is_some() && p.pos == toks.len(), "hard arith failed");
+    }
+
+    #[test]
+    fn arith_index_probe() {
+        let toks = arith_tokens(" a[1] + a[2] ").unwrap();
+        eprintln!("TOKS: {:?}", toks);
+        let mut r = Render::default();
+        let mut p = ArithParser { render: &mut r, toks: &toks, pos: 0 };
+        let e = p.parse_ternary();
+        eprintln!("PARSE: {:?} pos={} len={}", e.is_some(), p.pos, toks.len());
+        assert!(e.is_some() && p.pos == toks.len(), "arith index parse failed");
+    }
+
+    #[test]
+    fn test_arith_operand_probe() {
+        let toks = test_tokens("\"$n\" -lt $(( a[1] + a[2] ))").unwrap();
+        eprintln!("TOKS: {:?}", toks);
+        let mut r = Render::default();
+        r.arrays.insert("a".to_string());
+        r.written.insert("a".to_string());
+        r.written.insert("n".to_string());
+        let mut p = TestParser { render: &mut r, toks: &toks, pos: 0, style: "[" };
+        let e = p.parse_or();
+        eprintln!("PARSE: {:?} pos={} len={}", e.is_some(), p.pos, toks.len());
+        assert!(e.is_some() && p.pos == toks.len(), "test arith operand failed");
     }
 
     #[test]
