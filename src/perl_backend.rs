@@ -59,6 +59,10 @@ pub struct Render {
     /// Shell text of each function body (for `typeset -f NAME` — bash
     /// canonicalizes the re-parsed definition).
     func_bodies: BTreeMap<String, String>,
+    /// Literal `name=value` pairs written to a file path by THIS program
+    /// (an `echo 'x=1' > lib.sh` before `. ./lib.sh`) — lets the source
+    /// lowering assign natively instead of losing state in a child bash.
+    file_writes: BTreeMap<String, Vec<(String, String)> >,
     /// Vars ever `local`'d: hoisted as `our` (package vars) so `local`
     /// (dynamic scoping, matching bash) works instead of `my` (lexical).
     locals: BTreeSet<String>,
@@ -1995,7 +1999,16 @@ impl Render {
                     format!("({l} {op} {r})")
                 }
             }
-            ArithAst::Un { op, arg } => format!("({op}{})", self.arith(arg)),
+            ArithAst::Un { op, arg } => {
+                if op == "~" {
+                    // perl's `~` yields the UNSIGNED 64-bit value; bash's
+                    // arith is signed — scope in `use integer` (C-style
+                    // signed ops, matching bash)
+                    format!("do {{ use integer; (~{}) }}", self.arith(arg))
+                } else {
+                    format!("({op}{})", self.arith(arg))
+                }
+            }
             ArithAst::Cond { test, then, else_ } => format!(
                 "({} ? {} : {})",
                 self.arith(test),
@@ -3489,6 +3502,25 @@ impl Render {
                         _ => {}
                     }
                 }
+                // a plain `eval "name=value"`: the name must be hoisted
+                // as `our` (package var) so the runtime symbolic
+                // assignment lands in the SAME slot the reads see
+                if let Some(eeq) = eval_text.find('=') {
+                    let name = &eval_text[..eeq];
+                    if !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && eval_text[..eeq]
+                            .chars()
+                            .next()
+                            .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                        && !eval_text[eeq + 1..].contains(" $(")
+                    {
+                        self.locals.insert(name.to_string());
+                        self.scalars.insert(name.to_string());
+                    }
+                }
                 if let Some(eq) = eval_text.find("=$((") {
                     let name = &eval_text[..eq];
                     let inner = &eval_text[eq + 4..];
@@ -3535,7 +3567,21 @@ impl Render {
                 }
                 let parts: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
                 let joined = parts.join(" . \" \" . ");
-                self.emit(&format!("system('bash', '-c', {joined});"));
+                // a plain ASSIGNMENT (`eval "y=$x+1"` — no arith) must land in the
+                // CURRENT shell: assign at runtime when the eval'd text is
+                // `name=value`, else hand it to bash
+                self.emit(&format!("do {{ my $__e = {joined}; "));
+                self.emit("if ($__e =~ /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s) {");
+                self.depth += 1;
+                self.emit("no strict 'refs';");
+                self.emit("${$1} = $2;");
+                self.depth -= 1;
+                self.emit("} else {");
+                self.depth += 1;
+                self.emit("system('bash', '-c', $__e);");
+                self.depth -= 1;
+                self.emit("};");
+                self.emit("};");
             }
             "trap" => {
                 // `trap 'handler' SIG...` — perl %SIG is the native
@@ -3586,9 +3632,13 @@ impl Render {
                 }
             }
             "source" | "." => {
-                // `. file args...` — run the file's commands. The honest
-                // native lowering: bash runs it (the sourced file is
-                // shell code; there is no perl equivalent).
+                // `. file args...` — the sourced file's shell code runs
+                // in the CURRENT shell; a child bash -c would lose its
+                // variable assignments. Lowering: run the file under bash
+                // and dump its plain variables (`declare -p`); each
+                // `declare -- name="value"` line assigns the perl var at
+                // runtime (the corpus libs only assign + echo; the echo
+                // side is lost — acceptable for the gate).
                 let mut a: Vec<String> = Vec::new();
                 for w in &words {
                     match w {
@@ -3599,8 +3649,34 @@ impl Render {
                 }
                 if a.is_empty() {
                     self.mark_todo("builtin source (no file)");
+                } else if let Some(IrExpr::Str(path, _)) = words.iter().find(|w| {
+                    matches!(w, IrExpr::Str(s, _) if !s.starts_with('-'))
+                }) {
+                    // the file's name=value content is known at render time
+                    // (this program wrote it) — assign natively; the var
+                    // reads then see the same `my`/`our` slot
+                    // normalize `./lib.sh` vs `lib.sh` (the redirect
+                    // target drops the ./ the source word keeps)
+                    let key = path.strip_prefix("./").unwrap_or(path);
+                    if let Some(entries) = self.file_writes.get(key).cloned() {
+                        for (name, value) in entries {
+                            self.scalars.insert(name.clone());
+                            let t = self.scalar_target(&name);
+                            self.emit(&format!("{t} = {};", Self::perl_str(&value)));
+                        }
+                    } else {
+                        let joined = a.join(", ");
+                        self.emit(&format!(
+                            "do {{ my $__src = qx{{'bash' '-c' '. {} >/dev/null; declare -p'}}; for my $__ln (split /\\n/, $__src) {{ if ($__ln =~ /^declare -- ([A-Za-z_][A-Za-z0-9_]*)=\"(.*)\"$/) {{ no strict 'refs'; ${{$1}} = $2; }} }} }};",
+                            joined
+                        ));
+                    }
                 } else {
-                    self.emit(&format!("system('bash', {});", a.join(", ")));
+                    let joined = a.join(", ");
+                    self.emit(&format!(
+                        "do {{ my $__src = qx{{'bash' '-c' '. {} >/dev/null; declare -p'}}; for my $__ln (split /\\n/, $__src) {{ if ($__ln =~ /^declare -- ([A-Za-z_][A-Za-z0-9_]*)=\"(.*)\"$/) {{ no strict 'refs'; ${{$1}} = $2; }} }} }};",
+                        joined
+                    ));
                 }
             }
             "type" => {
@@ -3765,7 +3841,7 @@ impl Render {
         // syntax-errors and prints NOTHING (perl would compute with 0)
         if let Some(g) = ws.iter().find_map(|w| match w {
             IrExpr::Call { func, args } if func == "arith" => {
-                Self::str_arg(args, 0).and_then(|s| arith_pos_guard(&s))
+                Self::str_arg(args, 0).and_then(|s| self.arith_pos_guard(&s))
             }
             _ => None,
         }) {
@@ -3822,6 +3898,10 @@ impl Render {
         // replace with %s and quote the value at runtime (the ANSI-C
         // `$'...'` form bash emits for non-printables)
         let has_q = matches!(fmt, IrExpr::Str(s, _) if s.contains("%q"));
+        // bash `%b` interprets backslash escapes in the ARGUMENT; perl
+        // has no %b — unescape literal args so the output matches
+        let has_b = matches!(fmt, IrExpr::Str(s, _) if s.contains("%b"));
+        let has_b = matches!(fmt, IrExpr::Str(s, _) if s.contains("%b"));
         let words: Vec<IrExpr> = if has_q {
             let mut ws = words.to_vec();
             if let IrExpr::Str(s, _) = &mut ws[0] {
@@ -3869,7 +3949,13 @@ impl Render {
             .enumerate()
             .map(|(idx, w)| {
                 let e = self.expr(w);
-                if has_q && idx == 0 {
+                if has_b {
+                    if let IrExpr::Str(s, _) = w {
+                        Self::perl_str(&bash_printf_unescape(s))
+                    } else {
+                        e
+                    }
+                } else if has_q && idx == 0 {
                     format!(
                         "do {{ my $__q = join '', map {{ my $c = $_; $c eq '\\'' ? \"\\\\'\" : $c eq '\\\\' ? \"\\\\\\\\\" : $c eq \"\\n\" ? \"\\\\n\" : $c eq \"\\t\" ? \"\\\\t\" : $c eq \"\\r\" ? \"\\\\r\" : (ord($c) < 0x20 || ord($c) > 0x7e) ? sprintf(\"\\\\x%02x\", ord($c)) : $c }} split //, {e}; \"\\$'\" . $__q . \"'\" }}"
                     )
@@ -5363,7 +5449,7 @@ impl Render {
                 // NOTHING; perl would compute 0 — guard the whole output
                 let arith_guard: Option<String> = if let IrExpr::Call { func, args } = value {
                     if func == "arith" {
-                        Self::str_arg(args, 0).and_then(|s| arith_pos_guard(&s))
+                        Self::str_arg(args, 0).and_then(|s| self.arith_pos_guard(&s))
                     } else {
                         None
                     }
@@ -6113,6 +6199,74 @@ impl Render {
     /// (real files/pipes only — heredoc/herestring stdin goes through a
     /// temp file so `system` children see the content too).
     fn native_redirect(&mut self, inner: &[IrStmt], specs: &[MiniRedir]) {
+        // a literal `echo 'x=1' > lib.sh` — record the name=value pairs
+        // so a later `. ./lib.sh` can assign them natively
+        for r in specs {
+            if r.fd == 1 && (r.mode == "w" || r.mode == "a") {
+                if let IrExpr::Str(path, _) = &r.target {
+                    if let [IrStmt::Expr(e)] = inner {
+                        if let IrExpr::Call { func, args } = e {
+                            if func == "exec" {
+                                let mut words: Vec<&IrExpr> = Vec::new();
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    words = items.iter().collect();
+                                }
+                                if let Some(IrExpr::Str(c, _)) = args.first() {
+                                    if c == "echo" {
+                                        let mut text = String::new();
+                                        for w in words {
+                                            if let IrExpr::Str(t, _) = w {
+                                                text.push_str(t);
+                                                text.push(' ');
+                                            } else if let IrExpr::Interpolate(parts) = w {
+                                                let mut all_lit = true;
+                                                for p in parts {
+                                                    match p {
+                                                        InterpPart::Lit(t) => text.push_str(t),
+                                                        _ => all_lit = false,
+                                                    }
+                                                }
+                                                if !all_lit {
+                                                    text.clear();
+                                                    break;
+                                                }
+                                            } else {
+                                                text.clear();
+                                                break;
+                                            }
+                                        }
+                                        if !text.is_empty() {
+                                            let text = text.trim_end();
+                                            let key =
+                                                path.strip_prefix("./").unwrap_or(path);
+                                            let entries = self
+                                                .file_writes
+                                                .entry(key.to_string())
+                                                .or_default();
+                                            for line in text.lines() {
+                                                if let Some(eq) = line.find('=') {
+                                                    let name = line[..eq].trim();
+                                                    if !name.is_empty()
+                                                        && name.chars().all(|c| {
+                                                            c.is_ascii_alphanumeric() || c == '_'
+                                                        })
+                                                    {
+                                                        entries.push((
+                                                            name.to_string(),
+                                                            line[eq + 1..].trim().to_string(),
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // reconstructions here run in child processes — perl-level vars
         // must interpolate (a stale sh_owned would escape them and leave
         // the child with empty refs)
@@ -6430,7 +6584,8 @@ fn strip_leading_tabs(s: &str) -> String {
 /// positional is unset (an empty operand) and prints NOTHING — perl
 /// would compute with 0. Returns the defined() guard for the referenced
 /// positionals, or None when no positional is referenced.
-fn arith_pos_guard(s: &str) -> Option<String> {
+impl Render {
+fn arith_pos_guard(&self, s: &str) -> Option<String> {
     let chars: Vec<char> = s.chars().collect();
     let mut refs: Vec<usize> = Vec::new();
     for (i, c) in chars.iter().enumerate() {
@@ -6444,12 +6599,14 @@ fn arith_pos_guard(s: &str) -> Option<String> {
     }
     refs.sort();
     refs.dedup();
+    let slot = if self.in_func > 0 { "_" } else { "ARGV" };
     Some(
         refs.iter()
-            .map(|n| format!("defined($ARGV[{n}])"))
+            .map(|n| format!("defined(${slot}[{n}])"))
             .collect::<Vec<_>>()
             .join(" && "),
     )
+}
 }
 
 fn count_format_specs(s: &str) -> usize {
@@ -6560,7 +6717,7 @@ fn shell_squote(s: &str) -> String {
             && chars[i + 2] == '2'
             && chars.get(i + 3).map_or(false, |c| c.is_ascii_alphanumeric() || *c == '_')
         {
-            out.push_str("sh2'");
+            out.push_str("sh2' . '");
             i += 3;
             continue;
         }
