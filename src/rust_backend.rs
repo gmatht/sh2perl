@@ -3765,11 +3765,56 @@ impl Render {
                 let has_capture = expr_mentions_capture(expr);
                 // `((i++))` arrives as Assign{i, Arith(IncDec)} — the
                 // arith block ALREADY writes the var; the outer write
-                // would clobber it with the OLD value
+                // would clobber it with the OLD value. But `(( j =
+                // i++ + ++i ))` — the target j is NOT written by the
+                // arith — it still needs the result value.
                 if arith_has_side_effects(expr) {
                     let x = self.expr_any(expr);
+                    let arith_writes_target = match expr {
+                        IrExpr::Arith(a) => {
+                            if let Some(t) = targets.first() {
+                                let tvar = t.var.split('[').next().unwrap_or(&t.var).to_string();
+                                if !t.var.contains('[') {
+                                    let mut aw: BTreeSet<String> = BTreeSet::new();
+                                    collect_written_arith(a, &mut aw);
+                                    !aw.contains(&tvar)
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                        // `(( j = i++ + ++i ))` — the arith TEXT carries
+                        // the increments; the ASSIGN target j still needs
+                        // the result (unless the text assigns it itself)
+                        IrExpr::Call { func, args } if func == "arith" => {
+                            let text = str_arg(args, 0).unwrap_or("");
+                            targets.first().map_or(false, |t| {
+                                let tvar = t.var.split('[').next().unwrap_or(&t.var);
+                                !t.var.contains('[') && !text.contains(&format!("{tvar}="))
+                            })
+                        }
+                        _ => false,
+                    };
+                    // ONE evaluation — the side-effecting arith must not
+                    // run twice (the increments would double-apply)
+                    let v = self.gensym("__sh_arith_v");
+                    self.emit(&format!("let {v} = {x};"));
+                    if arith_writes_target {
+                        if let Some(t) = targets.first() {
+                            let tvar = t.var.split('[').next().unwrap_or(&t.var).to_string();
+                            self.mark_written(&tvar);
+                            let stmt = if self.is_num(&tvar) {
+                                self.write_num(&tvar, &format!("({v}).trim().parse::<i64>().unwrap_or(0)"))
+                            } else {
+                                self.write_str(&tvar, &format!("{v}.clone()"))
+                            };
+                            self.emit(&stmt);
+                        }
+                    }
                     self.emit(&format!(
-                        "let _ = {{ let __v = {x}; let __n = __v.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __n != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v }};"
+                        "let _ = {{ let __v = {v}; let __n = __v.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __n != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v }};"
                     ));
                     return;
                 }
