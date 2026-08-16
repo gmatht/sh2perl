@@ -5473,6 +5473,566 @@ pub(crate) fn return_in_loop(mut prog: Program) -> Program {
     prog
 }
 
+// ── #10 directShellFnCalls (ported from lower.js) ────────────────────
+// Rewrites the dispatch call sites (`sh2.exec/fnCall/callDirect("f",
+// [args])`) of the NORMALIZED native function declarations to direct
+// JS calls — the texture generators' per-pixel helper calls are the
+// measured hot cost. The direct call keeps the dispatch's semantics:
+// the `$?` emulation for returning functions, the positional bridge for
+// `$1..$9` readers, and the await for async targets.
+
+pub(crate) fn direct_shell_fn_calls(mut prog: Program) -> Program {
+    struct FnInfo {
+        r#async: bool,
+        has_return: bool,
+        pos_refs: bool,
+    }
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn is_sh2_member(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if is_ident(object, "sh2") && is_ident(property, name))
+    }
+    // 1. the fns map: scan the function declarations' bodies
+    let mut fns: std::collections::HashMap<String, FnInfo> = Default::default();
+    for st in &prog.body {
+        if let Stmt::FunctionDeclaration { id, body, r#async, .. } = st {
+            if let Expr::Identifier { name } = id {
+                let mut has_return = false;
+                let mut pos_refs = false;
+                scan_fn_stmt(body, &mut has_return, &mut pos_refs);
+                fns.insert(
+                    name.clone(),
+                    FnInfo { r#async: *r#async, has_return, pos_refs },
+                );
+            }
+        }
+    }
+    if fns.is_empty() {
+        return prog;
+    }
+
+    // 2. the dispatch info: `sh2.exec/fnCall/callDirect("name", [args])`
+    struct CallInfo {
+        name: String,
+        args: Vec<Expr>,
+    }
+    fn call_info(e: &Expr) -> Option<CallInfo> {
+        if let Expr::CallExpression { callee, arguments, .. } = e {
+            if let Expr::MemberExpression { object, property, .. } = &**callee {
+                if is_ident(object, "sh2") {
+                    if let Expr::Identifier { name } = &**property {
+                        let is_dispatch = name == "exec" || name == "fnCall" || name == "callDirect";
+                        if is_dispatch && arguments.len() >= 2 {
+                            if let Expr::Literal { value, .. } = &arguments[0] {
+                                if let Some(s) = value.as_str() {
+                                    let arg_idx = if name == "callDirect" { 2 } else { 1 };
+                                    if let Some(Expr::ArrayExpression { elements }) = arguments.get(arg_idx) {
+                                        return Some(CallInfo { name: s.to_string(), args: elements.iter().flatten().cloned().collect() });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+    // `String(x).split(...).filter(...)` → x; the store-read base
+    fn unwrap_word_list(n: &Expr) -> Expr {
+        if let Expr::CallExpression { callee, arguments, .. } = n {
+            if let Expr::MemberExpression { object, property, .. } = &**callee {
+                if is_ident(property, "filter") && arguments.len() == 1 {
+                    if let Expr::CallExpression { callee: split_callee, .. } = &**object {
+                        if let Expr::MemberExpression { object: base, property: split_prop, .. } = &**split_callee {
+                            if is_ident(split_prop, "split") {
+                                // String(x).split(...) → x
+                                if let Expr::CallExpression { callee: str_callee, arguments: str_args, .. } = &**base {
+                                    if is_ident(str_callee, "String") && str_args.len() == 1 {
+                                        return str_args[0].clone();
+                                    }
+                                }
+                                return base.as_ref().clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        n.clone()
+    }
+
+    // 3. the direct-statement builders
+    fn build_expr(f: &FnInfo, args: Vec<Expr>, prog_body: &mut Vec<Stmt>) -> Expr {
+        let call_expr = |args: &Vec<Expr>| Expr::CallExpression {
+            callee: Box::new(Expr::Identifier { name: "".to_string() }), // patched by the caller
+            arguments: args.clone(),
+            optional: false,
+        };
+        let _ = call_expr;
+        unreachable!("replaced below")
+    }
+    // The builders need the fn name — pass it explicitly.
+    fn mk_direct(f: &FnInfo, name: &str, args: Vec<Expr>) -> Expr {
+        let args_copy = args.clone();
+        let call = Expr::CallExpression {
+            callee: Box::new(Expr::Identifier { name: name.to_string() }),
+            arguments: args,
+            optional: false,
+        };
+        if f.has_return && !f.pos_refs {
+            // `(() => { const __r = <await?> f(args); sh2.lastExit =
+            // (typeof __r === "string" || typeof __r === "number") ?
+            // Number(__r) : (__r === false ? 1 : 0); })()`
+            let r = Expr::Identifier { name: "__r".to_string() };
+            let sh2_last_exit = Expr::MemberExpression {
+                object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                property: Box::new(Expr::Identifier { name: "lastExit".to_string() }),
+                computed: false,
+                optional: false,
+            };
+            let typeof_r = |lit: serde_json::Value| Expr::BinaryExpression {
+                operator: "===".to_string(),
+                left: Box::new(Expr::UnaryExpression {
+                    operator: "typeof".to_string(),
+                    argument: Box::new(r.clone()),
+                    prefix: true,
+                }),
+                right: Box::new(Expr::Literal { value: lit, raw: None, regex: None }),
+            };
+            let inner = if f.r#async {
+                Expr::AwaitExpression { argument: Box::new(call) }
+            } else {
+                call
+            };
+            let assign = Stmt::ExpressionStatement {
+                expression: Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(sh2_last_exit),
+                    right: Box::new(Expr::ConditionalExpression {
+                        test: Box::new(Expr::LogicalExpression {
+                            operator: "||".to_string(),
+                            left: Box::new(typeof_r(serde_json::json!("string"))),
+                            right: Box::new(typeof_r(serde_json::json!("number"))),
+                        }),
+                        consequent: Box::new(Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier { name: "Number".to_string() }),
+                            arguments: vec![r.clone()],
+                            optional: false,
+                        }),
+                        alternate: Box::new(Expr::ConditionalExpression {
+                            test: Box::new(Expr::BinaryExpression {
+                                operator: "===".to_string(),
+                                left: Box::new(r.clone()),
+                                right: Box::new(Expr::Literal { value: serde_json::json!(false), raw: None, regex: None }),
+                            }),
+                            consequent: Box::new(Expr::Literal { value: serde_json::json!(1), raw: None, regex: None }),
+                            alternate: Box::new(Expr::Literal { value: serde_json::json!(0), raw: None, regex: None }),
+                        }),
+                    }),
+                },
+            };
+            let arrow = Expr::ArrowFunctionExpression {
+                params: vec![],
+                body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
+                    body: vec![
+                        Stmt::VariableDeclaration {
+                            declarations: vec![VariableDeclarator {
+                                type_: "VariableDeclarator",
+                                id: r.clone(),
+                                init: Some(inner),
+                            }],
+                            kind: "const",
+                        },
+                        assign,
+                    ],
+                })),
+                expression: false,
+                r#async: f.r#async,
+            };
+            let mut call2 = Expr::CallExpression {
+                callee: Box::new(arrow),
+                arguments: vec![],
+                optional: false,
+            };
+            if f.r#async {
+                call2 = Expr::AwaitExpression { argument: Box::new(call2) };
+            }
+            call2
+        } else if f.pos_refs {
+            // `(() => { const prevArgs = sh2.positional; sh2.positional =
+            // [args]; try { return <await?> f(args); } finally {
+            // sh2.positional = prevArgs; } })()`
+            let prev = Expr::Identifier { name: "prevArgs".to_string() };
+            let sh2_pos = || Expr::MemberExpression {
+                object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                property: Box::new(Expr::Identifier { name: "positional".to_string() }),
+                computed: false,
+                optional: false,
+            };
+            let call_inner = if f.r#async {
+                Expr::AwaitExpression { argument: Box::new(call) }
+            } else {
+                call
+            };
+            let arrow = Expr::ArrowFunctionExpression {
+                params: vec![],
+                body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
+                    body: vec![
+                        Stmt::VariableDeclaration {
+                            declarations: vec![VariableDeclarator {
+                                type_: "VariableDeclarator",
+                                id: prev.clone(),
+                                init: Some(sh2_pos()),
+                            }],
+                            kind: "const",
+                        },
+                        Stmt::ExpressionStatement {
+                            expression: Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(sh2_pos()),
+                                right: Box::new(Expr::ArrayExpression { elements: args_copy.iter().cloned().map(Some).collect() }),
+                            },
+                        },
+                        Stmt::TryStatement {
+                            block: Box::new(Stmt::BlockStatement {
+                                body: vec![Stmt::ReturnStatement { argument: Some(call_inner) }],
+                            }),
+                            handler: None,
+                            finalizer: Some(Box::new(Stmt::BlockStatement {
+                                body: vec![Stmt::ExpressionStatement {
+                                    expression: Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(sh2_pos()),
+                                        right: Box::new(prev.clone()),
+                                    },
+                                }],
+                            })),
+                        },
+                    ],
+                })),
+                expression: false,
+                r#async: f.r#async,
+            };
+            let mut out = Expr::CallExpression {
+                callee: Box::new(arrow),
+                arguments: vec![],
+                optional: false,
+            };
+            if f.r#async {
+                out = Expr::AwaitExpression { argument: Box::new(out) };
+            }
+            out
+        } else if f.r#async {
+            Expr::AwaitExpression { argument: Box::new(call) }
+        } else {
+            call
+        }
+    }
+
+    // 4. the rewrite — the statement-level dispatch → direct
+    fn rewrite_stmt(
+        s: &mut Stmt,
+        fns: &std::collections::HashMap<String, FnInfo>,
+    ) {
+        match s {
+            Stmt::ExpressionStatement { expression } => {
+                *expression = rewrite_expr_dispatch(expression, fns, true);
+            }
+            Stmt::BlockStatement { body } => {
+                for x in body { rewrite_stmt(x, fns); }
+            }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                *test = rewrite_expr_dispatch(test, fns, false);
+                rewrite_stmt(consequent, fns);
+                if let Some(a) = alternate { rewrite_stmt(a, fns); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                rewrite_stmt(block, fns);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { **p = rewrite_expr_dispatch(p, fns, false); }
+                    rewrite_stmt(&mut h.body, fns);
+                }
+                if let Some(f) = finalizer { rewrite_stmt(f, fns); }
+            }
+            Stmt::ThrowStatement { argument } => {
+                *argument = rewrite_expr_dispatch(argument, fns, false);
+            }
+            Stmt::SwitchStatement { discriminant, cases } => {
+                *discriminant = rewrite_expr_dispatch(discriminant, fns, false);
+                for c in cases {
+                    if let Some(t) = &mut c.test { *t = rewrite_expr_dispatch(t, fns, false); }
+                    for x in &mut c.consequent { rewrite_stmt(x, fns); }
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                *test = rewrite_expr_dispatch(test, fns, false);
+                rewrite_stmt(body, fns);
+            }
+            Stmt::ForStatement { init, test, update, body } => {
+                rewrite_stmt(init, fns);
+                *test = rewrite_expr_dispatch(test, fns, false);
+                *update = rewrite_expr_dispatch(update, fns, false);
+                rewrite_stmt(body, fns);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                rewrite_stmt(left, fns);
+                *right = rewrite_expr_dispatch(right, fns, false);
+                rewrite_stmt(body, fns);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { *p = rewrite_expr_dispatch(p, fns, false); }
+                rewrite_stmt(body, fns);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { *i = rewrite_expr_dispatch(i, fns, false); }
+                }
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { *a = rewrite_expr_dispatch(a, fns, false); }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    // the expression rewrite: dispatch calls at STATEMENT position → direct
+    // (value-position awaits stay dispatched)
+    fn rewrite_expr_dispatch(
+        e: &mut Expr,
+        fns: &std::collections::HashMap<String, FnInfo>,
+        stmt_pos: bool,
+    ) -> Expr {
+        // the direct replacement + the generic recursion
+        match e {
+            Expr::CallExpression { .. } => {
+                let info = call_info(e);
+                if let Some(info) = info {
+                    if let Some(f) = fns.get(&info.name) {
+                        if !(f.has_return && f.pos_refs) {
+                            if stmt_pos || (!f.has_return && !f.pos_refs) {
+                                let args = info.args.iter().map(unwrap_word_list).collect();
+                                return mk_direct(f, &info.name, args);
+                            }
+                        }
+                    }
+                }
+                // generic recursion
+                recurse_expr(e, fns, stmt_pos);
+                e.clone()
+            }
+            Expr::AwaitExpression { argument } => {
+                // the JS drops the outer await for a dispatched call (the
+                // direct call carries its own await for async targets; a
+                // returning target gets the $?-emulation IIFE)
+                if let Expr::CallExpression { .. } = &**argument {
+                    if let Some(info) = call_info(argument) {
+                        if let Some(f) = fns.get(&info.name) {
+                            if !(f.has_return && f.pos_refs) {
+                                let args = info.args.iter().map(unwrap_word_list).collect();
+                                return mk_direct(f, &info.name, args);
+                            }
+                        }
+                    }
+                }
+                let inner = rewrite_expr_dispatch(argument, fns, stmt_pos);
+                *argument = Box::new(inner);
+                e.clone()
+            }
+            _ => {
+                recurse_expr(e, fns, stmt_pos);
+                e.clone()
+            }
+        }
+    }
+    fn recurse_expr(e: &mut Expr, fns: &std::collections::HashMap<String, FnInfo>, stmt_pos: bool) {
+        match e {
+            Expr::TemplateLiteral { expressions, .. } => {
+                for x in expressions { *x = rewrite_expr_dispatch(x, fns, false); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                *callee = Box::new(rewrite_expr_dispatch(callee, fns, false));
+                for a in arguments { *a = rewrite_expr_dispatch(a, fns, false); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                *object = Box::new(rewrite_expr_dispatch(object, fns, false));
+                *property = Box::new(rewrite_expr_dispatch(property, fns, false));
+            }
+            Expr::AwaitExpression { argument } => {
+                *argument = Box::new(rewrite_expr_dispatch(argument, fns, false));
+            }
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params { *p = rewrite_expr_dispatch(p, fns, false); }
+                match body {
+                    ArrowBody::Expr(x) => *x = Box::new(rewrite_expr_dispatch(x, fns, false)),
+                    ArrowBody::Block(b) => rewrite_stmt(b, fns),
+                }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params { *p = rewrite_expr_dispatch(p, fns, false); }
+                rewrite_stmt(body, fns);
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties {
+                    let k = std::mem::replace(&mut p.key, Expr::Identifier { name: "__ph".into() });
+                    p.key = rewrite_expr_dispatch(&mut p.key.clone(), fns, false);
+                    p.key = k;
+                    let v = std::mem::replace(&mut p.value, Expr::Identifier { name: "__ph".into() });
+                    p.value = v;
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { *el = rewrite_expr_dispatch(el, fns, false); }
+            }
+            Expr::SpreadElement { argument } => {
+                *argument = Box::new(rewrite_expr_dispatch(argument, fns, false));
+            }
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                *left = Box::new(rewrite_expr_dispatch(left, fns, false));
+                *right = Box::new(rewrite_expr_dispatch(right, fns, false));
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                *test = Box::new(rewrite_expr_dispatch(test, fns, false));
+                *consequent = Box::new(rewrite_expr_dispatch(consequent, fns, false));
+                *alternate = Box::new(rewrite_expr_dispatch(alternate, fns, false));
+            }
+            Expr::UnaryExpression { argument, .. } => {
+                *argument = Box::new(rewrite_expr_dispatch(argument, fns, false));
+            }
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions { *x = rewrite_expr_dispatch(x, fns, false); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                *callee = Box::new(rewrite_expr_dispatch(callee, fns, false));
+                for a in arguments { *a = rewrite_expr_dispatch(a, fns, false); }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+
+    for s in &mut prog.body {
+        rewrite_stmt(s, &fns);
+    }
+    prog
+}
+
+fn scan_fn_stmt(s: &Stmt, has_return: &mut bool, pos_refs: &mut bool) {
+    match s {
+        Stmt::ReturnStatement { .. } => *has_return = true,
+        Stmt::ExpressionStatement { expression } => scan_fn_expr(expression, has_return, pos_refs),
+        Stmt::BlockStatement { body } => {
+            for x in body { scan_fn_stmt(x, has_return, pos_refs); }
+        }
+        Stmt::IfStatement { test, consequent, alternate } => {
+            scan_fn_expr(test, has_return, pos_refs);
+            scan_fn_stmt(consequent, has_return, pos_refs);
+            if let Some(a) = alternate { scan_fn_stmt(a, has_return, pos_refs); }
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            scan_fn_stmt(block, has_return, pos_refs);
+            if let Some(h) = handler {
+                if let Some(p) = &h.param { scan_fn_expr(p, has_return, pos_refs); }
+                scan_fn_stmt(&h.body, has_return, pos_refs);
+            }
+            if let Some(f) = finalizer { scan_fn_stmt(f, has_return, pos_refs); }
+        }
+        Stmt::ThrowStatement { argument } => scan_fn_expr(argument, has_return, pos_refs),
+        Stmt::SwitchStatement { discriminant, cases } => {
+            scan_fn_expr(discriminant, has_return, pos_refs);
+            for c in cases {
+                if let Some(t) = &c.test { scan_fn_expr(t, has_return, pos_refs); }
+                for x in &c.consequent { scan_fn_stmt(x, has_return, pos_refs); }
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            scan_fn_expr(test, has_return, pos_refs);
+            scan_fn_stmt(body, has_return, pos_refs);
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            scan_fn_stmt(init, has_return, pos_refs);
+            scan_fn_expr(test, has_return, pos_refs);
+            scan_fn_expr(update, has_return, pos_refs);
+            scan_fn_stmt(body, has_return, pos_refs);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            scan_fn_stmt(left, has_return, pos_refs);
+            scan_fn_expr(right, has_return, pos_refs);
+            scan_fn_stmt(body, has_return, pos_refs);
+        }
+        Stmt::FunctionDeclaration { .. } => {}
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                if let Some(i) = &d.init { scan_fn_expr(i, has_return, pos_refs); }
+            }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+fn scan_fn_expr(e: &Expr, has_return: &mut bool, pos_refs: &mut bool) {
+    match e {
+        Expr::MemberExpression { object, property, computed: false, .. }
+            if is_ident_expr(object, "sh2") && is_ident_expr(property, "positional") =>
+        {
+            *pos_refs = true;
+        }
+        _ => {}
+    }
+    match e {
+        Expr::TemplateLiteral { expressions, .. } => {
+            for x in expressions { scan_fn_expr(x, has_return, pos_refs); }
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            scan_fn_expr(callee, has_return, pos_refs);
+            for a in arguments { scan_fn_expr(a, has_return, pos_refs); }
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            scan_fn_expr(object, has_return, pos_refs);
+            scan_fn_expr(property, has_return, pos_refs);
+        }
+        Expr::AwaitExpression { argument } => scan_fn_expr(argument, has_return, pos_refs),
+        Expr::ArrowFunctionExpression { .. } => {}
+        Expr::FunctionExpression { .. } => {}
+        Expr::ObjectExpression { properties } => {
+            for p in properties {
+                scan_fn_expr(&p.key, has_return, pos_refs);
+                scan_fn_expr(&p.value, has_return, pos_refs);
+            }
+        }
+        Expr::ArrayExpression { elements } => {
+            for el in elements.iter().flatten() { scan_fn_expr(el, has_return, pos_refs); }
+        }
+        Expr::SpreadElement { argument } => scan_fn_expr(argument, has_return, pos_refs),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. }
+        | Expr::AssignmentExpression { left, right, .. } => {
+            scan_fn_expr(left, has_return, pos_refs);
+            scan_fn_expr(right, has_return, pos_refs);
+        }
+        Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+            scan_fn_expr(test, has_return, pos_refs);
+            scan_fn_expr(consequent, has_return, pos_refs);
+            scan_fn_expr(alternate, has_return, pos_refs);
+        }
+        Expr::UnaryExpression { argument, .. } => scan_fn_expr(argument, has_return, pos_refs),
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions { scan_fn_expr(x, has_return, pos_refs); }
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            scan_fn_expr(callee, has_return, pos_refs);
+            for a in arguments { scan_fn_expr(a, has_return, pos_refs); }
+        }
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+    }
+}
+
+fn is_ident_expr(e: &Expr, name: &str) -> bool {
+    matches!(e, Expr::Identifier { name: n } if n == name)
+}
+
 pub fn compile_head_passes(mut prog: Program) -> Program {
     prog = strip_process_env(prog);          // #1
     prog = await_sync_fn_calls(prog);        // #2
@@ -5482,6 +6042,8 @@ pub fn compile_head_passes(mut prog: Program) -> Program {
     prog = normalize_functions(prog);         // #6
     prog = unwrap_store_string(prog);         // #7
     prog = null_sentinel(prog);               // #8
+    prog = return_in_loop(prog);              // #9
+    prog = direct_shell_fn_calls(prog);       // #10
     prog
 }
 
