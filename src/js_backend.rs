@@ -261,6 +261,17 @@ impl Render {
                 self.sh2_stub("split", args, "split")
             }
             IrExpr::Call { func, args } => self.call(func, args),
+            // a numeric-range iterable (`For.iter` Range — the
+            // rust-frontend's `0..3` / `1..=2`): the JS surface has no
+            // range literal, so materialize the string list (the estree
+            // ref's bounded fallback — the For-of yields strings; the
+            // For arm's numeric-lift coerces each item)
+            IrExpr::Range { start, end } => {
+                let items: Vec<String> = (*start..=*end)
+                    .map(|v| Self::js_str(&v.to_string()))
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
             IrExpr::Json(v) => match v {
                 serde_json::Value::String(s) => Self::js_str(s),
                 serde_json::Value::Number(n) => n.to_string(),
@@ -370,8 +381,26 @@ impl Render {
                     // (an i64 sub-expression cast down to int)
                     IrType::Int32 => format!("(Number({inner}) | 0)"),
                     IrType::UInt32 => format!("(Number({inner}) >>> 0)"),
-                    IrType::Int64 => format!("BigInt.asIntN(64, BigInt({inner}))"),
-                    IrType::UInt64 => format!("BigInt.asUintN(64, BigInt({inner}))"),
+                    // exact i64 literal: the STRING form keeps the value
+                    // exact past 2^53 (a JS number literal rounds —
+                    // t44_huge_cond.c's 2^63-1 came out even); mirrors
+                    // the estree ref's bigint_lit_expr. The value already
+                    // fits, so no asIntN wrap.
+                    IrType::Int64 => match &**arg {
+                        ArithAst::Num(n) => format!("BigInt({})", Self::js_str(&n.to_string())),
+                        _ => format!("BigInt.asIntN(64, BigInt({inner}))"),
+                    },
+                    // u64: the i64 value is the two's-complement bit
+                    // pattern (the frontend emits negative i64 for u64
+                    // values >= 2^63); the STRING form keeps the literal
+                    // exact past 2^53 (estree parity)
+                    IrType::UInt64 => match &**arg {
+                        ArithAst::Num(n) => format!(
+                            "BigInt.asUintN(64, BigInt({}))",
+                            Self::js_str(&n.to_string())
+                        ),
+                        _ => format!("BigInt.asUintN(64, BigInt({inner}))"),
+                    },
                     IrType::Float(32) => format!("Math.fround({inner})"),
                     _ => inner,
                 }
@@ -524,6 +553,33 @@ impl Render {
                     }
                 }
                 self.sh2_stub("fnCall", args, "fnCall")
+            }
+            // user function call in a VALUE position — the C frontend's
+            // value-returning dispatch (t58_func_runtime.c: printf args,
+            // assign RHSes): same positional save/restore as fnCall, but
+            // the function's native `return e` value comes back to the
+            // caller (the estree ref's sh2.fnValue; caller-side
+            // consumers like printf %d coerce).
+            "fnValue" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if is_plain_name(name) {
+                        let fname = self.js_ident(name);
+                        let arg_exprs: Vec<String> = match args.get(1) {
+                            Some(IrExpr::Array(items)) => {
+                                items.iter().map(|a| self.expr(a)).collect()
+                            }
+                            _ => Vec::new(),
+                        };
+                        self.uses_positional = true;
+                        return format!(
+                            "(() => {{ const __saved = sh2_positional; sh2_positional = [{}]; try {{ return {}({}); }} finally {{ sh2_positional = __saved; }} }})()",
+                            arg_exprs.join(", "),
+                            fname,
+                            arg_exprs.join(", ")
+                        );
+                    }
+                }
+                self.sh2_stub("fnValue", args, "fnValue")
             }
             // multi-return line read (`line(cap, N)` → split("\n")[N])
             "line" => {
@@ -1609,7 +1665,196 @@ impl Render {
                     self.mark_todo("top-level continue");
                 }
             }
+            // try/except/else/finally (py-sh-go try_stmt) → JS
+            // try/catch/finally, mirroring the estree ref's TryStatement
+            // lowering: the except arms are an if/else-if ladder over
+            // `e instanceof <match>` INSIDE a single catch (a match-less
+            // arm is the ladder's terminal else; a ladder that matches
+            // nothing rethrows `e`), preceded by the signal guard — the
+            // runtime's BREAK/CONTINUE/RETURN control signals are NOT
+            // Error objects and must pass through a Try untouched (a
+            // bare `except:` must not swallow a `return`). `as` binds
+            // the caught value to the native var (the arm body's getVar
+            // reads see it). Python `else` runs only when the try body
+            // completed WITHOUT raising — even a HANDLED exception
+            // skips it — and else-body exceptions are NOT caught by
+            // this statement's arms, so the else suite sits behind a
+            // completion flag (`__sh2else`); `finally` is the JS
+            // finalizer.
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                if excepts.is_empty() && finally_body.is_empty() {
+                    // no handler: the try adds nothing — emit the suites
+                    // plainly (else just follows the body), like estree
+                    for s in body {
+                        self.stmt(s);
+                    }
+                    for s in else_body {
+                        self.stmt(s);
+                    }
+                    return;
+                }
+                if excepts.is_empty() {
+                    // no arms to protect the else from: else-body
+                    // exceptions propagate anyway (nothing catches
+                    // them), so the plain sequential form is exact
+                    self.emit("try {");
+                    self.depth += 1;
+                    for s in body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    if finally_body.is_empty() {
+                        self.emit("}");
+                    } else {
+                        self.emit("} finally {");
+                        self.depth += 1;
+                        for s in finally_body {
+                            self.stmt(s);
+                        }
+                        self.depth -= 1;
+                        self.emit("}");
+                    }
+                    for s in else_body {
+                        self.stmt(s);
+                    }
+                    return;
+                }
+                // arms present: the try/catch (+ possibly the flag-gated
+                // else, + the outer finalizer when both else and finally
+                // exist — python runs the else BEFORE the finally, and a
+                // JS finalizer fires when the whole statement ends).
+                let flag = "__sh2else";
+                let need_flag = !else_body.is_empty();
+                let outer = need_flag && !finally_body.is_empty();
+                if outer {
+                    self.emit("try {");
+                    self.depth += 1;
+                }
+                if need_flag {
+                    self.emit(&format!("let {flag} = false;"));
+                }
+                self.emit("try {");
+                self.depth += 1;
+                for s in body {
+                    self.stmt(s);
+                }
+                if need_flag {
+                    self.emit(&format!("{flag} = true;"));
+                }
+                self.depth -= 1;
+                self.emit("} catch (e) {");
+                self.depth += 1;
+                self.emit("if (!(e instanceof Error)) throw e;");
+                self.try_ladder(excepts);
+                self.depth -= 1;
+                if !finally_body.is_empty() && !outer {
+                    // the finalizer attaches to the try/catch: the
+                    // catch-close `}` doubles as the `finally` opener
+                    self.emit("} finally {");
+                    self.depth += 1;
+                    for s in finally_body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                } else {
+                    self.emit("}");
+                }
+                if need_flag {
+                    self.emit(&format!("if ({flag}) {{"));
+                    self.depth += 1;
+                    for s in else_body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                }
+                if outer {
+                    // close the OUTER try block (the inner try/catch
+                    // is already closed); the finalizer runs after
+                    // the flag-gated else — python's order
+                    self.depth -= 1;
+                    self.emit("} finally {");
+                    self.depth += 1;
+                    for s in finally_body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                }
+            }
             other => self.mark_todo(&format!("stmt {:?}", other)),
+        }
+    }
+
+    /// The except-arm ladder inside a catch (the IrStmt::Try arm):
+    /// `e instanceof <match>` ifs in source order; a match-less (bare)
+    /// arm is the ladder's terminal else — later arms are dead in
+    /// Python, nested inside its block (unreachable but still emitted,
+    /// estree parity); a match-ladder that matches nothing rethrows
+    /// `e`. `as` bindings write the caught value first.
+    fn try_ladder(&mut self, excepts: &[crate::ir::TryExcept]) {
+        // the bare arm index (scan from the end: the LAST bare arm; the
+        // source arms after it are the dead tail nested in its block)
+        let bare = excepts.iter().rposition(|e| e.match_expr.is_none());
+        for (i, e) in excepts.iter().enumerate() {
+            let last_live = match bare {
+                Some(b) => i + 1 == b,
+                None => i + 1 == excepts.len(),
+            };
+            if let Some(m) = &e.match_expr {
+                let m = self.expr(m);
+                self.emit(&format!("if (e instanceof {m}) {{"));
+            } else {
+                self.emit("else {");
+            }
+            self.depth += 1;
+            if let Some(asn) = &e.as_name {
+                let nm = self.js_ident(asn);
+                self.emit(&format!("{nm} = e;"));
+            }
+            for s in &e.body {
+                self.stmt(s);
+            }
+            if Some(i) == bare {
+                // dead arms after the bare one (unreachable python
+                // syntax) — nested blocks keep the code compile-able
+                for dead in &excepts[i + 1..] {
+                    self.emit("{");
+                    self.depth += 1;
+                    for s in &dead.body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                }
+            }
+            self.depth -= 1;
+            if let Some(m) = &e.match_expr {
+                if last_live {
+                    // the last live arm: a non-matching exception has
+                    // nowhere else to go — rethrow (or the bare arm
+                    // follows as the terminal else)
+                    if bare.is_some() {
+                        self.emit("}");
+                    } else {
+                        self.emit("} else {");
+                        self.depth += 1;
+                        self.emit("throw e;");
+                        self.depth -= 1;
+                        self.emit("}");
+                    }
+                } else {
+                    self.emit("} else {");
+                }
+            } else {
+                self.emit("}");
+            }
         }
     }
 
@@ -1897,6 +2142,24 @@ fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             }
             IrStmt::Function { body, .. } => collect_vars(body, out),
             IrStmt::Subshell(b) | IrStmt::Background(b) | IrStmt::Block(b) => collect_vars(b, out),
+            // try/except: the `as` binding writes the caught value into
+            // the native var (the arm body's getVar reads must see it)
+            IrStmt::Try {
+                body,
+                excepts,
+                else_body,
+                finally_body,
+            } => {
+                collect_vars(body, out);
+                for e in excepts {
+                    if let Some(asn) = &e.as_name {
+                        out.insert(asn.clone());
+                    }
+                    collect_vars(&e.body, out);
+                }
+                collect_vars(else_body, out);
+                collect_vars(finally_body, out);
+            }
             _ => {}
         }
     }
