@@ -38,6 +38,83 @@
 use crate::ir::*;
 use std::collections::BTreeSet;
 
+/// The C memory arena runtime (the c/cpp frontends' malloc/pointer
+/// model — a subset of sh2-namespace.mjs slice 2, matching the python
+/// backend's `sh2_mem*`). Handles are the tagged strings
+/// `\x01mem:<id>:<off>`; the arena is a flat byte-slot array with the
+/// load/store offset scaled by the type's element size. Emitted only
+/// when a program actually calls a mem* function.
+const MEM_RUNTIME: &str = r#"my $__sh_mem_seq = 0;
+my %__sh_mem;
+sub __sh_mem_parse {
+    my ($h) = @_;
+    my $s = defined $h ? "$h" : "";
+    return () unless $s =~ /^\x01mem:([^:]+):(-?\d+)$/;
+    return ($1, $2 + 0);
+}
+sub sh2_memElemSize {
+    my ($t) = @_;
+    my %sizes = ('char' => 1, 'signed char' => 1, 'unsigned char' => 1,
+        'short' => 2, 'short int' => 2, 'int' => 4, 'unsigned int' => 4,
+        'unsigned' => 4, 'long' => 8, 'long int' => 8, 'long long' => 8,
+        'unsigned long' => 8, 'unsigned long long' => 8, 'float' => 4,
+        'double' => 8, 'void*' => 8, 'ptr' => 8, 'pointer' => 8,
+        'int8' => 1, 'int16' => 2, 'int32' => 4, 'int64' => 8,
+        'u32' => 4, 'u64' => 8);
+    return $sizes{$t} // 1;
+}
+sub sh2_memAlloc {
+    my ($size) = @_;
+    my $n = int(defined $size ? $size : 0);
+    $n = 0 if $n < 0;
+    $__sh_mem_seq++;
+    $__sh_mem{$__sh_mem_seq} = [(0) x $n];
+    return "\x01mem:$__sh_mem_seq:0";
+}
+sub sh2_memLoad {
+    my ($h, $offset, $t) = @_;
+    my @p = __sh_mem_parse($h);
+    return "" unless @p && exists $__sh_mem{$p[0]};
+    my $i = ($p[1] + int(defined $offset ? $offset : 0)) * sh2_memElemSize($t);
+    my $a = $__sh_mem{$p[0]};
+    return ($i >= 0 && $i < @$a) ? "$a->[$i]" : "";
+}
+sub sh2_memStore {
+    my ($h, $offset, $t, $v) = @_;
+    my @p = __sh_mem_parse($h);
+    return unless @p && exists $__sh_mem{$p[0]};
+    my $i = ($p[1] + int(defined $offset ? $offset : 0)) * sh2_memElemSize($t);
+    my $a = $__sh_mem{$p[0]};
+    $a->[$i] = defined $v ? "$v" : "" if $i >= 0 && $i < @$a;
+}
+sub sh2_memAdvance {
+    my ($h, $n) = @_;
+    my $s = defined $h ? "$h" : "";
+    return $h unless $s =~ /^(\x01mem:[^:]+):(-?\d+)$/;
+    return "$1:" . ($2 + int(defined $n ? $n : 0));
+}
+sub sh2_memTest {
+    my ($op, $a, $b) = @_;
+    my ($pa, $pb) = (0, 0);
+    if (defined $a && $a =~ /^\x01mem:[^:]+:(-?\d+)$/) { $pa = $1 + 0 }
+    elsif (defined $a && $a =~ /^-?\d+(?:\.\d+)?$/) { $pa = $a + 0 }
+    if (defined $b && $b =~ /^\x01mem:[^:]+:(-?\d+)$/) { $pb = $1 + 0 }
+    elsif (defined $b && $b =~ /^-?\d+(?:\.\d+)?$/) { $pb = $b + 0 }
+    return 1 if $op eq '<' && $pa < $pb;
+    return 1 if $op eq '<=' && $pa <= $pb;
+    return 1 if $op eq '>' && $pa > $pb;
+    return 1 if $op eq '>=' && $pa >= $pb;
+    return 1 if $op eq '==' && $pa == $pb;
+    return 1 if $op eq '!=' && $pa != $pb;
+    return 0;
+}
+sub sh2_memFree {
+    my ($h) = @_;
+    my @p = __sh_mem_parse($h);
+    delete $__sh_mem{$p[0]} if @p && $p[0] =~ /^\d+$/;
+}
+"#;
+
 #[derive(Default)]
 pub struct Render {
     /// Rendered body lines (rendered before the preamble so the var
@@ -58,6 +135,10 @@ pub struct Render {
     funcs: BTreeSet<String>,
     need_say: bool,
     need_basename: bool,
+    /// The C memory arena (memAlloc/memLoad/memStore/memAdvance/
+    /// memFree/memTest/memElemSize calls — c/cpp frontends): the
+    /// preamble emits the sh2_mem* runtime.
+    need_mem: bool,
     todo: usize,
 }
 
@@ -97,6 +178,13 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     }
     for req in &prog.requires {
         r.emit(&format!("require {};", req));
+    }
+    if r.need_mem {
+        r.emit("");
+        for line in MEM_RUNTIME.lines() {
+            r.emit(line);
+        }
+        r.emit("");
     }
     let scalars: Vec<String> = r
         .scalars
@@ -988,6 +1076,18 @@ impl Render {
                 Some(v) => format!("do {{ return {}; }}", self.expr(v)),
                 None => "do { return; 0 }".to_string(),
             },
+            // the C memory model (malloc/pointer arithmetic): the arena
+            // runtime (subset of sh2-namespace.mjs slice 2 — memLoad
+            // reads from 64-bit-elem heap pointers; the offset is scaled
+            // by the type's element size). Rendered as sh2_mem* calls
+            // with the runtime preamble (c/cpp frontends: t03_new_delete,
+            // t83_const_ptr, the triage-perl cluster).
+            "memAlloc" | "memStore" | "memLoad" | "memAdvance" | "memFree"
+            | "memTest" | "memElemSize" => {
+                self.need_mem = true;
+                let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
+                format!("sh2_{}({})", func, a.join(", "))
+            }
             "unsupported" => {
                 self.mark_todo("unsupported");
                 "0".into()

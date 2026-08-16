@@ -15,6 +15,13 @@ use crate::ir::{IrExpr, IrProgram, IrStmt};
 pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
     let mut out = String::new();
     out.push_str("public class Sh2Program {\n");
+    if stmts_need_sh2num(&prog.stmts) {
+        // printf %d/%i/%u conversion helper — bash coerces a
+        // non-numeric arg to 0 (the java backend's fields are Strings)
+        out.push_str("    static long sh2Num(String s) {\n");
+        out.push_str("        try { return Long.parseLong(s.trim()); } catch (Exception e) { return 0; }\n");
+        out.push_str("    }\n");
+    }
     // v1: every assignment target becomes a static field (strings only).
     for st in &prog.stmts {
         collect_fields(st, &mut out)?;
@@ -188,14 +195,74 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
                     out.push_str(");\n");
                 }
                 "printf" => {
+                    // The A1 shape: exec("printf", [Array[fmt, arg...]]).
+                    // Apply the %s/%d/%i/%u conversions over a literal
+                    // format (cpp-sh-go t32_varargs.cc — the folded
+                    // `sum(3,1,2,3)` → "6" must land through %d, not be
+                    // joined as a word); mirrors the estree ref / js
+                    // renderer's printf lowering. A flags/width/prec
+                    // spec keeps the raw join (the v1 fallback).
+                    let Some(IrExpr::Array(items)) = args.get(1) else {
+                        return Err("printf without an args array (v1)".into());
+                    };
+                    let Some(IrExpr::Str(fmt, _)) = items.first() else {
+                        return Err("printf with a non-literal format (v1)".into());
+                    };
+                    let parsed = printf_parse(fmt);
+                    let Some((els, n_specs)) = parsed else {
+                        // complex spec — the v1 raw join
+                        indent(out, d);
+                        out.push_str("System.out.print(");
+                        let mut parts = Vec::new();
+                        for w in &args[1..] {
+                            parts.push(word_to_java(w)?);
+                        }
+                        out.push_str(&parts.join(" + "));
+                        out.push_str(");\n");
+                        return Ok(());
+                    };
+                    let fmt_args: Vec<&IrExpr> = items[1..].iter().collect();
+                    let arg_exprs: Result<Vec<String>, String> =
+                        fmt_args.iter().map(|a| word_to_java(a)).collect();
+                    let arg_exprs = arg_exprs?;
+                    let mut pieces: Vec<String> = Vec::new();
+                    if n_specs == 0 {
+                        // printf(1): the format text repeats once per arg
+                        let text = java_str_lit(&printf_unescape(fmt));
+                        let passes = if fmt_args.is_empty() { 1 } else { fmt_args.len() };
+                        for _ in 0..passes {
+                            pieces.push(text.clone());
+                        }
+                    } else {
+                        let passes = if arg_exprs.is_empty() {
+                            1
+                        } else {
+                            (arg_exprs.len() + n_specs - 1) / n_specs
+                        };
+                        let mut ai = 0usize;
+                        for _pass in 0..passes {
+                            for (text, spec) in &els {
+                                if let Some(conv) = spec {
+                                    let arg = arg_exprs
+                                        .get(ai)
+                                        .cloned()
+                                        .unwrap_or_else(|| "\"\"".into());
+                                    ai += 1;
+                                    match conv {
+                                        's' => pieces.push(arg),
+                                        'd' | 'i' | 'u' => pieces
+                                            .push(format!("Long.toString(sh2Num({arg}))")),
+                                        _ => unreachable!("printf_parse gates the conversions"),
+                                    }
+                                } else {
+                                    pieces.push(java_str_lit(&printf_unescape(text)));
+                                }
+                            }
+                        }
+                    }
                     indent(out, d);
                     out.push_str("System.out.print(");
-                    let words = &args[1..];
-                    let mut parts = Vec::new();
-                    for w in words {
-                        parts.push(word_to_java(w)?);
-                    }
-                    out.push_str(&parts.join(" + "));
+                    out.push_str(&pieces.join(" + "));
                     out.push_str(");\n");
                 }
                 other => {
@@ -222,8 +289,7 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
 /// (a raw newline inside the literal is a compile error — cpp-sh-go
 /// t30_static_assert.cc's `printf "static assert ok\n"` carries a real
 /// \n in the A1 Str).
-fn java_str_lit(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+fn java_str_lit(s: &str) -> String {    let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
         match c {
@@ -240,6 +306,160 @@ fn java_str_lit(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// printf(1) format parse (mirror of the js renderer's printf_parse):
+/// %s/%d/%i/%u conversions over literal text runs. A flags/width/prec
+/// spec (or any other conversion) yields None — the caller keeps the
+/// v1 raw join. `%%` is an escaped percent.
+fn printf_parse(fmt: &str) -> Option<(Vec<(String, Option<char>)>, usize)> {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut els: Vec<(String, Option<char>)> = Vec::new();
+    let mut text = String::new();
+    let mut n_specs = 0usize;
+    let mut pos = 0usize;
+    while pos < chars.len() {
+        if chars[pos] == '%' {
+            let mut i = pos + 1;
+            let flags_start = i;
+            while i < chars.len() && matches!(chars[i], '-' | '+' | ' ' | '0' | '#') {
+                i += 1;
+            }
+            let has_flags = i > flags_start;
+            let mut has_width = false;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                has_width = true;
+                i += 1;
+            }
+            let mut has_prec = false;
+            if i < chars.len() && chars[i] == '.' {
+                i += 1;
+                has_prec = true;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            let Some(&conv) = chars.get(i) else {
+                return None;
+            };
+            if has_flags || has_width || has_prec {
+                return None;
+            }
+            match conv {
+                's' | 'd' | 'i' | 'u' => {
+                    if !text.is_empty() {
+                        els.push((std::mem::take(&mut text), None));
+                    }
+                    els.push((String::new(), Some(conv)));
+                    n_specs += 1;
+                    pos = i + 1;
+                }
+                '%' => {
+                    text.push('%');
+                    pos = i + 1;
+                }
+                _ => return None,
+            }
+        } else {
+            text.push(chars[pos]);
+            pos += 1;
+        }
+    }
+    if !text.is_empty() {
+        els.push((text, None));
+    }
+    Some((els, n_specs))
+}
+
+/// printf(1) backslash escapes in the format text (\n, \t, \r, \a,
+/// \b, \f, \v, \\\\, octal) — mirror of the js renderer's
+/// printf_unescape; the A1 Str values carry the raw escape sequences.
+fn printf_unescape(s: &str) -> String {
+    let mut out = s.to_string();
+    for (from, to) in [
+        ("\\n", "\n"),
+        ("\\t", "\t"),
+        ("\\r", "\r"),
+        ("\\a", "\x07"),
+        ("\\b", "\x08"),
+        ("\\f", "\x0c"),
+        ("\\v", "\x0b"),
+        ("\\\\", "\\"),
+    ] {
+        out = out.replace(from, to);
+    }
+    let chars: Vec<char> = out.chars().collect();
+    let mut res = String::with_capacity(out.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            let mut oct = String::new();
+            let mut j = i + 1;
+            while j < chars.len() && oct.len() < 3 && matches!(chars[j], '0'..='7') {
+                oct.push(chars[j]);
+                j += 1;
+            }
+            if !oct.is_empty() {
+                if let Ok(v) = u32::from_str_radix(&oct, 8) {
+                    if let Some(c) = char::from_u32(v) {
+                        res.push(c);
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+        }
+        res.push(chars[i]);
+        i += 1;
+    }
+    res
+}
+
+/// Does any statement contain a printf with a numeric conversion
+/// (%d/%i/%u)? Those need the sh2Num coercion helper emitted.
+fn stmts_need_sh2num(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(|st| match st {
+        IrStmt::Expr(e) => expr_need_sh2num(e),
+        IrStmt::Assign { expr, .. } => expr_need_sh2num(expr),
+        IrStmt::If {
+            cond,
+            then,
+            elsifs,
+            else_,
+            ..
+        } => {
+            expr_need_sh2num(cond)
+                || stmts_need_sh2num(then)
+                || stmts_need_sh2num(else_)
+                || elsifs.iter().any(|(c, b)| expr_need_sh2num(c) || stmts_need_sh2num(b))
+        }
+        IrStmt::For { iter, body, .. } => expr_need_sh2num(iter) || stmts_need_sh2num(body),
+        IrStmt::While { cond, body, .. } => expr_need_sh2num(cond) || stmts_need_sh2num(body),
+        IrStmt::Block(b) => stmts_need_sh2num(b),
+        _ => false,
+    })
+}
+
+fn expr_need_sh2num(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } if func == "exec" => {
+            // printf with a literal format containing a numeric conv
+            let Some(IrExpr::Array(items)) = args.get(1) else {
+                return false;
+            };
+            let Some(IrExpr::Str(fmt, _)) = items.first() else {
+                return false;
+            };
+            printf_parse(fmt)
+                .map(|(els, _)| {
+                    els.iter()
+                        .any(|(_, spec)| matches!(spec, Some('d' | 'i' | 'u')))
+                })
+                .unwrap_or(false)
+        }
+        IrExpr::Array(items) => items.iter().any(expr_need_sh2num),
+        _ => false,
+    }
 }
 
 fn word_to_java(e: &IrExpr) -> Result<String, String> {
