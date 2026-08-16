@@ -104,6 +104,9 @@ pub struct Render {
     for_index: Option<String>,
     /// the last var consumed by the arith-text parser (for ++/--)
     last_arith_var: Option<String>,
+    /// an echo word's arith expansion is parse-failure-guarded (the
+    /// print is suppressed when a referenced positional is empty)
+    arith_word_guard: bool,
     todo: usize,
 }
 
@@ -2049,6 +2052,57 @@ impl Render {
         if p.pos == toks.len() { Some(e) } else { None }
     }
 
+    /// Positional indices (`$1`, `$2`, …) referenced by an arith TEXT.
+    fn arith_text_positionals(text: &str) -> Vec<usize> {
+        let ch: Vec<char> = text.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < ch.len() {
+            if ch[i] == '$' && i + 1 < ch.len() && ch[i + 1].is_ascii_digit() {
+                let mut j = i + 1;
+                while j < ch.len() && ch[j].is_ascii_digit() { j += 1; }
+                let n: String = ch[i + 1..j].iter().collect();
+                if let Ok(k) = n.parse::<usize>() {
+                    if k > 0 && !out.contains(&k) { out.push(k); }
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Render an arith TEXT as a WORD value. Bash RE-EXPANDS the text
+    /// before parsing: a positional that expands to empty makes a
+    /// composite expression a SYNTAX error, so the whole command word
+    /// fails and the containing echo prints nothing. The guard records
+    /// the failure (via `__SH_ARITH_WORD_FAIL`) for `__sh_print_words`
+    /// to honor; a single bare `$N` stays valid (empty → 0).
+    /// Returns (expr, guarded).
+    fn arith_word(&mut self, text: &str) -> (String, bool) {
+        if let Some(e) = self.arith_text(text) {
+            let pos = Self::arith_text_positionals(text);
+            let single = pos.len() == 1
+                && text.trim().chars().filter(|c| *c != '$').all(|c| c.is_ascii_digit());
+            if !pos.is_empty() && !single {
+                let checks: Vec<String> = pos
+                    .iter()
+                    .map(|i| format!("__sh_arg({}).trim().is_empty()", i.saturating_sub(1)))
+                    .collect();
+                let ev = format!(
+                    "vec![{{ let __aw = ({e}).to_string(); if {} {{ __SH_ARITH_WORD_FAIL.store(true, Ordering::SeqCst); }} __aw }}]",
+                    checks.join(" || ")
+                );
+                (ev, true)
+            } else {
+                (format!("vec![({e}).to_string()]"), false)
+            }
+        } else {
+            ("vec![\"0\".to_string()]".to_string(), false)
+        }
+    }
+
     // ── command-text reconstruction (shell-outs) ─────────────────────
 
     /// Build the bash command text for an exec call's words (a String
@@ -2173,11 +2227,11 @@ impl Render {
             }
             "arith" => {
                 let text = str_arg(args, 0).unwrap_or("").replace(GLOB_SENTINEL, "");
-                if let Some(e) = self.arith_text(&text) {
-                    format!("vec![({e}).to_string()]")
-                } else {
-                    "vec![\"0\".to_string()]".to_string()
+                let (ev, guarded) = self.arith_word(&text);
+                if guarded {
+                    self.arith_word_guard = true;
                 }
+                ev
             }
             "captureWords" => self.capture_words_expr(args),
             "assign" => format!("vec![{}]", self.assign_call_str(args)),
@@ -3555,6 +3609,7 @@ impl Render {
     }
 
     fn echo_stmt(&mut self, words: &[&IrExpr]) {
+        self.arith_word_guard = false;
         let (parts, nl, esc) = self.echo_parts(words);
         let ws: Vec<String> = parts
             .into_iter()
@@ -3564,6 +3619,11 @@ impl Render {
             })
             .collect();
         self.add_helper("print_words");
+        if self.arith_word_guard {
+            // a guarded arith word may raise the fail flag while its
+            // args evaluate — clear it first, the print consumes it
+            self.emit("__SH_ARITH_WORD_FAIL.store(false, Ordering::SeqCst);");
+        }
         self.emit(&format!("__sh_print_words(&[{}], {}, {});", ws.join(", "), nl, esc));
         self.emit("__SH_RC.store(0, Ordering::SeqCst);");
     }
@@ -3586,10 +3646,34 @@ impl Render {
             return;
         }
         let fmt = self.expr_str(words[idx]);
-        let arg_exprs: Vec<String> =
-            words.iter().skip(idx + 1).map(|w| self.expr_str(w)).collect();
+        // `split` args are field-split word LISTS — keep them as Vecs and
+        // flatten, so the format RE-APPLIES per field (`printf "<%s>\\n"
+        // $x` with x="a b" prints `<a>` and `<b>`, bash semantics).
+        let arg_exprs: Vec<String> = words
+            .iter()
+            .skip(idx + 1)
+            .map(|w| match w {
+                IrExpr::Call { func, args } if func == "split" => {
+                    let s = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
+                    self.add_helper("split_ifs");
+                    format!("__sh_split_ifs(&{s}, \" \\t\\n\")")
+                }
+                IrExpr::Call { func, args } if func == "capture" => {
+                    // an unquoted capture also field-splits
+                    let c = self.capture_expr(args);
+                    self.add_helper("split_ifs");
+                    format!("__sh_split_ifs(&{c}, \" \\t\\n\")")
+                }
+                w => format!("vec![{}]", self.expr_str(w)),
+            })
+            .collect();
         self.add_helper("printf");
-        let call = format!("__sh_printf(&{fmt}, &[{}])", arg_exprs.join(", "));
+        self.add_helper("cat");
+        let call = if arg_exprs.is_empty() {
+            format!("__sh_printf(&{fmt}, &[])")
+        } else {
+            format!("__sh_printf(&{fmt}, &__sh_cat(&[{}]))", arg_exprs.join(", "))
+        };
         if let Some(t) = target {
             self.mark_written(&t);
             if self.is_num(&t) {
@@ -4483,13 +4567,23 @@ impl Render {
                         .filter(|p| p.as_str() != "*")
                         .map(|p| {
                             let t = p.trim();
-                            if t.len() >= 2
+                            let unquoted = if t.len() >= 2
                                 && ((t.starts_with('"') && t.ends_with('"'))
                                     || (t.starts_with('\'') && t.ends_with('\'')))
                             {
                                 t[1..t.len() - 1].to_string()
                             } else {
                                 p.clone()
+                            };
+                            // `$(cmd)` patterns are EVALUATED at runtime
+                            // (an unescaped `$(` — `\$(` is a literal)
+                            if contains_unescaped_dollar_paren(&unquoted) {
+                                self.add_helper("capture_rc");
+                                let interp = self.dollar_interp(&unquoted);
+                                // cmdsub strips trailing newlines
+                                format!("&({interp}).trim_end_matches('\\n').to_string()")
+                            } else {
+                                Self::rust_str(&unquoted)
                             }
                         })
                         .collect();
@@ -4498,9 +4592,11 @@ impl Render {
                         "true".to_string()
                     } else {
                         self.add_helper("fnmatch");
+                        // pats are already fnmatch ARG expressions — a
+                        // quoted literal or a runtime-evaluated `&(expr)`
                         let alts = pats
                             .iter()
-                            .map(|p| format!("__sh_fnmatch({}, &{dg})", Self::rust_str(p)))
+                            .map(|p| format!("__sh_fnmatch({p}, &{dg})"))
                             .collect::<Vec<_>>()
                             .join(" || ");
                         format!("({alts})")
@@ -4767,6 +4863,7 @@ impl Render {
         self.emit("static __SH_TRAPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
         self.emit("static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
+        self.emit("static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
         self.emit("");
         self.out.extend(decl_out.iter().cloned());
         for h in HELPER_ORDER {
@@ -5050,6 +5147,10 @@ fn helper_source(h: &str) -> &'static str {
     s.trim().parse().unwrap_or(0.0)
 }"#,
         "print_words" => r#"fn __sh_print_words(ws: &[Vec<String>], nl: bool, esc: bool) {
+    // a word's `$((…))` arith expansion FAILED (an empty positional
+    // makes the expanded text a syntax error) — bash suppresses the
+    // WHOLE simple command, not just the word
+    if __SH_ARITH_WORD_FAIL.swap(false, Ordering::SeqCst) { return; }
     let mut s = String::new();
     let mut first = true;
     for w in ws {
@@ -6083,6 +6184,19 @@ impl Render {
             _ => None,
         }
     }
+}
+
+/// Does a case-pattern text contain an UNESCAPED `$(` (a runtime
+/// command substitution)? `\$(` is a literal dollar-paren.
+fn contains_unescaped_dollar_paren(p: &str) -> bool {
+    let ch: Vec<char> = p.chars().collect();
+    let mut i = 0;
+    while i + 1 < ch.len() {
+        if ch[i] == '\\' { i += 2; continue; }
+        if ch[i] == '$' && ch[i + 1] == '(' { return true; }
+        i += 1;
+    }
+    false
 }
 
 /// Does the statement list contain a shell-out (needs text reconstruction)?
