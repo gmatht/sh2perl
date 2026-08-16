@@ -77,6 +77,9 @@ pub struct Render {
     functions: BTreeSet<String>,
     /// `typeset -i` vars (integer attribute — text assigns are arith)
     int_vars: BTreeSet<String>,
+    /// Int-typed vars that ALSO receive string values (captures,
+    /// pipelines) — bash stores the TEXT; the TLS must be a String
+    str_forced: BTreeSet<String>,
     /// `typeset -l` vars (lowercase attribute)
     lower_vars: BTreeSet<String>,
     /// `typeset -u` vars (uppercase attribute)
@@ -104,10 +107,80 @@ pub struct Render {
     for_index: Option<String>,
     /// the last var consumed by the arith-text parser (for ++/--)
     last_arith_var: Option<String>,
-    /// an echo word's arith expansion is parse-failure-guarded (the
-    /// print is suppressed when a referenced positional is empty)
-    arith_word_guard: bool,
+    /// an echo word's expansion is failure-guarded (an arith parse
+    /// error or a bad substitution suppresses the print and sets rc 1)
+    word_fail_guard: bool,
     todo: usize,
+}
+
+/// A string-producing RHS (capture/pipeline/word list) — bash stores
+/// its TEXT even in an Int-typed var (`result=$(echo "x" | sed …)`
+/// holds the string, not 0).
+fn expr_is_stringy(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, .. } => matches!(
+            func.as_str(),
+            "capture" | "pipeline" | "captureWords" | "split" | "join"
+        ),
+        IrExpr::Capture { .. } | IrExpr::Array(_) | IrExpr::Interpolate(_) => true,
+        _ => false,
+    }
+}
+
+/// Vars the type analysis calls Int but that receive a string value
+/// somewhere (a capture/pipeline assignment or a `local x=$(…)`): bash
+/// stores the TEXT, so the var's TLS must be a String, not an int cell.
+fn str_forced_vars(prog: &IrProgram) -> BTreeSet<String> {
+    fn walk(out: &mut BTreeSet<String>, stmts: &[IrStmt], types: &[(String, IrType)]) {
+        let t = |n: &str| types.iter().find(|(k, _)| k == n).map(|(_, v)| *v);
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, expr, .. } => {
+                    if expr_is_stringy(expr) {
+                        for tg in targets {
+                            if t(&tg.var) == Some(IrType::Int) {
+                                out.insert(tg.var.clone());
+                            }
+                        }
+                    }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+                    // `local result=$(…)` — a decl word `name=` followed
+                    // by a stringy VALUE word
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        for (i, w) in items.iter().enumerate() {
+                            if let IrExpr::Str(ws, _) = w {
+                                if let Some((name, val)) = ws.split_once('=') {
+                                    if !name.is_empty()
+                                        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                        && t(name) == Some(IrType::Int)
+                                    {
+                                        if !val.is_empty() {
+                                            if val.contains('$') {
+                                                out.insert(name.to_string());
+                                            }
+                                        } else if let Some(next) = items.get(i + 1) {
+                                            if expr_is_stringy(next) {
+                                                out.insert(name.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                IrStmt::Function { body, .. } => walk(out, body, types),
+                IrStmt::Block(b) | IrStmt::Subshell(b) => walk(out, b, types),
+                IrStmt::Redirect { inner, .. } => walk(out, inner, types),
+                IrStmt::While { body, .. } => walk(out, body, types),
+                _ => {}
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(&mut out, &prog.stmts, &prog.var_types);
+    out
 }
 
 /// Render an `IrProgram` to Rust source (fn main()).
@@ -116,6 +189,7 @@ pub fn shir_to_rust(prog: &IrProgram) -> String {
     prog.var_types = crate::shir::analyze_var_types(&prog);
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
+    r.str_forced = str_forced_vars(&prog);
     r.program(&prog);
     r.out.join("\n")
 }
@@ -264,7 +338,8 @@ impl Render {
     // ── var classification ───────────────────────────────────────────
 
     fn is_num(&self, name: &str) -> bool {
-        self.var_types.get(name).copied() == Some(IrType::Int) || self.int_vars.contains(name)
+        !self.str_forced.contains(name)
+            && (self.var_types.get(name).copied() == Some(IrType::Int) || self.int_vars.contains(name))
     }
 
     fn is_array(&self, name: &str) -> bool {
@@ -2229,7 +2304,7 @@ impl Render {
                 let text = str_arg(args, 0).unwrap_or("").replace(GLOB_SENTINEL, "");
                 let (ev, guarded) = self.arith_word(&text);
                 if guarded {
-                    self.arith_word_guard = true;
+                    self.word_fail_guard = true;
                 }
                 ev
             }
@@ -3609,7 +3684,7 @@ impl Render {
     }
 
     fn echo_stmt(&mut self, words: &[&IrExpr]) {
-        self.arith_word_guard = false;
+        self.word_fail_guard = false;
         let (parts, nl, esc) = self.echo_parts(words);
         let ws: Vec<String> = parts
             .into_iter()
@@ -3619,13 +3694,22 @@ impl Render {
             })
             .collect();
         self.add_helper("print_words");
-        if self.arith_word_guard {
-            // a guarded arith word may raise the fail flag while its
-            // args evaluate — clear it first, the print consumes it
+        if self.word_fail_guard {
+            // a guarded word may raise the fail flag while its args
+            // evaluate — clear it first, then evaluate into a local,
+            // print only on success, and report rc 1 on failure (bash
+            // suppresses the whole simple command)
+            self.add_helper("cat");
             self.emit("__SH_ARITH_WORD_FAIL.store(false, Ordering::SeqCst);");
+            self.emit(&format!(
+                "{{ let __ws = __sh_cat(&[{}]); let __wf = __SH_ARITH_WORD_FAIL.swap(false, Ordering::SeqCst); \
+                 if !__wf {{ __sh_print_words(&[__ws], {}, {}); }} __SH_RC.store(if __wf {{ 1 }} else {{ 0 }}, Ordering::SeqCst); }}",
+                ws.join(", "), nl, esc
+            ));
+        } else {
+            self.emit(&format!("__sh_print_words(&[{}], {}, {});", ws.join(", "), nl, esc));
+            self.emit("__SH_RC.store(0, Ordering::SeqCst);");
         }
-        self.emit(&format!("__sh_print_words(&[{}], {}, {});", ws.join(", "), nl, esc));
-        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
     }
 
     fn printf_stmt(&mut self, words: &[&IrExpr]) {
@@ -3701,6 +3785,12 @@ impl Render {
         let off_num = matches!(args.get(2), Some(IrExpr::Str(s, _)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
         let name_at = name.ends_with("[@]") || name.ends_with("[*]");
         if let Some(keys) = name.strip_prefix('!') {
+            // `${!prefix*[@]:0:3}` — slicing the indirect key list is a
+            // bash BAD SUBSTITUTION: the whole command word fails
+            if op == "slice" {
+                self.word_fail_guard = true;
+                return "{ __SH_ARITH_WORD_FAIL.store(true, Ordering::SeqCst); String::new() }".to_string();
+            }
             let keys = array_base_name(keys);
             if !keys.is_empty() && (idx_at || name_at) {
                 self.mark_written(&keys);
@@ -3856,6 +3946,13 @@ impl Render {
                 format!("__sh_replace(&{var_expr}, {}, &{repl}, {all})", Self::rust_str(pat))
             }
             "slice" => {
+                // `${!prefix*[@]:off:len}` — a slice of the INDIRECT key
+                // list is a bash BAD SUBSTITUTION: the whole command word
+                // fails (the echo prints nothing)
+                if name.starts_with('!') {
+                    self.word_fail_guard = true;
+                    return "{ __SH_ARITH_WORD_FAIL.store(true, Ordering::SeqCst); String::new() }".to_string();
+                }
                 // `${arr[@]:off:len}` — an element slice; scalar strings
                 // get a char slice
                 let off = args.get(2).map(|x| self.slice_index_expr(x)).unwrap_or_else(|| "0".to_string());
@@ -4923,7 +5020,7 @@ impl Render {
             let w = self.words_expr(e);
             self.add_helper("cat");
             self.write_arr(name, &format!("__sh_cat(&[{w}])"))
-        } else if self.is_num(name) {
+        } else if self.is_num(name) && !expr_is_stringy(e) {
             let n = self.expr_num(e);
             self.write_num(name, &n)
         } else {
