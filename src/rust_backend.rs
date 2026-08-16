@@ -2607,9 +2607,13 @@ impl Render {
         self.emit("let __cap_oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());");
         self.emit("let __old = __SH_OUT.lock().unwrap().take();");
         self.emit("*__SH_OUT.lock().unwrap() = Some(Vec::new());");
+        // the captured commands must NOT consume the stage's stdin (a
+        // nested mktemp would eat the pipeline buffer)
+        self.emit("let __cap_oldin = __SH_STDIN.lock().unwrap().take();");
         for s in stmts {
             self.stmt(s);
         }
+        self.emit("*__SH_STDIN.lock().unwrap() = __cap_oldin;");
         self.emit("let __cap = __SH_OUT.lock().unwrap().take().unwrap();");
         self.emit("*__SH_OUT.lock().unwrap() = __old;");
         self.emit("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __cap_oldout);");
@@ -3048,7 +3052,8 @@ impl Render {
         // shell-out the whole thing when the inner is text-reconstructable;
         // anything else (pipelines, while loops, `and` blocks) renders
         // natively — its shell-outs already respect __SH_OUTFILE/__SH_STDIN
-        if let Some(text) = self.stage_text(inner) {
+        if !contains_fn_call(self, inner) {
+            if let Some(text) = self.stage_text(inner) {
             let mut full = text;
                 let mut input: Option<String> = None;
                 for r in redirs {
@@ -3123,7 +3128,8 @@ impl Render {
                 } else {
                     self.emit(&format!("__SH_RC.store(__sh_spawn(&{full}, None), Ordering::SeqCst);"));
                 }
-            return;
+                return;
+            }
         }
         // native inner: fd0 via __SH_STDIN, fd1 via __SH_OUTFILE
         let mut pre = Vec::new();
@@ -3134,10 +3140,18 @@ impl Render {
                     if let Some(t) = &r.target {
                         let te = self.expr_str(t);
                         pre.push("let __oldin = __SH_STDIN.lock().unwrap().take();".to_string());
+                        pre.push("let __oldinp = __SH_STDIN_PATH.lock().unwrap().take();".to_string());
                         pre.push(format!(
                             "*__SH_STDIN.lock().unwrap() = Some(Box::new(std::fs::File::open(&{te}).unwrap_or_else(|_| {{ let f = std::fs::File::open(\"/dev/null\").unwrap(); f }})));"
                         ));
+                        // a shell-out inheriting this stdin must see the
+                        // REAL device fd (`tty < /dev/pts/5` needs
+                        // isatty), not the byte stream
+                        pre.push(format!(
+                            "*__SH_STDIN_PATH.lock().unwrap() = Some(std::path::PathBuf::from(&{te}));"
+                        ));
                         post.push("*__SH_STDIN.lock().unwrap() = __oldin;".to_string());
+                        post.push("*__SH_STDIN_PATH.lock().unwrap() = __oldinp;".to_string());
                     }
                 }
                 "heredoc" | "heredoc-tabs" | "herestring" => {
@@ -4586,6 +4600,7 @@ impl Render {
         self.emit("static __SH_OUT: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);");
         self.emit("thread_local! { static __SH_OUTFILE_TL: std::cell::RefCell<Option<std::fs::File>> = const { std::cell::RefCell::new(None) }; }");
         self.emit("static __SH_STDIN: std::sync::Mutex<Option<Box<dyn std::io::Read + Send>>> = std::sync::Mutex::new(None);");
+        self.emit("static __SH_STDIN_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);");
         self.emit("static __SH_BG: std::sync::Mutex<Vec<(u32, std::process::Child)>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGTHREADS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_PIPESTATUS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());");
@@ -4973,7 +4988,10 @@ fn helper_source(h: &str) -> &'static str {
     out
 }"#,
         "capture" => r#"fn __sh_capture(cmd: &str) -> String {
-    match std::process::Command::new("bash").arg("-c").arg(cmd).output() {
+    let mut c = std::process::Command::new("bash");
+    c.arg("-c").arg(cmd);
+    c.stdin(std::process::Stdio::inherit());
+    match c.output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Err(_) => String::new(),
     }
@@ -4998,6 +5016,7 @@ fn helper_source(h: &str) -> &'static str {
     let mut c = std::process::Command::new("bash");
     c.arg("-c").arg(cmd);
     c.stdout(std::process::Stdio::piped());
+    c.stdin(std::process::Stdio::inherit());
     let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return (String::new(), 1) };
     let mut out = Vec::new();
     if let Some(mut so) = ch.stdout.take() {
@@ -5009,14 +5028,31 @@ fn helper_source(h: &str) -> &'static str {
     (s, rc)
 }"#,
         "spawn" => r#"fn __sh_spawn(cmd: &str, input: Option<&[u8]>) -> i32 {
+    // a shell-out inside a native stage inherits the stage's stdin
+    // (`echo x | grep -f <(…)` — the grep reads the echo's buffer)
+    let mut input = input.map(|d| d.to_vec());
+    let stdin_path = __SH_STDIN_PATH.lock().unwrap().clone();
+    if input.is_none() && stdin_path.is_none() {
+        if let Some(mut r) = __SH_STDIN.lock().unwrap().take() {
+            let mut d = Vec::new();
+            let _ = r.read_to_end(&mut d);
+            input = Some(d);
+        }
+    }
     let want_out = __SH_OUT.lock().unwrap().is_some() || __SH_OUTFILE_TL.with(|v| v.borrow().is_some());
     let mut c = std::process::Command::new("bash");
     c.arg("-c").arg(cmd);
     if want_out { c.stdout(std::process::Stdio::piped()); }
-    if input.is_some() { c.stdin(std::process::Stdio::piped()); }
+    if let Some(p) = &stdin_path {
+        // the child must see the REAL device fd (`tty < /dev/pts/5`
+        // needs isatty, which a byte pipe lacks)
+        if let Ok(f) = std::fs::File::open(p) {
+            c.stdin(std::process::Stdio::from(f));
+        }
+    } else if input.is_some() { c.stdin(std::process::Stdio::piped()); }
     let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return 1 };
     if let Some(data) = input {
-        if let Some(mut si) = ch.stdin.take() { let _ = si.write_all(data); }
+        if let Some(mut si) = ch.stdin.take() { let _ = si.write_all(&data); }
     }
     let mut out = Vec::new();
     if let Some(mut so) = ch.stdout.take() {
@@ -5849,6 +5885,28 @@ impl Render {
 }
 
 /// Does the statement list contain a shell-out (needs text reconstruction)?
+/// Does the statement list call a shell FUNCTION? (a fn call shelling
+/// out would lose the body — render natively)
+fn contains_fn_call(r: &Render, stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+            r.functions.contains(str_arg(args, 0).unwrap_or(""))
+        }
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "redirect" => {
+            args.first().map_or(false, |a| {
+                if let IrExpr::Arrow(b) = a {
+                    contains_fn_call(r, b)
+                } else {
+                    false
+                }
+            })
+        }
+        IrStmt::Redirect { inner, .. } => contains_fn_call(r, inner),
+        IrStmt::Subshell(b) | IrStmt::Block(b) => contains_fn_call(r, b),
+        _ => false,
+    })
+}
+
 fn contains_shell(stmts: &[IrStmt]) -> bool {
     stmts.iter().any(|s| match s {
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
