@@ -14230,7 +14230,12 @@ pub fn shir_to_estree_json(prog: &IrProgram) -> Result<String, serde_json::Error
     // the A1 path). The pass's return-conversion is now keyed on LOOP-BODY
     // arrows only (the in_loop flag), so frontend VALUE-returning arrows
     // (zig `__fn_f`, the py ArrayComp IIFE, C fnValue) keep native returns.
-    Ok(crate::estree::estree_to_json(&fix_control_flow(shir_to_estree(prog))))
+    // The A1 optimizer family (estree-20260813-183713/182434/182435) runs
+    // on the ingress clone: const/copy prop + DSE + const-pool arith fold,
+    // exactly like the wasi/CLI ingress paths (one shared entry).
+    let mut prog = prog.clone();
+    crate::shir_passes::optimize::optimize(&mut prog);
+    Ok(crate::estree::estree_to_json(&fix_control_flow(shir_to_estree(&prog))))
 }
 
 /// Classification of a case-pattern string for the native lowering.

@@ -257,6 +257,8 @@ fn otranspilerl_transpile_impl(src: &str, src_lang: &str, tgt_lang: &str) -> Res
     if src_lang == "shir" {
         let mut prog = crate::shir_json_in::shir_json_to_ir(src)?;
         crate::shir_passes::strip_cfor(&mut prog);
+        // the A1 optimizer family (estree-20260813-183713/182434/182435)
+        crate::shir_passes::optimize::optimize(&mut prog);
         return render_ir(&prog, tgt_lang);
     }
     if src_lang == "sh" {
@@ -286,6 +288,8 @@ pub extern "C" fn otranspilerl_render(a1: *const u8, a1_len: usize, lang: *const
     let res = crate::shir_json_in::shir_json_to_ir(&a1)
         .and_then(|mut prog| {
             crate::shir_passes::strip_cfor(&mut prog);
+            // the A1 optimizer family (estree-20260813-183713/182434/182435)
+            crate::shir_passes::optimize::optimize(&mut prog);
             render_ir(&prog, &lang)
         });
     match res {
