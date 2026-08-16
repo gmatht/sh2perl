@@ -47,6 +47,7 @@ pub mod analysis;
 pub mod context;
 pub mod lifetime;
 pub mod metric;
+pub mod optimize; // const_prop + dead_store_elim (the A1 optimizer family)
 pub mod pattern;
 pub mod restructure;
 pub mod strip;
