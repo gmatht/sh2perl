@@ -598,7 +598,7 @@ impl Render {
                 }
             }
             IrExpr::Interpolate(parts) => self.interpolate(parts),
-            IrExpr::Arith(a) => format!("({}).to_string()", self.arith(a)),
+            IrExpr::Arith(a) => self.arith_str(a),
             IrExpr::Bool(b) => {
                 if *b { "(true).to_string()".into() } else { "(false).to_string()".into() }
             }
@@ -647,6 +647,18 @@ impl Render {
             }
             other => self.expr_any(other),
         }
+    }
+
+    /// An arith value stringified — bash collapses the WHOLE expansion
+    /// to empty on an evaluation error (division/modulo by zero), so the
+    /// checked div/mod helpers set `__SH_ARITH_ERR` and the string
+    /// boundary nulls the result (and lets the caller set rc 1).
+    fn arith_str(&mut self, a: &ArithAst) -> String {
+        self.add_helper("arith_err");
+        format!(
+            "{{ let __v = ({}).to_string(); if __SH_ARITH_ERR.swap(false, Ordering::SeqCst) {{ String::new() }} else {{ __v }} }}",
+            self.arith(a)
+        )
     }
 
     /// Render as a bool-typed expression (conditions).
@@ -836,7 +848,7 @@ impl Render {
                     self.expr_num(rhs)
                 )
             }
-            IrExpr::Arith(a) => format!("({}).to_string()", self.arith(a)),
+            IrExpr::Arith(a) => self.arith_str(a),
             IrExpr::Interpolate(parts) => self.interpolate(parts),
             IrExpr::Ternary { cond, then, else_ } => format!(
                 "(if {} {{ {} }} else {{ {} }})",
@@ -950,6 +962,14 @@ impl Render {
                         format!("(({l} {op} {r}) as i64)")
                     }
                     ">>" | "<<" => format!("({l} {op} {r})"),
+                    "/" => {
+                        self.add_helper("div");
+                        format!("__sh_div({l},{r})")
+                    }
+                    "%" => {
+                        self.add_helper("mod");
+                        format!("__sh_mod({l},{r})")
+                    }
                     _ => format!("({l} {op} {r})"),
                 }
             }
@@ -1391,16 +1411,39 @@ impl Render {
     fn decl_words(&mut self, words: &[&IrExpr], exported: bool) {
         let mut i = 0;
         while i < words.len() {
+            // `local -a args=(...)` — the core nests the whole setArray
+            // call as ONE word (not a "setArray" Str + trailing args)
+            if let IrExpr::Call { func, args } = words[i] {
+                if func == "setArray" {
+                    self.array_call_stmt(&args[..]);
+                    i += 1;
+                    continue;
+                } else if func == "setArrayAppend" {
+                    self.array_append_stmt(&args[..]);
+                    i += 1;
+                    continue;
+                }
+            }
             if let Some(ws) = str_arg(&[(*words[i]).clone()], 0) {
                 if ws.starts_with('-') {
                     // -a / -A / -x / -r / -i / -l / -u / -n / -p — the
                     // -a/-A mark the NEXT name as an array/assoc; -i/-l/-u
                     // set attributes.
                     if ws == "-a" || ws == "-A" || ws == "-i" || ws == "-l" || ws == "-u" {
-                        if let Some(n) = words.get(i + 1).and_then(|w| {
+                        let n = words.get(i + 1).and_then(|w| {
                             str_arg(&[(*w).clone()], 0)
                                 .map(|s| s.split('=').next().unwrap_or(s).to_string())
-                        }) {
+                        }).or_else(|| {
+                            // the next word may be a nested setArray call
+                            // (`local -a arr=(...)`): take its name
+                            if let Some(IrExpr::Call { func, args }) = words.get(i + 1) {
+                                if func == "setArray" || func == "setArrayAppend" {
+                                    return str_arg(args, 0).map(|s| s.to_string());
+                                }
+                            }
+                            None
+                        });
+                        if let Some(n) = n {
                             if ws == "-A" {
                                 self.assoc.insert(n.clone());
                             } else if ws == "-a" {
@@ -1941,9 +1984,10 @@ impl Render {
                     Some(x) => self.expr_num(x),
                 };
                 return format!(
-                    "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = ({off} - 1).max(0) as usize; \
+                    "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__v.len()); \
                      let __l = if {len} < 0 {{ __v.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
                      let __e = ((__o as i64 + __l).max(__o as i64)).min(__v.len() as i64) as usize; \
+                     let __e = __e.max(__o); \
                      __v[__o..__e].to_vec() }}"
                 );
             }
@@ -1965,7 +2009,7 @@ impl Render {
                     };
                     let arr = self.read_arr(var);
                     return format!(
-                        "{{ let __v = {arr}; let __o = if {off} < 0 {{ (__v.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __l = if {len} < 0 {{ __v.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize;                          __v[__s..__e].to_vec() }}"
+                        "{{ let __v = {arr}; let __o = if {off} < 0 {{ (__v.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __o = __o.min(__v.len()); let __l = if {len} < 0 {{ __v.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize; let __e = __e.max(__s);                          __v[__s..__e].to_vec() }}"
                     );
                 }
                 return self.read_arr(var);
@@ -2380,7 +2424,42 @@ impl Render {
         self.add_helper("cap_bytes");
         let buf = self.gensym("__sh_pbuf");
         self.emit(&format!("let mut {buf}: Vec<u8> = Vec::new();"));
-        for (idx, st) in stages.iter().enumerate() {
+        let mut idx = 0;
+        while idx < n {
+            // consecutive shell stages are joined into ONE `bash -c`
+            // pipeline — bash's pipe plumbing (SIGPIPE closing, e.g.
+            // `yes | head`) only works inside a single process group;
+            // per-stage captures would block forever on infinite
+            // producers.
+            let mut run: Vec<String> = Vec::new();
+            let mut j = idx;
+            while j < n {
+                if let Some(text) = self.stage_text(&stages[j]) {
+                    // drop the leading borrow (`&__sh_wq(..)`) — the
+                    // joined pipeline owns its pieces
+                    let t = text.strip_prefix('&').unwrap_or(&text).to_string();
+                    run.push(t);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if run.len() > 1 {
+                // join as a runtime format! — the stages are String
+                // EXPRESSIONS, not bash text (no `|` operator on String)
+                let mut joined = run[0].clone();
+                for t in &run[1..] {
+                    joined = format!("format!(\"{{}} | {{}}\", {joined}, {t})");
+                }
+                if j == n {
+                    self.emit(&format!("__SH_RC.store(__sh_spawn(&{joined}, Some(&{buf})), Ordering::SeqCst);"));
+                } else {
+                    self.emit(&format!("{buf} = __sh_cap_bytes(&{joined}, Some(&{buf}));"));
+                }
+                idx = j;
+                continue;
+            }
+            let st = &stages[idx];
             let last = idx + 1 == n;
             if let Some(text) = self.stage_text(st) {
                 // shell stage
@@ -2421,6 +2500,7 @@ impl Render {
                 self.depth = old_depth;
                 self.emit(&format!("{{\n{block}\n}}"));
             }
+            idx += 1;
         }
         if n > 1 {
             // bash: the pipeline rc is the LAST stage's — already stored
@@ -2451,13 +2531,23 @@ impl Render {
         let mut cond: Vec<IrStmt> = Vec::new();
         let mut body: Vec<IrStmt> = Vec::new();
         if let Some(IrExpr::Arrow(outer)) = args.first() {
+            let mut found_wrapped = false;
             for a in outer {
                 if let IrStmt::Expr(IrExpr::Arrow(stmts)) = a {
+                    // wrapped shape: [Expr(Arrow(cond)), Expr(Arrow(body))]
                     if cond.is_empty() {
                         cond = stmts.clone();
+                        found_wrapped = true;
                     } else {
                         body = stmts.clone();
                     }
+                }
+            }
+            if !found_wrapped {
+                // direct shape: args = [Arrow(cond), Arrow(body)]
+                cond = outer.clone();
+                if let Some(IrExpr::Arrow(b)) = args.get(1) {
+                    body = b.clone();
                 }
             }
         }
@@ -2484,7 +2574,12 @@ impl Render {
     fn cond_block(&mut self, stmts: &[IrStmt]) -> String {
         if stmts.len() == 1 {
             if let IrStmt::Expr(e) = &stmts[0] {
-                return self.expr_bool(e);
+                // a redirect-wrapped condition (`while read x; done < f`)
+                // must run its statements (the read) and test the rc —
+                // expr_bool has no redirect arm
+                if !matches!(e, IrExpr::Call { func, .. } if func == "redirect") {
+                    return self.expr_bool(e);
+                }
             }
         }
         let mut saved = std::mem::take(&mut self.out);
@@ -2637,6 +2732,7 @@ impl Render {
         let mut fd: Option<i64> = None;
         let mut mode = String::new();
         let mut target: Option<IrExpr> = None;
+        let mut interpolate = false;
         for (k, v) in props {
             match k.as_str() {
                 "fd" => {
@@ -2650,10 +2746,27 @@ impl Render {
                     }
                 }
                 "target" => target = Some(v.clone()),
+                "interpolate" => {
+                    if let IrExpr::Bool(b) = v {
+                        interpolate = *b;
+                    }
+                }
                 _ => {}
             }
         }
-        Some(IrRedirectInfo { fd: fd.unwrap_or(1), mode, target })
+        Some(IrRedirectInfo { fd: fd.unwrap_or(1), mode, target, interpolate })
+    }
+
+    /// A redirect target's string value: an unquoted heredoc body
+    /// (interpolate) expands `$var`/`${...}`/`$(...)` shell-style; quoted
+    /// heredocs and plain targets are literal.
+    fn redirect_target_text(&mut self, t: &IrExpr, interpolate: bool) -> String {
+        if interpolate {
+            if let IrExpr::Str(s, _) = t {
+                return self.dollar_interp(s);
+            }
+        }
+        self.expr_str(t)
     }
 
     /// Render a redirect statement (IrStmt::Redirect or the Call form).
@@ -2712,7 +2825,7 @@ impl Render {
                         }
                         "heredoc" | "heredoc-tabs" | "herestring" => {
                             if let Some(t) = &r.target {
-                                let mut te = self.expr_str(t);
+                                let mut te = self.redirect_target_text(t, r.interpolate);
                                 if r.mode == "herestring" {
                                     te = format!("format!(\"{{}}\\n\", {te})");
                                 }
@@ -2762,7 +2875,7 @@ impl Render {
                 }
                 "heredoc" | "heredoc-tabs" | "herestring" => {
                     if let Some(t) = &r.target {
-                        let mut te = self.expr_str(t);
+                        let mut te = self.redirect_target_text(t, r.interpolate);
                         if r.mode == "herestring" {
                             te = format!("format!(\"{{}}\\n\", {te})");
                         }
@@ -2798,19 +2911,64 @@ impl Render {
             let t = r.target.as_ref().unwrap();
             let te = self.expr_str(t);
             used_outfile = true;
-            pre.push("let __oldout = __SH_OUTFILE.lock().unwrap().take();".to_string());
+            pre.push("let __oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());".to_string());
             if r.mode == "w" {
                 pre.push(format!(
-                    "*__SH_OUTFILE.lock().unwrap() = Some(std::fs::File::create(&{te}).unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap()));"
+                    "__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(std::fs::File::create(&{te}).unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap())));"
                 ));
             } else {
                 pre.push(format!(
-                    "*__SH_OUTFILE.lock().unwrap() = Some(std::fs::OpenOptions::new().append(true).create(true).open(&{te}).unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap()));"
+                    "__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = Some(std::fs::OpenOptions::new().append(true).create(true).open(&{te}).unwrap_or_else(|_| std::fs::File::open(\"/dev/null\").unwrap())));"
                 ));
             }
-            post.push("*__SH_OUTFILE.lock().unwrap() = __oldout;".to_string());
+            post.push("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __oldout);".to_string());
         }
         let _ = used_outfile;
+        // process-substitution producer (`cmd <(while ...; done)`): the
+        // core lowers it to `__ps_tmpN = mktemp` + producer > tmp + consumer
+        // — for INFINITE producers (while true) the synchronous write
+        // never finishes. Run the producer block in a background thread;
+        // the consumer reads the growing file and the process exit kills
+        // the thread (bash's SIGPIPE semantics in miniature).
+        let ps_tmp = file_redirs.first().and_then(|r| match r.target.as_ref() {
+            Some(IrExpr::Var(name, _)) | Some(IrExpr::Ident(name))
+                if name.starts_with("__ps_tmp") =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        });
+        if ps_tmp.is_some() && inner.iter().any(|s| matches!(s, IrStmt::While { .. })) {
+            // the mktemp'd regular file would give the consumer an
+            // instant EOF — convert it to a FIFO so the consumer blocks
+            // until the producer writes (real process-substitution
+            // plumbing). The producer runs in a background thread — a
+            // thread_local var is per-thread, so the path is captured in
+            // a local FIRST and the block's reads are rewritten to it.
+            let tmp = ps_tmp.unwrap();
+            let te = self.expr_str(&IrExpr::Var(tmp.clone(), None));
+            self.emit(&format!(
+                "{{ let __p = {te}; let _ = std::fs::remove_file(&__p); let _ = std::process::Command::new(\"mkfifo\").arg(&__p).status(); }}"
+            ));
+            self.emit(&format!("let __ps_tmp_loc = {te};"));
+            let mut saved = std::mem::take(&mut self.out);
+            let old_depth = self.depth;
+            self.depth = 1;
+            for p in &pre {
+                self.emit(&p.replace(&format!("&{te}"), "&__ps_tmp_loc"));
+            }
+            for s in inner {
+                self.stmt(s);
+            }
+            for p in &post {
+                self.emit(&p.replace(&format!("&{te}"), "&__ps_tmp_loc"));
+            }
+            let block = self.out.join("\n");
+            self.out = saved;
+            self.depth = old_depth;
+            self.emit(&format!("std::thread::spawn(move || {{ \n{block}\n }});"));
+            return;
+        }
         for p in pre {
             self.emit(&p);
         }
@@ -2830,6 +2988,7 @@ impl Render {
                 fd: r.fd.unwrap_or(1) as i64,
                 mode: r.mode.clone(),
                 target: Some(r.target.clone()),
+                interpolate: r.interpolate,
             })
         }).collect();
         self.redirect_render(inner, &infos);
@@ -2865,7 +3024,22 @@ impl Render {
         };
         self.mark_written(name);
         if self.is_assoc(name) {
-            self.mark_todo("assoc setArray");
+            // `declare -A m=([k]=v ...)` / `local -A m=()` — the
+            // elements arrive as literal `[key]=value` words; empty
+            // inits just clear the map.
+            let items: Vec<String> = match args.get(1) {
+                Some(IrExpr::Array(items)) => items.iter().map(|i| self.words_expr(i)).collect(),
+                _ => vec![],
+            };
+            self.add_helper("cat");
+            let m = self.tls(name);
+            self.emit(&format!(
+                "{{ let __words = __sh_cat(&[{}]); let mut __m = {m}.with(|v| v.borrow_mut()); __m.clear(); \
+                 for __w in __words {{ if let Some(rest) = __w.strip_prefix('[') {{ \
+                 if let Some(eq) = rest.find(']') {{ let __k = rest[..eq].to_string(); \
+                 let __v = rest[eq + 2..].to_string(); __m.insert(__k, __v); }} }} }}}}",
+                items.join(", ")
+            ));
             return;
         }
         self.arrays.insert(name.to_string());
@@ -3118,9 +3292,10 @@ impl Render {
                 if name == "@" || name == "*" {
                     // `${@:off:len}` — the positional params (1-based off)
                     return format!(
-                        "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = ({off} - 1).max(0) as usize; \
+                        "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__v.len()); \
                          let __l = if {len} < 0 {{ __v.len().saturating_sub(__o) as i64 }} else {{ {len} }}; \
                          let __e = ((__o as i64 + __l).max(__o as i64)).min(__v.len() as i64) as usize; \
+                         let __e = __e.max(__o); \
                          __v[__o..__e].join(\" \") }}"
                     );
                 }
@@ -3129,7 +3304,7 @@ impl Render {
                 {
                     let arr = self.read_arr(&name.to_string());
                     return format!(
-                        "{{ let __v = {arr}; let __o = if {off} < 0 {{ (__v.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __l = if {len} < 0 {{ __v.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize;                          __v[__s..__e].join(\" \") }}"
+                        "{{ let __v = {arr}; let __o = if {off} < 0 {{ (__v.len() as i64 + {off}).max(0) }} else {{ {off} }} as usize; let __o = __o.min(__v.len()); let __l = if {len} < 0 {{ __v.len() as i64 - __o as i64 }} else {{ {len} }};                          let __s = __o.max(0) as usize; let __e = ((__s as i64 + __l).max(__s as i64)).min(__v.len() as i64) as usize; let __e = __e.max(__s);                          __v[__s..__e].join(\" \") }}"
                     );
                 }
                 self.add_helper("substr");
@@ -3460,7 +3635,20 @@ impl Render {
                     ));
                     return;
                 }
-                let rhs = self.expr_any(expr);
+                let rhs = if let IrExpr::Arith(a) = expr {
+                    // `x=$((...))` — bash collapses the expansion to
+                    // EMPTY and sets rc 1 on an evaluation error
+                    // (division/modulo by zero); the checked div/mod
+                    // helpers flag the error via __SH_ARITH_ERR.
+                    self.add_helper("arith_err");
+                    format!(
+                        "{{ let __v = ({}).to_string(); let __e = __SH_ARITH_ERR.swap(false, Ordering::SeqCst); \
+                         __SH_RC.store(if __e {{ 1 }} else {{ 0 }}, Ordering::SeqCst); if __e {{ String::new() }} else {{ __v }} }}",
+                        self.arith(a)
+                    )
+                } else {
+                    self.expr_any(expr)
+                };
                 // `arr[i]=v` — the var text carries the index
                 if let Some(open) = t.var.find('[') {
                     if t.var.ends_with(']') {
@@ -3976,10 +4164,11 @@ impl Render {
         self.emit("static __SH_RC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
         self.emit("static __SH_ARGV: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_OUT: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);");
-        self.emit("static __SH_OUTFILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);");
+        self.emit("thread_local! { static __SH_OUTFILE_TL: std::cell::RefCell<Option<std::fs::File>> = const { std::cell::RefCell::new(None) }; }");
         self.emit("static __SH_STDIN: std::sync::Mutex<Option<Box<dyn std::io::Read + Send>>> = std::sync::Mutex::new(None);");
         self.emit("static __SH_BG: std::sync::Mutex<Vec<(u32, std::process::Child)>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
+        self.emit("static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
         self.emit("");
         self.out.extend(decl_out.iter().cloned());
         for h in HELPER_ORDER {
@@ -4053,6 +4242,9 @@ struct IrRedirectInfo {
     fd: i64,
     mode: String,
     target: Option<IrExpr>,
+    /// Unquoted heredoc body — `$var`/`${...}`/`$(...)` must expand
+    /// (the core keeps the raw body text + this flag).
+    interpolate: bool,
 }
 
 // ── helpers registry ─────────────────────────────────────────────────
@@ -4064,6 +4256,7 @@ const HELPER_ORDER: &[&str] = &[
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
+    "div", "mod", "arith_err",
 ];
 
 fn helper_deps(h: &str) -> &'static [&'static str] {
@@ -4111,6 +4304,13 @@ fn helper_source(h: &str) -> &'static str {
     while i < b { r = r.wrapping_mul(a); i += 1; }
     r
 }"#,
+        "div" => r#"fn __sh_div(a: i64, b: i64) -> i64 {
+    if b == 0 { __SH_ARITH_ERR.store(true, Ordering::SeqCst); 0 } else { a / b }
+}"#,
+        "mod" => r#"fn __sh_mod(a: i64, b: i64) -> i64 {
+    if b == 0 { __SH_ARITH_ERR.store(true, Ordering::SeqCst); 0 } else { a % b }
+}"#,
+        "arith_err" => r#"#[allow(dead_code)] fn __sh_arith_err() -> bool { __SH_ARITH_ERR.swap(false, Ordering::SeqCst) }"#,
         "echo_esc" => r#"fn __sh_echo_esc(s: &str) -> String {
     let mut o = String::new();
     let ch: Vec<char> = s.chars().collect();
@@ -4175,12 +4375,9 @@ fn helper_source(h: &str) -> &'static str {
     }
     if esc { s = __sh_echo_esc(&s); }
     if nl { s.push('\n'); }
-    let of = __SH_OUTFILE.lock().unwrap();
-    if let Some(f) = of.as_ref() {
-        let _ = (&*f).write_all(s.as_bytes());
-        return;
-    }
-    drop(of);
+    let mut used = false;
+    __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = f.write_all(s.as_bytes()); used = true; } });
+    if used { return; }
     if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
         b.extend_from_slice(s.as_bytes());
         return;
@@ -4329,7 +4526,7 @@ fn helper_source(h: &str) -> &'static str {
     (s, rc)
 }"#,
         "spawn" => r#"fn __sh_spawn(cmd: &str, input: Option<&[u8]>) -> i32 {
-    let want_out = __SH_OUT.lock().unwrap().is_some() || __SH_OUTFILE.lock().unwrap().is_some();
+    let want_out = __SH_OUT.lock().unwrap().is_some() || __SH_OUTFILE_TL.with(|v| v.borrow().is_some());
     let mut c = std::process::Command::new("bash");
     c.arg("-c").arg(cmd);
     if want_out { c.stdout(std::process::Stdio::piped()); }
@@ -4344,11 +4541,9 @@ fn helper_source(h: &str) -> &'static str {
     }
     let rc = ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
     if !out.is_empty() {
-        let of = __SH_OUTFILE.lock().unwrap();
-        if let Some(f) = of.as_ref() {
-            let _ = (&*f).write_all(&out);
-        } else {
-            drop(of);
+        let mut used = false;
+        __SH_OUTFILE_TL.with(|v| { if let Some(f) = v.borrow_mut().as_mut() { let _ = f.write_all(&out); used = true; } });
+        if !used {
             if let Some(b) = __SH_OUT.lock().unwrap().as_mut() {
                 b.extend_from_slice(&out);
             } else {
