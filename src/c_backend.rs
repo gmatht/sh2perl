@@ -155,6 +155,9 @@ pub struct Render {
     /// scope instead of the fn's local block (shadowing would stale the
     /// helper's read).
     site_file_vars: BTreeSet<String>,
+    /// body-buffer line index of each Declare definition (for the
+    /// site-file promotion rewrite)
+    decl_line_idx: std::collections::BTreeMap<String, usize>,
     /// the definitions themselves (name, body) — emitted in the
     /// preamble (BEFORE main: C has no nested function definitions).
     fn_defs: Vec<(String, Vec<IrStmt>)>,
@@ -173,6 +176,12 @@ pub struct Render {
     store: BTreeSet<String>,
     /// shell-out runtime needed (the _sh_* preamble helpers)
     need_sh: bool,
+    /// index range in self.out covering the need_sh runtime helper block
+    /// (recorded at emit_runtime; trim_sh_runtime drops unreferenced
+    /// helpers from it after the body is rendered)
+    runtime_start: usize,
+    runtime_end: usize,
+    runtime_known: bool,
     /// sys/stat.h file tests (test_render -f/-d/...)
     need_stat: bool,
     /// fnmatch.h (test glob `==`/`!=` with * or ?)
@@ -252,6 +261,28 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_ranges = ranges;
     r.var_widths = widths;
     r.program(&prog);
+    r.trim_sh_runtime();
+    // _sh_rc models bash's `$?`: the renderer stores it after every
+    // command so a LATER read sees the right value. When nothing in
+    // the final program reads it (no `$?`, no surviving shell-out
+    // helper, no fn-call status), the stores are unobservable dead
+    // code — strip them and the definition.
+    r.strip_dead_rc();
+    // Only keep `#include`s whose symbols actually appear in the
+    // emitted program (after the runtime trim removed helpers).
+    r.trim_includes();
+    // A stripped runtime block can leave blank-line runs — keep at most
+    // two (the C convention between declarations/functions).
+    let mut blanks = 0usize;
+    r.out.retain(|l| {
+        if l.trim().is_empty() {
+            blanks += 1;
+            blanks <= 2
+        } else {
+            blanks = 0;
+            true
+        }
+    });
     r.out.join("\n")
 }
 
@@ -465,6 +496,7 @@ impl Render {
         self.emit("#include <assert.h>"); // debug-only length asserts (NDEBUG compiles out)
         self.emit("");
         if self.need_sh {
+            self.runtime_start = self.out.len();
             self.emit("/* shell-out runtime: build a command line, run it via bash -c */");
             self.emit("static int _sh_rc = 0;");
             self.emit("static int _sh_argc = 0; static char **_sh_argv = 0;");
@@ -735,6 +767,8 @@ impl Render {
             self.emit("  return d;");
             self.emit("}");
             self.emit("");
+            self.runtime_end = self.out.len();
+            self.runtime_known = true;
         }
         if self.need_grep {
             self.emit("/* grepMatches(text, pat, flags) — the `grep -o` lift: print");
@@ -835,6 +869,192 @@ impl Render {
 
     // ── expressions ──────────────────────────────────────────────────
 
+    /// Drop the `_sh_*` shell-out helpers the generated body never uses
+    /// (directly or transitively). Everything in the need_sh block is
+    /// `static` — internal linkage — so an unreferenced helper is dead
+    /// by definition and removing it cannot change behavior. A simple
+    /// `for … echo` loop keeps just `_sh_rc`; command substitution,
+    /// arrays and ${s#pat} keep exactly the helpers they call.
+    fn trim_sh_runtime(&mut self) {
+        if !self.runtime_known || self.runtime_end <= self.runtime_start {
+            return;
+        }
+        let body = self.out[self.runtime_end..].join("\n");
+        let runtime: Vec<String> = self.out[self.runtime_start..self.runtime_end].to_vec();
+
+        let mut segs: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        for line in &runtime {
+            let t = line.trim_start();
+            // only FUNCTION declarations start a segment — a `static char
+            // sc[65536];` LOCAL inside a helper would otherwise split the
+            // helper in two and orphan its body. Lines appended to a
+            // segment still contribute their `_sh_*` names (the `static
+            // int _sh_rc = 0;` def has no paren).
+            let toks = sh_tokens(t);
+            if t.starts_with("static ") && t.contains('(') {
+                // names come from the DECLARATION only — a single-line
+                // function (`static void f(void) { g(); }`) puts its body
+                // on the same line; its body's calls must not count as
+                // declared names or the reachability cascades
+                let head = t.split('{').next().unwrap_or(t);
+                segs.push((sh_tokens(head).into_iter().collect(), vec![line.clone()]));
+            } else if let Some(last) = segs.last_mut() {
+                // only `static` VARIABLE declarations contribute names
+                // (the `static int _sh_rc = 0;` def, `static char
+                // sc[65536];` locals) — a function BODY's calls must
+                // not, or the reachability cascades through the whole
+                // call graph
+                if t.starts_with("static ") {
+                    for tk in toks {
+                        if !last.0.contains(&tk) {
+                            last.0.push(tk);
+                        }
+                    }
+                }
+                last.1.push(line.clone());
+            } else {
+                segs.push((toks.into_iter().collect(), vec![line.clone()]));
+            }
+        }
+
+        let mut needed: BTreeSet<String> = sh_tokens(&body);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (names, lines) in &segs {
+                if names.iter().any(|n| needed.contains(n)) {
+                    for t in sh_tokens(&lines.join("\n")) {
+                        if needed.insert(t) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let block_survives = segs
+            .iter()
+            .any(|(names, _)| names.iter().any(|n| needed.contains(n)));
+        let mut kept: Vec<String> = Vec::new();
+        for (idx, (names, lines)) in segs.iter().enumerate() {
+            let keep = names.iter().any(|n| needed.contains(n))
+                || (idx == 0 && block_survives && names.is_empty());
+            if keep {
+                kept.extend(lines.iter().cloned());
+            }
+        }
+        self.out.splice(self.runtime_start..self.runtime_end, kept);
+
+        // sys/wait.h only feeds the WIFEXITED/WEXITSTATUS macros in
+        // _sh_system_rc/_sh_capture — when neither survived the trim it
+        // is dead AND missing from tcc's bundled headers, so drop it.
+        let full = self.out.join("\n");
+        if !full.contains("WIFEXITED") && !full.contains("WEXITSTATUS") {
+            self.out.retain(|l| !l.trim_start().starts_with("#include <sys/wait.h>"));
+        }
+    }
+
+    /// If nothing in the final program READS `_sh_rc` (no `$?`, no
+    /// surviving shell-out helper, no fn-call status), every `_sh_rc`
+    /// mention is a dead status write — strip the writes and the
+    /// definition so the output is as lean as the program's needs.
+    /// The reads are the `$?` lowering, the shell-out helpers' own
+    /// `return _sh_rc;`, and the fn-call status `(f(), …, _sh_rc)` —
+    /// all of which bail this cleanup out entirely.
+    fn strip_dead_rc(&mut self) {
+        let full = self.out.join("\n");
+        if rc_is_read(&full) {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.out.len());
+        for line in &self.out {
+            if let Some(stripped) = strip_rc_line(line) {
+                out.push(stripped);
+            }
+        }
+        self.out = out;
+    }
+
+    /// Drop `#include` lines nothing in the final program uses. stdio.h
+    /// stays (printf/fputs/fprintf are the output mechanism); every
+    /// other header is kept only while one of its trigger symbols
+    /// appears in the emitted text. The scan runs AFTER trim_sh_runtime
+    /// and strip_dead_rc, so a header that only fed a trimmed-away
+    /// helper (fnmatch.h for a dropped ${s#pat} helper, sys/wait.h for
+    /// a stripped _sh_capture rc write) disappears too. Only removes —
+    /// an unknown header or an incomplete trigger list keeps the line
+    /// (the emit-time need_* flags still gate the obvious ones).
+    fn trim_includes(&mut self) {
+        const HEADERS: &[(&str, &[&str])] = &[
+            (
+                "<stdlib.h>",
+                &[
+                    "exit(", "realloc(", "malloc(", "calloc(", "free(", "getenv(",
+                    "setenv(", "system(", "abort(", "atoll(", "atoi(", "atol(",
+                    "atof(", "strtol(", "abs(", "rand(", "qsort(",
+                ],
+            ),
+            (
+                "<string.h>",
+                &[
+                    "strlen(", "memcpy(", "memset(", "strcpy(", "strncpy(", "strcmp(",
+                    "strncmp(", "strchr(", "strstr(", "strcat(", "strdup(", "strtok(",
+                    "memcmp(", "strrchr(", "strncat(",
+                ],
+            ),
+            (
+                "<unistd.h>",
+                &[
+                    "chdir(", "getcwd(", "access(", "unlink(", "rmdir(", "getpid(",
+                    "getuid(", "getgid(", "isatty(", "dup(", "dup2(", "pipe(", "fork(",
+                    "read(", "write(", "close(", "usleep(", "fileno(",
+                ],
+            ),
+            (
+                "<ctype.h>",
+                &[
+                    "tolower(", "toupper(", "isalnum(", "isalpha(", "isdigit(",
+                    "isspace(", "isupper(", "islower(", "isprint(", "ispunct(",
+                    "isxdigit(",
+                ],
+            ),
+            ("<fnmatch.h>", &["fnmatch("]),
+            ("<regex.h>", &["regcomp(", "regexec(", "regfree(", "regmatch_t"]),
+            (
+                "<sys/stat.h>",
+                &["struct stat", "stat(", "fstat(", "lstat(", "mkdir(", "chmod("],
+            ),
+            ("<sys/wait.h>", &["WIFEXITED", "WEXITSTATUS"]),
+            (
+                "<time.h>",
+                &[
+                    "nanosleep(", "clock_gettime(", "struct timespec", "time(",
+                    "localtime(", "mktime(", "strftime(", "gettimeofday(",
+                ],
+            ),
+            (
+                "<math.h>",
+                &["pow(", "sqrt(", "floor(", "ceil(", "log(", "fabs(", "round(", "fmod("],
+            ),
+            ("<assert.h>", &["assert("]),
+        ];
+        let full = self.out.join("\n");
+        self.out.retain(|l| {
+            let t = l.trim_start();
+            if !t.starts_with("#include ") {
+                return true;
+            }
+            let hdr = t["#include ".len()..].trim();
+            if hdr == "<stdio.h>" {
+                return true;
+            }
+            match HEADERS.iter().find(|(h, _)| *h == hdr) {
+                Some((_, trigs)) => trigs.iter().any(|tr| full.contains(tr)),
+                None => true, // unknown header — keep
+            }
+        });
+    }
+
     fn expr(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Int(i) => i.to_string(),
@@ -882,6 +1102,11 @@ impl Render {
                 format!("[{}]", elems.join(", "))
             }
             IrExpr::Call { func, args } => self.call(func, args),
+            // `$(...)` — the raw Capture node (the ShIR JSON round-trip
+            // keeps the node; the in-process lowering folds it into a
+            // `capture` call). Render the Arrow body as command text and
+            // capture its stdout.
+            IrExpr::Capture { expr, .. } => self.capture_expr(expr),
             IrExpr::Json(v) => match v {
                 serde_json::Value::String(s) => Self::cstr(s),
                 serde_json::Value::Number(n) => n.to_string(),
@@ -1184,16 +1409,56 @@ impl Render {
         self.depth = 1;
         let prev_fn = self.in_function;
         self.in_function = true;
+        let site_mark = self.site_bodies.len();
+        let cap_mark = self.cap_bodies.len();
+        self.decl_line_idx.clear();
         for st in body {
             self.stmt(st);
         }
-        let body_out = std::mem::replace(&mut self.out, saved);
+        let mut body_out = std::mem::replace(&mut self.out, saved);
         self.depth = saved_depth;
         self.in_function = prev_fn;
         for n in &fvars {
             let id = self.c_ident(n);
             if body_out.iter().any(|l| text_contains_ident(l, &id)) {
                 self.site_file_vars.insert(n.clone());
+            }
+        }
+        // `local`-declared vars referenced by the site/capture helpers
+        // registered in THIS body: the helpers are file-scope functions,
+        // so the var must hoist too (the Declare's definition line is
+        // rewritten to a plain assignment below — a local shadow would
+        // hide the file-scope copy the helper reads).
+        for n in &declared {
+            if self.const_lifted.contains(n) {
+                continue;
+            }
+            let id = self.c_ident(n);
+            let refd = self.site_bodies[site_mark..]
+                .iter()
+                .any(|b| text_contains_ident(b, &id))
+                || self.cap_bodies[cap_mark..]
+                    .iter()
+                    .any(|b| text_contains_ident(b, &id));
+            if refd {
+                self.site_file_vars.insert(n.clone());
+                if let Some(&idx) = self.decl_line_idx.get(n) {
+                    if let Some(line) = body_out.get_mut(idx) {
+                        let name = self.c_ident(n);
+                        let trimmed = line.trim_start();
+                        if trimmed.starts_with(&format!("char {name}[")) {
+                            // bounded buffer: the file-scope decl owns
+                            // the storage; the guarded copy below still
+                            // assigns it
+                            *line =
+                                format!("/* {name}: file-scope decl (site-referenced) */");
+                        } else if let Some(pos) = trimmed.find(&format!("{name} = ")) {
+                            // `long long i = v;` / `char* i = v;` -> `i = v;`
+                            let keep = trimmed[pos..].to_string();
+                            *line = keep;
+                        }
+                    }
+                }
             }
         }
         self.emit(&format!("static void {fname}(void) {{"));
@@ -1258,16 +1523,21 @@ impl Render {
     fn num_temp(&mut self, v: &str) -> String {
         let t = format!("_s{}", self.temp_seq);
         self.temp_seq += 1;
-        self.emit(&format!("char {t}[32];"));
+        // STATIC: a file-scope var may hold the temp's address (`n =
+        // _s17`); a plain local's stack slot is reused by sibling
+        // scopes (gcc -O0 coalesces non-overlapping blocks) and the var
+        // would read a clobbered value on the next iteration.
+        self.emit(&format!("static char {t}[32];"));
         self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", (long long)({v}));"));
         t
     }
 
     /// Emit `char _sN[cap];` and return `_sN` — a per-use string temp.
+    /// STATIC (see num_temp — the address may escape into a var).
     fn str_temp(&mut self, cap: usize) -> String {
         let t = format!("_s{}", self.temp_seq);
         self.temp_seq += 1;
-        self.emit(&format!("char {t}[{cap}];"));
+        self.emit(&format!("static char {t}[{cap}];"));
         t
     }
 
@@ -1347,7 +1617,8 @@ impl Render {
                         return self.num_temp("getpid()");
                     }
                     if name == "#" {
-                        return "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into();
+                        // string form: `echo $#` prints the count
+                        return self.num_temp("((_sh_argc > 0) ? (_sh_argc - 1) : 0)");
                     }
                     if name == "@" || name == "*" {
                         let t = self.str_temp(4096);
@@ -1997,8 +2268,43 @@ impl Render {
                     self.sh_pipeline_text(buf, args);
                 }
                 IrStmt::Redirect { inner, redirects } => {
-                    self.sh_stage(buf, inner);
-                    self.sh_redirect_text(buf, redirects);
+                    // process-substitution temp: the producer's redirect
+                    // target is a `__ps_` var (the process_subst
+                    // transform's namespace) — a REGULAR file would make
+                    // an infinite producer never EOF (no SIGPIPE). Mirror
+                    // the perl backend: replace the file with a FIFO and
+                    // run the producer in the BACKGROUND — the consumer's
+                    // close gives the writer SIGPIPE and it dies.
+                    let ps_target = redirects.iter().find_map(|rd| {
+                        match (&rd.mode, &rd.target) {
+                            (m, IrExpr::Var(n, _))
+                                if (m == "w" || m == "a") && n.starts_with("__ps_") =>
+                            {
+                                Some(n.clone())
+                            }
+                            _ => None,
+                        }
+                    });
+                    if let Some(target) = ps_target {
+                        let tv = IrExpr::Var(target.clone(), None);
+                        self.sh_raw(buf, "rm -f");
+                        self.sh_word(buf, &tv);
+                        self.sh_raw(buf, ";");
+                        self.sh_raw(buf, "mkfifo");
+                        self.sh_word(buf, &tv);
+                        self.sh_raw(buf, ";");
+                        self.sh_raw(buf, "{");
+                        self.sh_raw(buf, "(");
+                        self.sh_stage(buf, inner);
+                        self.sh_raw(buf, ")");
+                        self.sh_raw(buf, ">");
+                        self.sh_word(buf, &tv);
+                        self.sh_raw(buf, "&");
+                        self.sh_raw(buf, "}");
+                    } else {
+                        self.sh_stage(buf, inner);
+                        self.sh_redirect_text(buf, redirects);
+                    }
                 }
                 IrStmt::Expr(IrExpr::Call { func, args }) if func == "redirect" => {
                     // a redirect CALL inside a stage: `cmd > f`
@@ -2252,6 +2558,20 @@ impl Render {
                     );
                     self.sh_stage(buf, body);
                     self.sh_add(buf, "; done");
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    // `local x=...` / `declare x=...` inside staged text:
+                    // `local` outside a function is a bash ERROR, so emit
+                    // the plain assignment (`x=value`); a bare `local x`
+                    // (no init) is a no-op — emit `:` so the stage stays
+                    // a valid command
+                    if let Some(t) = vars.first() {
+                        self.sh_raw(buf, &format!("{} =", t.name));
+                        match init {
+                            Some(e) => self.sh_word(buf, e),
+                            None => self.sh_raw(buf, ":"),
+                        }
+                    }
                 }
                 _ => {
                     self.mark_todo(&format!("capture body stmt {:?}", s));
@@ -2572,6 +2892,11 @@ impl Render {
                     raw(self, &format!("{fd_pre}>"));
                     self.sh_word(buf, &rd.target);
                 }
+                "wc" => {
+                    // `>|` — clobber, ignoring set -C
+                    raw(self, &format!("{fd_pre}>|"));
+                    self.sh_word(buf, &rd.target);
+                }
                 "a" => {
                     raw(self, &format!("{fd_pre}>>"));
                     self.sh_word(buf, &rd.target);
@@ -2646,7 +2971,20 @@ impl Render {
                 // (a split word would collapse whitespace in bash)
                 if words.iter().all(|w| self.echo_native_ok(w)) {
                     let mut parts = Vec::new();
+                    let mut skip_nl = false;
                     if let Some(IrExpr::Array(items)) = args.get(1) {
+                        // consume the -n/-e/-E flags (bash echo builtin)
+                        let mut items: Vec<&IrExpr> = items.iter().collect();
+                        while let Some(IrExpr::Str(fl, _)) = items.first().copied() {
+                            if fl == "-n" {
+                                skip_nl = true;
+                                items.remove(0);
+                            } else if fl == "-e" || fl == "-E" {
+                                items.remove(0);
+                            } else {
+                                break;
+                            }
+                        }
                         for (i, item) in items.iter().enumerate() {
                             if i > 0 {
                                 parts.push(Part::Lit(" ".to_string()));
@@ -2654,7 +2992,9 @@ impl Render {
                             parts.extend(self.parts_of(item));
                         }
                     }
-                    parts.push(Part::Lit("\n".to_string()));
+                    if !skip_nl {
+                        parts.push(Part::Lit("\n".to_string()));
+                    }
                     // `$?` inside the args must be read BEFORE the
                     // `_sh_rc = 0` below clobbers it — pre-capture
                     let has_rc = parts.iter().any(|pt| match pt {
@@ -2945,6 +3285,44 @@ impl Render {
             r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
             r.emit("return buf;");
         })
+    }
+
+    /// `$(...)` — a raw Capture node (ShIR JSON round-trip): render the
+    /// wrapped Arrow body as a command and capture its stdout (the
+    /// runtime `_sh_capture` strips trailing newlines, bash semantics).
+    fn capture_expr(&mut self, expr: &IrExpr) -> String {
+        let expr = expr.clone();
+        self.cap_site(|r, id| {
+            r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
+            if let IrExpr::Arrow(stmts) = &expr {
+                r.sh_stage(CmdBuf::Private(id), stmts);
+            } else {
+                r.mark_todo(&format!("capture expr {:?}", expr));
+            }
+            r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
+            r.emit("return buf;");
+        })
+    }
+
+    /// The core keeps `${x:-\"word\"}` defaults/replacements as RAW
+    /// TEXT (quote chars included); bash strips the quotes during word
+    /// expansion — emit the unquoted literal. A non-Str arg (a $var
+    /// default) renders as its value.
+    fn default_word(&mut self, x: &IrExpr) -> String {
+        if let IrExpr::Str(s, _) = x {
+            let t = s.trim();
+            let chars: Vec<char> = t.chars().collect();
+            if chars.len() >= 2
+                && ((chars[0] == '"' && chars[chars.len() - 1] == '"')
+                    || (chars[0] == '\'' && chars[chars.len() - 1] == '\''))
+            {
+                let inner: String = chars[1..chars.len() - 1].iter().collect();
+                return Self::cstr(&inner);
+            }
+            Self::cstr(t)
+        } else {
+            self.value_c(x)
+        }
     }
 
     /// A shell-out exec site (statement or expr position).
@@ -3730,8 +4108,14 @@ impl Render {
                 Self::cstr(&name)
             )
         };
-        let val = args.get(2).map(|x| self.value_c(x)).unwrap_or_else(|| "\"\"".into());
-        let repl = args.get(3).map(|x| self.value_c(x)).unwrap_or_else(|| "\"\"".into());
+        let val = args
+            .get(2)
+            .map(|x| self.default_word(x))
+            .unwrap_or_else(|| "\"\"".into());
+        let repl = args
+            .get(3)
+            .map(|x| self.default_word(x))
+            .unwrap_or_else(|| "\"\"".into());
         match op.as_str() {
             "" => var_expr,
             "-" => format!("(({var_expr}) ? ({var_expr}) : ({val}))"),
@@ -4751,7 +5135,11 @@ impl Render {
             IrExpr::Int(_) | IrExpr::Arith(_) | IrExpr::BinOp { .. } => true,
             // `$y` reads arrive as getVar("y"); a typed-Int var is numeric
             IrExpr::Call { func, args } if func == "getVar" => {
-                matches!(args.first(), Some(IrExpr::Str(name, _)) if name == "?" || self.is_num(name))
+                matches!(
+                    args.first(),
+                    Some(IrExpr::Str(name, _))
+                        if name == "?" || name == "#" || name == "$" || self.is_num(name)
+                )
             }
             IrExpr::Call { func, .. } if func == "arrayLen" => true,
             _ => false,
@@ -5086,8 +5474,16 @@ impl Render {
                 if let Some(b) = self.buf_bound(&t.var) {
                     // a bounded string var: the debug-only length assert
                     // fires BEFORE the write that would overflow the
-                    // fixed buffer (see emit_guarded_copy).
+                    // fixed buffer (see emit_guarded_copy). A NUMERIC
+                    // RHS (arith `i = 2` in a cstyle-for) renders as a
+                    // C int expression — stringify it first or the
+                    // copy is a no-op.
                     let rhs = self.expr(expr);
+                    let rhs = if self.expr_is_num(expr) {
+                        self.num_temp(&rhs)
+                    } else {
+                        rhs
+                    };
                     self.emit_guarded_copy(&name, b, &rhs);
                     return;
                 }
@@ -5138,6 +5534,12 @@ impl Render {
                 // before returning, so the value never matters).
                 if !is_num && rhs.starts_with("sh2_") {
                     self.emit(&format!("{name} = (char*)({rhs});"));
+                } else if !is_num {
+                    // COPY: the RHS may be (or alias) a temp buffer that
+                    // a later statement rewrites (a sibling snprintf
+                    // self-aliases `snprintf(_sN, "%s * %s", _sN, x)`),
+                    // so the var must own its storage
+                    self.emit(&format!("{name} = strdup({rhs});"));
                 } else {
                     self.emit(&format!("{name} = {rhs};"));
                 }
@@ -5165,14 +5567,17 @@ impl Render {
                             None => "0".into(),
                         };
                         self.emit(&format!("{} {name} = {v};", self.width_of_var(&d.name).c_type()));
+                        self.decl_line_idx.insert(d.name.clone(), self.out.len() - 1);
                     } else if let Some(b) = self.buf_bound(&d.name) {
                         self.emit(&format!("char {name}[{}] = \"\";", b + 1));
+                        self.decl_line_idx.insert(d.name.clone(), self.out.len() - 1);
                         if let Some(v) = init_expr.clone() {
                             self.emit_guarded_copy(&name, b, &v);
                         }
                     } else {
                         let v = init_expr.clone().unwrap_or_else(|| "NULL".into());
                         self.emit(&format!("char* {name} = {v};"));
+                        self.decl_line_idx.insert(d.name.clone(), self.out.len() - 1);
                     }
                 }
             }
@@ -6104,6 +6509,10 @@ impl Render {
                 .site_file_vars
                 .iter()
                 .filter(|v| !self.arrays.contains(*v))
+                // already hoisted at top level (the top-level `vars`
+                // set) — a duplicate file-scope decl would be a
+                // redefinition error
+                .filter(|v| !vars.contains(*v))
                 .cloned()
                 .collect();
             for v in &svars {
@@ -6163,7 +6572,13 @@ impl Render {
             self.emit("");
         }
         self.emit("int main(void) {");
-        if self.need_sh || !self.sh2_calls.is_empty() {
+        // Only REAL shell-out sites (bash -c subprocesses) need the
+        // preamble: their children share fd 1 — unbuffered stdout keeps
+        // the interleave order — and write to our stderr — silenced to
+        // /dev/null (the gate diffs stdout only). A native-only program
+        // has no subprocess: buffered stdout cannot reorder anything and
+        // the script's own stderr (Die/Warn) must reach the terminal.
+        if !cap_ids.is_empty() || !site_ids.is_empty() || !self.sh2_calls.is_empty() {
             self.emit("  freopen(\"/dev/null\", \"w\", stderr);");
             // unbuffered stdout: bash -c children share fd 1 — buffered
             // stdio would reorder their output after ours at flush time
@@ -6179,6 +6594,143 @@ impl Render {
 
 /// Collect every variable name referenced by statements (assign targets,
 /// declare lists, Var reads).
+/// Collect every variable name referenced by statements (assign targets,
+/// declare lists, Var reads).
+// All `_sh_…` identifiers in `s` (both calls `_sh_foo(` and variable
+// references `_sh_rc`). Used by trim_sh_runtime's reachability.
+fn sh_tokens(s: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i + 3 < b.len() {
+        if b[i] == b'_'
+            && b[i + 1] == b's'
+            && b[i + 2] == b'h'
+            && b[i + 3] == b'_'
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            let mut j = i + 4;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            out.insert(s[i..j].to_string());
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Does the generated text READ `_sh_rc` anywhere? A write is `_sh_rc =`
+/// (the definition and every status store, always space-padded); anything
+/// else (`return _sh_rc;`, `, _sh_rc)`, `long long q = _sh_rc;`) is a read.
+fn rc_is_read(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'_'
+            && s[i..].starts_with("_sh_rc")
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            let mut j = i + 6;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            // a bare `_sh_rc =` store is a write; `_sh_rc == 0` /
+            // `_sh_rc != 0` (fn-call status comparisons) are READS
+            if b.get(j) != Some(&b'=') || b.get(j + 1) == Some(&b'=') {
+                return true;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// One line of the dead-rc cleanup (called only when nothing reads
+/// `_sh_rc`). Drops whole-line definitions/status stores, rewrites
+/// `(_sh_rc = N, X)` sequence wrappers to `X` (the store was the only
+/// thing the comma operator did), and removes inline `; _sh_rc = …;`
+/// stores (cd/sleep/test/grep status writes inside single-line blocks).
+/// Returns None when the whole line is dead. The output is ASCII, so
+/// byte indexing is safe.
+fn strip_rc_line(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    if t == "static int _sh_rc = 0;"
+        || t == "/* shell-out runtime: build a command line, run it via bash -c */"
+        || (t.starts_with("_sh_rc ") && t.trim_end().ends_with(';'))
+    {
+        return None;
+    }
+    let b = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < b.len() {
+        // non-ASCII bytes (em-dashes in comments etc.) — only the ASCII
+        // constructs below are processed; skip the byte (slicing at a
+        // mid-char index would panic)
+        if b[i] >= 0x80 {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
+        // `(_sh_rc = N, X)` sequence wrapper → X
+        if b[i] == b'(' && line[i..].starts_with("(_sh_rc = ") {
+            let mut depth = 1usize;
+            let mut j = i + 1;
+            while j < b.len() && depth > 0 {
+                match b[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                let inner = &line[i + 1..j - 1];
+                if let Some(comma) = inner.find(", ") {
+                    out.push_str(inner[comma + 2..].trim());
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        // inline `…; _sh_rc = …;` / `{ _sh_rc = …;` status store
+        if (line[i..].starts_with("_sh_rc ") || line[i..].starts_with("_sh_rc="))
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            let mut j = i + 6;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            // `_sh_rc == 0` comparisons are NOT stores
+            if b.get(j) == Some(&b'=') && b.get(j + 1) != Some(&b'=') {
+                // the store statement ends at the next `;` (the RHS
+                // forms the renderer emits never contain one)
+                let mut k = j + 1;
+                while k < b.len() && b[k] != b';' {
+                    k += 1;
+                }
+                let end = if k < b.len() { k + 1 } else { b.len() };
+                // inline store: eat the preceding separator so no
+                // `; ;` / `{ }`-with-gap remains
+                let out_t = out.trim_end();
+                if out_t.ends_with(';') || out_t.ends_with('{') {
+                    out.truncate(out_t.len());
+                }
+                i = end;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    Some(out)
+}
+
 fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     collect_vars_full(stmts, out, &mut BTreeSet::new());
 }
@@ -6222,10 +6774,65 @@ fn collect_fn_defs(
 /// `x=$(( $(...) ))`) — the length analysis under-bounds command
 /// output, so these must not get a fixed buffer (a sha256sum capture
 /// is 64+2+filename bytes, not 64).
+/// Does an expr read a positional (`$1`, `$@`...) — either as a
+/// getVar call or as literal `$N` text (the exec-local `x=$1` form)?
+fn expr_refs_positional(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } => {
+            if func == "getVar" {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if n.chars().all(|c| c.is_ascii_digit()) || n == "@" || n == "*" {
+                        return true;
+                    }
+                }
+            }
+            args.iter().any(expr_refs_positional)
+        }
+        IrExpr::Str(s, _) => {
+            let chars: Vec<char> = s.chars().collect();
+            chars.windows(2).any(|w| w[0] == '$' && w[1].is_ascii_digit())
+        }
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            InterpPart::Lit(s) => {
+                let chars: Vec<char> = s.chars().collect();
+                chars.windows(2).any(|w| w[0] == '$' && w[1].is_ascii_digit())
+            }
+            InterpPart::Expr(x) => expr_refs_positional(x),
+        }),
+        IrExpr::Arith(a) => arith_refs_positional(a),
+        _ => false,
+    }
+}
+
+fn arith_refs_positional(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            n.chars().all(|c| c.is_ascii_digit()) || n == "@" || n == "*"
+        }
+        ArithAst::Index { var: _, key } => arith_refs_positional(key),
+        ArithAst::Bin { lhs, rhs, .. } => arith_refs_positional(lhs) || arith_refs_positional(rhs),
+        ArithAst::Un { arg, .. } => arith_refs_positional(arg),
+        ArithAst::Cond { test, then, else_, .. } => {
+            arith_refs_positional(test) || arith_refs_positional(then) || arith_refs_positional(else_)
+        }
+        ArithAst::Assign { rhs, .. } => arith_refs_positional(rhs),
+        ArithAst::IncDec { .. } => false,
+        ArithAst::Cast { arg, .. } => arith_refs_positional(arg),
+        ArithAst::Sizeof(_) => false,
+        ArithAst::Num(_) => false,
+    }
+}
+
 fn collect_capture_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
+                // a positional-sourced value (`x=$1`) is unbounded too
+                if expr_refs_positional(expr) {
+                    for t in targets {
+                        out.insert(t.var.clone());
+                    }
+                }
                 let is_cap = match expr {
                     IrExpr::Call { func, args } => {
                         (func == "capture" || func == "captureWords")
@@ -6248,6 +6855,24 @@ fn collect_capture_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 if let IrExpr::Call { func, args } = e {
                     if func == "exec" {
                         if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                            if cmd == "local"
+                                || cmd == "declare"
+                                || cmd == "typeset"
+                                || cmd == "export"
+                                || cmd == "readonly"
+                            {
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    for w in items {
+                                        if let IrExpr::Str(ws, _) = w {
+                                            if let Some((name, val)) = ws.split_once('=') {
+                                                if val.contains('$') {
+                                                    out.insert(name.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if cmd == "read" {
                                 if let Some(IrExpr::Array(items)) = args.get(1) {
                                     for w in items {

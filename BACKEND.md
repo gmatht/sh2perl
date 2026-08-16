@@ -1,4 +1,4 @@
-# c backend (worktree: /nvme/ai/sh2loop/backends/c, branch: backend/c)
+# c backend (worktree: /home/llm/sh2loop/sh2perl/backends/c, branch: backend/c)
 
 Shared core (do NOT fork): src/shir.rs (ShIR + lowering), src/ir.rs,
 src/estree.rs (node model), src/parser/. Consume the ShIR; render it in
