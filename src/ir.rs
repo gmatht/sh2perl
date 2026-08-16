@@ -3128,7 +3128,12 @@ fn bash_word_for(w: &IrExpr) -> String {
                         if let IrExpr::Call { func, args } = e.as_ref() {
                             if func == "getVar" {
                                 if let Some(n) = args.first().and_then(call_arg_str) {
-                                    s.push_str(&format!("${}", n));
+                                    // var_read: digits → $ARGV[0] (positional),
+                                    // env-style → $ENV{VAR1}, locals → $x.
+                                    // The bare `${}` emitted `$ENV{"1"}` for
+                                    // `$1` inside a function (verified:
+                                    // examples/002_control_flow greet).
+                                    s.push_str(&var_read(&n));
                                     continue;
                                 }
                             }
@@ -6891,11 +6896,13 @@ pub fn is_env_style_var_name(name: &str) -> bool {
     if PERL_SPECIAL_VARS.contains(&name) {
         return false;
     }
-    // Env-style: uppercase letters, digits, underscore (VAR1, PATH, HOME —
-    // bash env names allow digits; the old all-uppercase check misread
-    // `VAR1` as a local, so `echo "$VAR1"` printed the empty preamble
-    // local instead of %ENV).
+    // Env-style: at least one UPPERCASE letter, plus digits/underscore
+    // (VAR1, PATH, HOME — bash env names allow digits). A name of only
+    // digits is a POSITIONAL ($1 → $ARGV[0]), never env-style — the old
+    // all-uppercase check misread `VAR1` as a local, and the pure-digit
+    // variant misread `$1` as `$ENV{1}` (examples/002_control_flow greet).
     !name.is_empty()
+        && name.chars().any(|c| c.is_ascii_uppercase())
         && name
             .chars()
             .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
