@@ -144,6 +144,11 @@ pub struct Render {
 
 /// Render an `IrProgram` to Perl source.
 pub fn shir_to_perl(prog: &IrProgram) -> String {
+    // builtin-op fallback arm (PLAN.md §11, shir-builtin-op-20260816):
+    // the perl backend has NOT accepted the `builtin` op — render the
+    // calls as the exec they came from. Drop this when native arms land.
+    let mut prog = prog.clone();
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
     let mut r = Render::default();
     // A2 var_types are ignored: Perl scalars are dynamically typed, so the
     // type verdicts are only relevant for the static backends (C).

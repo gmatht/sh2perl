@@ -230,6 +230,9 @@ const ARR_CAP: usize = 1024;
 /// Render an `IrProgram` to C source (main() body).
 pub fn shir_to_c(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
+    // builtin-op fallback arm (shir-builtin-op-20260816): the c backend
+    // has NOT accepted the `builtin` op — render as exec.
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
     // A2 + var_lengths: the analyses run at serialization time in the
     // JSON path; the library path must run the same ones.
     prog.var_types = crate::shir::analyze_var_types(&prog);

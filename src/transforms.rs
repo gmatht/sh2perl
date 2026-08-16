@@ -18,6 +18,7 @@ use crate::ir::IrStmt;
 pub type TransformFn = fn(&mut Vec<IrStmt>) -> bool;
 
 pub mod arith_forms;
+pub mod builtin; // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod grep_o; // `grep -o PAT` → the generic grepMatches(text, pattern, flags) op
 pub mod process_subst;
 pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
@@ -38,6 +39,11 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // the --shir export and the A1 ingress (frontend-emitted JSON).
         ("process-subst", process_subst::transform),
         ("arith-forms", arith_forms::transform),
+        // NOTE: exec-to-builtin (shir-builtin-op-20260816) is NOT in the
+        // ast_to_ir channel — the rewrite happens at the A1 EXPORT
+        // (shir_json::shir_to_shir_json) so the analyses and every
+        // exec-keyed renderer arm stay untouched; the exported contract
+        // carries the op and the renderers erase/accept at entry.
     ]
 }
 

@@ -918,6 +918,25 @@ fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
                     }
                 }
             }
+            // shir-builtin-op-20260816: the `builtin` op carries the
+            // shared builtins namespace. The contract validates the
+            // command name at ingress (unknown names REFUSE — the same
+            // ERASURE policy the generics typeArgs use, inverted: type
+            // args are dropped, a builtin op is MEANINGFUL only for a
+            // name the namespace defines).
+            if func == "builtin" {
+                let ok = match args.first() {
+                    Some(IrExpr::Str(s, _)) | Some(IrExpr::Ident(s)) => {
+                        crate::transforms::builtin::is_builtin(s)
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    return Err(format!(
+                        "{where_}.func[builtin]: args[0] must be a builtins.json command name"
+                    ));
+                }
+            }
             IrExpr::Call { func, args }
         }
         "MethodCall" => {

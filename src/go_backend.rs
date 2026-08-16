@@ -167,6 +167,9 @@ const GO_RESERVED: &[&str] = &[
 /// Render an `IrProgram` to Go source (package main).
 pub fn shir_to_go(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
+    // builtin-op fallback arm (shir-builtin-op-20260816): the go backend
+    // has NOT accepted the `builtin` op — render as exec.
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
     // A2: the type verdicts are computed at serialization time in the JSON
     // path; the library path must run the same analysis.
     prog.var_types = crate::shir::analyze_var_types(&prog);
