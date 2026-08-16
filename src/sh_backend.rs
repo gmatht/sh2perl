@@ -3235,7 +3235,13 @@ fn redirect_to_sh(r: &IrRedirect) -> Result<String, String> {
             let fdpre = fd_prefix(fd);
             return Ok(format!(" {fdpre}<<{tab}{q}{delim}{q}\n{body}{delim}\n"));
         }
-        "unsupported" => return Ok(String::new()), // process substitution — dropped in the IR
+        // `unsupported` / unknown modes must never be silently dropped
+        // (core request sh-20260807-130936 item 3 — refuse loudly; the
+        // dropped redirect corrupted the command, e.g. `grep -f` with
+        // no argument). The file pipeline + A1 ingress convert process
+        // substitution to process-in/process-out (process_subst
+        // transform), so this only fires on contract-invalid input.
+        "unsupported" => return Err("redirect mode not renderable: \"unsupported\"".to_string()),
         other => return Err(format!("redirect mode not renderable: {other:?}")),
     };
     let fdpre = fd_prefix(fd);
