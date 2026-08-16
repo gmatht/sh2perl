@@ -5043,13 +5043,16 @@ fn helper_source(h: &str) -> &'static str {
     let mut c = std::process::Command::new("bash");
     c.arg("-c").arg(cmd);
     if want_out { c.stdout(std::process::Stdio::piped()); }
-    if let Some(p) = &stdin_path {
-        // the child must see the REAL device fd (`tty < /dev/pts/5`
-        // needs isatty, which a byte pipe lacks)
-        if let Ok(f) = std::fs::File::open(p) {
-            c.stdin(std::process::Stdio::from(f));
+    if input.is_none() {
+        if let Some(p) = &stdin_path {
+            // the child must see the REAL device fd (`tty < /dev/pts/5`
+            // needs isatty, which a byte pipe lacks)
+            if let Ok(f) = std::fs::File::open(p) {
+                c.stdin(std::process::Stdio::from(f));
+            }
         }
-    } else if input.is_some() { c.stdin(std::process::Stdio::piped()); }
+    }
+    if input.is_some() { c.stdin(std::process::Stdio::piped()); }
     let mut ch = match c.spawn() { Ok(x) => x, Err(_) => return 1 };
     if let Some(data) = input {
         if let Some(mut si) = ch.stdin.take() { let _ = si.write_all(&data); }
