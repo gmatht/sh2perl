@@ -493,7 +493,7 @@ pub struct SelectClause {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IrRedirect {
     pub fd: Option<i32>,
-    pub mode: String, // "r" | "w" | "a" | "r+" | "heredoc" | "herestring" | "unsupported"
+    pub mode: String, // "r" | "w" | "a" | "r+" | "wc" | "heredoc" | "herestring" | "unsupported"
     pub target: IrExpr,
     /// Whether an unquoted heredoc body should be interpolated (ESTree path).
     pub interpolate: bool,
@@ -1585,7 +1585,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                     // w/a/r file redirect with an
                                     // interpolated target — bind it in Perl
                                     // and reference the env slot from bash.
-                                    if !matches!(r.mode.as_str(), "w" | "a" | "r") {
+                                    if !matches!(r.mode.as_str(), "w" | "wc" | "a" | "r") {
                                         ok = false;
                                         break;
                                     }
@@ -1601,7 +1601,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                         render_word(&r.target)
                                     ));
                                     let op = match r.mode.as_str() {
-                                        "w" => ">",
+                                        "w" | "wc" => ">",
                                         "a" => ">>",
                                         _ => "<",
                                     };
@@ -1676,7 +1676,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                 emit_stmt(out, s, indent);
                             }
                         }
-                        Some(r) if matches!(r.mode.as_str(), "w" | "a" | "r+") => {
+                        Some(r) if matches!(r.mode.as_str(), "w" | "wc" | "a" | "r+") => {
                             let target = call_arg_str(&r.target).unwrap_or_default();
                             let mode = if r.mode == "a" { "'>>'" } else { "'>'" };
                             emit_indent(out, indent);
@@ -3617,6 +3617,16 @@ fn exec_call_parts(args: &[IrExpr]) -> Option<(String, Vec<&IrExpr>)> {
 
 /// Emit `LHS = do { open('bash','-c',CMD) ... }` capture (chomps trailing NL).
 fn emit_capture_assign(out: &mut String, indent: usize, lhs: &str, cmd: &str) {
+    // `$ENV{name} = $name;` prelude — the bash -c child must see the
+    // vars the captured command reads (mirror of the cd/if shell-out
+    // sites' var_exports_str prefix; without it `y=$(echo $x)` sees an
+    // unset $x in the child and captures the wrong answer).
+    let exports = var_exports_str(cmd);
+    for line in exports.lines() {
+        emit_indent(out, indent);
+        out.push_str(line);
+        out.push('\n');
+    }
     emit_indent(out, indent);
     out.push_str(&format!("{} = {};\n", lhs, cmd_str_to_open_perl(cmd)));
 }
@@ -3718,6 +3728,7 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
     }
     let op = match mode {
         "w" => ">",
+        "wc" => ">|", // `>|` — noclobber-bypassing truncate (POSIX)
         "a" => ">>",
         "r" => "<",
         _ => return false,
@@ -5317,6 +5328,26 @@ fn render_test_call(args: &[IrExpr]) -> String {
 pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
     match expr {
         IrExpr::Capture { expr, native } => {
+            // Prefer the REBUILT SHELL TEXT for Arrow bodies: the old
+            // fallback rendered the Arrow as a Perl anonymous sub
+            // (`sub { … }`) and fed it to bash -c — which is not shell.
+            // Bash reported `sub: command not found` (verified via
+            // `x=$(printf "%s\n" …)` and `$(echo hi)` — the pre-existing
+            // capture bug). The ASSIGN-capture path got this fix at the
+            // emit_capture_assign site; this is the exec-arg-capture
+            // twin (e.g. `printf '%s' "$([ -f "$f" ] && echo yes || …)"`
+            // — parse-redirect-clobber's cmdsub-in-arg).
+            if !*native {
+                if let IrExpr::Arrow(stmts) = expr.as_ref() {
+                    if let Some(cmd) = stmts_to_shell_cmd(stmts) {
+                        return cmd_str_to_open_perl(&cmd);
+                    }
+                    // A non-rebuildable closure: its Perl rendering is
+                    // not shell — refuse loudly rather than emit the
+                    // broken `sub {}` text into bash -c.
+                    return "die \"debashc: shIR capture not expressible as shell (Perl backend)\\n\"".to_string();
+                }
+            }
             let mut inner = ir_expr_to_perl(expr);
             // Strip surrounding backticks from StrStyle::Command rendering
             if inner.starts_with('`') && inner.ends_with('`') && inner.len() >= 2 {
