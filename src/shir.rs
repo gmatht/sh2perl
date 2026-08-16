@@ -18645,6 +18645,14 @@ fn tr_decode_escapes(s: &str) -> Option<String> {
 /// scalar length, and `${@:off:len}` joins to a scalar string.
 fn exec_arg_is_array_valued(e: &IrExpr) -> bool {
     match e {
+        // Starred-expression splice (core request py-sh-go-star-expr): the
+        // wrapped expr's elements splice into the enclosing Array/Call —
+        // array-valued when the wrapped expr is (arrayItems/listVar/
+        // param-slice return native JS arrays the runtime splices; a
+        // scalar wraps as one element). The exec-arg flattener and the
+        // echo fold (`.flat()` before the join) treat it like the other
+        // array-valued args.
+        IrExpr::Splice(inner) => exec_arg_is_array_valued(inner),
         IrExpr::Call { func, args } => match func.as_str() {
             "captureWords" | "listVar" | "split" => true,
             "arrayIndex" => matches!(

@@ -568,6 +568,11 @@ fn call_purity(func: &str, args: &[IrExpr]) -> &'static str {
         | "setArray" | "setArrayAppend" | "arrayItems" | "arrayKeys" | "arrayLen"
         | "arrayIndex" | "fnCall" | "fnValue" | "define" | "forLoop" | "whileLoop" | "block" | "shopt"
         | "builtin" | "bcSqrt" | "ternary" | "arrayStore" | "memAdvance" | "memTest" | "line"
+        // associative-array helpers (core request py-sh-go-20260806-144303-b):
+        // assocSet/assocGet/assocNames/assocValues — runtime store ops on
+        // the assoc Map, CPU-only, no process spawn (mirror setArray/
+        // arrayItems).
+        | "assocSet" | "assocSet2" | "assocGet" | "assocNames" | "assocValues"
         // channel/select vocabulary (core requests go-sh-commclause /
         // go-sh-recvstmt): FIFO channels + blocking recv/send + the
         // round-robin select poll — all implementable in the runtime
