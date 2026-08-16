@@ -281,6 +281,15 @@ static ARITH_REF_SET: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// compilation by `shir_to_estree`; the `split` call emitter consults it
 /// to skip the word-split on such vars (a provable no-op).
 static VAR_NOSPACE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Whether the program may run with a CUSTOM (non-whitespace) IFS value
+/// in the store (frontends-ifs: `IFS=,` assignments / `setVar("IFS", …)`
+/// / env-carrying `IFS=…` exec calls, with a value not provably
+/// whitespace-only). Set per compilation by `shir_to_estree`; when set,
+/// the "No spaces" tag is DISABLED (a whitespace-free value may still
+/// contain custom separator chars) and the `split` marker must dispatch
+/// to the runtime (`sh2.split`, which consults `this.vars.IFS`) instead
+/// of the inline whitespace regex.
+static IFS_CUSTOM: Mutex<Option<bool>> = Mutex::new(None);
 /// Whether `shopt -s nocasematch` may be enabled anywhere in the current
 /// program (set per compilation by `shir_to_estree`; see
 /// `ir_may_enable_nocasematch`). Native case/test substring lifts must
@@ -4054,6 +4063,108 @@ pub fn analyze_var_bash_env(prog: &IrProgram) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// True when the program may run with a custom (non-whitespace) IFS
+/// value (frontends-ifs 20260806): any write to the IFS variable — a
+/// store `Assign` target, a `setVar("IFS", …)` call, or an env-carrying
+/// exec (`IFS=: read …`) — whose value is not PROVABLY whitespace-only
+/// (space/tab/newline). Conservative by design: an unprovable value
+/// (dynamic, empty, or a non-whitespace literal) counts as custom; the
+/// runtime `sh2.split` then decides per-field-split against the live
+/// store IFS, which is exactly the default behavior when no custom IFS
+/// ever lands in the store (env-scoped `IFS=: read` does not touch it).
+pub fn program_may_custom_ifs(prog: &IrProgram) -> bool {
+    use crate::ir::{InterpPart, IrExpr, IrStmt};
+
+    /// A value that is provably whitespace-only (the runtime's default
+    /// `^[ \t\n]+$` branch — an EMPTY value is NOT whitespace-only:
+    /// bash's empty IFS means NO field splitting, which the runtime's
+    /// custom path implements).
+    fn whitespace_only(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Str(s, _) => {
+                !s.is_empty() && s.chars().all(|c| c == ' ' || c == '\t' || c == '\n')
+            }
+            IrExpr::Interpolate(parts) => {
+                let mut text = String::new();
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(s) => text.push_str(s),
+                        InterpPart::Expr(_) => return false, // dynamic — unprovable
+                    }
+                }
+                !text.is_empty() && text.chars().all(|c| c == ' ' || c == '\t' || c == '\n')
+            }
+            _ => false, // getVar / capture / arith / … — unprovable
+        }
+    }
+
+    fn value_is_custom(e: &IrExpr) -> bool {
+        !whitespace_only(e)
+    }
+
+    fn walk(stmts: &[IrStmt]) -> bool {
+        for st in stmts {
+            let hit = match st {
+                IrStmt::Assign { targets, expr, .. } => {
+                    targets.iter().any(|t| t.var == "IFS" && t.indices.is_empty())
+                        && value_is_custom(expr)
+                }
+                IrStmt::Exec { env, .. } => env
+                    .iter()
+                    .any(|(k, v)| k == "IFS" && value_is_custom(v)),
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" => {
+                    matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "IFS")
+                        && args.get(1).map(value_is_custom).unwrap_or(false)
+                }
+                IrStmt::If {
+                    then, elsifs, else_, ..
+                } => {
+                    walk(then)
+                        || elsifs.iter().any(|(_, b)| walk(b))
+                        || walk(else_)
+                }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body)
+                        || excepts.iter().any(|e| walk(&e.body))
+                        || walk(else_body)
+                        || walk(finally_body)
+                }
+                IrStmt::For { body, .. } => walk(body),
+                IrStmt::ForInit {
+                    init, step, body, ..
+                } => walk(init) || walk(step) || walk(body),
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => walk(body),
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk(body)
+                        || named_blocks.iter().any(|(_, nb)| walk(nb))
+                }
+                IrStmt::Case { clauses, .. } => clauses.iter().any(|c| walk(&c.body)),
+                IrStmt::Redirect { inner, .. } => walk(inner),
+                IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| walk(s)),
+                IrStmt::Block(b) => walk(b),
+                _ => false,
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+
+    walk(&prog.stmts)
+}
+
+/// `IFS_CUSTOM` — the per-compilation flag set by `shir_to_estree` (see
+/// [`program_may_custom_ifs`]).
+pub fn ifs_custom_possible() -> bool {
+    IFS_CUSTOM.lock().unwrap().unwrap_or(false)
+}
+
 pub fn analyze_var_nospace(prog: &IrProgram) -> Vec<(String, bool)> {
     use crate::ir::{InterpPart, IrExpr, IrStmt};
     use std::collections::{BTreeMap, BTreeSet};
@@ -5647,8 +5758,32 @@ pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
                     }
                 }
             }
-            IrStmt::Declare { vars, .. } => {
-                reject(ok, &vars.iter().map(|v| v.name.clone()).collect::<Vec<_>>());
+            IrStmt::Declare { vars, init, .. } => {
+                // The shell frontend's declaration lowering (`local x=5` —
+                // core requests posix-sh-go-20260813-001245/-003404):
+                // the init IS the write, exactly like the exec name=value
+                // form it replaced (the `local x=<int>` proven-write
+                // test). A single-var Declare with an init classifies the
+                // value like an Assign; a bare declaration (init None) or
+                // a multi-target one stays conservative (reject).
+                if vars.len() == 1 {
+                    if let Some(e) = init {
+                        let name = &vars[0].name;
+                        writes.entry(name.clone()).or_default().push(e.clone());
+                        match write_val(e, candidates) {
+                            Some(W::ProvenInt) => {
+                                ok.entry(name.clone()).or_insert(true);
+                            }
+                            _ => {
+                                ok.insert(name.clone(), false);
+                            }
+                        }
+                    } else {
+                        ok.insert(vars[0].name.clone(), false);
+                    }
+                } else {
+                    reject(ok, &vars.iter().map(|v| v.name.clone()).collect::<Vec<_>>());
+                }
             }
             IrStmt::DeclareArray { var, .. } => {
                 ok.insert(var.clone(), false);
@@ -6458,6 +6593,16 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
                             }
                         }
                     }
+                }
+            }
+        }
+        // The frontend's declaration lowering (`local x=5` — core requests
+        // posix-sh-go-20260813-001245/-003404): the Declare init is the
+        // write, exactly like the exec name=value shape above.
+        IrStmt::Declare { vars, init, .. } => {
+            if let Some(init) = init {
+                if vars.len() == 1 {
+                    state.insert(vars[0].name.clone(), ir_range(init, state));
                 }
             }
         }
@@ -7295,6 +7440,15 @@ fn exec_stmt(
     env: &std::collections::BTreeMap<String, Word>,
     redirects: &[Redirect],
 ) -> IrStmt {
+    // `local`/`declare`/`typeset` declaration lowering (core requests
+    // posix-sh-go-20260813-001245 / -003404): a flag-free declaration
+    // argument list (`local x=5`, `local x`, `local a=1 b=2`) lowers to
+    // the A1 `IrStmt::Declare` node instead of an exec-builtin call.
+    if redirects.is_empty() && env.is_empty() {
+        if let Some(decl) = try_declare_stmt(name, args) {
+            return decl;
+        }
+    }
     let exec_call = exec_call_ir(name, args, env);
     if redirects.is_empty() {
         IrStmt::Expr(exec_call)
@@ -7303,6 +7457,61 @@ fn exec_stmt(
             inner: vec![IrStmt::Expr(exec_call)],
             redirects: redirects.iter().map(redirect_to_ir).collect(),
         }
+    }
+}
+
+/// The `local`/`declare`/`typeset` → `IrStmt::Declare` lowering (core
+/// requests posix-sh-go-20260813-001245 / -003404, the A1 Declare-node
+/// coverage gap): emits the contract's declarative declaration for a
+/// flag-free argument list. Only PURE-LITERAL values convert — a value
+/// containing `$`/backticks (`local n=$1`), a quoted/interpolated word
+/// (`local x="$1"`), a flag (`local -i x=5`), an array-literal arg
+/// (`local -A map=(...)`) or a `name+=` append form stays the legacy
+/// exec-builtin call (the Declare node has no flag/append field, and
+/// the dynamic-init render path is the runtime builtin — the exec shape
+/// is the faithful one for those). Multi-target lists (`local a=1 b=2`)
+/// emit ONE Declare per target so no value is dropped (the contract's
+/// single `init` applies to the first var only).
+fn try_declare_stmt(name: &Word, args: &[Word]) -> Option<IrStmt> {
+    let Word::Literal(cname, _) = name else {
+        return None;
+    };
+    if !matches!(cname.as_str(), "local" | "declare" | "typeset") {
+        return None;
+    }
+    let mut decls: Vec<IrStmt> = Vec::new();
+    for arg in args {
+        let Word::Literal(s, _) = arg else {
+            return None; // interpolation / array / … — keep the exec call
+        };
+        if s.starts_with('-') {
+            return None; // flag form (`-i`, `-A`, `-a`, …)
+        }
+        let (vname, value) = match s.split_once('=') {
+            // `x=5` — a pure literal value (no `$` — a `$` would need
+            // the dynamic builtin path the exec shape already renders)
+            Some((n, v)) if is_plain_ident(n) && !v.contains('$') => (n, Some(v)),
+            // `x=$y`, `x+=1` (append), `=5` (no name), `x=a$b` — keep exec
+            Some(_) => return None,
+            // bare `x` — a plain identifier name
+            None if is_plain_ident(s) => (s.as_str(), None),
+            None => return None,
+        };
+        decls.push(IrStmt::Declare {
+            vars: vec![Decl {
+                name: vname.to_string(),
+                sigil: None,
+            }],
+            init: value.map(|v| IrExpr::Str(v.to_string(), StrStyle::DoubleQuoted)),
+            local: cname == "local",
+        });
+    }
+    if decls.is_empty() {
+        None
+    } else if decls.len() == 1 {
+        decls.pop()
+    } else {
+        Some(IrStmt::Block(decls))
     }
 }
 
@@ -13566,12 +13775,23 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // set — MUST be stored before the lift analyses run (their walkers
     // consult native_arith_text, which reads the static).
     *ARITH_REF_SET.lock().unwrap() = Some(collect_arith_ref_set_vars(prog));
+    // frontends-ifs: a program that may run with a custom (non-whitespace)
+    // IFS invalidates the "No spaces" tag (a whitespace-free value may
+    // still contain custom separator chars) — the tag set is emptied and
+    // the `split` emitter dispatches to the runtime instead of the inline
+    // whitespace regex.
+    let custom_ifs = crate::shir::program_may_custom_ifs(prog);
+    *IFS_CUSTOM.lock().unwrap() = Some(custom_ifs);
     *VAR_NOSPACE.lock().unwrap() = Some(
-        crate::shir::analyze_var_nospace(prog)
-            .into_iter()
-            .filter(|(_, b)| *b)
-            .map(|(n, _)| n)
-            .collect(),
+        if custom_ifs {
+            HashSet::new()
+        } else {
+            crate::shir::analyze_var_nospace(prog)
+                .into_iter()
+                .filter(|(_, b)| *b)
+                .map(|(n, _)| n)
+                .collect()
+        },
     );
     let (num, str) = analyze_loop_var_refs(
         prog,
@@ -30506,9 +30726,23 @@ fn collect_native_store_access(prog: &IrProgram) -> (HashSet<String>, HashSet<St
                 }
                 walk_expr(expr, arr, assoc, refs, attr);
             }
-            IrStmt::Declare { vars, .. } => {
-                for v in vars {
-                    mark_word(&v.name, attr);
+            IrStmt::Declare { vars, init, local } => {
+                // A PURE shell local (`local x=5` — the frontend's
+                // declaration lowering, core requests
+                // posix-sh-go-20260813-001245/-003404) carries no
+                // attributes: skip the attr mark so the native store
+                // write path applies exactly like the legacy exec-call
+                // form (mirror of lift_stmt_is_pure_decl's pure-value
+                // skip). Other Declare forms (typed frontend decls,
+                // dynamic inits, bare declarations) keep the
+                // conservative attr block.
+                let pure_local = *local
+                    && vars.len() == 1
+                    && init.as_ref().and_then(literal_decl_value).is_some();
+                if !pure_local {
+                    for v in vars {
+                        mark_word(&v.name, attr);
+                    }
                 }
             }
             IrStmt::DeclareArray { var, .. } => mark_word(var, arr),
@@ -31430,15 +31664,22 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // no dispatch. `String(v)` guards lifted numeric bindings.
             if func == "split" {
                 if let [v] = args.as_slice() {
+                    // Custom IFS (frontends-ifs): with a non-whitespace IFS
+                    // possible, neither the "No spaces" elision (the value
+                    // may contain separator chars) nor the inline
+                    // whitespace regex (it must split on the IFS chars) is
+                    // sound — dispatch to the runtime `sh2.split`, which
+                    // consults `this.vars.IFS` per split.
+                    let custom_ifs = ifs_custom_possible();
                     // the "No spaces" tag: when the value is provably free
                     // of IFS whitespace (a tagged var, a numeric value, a
                     // spaceless literal), the word-split is a no-op —
                     // emit the value directly (no split/filter/join).
-                    if expr_known_nospace(v) {
+                    if !custom_ifs && expr_known_nospace(v) {
                         return expr_to_estree(v);
                     }
                     let ve = expr_to_estree(v);
-                    if expr_has_await(&ve) {
+                    if expr_has_await(&ve) || custom_ifs {
                         return sh2_call("split", vec![ve]);
                     }
                     return Expr::CallExpression {
