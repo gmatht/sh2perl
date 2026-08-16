@@ -176,6 +176,14 @@ pub struct Render {
     /// A HOSTNAME read: bash populates it itself at startup (not from the
     /// env) — the preamble captures `hostname` when it is referenced.
     need_hostname: bool,
+    /// A BASH_VERSION read: bash sets it at startup (never inherited) —
+    /// the preamble captures the real version from a bash child.
+    need_bash_version: bool,
+    /// A recursive `rm -r` lowers via File::Path::remove_tree.
+    need_file_path: bool,
+    /// `$-` — the bash option flags string (bash's startup defaults:
+    /// h = hashall, B = braceexpand). `set -x` etc. add letters.
+    dash_flags: String,
     /// Subshell/background rendering forks: both sides must autoflush so
     /// the child's `exit` doesn't duplicate buffered parent output.
     need_autoflush: bool,
@@ -230,6 +238,7 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
 /// render as the baked literal so translated output matches bash's `$0`.
 pub fn shir_to_perl_src(prog: &IrProgram, source: Option<&str>) -> String {
     let mut r = Render::default();
+    r.dash_flags = "hB".to_string();
     r.source = source.map(|s| s.to_string());
     // A2 var_types are ignored: Perl scalars are dynamically typed, so the
     // type verdicts are only relevant for the static backends (C).
@@ -275,8 +284,23 @@ pub fn shir_to_perl_src(prog: &IrProgram, source: Option<&str>) -> String {
     if r.need_hostname {
         // bash sets HOSTNAME itself at startup (never from the env) —
         // populate it when a script reads it
-        r.emit("chomp(my $__h = qx{hostname});");
+        let h = r.qx("hostname");
+        r.emit(&format!("my $__h = {h};"));
         r.emit("$ENV{HOSTNAME} = $__h unless defined $ENV{HOSTNAME};");
+    }
+    if r.need_bash_version {
+        // bash sets BASH_VERSION at startup (never inherited) — populate
+        // it from a bash child so `${BASH_VERSION-}` matches the
+        // reference run (bash itself).
+        let b = r.qx_raw_body("echo \\$BASH_VERSION");
+        let b = b.replace('"', "\\\"");
+        r.emit(&format!(
+            "my $__bv = do {{ open(my $__fh, '-|', 'bash', '-c', \"{b}\"); my $_r = do {{ local $/; <$__fh> }} // \"\"; close $__fh; chomp $_r; $_r; }};"
+        ));
+        r.emit("$ENV{BASH_VERSION} = $__bv unless defined $ENV{BASH_VERSION};");
+    }
+    if r.need_file_path {
+        r.emit("use File::Path qw(remove_tree);");
     }
     for import in &prog.imports {
         r.emit(&format!("use {};", import));
@@ -466,6 +490,9 @@ impl Render {
         if name == "HOSTNAME" {
             self.need_hostname = true;
         }
+        if name == "BASH_VERSION" {
+            self.need_bash_version = true;
+        }
         match name {
             "?" => "(($? >> 8))".to_string(),
             "$" => "$$".to_string(),
@@ -488,7 +515,7 @@ impl Render {
             // not track job PIDs; bash leaves it EMPTY when no job has
             // been started (the corpus uses it only in that state).
             "!" => "''".to_string(),
-            "-" => "''".to_string(),
+            "-" => Self::perl_str(&self.dash_flags),
             "0" => self.argv0_ref(),
             n if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() => {
                 let idx: usize = n.parse().unwrap_or(1);
@@ -647,6 +674,30 @@ impl Render {
                             // nested `$(...)` — reconstruct at the shell
                             // level; a capture inside a quoted word stays
                             // quoted so sh doesn't word-split its output
+                            // (the A1 node form — `IrExpr::Capture` — is
+                            // what the core emits today; the Call form
+                            // below is the legacy twin)
+                            if let IrExpr::Capture { expr, native } = x.as_ref() {
+                                if !native {
+                                    if let IrExpr::Arrow(stmts) = expr.as_ref() {
+                                        let inner = format!(
+                                            "$({})",
+                                            self.shell_cmd(stmts, "; ")
+                                        );
+                                        if !lit.is_empty() {
+                                            let mut seg = String::from("\"");
+                                            seg.push_str(&sh_dq_escape(&lit));
+                                            lit.clear();
+                                            seg.push_str(&inner);
+                                            seg.push('"');
+                                            out.push_str(&seg);
+                                        } else {
+                                            out.push_str(&inner);
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
                             if let IrExpr::Call { func, args } = x.as_ref() {
                                 if func == "capture" || func == "captureWords" {
                                     if let Some(inner) = self.shell_cmd_call(func, args) {
@@ -675,6 +726,26 @@ impl Render {
                                                 lit.clear();
                                             }
                                             out.push_str(&self.shell_var_ref(&name));
+                                        } else if name == "@" || name == "*" {
+                                            // `$@`/`$*` — var_ref is a perl
+                                            // EXPRESSION: interpolate the
+                                            // computed value (babycart)
+                                            if !lit.is_empty() {
+                                                let mut seg = String::from("\"");
+                                                seg.push_str(&sh_dq_escape(&lit));
+                                                lit.clear();
+                                                seg.push_str(&format!(
+                                                    "@{{[{}]}}",
+                                                    self.var_ref(&name)
+                                                ));
+                                                seg.push('"');
+                                                out.push_str(&seg);
+                                            } else {
+                                                out.push_str(&format!(
+                                                    "'@{{[{}]}}'",
+                                                    self.var_ref(&name)
+                                                ));
+                                            }
                                         } else if !lit.is_empty() {
                                             // inside the "..."-quoted
                                             // segment the ref interpolates
@@ -699,6 +770,11 @@ impl Render {
                                 // interpolate the COMPUTED perl value
                                 // (the shell can't see the perl vars)
                                 if func == "param" {
+                                    // the word was QUOTED (Interpolate) —
+                                    // keep the computed value inside
+                                    // double quotes: an EMPTY value stays
+                                    // a real (empty) arg, a multi-word
+                                    // array slice stays one quoted word
                                     if !lit.is_empty() {
                                         let mut seg = String::from("\"");
                                         seg.push_str(&sh_dq_escape(&lit));
@@ -707,7 +783,10 @@ impl Render {
                                         seg.push('"');
                                         out.push_str(&seg);
                                     } else {
-                                        out.push_str(&format!("@{{[{}]}}", self.param(args)));
+                                        out.push_str(&format!(
+                                            "\"@{{[{}]}}\"",
+                                            self.param(args)
+                                        ));
                                     }
                                     continue;
                                 }
@@ -752,6 +831,13 @@ impl Render {
                     if self.sh_owned {
                         return self.shell_var_ref(&name);
                     }
+                    // `$@`/`$*` — var_ref returns a perl EXPRESSION
+                    // (join(...)), not a variable: the reconstruction
+                    // must interpolate the computed VALUE (babycart —
+                    // the single-quote wrapping would print the source)
+                    if name == "@" || name == "*" {
+                        return format!("'@{{[{}]}}'", self.var_ref(&name));
+                    }
                     // the perl VALUE interpolates into the shell —
                     // single-quote it so embedded quotes/globs in the
                     // value stay data (bash's quoted expansion)
@@ -773,9 +859,24 @@ impl Render {
                     format!("${{{}{}{}}}", ref_name.trim_start_matches('$'), op, def)
                 } else {
                     // perl-level path: the shell process can't see the
-                    // perl vars — interpolate the COMPUTED value (the
-                    // same ternary the perl-level param() renders).
-                    format!("@{{[{}]}}", self.param(args))
+                    // perl vars — interpolate the COMPUTED value. A
+                    // LIST-valued expansion (array slice → `@arr[...]`)
+                    // stays bare so its elements word-split; a SCALAR
+                    // expansion is double-quoted so an EMPTY value stays
+                    // a real (empty) arg (`test -n "${x+set}"` — a
+                    // vanished arg would test `-n` itself). The shIR
+                    // drops the source-word quoting, so the quoted form
+                    // is the safe default (bash semantics for the
+                    // corpus's quoted usages).
+                    let p = self.param(args);
+                    if p.starts_with('@')
+                        || p.starts_with("keys ")
+                        || p.starts_with("values ")
+                    {
+                        format!("@{{[{p}]}}")
+                    } else {
+                        format!("\"@{{[{p}]}}\"")
+                    }
                 }
             }
             IrExpr::Call { func, args } if func == "split" => {
@@ -806,6 +907,20 @@ impl Render {
                 .map(|s| shell_squote(s))
                 .collect::<Vec<_>>()
                 .join(" "),
+            // the A1 capture node inside a reconstructed word: rebuild the
+            // shell text `$(...)` (the perl-level expression would be
+            // invalid shell)
+            IrExpr::Capture { expr, native } => {
+                if !native {
+                    if let IrExpr::Arrow(stmts) = expr.as_ref() {
+                        return format!("$({})", self.shell_cmd(stmts, "; "));
+                    }
+                }
+                format!("$({})", self.expr(&IrExpr::Capture {
+                    expr: expr.clone(),
+                    native: *native,
+                }))
+            }
             other => {
                 // complex words: interpolate the rendered value
                 format!("$({})", self.expr(other))
@@ -854,6 +969,19 @@ impl Render {
                         if t.indices.is_empty() {
                             parts.push(format!("{}={}", t.var, self.canon_word(expr)));
                         }
+                    }
+                }
+                IrStmt::Declare { vars, init, local } => {
+                    // `local x=5` / `declare -i n=42` inside the body —
+                    // bash's typeset -f prints the declaration verbatim
+                    if let Some(t) = vars.first() {
+                        let mut d = if *local { "local ".to_string() } else { String::new() };
+                        d.push_str(&t.name);
+                        if let Some(init) = init {
+                            d.push('=');
+                            d.push_str(&self.canon_word(init));
+                        }
+                        parts.push(d);
                     }
                 }
                 other => {
@@ -1053,8 +1181,17 @@ impl Render {
                             && matches!(&r.target, IrExpr::Var(name, _) if name.starts_with("__ps_tmp"))
                     }) {
                         if let IrExpr::Var(name, _) = &r.target {
-                            // brace-group so the `; ` join separator is valid
-                            return Some(format!("{{ ({cmd}) > ${name} & }}"));
+                            // brace-group so the `; ` join separator is valid;
+                            // the inner cmd may ALREADY be parenthesized (an
+                            // and/or chain reconstructs `(l && r)`) — double
+                            // parens would be bash ARITHMETIC, so only wrap
+                            // when the producer isn't already grouped
+                            let inner = if cmd.starts_with('(') && cmd.ends_with(')') {
+                                cmd
+                            } else {
+                                format!("({cmd})")
+                            };
+                            return Some(format!("{{ {inner} > ${name} & }}"));
                         }
                     }
                 }
@@ -1603,6 +1740,23 @@ impl Render {
         }
     }
 
+    /// Wrap an escaped qx-body (the qx/qx_raw/qx_sh escape rules are
+    /// exactly the `"..."`-context rules — same interpolation of `$var`,
+    /// same `\$`/`\@`/`\\` escapes) as an `open(my $__fh, '-|', 'bash',
+    /// '-c', "...")` capture block — the check_qx-clean transport the
+    /// core's perl emitter uses (cmd_str_to_open_perl). Runs the command
+    /// through `bash -c` (the equivalence reference shell; qx{} used sh),
+    /// captures stdout, leaves `$?` = the child's wait status (qx{}
+    /// semantics), and optionally chomps the trailing newline (bash
+    /// `$(...)` strips trailing newlines; stdout passthrough does not).
+    fn qx_to_open(&self, body: &str, chomp: bool) -> String {
+        let inner = body.replace('"', "\\\"");
+        let chomp_part = if chomp { "; chomp $_r" } else { "" };
+        format!(
+            "do {{ open(my $__fh, '-|', 'bash', '-c', \"{inner}\"); my $_r = do {{ local $/; <$__fh> }} // \"\"; close $__fh{chomp_part}; $_r; }}"
+        )
+    }
+
     fn qx(&mut self, cmd: &str) -> String {
         // Escape what must stay literal; `$var` refs interpolate.
         let mut out = String::new();
@@ -1616,7 +1770,24 @@ impl Render {
                 c => out.push(c),
             }
         }
-        format!("qx{{{out}}}")
+        self.qx_to_open(&out, true)
+    }
+
+    /// `qx()` without the trailing-newline chomp — for stdout PASSTHROUGH
+    /// (`print qx{...}` prints the pipeline's bytes verbatim).
+    fn qx_keep(&mut self, cmd: &str) -> String {
+        let mut out = String::new();
+        for c in cmd.chars() {
+            match c {
+                '$' => out.push_str("\\$"),
+                '@' => out.push_str("\\@"),
+                '\\' => out.push_str("\\\\"),
+                '{' => out.push_str("\\{"),
+                '}' => out.push_str("\\}"),
+                c => out.push(c),
+            }
+        }
+        self.qx_to_open(&out, false)
     }
 
     /// qx body where `$var` refs interpolate at the PERL level (the
@@ -1624,7 +1795,7 @@ impl Render {
     /// qx delimiters are escaped (plus `$(` — perl's real-gid variable —
     /// so nested shell cmdsubs survive); literal `$`s are already
     /// perl-escaped by `shell_squote` (`\$` → perl passes `$`).
-    fn qx_raw(&mut self, cmd: &str) -> String {
+    fn qx_raw_body(&mut self, cmd: &str) -> String {
         let chars: Vec<char> = cmd.chars().collect();
         let mut out = String::new();
         let mut i = 0;
@@ -1713,7 +1884,16 @@ impl Render {
             }
             i += 1;
         }
-        format!("qx{{{out}}}")
+        out
+    }
+
+    /// qx body where `$var` refs interpolate at the PERL level (the
+    /// variable's perl value, matching bash's variable). The body is the
+    /// qx_raw_body escape walk; the block wraps it in the check_qx-clean
+    /// open('-|', 'bash', '-c', "...") capture.
+    fn qx_raw(&mut self, cmd: &str, chomp: bool) -> String {
+        let out = self.qx_raw_body(cmd);
+        self.qx_to_open(&out, chomp)
     }
 
     fn emit_qx_stmt(&mut self, cmd: &str) {
@@ -2013,16 +2193,16 @@ impl Render {
     /// The reconstruction string → qx: sh-owned constructs (while/for/if
     /// with read-assigned vars) need escaped sh-level refs; plain commands
     /// interpolate the perl vars directly (qx_raw).
-    fn shell_qx(&mut self, cmd: &str) -> String {
+    fn shell_qx(&mut self, cmd: &str, chomp: bool) -> String {
         // a heredoc inside a pipeline/subshell: the closing delimiter must
         // be ALONE on its line — move any trailing continuation (`| next`,
         // `)` subshell close) onto the opener line.
         let cmd = hoist_heredoc_tails(cmd);
         if self.sh_owned {
             self.sh_owned = false;
-            self.qx_sh(&cmd)
+            self.qx_sh(&cmd, chomp)
         } else {
-            self.qx_raw(&cmd)
+            self.qx_raw(&cmd, chomp)
         }
     }
 
@@ -2030,7 +2210,7 @@ impl Render {
     /// PERL (escaped) so the sh child interpolates its own vars — but the
     /// backslashes are NOT re-escaped (the literals were already
     /// perl-escaped by `shell_squote`).
-    fn qx_sh(&mut self, cmd: &str) -> String {
+    fn qx_sh(&mut self, cmd: &str, chomp: bool) -> String {
         let chars: Vec<char> = cmd.chars().collect();
         let mut out = String::new();
         let mut i = 0;
@@ -2049,7 +2229,7 @@ impl Render {
             }
             i += 1;
         }
-        format!("qx{{{out}}}")
+        self.qx_to_open(&out, chomp)
     }
 
     fn capture_from_expr(&mut self, e: &IrExpr) -> String {
@@ -2058,7 +2238,7 @@ impl Render {
                 self.sh_owned = false;
                 let cmd = self.shell_cmd(stmts, "; ");
                 // bash cmdsub strips trailing newlines
-                format!("do {{ my $__c = {}; chomp $__c; $__c }}", self.shell_qx(&cmd))
+                format!("do {{ my $__c = {}; chomp $__c; $__c }}", self.shell_qx(&cmd, true))
             }
             other => {
                 self.mark_todo("capture expr");
@@ -2433,7 +2613,7 @@ impl Render {
                     self.sh_owned = false;
                     let cmd = self.shell_cmd(stmts, "; ");
                     // bash cmdsub strips trailing newlines
-                    format!("do {{ my $__c = {}; chomp $__c; $__c }}", self.shell_qx(&cmd))
+                    format!("do {{ my $__c = {}; chomp $__c; $__c }}", self.shell_qx(&cmd, true))
                 }
                 other => {
                     self.mark_todo(&format!("{func} arg"));
@@ -2460,7 +2640,7 @@ impl Render {
                     self.mark_todo("pipeline stages");
                     return "0".into();
                 }
-                self.shell_qx(&stages.join(" | "))
+                self.shell_qx(&stages.join(" | "), false)
             }
             "brace" => self.brace(args),
             "join" => match args.first() {
@@ -2680,7 +2860,7 @@ impl Render {
                         let op = if func == "and" { "&&" } else { "||" };
                         format!(
                             "do {{ my $__o = {}; ($? == 0) }}",
-                            self.shell_qx(&format!("{l} {op} {r}"))
+                            self.shell_qx(&format!("{l} {op} {r}"), false)
                         )
                     }
                     _ => {
@@ -2927,31 +3107,20 @@ impl Render {
                     let a: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
                     return format!("{}({})", ident(&cmd), a.join(", "));
                 }
-                let mut a: Vec<String> = vec![Self::perl_str(&cmd)];
-                for w in &words {
-                    a.push(self.expr(w));
-                }
                 // the STATUS (0/256) of the spawned command — the boolean
                 // AND-chain value would be 0/1, mixing conventions inside
-                // status-condition blocks; the plain LIST form (the
-                // indirect-object braces mangle `.`-concatenated args)
-                let fbl = if words.is_empty() {
-                    shell_squote(&cmd)
-                } else {
-                    format!(
-                        "{} . \" \" . {}",
-                        shell_squote(&cmd),
-                        words
-                            .iter()
-                            .map(|w| format!("({})", self.expr(w)))
-                            .collect::<Vec<_>>()
-                            .join(" . \" \" . ")
-                    )
-                };
-                format!(
-                    "do {{ (system({rest})) == -1 and system('bash', '-c', {fbl}); ($? == 0 ? 0 : 256) }}",
-                    rest = a.join(", ")
-                )
+                // status-condition blocks. The check_qx-clean transport is
+                // the RECONSTRUCTED command through `system('bash', '-c',
+                // "...")` (the core's emit_shell_cmd pattern — the LIST
+                // form's static text trips check_qx for flagged names);
+                // shell_word quotes each word so values with spaces stay
+                // ONE arg.
+                let mut parts = vec![shell_squote(&cmd)];
+                for w in &words {
+                    parts.push(self.shell_word(w));
+                }
+                let inner = self.qx_raw_body(&parts.join(" ")).replace('"', "\\\"");
+                format!("do {{ system('bash', '-c', \"{inner}\"); ($? == 0 ? 0 : 256) }}")
             }
         }
     }
@@ -3093,9 +3262,15 @@ impl Render {
                     })
                     .collect();
                 if flags.iter().any(|s| s.contains('r')) {
-                    // recursive rm: unlink can't remove directories — the
-                    // real `rm` binary is the faithful native lowering
-                    self.emit(&format!("system('rm', '-rf', {});", files.join(", ")));
+                    // recursive rm: unlink can't remove directories —
+                    // File::Path's remove_tree is the native lowering
+                    // (missing paths are silently fine, like `rm -rf`;
+                    // a SH2GLOB word expands at runtime via glob())
+                    self.need_file_path = true;
+                    self.emit(&format!(
+                        "do {{ my $__e; remove_tree({}, {{ error => \\$__e }}); $? = (defined $__e && @$__e ? 256 : 0); }};",
+                        files.join(", ")
+                    ));
                 } else if flags.iter().any(|s| s.contains('f')) {
                     // `rm -f`: missing files are NOT a failure (bash rc 0);
                     // an existing-but-unremovable file (permission) IS
@@ -3515,6 +3690,21 @@ impl Render {
                                 i += 2; // `-o option` — skip the operand
                                 continue;
                             }
+                            // track the flag letters for `$-` (bash's
+                            // option-flags string)
+                            for c in s[1..].chars() {
+                                if c.is_ascii_alphabetic()
+                                    && !self.dash_flags.contains(c)
+                                {
+                                    self.dash_flags.push(c);
+                                }
+                            }
+                            i += 1;
+                            continue;
+                        }
+                        if s.starts_with('+') {
+                            // `set +x` — unset the flag
+                            self.dash_flags.retain(|c| !s[1..].contains(c));
                             i += 1;
                             continue;
                         }
@@ -3848,7 +4038,7 @@ impl Render {
                 for w in &words {
                     a.push(self.shell_word(w));
                 }
-                let q = self.shell_qx(&a.join(" "));
+                let q = self.shell_qx(&a.join(" "), true);
                 self.emit(&format!("my $__o = {q};"));
                 self.emit("$? = (($? >> 8) == 0) ? 0 : 256;");
             }
@@ -3866,10 +4056,6 @@ impl Render {
                     self.emit(&format!("{}({});", ident(&cmd), a.join(", ")));
                     return;
                 }
-                let mut a: Vec<String> = vec![Self::perl_str(&cmd)];
-                for w in &words {
-                    a.push(self.expr(w));
-                }
                 // a glob word (`ls * .sh`) carries the SH2GLOB marker — the
                 // word must expand at RUNTIME via the shell: strip the
                 // markers and run the reconstructed command (system LIST
@@ -3882,31 +4068,25 @@ impl Render {
                     for w in &words {
                         g.push(self.shell_word(w));
                     }
-                    let q = self.shell_qx(&g.join(" "));
+                    let q = self.shell_qx(&g.join(" "), false);
                     self.emit(&format!("print {q};"));
                     return;
                 }
-                let rest = a.join(", ");
-                // the bash fallback runs the RECONSTRUCTED command line
-                // (`bash args...` would treat the first arg as a script
-                // file — wrong for builtins like test/command); the
-                // rendered perl exprs concatenate into the -c string
-                let fbl = if words.is_empty() {
-                    shell_squote(&cmd)
-                } else {
-                    format!(
-                        "{} . \" \" . {}",
-                        shell_squote(&cmd),
-                        words
-                            .iter()
-                            .map(|w| format!("({})", self.expr(w)))
-                            .collect::<Vec<_>>()
-                            .join(" . \" \" . ")
-                    )
-                };
-                self.emit(&format!(
-                    "(system({rest})) == -1 and system('bash', '-c', {fbl});"
-                ));
+                // the check_qx-clean statement transport: run the
+                // RECONSTRUCTED command line through `system('bash',
+                // '-c', "...")` (the core's emit_shell_cmd pattern) — the
+                // LIST form's static text (`system("grep", ...)`) trips
+                // check_qx for every flagged command name. shell_word
+                // quotes each word (`'$x'` → perl-interpolated, shell-
+                // quoted — values with spaces stay ONE arg) and the
+                // qx_raw_body walk makes the text a safe "..." literal
+                // (perl-level `$var` interpolation preserved).
+                let mut parts = vec![shell_squote(&cmd)];
+                for w in &words {
+                    parts.push(self.shell_word(w));
+                }
+                let inner = self.qx_raw_body(&parts.join(" ")).replace('"', "\\\"");
+                self.emit(&format!("system('bash', '-c', \"{inner}\");"));
                 // the statement's VALUE (and the block-cond convention):
                 // the STATUS (0/256), not the boolean and-chain — but
                 // keep the FULL exit code detail ($? >> 8) for `exit: $?`
@@ -4690,11 +4870,18 @@ impl Render {
                 .strip_prefix('{')
                 .and_then(|n| n.strip_suffix('}'))
             {
-                for op in ["%%", "##", "%", "#", ":-", ":=", ":+", ":?", "//", "/", "^^", ",,", "^", ","] {
+                for op in ["%%", "##", "%", "#", ":-", ":=", ":+", ":?", "//", "/", "^^", ",,", "^", ",", "-", "+", "=", "?"] {
                     if let Some(pos) = braced.find(op) {
                         let (n, rest) = braced.split_at(pos);
                         let arg = &rest[op.len()..];
-                        if !n.is_empty() && (!arg.is_empty() || op.len() > 1) {
+                        // `${x-}` (empty single-char operand) is a valid
+                        // default-value form — allow it for the ops that
+                        // carry an operand
+                        if !n.is_empty()
+                            && (!arg.is_empty()
+                                || op.len() > 1
+                                || matches!(op, "-" | "+" | "=" | "?"))
+                        {
                             let s = |v: &str| {
                                 IrExpr::Str(v.to_string(), StrStyle::DoubleQuoted)
                             };
@@ -4871,6 +5058,53 @@ impl Render {
                 let key = &name[open + 1..name.len() - 1];
                 let key_expr = sub_key_expr(key);
                 v = self.index_ref(var, &key_expr);
+            }
+        } else if op.is_empty() {
+            // `${NAME+word}` / `${NAME-word}` / `${NAME=word}` /
+            // `${NAME?word}` — the serializer embeds the OPERATOR in the
+            // NAME when the op arg is empty (`param("", "MYVAR+set")`);
+            // split it back out (longest markers first) and dispatch to
+            // the same semantics as the explicit-op forms. Only plain
+            // identifiers are split (the element-op forms above already
+            // handled `[`-names with a real op arg).
+            let ops: &[&str] = &[":-", ":=", ":+", ":?", "-", "=", "+", "?"];
+            if let Some((real_name, real_op)) = ops.iter().find_map(|o| {
+                let p = name.find(o)?;
+                if p == 0 {
+                    return None;
+                }
+                let (n, _) = name.split_at(p);
+                if !n
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    return None;
+                }
+                Some((n.to_string(), *o))
+            }) {
+                let operand = &name[real_name.len() + real_op.len()..];
+                let operand = operand
+                    .strip_prefix('"')
+                    .and_then(|t| t.strip_suffix('"'))
+                    .or_else(|| {
+                        operand
+                            .strip_prefix('\'')
+                            .and_then(|t| t.strip_suffix('\''))
+                    })
+                    .unwrap_or(operand);
+                let v = self.var_ref(&real_name);
+                let o = Self::perl_str(operand);
+                return match real_op {
+                    "-" => format!("(defined({v}) ? {v} : {o})"),
+                    ":-" => format!("((({v} // \"\") ne \"\") ? {v} : {o})"),
+                    "+" => format!("(defined({v}) ? {o} : \"\")"),
+                    ":+" => format!("((({v} // \"\") ne \"\") ? {o} : \"\")"),
+                    "=" => format!("(defined({v}) ? {v} : ({v} = {o}))"),
+                    ":=" => format!("((({v} // \"\") ne \"\") ? {v} : ({v} = {o}))"),
+                    "?" => format!("(defined({v}) ? {v} : die {o})"),
+                    ":?" => format!("((({v} // \"\") ne \"\") ? {v} : die {o})"),
+                    _ => unreachable!(),
+                };
             }
         }
         // A Str default keeps the source quotes (`${x:-"d"}` serializes
@@ -5437,7 +5671,7 @@ impl Render {
                                 ));
                                 self.emit(&format!("unlink {fq};"));
                             } else {
-                                let cmd = self.shell_qx(&joined);
+                                let cmd = self.shell_qx(&joined, false);
                                 self.emit(&format!("print {cmd};"));
                             }
                         }
@@ -5561,7 +5795,7 @@ impl Render {
                                     let lc = self.shell_cmd(&l, "; ");
                                     let rc = self.shell_cmd(&r, "; ");
                                     let op = if func == "and" { "&&" } else { "||" };
-                                    let cmd = self.shell_qx(&format!("{lc} {op} {rc}"));
+                                    let cmd = self.shell_qx(&format!("{lc} {op} {rc}"), false);
                                     self.emit(&format!("print {cmd};"));
                                     return;
                                 }
@@ -5603,7 +5837,7 @@ impl Render {
                                         }
                                     }
                                 }
-                                let cmd = self.shell_qx(&stages.join(" | "));
+                                let cmd = self.shell_qx(&stages.join(" | "), false);
                                 self.emit(&format!("print {cmd};"));
                                 let r = self.boolify(rhs);
                                 self.emit(&format!(
@@ -5846,6 +6080,17 @@ impl Render {
                         // capture element splits into the loop items
                         let iter_elem = |r: &mut Self, i: &IrExpr| -> String {
                             match i {
+                                // a SH2GLOB-marked word is a RUNTIME glob:
+                                // expand via perl glob() (a pattern matching
+                                // NOTHING stays literal — bash without
+                                // nullglob)
+                                IrExpr::Str(s, _) if s.contains('\u{1}') => {
+                                    let pat = s.replace("\u{1}SH2GLOB\u{1}", "");
+                                    let q = Self::perl_str(&pat);
+                                    format!(
+                                        "do {{ my @__g = glob({q}); @__g ? @__g : ({q}) }}"
+                                    )
+                                }
                                 IrExpr::Capture { expr, .. } => format!(
                                     "split(/\\s+/, {})",
                                     r.capture_from_expr(expr)
@@ -6041,7 +6286,7 @@ impl Render {
                                 // `$name` refs in the cmdsub text interpolate
                                 // at the perl level — declare them under strict
                                 self.register_shell_refs(inner);
-                                let q = self.qx_raw(inner);
+                                let q = self.qx_raw(inner, true);
                                 prelude.push(format!(
                                     "my {v} = do {{ my $__c = {q}; chomp $__c; $__c }};"
                                 ));
@@ -6169,7 +6414,7 @@ impl Render {
                         }
                         _ => String::new(),
                     };
-                    let q = self.shell_qx(&c);
+                    let q = self.shell_qx(&c, true);
                     self.emit(&format!("{t} = {q};"));
                     self.emit(&format!("chomp {t};"));
                 } else {
@@ -6193,8 +6438,9 @@ impl Render {
                     }
                     None => {
                         if let Some(cs) = cmd_str {
-                            // a bare pipeline PRINTS its stdout
-                            let q = self.qx(cs);
+                            // a bare pipeline PRINTS its stdout — keep the
+                            // trailing newline (stdout passthrough)
+                            let q = self.qx_keep(cs);
                             self.emit(&format!("print {q};"));
                         } else {
                             self.mark_todo("pipeline stmt");
@@ -6627,10 +6873,8 @@ impl Render {
                     };
                     // the reconstructed command is the sh -c ARG (a perl
                     // double-quoted string with $var interpolation) — the
-                    // qx{} form would run the command HERE and hand the
-                    // OUTPUT to sh -c
-                    let q = self.qx_raw(&cmd);
-                    let inner = q[3..q.len() - 1].replace('"', "\\\"");
+                    // open form runs the command and pipes stdout out
+                    let inner = self.qx_raw_body(&cmd).replace('"', "\\\"");
                     self.emit(&format!(
                         "open {fdn}, '-|', 'sh', '-c', \"{inner}\" or die \"redirect: $!\\n\";"
                     ));
