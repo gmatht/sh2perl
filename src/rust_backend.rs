@@ -84,6 +84,10 @@ pub struct Render {
     lower_vars: BTreeSet<String>,
     /// `typeset -u` vars (uppercase attribute)
     upper_vars: BTreeSet<String>,
+    /// `typeset -r` vars (readonly attribute — `typeset -p` shows it)
+    readonly_vars: BTreeSet<String>,
+    /// function definitions (name, body stmts) — for `typeset -f`
+    fn_defs: Vec<(String, Vec<IrStmt>, bool)>,
     /// var -> captured local (background-thread bodies)
     captured: HashMap<String, String>,
     /// `typeset -n ref=target` namerefs (reads/writes redirect)
@@ -314,6 +318,26 @@ impl Render {
     /// A Rust string literal (value context — callers append
     /// `.to_string()` where a `String` value is required).
     fn rust_str(s: &str) -> String {
+        // lossy-read markers (U+E000 + source byte, the core's
+        // bytes_to_marked_lossy): bash passes invalid UTF-8 bytes
+        // through, so re-emit the RAW byte — a Rust str literal can't
+        // hold it, so build the value byte-wise (unsafe: the invariant
+        // is deliberately violated, the same tradeoff as perl's \xNN)
+        if s.chars().any(|c| (0xE000..=0xE0FF).contains(&(c as u32))) {
+            let mut out = String::from("(&unsafe { String::from_utf8_unchecked(vec![");
+            for c in s.chars() {
+                if (0xE000..=0xE0FF).contains(&(c as u32)) {
+                    out.push_str(&format!("0x{:02X},", (c as u32 - 0xE000) as u8));
+                } else {
+                    let mut b = [0u8; 4];
+                    for x in c.encode_utf8(&mut b).bytes() {
+                        out.push_str(&format!("0x{:02X},", x));
+                    }
+                }
+            }
+            out.push_str("]) })");
+            return out;
+        }
         let mut out = String::new();
         out.push('"');
         for c in s.chars() {
@@ -601,6 +625,20 @@ impl Render {
         }
     }
 
+    /// An arith TEXT the parser cannot handle — nested `$(…)` command
+    /// substitutions: evaluate in a child bash (matching bash's own
+    /// expansion, including an arith error → empty). `as_num` → i64.
+    fn arith_text_unparsed(&mut self, text: &str, as_num: bool) -> String {
+        self.add_helper("capture_rc");
+        let inner = Self::rust_str(text);
+        let cap = format!("__sh_capture_rc(&format!(\"echo \\\"$(( {{}} ))\\\"\", {inner}))");
+        if as_num {
+            format!("{cap}.0.trim().parse::<i64>().unwrap_or(0)")
+        } else {
+            format!("{cap}.0.trim().to_string()")
+        }
+    }
+
     /// Render as an i64-typed expression.
     fn expr_num(&mut self, e: &IrExpr) -> String {
         match e {
@@ -679,6 +717,8 @@ impl Render {
                 let text = str_arg(args, 0).unwrap_or("").replace(GLOB_SENTINEL, "");
                 if let Some(e) = self.arith_text(&text) {
                     e
+                } else if text.contains("$(") {
+                    self.arith_text_unparsed(&text, true)
                 } else {
                     "0".to_string()
                 }
@@ -849,6 +889,8 @@ impl Render {
                 let text = str_arg(args, 0).unwrap_or("").replace(GLOB_SENTINEL, "");
                 if let Some(e) = self.arith_text(&text) {
                     format!("{{ let __v = ({e}); __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v != 0 }}")
+                } else if text.contains("$(") {
+                    format!("{{ let __v = {}; __SH_RC.store(if __v != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v != 0 }}", self.arith_text_unparsed(&text, true))
                 } else {
                     "{{ __SH_RC.store(1, Ordering::SeqCst); false }}".to_string()
                 }
@@ -1225,6 +1267,23 @@ impl Render {
                 self.emit(&format!("let _ = {e};"));
             }
             "export" | "local" | "declare" | "typeset" | "readonly" => {
+                // `typeset -f name` (body) / `-F name` (names) / `-p name`
+                // (declaration) print forms
+                if let Some(flag) = words.first().and_then(|w| str_arg(&[(*w).clone()], 0).map(|s| s.to_string())) {
+                    if (flag == "-f" || flag == "-F" || flag == "-p")
+                        && words.len() >= 2
+                    {
+                        if let Some(name) = words.get(1).and_then(|w| str_arg(&[(*w).clone()], 0).map(|s| s.to_string())) {
+                            if flag == "-p" {
+                                self.decl_print(&name);
+                            } else {
+                                self.fn_print(&name, flag == "-F");
+                            }
+                            self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                            return;
+                        }
+                    }
+                }
                 let exported = matches!(cmd, "export" | "readonly");
                 self.decl_words(&words, exported);
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
@@ -1680,6 +1739,87 @@ impl Render {
     /// `export X=1` / `declare -a arr=(...)` / `local x=$1` — word assigns.
     /// `exported` — also write the value into the process env so shell-out
     /// children (bash -c) see it.
+    /// `typeset -p name` — print the declaration (`declare -ir x="…"`).
+    fn decl_print(&mut self, name: &str) {
+        let mut attrs = String::new();
+        if self.is_num(name) {
+            attrs.push('i');
+        }
+        if self.readonly_vars.contains(name) {
+            attrs.push('r');
+        }
+        if self.lower_vars.contains(name) {
+            attrs.push('l');
+        }
+        if self.upper_vars.contains(name) {
+            attrs.push('u');
+        }
+        let v = if self.is_num(name) {
+            format!("{}.to_string()", self.read_num(name))
+        } else {
+            self.read_str(name)
+        };
+        let tag = if attrs.is_empty() {
+            "declare --".to_string()
+        } else {
+            format!("declare -{attrs}")
+        };
+        self.add_helper("print_words");
+        self.emit(&format!(
+            "__sh_print_words(&[vec![format!(\"{tag} {name}=\\\"{{}}\\\"\", {v})]], true, false);"
+        ));
+    }
+
+    /// `typeset -f name` — print the function body in bash's display
+    /// format; `typeset -F name` — just the name.
+    fn fn_print(&mut self, name: &str, names_only: bool) {
+        if names_only {
+            self.add_helper("print_words");
+            self.emit(&format!(
+                "__sh_print_words(&[vec![{}]], true, false);",
+                Self::rust_str_expr(name)
+            ));
+            return;
+        }
+        let body: Vec<IrStmt> = self
+            .fn_defs
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, b, _)| b.clone())
+            .unwrap_or_default();
+        if body.is_empty() {
+            self.mark_todo(&format!("typeset -f {name}"));
+            return;
+        }
+        // reconstruct the source-ish text (vars stay UNEXPANDED — bash
+        // prints the definition, not the values)
+        let mut lines = Vec::new();
+        for s in &body {
+            let t = fn_body_line_text(self, s);
+            lines.push(t);
+        }
+        let mut text = format!("{} () \n{{ \n", name);
+        for (i, l) in lines.iter().enumerate() {
+            if i + 1 == lines.len() {
+                text.push_str(&format!("    {l}\n"));
+            } else {
+                text.push_str(&format!("    {l};\n"));
+            }
+        }
+        text.push('}');
+        self.add_helper("print_words");
+        self.emit(&format!(
+            "__sh_print_words(&[vec![{}]], true, false);",
+            Self::rust_str_expr(&text)
+        ));
+    }
+
+    /// `typeset -n ref=target` — bind the nameref
+    fn nameref_bind(&mut self, name: &str, target: &str) {
+        self.namerefs.insert(name.to_string(), target.to_string());
+        self.mark_written(&name.to_string());
+    }
+
     fn decl_words(&mut self, words: &[&IrExpr], exported: bool) {
         let mut i = 0;
         // `typeset -x name=val` — the -x flag exports the name;
@@ -1702,20 +1842,28 @@ impl Render {
             }
             if let Some(ws) = str_arg(&[(*words[i]).clone()], 0) {
                 if ws.starts_with('-') {
-                    // -a / -A / -x / -r / -i / -l / -u / -n / -p — the
+                    // -a / -A / -x / -r / -i / -l / -u / -n — the
                     // -a/-A mark the NEXT name as an array/assoc; -i/-l/-u
-                    // set attributes; -x exports it.
-                    if ws == "-x" {
+                    // set attributes; -x exports; -r makes readonly.
+                    // Combined bundles (`-il`, `-iu`) apply every flag.
+                    let mut xflag_here = false;
+                    let mut nflag_here = false;
+                    let mut attrs: Vec<char> = Vec::new();
+                    for f in ws.chars().skip(1) {
+                        match f {
+                            'x' => xflag_here = true,
+                            'n' => nflag_here = true,
+                            'a' | 'A' | 'i' | 'l' | 'u' | 'r' => attrs.push(f),
+                            _ => {}
+                        }
+                    }
+                    if xflag_here {
                         xflag = true;
-                        i += 1;
-                        continue;
                     }
-                    if ws == "-n" {
+                    if nflag_here {
                         nflag = true;
-                        i += 1;
-                        continue;
                     }
-                    if ws == "-a" || ws == "-A" || ws == "-i" || ws == "-l" || ws == "-u" {
+                    if !attrs.is_empty() {
                         let n = words.get(i + 1).and_then(|w| {
                             str_arg(&[(*w).clone()], 0)
                                 .map(|s| s.split('=').next().unwrap_or(s).to_string())
@@ -1730,16 +1878,16 @@ impl Render {
                             None
                         });
                         if let Some(n) = n {
-                            if ws == "-A" {
-                                self.assoc.insert(n.clone());
-                            } else if ws == "-a" {
-                                self.arrays.insert(n.clone());
-                            } else if ws == "-i" {
-                                self.int_vars.insert(n.clone());
-                            } else if ws == "-l" {
-                                self.lower_vars.insert(n.clone());
-                            } else if ws == "-u" {
-                                self.upper_vars.insert(n.clone());
+                            for f in &attrs {
+                                match f {
+                                    'A' => { self.assoc.insert(n.clone()); }
+                                    'a' => { self.arrays.insert(n.clone()); }
+                                    'i' => { self.int_vars.insert(n.clone()); }
+                                    'l' => { self.lower_vars.insert(n.clone()); }
+                                    'u' => { self.upper_vars.insert(n.clone()); }
+                                    'r' => { self.readonly_vars.insert(n.clone()); }
+                                    _ => {}
+                                }
                             }
                             self.mark_written(&n);
                         }
@@ -2173,6 +2321,10 @@ impl Render {
             } else {
                 (format!("vec![({e}).to_string()]"), false)
             }
+        } else if text.contains("$(") {
+            // nested `$(…)` cmdsubs — evaluate in a child bash (the
+            // parser's only fallback for unparseable arith text)
+            (format!("vec![{}]", self.arith_text_unparsed(text, false)), false)
         } else {
             ("vec![\"0\".to_string()]".to_string(), false)
         }
@@ -4869,6 +5021,9 @@ impl Render {
         collect_arrays(&prog.stmts, &mut self.arrays, &mut self.assoc);
         collect_attrs(&prog.stmts, &mut self.int_vars, &mut self.lower_vars, &mut self.upper_vars);
         collect_functions(&prog.stmts, &mut self.functions);
+        let mut defs = Vec::new();
+        collect_fn_defs(&prog.stmts, &mut defs);
+        self.fn_defs = defs;
         for (n, _) in &prog.var_types {
             written.insert(n.clone());
         }
@@ -5021,7 +5176,21 @@ impl Render {
             self.add_helper("cat");
             self.write_arr(name, &format!("__sh_cat(&[{w}])"))
         } else if self.is_num(name) && !expr_is_stringy(e) {
-            let n = self.expr_num(e);
+            // `typeset -i` vars evaluate a TEXT rhs as arithmetic
+            // (`comb=comb+1` with the -i attribute → 42+1=43)
+            let n = if self.int_vars.contains(name) {
+                if let IrExpr::Str(s, _) = e {
+                    if let Some(a) = self.arith_text(s) {
+                        a
+                    } else {
+                        self.expr_num(e)
+                    }
+                } else {
+                    self.expr_num(e)
+                }
+            } else {
+                self.expr_num(e)
+            };
             self.write_num(name, &n)
         } else {
             let v = self.expr_any(e);
@@ -5434,6 +5603,11 @@ fn helper_source(h: &str) -> &'static str {
     let want_out = __SH_OUT.lock().unwrap().is_some() || __SH_OUTFILE_TL.with(|v| v.borrow().is_some());
     let mut c = std::process::Command::new("bash");
     c.arg("-c").arg(cmd);
+    if !want_out {
+        // the child inherits fd 1 raw — flush Rust's buffered stdout
+        // first so prints BEFORE the child hit the pipe first
+        let _ = std::io::stdout().flush();
+    }
     if want_out { c.stdout(std::process::Stdio::piped()); }
     if input.is_none() {
         if let Some(p) = &stdin_path {
@@ -5536,6 +5710,10 @@ fn helper_source(h: &str) -> &'static str {
     out
 }"#,
         "fnmatch" => r#"fn __sh_fnmatch(pat: &str, s: &str) -> bool {
+    // bash's pattern matcher treats the pattern as a C string — a NUL
+    // truncates it (so `*$'\x00'*` is effectively just `*` and always
+    // matches)
+    let pat = pat.split('\0').next().unwrap_or(pat);
     let p: Vec<char> = pat.chars().collect();
     let t: Vec<char> = s.chars().collect();
     fn m(p: &[char], t: &[char]) -> bool {
@@ -6294,6 +6472,86 @@ fn contains_unescaped_dollar_paren(p: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Reconstruct one function-body statement as display text for
+/// `typeset -f` — vars stay UNEXPANDED (bash prints the definition).
+fn fn_body_line_text(r: &mut Render, s: &IrStmt) -> String {
+    fn word_text(w: &IrExpr) -> String {
+        match w {
+            IrExpr::Str(t, _) => t.clone(),
+            IrExpr::Interpolate(parts) => {
+                let mut o = String::new();
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(t) => o.push_str(t),
+                        InterpPart::Expr(x) => match x.as_ref() {
+                            IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                                o.push('$');
+                                o.push_str(n);
+                            }
+                            IrExpr::Call { func, args } if func == "getVar" => {
+                                if let Some(IrExpr::Str(n, _)) = args.first() {
+                                    o.push('$');
+                                    o.push_str(n);
+                                }
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+                o
+            }
+            IrExpr::Array(items) => items.iter().map(word_text).collect::<Vec<_>>().join(" "),
+            _ => String::new(),
+        }
+    }
+    match s {
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+            let mut words: Vec<&IrExpr> = Vec::new();
+            if let Some(first) = args.first() {
+                words.push(first);
+            }
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                words.extend(items.iter());
+            }
+            let texts: Vec<String> = words
+                .iter()
+                .map(|w| {
+                    let t = word_text(w);
+                    // bash's display quotes words with spaces or $-refs
+                    if t.contains(' ') || t.contains('$') {
+                        format!("\"{t}\"")
+                    } else {
+                        t
+                    }
+                })
+                .collect();
+            let _ = r;
+            texts.join(" ")
+        }
+        IrStmt::Declare { vars, init, local } => {
+            let kw = if *local { "local" } else { "declare" };
+            let mut out = String::new();
+            for (i, v) in vars.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                out.push_str(&v.name);
+            }
+            if let Some(init) = init {
+                let t = word_text(init);
+                out.push('=');
+                if t.contains(' ') || t.contains('$') {
+                    out.push_str(&format!("\"{t}\""));
+                } else {
+                    out.push_str(&t);
+                }
+            }
+            format!("{kw} {out}")
+        }
+        _ => String::new(),
+    }
 }
 
 /// Does the statement list contain a shell-out (needs text reconstruction)?
@@ -7202,6 +7460,7 @@ fn arith_tokens(t: &str) -> Option<Vec<String>> {
                 // $(cmd) — command substitution inside arithmetic
                 let start = i;
                 let mut depth = 1;
+                i += 1; // the opener paren is already counted
                 while i < ch.len() && depth > 0 {
                     if ch[i] == '(' { depth += 1; }
                     else if ch[i] == ')' { depth -= 1; if depth == 0 { break; } }
@@ -8375,13 +8634,19 @@ fn collect_attrs(
                                         flags.push(t.to_string());
                                     } else {
                                         let n = t.split('=').next().unwrap_or(t).to_string();
-                                        if flags.iter().any(|f| f == "-i") {
+                                        // combined bundles (`-il`, `-iu`)
+                                        let has = |c: char| {
+                                            flags.iter().any(|f| {
+                                                f.starts_with('-') && f[1..].contains(c)
+                                            })
+                                        };
+                                        if has('i') {
                                             ints.insert(n.clone());
                                         }
-                                        if flags.iter().any(|f| f == "-l") {
+                                        if has('l') {
                                             lowers.insert(n.clone());
                                         }
-                                        if flags.iter().any(|f| f == "-u") {
+                                        if has('u') {
                                             uppers.insert(n);
                                         }
                                     }
