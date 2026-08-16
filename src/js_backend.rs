@@ -44,6 +44,10 @@ pub struct Render {
     /// $1..$9 positional reads / fnCall present — emit the positional
     /// array + call protocol
     uses_positional: bool,
+    /// `$?` reads / exec statements present — emit the `sh2_lastExit`
+    /// status binding + the writes after each exec (the estree ref's
+    /// `sh2.lastExit` protocol; bash `$?` is the last command's status)
+    uses_status: bool,
     /// C memory arena (mem*) calls present — emit the mem helpers
     uses_mem: bool,
     todo: usize,
@@ -59,6 +63,14 @@ fn is_plain_name(s: &str) -> bool {
     }
     cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
+
+/// Names bash may answer from the CALLER's environment (the estree
+/// ref's `env_resident` set): a never-written read of one of these
+/// falls back to `process.env.<name>` instead of the unset "".
+const ENV_RESIDENT: &[&str] = &[
+    "HOME", "USER", "PATH", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "LC_CTYPE",
+    "OLDPWD", "SHLVL", "TMPDIR", "EDITOR", "PAGER", "HOSTNAME", "BASH_VERSION", "BASH",
+];
 
 /// Render an `IrProgram` to a Node-style JS script.
 pub fn shir_to_js(prog: &IrProgram) -> String {
@@ -272,8 +284,11 @@ impl Render {
         }
     }
 
-    /// String interpolation: `"a$xb"` → `("a" + x + "b")` — plain `+`
-    /// concatenation (JS coerces numbers to strings mid-concat).
+    /// String interpolation: `"a$xb"` → `("a" + String(x) + "b")` —
+    /// plain `+` concatenation, with NUMERIC parts String()-coerced so
+    /// an all-numeric interpolation (`"$i$j"`) concatenates instead of
+    /// adding (bash: string context; the estree ref renders
+    /// interpolations as template literals, which stringify each part).
     fn interpolate(&mut self, parts: &[InterpPart]) -> String {
         let mut exprs: Vec<String> = Vec::new();
         let mut lit = String::new();
@@ -285,7 +300,12 @@ impl Render {
                         exprs.push(Self::js_str(&lit));
                         lit.clear();
                     }
-                    exprs.push(self.expr(x));
+                    let e = self.expr(x);
+                    if self.expr_is_num(x) {
+                        exprs.push(format!("String({e})"));
+                    } else {
+                        exprs.push(e);
+                    }
                 }
             }
         }
@@ -419,6 +439,21 @@ impl Render {
                 }
                 self.sh2_stub("arith", args, "arith")
             }
+            // `param(op, name[, a[, b]])` — `${x}` parameter expansions
+            // (the C/zsh/go frontends' `${#x}` strlen / `${x:-d}`
+            // default / strip / replace / slice lowerings). Mirrors the
+            // estree ref's `try_native_param` native forms for literal
+            // operands; anything else keeps the runtime stub.
+            "param" => {
+                if let (Some(IrExpr::Str(op, _)), Some(IrExpr::Str(name, _))) =
+                    (args.first(), args.get(1))
+                {
+                    if let Some(x) = self.param_native(op, name, args) {
+                        return x;
+                    }
+                }
+                self.sh2_stub("param", args, "param")
+            }
             // C array literal (`int a[3] = {..}` → setArray("a", [...]))
             "setArray" => {
                 if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Array(items))) =
@@ -532,9 +567,15 @@ impl Render {
         if self.env_vars.contains(name) {
             return None;
         }
+        // `$?` — the last command's exit status (the estree ref's
+        // `sh2.lastExit`; exec statements write it)
+        if name == "?" {
+            self.uses_status = true;
+            return Some("sh2_lastExit".into());
+        }
         if matches!(
             name,
-            "?" | "$"
+            "$"
                 | "#"
                 | "@"
                 | "*"
@@ -560,6 +601,13 @@ impl Render {
         if is_plain_name(name) {
             if self.known_vars.contains(name) {
                 return Some(self.js_ident(name));
+            }
+            // ENV-RESIDENT name (the estree ref's env_resident set —
+            // the runtime's env fallback): a name never written in the
+            // program answers the caller's environment (zsh-sh-go
+            // t05_env_read.zsh — `echo $HOME`)
+            if ENV_RESIDENT.contains(&name) {
+                return Some(format!("(process.env.{name} ?? \"\")"));
             }
             // never written (and not env): bash reads unset → ""
             return Some("\"\"".into());
@@ -598,6 +646,220 @@ impl Render {
             }
             _ => None,
         }
+    }
+
+    /// The native read of a `param` target: the binding for a
+    /// referenced name, the env fallback for an env-resident
+    /// never-written name, "" — exactly the getVar fold (param reads
+    /// route through the same value paths; `?` is the last-exit status).
+    fn read_var(&mut self, name: &str) -> String {
+        if name == "?" {
+            self.uses_status = true;
+            return "sh2_lastExit".into();
+        }
+        if self.known_vars.contains(name) {
+            return self.js_ident(name);
+        }
+        if ENV_RESIDENT.contains(&name) {
+            return format!("(process.env.{name} ?? \"\")");
+        }
+        "\"\"".into()
+    }
+
+    /// A literal glob-strip/substitute pattern (no metachars) that
+    /// embeds cleanly in a JS string literal.
+    fn is_literal_pattern(p: &str) -> bool {
+        !p.is_empty() && p.is_ascii() && !p.chars().any(|c| matches!(c, '*' | '?' | '['))
+    }
+
+    /// `param(op, name[, a[, b]])` with literal operands — the native
+    /// forms mirroring the estree ref's `try_native_param` (the runtime
+    /// param dispatch's literal fast paths) over the native bindings.
+    /// None → the runtime stub.
+    fn param_native(&mut self, op: &str, name: &str, args: &[IrExpr]) -> Option<String> {
+        if !is_plain_name(name) {
+            return None;
+        }
+        let val = self.read_var(name);
+        // `${x}` — a plain read of the binding
+        if op.is_empty() {
+            return Some(val);
+        }
+        // `${#x}` — string length
+        if op == "len" {
+            return Some(format!("String({val}).length"));
+        }
+        // `${x^^}` / `${x,,}` — case conversion
+        if op == "^^" {
+            return Some(format!("({val}).toUpperCase()"));
+        }
+        if op == ",," {
+            return Some(format!("({val}).toLowerCase()"));
+        }
+        // `${x^}` / `${x,}` — first character only (empty → "", like
+        // the runtime's `v.length ? ... : v`)
+        if op == "^" || op == "," {
+            let up = if op == "^" { "toUpperCase" } else { "toLowerCase" };
+            return Some(format!(
+                "(({val}).charAt(0).{up}() + ({val}).slice(1))"
+            ));
+        }
+        // `${x#p}` / `${x##p}` / `${x%p}` / `${x%%p}` — literal
+        // prefix/suffix removal (shortest == longest for literal
+        // patterns, exactly like the runtime's literal fast paths);
+        // single-star globs (`*P` / `P*`) strip through the first/last
+        // occurrence of the literal core.
+        if matches!(op, "#" | "##" | "%" | "%%") {
+            let [_, _, IrExpr::Str(p, _), ..] = args else {
+                return None;
+            };
+            if Self::is_literal_pattern(p) {
+                let len = p.chars().count() as i64;
+                return Some(if op.starts_with('#') {
+                    format!(
+                        "(({val}).startsWith({p}) ? ({val}).slice({len}) : ({val}))",
+                        p = Self::js_str(p)
+                    )
+                } else {
+                    format!(
+                        "(({val}).endsWith({p}) ? ({val}).slice(0, -{len}) : ({val}))",
+                        p = Self::js_str(p)
+                    )
+                });
+            }
+            let core = if op.starts_with('#') {
+                p.strip_prefix('*')
+            } else {
+                p.strip_suffix('*')
+            };
+            let core = core?;
+            if core.is_empty() || !Self::is_literal_pattern(core) {
+                return None;
+            }
+            let clen = core.chars().count() as i64;
+            // `#` (shortest prefix) / `%%` (longest suffix) are the
+            // FIRST occurrence; `##` (longest prefix) / `%` (shortest
+            // suffix) are the LAST (literal: first == last, but the
+            // runtime's indexOf/lastIndexOf mirror keeps it exact).
+            let first = op == "#" || op == "%%";
+            let ix = if first {
+                format!("({val}).indexOf({})", Self::js_str(core))
+            } else {
+                format!("({val}).lastIndexOf({})", Self::js_str(core))
+            };
+            return Some(if op.starts_with('#') {
+                format!("(({ix}) >= 0 ? ({val}).slice(({ix}) + {clen}) : ({val}))")
+            } else {
+                format!("(({ix}) >= 0 ? ({val}).slice(0, ({ix})) : ({val}))")
+            });
+        }
+        // `${x/p/r}` — replace the first occurrence; `${x//p/r}` — all
+        // occurrences. A `$` in the replacement stays on the runtime
+        // (JS replace would interpret `$&`/`$1` sequences); the `//`
+        // form then takes the split/join path instead.
+        if op == "/" || op == "//" {
+            let [_, _, IrExpr::Str(p, _), IrExpr::Str(r, _), ..] = args else {
+                return None;
+            };
+            if !Self::is_literal_pattern(p) {
+                return None;
+            }
+            if r.contains('$') {
+                if op == "/" {
+                    return None;
+                }
+                return Some(format!(
+                    "(({val}).split({}).join({}))",
+                    Self::js_str(p),
+                    Self::js_str(r)
+                ));
+            }
+            let m = if op == "/" { "replace" } else { "replaceAll" };
+            return Some(format!(
+                "({val}).{m}({}, {})",
+                Self::js_str(p),
+                Self::js_str(r)
+            ));
+        }
+        // `${x:-d}` — default when empty. `${x:=d}` also WRITES the
+        // binding (a JS assignment expression; only for a native
+        // binding — an undeclared write would throw in strict mode).
+        if op == ":-" || op == ":=" {
+            let [_, _, d] = args else {
+                return None;
+            };
+            let dflt = self.expr(d);
+            if op == ":-" {
+                return Some(format!("(({val}) !== \"\" ? ({val}) : {dflt})"));
+            }
+            if !self.known_vars.contains(name) {
+                return None;
+            }
+            let nm = self.js_ident(name);
+            return Some(format!(
+                "(({val}) !== \"\" ? ({val}) : ({nm} = {dflt}, {nm}))"
+            ));
+        }
+        // `${x:?msg}` — error when empty: bash prints to stderr and
+        // exits 1 (a literal message only).
+        if op == ":?" {
+            let [_, _, IrExpr::Str(m, _)] = args else {
+                return None;
+            };
+            if m.contains('$') {
+                return None;
+            }
+            let msg = if m.is_empty() {
+                format!("{name}: parameter null or not set")
+            } else {
+                m.clone()
+            };
+            return Some(format!(
+                "(({val}) !== \"\" ? ({val}) : (process.stderr.write({}), process.exit(1)))",
+                Self::js_str(&format!("bash: {name}: {msg}\n"))
+            ));
+        }
+        // `${x:off:len}` — substring slice with LITERAL integer
+        // offsets (negative counts from the end, like the runtime's
+        // v.slice(off, off + len)); non-integer offsets stay on the
+        // runtime.
+        if op == "slice" {
+            let int_of = |t: &str| -> Option<i64> {
+                let t = t.trim();
+                if t.is_empty() {
+                    Some(0)
+                } else if t.starts_with('-') {
+                    t[1..].parse::<i64>().ok().map(|v| -v)
+                } else {
+                    t.parse::<i64>().ok()
+                }
+            };
+            let [_, _, IrExpr::Str(off, _), IrExpr::Str(len, _)] = args else {
+                return None;
+            };
+            let o = int_of(off)?;
+            if len.trim().is_empty() {
+                return Some(format!("({val}).slice({o})"));
+            }
+            let l = int_of(len)?;
+            return Some(format!("({val}).slice({o}, {})", o + l));
+        }
+        // `${x##*/}` — the parser's basename/dirname ops: trailing-
+        // slash strip + last-component split (a missing slash yields
+        // the whole path / ".").
+        if op == "basename" || op == "dirname" {
+            let strip = format!("({val}).replace(/\\/+$/, \"\")");
+            return Some(if op == "basename" {
+                format!(
+                    "(() => {{ const s = {strip}; const i = s.lastIndexOf(\"/\"); return i >= 0 ? s.slice(i + 1) : s; }})()"
+                )
+            } else {
+                format!(
+                    "(() => {{ const s = {strip}; const i = s.lastIndexOf(\"/\"); return i >= 0 ? s.slice(0, i) : \".\"; }})()"
+                )
+            });
+        }
+        None
     }
 
     /// `$(echo <literal words>)` — a capture of a literal echo folds to
@@ -697,12 +959,17 @@ impl Render {
         }
     }
 
-    /// A test operand: `$y` (optionally quoted) → the native var binding;
-    /// a number → a literal; anything else → a quoted string (bash only
-    /// expands `$`-prefixed operands).
-    fn test_operand(&self, t: &str) -> String {
+    /// A test operand: `$y` (optionally quoted) → the native var
+    /// binding; `$?` → the last-exit status; a number → a literal;
+    /// anything else → a quoted string (bash only expands
+    /// `$`-prefixed operands).
+    fn test_operand(&mut self, t: &str) -> String {
         let t = t.trim().trim_matches('"');
         if let Some(rest) = t.strip_prefix('$') {
+            if rest == "?" {
+                self.uses_status = true;
+                return "sh2_lastExit".into();
+            }
             if is_plain_name(rest) {
                 return self.js_ident(rest);
             }
@@ -781,19 +1048,26 @@ impl Render {
 
     /// `parts` → a single `process.stdout.write(<concat>)` expression.
     /// JS's dynamic typing makes the C renderer's %lld/%s split
-    /// unnecessary — plain `+` concatenation coerces numbers.
+    /// unnecessary — plain `+` concatenation coerces strings — but a
+    /// NUMERIC part must be String()-coerced first: `$i$j` with two
+    /// Int-typed vars would otherwise ADD (bash: string concatenation;
+    /// the estree ref String()s every non-literal echo arg).
     fn write_from_parts(&mut self, parts: Vec<Part>) -> String {
         let mut exprs: Vec<String> = Vec::new();
         let mut lit = String::new();
         for p in parts {
             match p {
                 Part::Lit(t) => lit.push_str(&t),
-                Part::Arg(v, _is_num) => {
+                Part::Arg(v, is_num) => {
                     if !lit.is_empty() {
                         exprs.push(Self::js_str(&lit));
                         lit.clear();
                     }
-                    exprs.push(v);
+                    if is_num {
+                        exprs.push(format!("String({v})"));
+                    } else {
+                        exprs.push(v);
+                    }
                 }
             }
         }
@@ -1085,6 +1359,28 @@ impl Render {
                         if func == "continue" {
                             self.emit("continue;");
                             return;
+                        }
+                    }
+                }
+                // exec statements set the exit status (`$?` — the estree
+                // ref's sh2.lastExit protocol): the known natives fold to
+                // a constant; an unknown external keeps the previous
+                // status (its sh2.* stub aborts anyway).
+                if let IrExpr::Call { func, args } = e {
+                    if func == "exec" {
+                        if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                            let status = match cmd.as_str() {
+                                "false" => Some("1"),
+                                "true" | "echo" | "printf" => Some("0"),
+                                _ => None,
+                            };
+                            if let Some(st) = status {
+                                let x = self.expr(e);
+                                self.emit(&format!("{x};"));
+                                self.uses_status = true;
+                                self.emit(&format!("sh2_lastExit = {st};"));
+                                return;
+                            }
                         }
                     }
                 }
@@ -1409,6 +1705,10 @@ impl Render {
         self.emit("#!/usr/bin/env node");
         self.emit("\"use strict\";");
         self.emit("");
+        if self.uses_status {
+            self.emit("let sh2_lastExit = 0;");
+            self.emit("");
+        }
         if !self.sh2_calls.is_empty() {
             self.emit("/* sh2.* runtime stubs — TODO: implement (harness/sh2-namespace.json) */");
             let names: Vec<String> = self.sh2_calls.iter().cloned().collect();
