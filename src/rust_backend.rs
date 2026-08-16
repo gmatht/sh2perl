@@ -1098,7 +1098,7 @@ impl Render {
                     None => "0".to_string(),
                 };
                 // EXIT traps fire before the process exits
-                self.add_helper("run");
+                self.add_helper("run_traps");
                 self.emit("__sh_run_traps();");
                 self.emit(&format!("std::process::exit(({code}) as i32);"));
             }
@@ -4576,7 +4576,7 @@ impl Render {
             self.stmt(s);
         }
         if !self.trap_exit.is_empty() {
-            self.add_helper("run");
+            self.add_helper("run_traps");
             self.emit("__sh_run_traps();");
         }
         std::mem::swap(&mut self.out, &mut body_out);
@@ -4797,6 +4797,7 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "printf" => &["q", "echo_esc", "atoi", "atou", "atof"],
         "capture_rc" => &["cap_bytes"],
         "run" => &["spawn"],
+        "run_traps" => &["spawn"],
         "strippre" | "stripsuf" | "replace" => &["fnmatch"],
         "glob" => &["cap_bytes"],
         "rand" => &["cap_bytes"],
