@@ -634,7 +634,7 @@ impl Render {
                 format!("__sh_cat(&[{w}]).join(\" \")")
             }
             IrExpr::Call { func, args } if func == "arrayItems" => {
-                args.first().map(|a| self.expr_str(a)).unwrap_or_else(|| "String::new()".to_string())
+                self.array_items_str(args)
             }
             IrExpr::Call { func, args } if func == "test" => {
                 let _ = args;
@@ -1748,6 +1748,30 @@ impl Render {
         }
     }
 
+    /// `${!prefix*}` — the declared-var names matching the prefix; the
+    /// renderer knows the hoisted set (bash's name-list expansion).
+    fn array_items_str(&mut self, args: &[IrExpr]) -> String {
+        if let Some(prefix) = str_arg(args, 0) {
+            let mut names: Vec<String> = self
+                .written
+                .iter()
+                .filter(|n| n.starts_with(prefix))
+                .cloned()
+                .collect();
+            names.sort();
+            if names.is_empty() {
+                "String::new()".to_string()
+            } else {
+                format!(
+                    "[{}].join(\" \")",
+                    names.iter().map(|n| Self::rust_str(n)).collect::<Vec<_>>().join(", ")
+                )
+            }
+        } else {
+            "String::new()".to_string()
+        }
+    }
+
     /// `let x=1+2` / `let x++` / `let i < n` — a mini arithmetic-text
     /// parser producing a native i64 expression.
     fn let_expr(&mut self, text: &str) -> Option<String> {
@@ -1950,10 +1974,10 @@ impl Render {
                 func: func.to_string(),
                 args: args.to_vec(),
             })),
-            "arrayItems" => args
-                .first()
-                .map(|a| format!("vec![{}]", self.expr_str(a)))
-                .unwrap_or_else(|| "Vec::new()".to_string()),
+            "arrayItems" => {
+                let s = self.array_items_str(args);
+                format!("vec![{s}]", )
+            }
             "arith" => {
                 let text = str_arg(args, 0).unwrap_or("").replace(GLOB_SENTINEL, "");
                 if let Some(e) = self.arith_text(&text) {
@@ -2209,7 +2233,12 @@ impl Render {
     fn assoc_key_expr(&mut self, key: &str) -> String {
         let k = key.trim();
         if k.starts_with('"') && k.ends_with('"') && k.len() >= 2 {
-            return Self::rust_str_expr(&k[1..k.len() - 1]);
+            let inner = &k[1..k.len() - 1];
+            if inner.contains('$') {
+                // `options["$key"]` — the quoted key is source text
+                return self.dollar_interp(inner);
+            }
+            return Self::rust_str_expr(inner);
         }
         if k.starts_with('$') || k.starts_with('{') || k.contains('$') {
             // interpolate the key text at runtime
@@ -2284,6 +2313,9 @@ impl Render {
     fn brace_group(&mut self, g: &serde_json::Value) -> Vec<String> {
         let mut items: Vec<String> = Vec::new();
         if let Some(es) = g.as_array() {
+            // bash: `{1..10,20}` is a comma LIST — range-looking items
+            // stay LITERAL (`1..10`) unless the brace is a bare range
+            let comma_list = es.len() > 1;
             for e in es {
                 if let Some(s) = e.as_str() {
                     items.push(s.to_string());
@@ -2291,6 +2323,10 @@ impl Render {
                     let start = r.first().and_then(|x| x.as_str()).unwrap_or("");
                     let end = r.get(1).and_then(|x| x.as_str()).unwrap_or("");
                     let step: i64 = r.get(2).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).unwrap_or(1);
+                    if comma_list {
+                        items.push(format!("{start}..{end}"));
+                        continue;
+                    }
                     if let (Ok(a), Ok(b)) = (start.parse::<i64>(), end.parse::<i64>()) {
                         // zero-padding follows bash: only when the FIRST
                         // operand has a leading zero; width = its width
@@ -2394,6 +2430,11 @@ impl Render {
         let mut saved = std::mem::take(&mut self.out);
         let old_depth = self.depth;
         self.depth = 1;
+        // a capture is a standalone stdout context — an active fd-1
+        // redirect (a nested `<(producer)` file) must not swallow the
+        // captured output (the inner mktemp would write its path into
+        // the outer producer's file)
+        self.emit("let __cap_oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());");
         self.emit("let __old = __SH_OUT.lock().unwrap().take();");
         self.emit("*__SH_OUT.lock().unwrap() = Some(Vec::new());");
         for s in stmts {
@@ -2401,6 +2442,7 @@ impl Render {
         }
         self.emit("let __cap = __SH_OUT.lock().unwrap().take().unwrap();");
         self.emit("*__SH_OUT.lock().unwrap() = __old;");
+        self.emit("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = __cap_oldout);");
         self.emit("let mut __s = String::from_utf8_lossy(&__cap).to_string();");
         self.emit("while __s.ends_with('\\n') { __s.pop(); }");
         self.emit("__s");
@@ -3016,6 +3058,11 @@ impl Render {
             self.emit(&format!("std::thread::spawn(move || {{ \n{block}\n }});"));
             return;
         }
+        // an explicit Rust block scope — the thread_local OUTFILE
+        // Option<File> is moved by the post restore; nested redirects
+        // in the same flat scope would otherwise share one binding
+        self.emit("{");
+        self.depth += 1;
         for p in pre {
             self.emit(&p);
         }
@@ -3025,6 +3072,8 @@ impl Render {
         for p in post {
             self.emit(&p);
         }
+        self.depth -= 1;
+        self.emit("}");
     }
 
     /// The IrStmt::Redirect statement.
@@ -3242,6 +3291,30 @@ impl Render {
             }
         }
         if name.contains('[') && name.ends_with(']') {
+            // `${arr[i]#pat}` / `${arr[i]%pat}` etc. — a transform on an
+            // ELEMENT: read the element, then apply the op
+            if matches!(op, "#" | "##" | "%" | "%%" | "/" | "//") {
+                let var_expr = self.array_index_name(name);
+                let pat = str_arg(args, 2).unwrap_or("");
+                return match op {
+                    "#" | "##" => {
+                        let greedy = op == "##";
+                        self.add_helper("strippre");
+                        format!("__sh_strippre(&{var_expr}, {}, {greedy})", Self::rust_str(pat))
+                    }
+                    "%" | "%%" => {
+                        let greedy = op == "%%";
+                        self.add_helper("stripsuf");
+                        format!("__sh_stripsuf(&{var_expr}, {}, {greedy})", Self::rust_str(pat))
+                    }
+                    _ => {
+                        let repl = args.get(3).map(|x| self.param_val_str(x)).unwrap_or_else(|| "String::new()".to_string());
+                        let all = op == "//";
+                        self.add_helper("replace");
+                        format!("__sh_replace(&{var_expr}, {}, &{repl}, {all})", Self::rust_str(pat))
+                    }
+                };
+            }
             return self.array_index_name(name);
         }
         if name_at || idx_at {
@@ -3422,10 +3495,7 @@ impl Render {
                 self.add_helper("cat");
                 format!("__sh_cat(&[{w}]).join(\" \")")
             }
-            "arrayItems" => args
-                .first()
-                .map(|a| self.expr_str(a))
-                .unwrap_or_else(|| "String::new()".to_string()),
+            "arrayItems" => self.array_items_str(args),
             "grepMatches" => {
                 self.add_helper("grepmatches");
                 let text = args.first().map(|a| self.expr_str(a)).unwrap_or_default();
@@ -3975,7 +4045,25 @@ impl Render {
                 self.emit(&format!("let {dg} = {d};"));
                 let mut first = true;
                 for c in clauses {
-                    let mut pats: Vec<&String> = c.patterns.iter().filter(|p| !p.is_empty() && p.as_str() != "*").collect();
+                    // patterns arrive as source text — unwrap a fully
+                    // quoted pattern (`""` matches the empty string;
+                    // `"*"` is a LITERAL star, not the wildcard)
+                    let mut pats: Vec<String> = c
+                        .patterns
+                        .iter()
+                        .filter(|p| p.as_str() != "*")
+                        .map(|p| {
+                            let t = p.trim();
+                            if t.len() >= 2
+                                && ((t.starts_with('"') && t.ends_with('"'))
+                                    || (t.starts_with('\'') && t.ends_with('\'')))
+                            {
+                                t[1..t.len() - 1].to_string()
+                            } else {
+                                p.clone()
+                            }
+                        })
+                        .collect();
                     let is_default = pats.is_empty();
                     let cond = if is_default {
                         "true".to_string()
