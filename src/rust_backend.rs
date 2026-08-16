@@ -85,6 +85,8 @@ pub struct Render {
     captured: HashMap<String, String>,
     /// `typeset -n ref=target` namerefs (reads/writes redirect)
     namerefs: HashMap<String, String>,
+    /// `shopt -s nocasematch` — [[ ]] pattern matches fold case
+    nocasematch: bool,
     /// runtime helper fns needed (dependency closure)
     helpers: BTreeSet<String>,
     /// Rust identifier per shell var name (sanitize + de-dup)
@@ -341,6 +343,14 @@ impl Render {
 
     /// Array element read: `ARR[i]` (index arrays).
     fn array_elem(&mut self, name: &str, key: &str) -> String {
+        if name == "PIPESTATUS" {
+            // the pipeline stage rcs (populated by pipeline_stmt); the
+            // guard must be scoped (two reads in one expression would
+            // otherwise deadlock the non-reentrant mutex)
+            return format!(
+                "{{ let __p = __SH_PIPESTATUS.lock().unwrap(); __p.get({key} as usize).cloned().unwrap_or(0).to_string() }}"
+            );
+        }
         let m = self.tls(name);
         format!("{m}.with(|v| v.borrow().get({key} as usize).cloned().unwrap_or_default())")
     }
@@ -425,6 +435,10 @@ impl Render {
                 "UID" | "EUID" => {
                     self.add_helper("capture");
                     "__sh_capture(\"id -u\")".to_string()
+                }
+                "HOSTNAME" => {
+                    self.add_helper("capture");
+                    "__sh_capture(\"hostname\")".to_string()
                 }
                 "-" => "\"hB\".to_string()".to_string(),
                 "LINENO" | "SECONDS" | "BASH_VERSION" | "BASH_SOURCE" | "FUNCNAME"
@@ -1157,8 +1171,21 @@ impl Render {
                 }
             }
             "shopt" => {
-                // `shopt -s/-u opt` — option toggles (nullglob, extglob…)
-                // don't affect the native lowering; a no-op is faithful
+                // `shopt -s/-u nocasematch` — [[ ]] pattern matches turn
+                // case-insensitive (render-time: shopt is static here)
+                let mut set = false;
+                let mut unset = false;
+                for w in &words {
+                    if let Some(ws) = str_arg(&[(*w).clone()], 0) {
+                        if ws == "-s" {
+                            set = true;
+                        } else if ws == "-u" {
+                            unset = true;
+                        } else if ws == "nocasematch" {
+                            self.nocasematch = set && !unset;
+                        }
+                    }
+                }
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
             "true" | ":" => {
@@ -1620,6 +1647,15 @@ impl Render {
                 } else if !ws.is_empty() {
                     // a bare name — already declared by the hoist
                     self.mark_written(ws);
+                    if exported || xflag {
+                        // `export NAME` — push the current value out
+                        let cur = self.read_str(ws);
+                        self.emit(&format!(
+                            "std::env::set_var({}, &{cur});",
+                            Self::rust_str(ws)
+                        ));
+                        xflag = false;
+                    }
                 }
             }
             i += 1;
@@ -2095,8 +2131,8 @@ impl Render {
             if op == "slice" {
                 let off = args.get(2).map(|x| self.slice_index_expr(x)).unwrap_or_else(|| "0".to_string());
                 let len = match args.get(3) {
-                    None => "-1".to_string(),
-                    Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
+                    None => "i64::MIN".to_string(),
+                    Some(IrExpr::Str(s, _)) if s.is_empty() => "i64::MIN".to_string(),
                     Some(x) => self.slice_index_expr(x),
                 };
                 return format!(
@@ -2216,6 +2252,11 @@ impl Render {
                 return self.assoc_get(name, &Self::rust_str_expr(k));
             }
             self.assoc_get(name, &key)
+        } else if name == "PIPESTATUS" {
+            // the pipeline stage rcs (populated by pipeline_stmt)
+            format!(
+                "__SH_PIPESTATUS.lock().unwrap().get({key} as usize).cloned().unwrap_or(0).to_string()"
+            )
         } else {
             self.array_elem(name, &key)
         }
@@ -2575,6 +2616,7 @@ impl Render {
         self.add_helper("cap_bytes");
         let buf = self.gensym("__sh_pbuf");
         self.emit(&format!("let mut {buf}: Vec<u8> = Vec::new();"));
+        self.emit("__SH_PIPESTATUS.lock().unwrap().clear();");
         let mut idx = 0;
         while idx < n {
             // consecutive shell stages are joined into ONE `bash -c`
@@ -2607,6 +2649,7 @@ impl Render {
                 } else {
                     self.emit(&format!("{buf} = __sh_cap_bytes(&{joined}, Some(&{buf}));"));
                 }
+                self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::SeqCst));");
                 idx = j;
                 continue;
             }
@@ -2619,6 +2662,7 @@ impl Render {
                 } else {
                     self.emit(&format!("{buf} = __sh_cap_bytes(&{text}, Some(&{buf}));"));
                 }
+                self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::SeqCst));");
             } else {
                 // native stage
                 let mut saved = std::mem::take(&mut self.out);
@@ -2656,6 +2700,7 @@ impl Render {
                 if idx > 0 {
                     self.emit("*__SH_STDIN.lock().unwrap() = __oldin;");
                 }
+                self.emit("__SH_PIPESTATUS.lock().unwrap().push(__SH_RC.load(Ordering::SeqCst));");
                 let block = self.out.join("\n");
                 self.out = saved;
                 self.depth = old_depth;
@@ -3481,8 +3526,8 @@ impl Render {
                 // get a char slice
                 let off = args.get(2).map(|x| self.slice_index_expr(x)).unwrap_or_else(|| "0".to_string());
                 let len = match args.get(3) {
-                    None => "-1".to_string(),
-                    Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
+                    None => "i64::MIN".to_string(),
+                    Some(IrExpr::Str(s, _)) if s.is_empty() => "i64::MIN".to_string(),
                     Some(x) => self.slice_index_expr(x),
                 };
                 if name == "@" || name == "*" {
@@ -3623,7 +3668,15 @@ impl Render {
                 }
             }
             "shopt" => {
-                // option toggles — no-ops for the native lowering
+                // `shopt -s/-u nocasematch` — [[ ]] pattern matches fold
+                // case (render-time: shopt is static in these scripts)
+                if let Some(opt) = str_arg(args, 0) {
+                    if opt == "nocasematch" {
+                        if let Some(IrExpr::Bool(on)) = args.get(1) {
+                            self.nocasematch = *on;
+                        }
+                    }
+                }
                 "String::new()".to_string()
             }
             "assign" => self.assign_call_str(args),
@@ -4445,6 +4498,7 @@ impl Render {
         self.emit("static __SH_STDIN: std::sync::Mutex<Option<Box<dyn std::io::Read + Send>>> = std::sync::Mutex::new(None);");
         self.emit("static __SH_BG: std::sync::Mutex<Vec<(u32, std::process::Child)>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGTHREADS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());");
+        self.emit("static __SH_PIPESTATUS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
         self.emit("static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
         self.emit("");
@@ -5146,7 +5200,7 @@ fn helper_source(h: &str) -> &'static str {
     let mut o = if off < 0 { n + off } else { off };
     if o < 0 { o = 0; }
     if o > n { return String::new(); }
-    let mut l = if len < 0 { n - o } else { len };
+    let mut l = if len == i64::MIN { n - o } else if len < 0 { n + len - o } else { len };
     if l < 0 { l = 0; }
     if o + l > n { l = n - o; }
     ch[o as usize..(o + l) as usize].iter().collect()
@@ -6007,8 +6061,26 @@ fn test_tokens(s: &str) -> Option<Vec<TTok>> {
                 }
             }
             _ => {
+                // `~`, backslash-escapes and other odd starts — scan a
+                // word but BREAK at operators/quotes (the shIR test text
+                // joins operands without spaces: `a="$b"`)
                 let start = i;
-                while i < ch.len() && ch[i] != ' ' && ch[i] != '\t' && ch[i] != '\n' {
+                while i < ch.len() {
+                    let c2 = ch[i];
+                    if c2 == ' ' || c2 == '\t' || c2 == '\n' || c2 == '(' || c2 == ')'
+                        || c2 == '!' || c2 == '=' || c2 == '<' || c2 == '>' || c2 == '"'
+                        || c2 == '\''
+                    {
+                        break;
+                    }
+                    if c2 == '$' {
+                        let next = ch.get(i + 1).copied();
+                        if matches!(next, Some('{') | Some('('))
+                            || matches!(next, Some(n) if n.is_alphanumeric() || n == '_')
+                        {
+                            break;
+                        }
+                    }
                     i += 1;
                 }
                 out.push(TTok::Operand(ch[start..i].iter().collect()));
@@ -6199,7 +6271,14 @@ impl<'a, 'r> TestParser<'a, 'r> {
                 if self.style == "[[" {
                     // pattern match (glob) in [[ ]]
                     self.render.add_helper("fnmatch");
-                    format!("({} __sh_fnmatch(&{rhs}, &{lhs}))", if eq { "" } else { "!" })
+                    if self.render.nocasematch {
+                        format!(
+                            "({} __sh_fnmatch(&{rhs}.to_lowercase(), &{lhs}.to_lowercase()))",
+                            if eq { "" } else { "!" }
+                        )
+                    } else {
+                        format!("({} __sh_fnmatch(&{rhs}, &{lhs}))", if eq { "" } else { "!" })
+                    }
                 } else {
                     let rs = if eq { "==" } else { "!=" };
                     let l = if lhs_num { format!("{lhs}.to_string()") } else { lhs.to_string() };
@@ -6243,6 +6322,20 @@ impl Render {
         let quoted = (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
             || (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2);
         let inner = if quoted { &t[1..t.len() - 1] } else { t };
+        // `~/path` — tilde expansion (bare `~` and `~/...`)
+        if !quoted && inner.starts_with('~') {
+            let rest = &inner[1..];
+            if rest.is_empty() || rest.starts_with('/') {
+                self.add_helper("env");
+                if rest.is_empty() {
+                    return ("__sh_env(\"HOME\")".to_string(), false);
+                }
+                return (
+                    format!("format!(\"{{}}{{}}\", __sh_env(\"HOME\"), {})", Self::rust_str(rest)),
+                    false,
+                );
+            }
+        }
         // pure `$var`?
         if !quoted {
             if let Some(rest) = inner.strip_prefix('$') {
