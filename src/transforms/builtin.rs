@@ -74,7 +74,10 @@ fn rewrite_expr(e: &mut IrExpr) -> bool {
                     changed = true;
                 }
             }
-            for a in args.iter_mut().skip(1) {
+            // recurse into ALL args — pipeline/redirect/capture shapes
+            // carry nested Arrow bodies in args[0] (the cmd literal is a
+            // Str/Ident; recursing it is a no-op)
+            for a in args.iter_mut() {
                 changed |= rewrite_expr(a);
             }
             changed
@@ -98,12 +101,11 @@ fn rewrite_expr(e: &mut IrExpr) -> bool {
             }
             changed
         }
-        IrExpr::Capture { expr, .. } => {
+        IrExpr::Capture { .. } => {
             // pure command-substitution context: keep the inner exec's
-            // async semantics — do NOT rewrite, do recurse (deeper
-            // non-exec shapes are unaffected anyway).
-            let _ = expr;
-            rewrite_expr(expr) && false
+            // async semantics — do NOT descend (the capture renderers'
+            // native folds key on the exec command name).
+            false
         }
         IrExpr::Arrow(stmts) | IrExpr::Lambda { body: stmts, .. } => rewrite_stmts(stmts),
         IrExpr::Array(items) => {
@@ -305,7 +307,7 @@ fn erase(st: &mut IrStmt) -> bool {
                 } else {
                     false
                 };
-                for a in args.iter_mut().skip(1) {
+                for a in args.iter_mut() {
                     changed |= erase_expr(a);
                 }
                 changed
