@@ -1345,7 +1345,7 @@ impl Render {
                         format!("{m}.with(|v| *v.borrow_mut() = __v.trim().to_string())")
                     };
                     assigns.push(format!(
-                        "if __n == {} {{ let __v = __val.trim_matches(\\'\\').trim_matches(\\\"\\\"); {st}; }}",
+                        "if __n == {} {{ let __v = __val.trim_matches(|c| c == '\\'' || c == '\\\"'); {st}; }}",
                         Self::rust_str(v)
                     ));
                 }
@@ -1361,8 +1361,15 @@ impl Render {
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
             "exec" => {
-                // `exec cmd args` — run the command, then exit with its rc
+                // `exec cmd args` — run the command, then exit with its rc.
+                // `exec 3>&1` (redirects ONLY) just applies the redirects
+                // in a child — the process must NOT exit.
                 let text = self.cmd_text(&words, None);
+                if words.is_empty() {
+                    self.add_helper("run");
+                    self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::SeqCst);"));
+                    return;
+                }
                 self.add_helper("run");
                 self.emit(&format!("std::process::exit(__sh_run(&{text}));"));
             }
@@ -2807,15 +2814,20 @@ impl Render {
         let old_depth = self.depth;
         self.depth = 0;
         let cond_block = self.cond_block(&cond);
+        // bash: a while whose condition never tests true exits 0
+        let ran = self.gensym("__sh_while_ran");
+        self.emit(&format!("let mut {ran} = false;"));
         self.emit(&format!("while {cond_block} {{"));
         self.loop_depth += 1;
         self.depth += 1;
+        self.emit(&format!("{ran} = true;"));
         for s in &body {
             self.stmt(s);
         }
         self.depth -= 1;
         self.loop_depth -= 1;
         self.emit("}");
+        self.emit(&format!("if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }}"));
         let block = self.out.join("\n");
         self.out = saved;
         self.depth = old_depth;
@@ -3071,7 +3083,10 @@ impl Render {
                         }
                         "process-in" => {
                             if let Some(t) = &r.target {
-                                let te = self.expr_str(t);
+                                // the producer text is bash code with the
+                                // NATIVE vars interpolated (a child bash
+                                // would not see them)
+                                let te = self.redirect_target_text(t, true);
                                 full = format!("format!(\"{{}} < <({{}})\", {full}, {te})");
                             }
                         }
@@ -3140,7 +3155,7 @@ impl Render {
                 }
                 "process-in" => {
                     if let Some(t) = &r.target {
-                        let te = self.expr_str(t);
+                        let te = self.redirect_target_text(t, true);
                         self.add_helper("cap_bytes");
                         pre.push("let __oldin = __SH_STDIN.lock().unwrap().take();".to_string());
                         pre.push(format!(
@@ -3491,7 +3506,10 @@ impl Render {
                 .unwrap_or(name);
             if self.is_assoc(var) {
                 self.mark_written(var);
-                return self.assoc_keys(var).replace("collect::<Vec<String>>()", "join(\" \")");
+                // `${map[@]}` / `${map[*]}` — the VALUES (bash); the
+                // `${!map[@]}` keys form is handled by the `!` branch
+                let m = self.tls(var);
+                return format!("{m}.with(|v| v.borrow().values().cloned().collect::<Vec<String>>().join(\" \"))");
             }
             if self.is_array(var) {
                 self.mark_written(var);
@@ -4148,15 +4166,20 @@ impl Render {
             }
             IrStmt::While { cond, body } => {
                 let c = self.expr_bool(cond);
+                // bash: a while whose condition never tests true exits 0
+                let ran = self.gensym("__sh_while_ran");
+                self.emit(&format!("let mut {ran} = false;"));
                 self.emit(&format!("while {c} {{"));
                 self.loop_depth += 1;
                 self.depth += 1;
+                self.emit(&format!("{ran} = true;"));
                 for s in body {
                     self.stmt(s);
                 }
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 self.emit("}");
+                self.emit(&format!("if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }}"));
             }
             IrStmt::DoWhile { body, cond, until } => {
                 self.emit("loop {");
@@ -6503,7 +6526,14 @@ impl Render {
                             if let Some(e) = self.arith_text(&norm) {
                                 args.push(format!("({e}).to_string()"));
                             } else {
-                                args.push("String::new()".to_string());
+                                // `$(( $(cmd) + $(cmd) ))` — nested
+                                // command substitutions the arith parser
+                                // can't see — evaluate in a child bash
+                                self.add_helper("capture_rc");
+                                args.push(format!(
+                                    "__sh_capture_rc(&format!(\"echo \\\"$(( {{}} ))\\\"\", {})).0.trim().to_string()",
+                                    Self::rust_str(&body)
+                                ));
                             }
                             i = j + 2;
                             continue;
