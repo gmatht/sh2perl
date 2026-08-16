@@ -55,10 +55,10 @@ if (!-f $input_file) {
     die "Error: Input file '$input_file' does not exist\n";
 }
 
-# Resolve the embed backend (PLAN §10 Stage 2): otranspilerl-cli renders
-# shell snippets as embeddable fragments. Explicit option / OTRANSPILERL_CLI
-# env / the sibling crate's debug binary. Absent ⇒ embed path disabled and
-# purify degrades to the legacy debashc path (unchanged behaviour).
+# Resolve the embed backend (PLAN §10): otranspilerl-cli renders shell
+# snippets as embeddable fragments. Explicit option / OTRANSPILERL_CLI env /
+# the sibling crate's debug binary. Absent ⇒ snippets fall to the exec
+# fallback (never the legacy debashc Generator — otranspiler-only).
 {
     my $script_dir = $0 =~ m{(.*)[/\\]} ? $1 : '.';
     my $candidate = $otranspilerl_path
@@ -66,11 +66,9 @@ if (!-f $input_file) {
         || "$script_dir/../otranspilerl/target/debug/otranspilerl-cli";
     $OTRANSPILERL = (-x $candidate) ? $candidate : undef;
     print "DEBUG: otranspilerl-cli: " . ($OTRANSPILERL || 'NOT FOUND') . "\n" if $verbose;
-}
-
-# Check if debashc exists
-if (!-f $debashc_path) {
-    die "Error: debashc not found at '$debashc_path'. Please build the project first with 'cargo build'\n";
+    if (!$OTRANSPILERL) {
+        print "Warning: otranspilerl-cli not found — snippets will use the exec fallback (build with: cd otranspilerl && cargo build)\n";
+    }
 }
 
 print "Purifying Perl file: $input_file\n" if $verbose;
@@ -682,10 +680,10 @@ sub process_single_backtick_string {
             print "DEBUG: embed fragment for [$command]: $code\n" if $verbose;
             return defined $var_name ? "$prefix$var_name = $code;" : $code;
         }
-        print "DEBUG: embed refused; falling back to legacy debashc\n" if $verbose;
-        $perl_result = convert_shell_to_perl($command, 1);
+        print "DEBUG: embed refused; using exec fallback\n" if $verbose;
+        $perl_result = undef;
     } else {
-        $perl_result = convert_shell_to_perl($command, 1);
+        $perl_result = undef;
     }
 
     # Debashc sometimes generates code that references internal variables
@@ -1291,10 +1289,12 @@ sub generate_exec_do_block {
                 # raw command (without additional surrounding quotes) to debashc
                 # generally lets the parser see the intended shell syntax and
                 # enables generators (e.g. sha256sum/sha512sum) to emit pure-Perl
-                # implementations. If this fails we will fall back to the exec
-                #('sh','-c', ...) path below which uses the quoted form.
+                # implementations. otranspiler-only: the debashc --system path is
+                # retired — always fall to the exec('sh','-c', ...) path below
+                # (semantically exact; the legacy Generator conversion was
+                # nondeterministic and has been removed).
                 my $try_raw = $shell_cmd_raw;
-                $perl_inner = convert_shell_to_perl($try_raw, 0);
+                $perl_inner = undef;
             }
 
             if (defined $perl_inner) {
@@ -2093,7 +2093,10 @@ sub replace_backtick_with_code {
 # ── embed backend helpers (PLAN §10 Stage 2) ──────────────────────────
 
 sub embed_enabled {
-    return ($ENV{PURIFY_EMBED} && $ENV{PURIFY_EMBED} ne '0' && $OTRANSPILERL) ? 1 : 0;
+    # otranspiler-only (PLAN "migrate to otranspiler only"): the embed
+    # path is THE backtick path; refusals fall to the exec fallback, never
+    # the legacy debashc Generator.
+    return $OTRANSPILERL ? 1 : 0;
 }
 
 # Spawn a CLI with an argv array (no shell quoting layer), capture stdout+
