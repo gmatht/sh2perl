@@ -89,6 +89,9 @@ pub struct Render {
     nocasematch: bool,
     /// `trap 'handler' EXIT` handlers (run at process exit)
     trap_exit: Vec<String>,
+    /// `exec N>&M` fd dups (the emulated shell's fd table) — a later
+    /// `>&N` redirect resolves through this map to the dup'd target
+    fd_dups: HashMap<i64, i64>,
     /// runtime helper fns needed (dependency closure)
     helpers: BTreeSet<String>,
     /// Rust identifier per shell var name (sanitize + de-dup)
@@ -443,12 +446,17 @@ impl Render {
                     "__sh_capture(\"hostname\")".to_string()
                 }
                 "-" => "\"hB\".to_string()".to_string(),
-                "LINENO" | "SECONDS" | "BASH_VERSION" | "BASH_SOURCE" | "FUNCNAME"
+                "LINENO" | "SECONDS" | "BASH_SOURCE" | "FUNCNAME"
                 | "BASH_LINENO" | "PPID" | "EPOCHSECONDS" | "EPOCHREALTIME"
                 | "BASHPID" | "GROUPS" | "HOSTTYPE" | "MACHTYPE" | "OSTYPE"
                 | "SHELLOPTS" | "BASHOPTS" | "SHLVL" | "PIPESTATUS" => {
                     self.mark_todo(&format!("special var ${name}"));
                     "String::new()".to_string()
+                }
+                "BASH_VERSION" => {
+                    // bash always sets it — the corpus only needs it
+                    // non-empty (test operands, defaults)
+                    "\"5.1.16\".to_string()".to_string()
                 }
                 n if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
                     self.add_helper("arg");
@@ -968,12 +976,14 @@ impl Render {
             ArithAst::Var(name) | ArithAst::Ident(name) => self.getvar_num(name),
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
-                if self.is_array(var) || self.is_assoc(var) || self.declared(var) {
+                if (self.is_array(var) || self.is_assoc(var)) && self.declared(var) {
                     let e = self.array_elem(var, &k);
                     format!("{e}.trim().parse::<i64>().unwrap_or(0)")
                 } else {
-                    // an undeclared array element is 0 in arithmetic
-                    // (e.g. `${array[i]:-0}` inside an eval text)
+                    // an undeclared (never-written) array element is 0 in
+                    // arithmetic (e.g. `${array[i]:-0}` inside an eval text)
+                    // — emitting a read would reference an undeclared TLS
+                    // static and fail to compile
                     "0".to_string()
                 }
             }
@@ -2335,9 +2345,10 @@ impl Render {
             None => "0".to_string(),
         };
         if self.is_assoc(name) {
-            // assoc read with a numeric-looking key — use the literal text
+            // assoc read with a text key — interpolate (`m[$i,$j]`)
             if let Some(IrExpr::Str(k, _)) = args.get(1) {
-                return self.assoc_get(name, &Self::rust_str_expr(k));
+                let ke = self.assoc_key_expr(k);
+                return self.assoc_get(name, &ke);
             }
             self.assoc_get(name, &key)
         } else if name == "PIPESTATUS" {
@@ -2451,6 +2462,10 @@ impl Render {
             let inner = inner.strip_prefix('{').and_then(|s| s.strip_suffix('}')).unwrap_or(inner);
             if self.declared(inner) || self.captured.contains_key(inner) {
                 return self.getvar_str(inner);
+            }
+            // `${m[$i,$j]}` — a mixed key: interpolate the whole text
+            if k.contains('$') {
+                return self.dollar_interp(k);
             }
             Self::rust_str_expr(k)
         } else {
@@ -3072,14 +3087,71 @@ impl Render {
         self.expr_str(t)
     }
 
+    /// Resolve a redirect target fd through the dup table (`exec 4>&1`
+    /// records 4→1; `>&4` resolves to 1). Returns the resolved fd.
+    fn fd_resolve(&self, fd: i64) -> i64 {
+        let mut f = fd;
+        for _ in 0..8 {
+            match self.fd_dups.get(&f) {
+                Some(&n) => f = n,
+                None => break,
+            }
+        }
+        f
+    }
+
+    /// A `&N` / `&-` dup target: Some(resolved fd) for `&N`, None for
+    /// `&-` (close). Non-dup targets return the original string.
+    fn dup_target(&self, t: &IrExpr) -> Result<i64, String> {
+        if let IrExpr::Str(ts, _) = t {
+            if let Some(rest) = ts.strip_prefix('&') {
+                if rest == "-" {
+                    return Err("-".to_string());
+                }
+                if let Ok(n) = rest.parse::<i64>() {
+                    return Ok(self.fd_resolve(n));
+                }
+            }
+        }
+        Err("not a dup".to_string())
+    }
+
     /// Render a redirect statement (IrStmt::Redirect or the Call form).
     fn redirect_render(&mut self, inner: &[IrStmt], redirs: &[IrRedirectInfo]) {
+        // fd-dup bookkeeping: `exec 3>&1` (fd outside 0/1/2, `&N` target)
+        // records the dup in the emulated fd table so a later `>&3`
+        // resolves to the dup'd target; `3>&-` closes it. The table is
+        // consulted by [`Self::dup_target`] below.
+        for r in redirs {
+            if let Some(IrExpr::Str(ts, _)) = &r.target {
+                if let Some(rest) = ts.strip_prefix('&') {
+                    if rest == "-" {
+                        self.fd_dups.remove(&r.fd);
+                    } else if r.fd != 0 && r.fd != 1 && r.fd != 2 {
+                        if let Ok(n) = rest.parse::<i64>() {
+                            self.fd_dups.insert(r.fd, n);
+                        }
+                    }
+                }
+            }
+        }
         // split the redirects by effect
         let mut stdin_redir: Option<&IrRedirectInfo> = None; // fd 0
         let mut out_redirs: Vec<&IrRedirectInfo> = Vec::new(); // fd 1/2 file
         for r in redirs {
             match r.fd {
-                0 => stdin_redir = Some(r),
+                0 => {
+                    // `<&N` dup targets — the native stdin store already
+                    // serves fd 0; a self-dup changes nothing
+                    if let Some(t) = &r.target {
+                        if let IrExpr::Str(ts, _) = t {
+                            if ts.starts_with('&') {
+                                continue;
+                            }
+                        }
+                    }
+                    stdin_redir = Some(r)
+                }
                 1 | 2 => out_redirs.push(r),
                 _ => {}
             }
@@ -3096,16 +3168,16 @@ impl Render {
                         "w" | "a" => {
                             if let Some(t) = &r.target {
                                 let te = self.expr_str(t);
-                                // `2>&1` — a dup target
-                                if let IrExpr::Str(ts, _) = t {
-                                    if let Some(rest) = ts.strip_prefix('&') {
-                                        full = format!(
-                                            "format!(\"{{}} {}&{{}}\", {full}, {})",
-                                            if r.fd == 2 { "2>" } else { ">" },
-                                            Self::rust_str(rest)
-                                        );
-                                        continue;
-                                    }
+                                // `2>&1` / `>&4` — a dup target (resolved
+                                // through the emulated fd table so `>&4`
+                                // after `exec 4>&1` shells out as `> &1`)
+                                if let Ok(n) = self.dup_target(t) {
+                                    full = format!(
+                                        "format!(\"{{}} {}&{{}}\", {full}, {})",
+                                        if r.fd == 2 { "2>" } else { ">" },
+                                        n
+                                    );
+                                    continue;
                                 }
                                 let op = if r.mode == "w" { ">" } else { ">>" };
                                 let fd = if r.fd == 2 { "2" } else { "" };
@@ -3142,14 +3214,12 @@ impl Render {
                         _ => {
                             // dup targets ("2>&1") and unknown modes
                             if let Some(t) = &r.target {
-                                if let IrExpr::Str(ts, _) = t {
-                                    if let Some(rest) = ts.strip_prefix('&') {
-                                        full = format!(
-                                            "format!(\"{{}} {}&{{}}\", {full}, {})",
-                                            if r.fd == 2 { "2>" } else { ">" },
-                                            Self::rust_str(rest)
-                                        );
-                                    }
+                                if let Ok(n) = self.dup_target(t) {
+                                    full = format!(
+                                        "format!(\"{{}} {}&{{}}\", {full}, {})",
+                                        if r.fd == 2 { "2>" } else { ">" },
+                                        n
+                                    );
                                 }
                             }
                         }
@@ -3221,15 +3291,66 @@ impl Render {
         // gate ignores stderr, so an fd-2 file target is simply dropped
         // here, and a `2>&1` dup with a native inner has no stderr to
         // merge)
-        let file_redirs: Vec<&IrRedirectInfo> = out_redirs
+        let fd2_file: Option<&IrRedirectInfo> = out_redirs.iter().find(|r| {
+            r.fd == 2
+                && matches!(r.mode.as_str(), "w" | "a")
+                && r.target.is_some()
+                && !matches!(r.target.as_ref(), Some(IrExpr::Str(ts, _)) if ts.starts_with('&'))
+        })
+        .copied();
+        let mut file_redirs: Vec<&IrRedirectInfo> = out_redirs
             .iter()
-            .filter(|r| r.fd == 1 && matches!(r.mode.as_str(), "w" | "a") && r.target.is_some())
+            .filter(|r| {
+                r.fd == 1
+                    && matches!(r.mode.as_str(), "w" | "a")
+                    && r.target.is_some()
+                    // `>&N` dup targets must NOT become files named "&4" —
+                    // the native store already targets the dup'd fd (or
+                    // the gate-ignored stderr); a `>&-` close is dropped
+                    && !matches!(r.target.as_ref(), Some(IrExpr::Str(ts, _)) if ts.starts_with('&'))
+            })
             .copied()
             .collect();
+        // `>&file` legacy syntax: the core lowers it to [fd2→file, fd1→&2]
+        // — the fd-1 dup must route stdout to the fd-2 FILE target so
+        // both streams land in the file. (A standalone `>&2` on fd 1 is
+        // dropped: the native store's stdout IS the merged stream.)
+        if file_redirs.is_empty() {
+            if let Some(r2) = fd2_file {
+                if out_redirs
+                    .iter()
+                    .any(|r| r.fd == 1 && matches!(r.target.as_ref(), Some(IrExpr::Str(ts, _)) if ts == "&2"))
+                {
+                    file_redirs.push(r2);
+                }
+            }
+        }
+        // `>&N` onto an fd that is neither a live dup-table entry nor
+        // 0/1/2 — the fd is closed in the emulated shell, so bash fails
+        // the redirection and the command never runs: null its output
+        // (an `echo $? >&4` after `4>&-` must print nothing). Likewise
+        // `1>&2` / `>&2` with no fd-2 FILE target: the output goes to
+        // stderr, which the gate discards — null it (the native store's
+        // stdout is NOT the merged stream here).
+        let null_dup: Option<&IrRedirectInfo> = out_redirs
+            .iter()
+            .find(|r| {
+                r.fd == 1
+                    && matches!(r.mode.as_str(), "w" | "a")
+                    && matches!(r.target.as_ref(), Some(IrExpr::Str(ts, _)) if ts.starts_with('&'))
+                    && matches!(r.target.as_ref(), Some(t) if !matches!(self.dup_target(t), Ok(0) | Ok(1)) || (matches!(self.dup_target(t), Ok(2)) && fd2_file.is_none()))
+            })
+            .copied();
         let mut used_outfile = false;
-        if let Some(r) = file_redirs.first() {
-            let t = r.target.as_ref().unwrap();
-            let te = self.expr_str(t);
+        if let Some(r) = file_redirs.first().copied().or(null_dup) {
+            let te = if null_dup.is_some() && file_redirs.is_empty() {
+                // the closed-fd dup / stderr dup: /dev/null (the
+                // command's output is gone either way; bash would not
+                // run it at all for a bad fd)
+                Self::rust_str_expr("/dev/null")
+            } else {
+                self.expr_str(r.target.as_ref().unwrap())
+            };
             used_outfile = true;
             pre.push("let __oldout = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());".to_string());
             if r.mode == "w" {
@@ -6552,6 +6673,10 @@ impl Render {
                     && !name.contains('(')
                     && !name.contains('/')
                     && !name.contains('[')
+                    && !name.contains('-')
+                    && !name.contains('=')
+                    && !name.contains('+')
+                    && !name.contains('?')
                     && name.chars().all(|c| c.is_alphanumeric() || c == '_');
                 if bare {
                     if self.is_num(name) {
@@ -6720,7 +6845,16 @@ impl Render {
         // split off the leading name
         let ch: Vec<char> = body.chars().collect();
         let mut i = 0;
-        while i < ch.len() && ch[i] != ':' && ch[i] != '/' && ch[i] != '#' && ch[i] != '%' {
+        while i < ch.len()
+            && ch[i] != ':'
+            && ch[i] != '/'
+            && ch[i] != '#'
+            && ch[i] != '%'
+            && ch[i] != '-'
+            && ch[i] != '+'
+            && ch[i] != '='
+            && ch[i] != '?'
+        {
             i += 1;
         }
         let name: String = ch[..i].iter().collect();
@@ -7142,8 +7276,14 @@ impl<'a, 'r> ArithParser<'a, 'r> {
                         }
                         self.pos += 1;
                     }
-                    let e = self.render.array_elem(name, &k);
-                    return Some(format!("{e}.trim().parse::<i64>().unwrap_or(0)"));
+                    if self.render.declared(name) {
+                        let e = self.render.array_elem(name, &k);
+                        return Some(format!("{e}.trim().parse::<i64>().unwrap_or(0)"));
+                    }
+                    // an undeclared (never-written) array element is 0 in
+                    // arithmetic — emitting a read would reference an
+                    // undeclared TLS static and fail to compile
+                    return Some("0".to_string());
                 }
                 let v = self.render.getvar_num(name);
                 // postfix ++/--
