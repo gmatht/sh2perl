@@ -87,6 +87,8 @@ pub struct Render {
     namerefs: HashMap<String, String>,
     /// `shopt -s nocasematch` — [[ ]] pattern matches fold case
     nocasematch: bool,
+    /// `trap 'handler' EXIT` handlers (run at process exit)
+    trap_exit: Vec<String>,
     /// runtime helper fns needed (dependency closure)
     helpers: BTreeSet<String>,
     /// Rust identifier per shell var name (sanitize + de-dup)
@@ -1095,7 +1097,40 @@ impl Render {
                     Some(w) => self.expr_num(w),
                     None => "0".to_string(),
                 };
+                // EXIT traps fire before the process exits
+                self.add_helper("run");
+                self.emit("__sh_run_traps();");
                 self.emit(&format!("std::process::exit(({code}) as i32);"));
+            }
+            "trap" => {
+                // `trap 'handler' EXIT` — run the handler at exit (the
+                // child-bash shell-out would fire it at the wrong time)
+                let handler = words.first().and_then(|w| {
+                    let c = (*w).clone();
+                    str_arg(&[c], 0).map(|s| s.to_string())
+                });
+                if let Some(handler) = handler {
+                    if words.len() >= 2 {
+                        let sig = words.get(1).and_then(|w| {
+                            let c = (*w).clone();
+                            str_arg(&[c], 0).map(|s| s.to_string())
+                        });
+                        if let Some(sig) = sig {
+                            if sig == "EXIT" || sig == "0" {
+                                self.trap_exit.push(handler.to_string());
+                                self.emit(&format!(
+                                    "__SH_TRAPS.lock().unwrap().push({}.to_string());",
+                                    Self::rust_str(&handler)
+                                ));
+                                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                                return;
+                            }
+                        }
+                    }
+                }
+                // ERR/other traps: registered but not fired by the
+                // native lowering (a no-op is faithful when no error)
+                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
             "cd" => {
                 let e = self.cd_expr(&words);
@@ -4540,6 +4575,10 @@ impl Render {
         for s in &prog.stmts {
             self.stmt(s);
         }
+        if !self.trap_exit.is_empty() {
+            self.add_helper("run");
+            self.emit("__sh_run_traps();");
+        }
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 0;
 
@@ -4604,6 +4643,7 @@ impl Render {
         self.emit("static __SH_BG: std::sync::Mutex<Vec<(u32, std::process::Child)>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGTHREADS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_PIPESTATUS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());");
+        self.emit("static __SH_TRAPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
         self.emit("static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
         self.emit("");
@@ -4695,7 +4735,7 @@ const HELPER_ORDER: &[&str] = &[
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
-    "div", "mod", "arith_err", "capture",
+    "div", "mod", "arith_err", "capture", "run_traps",
 ];
 
 /// `${var}`, `${var:-N}`, `${var:-$other}`, `${arr[i]:-N}` inside an arith
@@ -5077,6 +5117,10 @@ fn helper_source(h: &str) -> &'static str {
 }"#,
         "run" => r#"fn __sh_run(cmd: &str) -> i32 {
     __sh_spawn(cmd, None)
+}"#,
+        "run_traps" => r#"fn __sh_run_traps() {
+    let hs = std::mem::take(&mut *__SH_TRAPS.lock().unwrap());
+    for h in hs { let _ = __sh_spawn(&h, None); }
 }"#,
         "readline" => r#"fn __sh_readline() -> (String, bool) {
     let mut buf: Vec<u8> = Vec::new();
