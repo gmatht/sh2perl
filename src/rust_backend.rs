@@ -104,6 +104,11 @@ pub struct Render {
     /// Rust identifier per shell var name (sanitize + de-dup)
     mangle: HashMap<String, String>,
     loop_depth: usize,
+    /// per-loop last-body-rc capture var (bash's loop status) — pushed by
+    /// While/DoWhile/ForInit/whileLoop renderers; `continue`/`break` (status-0
+    /// builtins) capture their 0 into it before jumping so the loop restores
+    /// the right status after the cond eval clobbers __SH_RC
+    loop_rc_last: Vec<String>,
     /// gensym counter for loop/block temporaries (`__sh_t0`, …)
     gensym: usize,
     /// inside a For-over-words body: the index var — a `continue` must
@@ -231,6 +236,15 @@ impl Render {
 
     fn mark_written(&mut self, name: &str) {
         self.written.insert(name.to_string());
+    }
+
+    /// Capture the current rc as the enclosing loop's final status (bash's
+    /// loop rc = last body command's status) — no-op outside a loop that
+    /// restores it (a plain `for` needs no restore: no cond eval clobbers).
+    fn loop_capture_rc(&mut self) {
+        if let Some(v) = self.loop_rc_last.last() {
+            self.emit(&format!("{v} = __SH_RC.load(Ordering::SeqCst);"));
+        }
     }
 
     /// Emit a `continue` — inside a For-over-words body the index must
@@ -906,14 +920,22 @@ impl Render {
             }
             IrExpr::Call { func, args } if func == "break" => {
                 if self.loop_depth > 0 {
-                    "{ break; false }".to_string()
+                    if let Some(v) = self.loop_rc_last.last() {
+                        format!("{{ __SH_RC.store(0, Ordering::SeqCst); {v} = __SH_RC.load(Ordering::SeqCst); break; false }}")
+                    } else {
+                        "{ __SH_RC.store(0, Ordering::SeqCst); break; false }".to_string()
+                    }
                 } else {
                     "false".to_string()
                 }
             }
             IrExpr::Call { func, args } if func == "continue" => {
                 if self.loop_depth > 0 {
-                    "{ continue; false }".to_string()
+                    if let Some(v) = self.loop_rc_last.last() {
+                        format!("{{ __SH_RC.store(0, Ordering::SeqCst); {v} = __SH_RC.load(Ordering::SeqCst); continue; false }}")
+                    } else {
+                        "{ __SH_RC.store(0, Ordering::SeqCst); continue; false }".to_string()
+                    }
                 } else {
                     "false".to_string()
                 }
@@ -1420,11 +1442,17 @@ impl Render {
             }
             "break" => {
                 if self.loop_depth > 0 {
+                    // break/continue are status-0 builtins; the loop's rc
+                    // is the last body command's — capture 0 before jumping
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.loop_capture_rc();
                     self.emit("break;");
                 }
             }
             "continue" => {
                 if self.loop_depth > 0 {
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.loop_capture_rc();
                     self.emit_continue();
                 }
             }
@@ -2148,11 +2176,15 @@ impl Render {
             }
             IrExpr::Call { func, .. } if func == "break" => {
                 if self.loop_depth > 0 {
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.loop_capture_rc();
                     self.emit("break;");
                 }
             }
             IrExpr::Call { func, .. } if func == "continue" => {
                 if self.loop_depth > 0 {
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.loop_capture_rc();
                     self.emit_continue();
                 }
             }
@@ -3149,20 +3181,29 @@ impl Render {
         let old_depth = self.depth;
         self.depth = 0;
         let cond_block = self.cond_block(&cond);
-        // bash: a while whose condition never tests true exits 0
+        // bash: a while whose condition never tests true exits 0;
+        // otherwise the loop's rc = the last body command's rc (the cond
+        // eval clobbers __SH_RC, so the body's rc is captured + restored)
         let ran = self.gensym("__sh_while_ran");
+        let last = self.gensym("__sh_while_last");
         self.emit(&format!("let mut {ran} = false;"));
+        self.emit(&format!("let mut {last} = 0;"));
         self.emit(&format!("while {cond_block} {{"));
         self.loop_depth += 1;
         self.depth += 1;
         self.emit(&format!("{ran} = true;"));
+        self.loop_rc_last.push(last.clone());
         for s in &body {
             self.stmt(s);
         }
+        self.loop_rc_last.pop();
+        self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
         self.depth -= 1;
         self.loop_depth -= 1;
         self.emit("}");
-        self.emit(&format!("if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }}"));
+        self.emit(&format!(
+            "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
+        ));
         let block = self.out.join("\n");
         self.out = saved;
         self.depth = old_depth;
@@ -4438,11 +4479,15 @@ impl Render {
                 }
                 IrExpr::Call { func, args } if func == "break" => {
                     if self.loop_depth > 0 {
+                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        self.loop_capture_rc();
                         self.emit("break;");
                     }
                 }
                 IrExpr::Call { func, args } if func == "continue" => {
                     if self.loop_depth > 0 {
+                        self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                        self.loop_capture_rc();
                         self.emit("continue;");
                     }
                 }
@@ -4685,28 +4730,45 @@ impl Render {
             }
             IrStmt::While { cond, body } => {
                 let c = self.expr_bool(cond);
-                // bash: a while whose condition never tests true exits 0
+                // bash: a while whose condition never tests true exits 0;
+                // otherwise the loop's rc = the last body command's rc —
+                // the cond eval stores its own rc every iteration, so the
+                // body's rc is captured and restored after the loop
                 let ran = self.gensym("__sh_while_ran");
+                let last = self.gensym("__sh_while_last");
                 self.emit(&format!("let mut {ran} = false;"));
+                self.emit(&format!("let mut {last} = 0;"));
                 self.emit(&format!("while {c} {{"));
                 self.loop_depth += 1;
                 self.depth += 1;
                 self.emit(&format!("{ran} = true;"));
+                self.loop_rc_last.push(last.clone());
                 for s in body {
                     self.stmt(s);
                 }
+                self.loop_rc_last.pop();
+                self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 self.emit("}");
-                self.emit(&format!("if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }}"));
+                self.emit(&format!(
+                    "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
+                ));
             }
             IrStmt::DoWhile { body, cond, until } => {
+                // bash: do/until rc = the last body command's rc — the cond
+                // eval clobbers __SH_RC, so capture + restore
+                let last = self.gensym("__sh_dw_last");
+                self.emit(&format!("let mut {last} = 0;"));
                 self.emit("loop {");
                 self.loop_depth += 1;
                 self.depth += 1;
+                self.loop_rc_last.push(last.clone());
                 for s in body {
                     self.stmt(s);
                 }
+                self.loop_rc_last.pop();
+                self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 let c = self.expr_bool(cond);
@@ -4716,6 +4778,7 @@ impl Render {
                     self.emit(&format!("if !{c} {{ break; }}"));
                 }
                 self.emit("}");
+                self.emit(&format!("__SH_RC.store({last}, Ordering::SeqCst);"));
             }
             IrStmt::For { var, iter, body } => {
                 self.mark_written(var);
@@ -4786,11 +4849,15 @@ impl Render {
             }
             IrStmt::Continue => {
                 if self.loop_depth > 0 {
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.loop_capture_rc();
                     self.emit_continue();
                 }
             }
             IrStmt::Break => {
                 if self.loop_depth > 0 {
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.loop_capture_rc();
                     self.emit("break;");
                 }
             }
@@ -4865,6 +4932,11 @@ impl Render {
                 if first {
                     // no clauses at all — nothing
                 } else {
+                    // no pattern matched — bash's case rc is 0
+                    self.emit("} else {");
+                    self.depth += 1;
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                    self.depth -= 1;
                     self.emit("}");
                 }
             }
@@ -4910,12 +4982,23 @@ impl Render {
                     self.stmt(s);
                 }
                 let c = self.expr_bool(cond);
+                // c-style for: rc = the last BODY command's rc (bash) — the
+                // cond eval clobbers __SH_RC each iteration, so capture the
+                // body's rc (before the step runs) and restore after
+                let ran = self.gensym("__sh_forinit_ran");
+                let last = self.gensym("__sh_forinit_last");
+                self.emit(&format!("let mut {ran} = false;"));
+                self.emit(&format!("let mut {last} = 0;"));
                 self.emit(&format!("while {c} {{"));
                 self.loop_depth += 1;
                 self.depth += 1;
+                self.emit(&format!("{ran} = true;"));
+                self.loop_rc_last.push(last.clone());
                 for s in body {
                     self.stmt(s);
                 }
+                self.loop_rc_last.pop();
+                self.emit(&format!("{last} = __SH_RC.load(Ordering::SeqCst);"));
                 self.depth -= 1;
                 self.loop_depth -= 1;
                 self.emit("if true {");
@@ -4926,6 +5009,9 @@ impl Render {
                 self.depth -= 1;
                 self.emit("}");
                 self.emit("}");
+                self.emit(&format!(
+                    "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
+                ));
             }
             IrStmt::Die { .. } | IrStmt::Warn { .. } | IrStmt::SetChildError(_)
             | IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Goto(_)
@@ -5044,10 +5130,15 @@ impl Render {
         for s in &prog.stmts {
             self.stmt(s);
         }
+        // the script's exit code is the LAST statement's rc (bash's final
+        // status = the last command's) — saved BEFORE the EXIT traps run
+        // (their __sh_spawn calls would clobber __SH_RC)
+        self.emit("let __sh_final = __SH_RC.load(Ordering::SeqCst);");
         if !self.trap_exit.is_empty() {
             self.add_helper("run_traps");
             self.emit("__sh_run_traps();");
         }
+        self.emit("std::process::exit(__sh_final);");
         std::mem::swap(&mut self.out, &mut body_out);
         self.depth = 0;
 
