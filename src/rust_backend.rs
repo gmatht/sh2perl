@@ -52,6 +52,7 @@ const NATIVE_CMDS: &[&str] = &[
     "echo", "printf", "exit", "cd", "export", "local", "declare", "typeset", "readonly",
     "unset", "set", "shift", "read", "let", "true", ":", "false", "pwd", "sleep", "wait",
     "break", "continue", "return", "test", "eval", "source", ".", "exec",
+    "mapfile", "readarray",
 ];
 
 /// Word part: literal text or a runtime word-list (`Vec<String>` expr).
@@ -1101,6 +1102,38 @@ impl Render {
                 let ifs = env_ifs(&env);
                 let e = self.read_expr(&words, ifs);
                 self.emit(&format!("let _ = {e};"));
+            }
+            "mapfile" | "readarray" => {
+                // `mapfile -t arr < <(producer)` — read ALL stdin lines
+                // into the array var (native: the child-bash shell-out's
+                // var would be lost)
+                let mut var = String::new();
+                let mut strip_nl = false;
+                for w in &words {
+                    if let Some(ws) = str_arg(&[(*w).clone()], 0) {
+                        if ws == "-t" {
+                            strip_nl = true;
+                        } else if !ws.starts_with('-') && ws.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            var = ws.to_string();
+                        }
+                    }
+                }
+                if !var.is_empty() {
+                    self.mark_written(&var);
+                    self.arrays.insert(var.clone());
+                    self.add_helper("readline");
+                    let m = self.tls(&var);
+                    if strip_nl {
+                        self.emit(&format!(
+                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__ln, __any) = __sh_readline(); if !__any {{ break; }} __lines.push(__ln); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
+                        ));
+                    } else {
+                        self.emit(&format!(
+                            "{{ let mut __lines: Vec<String> = Vec::new(); loop {{ let (__ln, __any) = __sh_readline(); if !__any {{ break; }} __lines.push(format!(\"{{}}\\n\", __ln)); }} {m}.with(|v| *v.borrow_mut() = __lines); }}"
+                        ));
+                    }
+                }
+                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
             "let" => {
                 let text = words
@@ -2482,15 +2515,25 @@ impl Render {
                     ));
                 }
                 if !last {
+                    // intermediate stages must land in the pipeline
+                    // buffer, not whatever fd-1 redirect is active
+                    // (the producer of a `<(...)` redirect) — take
+                    // OUTFILE away for the capture
+                    let oldout = self.gensym("__sh_oldout");
+                    self.emit(&format!("let {oldout} = __SH_OUTFILE_TL.with(|v| v.borrow_mut().take());"));
                     self.emit("let __old = __SH_OUT.lock().unwrap().take();");
                     self.emit("*__SH_OUT.lock().unwrap() = Some(Vec::new());");
-                }
-                for s in st {
-                    self.stmt(s);
-                }
-                if !last {
+                    let oldout2 = oldout.clone();
+                    for s in st {
+                        self.stmt(s);
+                    }
                     self.emit(&format!("{buf} = __SH_OUT.lock().unwrap().take().unwrap();"));
                     self.emit("*__SH_OUT.lock().unwrap() = __old;");
+                    self.emit(&format!("__SH_OUTFILE_TL.with(|v| *v.borrow_mut() = {oldout2});"));
+                } else {
+                    for s in st {
+                        self.stmt(s);
+                    }
                 }
                 if idx > 0 {
                     self.emit("*__SH_STDIN.lock().unwrap() = __oldin;");
@@ -2900,10 +2943,14 @@ impl Render {
                 _ => {}
             }
         }
-        // fd 1/2 file redirects for native output
+        // fd-1 file redirects for native output (fd-2 redirs must NOT
+        // hijack stdout — the native store's OUTFILE replaces fd 1; the
+        // gate ignores stderr, so an fd-2 file target is simply dropped
+        // here, and a `2>&1` dup with a native inner has no stderr to
+        // merge)
         let file_redirs: Vec<&IrRedirectInfo> = out_redirs
             .iter()
-            .filter(|r| matches!(r.mode.as_str(), "w" | "a") && r.target.is_some())
+            .filter(|r| r.fd == 1 && matches!(r.mode.as_str(), "w" | "a") && r.target.is_some())
             .copied()
             .collect();
         let mut used_outfile = false;
@@ -3586,6 +3633,27 @@ impl Render {
                 IrExpr::Call { func, args } if func == "grepMatches" => {
                     self.grepmatches_stmt(args);
                 }
+                IrExpr::Call { func, args } if func == "and" => {
+                    // the fallback's unconditional rc clobber would mask
+                    // the last stage's status (a `diff … || echo` whose
+                    // lhs wraps an `and` must still see diff's rc)
+                    self.and_stmt(args);
+                }
+                IrExpr::Call { func, args } if func == "or" => {
+                    let blocks = self.and_blocks(args);
+                    for (i, b) in blocks.iter().enumerate() {
+                        if i > 0 {
+                            self.emit("if __SH_RC.load(Ordering::SeqCst) != 0 {");                            self.depth += 1;
+                        }
+                        for s in b {
+                            self.stmt(s);
+                        }
+                        if i > 0 {
+                            self.depth -= 1;
+                            self.emit("}");
+                        }
+                    }
+                }
                 IrExpr::Call { func, args } if func == "break" => {
                     if self.loop_depth > 0 {
                         self.emit("break;");
@@ -4075,10 +4143,10 @@ impl Render {
         for p in pre {
             self.emit(&p);
         }
-        // detached thread — the body runs on a copy (bash `{ ... } &`
-        // forks; the handle is dropped, the thread is never joined)
+        // tracked background thread — `wait` joins it (bash `{ ... } &`
+        // + `wait` must observe the job's completion/ordering)
         self.emit(&format!(
-            "let _ = std::thread::spawn(move || {{\n{body_src}\n}});"
+            "let __th = std::thread::spawn(move || {{\n{body_src}\n}});\n__SH_BGTHREADS.lock().unwrap().push(__th);"
         ));
     }
 
@@ -4167,6 +4235,7 @@ impl Render {
         self.emit("thread_local! { static __SH_OUTFILE_TL: std::cell::RefCell<Option<std::fs::File>> = const { std::cell::RefCell::new(None) }; }");
         self.emit("static __SH_STDIN: std::sync::Mutex<Option<Box<dyn std::io::Read + Send>>> = std::sync::Mutex::new(None);");
         self.emit("static __SH_BG: std::sync::Mutex<Vec<(u32, std::process::Child)>> = std::sync::Mutex::new(Vec::new());");
+        self.emit("static __SH_BGTHREADS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());");
         self.emit("static __SH_BGPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
         self.emit("static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
         self.emit("");
@@ -4961,6 +5030,8 @@ fn helper_source(h: &str) -> &'static str {
         "wait_all" => r#"fn __sh_wait_all() {
     let hs = std::mem::take(&mut *__SH_BG.lock().unwrap());
     for (_, mut h) in hs { let _ = h.wait(); }
+    let ths = std::mem::take(&mut *__SH_BGTHREADS.lock().unwrap());
+    for th in ths { let _ = th.join(); }
 }"#,
         "bg" => r#"fn __sh_bg(cmd: &str) {
     let mut c = std::process::Command::new("bash");
@@ -5280,7 +5351,17 @@ impl Render {
                 }
                 Some(full)
             }
-            [IrStmt::Expr(e)] => single_exec_text(self, e),
+            [IrStmt::Expr(e)] => {
+                // a native builtin (echo, mapfile, read, …) must render
+                // through the native path — its store/var effects would
+                // be lost in a child bash
+                if let IrExpr::Call { func, args } = e {
+                    if func == "exec" && is_native_cmd(str_arg(args, 0).unwrap_or("")) {
+                        return None;
+                    }
+                }
+                single_exec_text(self, e)
+            }
             [IrStmt::Redirect { inner, redirects }] => {
                 // a heredoc/herestring stage needs its content as stdin —
                 // route through the native path (which passes it as input)
@@ -6735,6 +6816,14 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                             _ => vec![],
                         };
                         if cmd == "read" {
+                            for w in &words {
+                                if let Some(n) = str_arg(&[(*w).clone()], 0) {
+                                    if !n.starts_with('-') && !n.is_empty() {
+                                        out.insert(n.to_string());
+                                    }
+                                }
+                            }
+                        } else if cmd == "mapfile" || cmd == "readarray" {
                             for w in &words {
                                 if let Some(n) = str_arg(&[(*w).clone()], 0) {
                                     if !n.starts_with('-') && !n.is_empty() {
