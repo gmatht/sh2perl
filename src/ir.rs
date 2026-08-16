@@ -1184,6 +1184,9 @@ pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
     // keeps the shared pass honest).
     let mut stripped = prog.clone();
     crate::shir_passes::strip_cfor(&mut stripped);
+    // builtin-op fallback arm (shir-builtin-op-20260816): the embed
+    // renderer has NOT accepted the `builtin` op — render as exec.
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut stripped);
     let stmts = optimize_stmts(&stripped.stmts);
 
     // Refuse constructs that only make sense in a standalone program (v1):

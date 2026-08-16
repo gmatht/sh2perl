@@ -13016,7 +13016,8 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // `test` / `setArray` / `setArrayAppend` strings are
                 // excluded: the renderer injects lifted values into them,
                 // so a lifted var may appear inside them.
-                let let_args_native = func == "exec" && arith_let_args_native(args);
+                let let_args_native =
+                    matches!(func.as_str(), "exec" | "builtin") && arith_let_args_native(args);
                 // `arith` texts are handled by the arith block below (the
                 // native-lowerable ones are exempt from ALL store marks).
                 if func != "getVar"
@@ -13608,7 +13609,7 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 }
             }
             IrExpr::Call { func, args } => {
-                if func == "exec" {
+                if matches!(func.as_str(), "exec" | "builtin") {
                     // the statement-form `(( ))` / `let` / `typeset -i`
                     // (mirror of the IrStmt::Exec arm above)
                     collect_native_arith_sources(args, assigns);
@@ -13715,6 +13716,14 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // strip produces; double-strip is a no-op).
     let mut stripped = prog.clone();
     crate::shir_passes::strip_cfor(&mut stripped);
+    // builtin-op acceptance (shir-builtin-op-20260816): the estree
+    // renderer treats the A1 `builtin` op as the exec it came from — its
+    // dispatch already lowers exec-of-builtin to the native sync
+    // `sh2.builtin` call (JS_SYNC_BUILTINS) or the exec bridge, so the
+    // op's render is byte-identical to exec's. The op stays in the A1
+    // contract (other backends may adopt a native arm); the estree side
+    // normalizes to its own native path.
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut stripped);
     // Const-pool arith fold (core request estree-20260813-182434-const-fold-arith):
     // top-level single-site const assignments seed a pool; pure-int arith
     // reads of pooled names fold to literals (the mimecroft `CELLS`/
@@ -16181,7 +16190,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // fired under a possible `set -e` (the guard consumes the
             // value); conditions never reach this statement arm.
             if let IrExpr::Call { func, args, .. } = e {
-                if func == "exec" && lastexit_write_is_dead(stmt) {
+                // exec/builtin are the SAME statement op for the estree
+                // renderer (builtin-op acceptance: shir-builtin-op-20260816)
+                if matches!(func.as_str(), "exec" | "builtin") && lastexit_write_is_dead(stmt) {
                     if let Some(dead) = try_native_let_dead(args) {
                         return Some(Stmt::ExpressionStatement { expression: dead });
                     }
@@ -16218,7 +16229,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // never reaches this arm (the BinOp lowers via expr_to_estree
             // directly; the analysis keeps such names store-bound).
             if let IrExpr::Call { func, args } = e {
-                if func == "exec" {
+                if matches!(func.as_str(), "exec" | "builtin") {
                     if let Some(IrExpr::Str(name, _)) = args.first() {
                         if matches!(name.as_str(), "local" | "declare" | "typeset" | "readonly") {
                             if let Some(stmts) = try_native_local_decl_stmt(args) {
