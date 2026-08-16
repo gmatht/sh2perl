@@ -52,7 +52,7 @@ const NATIVE_CMDS: &[&str] = &[
     "echo", "printf", "exit", "cd", "export", "local", "declare", "typeset", "readonly",
     "unset", "set", "shift", "read", "let", "true", ":", "false", "pwd", "sleep", "wait",
     "break", "continue", "return", "test", "eval", "source", ".", "exec",
-    "mapfile", "readarray",
+    "mapfile", "readarray", "type",
 ];
 
 /// Word part: literal text or a runtime word-list (`Vec<String>` expr).
@@ -966,8 +966,14 @@ impl Render {
             ArithAst::Var(name) | ArithAst::Ident(name) => self.getvar_num(name),
             ArithAst::Index { var, key } => {
                 let k = self.arith(key);
-                let e = self.array_elem(var, &k);
-                format!("{e}.trim().parse::<i64>().unwrap_or(0)")
+                if self.is_array(var) || self.is_assoc(var) || self.declared(var) {
+                    let e = self.array_elem(var, &k);
+                    format!("{e}.trim().parse::<i64>().unwrap_or(0)")
+                } else {
+                    // an undeclared array element is 0 in arithmetic
+                    // (e.g. `${array[i]:-0}` inside an eval text)
+                    "0".to_string()
+                }
             }
             ArithAst::Bin { op, lhs, rhs } => {
                 let l = self.arith(lhs);
@@ -1188,6 +1194,21 @@ impl Render {
                 }
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
+            "type" => {
+                // `type doselect` — a registered (eval'd) function
+                for w in &words {
+                    if let Some(n) = str_arg(&[(*w).clone()], 0) {
+                        if self.functions.contains(n) {
+                            self.add_helper("print_words");
+                            self.emit(&format!(
+                                "__sh_print_words(&[vec![format!(\"{{}} is a function\", {})]], true, false);",
+                                Self::rust_str(n)
+                            ));
+                        }
+                    }
+                }
+                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+            }
             "true" | ":" => {
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
@@ -1248,6 +1269,27 @@ impl Render {
                     .map(|w| word_source_text(w))
                     .collect::<Vec<_>>()
                     .join(" ");
+                // `eval 'f() { … }'` — a function DEFINITION lands in the
+                // current shell too (tzselect-style); register it so
+                // `type f` / native calls see it
+                for w in joined.split(|c: char| c == '\n' || c == ';') {
+                    let t = w.trim();
+                    if let Some(rest) = t.strip_suffix("()") {
+                        let name = rest.trim();
+                        if !name.is_empty()
+                            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        {
+                            self.functions.insert(name.to_string());
+                        }
+                    } else if let Some(rest) = t.strip_suffix("() {") {
+                        let name = rest.trim();
+                        if !name.is_empty()
+                            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        {
+                            self.functions.insert(name.to_string());
+                        }
+                    }
+                }
                 if let Some((name, rest)) = joined.trim().split_once('=') {
                     if !name.is_empty()
                         && name.chars().all(|c| c.is_alphanumeric() || c == '_')
@@ -1309,8 +1351,12 @@ impl Render {
                 }
                 self.emit(&format!(
                     "{{ let __src = std::fs::read_to_string(&{path}).unwrap_or_default(); \
-                     for __line in __src.lines() {{ if let Some((__n, __val)) = __line.trim().split_once('=') {{ {} else {{ std::env::set_var(__n, __val.trim()); }} }} }} }}",
-                    assigns.join(" else ")
+                     for __line in __src.lines() {{ if let Some((__n, __val)) = __line.trim().split_once('=') {{ {} }} }} }}",
+                    if assigns.is_empty() {
+                        "std::env::set_var(__n, __val.trim());".to_string()
+                    } else {
+                        format!("{} else {{ std::env::set_var(__n, __val.trim()); }}", assigns.join(" else "))
+                    }
                 ));
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
@@ -4590,7 +4636,7 @@ const HELPER_ORDER: &[&str] = &[
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
-    "div", "mod", "arith_err",
+    "div", "mod", "arith_err", "capture",
 ];
 
 /// `${var}`, `${var:-N}`, `${var:-$other}`, `${arr[i]:-N}` inside an arith
@@ -4655,6 +4701,7 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
         "strippre" | "stripsuf" | "replace" => &["fnmatch"],
         "glob" => &["cap_bytes"],
         "rand" => &["cap_bytes"],
+        "capture" => &[],
         "grepmatches" => &["cap_bytes"],
         _ => &[],
     }
@@ -4880,6 +4927,12 @@ fn helper_source(h: &str) -> &'static str {
         if ai >= args.len() || ai == start_ai { break; }
     }
     out
+}"#,
+        "capture" => r#"fn __sh_capture(cmd: &str) -> String {
+    match std::process::Command::new("bash").arg("-c").arg(cmd).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(_) => String::new(),
+    }
 }"#,
         "cap_bytes" => r#"fn __sh_cap_bytes(cmd: &str, input: Option<&[u8]>) -> Vec<u8> {
     let mut c = std::process::Command::new("bash");
@@ -6490,9 +6543,9 @@ impl Render {
             // literal text — escape format! braces (the text may be
             // arbitrary shell code: `proxy() { … }`)
             if ch[i] == '{' {
-                fmt.push_str("{{{");
+                fmt.push_str("{{");
             } else if ch[i] == '}' {
-                fmt.push_str("}}}");
+                fmt.push_str("}}");
             } else {
                 fmt.push(ch[i]);
             }
