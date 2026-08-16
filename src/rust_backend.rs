@@ -3473,6 +3473,22 @@ impl Render {
             }
         }
         if name.contains('[') && name.ends_with(']') {
+            // `${arr[@]}` / `${arr[*]}` — the whole-array values
+            if name.ends_with("[*]") || name.ends_with("[@]") {
+                let var = name
+                    .strip_suffix("[*]")
+                    .or_else(|| name.strip_suffix("[@]"))
+                    .unwrap_or(name)
+                    .to_string();
+                self.mark_written(&var);
+                if self.is_assoc(&var) {
+                    let m = self.tls(&var);
+                    return format!("{m}.with(|v| {{ let mut __vs = v.borrow().values().cloned().collect::<Vec<String>>(); __vs.sort(); __vs.join(\" \") }})");
+                }
+                if self.is_array(&var) {
+                    return format!("{}.join(\" \")", self.read_arr(&var));
+                }
+            }
             // `${arr[i]#pat}` / `${arr[i]%pat}` etc. — a transform on an
             // ELEMENT: read the element, then apply the op
             if matches!(op, "#" | "##" | "%" | "%%" | "/" | "//") {
@@ -3509,7 +3525,7 @@ impl Render {
                 // `${map[@]}` / `${map[*]}` — the VALUES (bash); the
                 // `${!map[@]}` keys form is handled by the `!` branch
                 let m = self.tls(var);
-                return format!("{m}.with(|v| v.borrow().values().cloned().collect::<Vec<String>>().join(\" \"))");
+                return format!("{m}.with(|v| {{ let mut __vs = v.borrow().values().cloned().collect::<Vec<String>>(); __vs.sort(); __vs.join(\" \") }})");
             }
             if self.is_array(var) {
                 self.mark_written(var);
@@ -4514,7 +4530,12 @@ impl Render {
         self.depth = 0;
 
         // The thread_local var declarations are MODULE-level statics (the
-        // function bodies reference them) — emitted before main.
+        // function bodies reference them) — emitted before main. Render
+        // pass may have discovered MORE arrays (eval-word param texts) —
+        // fold them in before declaring.
+        for a in &self.arrays {
+            written.insert(a.clone());
+        }
         let mut decl_out = Vec::new();
         std::mem::swap(&mut self.out, &mut decl_out);
         self.depth = 0;
