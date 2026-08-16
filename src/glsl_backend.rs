@@ -405,6 +405,9 @@ pub fn shir_to_glsl(prog: &IrProgram) -> String {
 /// Render with options (see [`ShGlslOptions`]).
 pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
     let mut prog = prog.clone();
+    // builtin-op fallback arm (shir-builtin-op-20260816): the glsl
+    // backend has NOT accepted the `builtin` op — render as exec.
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
     // A2: the raw ShIR carries no type verdicts; run the analysis so
     // int vars become native GLSL ints (like the C backend does).
     prog.var_types = crate::shir::analyze_var_types(&prog);

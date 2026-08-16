@@ -30,6 +30,10 @@ struct JavaCtx {
 /// Render a ShIR program to Java source. `Err` on a construct outside
 /// the v1 subset (the gate reports it as a FAIL).
 pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
+    // builtin-op fallback arm (shir-builtin-op-20260816): the java
+    // backend has NOT accepted the `builtin` op — render as exec.
+    let mut prog = prog.clone();
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
     let mut out = String::new();
     out.push_str("public class Sh2Program {\n");
     if stmts_need_sh2num(&prog.stmts) {
