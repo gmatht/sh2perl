@@ -710,7 +710,17 @@ pub fn export_shir(input: &str, raw: bool) {
 pub fn export_shir_raw(input: &str) {
     let commands = match Parser::new(input).parse() {
         Ok(c) => c,
-        Err(e) => { eprintln!("Parse error: {}", e); return; }
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            // parse-gaps core request: same graceful fallback as
+            // `export_shir` — the canonical empty Program (never empty
+            // stdout, which frontends read as "invalid JSON: EOF").
+            // Frontends byte-match the core on this shape for
+            // unparseable inputs.
+            let json = debashl::shir_json::shir_to_shir_json_raw(&debashl::shir::ast_to_ir_raw(&[]));
+            print!("{}", json);
+            return;
+        }
     };
     let prog = debashl::shir::ast_to_ir_raw(&commands);
     print!("{}", debashl::shir_json::shir_to_shir_json_raw(&prog));
