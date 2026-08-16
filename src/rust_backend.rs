@@ -83,6 +83,8 @@ pub struct Render {
     upper_vars: BTreeSet<String>,
     /// var -> captured local (background-thread bodies)
     captured: HashMap<String, String>,
+    /// `typeset -n ref=target` namerefs (reads/writes redirect)
+    namerefs: HashMap<String, String>,
     /// runtime helper fns needed (dependency closure)
     helpers: BTreeSet<String>,
     /// Rust identifier per shell var name (sanitize + de-dup)
@@ -267,8 +269,12 @@ impl Render {
         self.written.contains(name)
     }
 
-    /// The thread_local static name for a var.
+    /// The thread_local static name for a var — a nameref redirects to
+    /// its target's static.
     fn tls(&mut self, name: &str) -> String {
+        if let Some(t) = self.namerefs.get(name).cloned() {
+            return self.tls(&t);
+        }
         self.rust_ident(name)
     }
 
@@ -1443,6 +1449,10 @@ impl Render {
     /// children (bash -c) see it.
     fn decl_words(&mut self, words: &[&IrExpr], exported: bool) {
         let mut i = 0;
+        // `typeset -x name=val` — the -x flag exports the name;
+        // `typeset -n ref=target` — a nameref (no own storage)
+        let mut xflag = false;
+        let mut nflag = false;
         while i < words.len() {
             // `local -a args=(...)` — the core nests the whole setArray
             // call as ONE word (not a "setArray" Str + trailing args)
@@ -1461,7 +1471,17 @@ impl Render {
                 if ws.starts_with('-') {
                     // -a / -A / -x / -r / -i / -l / -u / -n / -p — the
                     // -a/-A mark the NEXT name as an array/assoc; -i/-l/-u
-                    // set attributes.
+                    // set attributes; -x exports it.
+                    if ws == "-x" {
+                        xflag = true;
+                        i += 1;
+                        continue;
+                    }
+                    if ws == "-n" {
+                        nflag = true;
+                        i += 1;
+                        continue;
+                    }
                     if ws == "-a" || ws == "-A" || ws == "-i" || ws == "-l" || ws == "-u" {
                         let n = words.get(i + 1).and_then(|w| {
                             str_arg(&[(*w).clone()], 0)
@@ -1508,6 +1528,14 @@ impl Render {
                 }
                 if let Some((name, val)) = ws.split_once('=') {
                     if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        if nflag {
+                            // `typeset -n ref=target` — bind the nameref
+                            self.namerefs.insert(name.to_string(), val.to_string());
+                            self.mark_written(&name.to_string());
+                            nflag = false;
+                            i += 1;
+                            continue;
+                        }
                         // `local x=$1` — the core splits `x=` and the VALUE
                         // EXPR into separate word args
                         let value_expr: Option<&IrExpr> = if val.is_empty()
@@ -1541,7 +1569,7 @@ impl Render {
                         };
                         self.emit(&stmt);
                         self.mark_written(&name.to_string());
-                        if exported {
+                        if exported || xflag {
                             // export: the value must reach bash -c children
                             let ve = if let Some(e) = value_expr {
                                 self.expr_any(e)
@@ -1552,6 +1580,7 @@ impl Render {
                                 "std::env::set_var({}, &{ve});",
                                 Self::rust_str(&name)
                             ));
+                            xflag = false;
                         }
                     }
                 } else if ws.contains('[') {
@@ -2034,11 +2063,11 @@ impl Render {
         let _ = op;
         if name == "@" || name == "*" {
             if op == "slice" {
-                let off = args.get(2).map(|x| self.expr_num(x)).unwrap_or_else(|| "0".to_string());
+                let off = args.get(2).map(|x| self.slice_index_expr(x)).unwrap_or_else(|| "0".to_string());
                 let len = match args.get(3) {
                     None => "-1".to_string(),
                     Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
-                    Some(x) => self.expr_num(x),
+                    Some(x) => self.slice_index_expr(x),
                 };
                 return format!(
                     "{{ let __v = __SH_ARGV.lock().unwrap().clone(); let __o = (({off} - 1).max(0) as usize).min(__v.len()); \
@@ -2058,11 +2087,11 @@ impl Render {
             if self.is_array(var) || self.is_assoc(var) {
                 self.mark_written(var);
                 if op == "slice" {
-                    let off = args.get(2).map(|x| self.expr_num(x)).unwrap_or_else(|| "0".to_string());
+                    let off = args.get(2).map(|x| self.slice_index_expr(x)).unwrap_or_else(|| "0".to_string());
                     let len = match args.get(3) {
                         None => "-1".to_string(),
                         Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
-                        Some(x) => self.expr_num(x),
+                        Some(x) => self.slice_index_expr(x),
                     };
                     let arr = self.read_arr(var);
                     return format!(
@@ -2209,8 +2238,7 @@ impl Render {
         let k = key.trim();
         if let Ok(n) = k.parse::<i64>() {
             return n.to_string();
-        }
-        if k.contains('$') || k.contains('*') || k.contains('+') || k.contains('-')
+        }        if k.contains('$') || k.contains('*') || k.contains('+') || k.contains('-')
             || k.contains('/') || k.contains('%') || k.starts_with('(')
         {
             // an arithmetic index expression
@@ -2227,6 +2255,24 @@ impl Render {
         } else {
             "0".to_string()
         }
+    }
+
+    /// A slice offset/length arg (`${s:j:1}` — the arg is SOURCE text:
+    /// a number literal, a var name, or an arith expression).
+    fn slice_index_expr(&mut self, x: &IrExpr) -> String {
+        if let Some(s) = str_arg(&[x.clone()], 0) {
+            let k = s.trim();
+            if let Ok(n) = k.parse::<i64>() {
+                return n.to_string();
+            }
+            if !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return self.getvar_num(k);
+            }
+            if let Some(e) = self.arith_text(k) {
+                return e;
+            }
+        }
+        self.expr_num(x)
     }
 
     /// An assoc key expr from source text (`info[$key]` → runtime value).
@@ -3130,10 +3176,10 @@ impl Render {
             self.add_helper("cat");
             let m = self.tls(name);
             self.emit(&format!(
-                "{{ let __words = __sh_cat(&[{}]); let mut __m = {m}.with(|v| v.borrow_mut()); __m.clear(); \
+                "{{ let __words = __sh_cat(&[{}]); {m}.with(|v| {{ let mut __m = v.borrow_mut(); __m.clear(); \
                  for __w in __words {{ if let Some(rest) = __w.strip_prefix('[') {{ \
                  if let Some(eq) = rest.find(']') {{ let __k = rest[..eq].to_string(); \
-                 let __v = rest[eq + 2..].to_string(); __m.insert(__k, __v); }} }} }}}}",
+                 let __v = rest[eq + 2..].to_string(); __m.insert(__k, __v); }} }} }} }}); }}",
                 items.join(", ")
             ));
             return;
@@ -3403,11 +3449,11 @@ impl Render {
             "slice" => {
                 // `${arr[@]:off:len}` — an element slice; scalar strings
                 // get a char slice
-                let off = args.get(2).map(|x| self.expr_num(x)).unwrap_or_else(|| "0".to_string());
+                let off = args.get(2).map(|x| self.slice_index_expr(x)).unwrap_or_else(|| "0".to_string());
                 let len = match args.get(3) {
                     None => "-1".to_string(),
                     Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
-                    Some(x) => self.expr_num(x),
+                    Some(x) => self.slice_index_expr(x),
                 };
                 if name == "@" || name == "*" {
                     // `${@:off:len}` — the positional params (1-based off)
@@ -4396,6 +4442,11 @@ impl Render {
 
     /// The thread_local declaration for one var.
     fn decl_stmt(&mut self, v: &str) -> String {
+        // a nameref has no storage of its own — its static is the
+        // target's (declared under the target's name)
+        if self.namerefs.contains_key(v) {
+            return String::new();
+        }
         let m = self.tls(v);
         if self.is_assoc(v) {
             format!(
@@ -7134,23 +7185,37 @@ fn collect_arrays(stmts: &[IrStmt], arrays: &mut BTreeSet<String>, assoc: &mut B
                         }
                     }
                     // `declare -A map` / `local -A map` / `declare -a arr`
+                    // / `local -a arr=(...)` — the flag applies to the
+                    // following NAME (which may be a nested setArray call
+                    // carrying the name in args[0])
                     if let Some(IrExpr::Array(words)) = args.get(1) {
-                        let mut flags: Vec<String> = Vec::new();
-                        let mut names: Vec<String> = Vec::new();
+                        let mut cur_flags: Vec<String> = Vec::new();
                         for w in words {
                             if let Some(t) = str_arg(&[(*w).clone()], 0) {
                                 if t.starts_with('-') {
-                                    flags.push(t.to_string());
-                                } else {
-                                    names.push(t.to_string());
+                                    cur_flags.push(t.to_string());
+                                } else if !cur_flags.is_empty() {
+                                    let n = t.split('=').next().unwrap_or(t).to_string();
+                                    if cur_flags.iter().any(|f| f == "-A" || f == "-aA") {
+                                        assoc.insert(n);
+                                    } else if cur_flags.iter().any(|f| f == "-a") {
+                                        arrays.insert(n);
+                                    }
+                                    cur_flags.clear();
                                 }
-                            }
-                        }
-                        for n in names {
-                            if flags.iter().any(|f| f == "-A" || f == "-aA") {
-                                assoc.insert(n);
-                            } else if flags.iter().any(|f| f == "-a") {
-                                arrays.insert(n);
+                            } else if let IrExpr::Call { func, args } = w {
+                                if (func == "setArray" || func == "setArrayAppend")
+                                    && !cur_flags.is_empty()
+                                {
+                                    if let Some(name) = str_arg(args, 0) {
+                                        if cur_flags.iter().any(|f| f == "-A" || f == "-aA") {
+                                            assoc.insert(name.to_string());
+                                        } else if cur_flags.iter().any(|f| f == "-a") {
+                                            arrays.insert(name.to_string());
+                                        }
+                                    }
+                                    cur_flags.clear();
+                                }
                             }
                         }
                     }
@@ -7281,24 +7346,38 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
                                 }
                             }
                         }
-                        // `declare -A map` / `local -A map` / `declare -a arr`
+                        // `declare -A map` / `local -A map` / `declare -a
+                        // arr` / `local -a arr=(...)` — the flag applies
+                        // to the following NAME (which may be a nested
+                        // setArray call carrying the name in args[0])
                         if let Some(IrExpr::Array(words)) = args.get(1) {
-                            let mut flags: Vec<String> = Vec::new();
-                            let mut names: Vec<String> = Vec::new();
+                            let mut cur_flags: Vec<String> = Vec::new();
                             for w in words {
                                 if let Some(t) = str_arg(&[(*w).clone()], 0) {
                                     if t.starts_with('-') {
-                                        flags.push(t.to_string());
-                                    } else {
-                                        names.push(t.to_string());
+                                        cur_flags.push(t.to_string());
+                                    } else if !cur_flags.is_empty() {
+                                        let n = t.split('=').next().unwrap_or(t).to_string();
+                                        if cur_flags.iter().any(|f| f == "-A" || f == "-aA") {
+                                            assoc.insert(n);
+                                        } else if cur_flags.iter().any(|f| f == "-a") {
+                                            arrays.insert(n);
+                                        }
+                                        cur_flags.clear();
                                     }
-                                }
-                            }
-                            for n in names {
-                                if flags.iter().any(|f| f == "-A" || f == "-aA") {
-                                    assoc.insert(n);
-                                } else if flags.iter().any(|f| f == "-a") {
-                                    arrays.insert(n);
+                                } else if let IrExpr::Call { func, args } = w {
+                                    if (func == "setArray" || func == "setArrayAppend")
+                                        && !cur_flags.is_empty()
+                                    {
+                                        if let Some(name) = str_arg(args, 0) {
+                                            if cur_flags.iter().any(|f| f == "-A" || f == "-aA") {
+                                                assoc.insert(name.to_string());
+                                            } else if cur_flags.iter().any(|f| f == "-a") {
+                                                arrays.insert(name.to_string());
+                                            }
+                                        }
+                                        cur_flags.clear();
+                                    }
                                 }
                             }
                         }
