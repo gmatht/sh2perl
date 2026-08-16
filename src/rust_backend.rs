@@ -1240,8 +1240,11 @@ impl Render {
                     }
                 }
                 let text = self.cmd_text(&words, None);
+                // `eval "echo … $x …"` — expand the vars into the text
+                // (a child bash would not see the native store)
+                let interp = self.dollar_interp(&joined);
                 self.add_helper("run");
-                self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::SeqCst);"));
+                self.emit(&format!("__SH_RC.store(__sh_run(&{interp}), Ordering::SeqCst);"));
             }
             "command" => {
                 let text = self.cmd_text(&words, None);
@@ -1249,13 +1252,40 @@ impl Render {
                 self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::SeqCst);"));
             }
             "source" | "." => {
-                // `. file args` — the cmd word itself is part of the text
-                let cmd_word = IrExpr::Str(cmd.to_string(), crate::ir::StrStyle::DoubleQuoted);
-                let mut all: Vec<&IrExpr> = vec![&cmd_word];
-                all.extend(words.iter());
-                let text = self.cmd_text(&all, None);
-                self.add_helper("run");
-                self.emit(&format!("__SH_RC.store(__sh_run(&{text}), Ordering::SeqCst);"));
+                // `. file args` — the sourced assignments must land in
+                // the CURRENT store (a child bash would lose them): read
+                // the file and apply simple `name=value` lines inline
+                let path = match words.first() {
+                    Some(w) => self.expr_str(w),
+                    None => "String::new()".to_string(),
+                };
+                let mut assigns: Vec<String> = Vec::new();
+                let written: Vec<String> = self.written.iter().cloned().collect();
+                for v in &written {
+                    if v.is_empty()
+                        || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        continue;
+                    }
+                    let m = self.tls(v);
+                    let st = if self.is_num(v) {
+                        format!(
+                            "{m}.with(|v| v.set(__v.trim().parse::<i64>().unwrap_or(0)))"
+                        )
+                    } else {
+                        format!("{m}.with(|v| *v.borrow_mut() = __v.trim().to_string())")
+                    };
+                    assigns.push(format!(
+                        "if __n == {} {{ let __v = __val.trim_matches(\\'\\').trim_matches(\\\"\\\"); {st}; }}",
+                        Self::rust_str(v)
+                    ));
+                }
+                self.emit(&format!(
+                    "{{ let __src = std::fs::read_to_string(&{path}).unwrap_or_default(); \
+                     for __line in __src.lines() {{ if let Some((__n, __val)) = __line.trim().split_once('=') {{ {} else {{ std::env::set_var(__n, __val.trim()); }} }} }} }}",
+                    assigns.join(" else ")
+                ));
+                self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
             "exec" => {
                 // `exec cmd args` — run the command, then exit with its rc
@@ -4442,12 +4472,9 @@ impl Render {
 
     /// The thread_local declaration for one var.
     fn decl_stmt(&mut self, v: &str) -> String {
-        // a nameref has no storage of its own — its static is the
-        // target's (declared under the target's name)
-        if self.namerefs.contains_key(v) {
-            return String::new();
-        }
-        let m = self.tls(v);
+        // a nameref's own static is still declared (dead but harmless) —
+        // `unset ref` etc. may reference it before the binding renders
+        let m = self.rust_ident(v);
         if self.is_assoc(v) {
             format!(
                 "thread_local! {{ static {m}: std::cell::RefCell<std::collections::BTreeMap<String, String>> = const {{ std::cell::RefCell::new(std::collections::BTreeMap::new()) }}; }}"
@@ -4511,6 +4538,58 @@ const HELPER_ORDER: &[&str] = &[
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
     "div", "mod", "arith_err",
 ];
+
+/// `${var}`, `${var:-N}`, `${var:-$other}`, `${arr[i]:-N}` inside an arith
+/// body → the plain var reference (an unset var is 0 in arithmetic —
+/// matching `:-0`).
+fn normalize_arith_vars(s: &str) -> String {
+    let ch: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < ch.len() {
+        if ch[i] == '$' && i + 1 < ch.len() && ch[i + 1] == '{' {
+            let mut j = i + 2;
+            let mut depth = 1;
+            while j < ch.len() && depth > 0 {
+                if ch[j] == '{' {
+                    depth += 1;
+                } else if ch[j] == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                let inner: String = ch[i + 2..j].iter().collect();
+                // the name part — split at the first `:`/`=` OUTSIDE []
+                let mut split = None;
+                let mut bdepth = 0;
+                for (k, c) in inner.char_indices() {
+                    if c == '[' {
+                        bdepth += 1;
+                    } else if c == ']' {
+                        bdepth -= 1;
+                    } else if (c == ':' || c == '=') && bdepth == 0 {
+                        split = Some(k);
+                        break;
+                    }
+                }
+                let name_part = match split {
+                    Some(k) => &inner[..k],
+                    None => inner.as_str(),
+                };
+                out.push_str(&normalize_arith_vars(name_part));
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(ch[i]);
+        i += 1;
+    }
+    out
+}
 
 fn helper_deps(h: &str) -> &'static [&'static str] {
     match h {
@@ -6270,7 +6349,12 @@ impl Render {
                         if j < ch.len() {
                             let body: String = ch[start..j].iter().collect();
                             fmt.push_str("{}");
-                            if let Some(e) = self.arith_text(&body) {
+                            // `${var:-0}` / `${var}` forms inside the arith
+                            // collapse to the plain name — getvar_num
+                            // already yields 0 for an unset var (matching
+                            // the `:-0` default)
+                            let norm = normalize_arith_vars(&body);
+                            if let Some(e) = self.arith_text(&norm) {
                                 args.push(format!("({e}).to_string()"));
                             } else {
                                 args.push("String::new()".to_string());
@@ -6310,7 +6394,15 @@ impl Render {
                     }
                 }
             }
-            fmt.push(ch[i]);
+            // literal text — escape format! braces (the text may be
+            // arbitrary shell code: `proxy() { … }`)
+            if ch[i] == '{' {
+                fmt.push_str("{{{");
+            } else if ch[i] == '}' {
+                fmt.push_str("}}}");
+            } else {
+                fmt.push(ch[i]);
+            }
             i += 1;
         }
         if args.is_empty() {
