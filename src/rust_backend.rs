@@ -4850,7 +4850,7 @@ struct IrRedirectInfo {
 // ── helpers registry ─────────────────────────────────────────────────
 
 const HELPER_ORDER: &[&str] = &[
-    "q", "wq", "cat", "pow", "echo_esc", "atoi", "atou", "atof", "print_words", "printf",
+    "q", "q_printf", "wq", "cat", "pow", "echo_esc", "atoi", "atou", "atof", "print_words", "printf",
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
     "fnmatch", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
@@ -4915,7 +4915,7 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
     match h {
         "wq" => &["q"],
         "print_words" => &["echo_esc"],
-        "printf" => &["q", "echo_esc", "atoi", "atou", "atof"],
+        "printf" => &["q", "q_printf", "echo_esc", "atoi", "atou", "atof"],
         "capture_rc" => &["cap_bytes"],
         "run" => &["spawn"],
         "run_traps" => &["spawn"],
@@ -4939,7 +4939,39 @@ fn helper_source(h: &str) -> &'static str {
     o.push('\'');
     o
 }"#,
-        "wq" => r#"fn __sh_wq(ws: &[String]) -> String {
+        "q_printf" => r#"fn __sh_q_printf(s: &str) -> String {
+    if s.is_empty() { return "''".to_string(); }
+    let mut ansi = false;
+    for c in s.chars() {
+        if (c as u32) < 32 || c as u32 == 127 { ansi = true; }
+    }
+    if ansi {
+        // control chars — bash switches to $'...' ANSI-C quoting
+        let mut body = String::new();
+        for c in s.chars() {
+            match c {
+                '\n' => body.push_str("\\n"),
+                '\t' => body.push_str("\\t"),
+                '\r' => body.push_str("\\r"),
+                '\'' => body.push_str("\\'"),
+                '\\' => body.push_str("\\\\"),
+                c if (c as u32) < 32 || c as u32 == 127 => body.push_str(&format!("\\x{:02x}", c as u32)),
+                _ => body.push(c),
+            }
+        }
+        return format!("$'{}'", body);
+    }
+    // plain word — backslash-escape the shell metachars bash %q escapes
+    let mut o = String::new();
+    for c in s.chars() {
+        match c {
+            ' ' | '\'' | '\\' | '"' | '$' | '`' => { o.push('\\'); o.push(c); }
+            _ => o.push(c),
+        }
+    }
+    o
+}"#,
+"wq" => r#"fn __sh_wq(ws: &[String]) -> String {
     let mut o = String::new();
     for (i, w) in ws.iter().enumerate() {
         if i > 0 { o.push(' '); }
@@ -5108,7 +5140,7 @@ fn helper_source(h: &str) -> &'static str {
                         piece = __sh_echo_esc(&arg);
                         if p >= 0 { piece = piece.chars().take(p as usize).collect(); }
                     }
-                    'q' => { piece = __sh_q(&arg); }
+                    'q' => { piece = __sh_q_printf(&arg); }
                     'c' => { piece = arg.chars().next().map(|c| c.to_string()).unwrap_or_default(); }
                     'd' | 'i' => { piece = format!("{}", __sh_atoi(&arg)); }
                     'u' => { piece = format!("{}", __sh_atou(&arg)); }
