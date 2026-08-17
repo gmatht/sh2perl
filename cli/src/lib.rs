@@ -765,13 +765,6 @@ exit $main_exit_code;
                 }
                 let filename = &args[3];
                 parse_shir_json_to_perl(filename);
-            } else if args.len() >= 3 && args[2] == "--shir-in-estree" {
-                if args.len() < 4 {
-                    println!("Error: file --shir-in-estree requires filename");
-                    return;
-                }
-                let filename = &args[3];
-                parse_shir_json_to_estree(filename);
             } else if args.len() >= 3 && args[2] == "--shir-in-rust" {
                 if args.len() < 4 {
                     println!("Error: file --shir-in-rust requires filename");
@@ -779,6 +772,13 @@ exit $main_exit_code;
                 }
                 let filename = &args[3];
                 parse_shir_json_to_rust(filename);
+            } else if args.len() >= 3 && args[2] == "--shir-in-estree" {
+                if args.len() < 4 {
+                    println!("Error: file --shir-in-estree requires filename");
+                    return;
+                }
+                let filename = &args[3];
+                parse_shir_json_to_estree(filename);
             } else if args.len() >= 3 && args[2] == "--perl-critic-only" {
                 if args.len() < 4 {
                     println!("Error: file --perl-critic-only requires filename");
@@ -1008,34 +1008,6 @@ exit $main_exit_code;
             debashl::transforms::process_subst::transform_program(&mut prog);
             print!("{}", debashl::ir::shir_to_perl(&prog));
         }
-        "--shir-in-sh" => {
-            if args.len() < 3 { println!("Error: --shir-in-sh requires input"); return; }
-            let input = &args[2];
-            let content = if input == "-" {
-                let mut s = String::new();
-                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
-                    eprintln!("stdin: {}", e); std::process::exit(1);
-                }
-                Ok(s)
-            } else {
-                fs::read_to_string(input)
-            };
-            let content = match content {
-                Ok(c) => c,
-                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
-            };
-            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
-                Ok(p) => p,
-                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
-            };
-            debashl::shir_passes::strip_cfor(&mut prog);
-            debashl::shir_passes::restructure_goto_only(&mut prog);
-            debashl::transforms::process_subst::transform_program(&mut prog);
-            print!("{}", match debashl::sh_backend::shir_to_sh(&prog) {
-                Ok(s) => s,
-                Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
-            });
-        }
         "--shir-in-rust" => {
             if args.len() < 3 { println!("Error: --shir-in-rust requires input"); return; }
             let input = &args[2];
@@ -1065,13 +1037,39 @@ exit $main_exit_code;
             // the shared core pipeline (mirrors the --shir-in-estree arm):
             // strip_cfor lowers the C-style ForInit (step spliced before
             // every continue), restructure_goto_only folds goto/label
-            // pairs (t29_goto.cc: the un-restructured Goto lowered to a
-            // TODO and the loop ran once), process_subst materializes
-            // captures.
+            // pairs, process_subst materializes captures.
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
             print!("{}", debashl::rust_backend::shir_to_rust(&prog));
+        }
+        "--shir-in-sh" => {
+            if args.len() < 3 { println!("Error: --shir-in-sh requires input"); return; }
+            let input = &args[2];
+            let content = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e); std::process::exit(1);
+                }
+                Ok(s)
+            } else {
+                fs::read_to_string(input)
+            };
+            let content = match content {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+            };
+            debashl::shir_passes::strip_cfor(&mut prog);
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
+            print!("{}", match debashl::sh_backend::shir_to_sh(&prog) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
+            });
         }
         "--mir" => {
             if args.len() < 3 {
