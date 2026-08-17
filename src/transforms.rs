@@ -18,7 +18,8 @@ use crate::ir::IrStmt;
 pub type TransformFn = fn(&mut Vec<IrStmt>) -> bool;
 
 pub mod arith_forms;
-pub mod builtin; // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
+pub mod builtin;
+pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod grep_o; // `grep -o PAT` → the generic grepMatches(text, pattern, flags) op
 pub mod process_subst;
 pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
