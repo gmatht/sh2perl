@@ -32,7 +32,7 @@ pub fn generate_wc_command_with_output(
     let mut count_chars = false;
     let mut count_bytes = false;
     let mut longest_line = false;
-    let mut file_arg: Option<String> = None;
+    let mut file_args: Vec<String> = Vec::new();
 
     for arg in &cmd.args {
         if let Word::Literal(s, _) = arg {
@@ -58,9 +58,9 @@ pub fn generate_wc_command_with_output(
                         _ => {}
                     }
                 }
-            } else if !s.starts_with('-') && s != "-" {
+            } else if s != "-" {
                 // File argument
-                file_arg = Some(s.clone());
+                file_args.push(s.clone());
             }
         }
     }
@@ -72,6 +72,8 @@ pub fn generate_wc_command_with_output(
         count_bytes = true;
     }
 
+    let file_arg = file_args.first().cloned();
+
     // Build the counting code
     let output_name = output_var.trim_start_matches('$');
     let output_var_expr = if output_var.starts_with('$') {
@@ -79,6 +81,45 @@ pub fn generate_wc_command_with_output(
     } else {
         format!("${}", output_name)
     };
+
+    // GNU wc with MULTIPLE files prints per-file lines plus a `total` row;
+    // the native emulation reads ONE file. Emit the real `bash -c` capture
+    // (per-file + totals exactly) — the legacy caller always `print`s the
+    // output var, so a bare empty return would leave it undeclared.
+    if file_args.len() > 1 {
+        let flags = {
+            let mut f = String::new();
+            if count_lines {
+                f.push_str(" -l");
+            }
+            if count_words {
+                f.push_str(" -w");
+            }
+            if count_chars {
+                f.push_str(" -m");
+            }
+            if count_bytes {
+                f.push_str(" -c");
+            }
+            if longest_line {
+                f.push_str(" -L");
+            }
+            f
+        };
+        let cmd_text = format!(
+            "wc{}{}",
+            flags,
+            file_args
+                .iter()
+                .map(|f| format!(" '{}'", f.replace('\'', "'\\''")))
+                .collect::<String>()
+        );
+        let q = crate::ir::safe_perl_q_string(&cmd_text);
+        return format!(
+            "{} = do {{ open(my $__fh, '-|', 'bash', '-c', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $_r; }};\n",
+            output_var_expr, q
+        );
+    }
 
     // Collect lines/words/chars
     let read_input = if let Some(ref filename) = file_arg {
@@ -99,15 +140,9 @@ pub fn generate_wc_command_with_output(
 
     // Declare output variable
     if generator.declared_locals.contains(output_name) {
-        output.push_str(&format!(
-            "{} = do {{\n",
-            output_var_expr
-        ));
+        output.push_str(&format!("{} = do {{\n", output_var_expr));
     } else {
-        output.push_str(&format!(
-            "my {} = do {{\n",
-            output_var_expr
-        ));
+        output.push_str(&format!("my {} = do {{\n", output_var_expr));
         generator.declared_locals.insert(output_name.to_string());
     }
     generator.indent_level += 1;
@@ -150,45 +185,98 @@ pub fn generate_wc_command_with_output(
     // output like:  my $_wc_result = sprintf "%7d %7d %7d\n",
     //                $_wc_lines, $_wc_words, $_wc_bytes;
     // instead of the piecewise .= concatenation.
-    let num_cols = [count_lines, count_words, count_chars || count_bytes, longest_line]
-        .iter().filter(|&&x| x).count();
+    let num_cols = [
+        count_lines,
+        count_words,
+        count_chars || count_bytes,
+        longest_line,
+    ]
+    .iter()
+    .filter(|&&x| x)
+    .count();
+    // GNU wc field width: digits of the LARGEST count across all files and
+    // columns — `(5,8,48)` → width 2 → ` 5  8 48 file`; `(1,1,2)` → width 1
+    // → `1 1 2 file`; six-digit counts → `100000 588895` (no visible pad).
+    // The old `%7d` over-padded. The width is a RUNTIME value (the counts
+    // depend on the file), so emit a width computation + `%*d` fields.
     let use_padding = num_cols > 1;
-    let pad = if use_padding { "%7d" } else { "%d" };
+    let pad = if use_padding { "%*d" } else { "%d" };
+    let count_vars: Vec<&str> = {
+        let mut v = Vec::new();
+        if count_lines {
+            v.push("_wc_lines");
+        }
+        if count_words {
+            v.push("_wc_words");
+        }
+        if count_chars || count_bytes {
+            v.push(if count_chars { "_wc_chars" } else { "_wc_bytes" });
+        }
+        if longest_line {
+            v.push("_wc_longest");
+        }
+        v
+    };
+    if use_padding {
+        output.push_str("my $_wc_w = 1;\n");
+        output.push_str(&format!(
+            "for my $_wc_c ({}) {{\n",
+            count_vars
+                .iter()
+                .map(|v| format!("${v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        output.push_str("    my $_wc_d = length($_wc_c);\n");
+        output.push_str("    $_wc_w = $_wc_d if $_wc_d > $_wc_w;\n");
+        output.push_str("}\n");
+    }
 
     let mut fmt_parts: Vec<String> = Vec::new();
     let mut sprintf_args: Vec<IrExpr> = Vec::new();
 
     if count_lines {
         fmt_parts.push(pad.to_string());
+        if use_padding {
+            sprintf_args.push(IrExpr::Var("_wc_w".to_string(), Some(Sigil::Scalar)));
+        }
         sprintf_args.push(IrExpr::Var("_wc_lines".to_string(), Some(Sigil::Scalar)));
     }
     if count_words {
         fmt_parts.push(pad.to_string());
+        if use_padding {
+            sprintf_args.push(IrExpr::Var("_wc_w".to_string(), Some(Sigil::Scalar)));
+        }
         sprintf_args.push(IrExpr::Var("_wc_words".to_string(), Some(Sigil::Scalar)));
     }
     if count_chars || count_bytes {
         fmt_parts.push(pad.to_string());
-        let var_name = if count_chars { "_wc_chars" } else { "_wc_bytes" };
+        if use_padding {
+            sprintf_args.push(IrExpr::Var("_wc_w".to_string(), Some(Sigil::Scalar)));
+        }
+        let var_name = if count_chars {
+            "_wc_chars"
+        } else {
+            "_wc_bytes"
+        };
         sprintf_args.push(IrExpr::Var(var_name.to_string(), Some(Sigil::Scalar)));
     }
     if longest_line {
         fmt_parts.push(pad.to_string());
+        if use_padding {
+            sprintf_args.push(IrExpr::Var("_wc_w".to_string(), Some(Sigil::Scalar)));
+        }
         sprintf_args.push(IrExpr::Var("_wc_longest".to_string(), Some(Sigil::Scalar)));
     }
 
-    // Append filename if provided
+    // Columns joined with single spaces; the filename (if any) follows with
+    // ONE space and NO trailing space (GNU wc: `… file\n`, not `… file \n`).
+    let mut fmt_str = fmt_parts.join(" ");
     if let Some(ref filename) = file_arg {
-        fmt_parts.push(filename.clone());
+        fmt_str.push(' ');
+        fmt_str.push_str(filename);
     }
-
-    // Use literal newline; DoubleQuoted handler will escape it to \\n
-    fmt_parts.push("\n".to_string());
-    let fmt_str = if num_cols <= 1 && file_arg.is_none() {
-        // Single column, no filename: just join without extra spacing
-        fmt_parts.join("")
-    } else {
-        fmt_parts.join(" ")
-    };
+    fmt_str.push_str("\n");
 
     let mut all_args = vec![IrExpr::Str(fmt_str, StrStyle::DoubleQuoted)];
     all_args.extend(sprintf_args);

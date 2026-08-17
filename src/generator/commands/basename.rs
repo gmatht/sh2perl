@@ -10,6 +10,15 @@ pub fn generate_basename_command(
     let mut output = String::new();
 
     // basename command syntax: basename path [suffix]
+    // GNU basename with TWO suffixes errors: "basename: extra operand '.bak'"
+    // (stderr, exit 1, no stdout). Return EMPTY so ir.rs's
+    // generator_emulate_command treats it as not-emulatable and falls back
+    // to the real bash basename, which reproduces the diagnostic exactly
+    // (the old code silently used only the first suffix: `basename f.txt
+    // .txt .bak` printed "file" instead of the error).
+    if cmd.args.len() > 2 {
+        return String::new();
+    }
     if let Some(path) = cmd.args.first() {
         let path_str = generator.word_to_perl(path);
         let suffix_str = if cmd.args.len() > 1 {
@@ -18,9 +27,14 @@ pub fn generate_basename_command(
             None
         };
 
-        if !generator.declared_locals.contains("basename_loaded_file_basename") {
+        if !generator
+            .declared_locals
+            .contains("basename_loaded_file_basename")
+        {
             output.push_str("use File::Basename qw(basename);\n");
-            generator.declared_locals.insert("basename_loaded_file_basename".to_string());
+            generator
+                .declared_locals
+                .insert("basename_loaded_file_basename".to_string());
         }
 
         let basename_expr = if let Some(suffix) = &suffix_str {

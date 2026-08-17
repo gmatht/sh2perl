@@ -137,6 +137,16 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
                 target
             ));
         }
+        RedirectOperator::ClobberOutput => {
+            // `>|` clobber output: same open as plain `>` for perl (the
+            // noclobber distinction is a POSIX sh / bash concern; perl
+            // open is always clobber).
+            let target = generator.perl_string_literal(&redirect.target);
+            output.push_str(&format!(
+                "open STDOUT, '>', {} or croak \"Cannot write file: $OS_ERROR\\n\";\n",
+                target
+            ));
+        }
         RedirectOperator::Append => {
             // Append redirection: command >> file
             let target = generator.perl_string_literal(&redirect.target);
@@ -223,6 +233,10 @@ waitpid $pid, 0;\n",
                 format!("{} . '/process_sub_{}.tmp'", get_temp_dir(), global_counter),
                 temp_var.clone(),
             );
+            // The temp var is a generated lexical; register it so later
+            // Word::Variable refs (e.g. native cmp operands) render as the
+            // scalar `$temp_file_ps_fh_N`, not `$ENV{...}`.
+            generator.declared_locals.insert(temp_var.clone());
 
             // Store the temp_var for use by commands that need it (like grep -f)
             generator.current_process_sub_file = Some(temp_var.clone());
@@ -570,13 +584,36 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
             for redirect in &redirect_cmd.redirects {
                 match &redirect.operator {
                     RedirectOperator::Input => {
-                        result.push_str(&format!(" < {}", word_to_bash_string(&redirect.target)));
+                        // `{fd}< target` — an explicit fd (e.g. `3<file`) keeps it;
+                        // fd None is the plain ` < target` form.
+                        if let Some(fd) = redirect.fd {
+                            result.push_str(&format!(" {}< {}", fd, word_to_bash_string(&redirect.target)));
+                        } else {
+                            result.push_str(&format!(" < {}", word_to_bash_string(&redirect.target)));
+                        }
                     }
                     RedirectOperator::Output => {
-                        result.push_str(&format!(" > {}", word_to_bash_string(&redirect.target)));
+                        if let Some(fd) = redirect.fd {
+                            result.push_str(&format!(" {}> {}", fd, word_to_bash_string(&redirect.target)));
+                        } else {
+                            result.push_str(&format!(" > {}", word_to_bash_string(&redirect.target)));
+                        }
+                    }
+                    RedirectOperator::ClobberOutput => {
+                        // `>|` — bash-valid; keep the clobber operator in
+                        // the bash -c string.
+                        if let Some(fd) = redirect.fd {
+                            result.push_str(&format!(" {}>| {}", fd, word_to_bash_string(&redirect.target)));
+                        } else {
+                            result.push_str(&format!(" >| {}", word_to_bash_string(&redirect.target)));
+                        }
                     }
                     RedirectOperator::Append => {
-                        result.push_str(&format!(" >> {}", word_to_bash_string(&redirect.target)));
+                        if let Some(fd) = redirect.fd {
+                            result.push_str(&format!(" {}>> {}", fd, word_to_bash_string(&redirect.target)));
+                        } else {
+                            result.push_str(&format!(" >> {}", word_to_bash_string(&redirect.target)));
+                        }
                     }
                     RedirectOperator::ProcessSubstitutionInput(cmd) => {
                         result.push_str(&format!(" <({})", generate_bash_command_string(cmd)));
@@ -588,10 +625,11 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                         result.push_str(&format!(" <<< {}", word_to_bash_string(&redirect.target)));
                     }
                     RedirectOperator::StderrOutput => {
-                        // When the redirection target is a numeric file descriptor (e.g. 1)
-                        // the canonical shell syntax uses an ampersand (e.g. 2>&1). If the
-                        // target serializes to a plain digit we render with the '&' form
-                        // to preserve the original semantics instead of producing "2> 1".
+                        // fd semantics: `2>file` (fd 2, file), `2>&1` (fd 2,
+                        // digit target → dup), `>&4` (fd None → fd 1 dup),
+                        // `3>&-` (explicit fd, close).  The parser stores
+                        // `>&`/`2>&` forms as StderrOutput; the fd field (or
+                        // None = 1 for `>&`) decides the actual descriptor.
                         let tgt = word_to_bash_string(&redirect.target);
                         let tgt_unquoted =
                             if tgt.starts_with('\'') && tgt.ends_with('\'') && tgt.len() > 1 {
@@ -599,10 +637,11 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             } else {
                                 tgt.clone()
                             };
-                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
-                            result.push_str(&format!(" 2>&{}", tgt_unquoted));
+                        let fd_str = redirect.fd.map(|n| n.to_string()).unwrap_or_else(|| "1".to_string());
+                        if tgt_unquoted == "-" || tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
+                            result.push_str(&format!(" {}>&{}", fd_str, tgt_unquoted));
                         } else {
-                            result.push_str(&format!(" 2> {}", tgt));
+                            result.push_str(&format!(" {}> {}", fd_str, tgt));
                         }
                     }
                     RedirectOperator::StderrAppend => {
@@ -613,10 +652,11 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             } else {
                                 tgt.clone()
                             };
-                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
-                            result.push_str(&format!(" 2>>&{}", tgt_unquoted));
+                        let fd_str = redirect.fd.map(|n| n.to_string()).unwrap_or_else(|| "1".to_string());
+                        if tgt_unquoted == "-" || tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
+                            result.push_str(&format!(" {}>>&{}", fd_str, tgt_unquoted));
                         } else {
-                            result.push_str(&format!(" 2>> {}", tgt));
+                            result.push_str(&format!(" {}>> {}", fd_str, tgt));
                         }
                     }
                     RedirectOperator::StderrInput => {
@@ -627,10 +667,11 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             } else {
                                 tgt.clone()
                             };
-                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
-                            result.push_str(&format!(" 2<&{}", tgt_unquoted));
+                        let fd_str = redirect.fd.map(|n| n.to_string()).unwrap_or_else(|| "1".to_string());
+                        if tgt_unquoted == "-" || tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
+                            result.push_str(&format!(" {}<&{}", fd_str, tgt_unquoted));
                         } else {
-                            result.push_str(&format!(" 2< {}", tgt));
+                            result.push_str(&format!(" {}< {}", fd_str, tgt));
                         }
                     }
                     RedirectOperator::InputOutput => {
@@ -641,9 +682,13 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                         // Heredoc: include the delimiter and body in the command string
                         let delim = word_to_bash_string(&redirect.target);
                         // Remove surrounding quotes if present
-                        let unquoted_delim = if delim.starts_with('\'') && delim.ends_with('\'') && delim.len() > 1 {
+                        let unquoted_delim = if delim.starts_with('\'')
+                            && delim.ends_with('\'')
+                            && delim.len() > 1
+                        {
                             delim[1..delim.len() - 1].to_string()
-                        } else if delim.starts_with('"') && delim.ends_with('"') && delim.len() > 1 {
+                        } else if delim.starts_with('"') && delim.ends_with('"') && delim.len() > 1
+                        {
                             delim[1..delim.len() - 1].to_string()
                         } else {
                             delim.clone()
@@ -692,6 +737,16 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
 // command string. Treat common glob metacharacters as special so patterns
 // like "*.txt" are preserved rather than being unintentionally expanded.
 fn needs_shell_quoting_literal(s: &str) -> bool {
+    needs_shell_quoting_literal_with_globs(s, true)
+}
+
+/// Same as `needs_shell_quoting_literal` but with glob metacharacters
+/// (`*`, `?`, `[`) treated as NON-quotable.  Used for BARE `Word::Literal`
+/// exec args: an unquoted glob must reach the inner bash so IT expands it
+/// (`grep -l pattern *.txt`), and an unmatched glob stays literal (nullglob
+/// off) exactly like the source script.  Quoted source args arrive as
+/// `StringInterpolation` and keep the glob-quoting behavior.
+fn needs_shell_quoting_literal_with_globs(s: &str, quote_globs: bool) -> bool {
     s.contains(' ')
         || s.contains('"')
         || s.contains('\'')
@@ -704,9 +759,9 @@ fn needs_shell_quoting_literal(s: &str) -> bool {
         || s.contains('&')
         || s.contains('<')
         || s.contains('>')
-        || s.contains('*')
-        || s.contains('?')
-        || s.contains('[')
+        || s.contains('(')
+        || s.contains(')')
+        || (quote_globs && (s.contains('*') || s.contains('?') || s.contains('[')))
         || s.contains('{')
         || s.contains('}')
         || s.contains('$')
@@ -722,7 +777,7 @@ fn word_to_bash_string(word: &Word) -> String {
                 return s.clone();
             }
 
-            if needs_shell_quoting_literal(s) {
+            if needs_shell_quoting_literal_with_globs(s, false) {
                 // If the literal contains backslash escape sequences like \n, \t,
                 // we must use double quotes so that bash's echo -e will interpret
                 // them.  Single quotes would preserve the backslash literally.
@@ -927,9 +982,11 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
         "set" => {
             // Convert shell set options to Perl equivalents
             // Check for "set -- arg1 arg2 ..." which sets positional parameters
-            if let Some(dashdash_pos) = cmd.args.iter().position(|a| {
-                matches!(a, Word::Literal(s, _) if s == "--")
-            }) {
+            if let Some(dashdash_pos) = cmd
+                .args
+                .iter()
+                .position(|a| matches!(a, Word::Literal(s, _) if s == "--"))
+            {
                 // Collect all args after -- into @ARGV (or @_ inside a function)
                 let perl_args: Vec<String> = cmd.args[dashdash_pos + 1..]
                     .iter()
@@ -1025,10 +1082,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                         if generator.declared_locals.contains(var_name)
                             || generator.function_level_vars.contains(var_name)
                         {
-                            output.push_str(&format!(
-                                "$ENV{{{}}} = ${};\n",
-                                var_name, var_name
-                            ));
+                            output.push_str(&format!("$ENV{{{}}} = ${};\n", var_name, var_name));
                         }
                     }
                 }
@@ -1073,6 +1127,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             if opt.contains('p') {
                                 is_print = true;
                             }
+                            i += 1;
                             continue;
                         }
                         // Handle declare -p (print variable definition)
@@ -1083,7 +1138,10 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("do {{\n"));
                                 output.push_str(&generator.indent());
-                                output.push_str(&format!("    my $output = \"declare -A {}=(\";\n", var));
+                                output.push_str(&format!(
+                                    "    my $output = \"declare -A {}=(\";\n",
+                                    var
+                                ));
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("    for my $key (keys %{}) {{\n", var));
                                 output.push_str(&generator.indent());
@@ -1101,12 +1159,16 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             } else if generator.declared_locals.contains(var) {
                                 // Print scalar variable
                                 output.push_str(&generator.indent());
-                                output.push_str(&format!("print \"declare -- {}=${{{}}}\\n\", ${};\n", var, var, var));
+                                output.push_str(&format!(
+                                    "print \"declare -- {}=${{{}}}\\n\", ${};\n",
+                                    var, var, var
+                                ));
                             } else {
                                 // Variable not declared, just print empty
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("print \"declare -- {}\\\n\";\n", var));
                             }
+                            i += 1;
                         } else {
                             // Check if it's an assignment (var=value)
                             if opt.contains('=') {
@@ -1143,10 +1205,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                                 }
                                                 Word::ParameterExpansion(pe, _) => {
                                                     perl_value = generator.word_to_perl(
-                                                        &Word::ParameterExpansion(
-                                                            pe.clone(),
-                                                            None,
-                                                        ),
+                                                        &Word::ParameterExpansion(pe.clone(), None),
                                                     );
                                                     i += 1;
                                                 }
@@ -1167,11 +1226,20 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                         }
                                         output.push_str(&generator.indent());
                                         if is_assoc {
-                                            output.push_str(&format!("my %{} = ({});\n", var, perl_value));
+                                            output.push_str(&format!(
+                                                "my %{} = ({});\n",
+                                                var, perl_value
+                                            ));
                                         } else if is_array {
-                                            output.push_str(&format!("my @{} = ({});\n", var, perl_value));
+                                            output.push_str(&format!(
+                                                "my @{} = ({});\n",
+                                                var, perl_value
+                                            ));
                                         } else {
-                                            output.push_str(&format!("my ${} = {};\n", var, perl_value));
+                                            output.push_str(&format!(
+                                                "my ${} = {};\n",
+                                                var, perl_value
+                                            ));
                                         }
                                         generator.declared_locals.insert(var.to_string());
                                     }
@@ -1199,7 +1267,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                         if !generator.declared_locals.contains(name) {
                             let elements_perl: Vec<String> = elements
                                 .iter()
-                                .map(|e| generator.array_element_to_perl(e))
+                                .map(|e| generator.array_element_word_to_perl(e))
                                 .collect();
                             output.push_str(&generator.indent());
                             if is_assoc {
@@ -1259,10 +1327,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                         Word::CommandSubstitution(cmd_sub, _) => {
                                             // Handle command substitution
                                             let perl_command = generator.word_to_perl(
-                                                &Word::CommandSubstitution(
-                                                    cmd_sub.clone(),
-                                                    None,
-                                                ),
+                                                &Word::CommandSubstitution(cmd_sub.clone(), None),
                                             );
                                             output.push_str(&generator.indent());
                                             output.push_str(&format!(
@@ -1304,7 +1369,8 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                             i += 1;
                                         }
                                         Word::Arithmetic(arith_expr, _) => {
-                                            let arith_word = Word::Arithmetic(arith_expr.clone(), None);
+                                            let arith_word =
+                                                Word::Arithmetic(arith_expr.clone(), None);
                                             let perl_value = generator.word_to_perl(&arith_word);
                                             output.push_str(&generator.indent());
                                             output.push_str(&format!(
@@ -1327,8 +1393,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                     // Regular assignment without command substitution
                                     let perl_value = shell_value_to_perl(value);
                                     output.push_str(&generator.indent());
-                                    output
-                                        .push_str(&format!("my ${} = {};\n", var, perl_value));
+                                    output.push_str(&format!("my ${} = {};\n", var, perl_value));
                                 }
                                 generator.declared_locals.insert(var.to_string());
                                 generator.function_level_vars.insert(var.to_string());
@@ -1368,10 +1433,11 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             let elements_perl: Vec<String> = elements
                                 .iter()
                                 .map(|e| {
-                                    if e == "\"$@\"" || e == "$@" {
+                                    let es = e.to_string();
+                                    if es == "\"$@\"" || es == "$@" {
                                         "@_".to_string()
                                     } else {
-                                        format!("'{}'", e.replace("'", "\\'"))
+                                        format!("'{}'", es.replace("'", "\\'"))
                                     }
                                 })
                                 .collect();
@@ -1529,6 +1595,28 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 ));
             }
         }
+        "exec" => {
+            // `exec cmd args...` replaces the shell process with the command:
+            // run it as an ordinary simple command and then exit with its
+            // status (nothing after an exec ever runs).  `exec` with no args
+            // just sets redirections (no-op here).  Redirects on the exec
+            // are handled by the outer Redirect wrapper.
+            if !cmd.args.is_empty() {
+                let simple = SimpleCommand {
+                    name: cmd.args[0].clone(),
+                    args: cmd.args[1..].to_vec(),
+                    redirects: vec![],
+                    env_vars: std::collections::BTreeMap::new(),
+                    stdout_used: cmd.stdout_used,
+                    stderr_used: cmd.stderr_used,
+                };
+                output.push_str(&generator.generate_simple_command(&simple));
+                output.push_str(&generator.indent());
+                output.push_str(&format!(
+                    "exit $CHILD_ERROR;\n"
+                ));
+            }
+        }
         "trap" => {
             // Handle trap command: trap 'handler' SIGNAL
             // For EXIT, generate END block. For other signals, use %SIG.
@@ -1561,31 +1649,22 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                     if signal_name == "EXIT" || signal_name == "0" {
                         // EXIT trap -> END block
                         // Use open() based approach instead of qx{...} to avoid check_qx.
-                        let handler_perl_escaped = handler
-                            .replace("\\", "\\\\")
-                            .replace("\'", "\\\'");
+                        let handler_perl_escaped =
+                            handler.replace("\\", "\\\\").replace("\'", "\\\'");
                         output.push_str(&format!(
                             "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = do {{ open(my $__fh, \'-|\', \'sh\', \'-c\', \'{} 2>&1\') or croak \"cmd: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $_r; }}; print $end_out if $end_out ne q{{}}; }}\n",
                             handler_perl_escaped
                         ));
                     } else if signal_name == "DEBUG" {
                         // DEBUG trap
-                        output.push_str(&format!(
-                            "# DEBUG trap not fully supported: {}\n",
-                            handler
-                        ));
+                        output
+                            .push_str(&format!("# DEBUG trap not fully supported: {}\n", handler));
                     } else if signal_name == "RETURN" {
                         // RETURN trap
-                        output.push_str(&format!(
-                            "# RETURN trap not supported: {}\n",
-                            handler
-                        ));
+                        output.push_str(&format!("# RETURN trap not supported: {}\n", handler));
                     } else if signal_name == "ERR" {
                         // ERR trap - use __DIE__ or custom handler
-                        output.push_str(&format!(
-                            "# ERR trap not fully supported: {}\n",
-                            handler
-                        ));
+                        output.push_str(&format!("# ERR trap not fully supported: {}\n", handler));
                     } else if !signal_name.is_empty() {
                         // Other signals: INT, TERM, etc.
                         // Use native Perl for echo commands; qx{bash -c ...} otherwise.
@@ -1601,7 +1680,8 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 signal_name, escaped_msg
                             ));
                         } else {
-                            let handler_escaped = handler.replace("\\", "\\\\").replace("\'", "\\\'");
+                            let handler_escaped =
+                                handler.replace("\\", "\\\\").replace("\'", "\\\'");
                             output.push_str(&format!(
                                 "$SIG{{{}}} = sub {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"trap handler failed: $!\"; close $__fh; }};\n",
                                 signal_name,

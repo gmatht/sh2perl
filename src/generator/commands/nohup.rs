@@ -40,14 +40,12 @@ pub fn generate_nohup_command(generator: &mut Generator, cmd: &SimpleCommand) ->
         // Check if the command is a shell builtin to handle exec correctly.
         let is_builtin = if let Word::Literal(name, _) = &cmd.args[0] {
             [
-                "echo", "nice", "cat", "grep", "head", "tail",
-                "ls", "wc", "sort", "uniq", "cut", "tee",
-                "sed", "awk", "find", "strings", "xargs",
-                "printf", "read", "pwd", "kill", "time",
-                "basename", "dirname", "expr", "hostname", "id",
-                "readlink", "realpath", "uname", "whoami", "tty", "stat",
-                "env", "gunzip", "zstd",
-            ].contains(&name.as_str())
+                "echo", "nice", "cat", "grep", "head", "tail", "ls", "wc", "sort", "uniq", "cut",
+                "tee", "sed", "awk", "find", "strings", "xargs", "printf", "read", "pwd", "kill",
+                "time", "basename", "dirname", "expr", "hostname", "id", "readlink", "realpath",
+                "uname", "whoami", "tty", "stat", "env", "gunzip", "zstd",
+            ]
+            .contains(&name.as_str())
         } else {
             false
         };
@@ -61,9 +59,7 @@ pub fn generate_nohup_command(generator: &mut Generator, cmd: &SimpleCommand) ->
             };
             // Generate: exec 'bash', '-c', 'cmd_name "$@"', 'cmd_name', @args
             let bash_cmd = format!("{} \"$@\"", cmd_name);
-            let bash_lit = generator.perl_string_literal_no_interp(
-                &Word::literal(bash_cmd),
-            );
+            let bash_lit = generator.perl_string_literal_no_interp(&Word::literal(bash_cmd));
             if args.is_empty() {
                 output.push_str(&format!(
                     "my $_exec_cmd = {}; exec 'bash', '-c', $_exec_cmd, '{}';\n",

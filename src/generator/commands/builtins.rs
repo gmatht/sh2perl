@@ -70,6 +70,7 @@ pub fn get_builtin_commands() -> HashMap<&'static str, BuiltinCommand> {
         "comm",
         BuiltinCommand::new("comm", "Compare sorted files", false),
     );
+    commands.insert("cmp", BuiltinCommand::new("cmp", "Compare files byte by byte", false));
     commands.insert("diff", BuiltinCommand::new("diff", "Compare files", false));
     commands.insert(
         "tr",
@@ -740,6 +741,12 @@ pub fn generate_generic_builtin(
         "tail" => {
             if input_var.is_empty() {
                 // Native Perl tail: read files and extract last N lines.
+                // Refuse flags the emulation can't express (bytes `-c`, follow
+                // `-f`, `-q`, `-s`, `--`) by returning EMPTY — ir.rs's
+                // generator_emulate_command treats empty as "not emulatable"
+                // and falls back to the real `bash -c` tail (which handles
+                // `tail -c 100` byte windows; the old code treated `-c`/its
+                // arg as FILE names — "tail: 100: No such file").
                 let mut num_lines = 10;
                 let mut file_args: Vec<String> = Vec::new();
                 let mut i = 0;
@@ -747,13 +754,25 @@ pub fn generate_generic_builtin(
                     if let Word::Literal(s, _) = &cmd.args[i] {
                         if s == "-n" && i + 1 < cmd.args.len() {
                             if let Word::Literal(n, _) = &cmd.args[i + 1] {
-                                if let Ok(v) = n.parse::<usize>() { num_lines = v; }
-                                i += 2; continue;
+                                if let Ok(v) = n.parse::<usize>() {
+                                    num_lines = v;
+                                }
+                                i += 2;
+                                continue;
                             }
-                        } else if s.starts_with("-n") {
-                            if let Ok(v) = s[2..].parse::<usize>() { num_lines = v; }
+                        } else if s.starts_with("-n") && s.len() > 2 {
+                            if let Ok(v) = s[2..].parse::<usize>() {
+                                num_lines = v;
+                            }
                         } else if s.starts_with('-') && s.len() > 1 {
-                            if let Ok(v) = s[1..].parse::<usize>() { num_lines = v; }
+                            if let Ok(v) = s[1..].parse::<usize>() {
+                                // bare `-N`: last N lines
+                                num_lines = v;
+                            } else {
+                                // unsupported flag (`-c`, `-f`, `-q`, …) —
+                                // hand the command back to bash
+                                return String::new();
+                            }
                         } else {
                             file_args.push(generator.word_to_perl(&cmd.args[i]));
                         }
@@ -764,25 +783,37 @@ pub fn generate_generic_builtin(
                 }
                 let files_joined = file_args.join(", ");
                 let n = num_lines;
+                // bash `tail -n N`: last N lines, or ALL when the input has
+                // fewer (the old `>= N` guard dropped the whole tail for
+                // `tail -n 15` on a 10-line file).
+                let tail_sel = |n: usize| {
+                    format!("@__lines > {n} ? @__lines[-{n}..-1] : @__lines")
+                };
                 if output_var.is_empty() {
                     if file_args.is_empty() {
-                        format!("do {{ my @__lines = <STDIN>; my @__tail = @__lines[-{}..-1] if @__lines >= {}; print @__tail; }};\n", n, n)
+                        format!(
+                            "do {{ my @__lines = <STDIN>; my @__tail = {}; print @__tail; }};\n",
+                            tail_sel(n)
+                        )
                     } else {
                         format!(
-                            "do {{ for my $__f ({}) {{ open(my $__fh, '<', $__f) or croak \"tail: $__f: $ERRNO\"; my @__lines = <$__fh>; close $__fh; my @__tail = @__lines[-{}..-1] if @__lines >= {}; print @__tail; }} }};\n",
-                            files_joined, n, n
+                            "do {{ for my $__f ({}) {{ open(my $__fh, '<', $__f) or croak \"tail: $__f: $ERRNO\"; my @__lines = <$__fh>; close $__fh; my @__tail = {}; print @__tail; }} }};\n",
+                            files_joined, tail_sel(n)
                         )
                     }
                 } else {
                     if file_args.is_empty() {
                         format!(
-                            "do {{ my @__lines = <STDIN>; my @__tail = @__lines[-{}..-1] if @__lines >= {}; ${} = join q{{}}, @__tail; }};\n",
-                            n, n, output_var
+                            "do {{ my @__lines = <STDIN>; my @__tail = {}; ${} = join q{{}}, @__tail; }};\n",
+                            tail_sel(n),
+                            output_var
                         )
                     } else {
                         format!(
-                            "do {{ my $__out = q{{}}; for my $__f ({}) {{ open(my $__fh, '<', $__f) or croak \"tail: $__f: $ERRNO\"; my @__lines = <$__fh>; close $__fh; my @__tail = @__lines[-{}..-1] if @__lines >= {}; $__out .= join q{{}}, @__tail; }} ${} = $__out; }};\n",
-                            files_joined, n, n, output_var
+                            "do {{ my $__out = q{{}}; for my $__f ({}) {{ open(my $__fh, '<', $__f) or croak \"tail: $__f: $ERRNO\"; my @__lines = <$__fh>; close $__fh; my @__tail = {}; $__out .= join q{{}}, @__tail; }} ${} = $__out; }};\n",
+                            files_joined,
+                            tail_sel(n),
+                            output_var
                         )
                     }
                 }
@@ -792,9 +823,9 @@ pub fn generate_generic_builtin(
                 )
             }
         }
-        "cut" => {
-            crate::generator::commands::cut::generate_cut_command_with_output(generator, cmd, input_var, 0, output_var)
-        }
+        "cut" => crate::generator::commands::cut::generate_cut_command_with_output(
+            generator, cmd, input_var, 0, output_var,
+        ),
         "paste" => {
             // For now, use the existing signature but we should standardize this
             let paste_output =
@@ -802,7 +833,10 @@ pub fn generate_generic_builtin(
             if output_var.is_empty() {
                 // Standalone paste command: capture the do-block result and print it.
                 let paste_result_var = format!("paste_result_{}", generator.get_unique_id());
-                format!("my ${} = {};\nprint ${};\n", paste_result_var, paste_output, paste_result_var)
+                format!(
+                    "my ${} = {};\nprint ${};\n",
+                    paste_result_var, paste_output, paste_result_var
+                )
             } else {
                 format!("${} = {};\n", output_var, paste_output)
             }
@@ -810,6 +844,10 @@ pub fn generate_generic_builtin(
         "comm" => {
             // For now, use the existing signature but we should standardize this
             crate::generator::commands::comm::generate_comm_command(generator, cmd, input_var, &[])
+        }
+        "cmp" => {
+            // Native cmp: check_qx forbids system(cmp); emulate GNU formats.
+            crate::generator::commands::cmp::generate_cmp_command(generator, cmd)
         }
         "diff" => {
             // For now, use the existing signature but we should standardize this
@@ -851,13 +889,11 @@ pub fn generate_generic_builtin(
                 } else {
                     // command name args...: just run the command directly through the shell
                     // to preserve builtin semantics for other builtins like echo, printf, etc.
-                    let cmd_str = generator.generate_command_string_for_system(
-                        &Command::Simple(cmd.clone()),
-                    );
+                    let cmd_str =
+                        generator.generate_command_string_for_system(&Command::Simple(cmd.clone()));
                     if output_var.is_empty() {
                         format!(
                             "$main_exit_code = $CHILD_ERROR = system('bash', '-c', {}) >> 8;\n",
-
                             cmd_str
                         )
                     } else {
@@ -873,12 +909,9 @@ pub fn generate_generic_builtin(
             // env: print environment variables or run a command with modified environment
             // Build a full bash command string from args, preserving env var patterns
             // like VAR=value that the parser may have left as separate tokens.
-            let cmd_str = generator.generate_command_string_for_system(
-                &Command::Simple(cmd.clone()),
-            );
-            let cmd_lit = generator.perl_string_literal_no_interp(
-                &Word::literal(cmd_str),
-            );
+            let cmd_str =
+                generator.generate_command_string_for_system(&Command::Simple(cmd.clone()));
+            let cmd_lit = generator.perl_string_literal_no_interp(&Word::literal(cmd_str));
             if cmd.args.is_empty() && cmd.env_vars.is_empty() {
                 // env with no args: print all environment variables
                 "do { print qq{{$_\n}} for sort keys %ENV; $CHILD_ERROR = 0; };\n".to_string()
@@ -1044,15 +1077,19 @@ pub fn generate_generic_builtin(
         "read" => {
             // Handle read command - read from input_var if available, otherwise from STDIN
             // Extract variable names from cmd.args (skip flags like -r, -p, -n, -t, -d, -s, -u, -a)
-            let vars: Vec<String> = cmd.args.iter().filter_map(|arg| {
-                if let Word::Literal(s, _) = arg {
-                    if !s.starts_with('-') {
-                        return Some(s.clone());
+            let vars: Vec<String> = cmd
+                .args
+                .iter()
+                .filter_map(|arg| {
+                    if let Word::Literal(s, _) = arg {
+                        if !s.starts_with('-') {
+                            return Some(s.clone());
+                        }
                     }
-                }
-                None
-            }).collect();
-            
+                    None
+                })
+                .collect();
+
             if input_var.is_empty() {
                 // No input variable, read from STDIN
                 if let Some(var_name) = vars.first() {
@@ -1081,19 +1118,23 @@ pub fn generate_generic_builtin(
             // Use 0 (exit code zero) so that the if-condition handler's
             // !(...) wrapping produces a truthy Perl value (0 is falsy,
             // so !0 is truthy, matching shell semantics where exit 0
-            // means "success/true").
+            // means "success/true").  Also reset $CHILD_ERROR: bash's
+            // `true` sets $? = 0, and a later `[ "$?" = 0 ]` reads it.
             if output_var.is_empty() {
-                "0;\n".to_string()
+                "$CHILD_ERROR = 0;\n0;\n".to_string()
             } else {
-                format!("0;\n${} = q{};\n", output_var, "")
+                format!("$CHILD_ERROR = 0;\n0;\n${} = q{};\n", output_var, "")
             }
         }
         "false" => {
-            // false command always fails (exit status 1)
+            // false command always fails (exit status 1).  bash sets
+            // $? = 1 and CONTINUES — `exit 1` would terminate the whole
+            // script, so set $CHILD_ERROR and let the surrounding
+            // condition/exit machinery use it.
             if output_var.is_empty() {
-                "exit 1;\n".to_string()
+                "$CHILD_ERROR = 1;\n1;\n".to_string()
             } else {
-                format!("exit 1;\n${} = q{};\n", output_var, "")
+                format!("$CHILD_ERROR = 1;\n1;\n${} = q{};\n", output_var, "")
             }
         }
         "whoami" => {
@@ -1117,34 +1158,77 @@ pub fn generate_generic_builtin(
                 if let Word::Literal(s, _) = arg {
                     if s.starts_with('-') {
                         has_flags = true;
-                        if s.contains('a') { flag_a = true; }
-                        if s.contains('s') { flag_s = true; }
-                        if s.contains('n') { flag_n = true; }
-                        if s.contains('r') { flag_r = true; }
-                        if s.contains('v') { flag_v = true; }
-                        if s.contains('m') { flag_m = true; }
+                        if s.contains('a') {
+                            flag_a = true;
+                        }
+                        if s.contains('s') {
+                            flag_s = true;
+                        }
+                        if s.contains('n') {
+                            flag_n = true;
+                        }
+                        if s.contains('r') {
+                            flag_r = true;
+                        }
+                        if s.contains('v') {
+                            flag_v = true;
+                        }
+                        if s.contains('m') {
+                            flag_m = true;
+                        }
                     }
                 }
             }
-            if !has_flags || flag_s { flag_s = true; }
-            if flag_a { flag_s = true; flag_n = true; flag_r = true; flag_v = true; flag_m = true; }
+            if !has_flags || flag_s {
+                flag_s = true;
+            }
+            if flag_a {
+                flag_s = true;
+                flag_n = true;
+                flag_r = true;
+                flag_v = true;
+                flag_m = true;
+            }
             if output_var.is_empty() {
                 let mut code = "do { use POSIX qw(uname); my ($__sys, $__node, $__rel, $__ver, $__mach) = POSIX::uname(); my @__parts; ".to_string();
-                if flag_s { code.push_str("push @__parts, $__sys; "); }
-                if flag_n { code.push_str("push @__parts, $__node; "); }
-                if flag_r { code.push_str("push @__parts, $__rel; "); }
-                if flag_v { code.push_str("push @__parts, $__ver; "); }
-                if flag_m { code.push_str("push @__parts, $__mach; "); }
+                if flag_s {
+                    code.push_str("push @__parts, $__sys; ");
+                }
+                if flag_n {
+                    code.push_str("push @__parts, $__node; ");
+                }
+                if flag_r {
+                    code.push_str("push @__parts, $__rel; ");
+                }
+                if flag_v {
+                    code.push_str("push @__parts, $__ver; ");
+                }
+                if flag_m {
+                    code.push_str("push @__parts, $__mach; ");
+                }
                 code.push_str("print join(\" \", @__parts) . \"\\n\"; $CHILD_ERROR = 0; };\n");
                 code
             } else {
                 let mut code = format!("do {{ use POSIX qw(uname); my ($__sys, $__node, $__rel, $__ver, $__mach) = POSIX::uname(); my @__parts; ");
-                if flag_s { code.push_str("push @__parts, $__sys; "); }
-                if flag_n { code.push_str("push @__parts, $__node; "); }
-                if flag_r { code.push_str("push @__parts, $__rel; "); }
-                if flag_v { code.push_str("push @__parts, $__ver; "); }
-                if flag_m { code.push_str("push @__parts, $__mach; "); }
-                code.push_str(&format!("${} = join(\" \", @__parts) . \"\\n\"; $CHILD_ERROR = 0; }};\n", output_var));
+                if flag_s {
+                    code.push_str("push @__parts, $__sys; ");
+                }
+                if flag_n {
+                    code.push_str("push @__parts, $__node; ");
+                }
+                if flag_r {
+                    code.push_str("push @__parts, $__rel; ");
+                }
+                if flag_v {
+                    code.push_str("push @__parts, $__ver; ");
+                }
+                if flag_m {
+                    code.push_str("push @__parts, $__mach; ");
+                }
+                code.push_str(&format!(
+                    "${} = join(\" \", @__parts) . \"\\n\"; $CHILD_ERROR = 0; }};\n",
+                    output_var
+                ));
                 code
             }
         }
@@ -1163,7 +1247,10 @@ pub fn generate_generic_builtin(
                 "$CHILD_ERROR = 0;\n".to_string()
             } else {
                 let newname = generator.word_to_perl(&cmd.args[0]);
-                format!("$main_exit_code = $CHILD_ERROR = system('/bin/hostname', {}) >> 8;\n", newname)
+                format!(
+                    "$main_exit_code = $CHILD_ERROR = system('/bin/hostname', {}) >> 8;\n",
+                    newname
+                )
             }
         }
         "chmod" => {
@@ -1251,8 +1338,12 @@ pub fn generate_generic_builtin(
                     }
                     if s.starts_with('-') && !s.starts_with("-") {
                         // Combined flags like -sf
-                        if s.contains('s') { is_symbolic = true; }
-                        if s.contains('f') { is_force = true; }
+                        if s.contains('s') {
+                            is_symbolic = true;
+                        }
+                        if s.contains('f') {
+                            is_force = true;
+                        }
                         continue;
                     }
                 }
@@ -1299,10 +1390,14 @@ pub fn generate_generic_builtin(
         }
         "rmdir" => {
             // rmdir - remove empty directories using Perl's rmdir
-            let files: Vec<String> = cmd.args.iter()
+            let files: Vec<String> = cmd
+                .args
+                .iter()
                 .filter_map(|arg| {
                     if let Word::Literal(s, _) = arg {
-                        if s.starts_with('-') { return None; }
+                        if s.starts_with('-') {
+                            return None;
+                        }
                     }
                     Some(generator.word_to_perl(arg))
                 })

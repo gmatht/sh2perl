@@ -57,6 +57,21 @@ pub fn generate_echo_command(
                             "?" => "$CHILD_ERROR".to_string(),
                             "!" => "''".to_string(),
                             "-" => "''".to_string(),
+                            // `$0` is argv0 (the script name), NOT a positional
+                            // param — and $1/$2/… map to @ARGV (top level) or
+                            // @_ (inside a function), like word_to_perl does.
+                            // (Bare `$0`/`$1` in echo used to fall through to
+                            // `$ENV{0}`/`$ENV{1}`, which are never set.)
+                            _ if var.chars().all(|c| c.is_ascii_digit()) => {
+                                let idx = var.parse::<usize>().unwrap_or(0);
+                                if idx == 0 {
+                                    "$0".to_string()
+                                } else if generator.fn_nesting_depth > 0 {
+                                    format!("$_[{}]", idx - 1)
+                                } else {
+                                    format!("$ARGV[{}]", idx - 1)
+                                }
+                            }
                             _ => {
                                 if generator.declared_locals.contains(var)
                                     || generator.function_level_vars.contains(var)
@@ -67,7 +82,7 @@ pub fn generate_echo_command(
                                 }
                             }
                         }
-                    },
+                    }
                     Word::StringInterpolation(interp, _) => {
                         // Handle quoted variables like "$#" -> scalar(@ARGV)
                         if interp.parts.len() == 1 {
@@ -79,6 +94,19 @@ pub fn generate_echo_command(
                                     "?" => "$CHILD_ERROR".to_string(),
                                     "!" => "''".to_string(),
                                     "-" => "''".to_string(),
+                                    // Same argv0/positional treatment as the
+                                    // Word::Variable arm above (quoted `"$0"`
+                                    // used to render as $ENV{0}).
+                                    _ if var.chars().all(|c| c.is_ascii_digit()) => {
+                                        let idx = var.parse::<usize>().unwrap_or(0);
+                                        if idx == 0 {
+                                            "$0".to_string()
+                                        } else if generator.fn_nesting_depth > 0 {
+                                            format!("$_[{}]", idx - 1)
+                                        } else {
+                                            format!("$ARGV[{}]", idx - 1)
+                                        }
+                                    }
                                     _ => {
                                         if generator.declared_locals.contains(var)
                                             || generator.function_level_vars.contains(var)
@@ -123,7 +151,7 @@ pub fn generate_echo_command(
                                             .replace("\n", "\\n")
                                             .replace("\t", "\\t")
                                             .replace("\r", "\\r")
-                                        .replace("@", "\\@")
+                                            .replace("@", "\\@")
                                     )
                                 } else {
                                     // If this echo is being captured into an output variable
@@ -190,13 +218,33 @@ pub fn generate_echo_command(
                                                 "?" => result.push_str("$CHILD_ERROR"),
                                                 "!" => result.push_str(""),
                                                 "-" => result.push_str(""),
+                                                // Same argv0/positional treatment
+                                                // as the other arms (multi-part
+                                                // interp with -e).
+                                                _ if var.chars().all(|c| c.is_ascii_digit()) => {
+                                                    let idx = var.parse::<usize>().unwrap_or(0);
+                                                    if idx == 0 {
+                                                        result.push_str("$0");
+                                                    } else if generator.fn_nesting_depth > 0 {
+                                                        result
+                                                            .push_str(&format!("$_[{}]", idx - 1));
+                                                    } else {
+                                                        result.push_str(&format!(
+                                                            "$ARGV[{}]",
+                                                            idx - 1
+                                                        ));
+                                                    }
+                                                }
                                                 _ => {
                                                     if generator.declared_locals.contains(var)
-                                                        || generator.function_level_vars.contains(var)
+                                                        || generator
+                                                            .function_level_vars
+                                                            .contains(var)
                                                     {
                                                         result.push_str(&format!("${}", var));
                                                     } else {
-                                                        result.push_str(&format!("$ENV{{{}}}", var));
+                                                        result
+                                                            .push_str(&format!("$ENV{{{}}}", var));
                                                     }
                                                 }
                                             }
@@ -277,7 +325,7 @@ pub fn generate_echo_command(
                                     .replace("\n", "\\n")
                                     .replace("\t", "\\t")
                                     .replace("\r", "\\r")
-                                        .replace("@", "\\@")
+                                    .replace("@", "\\@")
                             )
                         } else {
                             // Check if the literal contains backticks that should be processed as command substitutions
@@ -348,7 +396,7 @@ pub fn generate_echo_command(
             if args[0].starts_with('"') && args[0].ends_with('"') && !args[0].contains("\\n") {
                 // Extract the string content and add newline directly using double quotes for escape sequences
                 let content = &args[0][1..args[0].len() - 1]; // Remove quotes
-                // Escape @ to prevent accidental array interpolation in double-quoted context
+                                                              // Escape @ to prevent accidental array interpolation in double-quoted context
                 let escaped_content = content.replace("@", "\\@");
                 output.push_str(&format!("${} .= \"{}\\n\";\n", output_var, escaped_content));
             } else if args[0].contains("\\n") {
@@ -385,8 +433,8 @@ pub fn handle_brace_expansion_for_echo(
     // In bash, a brace expansion with a single Range item is the only
     // case where ranges are actually expanded. When there are multiple
     // items (e.g. {1..10,20,30..40}), all items are treated as literals.
-    let is_single_range = expansion.items.len() == 1
-        && matches!(expansion.items.first(), Some(BraceItem::Range(_)));
+    let is_single_range =
+        expansion.items.len() == 1 && matches!(expansion.items.first(), Some(BraceItem::Range(_)));
 
     for item in &expansion.items {
         match item {
