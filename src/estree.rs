@@ -18,7 +18,7 @@
 
 use crate::ast::*;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ── ESTree node model (standard subset) ─────────────────────────────
 
@@ -45,6 +45,22 @@ pub enum Stmt {
         consequent: Box<Stmt>,
         alternate: Option<Box<Stmt>>,
     },
+    // Python-style try/except/else/finally (core request py-sh-go
+    // 20260813): the guarded block + catch clause(s) + optional
+    // finalizer. Standard ESTree: handler is a single CatchClause
+    // (multi-arm chains are an if/else-if ladder INSIDE it — see the
+    // lowering in shir.rs stmt_to_estree); the else suite lowers to a
+    // post-try guarded block (Python else runs only when the try body
+    // completed WITHOUT raising, and else-body exceptions must NOT be
+    // caught by this statement's arms).
+    TryStatement {
+        block: Box<Stmt>,
+        handler: Option<CatchClause>,
+        finalizer: Option<Box<Stmt>>,
+    },
+    ThrowStatement {
+        argument: Expr,
+    },
     SwitchStatement {
         discriminant: Expr,
         cases: Vec<SwitchCase>,
@@ -53,10 +69,42 @@ pub enum Stmt {
         test: Expr,
         body: Box<Stmt>,
     },
+    /// The A1 contract's post-test loop (core request
+    /// c-sh-go-20260814-111815): `do { body } while (test)` — the body
+    /// runs at least once, then the condition is re-checked (the While
+    /// arm's pre-test shape). Emitted by the c-sh-go frontend for C
+    /// `do-while` / `repeat-until` (until=true → the test is the
+    /// negated cond).
+    DoWhileStatement {
+        test: Expr,
+        body: Box<Stmt>,
+    },
+    /// The native numeric-range loop — `for (let i = lo; i <= hi; i++)`
+    /// — the `seq_range_for` transform's target (the hand-js ideal for
+    /// `for i in $(seq lo hi)`). init is a `VariableDeclaration`
+    /// (`let i = lo`); test the `< =` bound; update `i++`.
+    ForStatement {
+        init: Box<Stmt>,
+        test: Expr,
+        update: Expr,
+        body: Box<Stmt>,
+    },
     ForOfStatement {
         left: Box<Stmt>,
         right: Expr,
         body: Box<Stmt>,
+    },
+    /// A native function declaration — the normalize_functions port's
+    /// output (the JS-side estreeToJsMapped normalizes the sh2.functions
+    /// registrations into plain `function x(...)` declarations before the
+    /// astring codegen).
+    FunctionDeclaration {
+        id: Expr,
+        params: Vec<Expr>,
+        body: Box<Stmt>,
+        generator: bool,
+        expression: bool,
+        r#async: bool,
     },
     VariableDeclaration {
         declarations: Vec<VariableDeclarator>,
@@ -81,6 +129,18 @@ pub struct SwitchCase {
     pub consequent: Vec<Stmt>,
 }
 
+/// The single catch clause of a `TryStatement` (standard ESTree). The
+/// exception binding is a fixed generated identifier; `as`-bound names
+/// are written into the runtime store (sh2.setVar) so the handler's var
+/// reads see them.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatchClause {
+    #[serde(rename = "type")]
+    pub type_: &'static str,
+    pub param: Option<Box<Expr>>,
+    pub body: Box<Stmt>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct VariableDeclarator {
     #[serde(rename = "type")]
@@ -101,6 +161,16 @@ pub struct RegexLiteral {
 pub enum Expr {
     Identifier {
         name: String,
+    },
+    /// A native function expression — the normalize_functions port's
+    /// sequence-form output (`(__fn_x = function x(...) {…}, …)`).
+    FunctionExpression {
+        id: Box<Expr>,
+        params: Vec<Expr>,
+        body: Box<Stmt>,
+        generator: bool,
+        expression: bool,
+        r#async: bool,
     },
     Literal {
         value: serde_json::Value,
@@ -176,6 +246,15 @@ pub enum Expr {
     SequenceExpression {
         expressions: Vec<Expr>,
     },
+    // `new Promise(r => setTimeout(() => r(true), ms))` — the native
+    // sleep lowering (src/shir.rs try_native_sleep): the exec spawn
+    // collapses to a plain async timer. The executor arrow resolves
+    // `true` (the statement's value feeds the errexit guard, which needs
+    // truthiness like every exec statement's value).
+    NewExpression {
+        callee: Box<Expr>,
+        arguments: Vec<Expr>,
+    },
 }
 
 /// Arrow function body: an expression (`x => expr`) or a block
@@ -232,7 +311,7 @@ pub fn ast_to_estree(commands: &[Command]) -> Program {
 pub fn ast_to_estree_json(commands: &[Command]) -> Result<String, serde_json::Error> {
     let transformed: Vec<Command> = commands.iter().map(transform_cmd).collect();
     let ir = crate::shir::ast_to_ir(&transformed);
-    serde_json::to_string(&fix_control_flow(crate::shir::shir_to_estree(&ir)))
+    Ok(estree_to_json(&fix_control_flow(crate::shir::shir_to_estree(&ir))))
 }
 
 // ── control-flow legality pass ───────────────────────────────────────
@@ -246,14 +325,14 @@ pub fn ast_to_estree_json(commands: &[Command]) -> Result<String, serde_json::Er
 // `break` inside a `switch` (case clauses) and `return` inside a function
 // arrow stay native (both legal).
 
-fn fix_control_flow(prog: Program) -> Program {
+pub(crate) fn fix_control_flow(prog: Program) -> Program {
     Program {
         type_: prog.type_,
         source_type: prog.source_type,
         body: prog
             .body
             .into_iter()
-            .filter_map(|s| fix_stmt(s, false, false, false))
+            .filter_map(|s| fix_stmt(s, false, false, false, false))
             .collect(),
     }
 }
@@ -292,17 +371,15 @@ fn map_raw_bytes(s: &str) -> String {
     out
 }
 
-fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Option<Stmt> {
+fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool, in_loop: bool) -> Option<Stmt> {
     Some(match stmt {
         Stmt::BreakStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
             expression: sh2_call("break", vec![]),
         },
-        Stmt::ContinueStatement { label } if in_arrow && !in_switch => {
-            Stmt::ExpressionStatement {
-                expression: sh2_call("continue", vec![]),
-            }
-        }
-        Stmt::ReturnStatement { argument } if !in_arrow || !in_func => {
+        Stmt::ContinueStatement { label } if in_arrow && !in_switch => Stmt::ExpressionStatement {
+            expression: sh2_call("continue", vec![]),
+        },
+        Stmt::ReturnStatement { argument } if !in_arrow || in_loop => {
             let mut args = vec![];
             if let Some(a) = argument {
                 args.push(a);
@@ -312,12 +389,12 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
             }
         }
         Stmt::ExpressionStatement { expression } => Stmt::ExpressionStatement {
-            expression: fix_expr(expression, in_arrow, in_func),
+            expression: fix_expr(expression, in_arrow, in_func, in_loop),
         },
         Stmt::BlockStatement { body } => Stmt::BlockStatement {
             body: body
                 .into_iter()
-                .filter_map(|s| fix_stmt(s, in_arrow, in_func, false))
+                .filter_map(|s| fix_stmt(s, in_arrow, in_func, false, in_loop))
                 .collect(),
         },
         Stmt::IfStatement {
@@ -325,69 +402,114 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
             consequent,
             alternate,
         } => Stmt::IfStatement {
-            test: fix_expr(test, in_arrow, in_func),
+            test: fix_expr(test, in_arrow, in_func, in_loop),
             consequent: Box::new(
-                fix_stmt(*consequent, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
-                    body: vec![],
-                }),
+                fix_stmt(*consequent, in_arrow, in_func, false, in_loop)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
             alternate: alternate.map(|a| {
                 Box::new(
-                    fix_stmt(*a, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
-                        body: vec![],
-                    }),
+                    fix_stmt(*a, in_arrow, in_func, false, in_loop)
+                        .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )
             }),
+        },
+        // try/catch/finally: the guard block, handler and finalizer
+        // share the enclosing context (a native break/continue/return
+        // inside them is illegal or bash-return-position exactly as in
+        // a plain block). The catch param is the fixed generated `e`
+        // binding — never rewritten.
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => Stmt::TryStatement {
+            block: Box::new(
+                fix_stmt(*block, in_arrow, in_func, false, in_loop)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+            ),
+            handler: handler.map(|h| CatchClause {
+                type_: h.type_,
+                param: h.param,
+                body: Box::new(
+                    fix_stmt(*h.body, in_arrow, in_func, false, in_loop)
+                        .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+                ),
+            }),
+            finalizer: finalizer.map(|f| {
+                Box::new(
+                    fix_stmt(*f, in_arrow, in_func, false, in_loop)
+                        .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+                )
+            }),
+        },
+        Stmt::ThrowStatement { argument } => Stmt::ThrowStatement {
+            argument: fix_expr(argument, in_arrow, in_func, in_loop),
         },
         Stmt::SwitchStatement {
             discriminant,
             cases,
         } => Stmt::SwitchStatement {
-            discriminant: fix_expr(discriminant, in_arrow, in_func),
+            discriminant: fix_expr(discriminant, in_arrow, in_func, in_loop),
             cases: cases
                 .into_iter()
                 .map(|c| SwitchCase {
                     type_: c.type_,
-                    test: c.test.map(|t| fix_expr(t, in_arrow, in_func)),
+                    test: c.test.map(|t| fix_expr(t, in_arrow, in_func, in_loop)),
                     consequent: c
                         .consequent
                         .into_iter()
-                        .filter_map(|s| fix_stmt(s, in_arrow, in_func, true))
+                        .filter_map(|s| fix_stmt(s, in_arrow, in_func, true, in_loop))
                         .collect(),
                 })
                 .collect(),
         },
         Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
-            test: fix_expr(test, in_arrow, in_func),
+            test: fix_expr(test, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
-                    body: vec![],
-                }),
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
-        Stmt::ForOfStatement {
+        Stmt::DoWhileStatement { test, body } => Stmt::DoWhileStatement {
+            test: fix_expr(test, in_arrow, in_func, in_loop),
+            body: Box::new(
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+            ),
+        },
+        Stmt::ForOfStatement { left, right, body } => Stmt::ForOfStatement {
             left,
-            right,
+            right: fix_expr(right, in_arrow, in_func, in_loop),
+            body: Box::new(
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+            ),
+        },
+        Stmt::ForStatement {
+            init,
+            test,
+            update,
             body,
-        } => Stmt::ForOfStatement {
-            left,
-            right: fix_expr(right, in_arrow, in_func),
+        } => Stmt::ForStatement {
+            init: Box::new(
+                fix_stmt(*init, in_arrow, in_func, false, in_loop)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
+            ),
+            test: fix_expr(test, in_arrow, in_func, in_loop),
+            update: fix_expr(update, in_arrow, in_func, in_loop),
             body: Box::new(
-                fix_stmt(*body, in_arrow, in_func, false).unwrap_or(Stmt::BlockStatement {
-                    body: vec![],
-                }),
+                fix_stmt(*body, in_arrow, in_func, false, in_loop)
+                    .unwrap_or(Stmt::BlockStatement { body: vec![] }),
             ),
         },
-        Stmt::VariableDeclaration {
-            declarations,
-            kind,
-        } => Stmt::VariableDeclaration {
+        Stmt::VariableDeclaration { declarations, kind } => Stmt::VariableDeclaration {
             declarations: declarations
                 .into_iter()
                 .map(|d| VariableDeclarator {
                     type_: d.type_,
                     id: d.id,
-                    init: d.init.map(|i| fix_expr(i, in_arrow, in_func)),
+                    init: d.init.map(|i| fix_expr(i, in_arrow, in_func, in_loop)),
                 })
                 .collect(),
             kind,
@@ -396,7 +518,7 @@ fn fix_stmt(stmt: Stmt, in_arrow: bool, in_func: bool, in_switch: bool) -> Optio
     })
 }
 
-fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
+fn fix_expr(e: Expr, in_arrow: bool, in_func: bool, in_loop: bool) -> Expr {
     match e {
         Expr::CallExpression {
             callee,
@@ -404,19 +526,74 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             optional,
         } => {
             // Arrows are bash-return contexts (loop bodies, pipeline stages,
-            // subshells) EXCEPT the sh2.define function arrow, where a
-            // native `return` is legal (and keeps the function's value).
-            let is_define = matches!(
-                callee.as_ref(),
-                Expr::MemberExpression { object, property, .. }
+            // subshells) EXCEPT the function arrows — `sh2.define` (the
+            // bash/posix frontends) and `sh2.functions.set` (the A1
+            // IrStmt::Function rendering — bat-sh-go, c-sh-go's fnValue
+            // VALUE-returning functions) — where a native `return` is
+            // legal (and keeps the function's value). Without the
+            // functions.set arm, the A1-ingress fix_control_flow pass
+            // converted the C frontend's value returns to sh2.return()
+            // signals and fnValue lost the value (c-sh-go t58/t73 DIFF,
+            // 2026-08-14).
+            let is_define = match callee.as_ref() {
+                Expr::MemberExpression { object, property, .. } => {
+                    // `sh2.define`
                     if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2")
                         && matches!(property.as_ref(), Expr::Identifier { name } if name == "define")
-            );
+                    {
+                        true
+                    } else if matches!(property.as_ref(), Expr::Identifier { name } if name == "set") {
+                        // `sh2.functions.set` — the A1 IrStmt::Function
+                        // rendering (object = sh2.functions)
+                        matches!(
+                            object.as_ref(),
+                            Expr::MemberExpression { object: o2, property: p2, .. }
+                                if matches!(o2.as_ref(), Expr::Identifier { name } if name == "sh2")
+                                    && matches!(p2.as_ref(), Expr::Identifier { name } if name == "functions")
+                        )
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            let is_loop_helper = match callee.as_ref() {
+                Expr::MemberExpression { object, property, .. }
+                    if matches!(object.as_ref(), Expr::Identifier { name } if name == "sh2") =>
+                {
+                    matches!(
+                        property.as_ref(),
+                        Expr::Identifier { name }
+                            if matches!(
+                                name.as_str(),
+                                "whileLoop" | "whileLoopSync" | "whileLoopBatch" | "forLoop"
+                                    | "forLoopSync" | "forLoopBatch" | "cstyleFor"
+                                    | "cstyleForSync"
+                            )
+                    )
+                }
+                _ => false,
+            };
+            // the loop-BODY arrow (the LAST argument of an sh2 loop
+            // helper) is a LOOP-BODY context: a `return` inside it must
+            // signal (a native return would exit the callback and the
+            // loop would spin on). The other args (cond/items/init/update/
+            // batch) descend with the inherited flag. This is the precise
+            // replacement for the old blanket `!in_func` rule, which
+            // over-converted frontend VALUE-returning arrows (the zig
+            // `__fn_f = async () => ...` function defs, the py ArrayComp
+            // IIFE, the C fnValue bodies) — only loop-body arrows need
+            // the signal conversion.
+            let n_args = arguments.len();
             Expr::CallExpression {
-                callee: Box::new(fix_expr(*callee, in_arrow, in_func)),
+                callee: Box::new(fix_expr(*callee, in_arrow, in_func, in_loop)),
                 arguments: arguments
                     .into_iter()
-                    .map(|a| fix_expr(a, in_arrow, if is_define { true } else { false }))
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let a_loop = in_loop || (is_loop_helper && i + 1 == n_args);
+                        fix_expr(a, in_arrow, if is_define { true } else { false }, a_loop)
+                    })
                     .collect(),
                 optional,
             }
@@ -427,13 +604,13 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             computed,
             optional,
         } => Expr::MemberExpression {
-            object: Box::new(fix_expr(*object, in_arrow, in_func)),
-            property: Box::new(fix_expr(*property, in_arrow, in_func)),
+            object: Box::new(fix_expr(*object, in_arrow, in_func, in_loop)),
+            property: Box::new(fix_expr(*property, in_arrow, in_func, in_loop)),
             computed,
             optional,
         },
         Expr::AwaitExpression { argument } => Expr::AwaitExpression {
-            argument: Box::new(fix_expr(*argument, in_arrow, in_func)),
+            argument: Box::new(fix_expr(*argument, in_arrow, in_func, in_loop)),
         },
         Expr::ArrowFunctionExpression {
             params,
@@ -443,11 +620,12 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
         } => Expr::ArrowFunctionExpression {
             params,
             body: match body {
-                ArrowBody::Expr(inner) => ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func))),
+                ArrowBody::Expr(inner) => {
+                    ArrowBody::Expr(Box::new(fix_expr(*inner, true, in_func, in_loop)))
+                }
                 ArrowBody::Block(b) => ArrowBody::Block(Box::new(
-                    fix_stmt(*b, true, in_func, false).unwrap_or(Stmt::BlockStatement {
-                        body: vec![],
-                    }),
+                    fix_stmt(*b, true, in_func, false, in_loop)
+                        .unwrap_or(Stmt::BlockStatement { body: vec![] }),
                 )),
             },
             expression,
@@ -459,7 +637,7 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
                 .map(|p| Property {
                     type_: p.type_,
                     key: p.key,
-                    value: fix_expr(p.value, in_arrow, in_func),
+                    value: fix_expr(p.value, in_arrow, in_func, in_loop),
                     kind: p.kind,
                     computed: p.computed,
                     shorthand: p.shorthand,
@@ -469,7 +647,7 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
         Expr::ArrayExpression { elements } => Expr::ArrayExpression {
             elements: elements
                 .into_iter()
-                .map(|el| el.map(|e| fix_expr(e, in_arrow, in_func)))
+                .map(|el| el.map(|e| fix_expr(e, in_arrow, in_func, in_loop)))
                 .collect(),
         },
         Expr::Literal { value, raw, regex } => Expr::Literal {
@@ -480,7 +658,10 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             raw,
             regex,
         },
-        Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
+        Expr::TemplateLiteral {
+            quasis,
+            expressions,
+        } => Expr::TemplateLiteral {
             quasis: quasis
                 .into_iter()
                 .map(|q| TemplateElement {
@@ -494,7 +675,7 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
                 .collect(),
             expressions: expressions
                 .into_iter()
-                .map(|e| fix_expr(e, in_arrow, in_func))
+                .map(|e| fix_expr(e, in_arrow, in_func, in_loop))
                 .collect(),
         },
         Expr::LogicalExpression {
@@ -503,8 +684,8 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             right,
         } => Expr::LogicalExpression {
             operator,
-            left: Box::new(fix_expr(*left, in_arrow, in_func)),
-            right: Box::new(fix_expr(*right, in_arrow, in_func)),
+            left: Box::new(fix_expr(*left, in_arrow, in_func, in_loop)),
+            right: Box::new(fix_expr(*right, in_arrow, in_func, in_loop)),
         },
         Expr::UnaryExpression {
             operator,
@@ -512,13 +693,13 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             prefix,
         } => Expr::UnaryExpression {
             operator,
-            argument: Box::new(fix_expr(*argument, in_arrow, in_func)),
+            argument: Box::new(fix_expr(*argument, in_arrow, in_func, in_loop)),
             prefix,
         },
         Expr::SequenceExpression { expressions } => Expr::SequenceExpression {
             expressions: expressions
                 .into_iter()
-                .map(|e| fix_expr(e, in_arrow, in_func))
+                .map(|e| fix_expr(e, in_arrow, in_func, in_loop))
                 .collect(),
         },
         // the errexit-guard wrapper (`sh2._g = await sh2.forLoop(...)`)
@@ -530,10 +711,1803 @@ fn fix_expr(e: Expr, in_arrow: bool, in_func: bool) -> Expr {
             right,
         } => Expr::AssignmentExpression {
             operator,
-            left: Box::new(fix_expr(*left, in_arrow, in_func)),
-            right: Box::new(fix_expr(*right, in_arrow, in_func)),
+            left: Box::new(fix_expr(*left, in_arrow, in_func, in_loop)),
+            right: Box::new(fix_expr(*right, in_arrow, in_func, in_loop)),
         },
         other => other,
+    }
+}
+
+// ── lastExit-tail hoist ─────────────────────────────────────────────
+//
+// Lifts a constant `sh2.lastExit = N` write out of if/else common
+// tails, then out of the enclosing loop:
+//
+//   if (c) { (write, sh2.lastExit = N) } else { sh2.lastExit = N }
+//     →  if (c) { write } ; sh2.lastExit = N
+//     →  (when that if is the loop body's tail)  sh2.lastExit = N after
+//        the loop
+//
+// Phase 1 (if-hoist): an `if` whose consequent and alternate BOTH end
+// with the same `sh2.lastExit = N` write (a standalone assignment, or
+// the trailing element of a `(…, sh2.lastExit = N[, flag])` sequence)
+// leaves `$?` = N on every path — the write moves after the if with
+// identical semantics (the branches' own reads, all before the tail
+// write, see the same values either way).
+//
+// Phase 2 (loop-hoist): a loop whose body's last statement is a
+// standalone `sh2.lastExit = N` (the shape phase 1 leaves) can have it
+// moved after the loop when the body contains NO other `sh2.lastExit`
+// mention. Soundness:
+//   - no body reads → the pre-loop value is never observed mid-loop
+//     (every read point sees N before and after the move);
+//   - the TRACKED native loop's body ends with the tracking READ
+//     (`__sh2_loop_last = sh2.lastExit`), so phase 2's shape check only
+//     fires on BARE loops — whose final status write is provably dead
+//     (nothing observes `$?` after the loop before the next write), so
+//     the 0-iteration difference (original leaves the pre-loop value,
+//     hoisted writes N) is unobservable;
+//   - the native numeric-range `for` and a materialized-list for-of are
+//     ALWAYS bare but CAN run 0 times (`seq 5 1` / an empty range), so
+//     they additionally require the loop provably runs ≥ 1 iteration.
+//
+// Runs post-emission on the Program, so every consumer (the CLI's
+// --estree, the otranspilerl wasm, the corpus gate) sees it.
+// Deterministic and idempotent (phase 2 leaves no trailing write to
+// re-hoist).
+pub(crate) fn hoist_last_exit(prog: Program) -> Program {
+    Program {
+        type_: prog.type_,
+        source_type: prog.source_type,
+        body: hoist_stmts(prog.body),
+    }
+}
+
+/// `sh2.lastExit` member access?
+fn is_last_exit_member(e: &Expr) -> bool {
+    matches!(e, Expr::MemberExpression { object, property, computed: false, optional: false, .. }
+        if matches!(&**object, Expr::Identifier { name } if name == "sh2")
+            && matches!(&**property, Expr::Identifier { name } if name == "lastExit"))
+}
+
+/// `sh2.lastExit = <num literal>` → Some(N).
+fn last_exit_assign_value(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::AssignmentExpression { operator, left, right } if operator == "=" => {
+            if !is_last_exit_member(left) {
+                return None;
+            }
+            match &**right {
+                Expr::Literal { value, .. } => value.as_i64(),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_pure_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal { .. })
+}
+
+/// A statement list's final statement must be an ExpressionStatement
+/// whose expression ends with the `sh2.lastExit = N` write — standalone
+/// assignment, `(…, sh2.lastExit = N)`, or `(…, sh2.lastExit = N, flag)`.
+fn stmts_tail_write(stmts: &[Stmt]) -> Option<i64> {
+    let last = stmts.last()?;
+    let Stmt::ExpressionStatement { expression } = last else {
+        return None;
+    };
+    match expression {
+        Expr::AssignmentExpression { .. } => last_exit_assign_value(expression),
+        Expr::SequenceExpression { expressions } => {
+            let n = expressions.len();
+            if n == 0 {
+                return None;
+            }
+            if let Some(v) = last_exit_assign_value(&expressions[n - 1]) {
+                return Some(v);
+            }
+            if n >= 2 && is_pure_literal(&expressions[n - 1]) {
+                return last_exit_assign_value(&expressions[n - 2]);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn branch_tail_write(branch: &Stmt) -> Option<i64> {
+    match branch {
+        Stmt::BlockStatement { body } => stmts_tail_write(body),
+        other => stmts_tail_write(std::slice::from_ref(other)),
+    }
+}
+
+/// The common `sh2.lastExit = N` both branches end with (None when the
+/// if has no else, or the branches' tail writes differ / are missing).
+fn if_tail_write(stmt: &Stmt) -> Option<i64> {
+    let Stmt::IfStatement { consequent, alternate, .. } = stmt else {
+        return None;
+    };
+    let c = branch_tail_write(consequent)?;
+    let a = branch_tail_write(alternate.as_deref()?)?;
+    (c == a).then_some(c)
+}
+
+/// Remove the trailing `sh2.lastExit = n` write from a statement. None
+/// when the statement was ONLY the write (drop it entirely).
+fn strip_tail_write(stmt: Stmt, n: i64) -> Option<Stmt> {
+    let Stmt::ExpressionStatement { expression } = stmt else {
+        return Some(stmt);
+    };
+    match expression {
+        Expr::AssignmentExpression { .. } => {
+            if last_exit_assign_value(&expression) == Some(n) {
+                None
+            } else {
+                Some(Stmt::ExpressionStatement { expression })
+            }
+        }
+        Expr::SequenceExpression { mut expressions } => {
+            let m = expressions.len();
+            let write_at = if m >= 1 && last_exit_assign_value(&expressions[m - 1]) == Some(n) {
+                Some(m - 1)
+            } else if m >= 2
+                && is_pure_literal(&expressions[m - 1])
+                && last_exit_assign_value(&expressions[m - 2]) == Some(n)
+            {
+                Some(m - 2)
+            } else {
+                None
+            };
+            match write_at {
+                Some(i) => {
+                    expressions.remove(i);
+                    match expressions.len() {
+                        0 => None,
+                        1 => Some(Stmt::ExpressionStatement {
+                            expression: expressions.pop().unwrap(),
+                        }),
+                        _ => Some(Stmt::ExpressionStatement {
+                            expression: Expr::SequenceExpression { expressions },
+                        }),
+                    }
+                }
+                None => Some(Stmt::ExpressionStatement {
+                    expression: Expr::SequenceExpression { expressions },
+                }),
+            }
+        }
+        other => Some(Stmt::ExpressionStatement { expression: other }),
+    }
+}
+
+/// Strip the trailing write from a branch; a branch that becomes empty
+/// turns into an empty block.
+fn strip_branch_tail(branch: &Stmt, n: i64) -> Stmt {
+    match branch {
+        Stmt::BlockStatement { body } => {
+            let mut body = body.clone();
+            if let Some(last) = body.last() {
+                match strip_tail_write(last.clone(), n) {
+                    Some(s) => *body.last_mut().unwrap() = s,
+                    None => {
+                        body.pop();
+                    }
+                }
+            }
+            Stmt::BlockStatement { body }
+        }
+        other => strip_tail_write(other.clone(), n)
+            .unwrap_or_else(|| Stmt::BlockStatement { body: vec![] }),
+    }
+}
+
+/// `sh2.lastExit = n;`
+fn last_exit_write(n: i64) -> Stmt {
+    Stmt::ExpressionStatement {
+        expression: Expr::AssignmentExpression {
+            operator: "=".to_string(),
+            left: Box::new(sh2_member("lastExit")),
+            right: Box::new(Expr::Literal {
+                value: serde_json::Value::from(n),
+                raw: None,
+                regex: None,
+            }),
+        },
+    }
+}
+
+/// Recurse into nested statement lists first (bottom-up), then run the
+/// if-hoist and loop-hoist on this list.
+fn hoist_stmts(stmts: Vec<Stmt>) -> Vec<Stmt> {
+    let mut out: Vec<Stmt> = stmts.into_iter().map(hoist_stmt).collect();
+    hoist_list(&mut out);
+    out
+}
+
+fn hoist_stmt(stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::BlockStatement { body } => Stmt::BlockStatement { body: hoist_stmts(body) },
+        Stmt::IfStatement { test, consequent, alternate } => Stmt::IfStatement {
+            test,
+            consequent: Box::new(hoist_stmt(*consequent)),
+            alternate: alternate.map(|a| Box::new(hoist_stmt(*a))),
+        },
+        Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
+            test,
+            body: Box::new(hoist_stmt(*body)),
+        },
+        Stmt::DoWhileStatement { test, body } => Stmt::DoWhileStatement {
+            test,
+            body: Box::new(hoist_stmt(*body)),
+        },
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => Stmt::TryStatement {
+            block: Box::new(hoist_stmt(*block)),
+            handler: handler.map(|h| CatchClause {
+                type_: h.type_,
+                param: h.param,
+                body: Box::new(hoist_stmt(*h.body)),
+            }),
+            finalizer: finalizer.map(|f| Box::new(hoist_stmt(*f))),
+        },
+        Stmt::ForStatement { init, test, update, body } => Stmt::ForStatement {
+            init: Box::new(hoist_stmt(*init)),
+            test,
+            update,
+            body: Box::new(hoist_stmt(*body)),
+        },
+        Stmt::ForOfStatement { left, right, body } => Stmt::ForOfStatement {
+            left: Box::new(hoist_stmt(*left)),
+            right,
+            body: Box::new(hoist_stmt(*body)),
+        },
+        Stmt::SwitchStatement { discriminant, cases } => Stmt::SwitchStatement {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|c| SwitchCase {
+                    type_: c.type_,
+                    test: c.test,
+                    consequent: hoist_stmts(c.consequent),
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+/// Phase 1 (if common tails) then phase 2 (loop tails) on one list.
+fn hoist_list(stmts: &mut Vec<Stmt>) {
+    // Phase 1 — if-hoists.
+    let mut i = 0;
+    while i < stmts.len() {
+        if let Some(n) = if_tail_write(&stmts[i]) {
+            let new_stmt = match stmts[i].clone() {
+                Stmt::IfStatement { test, consequent, alternate } => {
+                    let cons = strip_branch_tail(&consequent, n);
+                    let alt = alternate.map(|a| strip_branch_tail(&a, n));
+                    let alt = match alt {
+                        Some(Stmt::BlockStatement { body }) if body.is_empty() => None,
+                        other => other,
+                    };
+                    Stmt::IfStatement {
+                        test,
+                        consequent: Box::new(cons),
+                        alternate: alt.map(Box::new),
+                    }
+                }
+                _ => unreachable!("if_tail_write only matches IfStatement"),
+            };
+            stmts[i] = new_stmt;
+            stmts.insert(i + 1, last_exit_write(n));
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    // Phase 2 — loop-hoists.
+    let mut j = 0;
+    while j < stmts.len() {
+        match loop_tail_hoist(&stmts[j]) {
+            Some((new_loop, n)) => {
+                stmts[j] = new_loop;
+                stmts.insert(j + 1, last_exit_write(n));
+                j += 2;
+            }
+            None => j += 1,
+        }
+    }
+}
+
+/// The loop body's last statement as a standalone `sh2.lastExit = N`
+/// (the shape phase 1 leaves).
+fn body_tail_write(body: &Stmt) -> Option<i64> {
+    match body {
+        Stmt::BlockStatement { body } => stmts_tail_write(body),
+        other => stmts_tail_write(std::slice::from_ref(other)),
+    }
+}
+
+/// Phase 2: a loop whose body ends with a standalone `sh2.lastExit = N`
+/// → hoist it after the loop (guards in the doc header).
+fn loop_tail_hoist(stmt: &Stmt) -> Option<(Stmt, i64)> {
+    let (body, n) = match stmt {
+        Stmt::WhileStatement { body, .. } => (body, body_tail_write(body)?),
+        // a do-while body provably runs at least once — the tail hoist
+        // is valid exactly as for the (provably-runs) For loops
+        Stmt::DoWhileStatement { body, .. } => (body, body_tail_write(body)?),
+        Stmt::ForStatement { body, .. } => {
+            let n = body_tail_write(body)?;
+            if !for_provably_runs(stmt) {
+                return None;
+            }
+            (body, n)
+        }
+        Stmt::ForOfStatement { body, right, .. } => {
+            let n = body_tail_write(body)?;
+            if !forof_provably_runs(right) {
+                return None;
+            }
+            (body, n)
+        }
+        _ => return None,
+    };
+    // no OTHER sh2.lastExit mention anywhere in the body (reads or
+    // mid-body writes would observe the pre-loop value)
+    let stripped = strip_body_tail(body, n);
+    if body_mentions_last_exit(&stripped) {
+        return None;
+    }
+    let new_stmt = match stmt {
+        Stmt::WhileStatement { test, .. } => Stmt::WhileStatement {
+            test: test.clone(),
+            body: Box::new(stripped),
+        },
+        Stmt::DoWhileStatement { test, .. } => Stmt::DoWhileStatement {
+            test: test.clone(),
+            body: Box::new(stripped),
+        },
+        Stmt::ForStatement { init, test, update, .. } => Stmt::ForStatement {
+            init: init.clone(),
+            test: test.clone(),
+            update: update.clone(),
+            body: Box::new(stripped),
+        },
+        Stmt::ForOfStatement { left, right, .. } => Stmt::ForOfStatement {
+            left: left.clone(),
+            right: right.clone(),
+            body: Box::new(stripped),
+        },
+        _ => unreachable!(),
+    };
+    Some((new_stmt, n))
+}
+
+fn strip_body_tail(body: &Stmt, n: i64) -> Stmt {
+    match body {
+        Stmt::BlockStatement { body } => {
+            let mut body = body.clone();
+            if let Some(last) = body.last() {
+                match strip_tail_write(last.clone(), n) {
+                    Some(s) => *body.last_mut().unwrap() = s,
+                    None => {
+                        body.pop();
+                    }
+                }
+            }
+            Stmt::BlockStatement { body }
+        }
+        other => strip_tail_write(other.clone(), n)
+            .unwrap_or_else(|| Stmt::BlockStatement { body: vec![] }),
+    }
+}
+
+/// Any remaining `sh2.lastExit` mention in the (already-stripped) body?
+/// Serialization-based: only the `sh2.lastExit` MemberExpression shape
+/// serializes as `"name":"lastExit"` — a string literal containing
+/// "lastExit" serializes as `"value":"lastExit"` and never matches.
+fn body_mentions_last_exit(body: &Stmt) -> bool {
+    serde_json::to_string(body)
+        .map(|json| json.contains("\"name\":\"lastExit\""))
+        .unwrap_or(true) // serialization failure → conservative veto
+}
+
+/// A native numeric-range `for (let i = lo; i <= hi; i++)` provably runs
+/// at least once when the init satisfies the test. The update direction
+/// is irrelevant — only the FIRST test matters.
+fn for_provably_runs(stmt: &Stmt) -> bool {
+    let Stmt::ForStatement { init, test, update, .. } = stmt else {
+        return false;
+    };
+    let Stmt::VariableDeclaration { declarations, .. } = &**init else {
+        return false;
+    };
+    let [d] = declarations.as_slice() else {
+        return false;
+    };
+    let Expr::Identifier { name } = &d.id else {
+        return false;
+    };
+    let Some(Expr::Literal { value, .. }) = &d.init else {
+        return false;
+    };
+    let Some(lo) = value.as_i64() else {
+        return false;
+    };
+    // the counter update shape: `i++` / `++i` / `i--` / `--i`
+    match update {
+        Expr::UnaryExpression { operator, argument, .. }
+            if matches!(operator.as_str(), "++" | "--") =>
+        {
+            match &**argument {
+                Expr::Identifier { name: n } if n == name => {}
+                _ => return false,
+            }
+        }
+        _ => return false,
+    }
+    let Expr::BinaryExpression { operator, left, right } = test else {
+        return false;
+    };
+    let (x, lit) = match (&**left, &**right) {
+        (Expr::Identifier { name: n }, Expr::Literal { value, .. }) if n == name => {
+            let Some(lit) = value.as_i64() else { return false };
+            (lo, lit)
+        }
+        (Expr::Literal { value, .. }, Expr::Identifier { name: n }) if n == name => {
+            let Some(lit) = value.as_i64() else { return false };
+            (lo, lit)
+        }
+        _ => return false,
+    };
+    cmp_value(operator, x, lit)
+}
+
+fn cmp_value(op: &str, a: i64, b: i64) -> bool {
+    match op {
+        "<" => a < b,
+        "<=" => a <= b,
+        ">" => a > b,
+        ">=" => a >= b,
+        "==" | "===" => a == b,
+        "!=" | "!==" => a != b,
+        _ => false,
+    }
+}
+
+/// A for-of over a non-empty array literal provably runs ≥ 1 time (the
+/// materialized range-item fallback — `seq 5 1` materializes to an
+/// EMPTY array and stays unhoisted).
+fn forof_provably_runs(right: &Expr) -> bool {
+    match right {
+        Expr::ArrayExpression { elements } => elements.iter().any(|e| e.is_some()),
+        _ => false,
+    }
+}
+
+// ── native-array lowering ───────────────────────────────────────────
+//
+// Migrated from the website's src/lower.js `lowerNativeArrays` (which
+// the corpus gate could never see) into the emitter, so the gate holds
+// it accountable. When the estree PROVES an array is simple — one
+// `sh2.setArray("name", [..])` at top level, then only reads — the
+// runtime store calls become dead weight:
+//
+//   sh2.setArray("arr", [a, b])            →  let arr = [a, b];
+//   sh2.arrayIndex("arr", "1")             →  (arr[1] !== undefined ? arr[1] : "")
+//   sh2.getVar("arr[1]")                   →  (arr[1] !== undefined ? arr[1] : "")
+//   sh2.arrayLen("arr") / param slice "#arr" →  arr.length
+//   sh2.arrayItems("arr") / param slice "arr" →  arr
+//
+// Conservative guards (stricter than lower.js, which predates the
+// current emitter's arrayIndex/arrayItems shapes and never ran under
+// the gate):
+//   • exactly ONE setArray, and it must be a DIRECT top-level statement
+//     (a nested/conditional setArray can't become a `let`);
+//   • the setArray items are an ArrayExpression (a runtime-valued
+//     initializer can't be a JS literal);
+//   • every other ref is an element READ with a literal non-negative
+//     integer index, a `len`, or a `join` — no whole-var reads (`$arr`),
+//     no computed/arithmetic/negative subscripts (the runtime
+//     evalArith's + wraps negatives), no `setVar`/`unset` writes;
+//   • no ref inside a script-function arrow (`let __fn_* = … =>` / the
+//     older `sh2.define` shape) — the function may run before the `let`
+//     initializes (TDZ), and may shadow the name;
+//   • no pre-existing declaration / bare identifier use of the name
+//     anywhere (a native array's uses are all sh2 string args).
+
+#[derive(Default)]
+struct ArrayRefs {
+    /// sh2.setArray("name", [..]) refs seen (any depth).
+    set_arrays: usize,
+    /// The program-body index of the top-level setArray statement.
+    set_array_idx: Option<usize>,
+    /// One of them is the DIRECT expression of a top-level statement.
+    top_set_array: bool,
+    /// Program-body indices of statements containing a READ of the name
+    /// (element/len/join). A read must never EXECUTE before the setArray
+    /// (a native `let` would hit the TDZ; the runtime returns "" for an
+    /// as-yet-unset array).
+    read_stmt_idxs: Vec<usize>,
+    /// A whole-var read (`$arr` → getVar("name") / getVar("name[@]")).
+    whole: bool,
+    /// A write / unset / non-array-valued setArray / non-@ param.
+    writes: bool,
+    /// A ref inside a script-function arrow (deferred invocation).
+    in_fn: bool,
+    /// A computed / non-integer / negative-literal subscript read.
+    index_bad: bool,
+}
+
+fn is_sh2_call(callee: &Expr, fn_name: &str) -> bool {
+    matches!(callee, Expr::MemberExpression { object, property, computed: false, optional: false, .. }
+        if matches!(&**object, Expr::Identifier { name } if name == "sh2")
+            && matches!(&**property, Expr::Identifier { name: p } if p == fn_name))
+}
+
+fn sh2_callee_name(callee: &Expr) -> Option<&str> {
+    match callee {
+        Expr::MemberExpression { object, property, computed: false, optional: false, .. } => {
+            match (&**object, &**property) {
+                (Expr::Identifier { name: o }, Expr::Identifier { name: p }) if o == "sh2" => {
+                    Some(p)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn lit_str<'a>(e: &'a Expr) -> Option<&'a str> {
+    match e {
+        Expr::Literal { value, .. } => value.as_str(),
+        _ => None,
+    }
+}
+
+/// Does runtime-expanded text `s` reference `name` (`$name` / `${name…}`)?
+/// The runtime resolves such refs from the STORE (test strings, exec
+/// args, arith texts are re-expanded at runtime), so a name referenced
+/// from a literal must keep its store binding — see the native-array
+/// fold's literal scan. Over-marking is safe; under-marking desyncs the
+/// store.
+/// Mark `acc` entries for every `top_set_arrays` name referenced by
+/// `$name` / `${name…}` in `s` — ONE scan of the string instead of one
+/// scan per array name (the estree::bash_text_refs hotspot: the literal
+/// walk re-scanned every literal once per tracked array).
+fn mark_text_refs(s: &str, top: &HashSet<String>, acc: &mut HashMap<String, ArrayRefs>) {
+    if !s.contains('$') {
+        return;
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let rest = &s[i + 1..];
+        if rest.starts_with('(') {
+            i += 1; // $(...) — command substitution, not a var ref
+            continue;
+        }
+        if rest.starts_with('{') {
+            let r2 = &rest[1..];
+            // ${#name} / ${!name} / ${name…} — strip a leading # / !
+            let r3 = r2
+                .strip_prefix('#')
+                .or_else(|| r2.strip_prefix('!'))
+                .unwrap_or(r2);
+            let n = r3
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
+                .count();
+            if n > 0 {
+                let nm = &r3[..n];
+                if top.contains(nm) {
+                    acc.entry(nm.to_string()).or_default().writes = true;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        let n = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
+            .count();
+        if n > 0 {
+            let nm = &rest[..n];
+            if top.contains(nm) {
+                acc.entry(nm.to_string()).or_default().writes = true;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// `"name[idx]"` → (name, idx) for a Literal getVar/setVar arg;
+/// `[@]`/`[*]` and bare `"name"` are whole-var (None).
+fn parse_var_arg_str(s: &str) -> Option<(&str, Option<&str>)> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_suffix(']') {
+        if let Some(open) = rest.rfind('[') {
+            let (name, idx) = (&rest[..open], &rest[open + 1..]);
+            if name.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                if idx == "@" || idx == "*" {
+                    return Some((name, None)); // whole-array form
+                }
+                return Some((name, Some(idx)));
+            }
+        }
+    }
+    Some((s, None))
+}
+
+/// Classify one sh2 call into the per-name accumulator.
+fn classify_array_call(
+    fn_name: &str,
+    args: &[Expr],
+    in_fn: bool,
+    stmt_idx: usize,
+    top_set_arrays: &std::collections::HashSet<String>,
+    acc: &mut std::collections::HashMap<String, ArrayRefs>,
+) {
+    let Some(first) = args.first() else { return };
+    let name = match fn_name {
+        "setArray" | "setArrayAppend" | "arrayLen" | "arrayItems" | "unset" => match lit_str(first) {
+            Some(n) => n,
+            None => return,
+        },
+        "getVar" | "setVar" => {
+            // Literal "name[idx]" / "name", or template `name[${i}]`
+            match first {
+                Expr::Literal { value, .. } => {
+                    let Some(s) = value.as_str() else { return };
+                    match parse_var_arg_str(s) {
+                        Some((n, _)) => n,
+                        None => return,
+                    }
+                }
+                Expr::TemplateLiteral { quasis, expressions } => {
+                    if quasis.len() == 2 && expressions.len() == 1 {
+                        let head = quasis[0].value.raw.trim_end_matches('[');
+                        if quasis[1].value.raw.trim() == "]" {
+                            head
+                        } else {
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+        "arrayIndex" => match lit_str(first) {
+            Some(n) => n,
+            None => return,
+        },
+        "param" => {
+            let Some(target_arg) = args.get(1) else { return };
+            let Some(target) = lit_str(target_arg) else { return };
+            let Some(op) = lit_str(first) else { return };
+            // zsh `${(flags)var}` (core requests zsh-sh-go-20260814-183409 /
+            // 193615 + re-filings): the flag/separator ride the extra args
+            // and the runtime's zshParamFlags reads the STORE array — the
+            // name is an array touch (never native-foldable).
+            if op == "slice" {
+                target.trim_start_matches('#')
+            } else if op.is_empty() && args.len() >= 3 {
+                target
+            } else {
+                return;
+            }
+        }
+        _ => return,
+    };
+    let entry = acc.entry(name.to_string()).or_default();
+    if in_fn {
+        entry.in_fn = true;
+    }
+    match fn_name {
+        "setArray" => {
+            entry.set_arrays += 1;
+            if top_set_arrays.contains(name) {
+                entry.top_set_array = true;
+                entry.set_array_idx = Some(stmt_idx);
+            }
+            if !matches!(args.get(1), Some(Expr::ArrayExpression { .. })) {
+                entry.writes = true;
+            }
+        }
+        "setArrayAppend" => entry.writes = true,
+        "getVar" => match args.first() {
+            Some(Expr::Literal { value, .. }) => {
+                if let Some((_, Some(idx))) = parse_var_arg_str(value.as_str().unwrap_or("")) {
+                    if idx.parse::<i64>().map(|v| v >= 0).unwrap_or(false)
+                        || parse_dollar_var(idx).is_some()
+                    {
+                        // plain literal or `$var` element read — OK
+                        entry.read_stmt_idxs.push(stmt_idx);
+                    } else {
+                        entry.index_bad = true;
+                    }
+                } else {
+                    entry.whole = true; // bare name / [@] / [*]
+                }
+            }
+            Some(Expr::TemplateLiteral { .. }) => entry.index_bad = true,
+            _ => {}
+        },
+        "arrayIndex" => match args.get(1) {
+            Some(Expr::Literal { value, .. }) => {
+                if value
+                    .as_i64()
+                    .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    .map(|v| v >= 0)
+                    .unwrap_or(false)
+                {
+                    // plain literal element read — OK
+                    entry.read_stmt_idxs.push(stmt_idx);
+                } else if value
+                    .as_str()
+                    .and_then(parse_dollar_var)
+                    .is_some()
+                {
+                    // `$var` element read — the runtime expands it
+                    // through the store; the native rewrite reads the
+                    // SAME store path (no dispatch / expansion)
+                    entry.read_stmt_idxs.push(stmt_idx);
+                } else {
+                    entry.index_bad = true;
+                }
+            }
+            _ => entry.index_bad = true,
+        },
+        "arrayLen" | "arrayItems" => entry.read_stmt_idxs.push(stmt_idx),
+        "param" => {
+            let op = args.first().and_then(lit_str).unwrap_or("");
+            let target = args.get(1).and_then(lit_str).unwrap_or("");
+            let mode = args.get(2).and_then(lit_str).unwrap_or("");
+            if op == "slice" && mode == "@" {
+                // len (#name) or join (name) — both reads
+                entry.read_stmt_idxs.push(stmt_idx);
+            } else if op.is_empty() && args.len() >= 3 {
+                // zsh flags — the runtime zshParamFlags reads the STORE
+                // array (the native fold would desync it)
+                entry.writes = true;
+            } else {
+                entry.writes = true;
+            }
+        }
+        "setVar" => entry.writes = true,
+        "unset" => entry.writes = true,
+        _ => {}
+    }
+}
+
+/// Walk every expr in a statement; `in_fn` becomes true inside a
+/// script-function arrow (`let __fn_* = … =>` / `sh2.define(…, … =>)`).
+fn walk_stmt_exprs(stmt: &Stmt, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
+    match stmt {
+        Stmt::ExpressionStatement { expression } => walk_expr(expression, in_fn, f),
+        Stmt::BlockStatement { body } => {
+            for s in body {
+                walk_stmt_exprs(s, in_fn, f);
+            }
+        }
+        Stmt::IfStatement { test, consequent, alternate, .. } => {
+            walk_expr(test, in_fn, f);
+            walk_stmt_exprs(consequent, in_fn, f);
+            if let Some(a) = alternate {
+                walk_stmt_exprs(a, in_fn, f);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases, .. } => {
+            walk_expr(discriminant, in_fn, f);
+            for c in cases {
+                for s in &c.consequent {
+                    walk_stmt_exprs(s, in_fn, f);
+                }
+            }
+        }
+        Stmt::WhileStatement { test, body, .. } => {
+            walk_expr(test, in_fn, f);
+            walk_stmt_exprs(body, in_fn, f);
+        }
+        Stmt::DoWhileStatement { test, body, .. } => {
+            walk_expr(test, in_fn, f);
+            walk_stmt_exprs(body, in_fn, f);
+        }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            walk_stmt_exprs(block, in_fn, f);
+            if let Some(h) = handler {
+                if let Some(p) = &h.param {
+                    walk_expr(p, in_fn, f);
+                }
+                walk_stmt_exprs(&h.body, in_fn, f);
+            }
+            if let Some(fin) = finalizer {
+                walk_stmt_exprs(fin, in_fn, f);
+            }
+        }
+        Stmt::ForStatement { init, test, update, body, .. } => {
+            walk_stmt_exprs(init, in_fn, f);
+            walk_expr(test, in_fn, f);
+            walk_expr(update, in_fn, f);
+            walk_stmt_exprs(body, in_fn, f);
+        }
+        Stmt::ForOfStatement { left, right, body, .. } => {
+            walk_stmt_exprs(left, in_fn, f);
+            walk_expr(right, in_fn, f);
+            walk_stmt_exprs(body, in_fn, f);
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            for p in params {
+                walk_expr(p, true, f);
+            }
+            walk_stmt_exprs(body, true, f);
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                walk_expr(&d.id, in_fn, f);
+                if let Some(init) = &d.init {
+                    // `let __fn_<name> = async (...) => {…}` — a script
+                    // function's body (deferred; scope-safety guard)
+                    let fn_arrow = matches!(&d.id, Expr::Identifier { name } if name.starts_with("__fn_"))
+                        && matches!(init, Expr::ArrowFunctionExpression { .. });
+                    walk_expr(init, if fn_arrow { true } else { in_fn }, f);
+                }
+            }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        Stmt::ReturnStatement { argument } => {
+            if let Some(a) = argument {
+                walk_expr(a, in_fn, f);
+            }
+        }
+        Stmt::ThrowStatement { argument } => walk_expr(argument, in_fn, f),
+    }
+}
+
+fn walk_expr(e: &Expr, in_fn: bool, f: &mut impl FnMut(&Expr, bool)) {
+    f(e, in_fn);
+    match e {
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        Expr::TemplateLiteral { expressions, .. } => {
+            for q in expressions {
+                walk_expr(q, in_fn, f);
+            }
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            walk_expr(callee, in_fn, f);
+            // the older `sh2.define("name", … => {…})` function shape
+            let in_define = is_sh2_call(callee, "define");
+            for a in arguments {
+                walk_expr(a, if in_define { true } else { in_fn }, f);
+            }
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            walk_expr(object, in_fn, f);
+            walk_expr(property, in_fn, f);
+        }
+        Expr::AwaitExpression { argument } => walk_expr(argument, in_fn, f),
+        Expr::FunctionExpression { params, body, .. } => {
+            for p in params {
+                walk_expr(p, true, f);
+            }
+            walk_stmt_exprs(body, true, f);
+        }
+        Expr::ArrowFunctionExpression { params, body, .. } => {
+            for p in params {
+                walk_expr(p, in_fn, f);
+            }
+            match body {
+                ArrowBody::Expr(e) => walk_expr(e, in_fn, f),
+                ArrowBody::Block(s) => walk_stmt_exprs(s, in_fn, f),
+            }
+        }
+        Expr::ObjectExpression { properties } => {
+            for p in properties {
+                walk_expr(&p.key, in_fn, f);
+                walk_expr(&p.value, in_fn, f);
+            }
+        }
+        Expr::ArrayExpression { elements } => {
+            for el in elements.iter().flatten() {
+                walk_expr(el, in_fn, f);
+            }
+        }
+        Expr::SpreadElement { argument } => walk_expr(argument, in_fn, f),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. } => {
+            walk_expr(left, in_fn, f);
+            walk_expr(right, in_fn, f);
+        }
+        Expr::AssignmentExpression { left, right, .. } => {
+            // `__fn_f = async () => {…}` — the script-function binding
+            // (the current emitter's shape: `let __fn_f = null` then the
+            // sequence assigns the arrow). The arrow body is deferred
+            // (scope-safety guard).
+            let fn_assign = matches!(&**left, Expr::Identifier { name } if name.starts_with("__fn_"))
+                && matches!(&**right, Expr::ArrowFunctionExpression { .. });
+            walk_expr(left, in_fn, f);
+            walk_expr(right, if fn_assign { true } else { in_fn }, f);
+        }
+        Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+            walk_expr(test, in_fn, f);
+            walk_expr(consequent, in_fn, f);
+            walk_expr(alternate, in_fn, f);
+        }
+        Expr::UnaryExpression { argument, .. } => walk_expr(argument, in_fn, f),
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions {
+                walk_expr(x, in_fn, f);
+            }
+        }
+        Expr::NewExpression { callee, arguments } => {
+            walk_expr(callee, in_fn, f);
+            for a in arguments {
+                walk_expr(a, in_fn, f);
+            }
+        }
+    }
+}
+
+/// Rewrite a provably-static array to native JS (lower.js's
+/// lowerNativeArrays, moved into the emitter). Runs FIRST in the
+/// post-emission pipeline (mirrors the website's pass order).
+pub(crate) fn lower_native_arrays(prog: Program) -> Program {
+    // Which names have a DIRECT top-level `sh2.setArray("name", [..])`?
+    let mut top_set_arrays: std::collections::HashSet<String> = Default::default();
+    for stmt in &prog.body {
+        if let Stmt::ExpressionStatement { expression } = stmt {
+            if let Expr::CallExpression { callee, arguments, .. } = expression {
+                if is_sh2_call(callee, "setArray") {
+                    if let [Expr::Literal { value, .. }, Expr::ArrayExpression { .. }] =
+                        arguments.as_slice()
+                    {
+                        if let Some(n) = value.as_str() {
+                            top_set_arrays.insert(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Classify every sh2 call in every top-level statement.
+    let mut acc: std::collections::HashMap<String, ArrayRefs> = Default::default();
+    let mut declared: std::collections::HashSet<String> = Default::default();
+    for (stmt_idx, stmt) in prog.body.iter().enumerate() {
+        walk_stmt_exprs(stmt, false, &mut |e, in_fn| {
+            if let Expr::CallExpression { callee, arguments, .. } = e {
+                if let Some(fn_name) = sh2_callee_name(callee) {
+                    classify_array_call(
+                        fn_name,
+                        arguments,
+                        in_fn,
+                        stmt_idx,
+                        &top_set_arrays,
+                        &mut acc,
+                    );
+                }
+            }
+            // Runtime-expanded TEXT (test strings, exec args, arith
+            // texts): the runtime resolves `$name` / `${name…}` refs from
+            // the STORE, which a native array never syncs — a name
+            // referenced from a literal must stay store-backed (the
+            // native fold would desync the store and the dead-decl drop
+            // would then remove the seed: `mx=(10 20 30)` + `if [
+            // "${mx[1]}" -eq 20 ]` compiled to `let mx = […]` only,
+            // dropped as unread, and the runtime expanded `${mx[1]}`
+            // against an unset store). Over-marking is safe (the fold
+            // simply does not fire); under-marking is the corruption.
+            if let Expr::Literal { value, .. } = e {
+                if let Some(s) = value.as_str() {
+                    mark_text_refs(s, &top_set_arrays, &mut acc);
+                }
+            }
+            if let Expr::TemplateLiteral { quasis, .. } = e {
+                for q in quasis {
+                    let s = q.value.cooked.as_deref().unwrap_or(&q.value.raw);
+                    mark_text_refs(s, &top_set_arrays, &mut acc);
+                }
+            }
+            if let Expr::Identifier { name } = e {
+                declared.insert(name.clone());
+            }
+        });
+    }
+    // Decide: exactly one top-level array-valued setArray; read-only
+    // literal/`$var`-index refs; nothing whole/write/unset/computed/
+    // in-function-before-init; no other bare use of the name anywhere.
+    // The `in_fn` reads are SAFE when the function declaration comes
+    // after the setArray (the order guard below): the `let` initializes
+    // before the function can exist or run (a `let __fn_` is in the TDZ
+    // until its declaration), and a function-local that SHADOWS the
+    // array name surfaces as a bare declarator identifier in `declared`
+    // (disqualifying it). The old blanket `in_fn` ban dropped the game's
+    // direction tables (DIR_X/DIR_Z — read per frame) just because
+    // `shoot()` also reads them.
+    let natives: std::collections::HashSet<String> = acc
+        .iter()
+        .filter(|(name, a)| {
+            a.set_arrays == 1
+                && a.top_set_array
+                && a.set_array_idx.is_some()
+                && a.read_stmt_idxs
+                    .iter()
+                    .all(|i| a.set_array_idx.unwrap() < *i)
+                && !a.whole
+                && !a.writes
+                && !a.index_bad
+                && !declared.contains(*name)
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    if natives.is_empty() {
+        return prog;
+    }
+    // Apply: setArray statement → `let name = items;` (with the runtime
+    // setArray's one-level SPLICE — array-valued items are flattened, so
+    // the initializer is `[].concat(...items)` unless every item is a
+    // plain scalar); rewrite reads everywhere.
+    let body = prog
+        .body
+        .into_iter()
+        .map(|stmt| match &stmt {
+            Stmt::ExpressionStatement { expression } => {
+                if let Expr::CallExpression { callee, arguments, .. } = expression {
+                    if is_sh2_call(callee, "setArray") {
+                        if let [Expr::Literal { value, .. }, items] = arguments.as_slice() {
+                            if let Some(n) = value.as_str() {
+                                if natives.contains(n) {
+                                    let items: Vec<Expr> = match items {
+                                        Expr::ArrayExpression { elements } => elements
+                                            .iter()
+                                            .flatten()
+                                            .map(|e| lower_expr(e.clone(), &natives))
+                                            .collect(),
+                                        _ => vec![],
+                                    };
+                                    let init = if items.iter().all(is_scalar_array_item) {
+                                        Expr::ArrayExpression {
+                                            elements: items.into_iter().map(Some).collect(),
+                                        }
+                                    } else {
+                                        // the runtime splices array-valued
+                                        // items one level ([].concat)
+                                        Expr::CallExpression {
+                                            callee: Box::new(Expr::MemberExpression {
+                                                object: Box::new(Expr::ArrayExpression {
+                                                    elements: vec![],
+                                                }),
+                                                property: Box::new(Expr::Identifier {
+                                                    name: "concat".to_string(),
+                                                }),
+                                                computed: false,
+                                                optional: false,
+                                            }),
+                                            arguments: items,
+                                            optional: false,
+                                        }
+                                    };
+                                    return Stmt::VariableDeclaration {
+                                        kind: "let",
+                                        declarations: vec![VariableDeclarator {
+                                            type_: "VariableDeclarator",
+                                            id: Expr::Identifier {
+                                                name: n.to_string(),
+                                            },
+                                            init: Some(init),
+                                        }],
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::ExpressionStatement {
+                    expression: lower_expr(expression.clone(), &natives),
+                }
+            }
+            _ => lower_stmt(stmt.clone(), &natives),
+        })
+        .collect();
+    Program {
+        type_: prog.type_,
+        source_type: prog.source_type,
+        body,
+    }
+}
+
+/// A setArray item that is provably a plain scalar (a JS array literal
+/// element, no runtime one-level splice needed). Calls, identifiers,
+/// arrays and member reads may hold ARRAYS — the runtime setArray
+/// splices those (`out.push(...e)`), so they take the `[].concat(...)`
+/// initializer form instead.
+fn is_scalar_array_item(e: &Expr) -> bool {
+    match e {
+        Expr::Literal { .. }
+        | Expr::TemplateLiteral { .. }
+        | Expr::UnaryExpression { .. }
+        | Expr::BinaryExpression { .. }
+        | Expr::LogicalExpression { .. }
+        | Expr::ConditionalExpression { .. }
+        | Expr::SequenceExpression { .. }
+        | Expr::AssignmentExpression { .. } => true,
+        _ => false,
+    }
+}
+
+fn lower_stmt(stmt: Stmt, natives: &std::collections::HashSet<String>) -> Stmt {
+    match stmt {
+        Stmt::ExpressionStatement { expression } => Stmt::ExpressionStatement {
+            expression: lower_expr(expression, natives),
+        },
+        Stmt::BlockStatement { body } => Stmt::BlockStatement {
+            body: body.into_iter().map(|s| lower_stmt(s, natives)).collect(),
+        },
+        Stmt::IfStatement { test, consequent, alternate } => Stmt::IfStatement {
+            test: lower_expr(test, natives),
+            consequent: Box::new(lower_stmt(*consequent, natives)),
+            alternate: alternate.map(|a| Box::new(lower_stmt(*a, natives))),
+        },
+        Stmt::SwitchStatement { discriminant, cases } => Stmt::SwitchStatement {
+            discriminant: lower_expr(discriminant, natives),
+            cases: cases
+                .into_iter()
+                .map(|c| SwitchCase {
+                    type_: c.type_,
+                    test: c.test.map(|t| lower_expr(t, natives)),
+                    consequent: c
+                        .consequent
+                        .into_iter()
+                        .map(|s| lower_stmt(s, natives))
+                        .collect(),
+                })
+                .collect(),
+        },
+        Stmt::WhileStatement { test, body } => Stmt::WhileStatement {
+            test: lower_expr(test, natives),
+            body: Box::new(lower_stmt(*body, natives)),
+        },
+        Stmt::DoWhileStatement { test, body } => Stmt::DoWhileStatement {
+            test: lower_expr(test, natives),
+            body: Box::new(lower_stmt(*body, natives)),
+        },
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => Stmt::TryStatement {
+            block: Box::new(lower_stmt(*block, natives)),
+            handler: handler.map(|h| CatchClause {
+                type_: h.type_,
+                param: h.param.map(|p| Box::new(lower_expr(*p, natives))),
+                body: Box::new(lower_stmt(*h.body, natives)),
+            }),
+            finalizer: finalizer.map(|f| Box::new(lower_stmt(*f, natives))),
+        },
+        Stmt::ForStatement { init, test, update, body } => Stmt::ForStatement {
+            init: Box::new(lower_stmt(*init, natives)),
+            test: lower_expr(test, natives),
+            update: lower_expr(update, natives),
+            body: Box::new(lower_stmt(*body, natives)),
+        },
+        Stmt::ForOfStatement { left, right, body } => Stmt::ForOfStatement {
+            left: Box::new(lower_stmt(*left, natives)),
+            right: lower_expr(right, natives),
+            body: Box::new(lower_stmt(*body, natives)),
+        },
+        Stmt::FunctionDeclaration { id, params, body, generator, expression, r#async } => Stmt::FunctionDeclaration {
+            id: lower_expr(id, natives),
+            params: params.into_iter().map(|p| lower_expr(p, natives)).collect(),
+            body: Box::new(lower_stmt(*body, natives)),
+            generator,
+            expression,
+            r#async,
+        },
+        Stmt::VariableDeclaration { declarations, kind } => Stmt::VariableDeclaration {
+            declarations: declarations
+                .into_iter()
+                .map(|d| VariableDeclarator {
+                    type_: d.type_,
+                    id: lower_expr(d.id, natives),
+                    init: d.init.map(|i| lower_expr(i, natives)),
+                })
+                .collect(),
+            kind,
+        },
+        Stmt::BreakStatement { label } => Stmt::BreakStatement { label },
+        Stmt::ContinueStatement { label } => Stmt::ContinueStatement { label },
+        Stmt::ReturnStatement { argument } => Stmt::ReturnStatement {
+            argument: argument.map(|a| lower_expr(a, natives)),
+        },
+        Stmt::ThrowStatement { argument } => Stmt::ThrowStatement {
+            argument: lower_expr(argument, natives),
+        },
+    }
+}
+
+/// Replace a matching sh2 read call with its native form; recurse.
+fn lower_expr(e: Expr, natives: &std::collections::HashSet<String>) -> Expr {
+    if let Expr::CallExpression { callee, arguments, .. } = &e {
+        if let Some(fn_name) = sh2_callee_name(callee) {
+            match fn_name {
+                "arrayIndex" | "getVar" => {
+                    if let Some((name, idx)) = array_read_index(fn_name, arguments) {
+                        if natives.contains(name) {
+                            if let Some(idx) = idx {
+                                return native_element_read(name, idx);
+                            }
+                        }
+                    }
+                }
+                "arrayLen" | "arrayItems" | "param" => {
+                    if let Some((name, len)) = array_len_join(fn_name, arguments) {
+                        if natives.contains(name) {
+                            return if len {
+                                native_len_read(name)
+                            } else {
+                                Expr::Identifier { name: name.to_string() }
+                            };
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    match e {
+        Expr::CallExpression { callee, arguments, optional } => Expr::CallExpression {
+            callee: Box::new(lower_expr(*callee, natives)),
+            arguments: arguments
+                .into_iter()
+                .map(|a| lower_expr(a, natives))
+                .collect(),
+            optional,
+        },
+        Expr::Identifier { .. } | Expr::Literal { .. } => e,
+        Expr::TemplateLiteral { quasis, expressions } => Expr::TemplateLiteral {
+            quasis,
+            expressions: expressions
+                .into_iter()
+                .map(|x| lower_expr(x, natives))
+                .collect(),
+        },
+        Expr::MemberExpression { object, property, computed, optional } => Expr::MemberExpression {
+            object: Box::new(lower_expr(*object, natives)),
+            property: Box::new(lower_expr(*property, natives)),
+            computed,
+            optional,
+        },
+        Expr::AwaitExpression { argument } => Expr::AwaitExpression {
+            argument: Box::new(lower_expr(*argument, natives)),
+        },
+        Expr::FunctionExpression { id, params, body, generator, expression, r#async } => Expr::FunctionExpression {
+            id: Box::new(lower_expr(*id, natives)),
+            params: params.into_iter().map(|p| lower_expr(p, natives)).collect(),
+            body: Box::new(lower_stmt(*body, natives)),
+            generator,
+            expression,
+            r#async,
+        },
+        Expr::ArrowFunctionExpression { params, body, expression, r#async } => {
+            Expr::ArrowFunctionExpression {
+                params: params.into_iter().map(|p| lower_expr(p, natives)).collect(),
+                body: match body {
+                    ArrowBody::Expr(e) => ArrowBody::Expr(Box::new(lower_expr(*e, natives))),
+                    ArrowBody::Block(s) => ArrowBody::Block(Box::new(lower_stmt(*s, natives))),
+                },
+                expression,
+                r#async,
+            }
+        }
+        Expr::ObjectExpression { properties } => Expr::ObjectExpression {
+            properties: properties
+                .into_iter()
+                .map(|p| Property {
+                    type_: p.type_,
+                    key: lower_expr(p.key, natives),
+                    value: lower_expr(p.value, natives),
+                    kind: p.kind,
+                    computed: p.computed,
+                    shorthand: p.shorthand,
+                })
+                .collect(),
+        },
+        Expr::ArrayExpression { elements } => Expr::ArrayExpression {
+            elements: elements
+                .into_iter()
+                .map(|el| el.map(|x| lower_expr(x, natives)))
+                .collect(),
+        },
+        Expr::SpreadElement { argument } => Expr::SpreadElement {
+            argument: Box::new(lower_expr(*argument, natives)),
+        },
+        Expr::LogicalExpression { operator, left, right } => Expr::LogicalExpression {
+            operator,
+            left: Box::new(lower_expr(*left, natives)),
+            right: Box::new(lower_expr(*right, natives)),
+        },
+        Expr::BinaryExpression { operator, left, right } => Expr::BinaryExpression {
+            operator,
+            left: Box::new(lower_expr(*left, natives)),
+            right: Box::new(lower_expr(*right, natives)),
+        },
+        Expr::AssignmentExpression { operator, left, right } => Expr::AssignmentExpression {
+            operator,
+            left: Box::new(lower_expr(*left, natives)),
+            right: Box::new(lower_expr(*right, natives)),
+        },
+        Expr::ConditionalExpression { test, consequent, alternate } => Expr::ConditionalExpression {
+            test: Box::new(lower_expr(*test, natives)),
+            consequent: Box::new(lower_expr(*consequent, natives)),
+            alternate: Box::new(lower_expr(*alternate, natives)),
+        },
+        Expr::UnaryExpression { operator, argument, prefix } => Expr::UnaryExpression {
+            operator,
+            argument: Box::new(lower_expr(*argument, natives)),
+            prefix,
+        },
+        Expr::SequenceExpression { expressions } => Expr::SequenceExpression {
+            expressions: expressions.into_iter().map(|x| lower_expr(x, natives)).collect(),
+        },
+        Expr::NewExpression { callee, arguments } => Expr::NewExpression {
+            callee: Box::new(lower_expr(*callee, natives)),
+            arguments: arguments.into_iter().map(|a| lower_expr(a, natives)).collect(),
+        },
+    }
+}
+
+/// `sh2.getVar("arr[1]")` / `sh2.arrayIndex("arr", "1")` → (name, Some(idx))
+/// for a LITERAL non-negative integer index; None for anything else.
+/// A native-array read index: a literal non-negative integer, or a
+/// `$var` store read. The runtime expands `$name` indexes through the
+/// store (`arrayIndex("DIR_X", "$yaw")` — the game's direction tables,
+/// read every frame); the native rewrite reads the SAME store path, so
+/// it is byte-equivalent and skips the per-read dispatch + expansion.
+enum NativeIdx {
+    Lit(i64),
+    Var(String),
+}
+
+/// `$yaw` → `Some("yaw")` for a simple store-var index (no `${…}`).
+fn parse_dollar_var(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('$')?;
+    match rest.chars().next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return None,
+    }
+    rest.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        .then_some(rest)
+}
+
+/// `sh2.getVar("arr[1])")` / `sh2.arrayIndex("arr", "1")` → (name, Some(idx))
+/// for a LITERAL non-negative integer index, or a `$var` (store) index;
+/// None for anything else.
+fn array_read_index<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, Option<NativeIdx>)> {
+    let name = lit_str(args.first()?)?;
+    if fn_name == "getVar" {
+        let (n, idx) = parse_var_arg_str(name)?;
+        let idx = idx?;
+        if let Some(v) = parse_dollar_var(idx) {
+            return Some((n, Some(NativeIdx::Var(v.to_string()))));
+        }
+        let v = idx.parse::<i64>().ok()?;
+        (v >= 0).then_some((n, Some(NativeIdx::Lit(v))))
+    } else {
+        if let Some(v) = args.get(1)?.as_literal_i64() {
+            return (v >= 0).then_some((name, Some(NativeIdx::Lit(v))));
+        }
+        if let Some(s) = lit_str(args.get(1)?) {
+            if let Some(v) = parse_dollar_var(s) {
+                return Some((name, Some(NativeIdx::Var(v.to_string()))));
+            }
+        }
+        None
+    }
+}
+
+/// `sh2.arrayLen("arr")` / `arrayItems("arr")` / `param("slice", …)` →
+/// (name, is_len). `arrayItems` returns the ARRAY (the native echo
+/// wraps it in `[].concat(…).join(" ")`), so the rewrite is the bare
+/// identifier; `len` rewrites to `name.length`.
+fn array_len_join<'a>(fn_name: &str, args: &'a [Expr]) -> Option<(&'a str, bool)> {
+    match fn_name {
+        "arrayLen" => lit_str(args.first()?).map(|n| (n, true)),
+        "arrayItems" => lit_str(args.first()?).map(|n| (n, false)),
+        "param" => {
+            let op = lit_str(args.first()?)?;
+            let mode = args.get(2).and_then(lit_str)?;
+            if op != "slice" || mode != "@" {
+                return None;
+            }
+            let target = lit_str(args.get(1)?)?;
+            Some((target.trim_start_matches('#'), target.starts_with('#')))
+        }
+        _ => None,
+    }
+}
+
+fn native_element_read(name: &str, idx: NativeIdx) -> Expr {
+    match idx {
+        NativeIdx::Lit(v) => {
+            let elem = Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: name.to_string(),
+                }),
+                property: Box::new(Expr::Literal {
+                    value: serde_json::Value::from(v),
+                    raw: None,
+                    regex: None,
+                }),
+                computed: true,
+                optional: false,
+            };
+            Expr::ConditionalExpression {
+                test: Box::new(Expr::BinaryExpression {
+                    operator: "!==".to_string(),
+                    left: Box::new(elem.clone()),
+                    right: Box::new(Expr::Identifier {
+                        name: "undefined".to_string(),
+                    }),
+                }),
+                consequent: Box::new(elem),
+                alternate: Box::new(Expr::Literal {
+                    value: serde_json::Value::String(String::new()),
+                    raw: None,
+                    regex: None,
+                }),
+            }
+        }
+        NativeIdx::Var(var) => {
+            // `String(<name>[Number(sh2.vars.<var> ?? "")] ?? "")` — the
+            // runtime's arrayIndex for a `$var` index does
+            // `String(v[Number(expand("$" + var))] ?? "")`; reading the
+            // SAME store path natively is byte-equivalent without the
+            // dispatch + operand-expansion machinery.
+            let vars = Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: "sh2".to_string(),
+                }),
+                property: Box::new(Expr::Identifier {
+                    name: "vars".to_string(),
+                }),
+                computed: false,
+                optional: false,
+            };
+            let store_read = Expr::MemberExpression {
+                object: Box::new(vars),
+                property: Box::new(Expr::Identifier { name: var }),
+                computed: false,
+                optional: false,
+            };
+            let idx_expr = Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "Number".to_string(),
+                }),
+                arguments: vec![Expr::LogicalExpression {
+                    operator: "??".to_string(),
+                    left: Box::new(store_read),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::String(String::new()),
+                        raw: None,
+                        regex: None,
+                    }),
+                }],
+                optional: false,
+            };
+            let elem = Expr::MemberExpression {
+                object: Box::new(Expr::Identifier {
+                    name: name.to_string(),
+                }),
+                property: Box::new(idx_expr),
+                computed: true,
+                optional: false,
+            };
+            Expr::CallExpression {
+                callee: Box::new(Expr::Identifier {
+                    name: "String".to_string(),
+                }),
+                arguments: vec![Expr::LogicalExpression {
+                    operator: "??".to_string(),
+                    left: Box::new(elem),
+                    right: Box::new(Expr::Literal {
+                        value: serde_json::Value::String(String::new()),
+                        raw: None,
+                        regex: None,
+                    }),
+                }],
+                optional: false,
+            }
+        }
+    }
+}
+
+fn native_len_read(name: &str) -> Expr {
+    Expr::MemberExpression {
+        object: Box::new(Expr::Identifier {
+            name: name.to_string(),
+        }),
+        property: Box::new(Expr::Identifier {
+            name: "length".to_string(),
+        }),
+        computed: false,
+        optional: false,
+    }
+}
+
+trait AsLiteralI64 {
+    fn as_literal_i64(&self) -> Option<i64>;
+}
+impl AsLiteralI64 for Expr {
+    fn as_literal_i64(&self) -> Option<i64> {
+        match self {
+            // The emitter passes bash index TEXT (arrayIndex("arr",
+            // "1")) — accept both JSON numbers and numeric strings.
+            Expr::Literal { value, .. } => value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok())),
+            _ => None,
+        }
+    }
+}
+
+// ── dead-flag removal ───────────────────────────────────────────────
+//
+// Migrated from the website's src/lower.js `dropDeadFlags`. A command
+// statement's VALUE is its success flag — `(cmd?, flag)` — consumed ONLY
+// for the program's last statement (jtsh's runViaTranspiler returns it
+// as the exit code; the harness `_finish` reads sh2.lastExit, which the
+// last statement's status lowering set). Every other statement — loop
+// bodies, blocks, branches, guarded calls' args — has a dead value, so
+// `(cmd, true)` is just `cmd`. Also unwraps 1-element sequences (a bare
+// `(flag)` left after the lastExit hoist) and drops literal-only
+// statements (no side effects).
+//
+// Runs AFTER the lastExit hoist (mirrors the website's pass order). The
+// trailing element is popped ONLY when it is PURE — an if-statement
+// lowers to `(test, lastExit === 0 ? BRANCH : false)` whose tail is the
+// side-effecting BRANCH conditional (writes, calls); popping that would
+// DELETE the branch, so purity is the guard.
+
+fn is_pure_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Literal { .. } | Expr::Identifier { .. } => true,
+        Expr::TemplateLiteral { expressions, .. } => expressions.iter().all(is_pure_expr),
+        Expr::UnaryExpression { argument, .. } => is_pure_expr(argument),
+        Expr::BinaryExpression { left, right, .. } | Expr::LogicalExpression { left, right, .. } => {
+            is_pure_expr(left) && is_pure_expr(right)
+        }
+        Expr::ConditionalExpression { test, consequent, alternate } => {
+            is_pure_expr(test) && is_pure_expr(consequent) && is_pure_expr(alternate)
+        }
+        _ => false,
+    }
+}
+
+/// Process one statement (drop its trailing flag / unwrap / mark dead).
+/// Returns true when the statement is a bare literal (drop it).
+fn drop_stmt_flags(stmt: &mut Stmt) -> bool {
+    if let Stmt::ExpressionStatement { expression } = stmt {
+        if let Expr::SequenceExpression { expressions } = expression {
+            if expressions.len() == 1 {
+                if is_pure_literal(&expressions[0]) {
+                    return true; // a bare `(true)` — no side effects
+                }
+                *expression = expressions.pop().unwrap();
+            } else if is_pure_expr(expressions.last().unwrap()) {
+                expressions.pop();
+                if expressions.len() == 1 {
+                    *expression = expressions.pop().unwrap();
+                }
+            }
+        }
+    }
+    drop_nested_flags(stmt);
+    false
+}
+
+/// Recurse into a statement's nested statement lists (no exemption).
+fn drop_nested_flags(stmt: &mut Stmt) {
+    match stmt {
+        Stmt::ExpressionStatement { expression } => drop_expr_flags(expression),
+        Stmt::BlockStatement { body } => drop_flags_in_list(body),
+        Stmt::IfStatement { test, consequent, alternate } => {
+            drop_expr_flags(test);
+            drop_stmt_flags(consequent);
+            if let Some(a) = alternate {
+                drop_stmt_flags(a);
+            }
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            drop_expr_flags(discriminant);
+            for c in cases {
+                drop_flags_in_list(&mut c.consequent);
+            }
+        }
+        Stmt::WhileStatement { test, body } => {
+            drop_expr_flags(test);
+            drop_stmt_flags(body);
+        }
+        Stmt::DoWhileStatement { test, body } => {
+            drop_expr_flags(test);
+            drop_stmt_flags(body);
+        }
+        Stmt::TryStatement {
+            block,
+            handler,
+            finalizer,
+        } => {
+            drop_stmt_flags(block);
+            if let Some(h) = handler {
+                drop_stmt_flags(&mut h.body);
+            }
+            if let Some(f) = finalizer {
+                drop_stmt_flags(f);
+            }
+        }
+        Stmt::ThrowStatement { argument } => drop_expr_flags(argument),
+        Stmt::ForStatement { init, test, update, body } => {
+            drop_stmt_flags(init);
+            drop_expr_flags(test);
+            drop_expr_flags(update);
+            drop_stmt_flags(body);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            drop_stmt_flags(left);
+            drop_expr_flags(right);
+            drop_stmt_flags(body);
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            for p in params {
+                drop_expr_flags(p);
+            }
+            drop_stmt_flags(body);
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                drop_expr_flags(&mut d.id);
+                if let Some(i) = &mut d.init {
+                    drop_expr_flags(i);
+                }
+            }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        Stmt::ReturnStatement { argument } => {
+            if let Some(a) = argument {
+                drop_expr_flags(a);
+            }
+        }
+    }
+}
+
+/// Recurse through an expression's nested statement lists (arrow bodies).
+fn drop_expr_flags(e: &mut Expr) {
+    match e {
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        Expr::TemplateLiteral { expressions, .. } => {
+            for x in expressions {
+                drop_expr_flags(x);
+            }
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            drop_expr_flags(callee);
+            for a in arguments {
+                drop_expr_flags(a);
+            }
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            drop_expr_flags(object);
+            drop_expr_flags(property);
+        }
+        Expr::AwaitExpression { argument } => drop_expr_flags(argument),
+        Expr::FunctionExpression { params, body, .. } => {
+            for p in params {
+                drop_expr_flags(p);
+            }
+            drop_stmt_flags(body);
+        }
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            ArrowBody::Expr(e) => drop_expr_flags(e),
+            ArrowBody::Block(s) => drop_nested_flags(s),
+        },
+        Expr::ObjectExpression { properties } => {
+            for p in properties {
+                drop_expr_flags(&mut p.key);
+                drop_expr_flags(&mut p.value);
+            }
+        }
+        Expr::ArrayExpression { elements } => {
+            for el in elements.iter_mut().flatten() {
+                drop_expr_flags(el);
+            }
+        }
+        Expr::SpreadElement { argument } => drop_expr_flags(argument),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. }
+        | Expr::AssignmentExpression { left, right, .. } => {
+            drop_expr_flags(left);
+            drop_expr_flags(right);
+        }
+        Expr::ConditionalExpression { test, consequent, alternate } => {
+            drop_expr_flags(test);
+            drop_expr_flags(consequent);
+            drop_expr_flags(alternate);
+        }
+        Expr::UnaryExpression { argument, .. } => drop_expr_flags(argument),
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions {
+                drop_expr_flags(x);
+            }
+        }
+        Expr::NewExpression { callee, arguments } => {
+            drop_expr_flags(callee);
+            for a in arguments {
+                drop_expr_flags(a);
+            }
+        }
+    }
+}
+
+/// Remove unconsumed success flags from a statement list (no exemption).
+fn drop_flags_in_list(stmts: &mut Vec<Stmt>) {
+    let n = stmts.len();
+    let mut dead = vec![false; n];
+    for i in 0..n {
+        dead[i] = drop_stmt_flags(&mut stmts[i]);
+    }
+    if dead.iter().any(|d| *d) {
+        let mut j = 0;
+        stmts.retain(|_| {
+            let d = dead[j];
+            j += 1;
+            !d
+        });
+    }
+}
+
+/// The program's last statement's VALUE is the exit flag — it keeps its
+/// sequence. Every other statement (all levels) loses its dead flag.
+pub(crate) fn drop_dead_flags(prog: Program) -> Program {
+    let mut body = prog.body;
+    let n = body.len();
+    let mut dead = vec![false; n];
+    for i in 0..n {
+        if i == n - 1 {
+            drop_nested_flags(&mut body[i]); // keep its own value; recurse
+        } else {
+            dead[i] = drop_stmt_flags(&mut body[i]);
+        }
+    }
+    if dead.iter().any(|d| *d) {
+        let mut j = 0;
+        body.retain(|_| {
+            let d = dead[j];
+            j += 1;
+            !d
+        });
+    }
+    Program {
+        type_: prog.type_,
+        source_type: prog.source_type,
+        body,
     }
 }
 
@@ -567,7 +2541,12 @@ const PS_MAGIC: &str = "\u{1}SH2PS\u{1}";
 fn stdin_only_command(name: Option<&str>) -> bool {
     matches!(
         name,
-        Some("mapfile") | Some("readarray") | Some("head") | Some("tail") | Some("cat") | Some("wc")
+        Some("mapfile")
+            | Some("readarray")
+            | Some("head")
+            | Some("tail")
+            | Some("cat")
+            | Some("wc")
     )
 }
 
@@ -632,14 +2611,8 @@ fn transform_cmd(cmd: &Command) -> Command {
             p.commands = p.commands.iter().map(transform_cmd).collect();
             Command::Pipeline(p)
         }
-        Command::And(l, r) => Command::And(
-            Box::new(transform_cmd(l)),
-            Box::new(transform_cmd(r)),
-        ),
-        Command::Or(l, r) => Command::Or(
-            Box::new(transform_cmd(l)),
-            Box::new(transform_cmd(r)),
-        ),
+        Command::And(l, r) => Command::And(Box::new(transform_cmd(l)), Box::new(transform_cmd(r))),
+        Command::Or(l, r) => Command::Or(Box::new(transform_cmd(l)), Box::new(transform_cmd(r))),
         Command::Not(c) => Command::Not(Box::new(transform_cmd(c))),
         Command::Background(c) => Command::Background(Box::new(transform_cmd(c))),
         Command::Subshell(c) => Command::Subshell(Box::new(transform_cmd(c))),
@@ -647,9 +2620,7 @@ fn transform_cmd(cmd: &Command) -> Command {
             let mut i = i.clone();
             i.condition = Box::new(transform_cmd(&i.condition));
             i.then_branch = Box::new(transform_cmd(&i.then_branch));
-            i.else_branch = i
-                .else_branch
-                .map(|b| Box::new(transform_cmd(&b)));
+            i.else_branch = i.else_branch.map(|b| Box::new(transform_cmd(&b)));
             Command::If(i)
         }
         Command::Case(c) => {
@@ -706,7 +2677,10 @@ fn transform_cmd(cmd: &Command) -> Command {
 fn is_unterminated_param_literal(w: &Word) -> bool {
     let joined = match w {
         Word::StringInterpolation(interp, _)
-            if interp.parts.iter().all(|p| matches!(p, StringPart::Literal(_))) =>
+            if interp
+                .parts
+                .iter()
+                .all(|p| matches!(p, StringPart::Literal(_))) =>
         {
             interp
                 .parts
@@ -1015,11 +2989,3062 @@ pub(crate) fn quasi_element(raw: &mut String, tail: bool) -> TemplateElement {
     TemplateElement {
         type_: "TemplateElement",
         value: TemplateElementValue {
-            raw: r.clone(),
+            raw: escape_template_raw(&r),
             cooked: Some(r),
         },
         tail,
     }
+}
+
+/// Escape the literal text of a template-literal quasi. The JS emitter
+/// (estree.js → astring) writes `TemplateElement.value.raw` VERBATIM, so
+/// the three characters that are special inside a template literal must
+/// be escaped: `\` (escape leader), `` ` `` (the delimiter) and `$`
+/// (`${` would open an expression slot). `cooked` keeps the unescaped
+/// VALUE. Without this, `echo "a\\b$y"` (bash) and `echo %X%\\`
+/// (batch) emitted `\b`/a bare trailing `\` into the template — a
+/// backspace or an unterminated template literal at eval time.
+pub(crate) fn escape_template_raw(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+// ── hand-rolled JSON writer for the ESTree ──────────────────────────
+//
+// serde_json::to_string(&program) — one Serializer dispatch + string
+// escape per field — was the #1 transpile hotspot (serialize_str: 13.8M
+// block executions on the game workload, ~31% of the profile). This
+// writer emits the SAME JSON the derive produces (same keys, same
+// declaration order, compact) with direct push_str/escape loops. The
+// browser consumes it via JSON.parse (order-insensitive), and the corpus
+// tests compare rendered output (parsed), so the exact field order is
+// cosmetic — it is kept identical to serde's anyway.
+
+/// Escape a JSON string body (without the quotes) — the fast path is a
+/// single scan; only strings containing a special char pay the rewrite.
+fn push_json_string(out: &mut String, s: &str) {
+    if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
+        out.push_str(s);
+        return;
+    }
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+fn push_key(out: &mut String, k: &str, v: &str) {
+    out.push('"');
+    out.push_str(k);
+    out.push_str("\":\"");
+    push_json_string(out, v);
+    out.push('"');
+}
+
+fn push_bool(out: &mut String, b: bool) {
+    out.push_str(if b { "true" } else { "false" });
+}
+
+fn write_str_field(out: &mut String, key: &str, v: &str) {
+    out.push(',');
+    push_key(out, key, v);
+}
+
+fn write_bool_field(out: &mut String, key: &str, b: bool) {
+    out.push(',');
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":");
+    push_bool(out, b);
+}
+
+pub fn estree_to_json(prog: &Program) -> String {
+    let mut out = String::with_capacity(256 * 1024);
+    write_program(&mut out, prog);
+    out
+}
+
+fn write_program(out: &mut String, p: &Program) {
+    out.push('{');
+    push_key(out, "type", p.type_);
+    out.push(',');
+    push_key(out, "sourceType", p.source_type);
+    out.push_str(",\"body\":[");
+    for (i, st) in p.body.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_stmt(out, st);
+    }
+    out.push_str("]}");
+}
+
+fn write_stmt(out: &mut String, st: &Stmt) {
+    match st {
+        Stmt::ExpressionStatement { expression } => {
+            out.push_str("{\"type\":\"ExpressionStatement\",\"expression\":");
+            write_expr(out, expression);
+            out.push('}');
+        }
+        Stmt::BlockStatement { body } => {
+            out.push_str("{\"type\":\"BlockStatement\",\"body\":[");
+            for (i, s) in body.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_stmt(out, s);
+            }
+            out.push_str("]}");
+        }
+        Stmt::IfStatement { test, consequent, alternate } => {
+            out.push_str("{\"type\":\"IfStatement\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"consequent\":");
+            write_stmt(out, consequent);
+            out.push_str(",\"alternate\":");
+            match alternate {
+                Some(a) => write_stmt(out, a),
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            out.push_str("{\"type\":\"TryStatement\",\"block\":");
+            write_stmt(out, block);
+            out.push_str(",\"handler\":");
+            match handler {
+                Some(h) => write_catch_clause(out, h),
+                None => out.push_str("null"),
+            }
+            out.push_str(",\"finalizer\":");
+            match finalizer {
+                Some(f) => write_stmt(out, f),
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
+        Stmt::ThrowStatement { argument } => {
+            out.push_str("{\"type\":\"ThrowStatement\",\"argument\":");
+            write_expr(out, argument);
+            out.push('}');
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            out.push_str("{\"type\":\"SwitchStatement\",\"discriminant\":");
+            write_expr(out, discriminant);
+            out.push_str(",\"cases\":[");
+            for (i, c) in cases.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_switch_case(out, c);
+            }
+            out.push_str("]}");
+        }
+        Stmt::WhileStatement { test, body } => {
+            out.push_str("{\"type\":\"WhileStatement\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::DoWhileStatement { test, body } => {
+            out.push_str("{\"type\":\"DoWhileStatement\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            out.push_str("{\"type\":\"ForStatement\",\"init\":");
+            write_stmt(out, init);
+            out.push_str(",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"update\":");
+            write_expr(out, update);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            out.push_str("{\"type\":\"ForOfStatement\",\"left\":");
+            write_stmt(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push_str(",\"body\":");
+            write_stmt(out, body);
+            out.push('}');
+        }
+        Stmt::FunctionDeclaration { id, params, body, generator, expression, r#async } => {
+            out.push_str("{\"type\":\"FunctionDeclaration\",\"id\":");
+            write_expr(out, id);
+            out.push_str(",\"params\":[");
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_expr(out, p);
+            }
+            out.push_str("],\"body\":");
+            write_stmt(out, body);
+            out.push_str(",\"generator\":");
+            push_bool(out, *generator);
+            out.push_str(",\"expression\":");
+            push_bool(out, *expression);
+            out.push_str(",\"async\":");
+            push_bool(out, *r#async);
+            out.push('}');
+        }
+        Stmt::VariableDeclaration { declarations, kind } => {
+            out.push_str("{\"type\":\"VariableDeclaration\",\"declarations\":[");
+            for (i, d) in declarations.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_var_declarator(out, d);
+            }
+            out.push_str("],");
+            push_key(out, "kind", kind);
+            out.push('}');
+        }
+        Stmt::BreakStatement { label } => {
+            out.push_str("{\"type\":\"BreakStatement\",\"label\":");
+            write_opt_string(out, label.as_deref());
+            out.push('}');
+        }
+        Stmt::ContinueStatement { label } => {
+            out.push_str("{\"type\":\"ContinueStatement\",\"label\":");
+            write_opt_string(out, label.as_deref());
+            out.push('}');
+        }
+        Stmt::ReturnStatement { argument } => {
+            out.push_str("{\"type\":\"ReturnStatement\",\"argument\":");
+            match argument {
+                Some(a) => write_expr(out, a),
+                None => out.push_str("null"),
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn write_opt_string(out: &mut String, s: Option<&str>) {
+    match s {
+        Some(v) => {
+            out.push('"');
+            push_json_string(out, v);
+            out.push('"');
+        }
+        None => out.push_str("null"),
+    }
+}
+
+fn write_switch_case(out: &mut String, c: &SwitchCase) {
+    out.push_str("{\"type\":\"SwitchCase\",\"test\":");
+    match &c.test {
+        Some(t) => write_expr(out, t),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"consequent\":[");
+    for (i, s) in c.consequent.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_stmt(out, s);
+    }
+    out.push_str("]}");
+}
+
+fn write_catch_clause(out: &mut String, h: &CatchClause) {
+    out.push_str("{\"type\":\"CatchClause\",\"param\":");
+    match &h.param {
+        Some(p) => write_expr(out, p),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"body\":");
+    write_stmt(out, &h.body);
+    out.push('}');
+}
+
+fn write_var_declarator(out: &mut String, d: &VariableDeclarator) {
+    out.push_str("{\"type\":\"VariableDeclarator\",\"id\":");
+    write_expr(out, &d.id);
+    out.push_str(",\"init\":");
+    match &d.init {
+        Some(i) => write_expr(out, i),
+        None => out.push_str("null"),
+    }
+    out.push('}');
+}
+
+fn write_expr(out: &mut String, e: &Expr) {
+    match e {
+        Expr::Identifier { name } => {
+            out.push_str("{\"type\":\"Identifier\",");
+            push_key(out, "name", name);
+            out.push('}');
+        }
+        Expr::Literal { value, raw, regex } => {
+            out.push_str("{\"type\":\"Literal\",\"value\":");
+            out.push_str(&value.to_string());
+            out.push_str(",\"raw\":");
+            write_opt_string(out, raw.as_deref());
+            if let Some(r) = regex {
+                out.push_str(",\"regex\":{\"pattern\":\"");
+                push_json_string(out, &r.pattern);
+                out.push_str("\",\"flags\":\"");
+                push_json_string(out, &r.flags);
+                out.push_str("\"}");
+            }
+            out.push('}');
+        }
+        Expr::TemplateLiteral { quasis, expressions } => {
+            out.push_str("{\"type\":\"TemplateLiteral\",\"quasis\":[");
+            for (i, q) in quasis.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_template_element(out, q);
+            }
+            out.push_str("],\"expressions\":[");
+            for (i, x) in expressions.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, x);
+            }
+            out.push_str("]}");
+        }
+        Expr::CallExpression { callee, arguments, optional } => {
+            out.push_str("{\"type\":\"CallExpression\",\"callee\":");
+            write_expr(out, callee);
+            out.push_str(",\"arguments\":[");
+            for (i, a) in arguments.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, a);
+            }
+            out.push(']');
+            write_bool_field(out, "optional", *optional);
+            out.push('}');
+        }
+        Expr::MemberExpression { object, property, computed, optional } => {
+            out.push_str("{\"type\":\"MemberExpression\",\"object\":");
+            write_expr(out, object);
+            out.push_str(",\"property\":");
+            write_expr(out, property);
+            write_bool_field(out, "computed", *computed);
+            write_bool_field(out, "optional", *optional);
+            out.push('}');
+        }
+        Expr::AwaitExpression { argument } => {
+            out.push_str("{\"type\":\"AwaitExpression\",\"argument\":");
+            write_expr(out, argument);
+            out.push('}');
+        }
+        Expr::FunctionExpression { id, params, body, generator, expression, r#async } => {
+            out.push_str("{\"type\":\"FunctionExpression\",\"id\":");
+            write_expr(out, id);
+            out.push_str(",\"params\":[");
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                write_expr(out, p);
+            }
+            out.push_str("],\"body\":");
+            write_stmt(out, body);
+            out.push_str(",\"generator\":");
+            push_bool(out, *generator);
+            out.push_str(",\"expression\":");
+            push_bool(out, *expression);
+            out.push_str(",\"async\":");
+            push_bool(out, *r#async);
+            out.push('}');
+        }
+        Expr::ArrowFunctionExpression { params, body, expression, r#async } => {
+            out.push_str("{\"type\":\"ArrowFunctionExpression\",\"params\":[");
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, p);
+            }
+            out.push_str("],\"body\":");
+            write_arrow_body(out, body);
+            write_bool_field(out, "expression", *expression);
+            write_bool_field(out, "async", *r#async);
+            out.push('}');
+        }
+        Expr::ObjectExpression { properties } => {
+            out.push_str("{\"type\":\"ObjectExpression\",\"properties\":[");
+            for (i, p) in properties.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_property(out, p);
+            }
+            out.push_str("]}");
+        }
+        Expr::ArrayExpression { elements } => {
+            out.push_str("{\"type\":\"ArrayExpression\",\"elements\":[");
+            for (i, el) in elements.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match el {
+                    Some(x) => write_expr(out, x),
+                    None => out.push_str("null"),
+                }
+            }
+            out.push_str("]}");
+        }
+        Expr::SpreadElement { argument } => {
+            out.push_str("{\"type\":\"SpreadElement\",\"argument\":");
+            write_expr(out, argument);
+            out.push('}');
+        }
+        Expr::LogicalExpression { operator, left, right } => {
+            out.push_str("{\"type\":\"LogicalExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"left\":");
+            write_expr(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push('}');
+        }
+        Expr::BinaryExpression { operator, left, right } => {
+            out.push_str("{\"type\":\"BinaryExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"left\":");
+            write_expr(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push('}');
+        }
+        Expr::AssignmentExpression { operator, left, right } => {
+            out.push_str("{\"type\":\"AssignmentExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"left\":");
+            write_expr(out, left);
+            out.push_str(",\"right\":");
+            write_expr(out, right);
+            out.push('}');
+        }
+        Expr::ConditionalExpression { test, consequent, alternate } => {
+            out.push_str("{\"type\":\"ConditionalExpression\",\"test\":");
+            write_expr(out, test);
+            out.push_str(",\"consequent\":");
+            write_expr(out, consequent);
+            out.push_str(",\"alternate\":");
+            write_expr(out, alternate);
+            out.push('}');
+        }
+        Expr::UnaryExpression { operator, argument, prefix } => {
+            out.push_str("{\"type\":\"UnaryExpression\",");
+            push_key(out, "operator", operator);
+            out.push_str(",\"argument\":");
+            write_expr(out, argument);
+            write_bool_field(out, "prefix", *prefix);
+            out.push('}');
+        }
+        Expr::SequenceExpression { expressions } => {
+            out.push_str("{\"type\":\"SequenceExpression\",\"expressions\":[");
+            for (i, x) in expressions.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, x);
+            }
+            out.push_str("]}");
+        }
+        Expr::NewExpression { callee, arguments } => {
+            out.push_str("{\"type\":\"NewExpression\",\"callee\":");
+            write_expr(out, callee);
+            out.push_str(",\"arguments\":[");
+            for (i, a) in arguments.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_expr(out, a);
+            }
+            out.push_str("]}");
+        }
+    }
+}
+
+fn write_arrow_body(out: &mut String, body: &ArrowBody) {
+    match body {
+        ArrowBody::Expr(e) => write_expr(out, e),
+        ArrowBody::Block(b) => write_stmt(out, b),
+    }
+}
+
+fn write_property(out: &mut String, p: &Property) {
+    out.push_str("{\"type\":\"Property\",\"key\":");
+    write_expr(out, &p.key);
+    out.push_str(",\"value\":");
+    write_expr(out, &p.value);
+    out.push_str(",\"kind\":\"");
+    push_json_string(out, p.kind);
+    out.push('"');
+    write_bool_field(out, "computed", p.computed);
+    write_bool_field(out, "shorthand", p.shorthand);
+    out.push('}');
+}
+
+fn write_template_element(out: &mut String, t: &TemplateElement) {
+    out.push_str("{\"type\":\"TemplateElement\",\"value\":{\"raw\":\"");
+    push_json_string(out, &t.value.raw);
+    out.push_str("\",\"cooked\":");
+    write_opt_string(out, t.value.cooked.as_deref());
+    out.push_str("},\"tail\":");
+    push_bool(out, t.tail);
+    out.push('}');
+}
+
+// ── the estreeToJs head passes, ported into the wasm ────────────────
+//
+// The JS-side estreeToJsMapped pipeline (estree.js/lower.js) normalizes
+// the wasm's sh2.*-targeted estree before the astring codegen. These are
+// the first passes of that pipeline, ported line-by-line so the compile
+// output stays byte-identical (the Node differential harness verifies the
+// composition: wasm-head + JS-suffix === the current full JS pipeline).
+//
+// The wasm runs a PREFIX of the pipeline; the JS side (estreeToJsMapped)
+// skips the moved prefix and continues at the next pass. The order is the
+// global pass order — a prefix is the only composition that preserves it.
+
+/// Generic mutable visitor over the ESTree (the Rust analog of the
+/// JS-side `walk`) — visits every Expr in the program (through stmts,
+/// arrows, template expressions, property keys/values, …), callback FIRST
+/// (top-down), then the children.
+pub(crate) fn visit_exprs(prog: &mut Program, f: &mut dyn FnMut(&mut Expr)) {
+    fn stmt(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
+        match s {
+            Stmt::ExpressionStatement { expression } => expr(expression, f),
+            Stmt::BlockStatement { body } => { for x in body { stmt(x, f); } }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                expr(test, f);
+                stmt(consequent, f);
+                if let Some(a) = alternate { stmt(a, f); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                stmt(block, f);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { expr(p, f); }
+                    stmt(&mut h.body, f);
+                }
+                if let Some(fin) = finalizer { stmt(fin, f); }
+            }
+            Stmt::ThrowStatement { argument } => expr(argument, f),
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr(discriminant, f);
+                for c in cases {
+                    if let Some(t) = &mut c.test { expr(t, f); }
+                    for x in &mut c.consequent { stmt(x, f); }
+                }
+            }
+            Stmt::WhileStatement { test, body } => { expr(test, f); stmt(body, f); }
+            Stmt::DoWhileStatement { test, body } => { expr(test, f); stmt(body, f); }
+            Stmt::ForStatement { init, test, update, body } => {
+                stmt(init, f);
+                expr(test, f);
+                expr(update, f);
+                stmt(body, f);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt(left, f);
+                expr(right, f);
+                stmt(body, f);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { expr(i, f); }
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { expr(a, f); }
+            }
+        }
+    }
+    fn expr(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+        f(e);
+        match e {
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            Expr::TemplateLiteral { quasis: _, expressions } => {
+                for x in expressions { expr(x, f); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                expr(callee, f);
+                for a in arguments { expr(a, f); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                expr(object, f);
+                expr(property, f);
+            }
+            Expr::AwaitExpression { argument } => expr(argument, f),
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params { expr(p, f); }
+                match body {
+                    ArrowBody::Expr(x) => expr(x, f),
+                    ArrowBody::Block(b) => stmt(b, f),
+                }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties {
+                    expr(&mut p.key, f);
+                    expr(&mut p.value, f);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { expr(el, f); }
+            }
+            Expr::SpreadElement { argument } => expr(argument, f),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                expr(left, f);
+                expr(right, f);
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                expr(test, f);
+                expr(consequent, f);
+                expr(alternate, f);
+            }
+            Expr::UnaryExpression { argument, .. } => expr(argument, f),
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions { expr(x, f); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                expr(callee, f);
+                for a in arguments { expr(a, f); }
+            }
+        }
+    }
+    for s in &mut prog.body {
+        stmt(s, f);
+    }
+}
+
+/// Does the subtree contain an AwaitExpression?
+pub(crate) fn has_await_expr(e: &Expr) -> bool {
+    match e {
+        Expr::AwaitExpression { .. } => true,
+        Expr::Identifier { .. } | Expr::Literal { .. } => false,
+        Expr::TemplateLiteral { expressions, .. } => expressions.iter().any(has_await_expr),
+        Expr::CallExpression { callee, arguments, .. } => {
+            has_await_expr(callee) || arguments.iter().any(has_await_expr)
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            has_await_expr(object) || has_await_expr(property)
+        }
+        Expr::ArrowFunctionExpression { body, .. } => match body {
+            ArrowBody::Expr(x) => has_await_expr(x),
+            ArrowBody::Block(b) => has_await_stmt(b),
+        },
+        Expr::FunctionExpression { body, .. } => has_await_stmt(body),
+        Expr::ObjectExpression { properties } => properties.iter().any(|p| {
+            has_await_expr(&p.value) || (p.computed && has_await_expr(&p.key))
+        }),
+        Expr::ArrayExpression { elements } => elements.iter().flatten().any(has_await_expr),
+        Expr::SpreadElement { argument } => has_await_expr(argument),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. }
+        | Expr::AssignmentExpression { left, right, .. } => {
+            has_await_expr(left) || has_await_expr(right)
+        }
+        Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+            has_await_expr(test) || has_await_expr(consequent) || has_await_expr(alternate)
+        }
+        Expr::UnaryExpression { argument, .. } => has_await_expr(argument),
+        Expr::SequenceExpression { expressions } => expressions.iter().any(has_await_expr),
+        Expr::NewExpression { callee, arguments, .. } => {
+            has_await_expr(callee) || arguments.iter().any(has_await_expr)
+        }
+    }
+}
+
+pub(crate) fn has_await_stmt(s: &Stmt) -> bool {
+    match s {
+        Stmt::ExpressionStatement { expression } => has_await_expr(expression),
+        Stmt::BlockStatement { body } => body.iter().any(has_await_stmt),
+        Stmt::IfStatement { test, consequent, alternate } => {
+            has_await_expr(test)
+                || has_await_stmt(consequent)
+                || alternate.as_ref().map(|a| has_await_stmt(a)).unwrap_or(false)
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            has_await_stmt(block)
+                || handler.as_ref().map(|h| has_await_stmt(&h.body)).unwrap_or(false)
+                || finalizer.as_ref().map(|f| has_await_stmt(f)).unwrap_or(false)
+        }
+        Stmt::ThrowStatement { argument } => has_await_expr(argument),
+        Stmt::SwitchStatement { discriminant, cases } => {
+            has_await_expr(discriminant)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().map(has_await_expr).unwrap_or(false)
+                        || c.consequent.iter().any(has_await_stmt)
+                })
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            has_await_expr(test) || has_await_stmt(body)
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            has_await_stmt(init) || has_await_expr(test) || has_await_expr(update) || has_await_stmt(body)
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            has_await_stmt(left) || has_await_expr(right) || has_await_stmt(body)
+        }
+        Stmt::FunctionDeclaration { body, .. } => has_await_stmt(body),
+        Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
+            d.init.as_ref().map(has_await_expr).unwrap_or(false)
+        }),
+        Stmt::ReturnStatement { argument } => argument.as_ref().map(has_await_expr).unwrap_or(false),
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => false,
+    }
+}
+
+/// estree.js `markAsyncOnAwait` — a function whose body contains an
+/// AwaitExpression must be `async` (a non-async function with `await`
+/// inside is a SyntaxError).
+pub(crate) fn mark_async_on_await(mut prog: Program) -> Program {
+    fn mark_expr(e: &mut Expr) {
+        if let Expr::ArrowFunctionExpression { body, r#async, .. } = e {
+            let has = match body {
+                ArrowBody::Expr(x) => has_await_expr(x),
+                ArrowBody::Block(b) => has_await_stmt(b),
+            };
+            if has { *r#async = true; }
+        }
+    }
+    visit_exprs(&mut prog, &mut mark_expr);
+    prog
+}
+
+/// estree.js `stripProcessEnv` — `process.env.<name>` and the
+/// `process.env` member itself become the runtime's env accessor
+/// (`sh2.env` — the sh2runtime's contract; the accessor names are the
+/// environment config). Ported verbatim: branch 1 rewrites `process.env`
+/// (object=process, property=env) to `sh2.env`; branch 2 rewrites the
+/// inner `process.env` of `process.env.X`.
+pub(crate) fn strip_process_env(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::MemberExpression { object, property, .. } = e {
+            // branch 1: `process.env` itself → `sh2.env`
+            if is_ident(property, "env") && is_ident(object, "process") {
+                **object = Expr::Identifier { name: "sh2".to_string() };
+                return;
+            }
+            // branch 2: `process.env.X` → `sh2.env.X` (rewrite the inner)
+            if let Expr::MemberExpression { object: inner, property: inner_prop, .. } = &mut **object {
+                if is_ident(inner_prop, "env") && is_ident(inner, "process") {
+                    **inner = Expr::Identifier { name: "sh2".to_string() };
+                }
+            }
+        }
+    }
+    visit_exprs(&mut prog, &mut rewrite);
+    prog
+}
+
+/// estree.js `awaitSyncFnCalls` — the otranspilerl estree emits the
+/// PROVABLY-SYNC `sh2.fnCall(...)` form; a callee body containing a
+/// capture/whileLoop IS async, so the un-awaited call detaches. Await
+/// every `sh2.fnCall` not already inside an AwaitExpression (a no-op on
+/// a sync value, a correct sequencing fix on a promise). Also rewrites
+/// non-sync-table `sh2.builtin` calls to the async `sh2.exec` bridge.
+pub(crate) fn await_sync_fn_calls(mut prog: Program) -> Program {
+    // the JS-side SYNC_BUILTINS table (estree.js) — NOT the wider
+    // shir.rs table: the identity with the JS pipeline requires this list.
+    const JS_SYNC_BUILTINS: &[&str] = &[
+        "echo", "printf", "true", "false", "date", "pwd", "cat", "cd", "export", "ls", "test",
+    ];
+    fn sync_twin(name: &str) -> bool {
+        matches!(name,
+            "captureSync" | "redirectSync" | "pipelineSync" | "subshellSync"
+            | "blockSync" | "whileLoopSync" | "forLoopSync" | "cstyleForSync")
+    }
+    fn is_sh2_call(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::CallExpression { callee, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, .. }
+                if is_ident(object, "sh2") && is_ident(property, name)))
+    }
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite_expr(e: &mut Expr, in_await: bool, in_sync: bool) {
+        // the JS recurses into arrays first (bottom-up); the visitor is
+        // top-down — replicate by recursing the children HERE (except the
+        // wrapped cases) so the order matches the JS rebuild semantics.
+        match e {
+            Expr::AwaitExpression { argument } => {
+                rewrite_expr(argument, true, in_sync);
+                return;
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                // a *Sync twin's body arrow was PROVEN await-free — keep
+                // its fnCalls un-awaited (the sync twin would throw)
+                if let Expr::MemberExpression { object, property, .. } = &**callee {
+                    if is_ident(object, "sh2") {
+                        if let Expr::Identifier { name } = &**property {
+                            if sync_twin(name) {
+                                for a in arguments.iter_mut() {
+                                    rewrite_expr(a, false, true);
+                                }
+                                return;
+                            }
+                            if name == "fnCall" && !in_await && !in_sync {
+                                for a in arguments.iter_mut() {
+                                    rewrite_expr(a, false, in_sync);
+                                }
+                                let args = std::mem::take(arguments);
+                                *e = Expr::AwaitExpression {
+                                    argument: Box::new(Expr::CallExpression {
+                                        callee: callee.clone(),
+                                        arguments: args,
+                                        optional: false,
+                                    }),
+                                };
+                                return;
+                            }
+                            if name == "builtin" && !in_await {
+                                let rewired = arguments
+                                    .iter_mut()
+                                    .map(|a| { rewrite_expr(a, false, in_sync); a.clone() })
+                                    .collect::<Vec<_>>();
+                                if let Some(Expr::Literal { value, .. }) = rewired.first() {
+                                    if let Some(s) = value.as_str() {
+                                        if !JS_SYNC_BUILTINS.contains(&s) {
+                                            let arg0 = Expr::Literal { value: serde_json::json!(s), raw: None, regex: None };
+                                            let arg1 = if rewired.len() > 1 {
+                                                rewired[1].clone()
+                                            } else {
+                                                Expr::ArrayExpression { elements: vec![] }
+                                            };
+                                            *e = Expr::AwaitExpression {
+                                                argument: Box::new(Expr::CallExpression {
+                                                    callee: Box::new(Expr::MemberExpression {
+                                                        object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                                                        property: Box::new(Expr::Identifier { name: "exec".to_string() }),
+                                                        computed: false,
+                                                        optional: false,
+                                                    }),
+                                                    arguments: vec![arg0, arg1],
+                                                    optional: false,
+                                                }),
+                                            };
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for a in arguments.iter_mut() {
+                    rewrite_expr(a, false, in_sync);
+                }
+                rewrite_expr(callee, false, in_sync);
+                return;
+            }
+            _ => {}
+        }
+        // generic children — the JS recurses EVERY child with
+        // inAwait=false (only an AwaitExpression's own argument keeps
+        // inAwait=true); the Call/Await arms of rewrite_expr handle their
+        // own recursion before wrapping.
+        fn visit_children(e: &mut Expr, f: &mut dyn FnMut(&mut Expr, bool, bool)) {
+            match e {
+                Expr::CallExpression { callee, arguments, .. } => {
+                    f(callee, false, false);
+                    for a in arguments { f(a, false, false); }
+                }
+                Expr::AwaitExpression { argument } => f(argument, false, false),
+                Expr::FunctionExpression { params, body, .. } => {
+                    for p in params { f(p, false, false); }
+                    visit_stmt(body, f);
+                }
+                Expr::TemplateLiteral { expressions, .. } => {
+                    for x in expressions { f(x, false, false); }
+                }
+                Expr::MemberExpression { object, property, .. } => {
+                    f(object, false, false);
+                    f(property, false, false);
+                }
+                Expr::ArrowFunctionExpression { params, body, .. } => {
+                    for p in params { f(p, false, false); }
+                    match body {
+                        ArrowBody::Expr(x) => f(x, false, false),
+                        ArrowBody::Block(b) => visit_stmt(b, f),
+                    }
+                }
+                Expr::ObjectExpression { properties } => {
+                    for p in properties { f(&mut p.key, false, false); f(&mut p.value, false, false); }
+                }
+                Expr::ArrayExpression { elements } => {
+                    for el in elements.iter_mut().flatten() { f(el, false, false); }
+                }
+                Expr::SpreadElement { argument } => f(argument, false, false),
+                Expr::LogicalExpression { left, right, .. }
+                | Expr::BinaryExpression { left, right, .. }
+                | Expr::AssignmentExpression { left, right, .. } => {
+                    f(left, false, false);
+                    f(right, false, false);
+                }
+                Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                    f(test, false, false);
+                    f(consequent, false, false);
+                    f(alternate, false, false);
+                }
+                Expr::UnaryExpression { argument, .. } => f(argument, false, false),
+                Expr::SequenceExpression { expressions } => {
+                    for x in expressions { f(x, false, false); }
+                }
+                Expr::NewExpression { callee, arguments, .. } => {
+                    f(callee, false, false);
+                    for a in arguments { f(a, false, false); }
+                }
+                Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            }
+        }
+        // the in-await flag resets for each child (the JS passes false)
+        visit_children(e, &mut |c, _, _| rewrite_expr(c, false, in_sync));
+    }
+    fn visit_stmt(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr, bool, bool)) {
+        match s {
+            Stmt::ExpressionStatement { expression } => f(expression, false, false),
+            Stmt::BlockStatement { body } => { for x in body { visit_stmt(x, f); } }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                f(test, false, false);
+                visit_stmt(consequent, f);
+                if let Some(a) = alternate { visit_stmt(a, f); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                visit_stmt(block, f);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { f(p, false, false); }
+                    visit_stmt(&mut h.body, f);
+                }
+                if let Some(fin) = finalizer { visit_stmt(fin, f); }
+            }
+            Stmt::ThrowStatement { argument } => f(argument, false, false),
+            Stmt::SwitchStatement { discriminant, cases } => {
+                f(discriminant, false, false);
+                for c in cases {
+                    if let Some(t) = &mut c.test { f(t, false, false); }
+                    for x in &mut c.consequent { visit_stmt(x, f); }
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                f(test, false, false);
+                visit_stmt(body, f);
+            }
+            Stmt::ForStatement { init, test, update, body } => {
+                visit_stmt(init, f);
+                f(test, false, false);
+                f(update, false, false);
+                visit_stmt(body, f);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                visit_stmt(left, f);
+                f(right, false, false);
+                visit_stmt(body, f);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { f(p, false, false); }
+                visit_stmt(body, f);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { f(i, false, false); }
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { f(a, false, false); }
+            }
+        }
+    }
+    // the JS rebuilds bottom-up — replicate by recursing before the wrap
+    // decisions; the code above handles the wrapping after the recursion.
+    for s in &mut prog.body {
+        visit_stmt(s, &mut |e, in_a, in_s| rewrite_expr(e, in_a, in_s));
+    }
+    prog
+}
+
+/// estree.js `forceAsyncFileRedirects` — the runtime's `redirectSync`
+/// twin only handles fd-dup (`&N`) targets; a file/device target must go
+/// through the async `sh2.redirect` (wrapped in await).
+pub(crate) fn force_async_file_redirects(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::CallExpression { callee, arguments, optional } = e {
+            if let Expr::MemberExpression { object, property, .. } = &**callee {
+                if is_ident(object, "sh2") {
+                    if let Expr::Identifier { name } = &**property {
+                        if name == "redirectSync" && arguments.len() == 2 {
+                            let mut file_target = false;
+                            if let Expr::ArrayExpression { elements } = &arguments[1] {
+                                for el in elements {
+                                    if let Some(Expr::ObjectExpression { properties }) = el {
+                                        for p in properties {
+                                            let k = match &p.key {
+                                                Expr::Identifier { name } => name.as_str(),
+                                                Expr::Literal { value, .. } => value.as_str().unwrap_or(""),
+                                                _ => "",
+                                            };
+                                            if k != "target" { continue; }
+                                            let lit = match &p.value {
+                                                Expr::TemplateLiteral { expressions, quasis } if expressions.is_empty() && quasis.len() == 1 => {
+                                                    quasis[0].value.cooked.clone()
+                                                }
+                                                Expr::Literal { value, .. } => value.as_str().map(|s| s.to_string()),
+                                                _ => None,
+                                            };
+                                            if lit.as_deref().map(|s| !s.starts_with('&')).unwrap_or(true) {
+                                                file_target = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if file_target {
+                                let call = Expr::CallExpression {
+                                    callee: Box::new(Expr::MemberExpression {
+                                        object: object.clone(),
+                                        property: Box::new(Expr::Identifier { name: "redirect".to_string() }),
+                                        computed: false,
+                                        optional: false,
+                                    }),
+                                    arguments: arguments.clone(),
+                                    optional: *optional,
+                                };
+                                *e = Expr::AwaitExpression { argument: Box::new(call) };
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    visit_exprs(&mut prog, &mut rewrite);
+    prog
+}
+
+
+/// The compile pipeline's moved PREFIX — the first four estreeToJs
+/// passes, in the global order (the JS side starts at #5
+/// awaitAsyncDirectCalls). The env-coupled passes (#1 stripProcessEnv,
+/// #3 forceAsyncFileRedirects) use the default sh2runtime contract; the
+/// environment config (devices/fs-bridge/stdout/env-accessor) parameterizes
+/// them when the full env layer moves (see PLAN-wasm-estree-pipeline.md).
+/// Post-order visitor (children first, then the callback) — the Rust
+/// twin of the JS rebuild passes (`{...node, ...}` bottom-up): a parent's
+/// rewrite decision must see its already-rewritten children, and a node
+/// replaced by its own rewrite is never revisited (no double-wrap).
+pub(crate) fn visit_exprs_post(prog: &mut Program, f: &mut dyn FnMut(&mut Expr)) {
+    fn stmt(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
+        match s {
+            Stmt::ExpressionStatement { expression } => expr(expression, f),
+            Stmt::BlockStatement { body } => { for x in body { stmt(x, f); } }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                expr(test, f);
+                stmt(consequent, f);
+                if let Some(a) = alternate { stmt(a, f); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                stmt(block, f);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { expr(p, f); }
+                    stmt(&mut h.body, f);
+                }
+                if let Some(fin) = finalizer { stmt(fin, f); }
+            }
+            Stmt::ThrowStatement { argument } => expr(argument, f),
+            Stmt::SwitchStatement { discriminant, cases } => {
+                expr(discriminant, f);
+                for c in cases {
+                    if let Some(t) = &mut c.test { expr(t, f); }
+                    for x in &mut c.consequent { stmt(x, f); }
+                }
+            }
+            Stmt::WhileStatement { test, body } => { expr(test, f); stmt(body, f); }
+            Stmt::DoWhileStatement { test, body } => { expr(test, f); stmt(body, f); }
+            Stmt::ForStatement { init, test, update, body } => {
+                stmt(init, f);
+                expr(test, f);
+                expr(update, f);
+                stmt(body, f);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                stmt(left, f);
+                expr(right, f);
+                stmt(body, f);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { expr(i, f); }
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { expr(a, f); }
+            }
+        }
+    }
+    fn expr(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+        match e {
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+            Expr::TemplateLiteral { quasis: _, expressions } => {
+                for x in expressions { expr(x, f); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                expr(callee, f);
+                for a in arguments { expr(a, f); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                expr(object, f);
+                expr(property, f);
+            }
+            Expr::AwaitExpression { argument } => expr(argument, f),
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params { expr(p, f); }
+                match body {
+                    ArrowBody::Expr(x) => expr(x, f),
+                    ArrowBody::Block(b) => stmt(b, f),
+                }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params { expr(p, f); }
+                stmt(body, f);
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties {
+                    expr(&mut p.key, f);
+                    expr(&mut p.value, f);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { expr(el, f); }
+            }
+            Expr::SpreadElement { argument } => expr(argument, f),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                expr(left, f);
+                expr(right, f);
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                expr(test, f);
+                expr(consequent, f);
+                expr(alternate, f);
+            }
+            Expr::UnaryExpression { argument, .. } => expr(argument, f),
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions { expr(x, f); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                expr(callee, f);
+                for a in arguments { expr(a, f); }
+            }
+        }
+        f(e);
+    }
+    for s in &mut prog.body {
+        stmt(s, f);
+    }
+}
+
+/// estree.js `awaitAsyncDirectCalls` — the async-direct fn set + the
+/// `sh2.callDirect` await wrap (post-order — a wrapped call is never
+/// revisited).
+pub(crate) fn await_async_direct_calls(mut prog: Program) -> Program {
+    let mut async_direct: std::collections::HashSet<String> = Default::default();
+    visit_exprs(&mut prog, &mut |e| {
+        if let Expr::AssignmentExpression { operator, left, right, .. } = e {
+            if operator == "=" {
+                if let Expr::Identifier { name } = &**left {
+                    if name.starts_with("__fn_") {
+                        if let Expr::ArrowFunctionExpression { r#async: true, .. } = &**right {
+                            async_direct.insert(name[5..].to_string());
+                        }
+                    }
+                }
+            }
+        }
+    });
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    visit_exprs_post(&mut prog, &mut |e| {
+        if let Expr::CallExpression { callee, arguments, .. } = e {
+            if let Expr::MemberExpression { object, property, .. } = &**callee {
+                if is_ident(object, "sh2") && is_ident(property, "callDirect") {
+                    if let Some(Expr::Literal { value, .. }) = arguments.first() {
+                        if let Some(s) = value.as_str() {
+                            if async_direct.contains(s) {
+                                let mut call = Expr::Identifier { name: "__ph".to_string() };
+                                std::mem::swap(e, &mut call);
+                                *e = Expr::AwaitExpression { argument: Box::new(call) };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    prog
+}
+
+// ── the estreeToJs head passes, part 2: #6 normalizeFunctions, #7
+// unwrapStoreString, #8 nullSentinel (ported from estree.js) ──────────
+
+/// estree.js `unwrapStoreString` — the C frontend's assign lowering wraps
+/// every rhs store read in `String(sh2.vars.x)`; a BOXED pointer would
+/// stringify to "[object Object]". Rewrite `String(sh2.vars.x)` (and the
+/// `?? (sh2.env.x ?? "")` fallback chain) to the read value itself.
+pub(crate) fn unwrap_store_string(mut prog: Program) -> Program {
+    fn is_store_read(e: &Expr) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                if matches!(&**o, Expr::Identifier { name } if name == "sh2")
+                    && matches!(&**p, Expr::Identifier { name } if name == "vars"))
+                && matches!(&**property, Expr::Identifier { .. }))
+    }
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::CallExpression { callee, arguments, .. } = e {
+            if is_ident(callee, "String") && arguments.len() == 1 {
+                let a = &arguments[0];
+                let matches = match a {
+                    Expr::LogicalExpression { operator, left, .. } if operator == "??" => {
+                        is_store_read(left)
+                    }
+                    _ => false,
+                };
+                if matches {
+                    let a2 = arguments[0].clone();
+                    *e = a2;
+                    return;
+                }
+            }
+        }
+    }
+    visit_exprs_post(&mut prog, &mut rewrite);
+    prog
+}
+
+/// estree.js `nullSentinel` — a C pointer NULL check renders as
+/// `String(p) !== ""`, but a chain tail stores the literal "0" (the
+/// frontend seeds `p = 0`), so the comparison must treat "0" as NULL
+/// too: `String(p) !== "" && String(p) !== "0"` / the `==` twin.
+pub(crate) fn null_sentinel(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn rewrite(e: &mut Expr) {
+        if let Expr::BinaryExpression { operator, left, right, .. } = e {
+            if (operator == "!==" || operator == "==")
+                && matches!(&**right, Expr::Literal { value, .. } if value == "")
+                && matches!(&**left, Expr::CallExpression { callee, .. } if is_ident(callee, "String"))
+            {
+                let is_ne = operator == "!==";
+                let op = if is_ne { "&&" } else { "||" };
+                let mk = |v: &str| Expr::BinaryExpression {
+                    operator: operator.clone(),
+                    left: (*left).clone(),
+                    right: Box::new(Expr::Literal {
+                        value: if v == "" { serde_json::json!("") } else { serde_json::json!("0") },
+                        raw: None,
+                        regex: None,
+                    }),
+                };
+                *e = Expr::LogicalExpression {
+                    operator: op.to_string(),
+                    left: Box::new(mk("")),
+                    right: Box::new(mk("0")),
+                };
+                return;
+            }
+        }
+    }
+    visit_exprs_post(&mut prog, &mut rewrite);
+    prog
+}
+
+// ── #6 normalizeFunctions ────────────────────────────────────────────
+// estree.js `normalizeFunctions`: converts `sh2.functions.set("x",
+// arrow)` registrations (the C frontend's param protocol) into plain
+// `function x(...)` declarations + an adapter arrow, rewrites the body's
+// store access to the native parameters/locals, and strips the moved
+// names from the top-level `let`.
+
+pub(crate) fn normalize_functions(mut prog: Program) -> Program {
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn is_sh2_member(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if is_ident(object, "sh2") && is_ident(property, name))
+    }
+    fn is_functions_set_callee(e: &Expr) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                if is_ident(o, "sh2") && is_ident(p, "functions"))
+                && is_ident(property, "set"))
+    }
+    fn is_sh2_vars(e: &Expr) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                if is_ident(o, "sh2") && is_ident(p, "vars"))
+                && matches!(&**property, Expr::Identifier { .. }))
+    }
+    fn lit_str(e: &Expr) -> Option<&str> {
+        match e {
+            Expr::Literal { value, .. } => value.as_str(),
+            _ => None,
+        }
+    }
+    fn lit_string(e: &Expr) -> Option<String> {
+        lit_str(e).map(|s| s.to_string())
+    }
+    fn is_sh2_positional_read(e: &Expr) -> Option<i64> {
+        // `sh2.positional[N]` (computed literal index)
+        match e {
+            Expr::MemberExpression { object, property, computed: true, .. } => {
+                if is_sh2_member(object, "positional") {
+                    if let Expr::Literal { value, .. } = &**property {
+                        if let Some(n) = value.as_i64() { return Some(n); }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    fn is_store_name_target(e: &Expr) -> Option<String> {
+        // `sh2.vars.X` → the identifier name (as an assignment LEFT)
+        match e {
+            Expr::MemberExpression { object, property, computed: false, .. } => {
+                if matches!(&**object, Expr::MemberExpression { object: o, property: p, computed: false, .. }
+                    if is_ident(o, "sh2") && is_ident(p, "vars"))
+                {
+                    if let Expr::Identifier { name } = &**property {
+                        return Some(name.clone());
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    struct Reg {
+        fn_name: String,
+        direct: bool,
+        // for the direct form: the stmt index in new_body + the arrow
+        arrow: Expr,
+        // for the sequence form: the sequence expression index
+        seq_idx: usize,
+    }
+
+    // 1. locate the registrations
+    let mut registrations: Vec<Reg> = Vec::new();
+    let mut new_body: Vec<Stmt> = Vec::with_capacity(prog.body.len());
+    for st in std::mem::take(&mut prog.body) {
+        if let Stmt::ExpressionStatement { expression } = &st {
+            let e = expression;
+            // direct form: sh2.functions.set("x", arrow)
+            if let Expr::CallExpression { callee, arguments, .. } = e {
+                if is_functions_set_callee(callee)
+                    && arguments.len() >= 2
+                    && matches!(&arguments[0], Expr::Literal { .. })
+                    && matches!(&arguments[1], Expr::ArrowFunctionExpression { .. })
+                {
+                    if let Some(name) = lit_string(&arguments[0]) {
+                        registrations.push(Reg {
+                            fn_name: name,
+                            direct: true,
+                            arrow: arguments[1].clone(),
+                            seq_idx: usize::MAX,
+                        });
+                        new_body.push(st);
+                        continue;
+                    }
+                }
+            }
+            // sequence form: (__fn_x = arrow, set("x", __fn_x), true)
+            if let Expr::SequenceExpression { expressions } = e {
+                let mut arrow: Option<Expr> = None;
+                let mut fn_name: Option<String> = None;
+                let mut seq_idx = usize::MAX;
+                for (i, x) in expressions.iter().enumerate() {
+                    if let Expr::AssignmentExpression { operator, left, right, .. } = x {
+                        if operator == "="
+                            && matches!(&**left, Expr::Identifier { name } if name.starts_with("__fn_"))
+                            && matches!(&**right, Expr::ArrowFunctionExpression { .. })
+                        {
+                            arrow = Some((**right).clone());
+                            seq_idx = i;
+                        }
+                    }
+                    if let Expr::CallExpression { callee, arguments, .. } = x {
+                        if is_functions_set_callee(callee)
+                            && !arguments.is_empty()
+                            && matches!(&arguments[0], Expr::Literal { .. })
+                        {
+                            fn_name = lit_string(&arguments[0]);
+                        }
+                    }
+                }
+                if arrow.is_some() && fn_name.is_some() {
+                    registrations.push(Reg {
+                        fn_name: fn_name.unwrap(),
+                        direct: false,
+                        arrow: arrow.unwrap(),
+                        seq_idx,
+                    });
+                }
+            }
+        }
+        new_body.push(st);
+    }
+    if registrations.is_empty() {
+        prog.body = new_body;
+        return prog;
+    }
+    let mut out_body: Vec<Stmt> = new_body;
+
+    // 2. the usage analysis (walkUsage): sh2.vars.X owners + the
+    //    runtime-by-name getLine/getVar string names
+    let mut usage: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        Default::default();
+    let mut runtime_by_name: std::collections::HashSet<String> = Default::default();
+    {
+        fn walk_usage(
+            node: &Expr,
+            owner: &str,
+            usage: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+            runtime_by_name: &mut std::collections::HashSet<String>,
+        ) {
+            match node {
+                Expr::Identifier { .. } | Expr::Literal { .. } => {}
+                Expr::TemplateLiteral { expressions, .. } => {
+                    for x in expressions { walk_usage(x, owner, usage, runtime_by_name); }
+                }
+                Expr::CallExpression { callee, arguments, .. } => {
+                    if let Expr::MemberExpression { object, property, .. } = &**callee {
+                        if is_ident(object, "sh2") {
+                            if let Expr::Identifier { name } = &**property {
+                                if (name == "getLine" || name == "getVar") && !arguments.is_empty() {
+                                    if let Some(s) = lit_str(&arguments[0]) {
+                                        if !s.is_empty()
+                                            && s.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+                                            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                        {
+                                            runtime_by_name.insert(s.to_string());
+                                        }
+                                    }
+                                    if let Expr::TemplateLiteral { quasis, .. } = &arguments[0] {
+                                        if let Some(head) = quasis.first().and_then(|q| q.value.cooked.clone()) {
+                                            let mut chars = head.chars();
+                                            let first = chars.next();
+                                            let rest = chars.as_str();
+                                            if first.map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+                                                && head.ends_with('[')
+                                            {
+                                                let nm = head.trim_end_matches('[').to_string();
+                                                if nm.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                                                    runtime_by_name.insert(nm);
+                                                }
+                                            }
+                                            let _ = rest;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    walk_usage(callee, owner, usage, runtime_by_name);
+                    for a in arguments { walk_usage(a, owner, usage, runtime_by_name); }
+                }
+                Expr::MemberExpression { object, property, .. } => {
+                    if is_sh2_vars(node) {
+                        if let Expr::Identifier { name } = &**property {
+                            usage.entry(name.clone()).or_default().insert(owner.to_string());
+                        }
+                    }
+                    walk_usage(object, owner, usage, runtime_by_name);
+                    walk_usage(property, owner, usage, runtime_by_name);
+                }
+                Expr::AwaitExpression { argument } => walk_usage(argument, owner, usage, runtime_by_name),
+                Expr::FunctionExpression { params, body, .. } => {
+                    for p in params { walk_usage(p, owner, usage, runtime_by_name); }
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Expr::ArrowFunctionExpression { params, body, .. } => {
+                    for p in params { walk_usage(p, owner, usage, runtime_by_name); }
+                    match body {
+                        ArrowBody::Expr(x) => walk_usage(x, owner, usage, runtime_by_name),
+                        ArrowBody::Block(b) => walk_usage_stmt(b, owner, usage, runtime_by_name),
+                    }
+                }
+                Expr::ObjectExpression { properties } => {
+                    for p in properties {
+                        walk_usage(&p.key, owner, usage, runtime_by_name);
+                        walk_usage(&p.value, owner, usage, runtime_by_name);
+                    }
+                }
+                Expr::ArrayExpression { elements } => {
+                    for el in elements.iter().flatten() { walk_usage(el, owner, usage, runtime_by_name); }
+                }
+                Expr::SpreadElement { argument } => walk_usage(argument, owner, usage, runtime_by_name),
+                Expr::LogicalExpression { left, right, .. }
+                | Expr::BinaryExpression { left, right, .. }
+                | Expr::AssignmentExpression { left, right, .. } => {
+                    walk_usage(left, owner, usage, runtime_by_name);
+                    walk_usage(right, owner, usage, runtime_by_name);
+                }
+                Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage(consequent, owner, usage, runtime_by_name);
+                    walk_usage(alternate, owner, usage, runtime_by_name);
+                }
+                Expr::UnaryExpression { argument, .. } => walk_usage(argument, owner, usage, runtime_by_name),
+                Expr::SequenceExpression { expressions } => {
+                    for x in expressions { walk_usage(x, owner, usage, runtime_by_name); }
+                }
+                Expr::NewExpression { callee, arguments, .. } => {
+                    walk_usage(callee, owner, usage, runtime_by_name);
+                    for a in arguments { walk_usage(a, owner, usage, runtime_by_name); }
+                }
+            }
+        }
+        fn walk_usage_stmt(
+            s: &Stmt,
+            owner: &str,
+            usage: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+            runtime_by_name: &mut std::collections::HashSet<String>,
+        ) {
+            match s {
+                Stmt::ExpressionStatement { expression } => walk_usage(expression, owner, usage, runtime_by_name),
+                Stmt::BlockStatement { body } => {
+                    for x in body { walk_usage_stmt(x, owner, usage, runtime_by_name); }
+                }
+                Stmt::IfStatement { test, consequent, alternate } => {
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage_stmt(consequent, owner, usage, runtime_by_name);
+                    if let Some(a) = alternate { walk_usage_stmt(a, owner, usage, runtime_by_name); }
+                }
+                Stmt::TryStatement { block, handler, finalizer } => {
+                    walk_usage_stmt(block, owner, usage, runtime_by_name);
+                    if let Some(h) = handler {
+                        if let Some(p) = &h.param { walk_usage(p, owner, usage, runtime_by_name); }
+                        walk_usage_stmt(&h.body, owner, usage, runtime_by_name);
+                    }
+                    if let Some(f) = finalizer { walk_usage_stmt(f, owner, usage, runtime_by_name); }
+                }
+                Stmt::ThrowStatement { argument } => walk_usage(argument, owner, usage, runtime_by_name),
+                Stmt::SwitchStatement { discriminant, cases } => {
+                    walk_usage(discriminant, owner, usage, runtime_by_name);
+                    for c in cases {
+                        if let Some(t) = &c.test { walk_usage(t, owner, usage, runtime_by_name); }
+                        for x in &c.consequent { walk_usage_stmt(x, owner, usage, runtime_by_name); }
+                    }
+                }
+                Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::ForStatement { init, test, update, body } => {
+                    walk_usage_stmt(init, owner, usage, runtime_by_name);
+                    walk_usage(test, owner, usage, runtime_by_name);
+                    walk_usage(update, owner, usage, runtime_by_name);
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::ForOfStatement { left, right, body } => {
+                    walk_usage_stmt(left, owner, usage, runtime_by_name);
+                    walk_usage(right, owner, usage, runtime_by_name);
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::FunctionDeclaration { params, body, .. } => {
+                    for p in params { walk_usage(p, owner, usage, runtime_by_name); }
+                    walk_usage_stmt(body, owner, usage, runtime_by_name);
+                }
+                Stmt::VariableDeclaration { declarations, .. } => {
+                    for d in declarations {
+                        if let Some(i) = &d.init { walk_usage(i, owner, usage, runtime_by_name); }
+                    }
+                }
+                Stmt::ReturnStatement { argument } => {
+                    if let Some(a) = argument { walk_usage(a, owner, usage, runtime_by_name); }
+                }
+                Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+            }
+        }
+        // the registration arrows are skipped for the "top" scan
+        for st in &out_body {
+            if let Stmt::ExpressionStatement { expression } = st {
+                walk_usage(expression, "top", &mut usage, &mut runtime_by_name);
+            }
+        }
+        for r in &registrations {
+            let arrow = r.arrow.clone();
+            walk_usage(&arrow, &r.fn_name, &mut usage, &mut runtime_by_name);
+        }
+    }
+
+    // 3. transform each registration (the param protocol + the rewrites)
+    struct Param { name: String, n: i64, cast: bool }
+    // the transform consumes r.arrow (it becomes a placeholder) — the
+    // step-4 let-strip needs the ORIGINAL arrows
+    let registration_arrows: Vec<Expr> = registrations.iter().map(|r| r.arrow.clone()).collect();
+    for r in &mut registrations {
+        let arrow = std::mem::replace(&mut r.arrow, Expr::Identifier { name: "__ph".into() });
+        let arrow_async = match &arrow {
+            Expr::ArrowFunctionExpression { r#async, .. } => *r#async,
+            _ => false,
+        };
+        let body = match arrow {
+            Expr::ArrowFunctionExpression { body, .. } => match body {
+                ArrowBody::Block(b) => *b,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let block = match body {
+            Stmt::BlockStatement { body } => body,
+            _ => continue,
+        };
+        // leading param bindings: `sh2.setVar("p", sh2.arith("$N"))` casts
+        // or `p = sh2.positional[N] ?? ""` (with the store-target or
+        // String-wrapped forms)
+        let mut params: Vec<Param> = Vec::new();
+        let mut idx = 0usize;
+        let mut consumed = 0usize;
+        while consumed < block.len() {
+            let s = &block[consumed];
+            let ok = match s {
+                Stmt::ExpressionStatement { expression } => {
+                    let a = expression;
+                    // cast: sh2.setVar("p", sh2.arith("$N"))
+                    let mut cast_done = false;
+                    if let Expr::CallExpression { callee, arguments, .. } = a {
+                        let arith_args: Option<&Vec<Expr>> = if is_sh2_member(callee, "setVar") && arguments.len() == 2
+                            && matches!(&arguments[0], Expr::Literal { .. })
+                        {
+                            match &arguments[1] {
+                                Expr::CallExpression { callee: c2, arguments: a2, .. }
+                                    if is_sh2_member(c2, "arith") && !a2.is_empty()
+                                        && matches!(&a2[0], Expr::Literal { .. }) =>
+                                    Some(a2),
+                                _ => None,
+                            }
+                        } else { None };
+                        if let Some(a2) = arith_args {
+                            let nm = lit_string(&arguments[0]).unwrap_or_default();
+                            if let Some(Expr::Literal { value, .. }) = a2.first() {
+                                if let Some(s) = value.as_str() {
+                                    let s2 = s.strip_prefix('$').unwrap_or(s);
+                                    if let Ok(n) = s2.parse::<i64>() {
+                                        if n >= 1 {
+                                            params.push(Param { name: nm, n: n - 1, cast: true });
+                                            consumed += 1;
+                                            cast_done = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if cast_done {
+                        true
+                    } else if let Expr::AssignmentExpression { operator, left, right, .. } = a {
+                        if operator != "=" { false } else {
+                            let name = match &**left {
+                                Expr::Identifier { name } => Some(name.clone()),
+                                l => is_store_name_target(l),
+                            };
+                            match name {
+                                None => false,
+                                Some(nm) => {
+                                    // unwrap a String(...) coercion
+                                    let inner = match &**right {
+                                        Expr::CallExpression { callee, arguments, .. }
+                                            if is_ident(callee, "String") && !arguments.is_empty() =>
+                                            Some(&arguments[0]),
+                                        _ => None,
+                                    };
+                                    let base = inner.unwrap_or(right);
+                                    let pos = match base {
+                                        Expr::LogicalExpression { operator, left, right: r2, .. }
+                                            if operator == "??" =>
+                                        {
+                                            if let Some(n) = is_sh2_positional_read(left) {
+                                                if matches!(&**r2, Expr::Literal { value, .. } if value == "") {
+                                                    Some(n)
+                                                } else { None }
+                                            } else { None }
+                                        }
+                                        _ => None,
+                                    };
+                                    match pos {
+                                        Some(n) => { params.push(Param { name: nm, n, cast: false }); consumed += 1; true }
+                                        None => false,
+                                    }
+                                }
+                            }
+                        }
+                    } else { false }
+                }
+                _ => false,
+            };
+            if !ok { break; }
+        }
+        idx = consumed;
+        if params.is_empty() { continue; } // not the C frontend's protocol
+        params.sort_by_key(|p| p.n);
+        let rest = block[idx..].to_vec();
+        let param_names: std::collections::HashSet<String> =
+            params.iter().map(|p| p.name.clone()).collect();
+        // function-locals: store vars used ONLY in this arrow, not
+        // runtime-written by name
+        let mut locals: std::collections::HashSet<String> = Default::default();
+        for (name, owners) in &usage {
+            if runtime_by_name.contains(name) { continue; }
+            if owners.len() == 1 && owners.contains(&r.fn_name) && !param_names.contains(name) {
+                locals.insert(name.clone());
+            }
+        }
+        for p in &params {
+            if p.cast { locals.insert(p.name.clone()); continue; }
+            if !runtime_by_name.contains(&p.name) { locals.insert(p.name.clone()); }
+        }
+        let param_by_pos: std::collections::HashMap<i64, String> = params
+            .iter()
+            .filter(|p| !p.cast)
+            .map(|p| (p.n, p.name.clone()))
+            .collect();
+        // `"$X"` / `"map[$X]"` — interpolate a param/local by name
+        fn interpolate_dollar_vars(
+            str_: &str,
+            param_names: &std::collections::HashSet<String>,
+            locals: &std::collections::HashSet<String>,
+            param_by_pos: &std::collections::HashMap<i64, String>,
+        ) -> Option<Expr> {
+            // manual scan for `$($|[A-Za-z_][A-Za-z0-9_]*|[1-9][0-9]*)`
+            let bytes = str_.as_bytes();
+            let mut segments: Vec<String> = Vec::new(); // text segments
+            let mut exprs: Vec<Expr> = Vec::new();
+            let mut last = 0usize;
+            let mut hit = false;
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i] != b'$' { i += 1; continue; }
+                let rest = &str_[i + 1..];
+                if rest.starts_with('$') { i += 2; continue; } // `$$`
+                let mut n = 0usize;
+                let c0 = rest.chars().next();
+                let is_ident = c0.map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false);
+                let is_digit = c0.map(|c| c.is_ascii_digit() && c != '0').unwrap_or(false);
+                if is_ident {
+                    n = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').count();
+                } else if is_digit {
+                    n = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+                }
+                if n == 0 { i += 1; continue; }
+                let nm = &rest[..n];
+                let resolved: Option<String> = if is_ident {
+                    if param_names.contains(nm) || locals.contains(nm) { Some(nm.to_string()) } else { None }
+                } else {
+                    match nm.parse::<i64>() {
+                        Ok(num) => param_by_pos.get(&(num - 1)).cloned(),
+                        Err(_) => None,
+                    }
+                };
+                if let Some(res) = resolved {
+                    hit = true;
+                    segments.push(str_[last..i].to_string());
+                    exprs.push(Expr::Identifier { name: res });
+                    i += 1 + n;
+                    last = i;
+                } else {
+                    i += 1;
+                }
+            }
+            if !hit { return None; }
+            segments.push(str_[last..].to_string());
+            let mut quasis: Vec<TemplateElement> = Vec::new();
+            for (k, t) in segments.iter().enumerate() {
+                quasis.push(TemplateElement {
+                    type_: "TemplateElement",
+                    value: TemplateElementValue { raw: t.clone(), cooked: Some(t.clone()) },
+                    tail: k == segments.len() - 1,
+                });
+            }
+            Some(Expr::TemplateLiteral { quasis, expressions: exprs })
+        }
+        // rewrite store access → native identifiers inside the body
+        let mut new_rest = rest;
+        {
+            let param_names = &param_names;
+            let locals = &locals;
+            let param_by_pos = &param_by_pos;
+            fn rewrite_expr(
+                e: &mut Expr,
+                param_names: &std::collections::HashSet<String>,
+                locals: &std::collections::HashSet<String>,
+                param_by_pos: &std::collections::HashMap<i64, String>,
+            ) {
+                visit_exprs_single(e, &mut |n| {
+                    // `$X` literal → the interpolated template
+                    if let Expr::Literal { value, .. } = n {
+                        if let Some(s) = value.as_str() {
+                            if let Some(tpl) = interpolate_dollar_vars(s, param_names, locals, param_by_pos) {
+                                *n = tpl;
+                                return;
+                            }
+                        }
+                    }
+                    // `sh2.positional[N] ?? ""` naming a param → the identifier
+                    let positional_name = |x: &Expr| -> Option<String> {
+                        if let Expr::LogicalExpression { operator, left, right, .. } = x {
+                            if operator == "??" {
+                                if let Some(pn) = is_sh2_positional_read(left) {
+                                    if matches!(&**right, Expr::Literal { value, .. } if value == "") {
+                                        return param_by_pos.get(&pn).cloned();
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    };
+                    let pos_wrap = match n {
+                        Expr::CallExpression { callee, arguments, .. }
+                            if is_ident(callee, "String") && !arguments.is_empty() =>
+                            Some(&arguments[0]),
+                        _ => None,
+                    };
+                    let pname = match pos_wrap {
+                        Some(inner) => positional_name(inner),
+                        None => positional_name(n),
+                    };
+                    if pname.is_some() {
+                        *n = Expr::Identifier { name: pname.unwrap() };
+                        return;
+                    }
+                    // sh2.vars.X → X (locals)
+                    if is_sh2_vars(n) {
+                        if let Expr::MemberExpression { property, .. } = n {
+                            if let Expr::Identifier { name } = &**property {
+                                if locals.contains(name) {
+                                    *n = Expr::Identifier { name: name.clone() };
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // sh2.vars.X ?? (process.env.X ?? "") → X
+                    if let Expr::LogicalExpression { operator, left, right, .. } = n {
+                        if operator == "??" && is_sh2_vars(left) {
+                            let lname = match &**left {
+                                Expr::MemberExpression { property, .. } => match &**property {
+                                    Expr::Identifier { name } => Some(name.clone()),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            if let Some(lname) = lname {
+                                if locals.contains(&lname) {
+                                    let env_chain = matches!(&**right, Expr::LogicalExpression { operator: o2, left: l2, .. }
+                                        if o2 == "??"
+                                            && matches!(&**l2, Expr::MemberExpression { object, property: p2, computed: false, .. }
+                                                if matches!(&**object, Expr::MemberExpression { object: o3, property: p3, computed: false, .. }
+                                                    if is_ident(o3, "process") && is_ident(p3, "env"))
+                                                    && matches!(&**p2, Expr::Identifier { .. })));
+                                    if env_chain {
+                                        *n = Expr::Identifier { name: lname };
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // sh2.vars.X = V → X = V
+                    if let Expr::AssignmentExpression { operator, left, right, .. } = n {
+                        if operator == "=" {
+                            if let Some(lname) = is_store_name_target(left) {
+                                if locals.contains(&lname) {
+                                    let r = (**right).clone();
+                                    *n = Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(Expr::Identifier { name: lname }),
+                                        right: Box::new(r),
+                                    };
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // sh2.setVar("X", V) → X = V (simple literal names)
+                    if let Expr::CallExpression { callee, arguments, .. } = n {
+                        if is_sh2_member(callee, "setVar") && arguments.len() == 2
+                            && matches!(&arguments[0], Expr::Literal { .. })
+                        {
+                            if let Some(lname) = lit_string(&arguments[0]) {
+                                if locals.contains(&lname) {
+                                    let r = arguments[1].clone();
+                                    *n = Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(Expr::Identifier { name: lname }),
+                                        right: Box::new(r),
+                                    };
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            // run the rewrite over the rest statements' exprs
+            let mut f = |e: &mut Expr| rewrite_expr(e, param_names, locals, param_by_pos);
+            for s in &mut new_rest {
+                visit_stmt_exprs(s, &mut f);
+            }
+        }
+        // build the plain function
+        let mut local_decls: Vec<&String> = locals.iter().filter(|n| !param_names.contains(*n)).collect();
+        local_decls.sort();
+        let mut param_store_prologue: Vec<Stmt> = Vec::new();
+        if !params.is_empty() {
+            let mut calls: Vec<Expr> = Vec::new();
+            for p in &params {
+                calls.push(Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                        property: Box::new(Expr::Identifier { name: "setVar".to_string() }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![
+                        Expr::Literal { value: serde_json::json!(p.name), raw: None, regex: None },
+                        Expr::Identifier { name: p.name.clone() },
+                    ],
+                    optional: false,
+                });
+            }
+            param_store_prologue.push(Stmt::ExpressionStatement {
+                expression: Expr::SequenceExpression { expressions: calls },
+            });
+        }
+        let mut fn_body: Vec<Stmt> = Vec::new();
+        if !local_decls.is_empty() {
+            fn_body.push(Stmt::VariableDeclaration {
+                declarations: local_decls
+                    .iter()
+                    .map(|n| VariableDeclarator {
+                        type_: "VariableDeclarator",
+                        id: Expr::Identifier { name: (*n).clone() },
+                        init: Some(Expr::Literal { value: serde_json::json!(""), raw: None, regex: None }),
+                    })
+                    .collect(),
+                kind: "let",
+            });
+        }
+        fn_body.extend(param_store_prologue);
+        fn_body.extend(new_rest);
+        let fn_block = Stmt::BlockStatement { body: fn_body };
+        let fn_async = arrow_async || has_await_stmt(&fn_block);
+        let fn_params: Vec<Expr> = params.iter().map(|p| Expr::Identifier { name: p.name.clone() }).collect();
+        // the adapter
+        let mut adapter_args: Vec<Expr> = Vec::new();
+        for p in &params {
+            let pos = Expr::MemberExpression {
+                object: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                    property: Box::new(Expr::Identifier { name: "positional".to_string() }),
+                    computed: false,
+                    optional: false,
+                }),
+                property: Box::new(Expr::Literal { value: serde_json::json!(p.n), raw: None, regex: None }),
+                computed: true,
+                optional: false,
+            };
+            if p.cast {
+                adapter_args.push(Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier { name: "Number".to_string() }),
+                    arguments: vec![pos],
+                    optional: false,
+                });
+            } else {
+                adapter_args.push(pos);
+            }
+        }
+        let adapter = Expr::ArrowFunctionExpression {
+            params: vec![],
+            body: ArrowBody::Expr(Box::new(Expr::CallExpression {
+                callee: Box::new(Expr::Identifier { name: r.fn_name.clone() }),
+                arguments: adapter_args,
+                optional: false,
+            })),
+            expression: true,
+            r#async: false,
+        };
+        let set_call = Expr::CallExpression {
+            callee: Box::new(Expr::MemberExpression {
+                object: Box::new(Expr::MemberExpression {
+                    object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                    property: Box::new(Expr::Identifier { name: "functions".to_string() }),
+                    computed: false,
+                    optional: false,
+                }),
+                property: Box::new(Expr::Identifier { name: "set".to_string() }),
+                computed: false,
+                optional: false,
+            }),
+            arguments: vec![
+                Expr::Literal { value: serde_json::json!(r.fn_name), raw: None, regex: None },
+                adapter,
+            ],
+            optional: false,
+        };
+        if r.direct {
+            // replace the registration stmt with the function declaration
+            // + the adapter registration — find it by the fn name
+            let fn_decl = Stmt::FunctionDeclaration {
+                id: Expr::Identifier { name: r.fn_name.clone() },
+                params: fn_params,
+                body: Box::new(fn_block),
+                generator: false,
+                expression: false,
+                r#async: fn_async,
+            };
+            for i in 0..out_body.len() {
+                if let Stmt::ExpressionStatement { expression } = &out_body[i] {
+                    let is_reg = matches!(expression, Expr::CallExpression { callee, arguments, .. }
+                        if is_functions_set_callee(callee)
+                            && !arguments.is_empty()
+                            && lit_string(&arguments[0]).as_deref() == Some(r.fn_name.as_str()));
+                    if is_reg {
+                        out_body[i] = fn_decl.clone();
+                        out_body.insert(
+                            i + 1,
+                            Stmt::ExpressionStatement { expression: set_call.clone() },
+                        );
+                        break;
+                    }
+                }
+            }
+        } else {
+            // sequence form: patch the assignment + the set call
+            for st in &mut out_body {
+                if let Stmt::ExpressionStatement { expression } = st {
+                    if let Expr::SequenceExpression { expressions } = expression {
+                        let mut fn_expr: Option<Expr> = None;
+                        for (k, x) in expressions.iter_mut().enumerate() {
+                            if k == r.seq_idx {
+                                if let Expr::AssignmentExpression { left, right, .. } = x {
+                                    let l = (**left).clone();
+                                    let block = fn_block.clone();
+                                    let params2 = fn_params.clone();
+                                    let async2 = fn_async;
+                                    let body = Stmt::BlockStatement { body: match block {
+                                        Stmt::BlockStatement { body } => body,
+                                        _ => unreachable!(),
+                                    } };
+                                    let fe = Expr::FunctionExpression {
+                                        id: Box::new(Expr::Identifier { name: r.fn_name.clone() }),
+                                        params: params2,
+                                        body: Box::new(body),
+                                        generator: false,
+                                        expression: false,
+                                        r#async: async2,
+                                    };
+                                    fn_expr = Some(fe.clone());
+                                    *x = Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(l),
+                                        right: Box::new(fe),
+                                    };
+                                }
+                            }
+                            if let Expr::CallExpression { callee, arguments, .. } = x {
+                                if is_functions_set_callee(callee)
+                                    && !arguments.is_empty()
+                                    && lit_string(&arguments[0]).as_deref() == Some(r.fn_name.as_str())
+                                {
+                                    *x = set_call.clone();
+                                }
+                            }
+                        }
+                        let _ = fn_expr;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. strip the moved param/local names from the top-level `let`
+    let mut moved: std::collections::HashSet<String> = Default::default();
+    for arrow in &registration_arrows {
+        if let Expr::ArrowFunctionExpression { body, .. } = arrow {
+            if let ArrowBody::Block(b) = body {
+                if let Stmt::BlockStatement { body: block } = &**b {
+                    let mut i = 0usize;
+                    while i < block.len() {
+                        let ok = match &block[i] {
+                            Stmt::ExpressionStatement { expression } => {
+                                matches!(expression, Expr::AssignmentExpression { operator, left, right, .. }
+                                    if operator == "="
+                                        && matches!(&**left, Expr::Identifier { .. })
+                                        && matches!(&**right, Expr::LogicalExpression { operator: o, left: l, .. }
+                                            if o == "??" && is_sh2_positional_read(l).is_some()))
+                            }
+                            _ => false,
+                        };
+                        if !ok { break; }
+                        if let Stmt::ExpressionStatement { expression } = &block[i] {
+                            if let Expr::AssignmentExpression { left, .. } = expression {
+                                if let Expr::Identifier { name } = &**left {
+                                    moved.insert(name.clone());
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+    if !moved.is_empty() {
+        let mut filtered: Vec<Stmt> = Vec::with_capacity(out_body.len());
+        for st in out_body {
+            if let Stmt::VariableDeclaration { declarations, kind } = st {
+                let kept: Vec<VariableDeclarator> = declarations
+                    .into_iter()
+                    .filter(|d| !matches!(&d.id, Expr::Identifier { name } if moved.contains(name)))
+                    .collect();
+                if !kept.is_empty() {
+                    filtered.push(Stmt::VariableDeclaration { declarations: kept, kind });
+                }
+            } else {
+                filtered.push(st);
+            }
+        }
+        prog.body = filtered;
+    } else {
+        prog.body = out_body;
+    }
+    prog
+}
+
+/// Visit every Expr in a single expression (pre-order, callback first).
+fn visit_exprs_single(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+    let mut stack: Vec<&mut Expr> = Vec::new();
+    stack.push(e);
+    while let Some(n) = stack.pop() {
+        f(n);
+        match n {
+            Expr::TemplateLiteral { expressions, .. } => {
+                for x in expressions.iter_mut() { stack.push(x); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                stack.push(callee);
+                for a in arguments.iter_mut() { stack.push(a); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                stack.push(object);
+                stack.push(property);
+            }
+            Expr::AwaitExpression { argument } => stack.push(argument),
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params.iter_mut() { stack.push(p); }
+                let mut v: Vec<&mut Expr> = Vec::new();
+                collect_stmt_exprs(body, &mut v);
+                stack.extend(v);
+            }
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params.iter_mut() { stack.push(p); }
+                match body {
+                    ArrowBody::Expr(x) => stack.push(x),
+                    ArrowBody::Block(b) => {
+                        let mut v: Vec<&mut Expr> = Vec::new();
+                        collect_stmt_exprs(b, &mut v);
+                        stack.extend(v);
+                    }
+                }
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties.iter_mut() {
+                    stack.push(&mut p.key);
+                    stack.push(&mut p.value);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { stack.push(el); }
+            }
+            Expr::SpreadElement { argument } => stack.push(argument),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                stack.push(test);
+                stack.push(consequent);
+                stack.push(alternate);
+            }
+            Expr::UnaryExpression { argument, .. } => stack.push(argument),
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions.iter_mut() { stack.push(x); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                stack.push(callee);
+                for a in arguments.iter_mut() { stack.push(a); }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+}
+
+fn collect_stmt_exprs<'a>(s: &'a mut Stmt, out: &mut Vec<&'a mut Expr>) {
+    match s {
+        Stmt::ExpressionStatement { expression } => out.push(expression),
+        Stmt::BlockStatement { body } => {
+            for x in body.iter_mut() { collect_stmt_exprs(x, out); }
+        }
+        Stmt::IfStatement { test, consequent, alternate } => {
+            out.push(test);
+            collect_stmt_exprs(consequent, out);
+            if let Some(a) = alternate { collect_stmt_exprs(a, out); }
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            collect_stmt_exprs(block, out);
+            if let Some(h) = handler {
+                if let Some(p) = &mut h.param { out.push(p); }
+                collect_stmt_exprs(&mut h.body, out);
+            }
+            if let Some(f) = finalizer { collect_stmt_exprs(f, out); }
+        }
+        Stmt::ThrowStatement { argument } => out.push(argument),
+        Stmt::SwitchStatement { discriminant, cases } => {
+            out.push(discriminant);
+            for c in cases.iter_mut() {
+                if let Some(t) = &mut c.test { out.push(t); }
+                for x in c.consequent.iter_mut() { collect_stmt_exprs(x, out); }
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            out.push(test);
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            collect_stmt_exprs(init, out);
+            out.push(test);
+            out.push(update);
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            collect_stmt_exprs(left, out);
+            out.push(right);
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            for p in params.iter_mut() { out.push(p); }
+            collect_stmt_exprs(body, out);
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations.iter_mut() {
+                if let Some(i) = &mut d.init { out.push(i); }
+            }
+        }
+        Stmt::ReturnStatement { argument } => {
+            if let Some(a) = argument { out.push(a); }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+fn visit_stmt_exprs(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
+    let mut v: Vec<&mut Expr> = Vec::new();
+    collect_stmt_exprs(s, &mut v);
+    for e in v {
+        visit_exprs_single(e, f);
+    }
+}
+
+
+/// estree.js `returnInLoop` — a `return V` inside a `sh2.*Loop` body
+/// arrow is a SyntaxError-adjacent semantic break (the return exits the
+/// arrow, not the function) — rewrite to `throw new
+/// sh2.ReturnSignal(V)`; the runtime's loop rethrows + the fnCall/exec
+/// dispatch unwraps it as the function's value. The inLoop flag
+/// propagates exactly like the JS (including through nested functions).
+pub(crate) fn return_in_loop(mut prog: Program) -> Program {
+    fn is_loop_call(e: &Expr) -> bool {
+        matches!(e, Expr::CallExpression { callee, .. }
+            if matches!(&**callee, Expr::MemberExpression { object, property, .. }
+                if matches!(&**object, Expr::Identifier { name } if name == "sh2")
+                    && matches!(&**property, Expr::Identifier { name }
+                        if name == "whileLoop" || name == "whileLoopSync" || name == "forLoop")))
+    }
+    fn rewrite_expr(e: &mut Expr, in_loop: bool) {
+        let is_loop = is_loop_call(e);
+        match e {
+            Expr::CallExpression { callee, arguments, .. } if is_loop && arguments.len() > 1 => {
+                for (i, a) in arguments.iter_mut().enumerate() {
+                    rewrite_expr(a, i == 1);
+                }
+                return;
+            }
+            Expr::TemplateLiteral { expressions, .. } => {
+                for x in expressions { rewrite_expr(x, in_loop); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                rewrite_expr(callee, in_loop);
+                for a in arguments { rewrite_expr(a, in_loop); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                rewrite_expr(object, in_loop);
+                rewrite_expr(property, in_loop);
+            }
+            Expr::AwaitExpression { argument } => rewrite_expr(argument, in_loop),
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params { rewrite_expr(p, in_loop); }
+                match body {
+                    ArrowBody::Expr(x) => rewrite_expr(x, in_loop),
+                    ArrowBody::Block(b) => rewrite_stmt(b, in_loop),
+                }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params { rewrite_expr(p, in_loop); }
+                rewrite_stmt(body, in_loop);
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties {
+                    rewrite_expr(&mut p.key, in_loop);
+                    rewrite_expr(&mut p.value, in_loop);
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { rewrite_expr(el, in_loop); }
+            }
+            Expr::SpreadElement { argument } => rewrite_expr(argument, in_loop),
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                rewrite_expr(left, in_loop);
+                rewrite_expr(right, in_loop);
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                rewrite_expr(test, in_loop);
+                rewrite_expr(consequent, in_loop);
+                rewrite_expr(alternate, in_loop);
+            }
+            Expr::UnaryExpression { argument, .. } => rewrite_expr(argument, in_loop),
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions { rewrite_expr(x, in_loop); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                rewrite_expr(callee, in_loop);
+                for a in arguments { rewrite_expr(a, in_loop); }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+    fn rewrite_stmt(s: &mut Stmt, in_loop: bool) {
+        match s {
+            Stmt::ReturnStatement { argument } if in_loop => {
+                if let Some(a) = argument.take() {
+                    let mut x = a;
+                    rewrite_expr(&mut x, false);
+                    *s = Stmt::ThrowStatement {
+                        argument: Expr::NewExpression {
+                            callee: Box::new(Expr::MemberExpression {
+                                object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                                property: Box::new(Expr::Identifier { name: "ReturnSignal".to_string() }),
+                                computed: false,
+                                optional: false,
+                            }),
+                            arguments: vec![x],
+                        },
+                    };
+                }
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument {
+                    rewrite_expr(a, in_loop);
+                }
+            }
+            Stmt::ExpressionStatement { expression } => rewrite_expr(expression, in_loop),
+            Stmt::BlockStatement { body } => {
+                for x in body { rewrite_stmt(x, in_loop); }
+            }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                rewrite_expr(test, in_loop);
+                rewrite_stmt(consequent, in_loop);
+                if let Some(a) = alternate { rewrite_stmt(a, in_loop); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                rewrite_stmt(block, in_loop);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { rewrite_expr(p, in_loop); }
+                    rewrite_stmt(&mut h.body, in_loop);
+                }
+                if let Some(f) = finalizer { rewrite_stmt(f, in_loop); }
+            }
+            Stmt::ThrowStatement { argument } => rewrite_expr(argument, in_loop),
+            Stmt::SwitchStatement { discriminant, cases } => {
+                rewrite_expr(discriminant, in_loop);
+                for c in cases {
+                    if let Some(t) = &mut c.test { rewrite_expr(t, in_loop); }
+                    for x in &mut c.consequent { rewrite_stmt(x, in_loop); }
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                rewrite_expr(test, in_loop);
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::ForStatement { init, test, update, body } => {
+                rewrite_stmt(init, in_loop);
+                rewrite_expr(test, in_loop);
+                rewrite_expr(update, in_loop);
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                rewrite_stmt(left, in_loop);
+                rewrite_expr(right, in_loop);
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { rewrite_expr(p, in_loop); }
+                rewrite_stmt(body, in_loop);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { rewrite_expr(i, in_loop); }
+                }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    for s in &mut prog.body {
+        rewrite_stmt(s, false);
+    }
+    prog
+}
+
+// ── #10 directShellFnCalls (ported from lower.js) ────────────────────
+// Rewrites the dispatch call sites (`sh2.exec/fnCall/callDirect("f",
+// [args])`) of the NORMALIZED native function declarations to direct
+// JS calls — the texture generators' per-pixel helper calls are the
+// measured hot cost. The direct call keeps the dispatch's semantics:
+// the `$?` emulation for returning functions, the positional bridge for
+// `$1..$9` readers, and the await for async targets.
+
+pub(crate) fn direct_shell_fn_calls(mut prog: Program) -> Program {
+    struct FnInfo {
+        r#async: bool,
+        has_return: bool,
+        pos_refs: bool,
+    }
+    fn is_ident(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::Identifier { name: n } if n == name)
+    }
+    fn is_sh2_member(e: &Expr, name: &str) -> bool {
+        matches!(e, Expr::MemberExpression { object, property, computed: false, .. }
+            if is_ident(object, "sh2") && is_ident(property, name))
+    }
+    // 1. the fns map: scan the function declarations' bodies
+    let mut fns: std::collections::HashMap<String, FnInfo> = Default::default();
+    for st in &prog.body {
+        if let Stmt::FunctionDeclaration { id, body, r#async, .. } = st {
+            if let Expr::Identifier { name } = id {
+                let mut has_return = false;
+                let mut pos_refs = false;
+                scan_fn_stmt(body, &mut has_return, &mut pos_refs);
+                fns.insert(
+                    name.clone(),
+                    FnInfo { r#async: *r#async, has_return, pos_refs },
+                );
+            }
+        }
+    }
+    if fns.is_empty() {
+        return prog;
+    }
+
+    // 2. the dispatch info: `sh2.exec/fnCall/callDirect("name", [args])`
+    struct CallInfo {
+        name: String,
+        args: Vec<Expr>,
+    }
+    fn call_info(e: &Expr) -> Option<CallInfo> {
+        if let Expr::CallExpression { callee, arguments, .. } = e {
+            if let Expr::MemberExpression { object, property, .. } = &**callee {
+                if is_ident(object, "sh2") {
+                    if let Expr::Identifier { name } = &**property {
+                        let is_dispatch = name == "exec" || name == "fnCall" || name == "callDirect";
+                        if is_dispatch && arguments.len() >= 2 {
+                            if let Expr::Literal { value, .. } = &arguments[0] {
+                                if let Some(s) = value.as_str() {
+                                    let arg_idx = if name == "callDirect" { 2 } else { 1 };
+                                    if let Some(Expr::ArrayExpression { elements }) = arguments.get(arg_idx) {
+                                        return Some(CallInfo { name: s.to_string(), args: elements.iter().flatten().cloned().collect() });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+    // `String(x).split(...).filter(...)` → x; the store-read base
+    fn unwrap_word_list(n: &Expr) -> Expr {
+        if let Expr::CallExpression { callee, arguments, .. } = n {
+            if let Expr::MemberExpression { object, property, .. } = &**callee {
+                if is_ident(property, "filter") && arguments.len() == 1 {
+                    if let Expr::CallExpression { callee: split_callee, .. } = &**object {
+                        if let Expr::MemberExpression { object: base, property: split_prop, .. } = &**split_callee {
+                            if is_ident(split_prop, "split") {
+                                // String(x).split(...) → x
+                                if let Expr::CallExpression { callee: str_callee, arguments: str_args, .. } = &**base {
+                                    if is_ident(str_callee, "String") && str_args.len() == 1 {
+                                        return str_args[0].clone();
+                                    }
+                                }
+                                return base.as_ref().clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        n.clone()
+    }
+
+    // 3. the direct-statement builders
+    fn build_expr(f: &FnInfo, args: Vec<Expr>, prog_body: &mut Vec<Stmt>) -> Expr {
+        let call_expr = |args: &Vec<Expr>| Expr::CallExpression {
+            callee: Box::new(Expr::Identifier { name: "".to_string() }), // patched by the caller
+            arguments: args.clone(),
+            optional: false,
+        };
+        let _ = call_expr;
+        unreachable!("replaced below")
+    }
+    // The builders need the fn name — pass it explicitly.
+    fn mk_direct(f: &FnInfo, name: &str, args: Vec<Expr>) -> Expr {
+        let args_copy = args.clone();
+        let call = Expr::CallExpression {
+            callee: Box::new(Expr::Identifier { name: name.to_string() }),
+            arguments: args,
+            optional: false,
+        };
+        if f.has_return && !f.pos_refs {
+            // `(() => { const __r = <await?> f(args); sh2.lastExit =
+            // (typeof __r === "string" || typeof __r === "number") ?
+            // Number(__r) : (__r === false ? 1 : 0); })()`
+            let r = Expr::Identifier { name: "__r".to_string() };
+            let sh2_last_exit = Expr::MemberExpression {
+                object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                property: Box::new(Expr::Identifier { name: "lastExit".to_string() }),
+                computed: false,
+                optional: false,
+            };
+            let typeof_r = |lit: serde_json::Value| Expr::BinaryExpression {
+                operator: "===".to_string(),
+                left: Box::new(Expr::UnaryExpression {
+                    operator: "typeof".to_string(),
+                    argument: Box::new(r.clone()),
+                    prefix: true,
+                }),
+                right: Box::new(Expr::Literal { value: lit, raw: None, regex: None }),
+            };
+            let inner = if f.r#async {
+                Expr::AwaitExpression { argument: Box::new(call) }
+            } else {
+                call
+            };
+            let assign = Stmt::ExpressionStatement {
+                expression: Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(sh2_last_exit),
+                    right: Box::new(Expr::ConditionalExpression {
+                        test: Box::new(Expr::LogicalExpression {
+                            operator: "||".to_string(),
+                            left: Box::new(typeof_r(serde_json::json!("string"))),
+                            right: Box::new(typeof_r(serde_json::json!("number"))),
+                        }),
+                        consequent: Box::new(Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier { name: "Number".to_string() }),
+                            arguments: vec![r.clone()],
+                            optional: false,
+                        }),
+                        alternate: Box::new(Expr::ConditionalExpression {
+                            test: Box::new(Expr::BinaryExpression {
+                                operator: "===".to_string(),
+                                left: Box::new(r.clone()),
+                                right: Box::new(Expr::Literal { value: serde_json::json!(false), raw: None, regex: None }),
+                            }),
+                            consequent: Box::new(Expr::Literal { value: serde_json::json!(1), raw: None, regex: None }),
+                            alternate: Box::new(Expr::Literal { value: serde_json::json!(0), raw: None, regex: None }),
+                        }),
+                    }),
+                },
+            };
+            let arrow = Expr::ArrowFunctionExpression {
+                params: vec![],
+                body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
+                    body: vec![
+                        Stmt::VariableDeclaration {
+                            declarations: vec![VariableDeclarator {
+                                type_: "VariableDeclarator",
+                                id: r.clone(),
+                                init: Some(inner),
+                            }],
+                            kind: "const",
+                        },
+                        assign,
+                    ],
+                })),
+                expression: false,
+                r#async: f.r#async,
+            };
+            let mut call2 = Expr::CallExpression {
+                callee: Box::new(arrow),
+                arguments: vec![],
+                optional: false,
+            };
+            if f.r#async {
+                call2 = Expr::AwaitExpression { argument: Box::new(call2) };
+            }
+            call2
+        } else if f.pos_refs {
+            // `(() => { const prevArgs = sh2.positional; sh2.positional =
+            // [args]; try { return <await?> f(args); } finally {
+            // sh2.positional = prevArgs; } })()`
+            let prev = Expr::Identifier { name: "prevArgs".to_string() };
+            let sh2_pos = || Expr::MemberExpression {
+                object: Box::new(Expr::Identifier { name: "sh2".to_string() }),
+                property: Box::new(Expr::Identifier { name: "positional".to_string() }),
+                computed: false,
+                optional: false,
+            };
+            let call_inner = if f.r#async {
+                Expr::AwaitExpression { argument: Box::new(call) }
+            } else {
+                call
+            };
+            let arrow = Expr::ArrowFunctionExpression {
+                params: vec![],
+                body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
+                    body: vec![
+                        Stmt::VariableDeclaration {
+                            declarations: vec![VariableDeclarator {
+                                type_: "VariableDeclarator",
+                                id: prev.clone(),
+                                init: Some(sh2_pos()),
+                            }],
+                            kind: "const",
+                        },
+                        Stmt::ExpressionStatement {
+                            expression: Expr::AssignmentExpression {
+                                operator: "=".to_string(),
+                                left: Box::new(sh2_pos()),
+                                right: Box::new(Expr::ArrayExpression { elements: args_copy.iter().cloned().map(Some).collect() }),
+                            },
+                        },
+                        Stmt::TryStatement {
+                            block: Box::new(Stmt::BlockStatement {
+                                body: vec![Stmt::ReturnStatement { argument: Some(call_inner) }],
+                            }),
+                            handler: None,
+                            finalizer: Some(Box::new(Stmt::BlockStatement {
+                                body: vec![Stmt::ExpressionStatement {
+                                    expression: Expr::AssignmentExpression {
+                                        operator: "=".to_string(),
+                                        left: Box::new(sh2_pos()),
+                                        right: Box::new(prev.clone()),
+                                    },
+                                }],
+                            })),
+                        },
+                    ],
+                })),
+                expression: false,
+                r#async: f.r#async,
+            };
+            let mut out = Expr::CallExpression {
+                callee: Box::new(arrow),
+                arguments: vec![],
+                optional: false,
+            };
+            if f.r#async {
+                out = Expr::AwaitExpression { argument: Box::new(out) };
+            }
+            out
+        } else if f.r#async {
+            Expr::AwaitExpression { argument: Box::new(call) }
+        } else {
+            call
+        }
+    }
+
+    // 4. the rewrite — the statement-level dispatch → direct
+    fn rewrite_stmt(
+        s: &mut Stmt,
+        fns: &std::collections::HashMap<String, FnInfo>,
+    ) {
+        match s {
+            Stmt::ExpressionStatement { expression } => {
+                *expression = rewrite_expr_dispatch(expression, fns, true);
+            }
+            Stmt::BlockStatement { body } => {
+                for x in body { rewrite_stmt(x, fns); }
+            }
+            Stmt::IfStatement { test, consequent, alternate } => {
+                *test = rewrite_expr_dispatch(test, fns, false);
+                rewrite_stmt(consequent, fns);
+                if let Some(a) = alternate { rewrite_stmt(a, fns); }
+            }
+            Stmt::TryStatement { block, handler, finalizer } => {
+                rewrite_stmt(block, fns);
+                if let Some(h) = handler {
+                    if let Some(p) = &mut h.param { **p = rewrite_expr_dispatch(p, fns, false); }
+                    rewrite_stmt(&mut h.body, fns);
+                }
+                if let Some(f) = finalizer { rewrite_stmt(f, fns); }
+            }
+            Stmt::ThrowStatement { argument } => {
+                *argument = rewrite_expr_dispatch(argument, fns, false);
+            }
+            Stmt::SwitchStatement { discriminant, cases } => {
+                *discriminant = rewrite_expr_dispatch(discriminant, fns, false);
+                for c in cases {
+                    if let Some(t) = &mut c.test { *t = rewrite_expr_dispatch(t, fns, false); }
+                    for x in &mut c.consequent { rewrite_stmt(x, fns); }
+                }
+            }
+            Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+                *test = rewrite_expr_dispatch(test, fns, false);
+                rewrite_stmt(body, fns);
+            }
+            Stmt::ForStatement { init, test, update, body } => {
+                rewrite_stmt(init, fns);
+                *test = rewrite_expr_dispatch(test, fns, false);
+                *update = rewrite_expr_dispatch(update, fns, false);
+                rewrite_stmt(body, fns);
+            }
+            Stmt::ForOfStatement { left, right, body } => {
+                rewrite_stmt(left, fns);
+                *right = rewrite_expr_dispatch(right, fns, false);
+                rewrite_stmt(body, fns);
+            }
+            Stmt::FunctionDeclaration { params, body, .. } => {
+                for p in params { *p = rewrite_expr_dispatch(p, fns, false); }
+                rewrite_stmt(body, fns);
+            }
+            Stmt::VariableDeclaration { declarations, .. } => {
+                for d in declarations {
+                    if let Some(i) = &mut d.init { *i = rewrite_expr_dispatch(i, fns, false); }
+                }
+            }
+            Stmt::ReturnStatement { argument } => {
+                if let Some(a) = argument { *a = rewrite_expr_dispatch(a, fns, false); }
+            }
+            Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+        }
+    }
+    // the expression rewrite: dispatch calls at STATEMENT position → direct
+    // (value-position awaits stay dispatched)
+    fn rewrite_expr_dispatch(
+        e: &mut Expr,
+        fns: &std::collections::HashMap<String, FnInfo>,
+        stmt_pos: bool,
+    ) -> Expr {
+        // the direct replacement + the generic recursion
+        match e {
+            Expr::CallExpression { .. } => {
+                let info = call_info(e);
+                if let Some(info) = info {
+                    if let Some(f) = fns.get(&info.name) {
+                        if !(f.has_return && f.pos_refs) {
+                            if stmt_pos || (!f.has_return && !f.pos_refs) {
+                                let args = info.args.iter().map(unwrap_word_list).collect();
+                                return mk_direct(f, &info.name, args);
+                            }
+                        }
+                    }
+                }
+                // generic recursion
+                recurse_expr(e, fns, stmt_pos);
+                e.clone()
+            }
+            Expr::AwaitExpression { argument } => {
+                // the JS drops the outer await for a dispatched call (the
+                // direct call carries its own await for async targets; a
+                // returning target gets the $?-emulation IIFE)
+                if let Expr::CallExpression { .. } = &**argument {
+                    if let Some(info) = call_info(argument) {
+                        if let Some(f) = fns.get(&info.name) {
+                            if !(f.has_return && f.pos_refs) {
+                                let args = info.args.iter().map(unwrap_word_list).collect();
+                                return mk_direct(f, &info.name, args);
+                            }
+                        }
+                    }
+                }
+                let inner = rewrite_expr_dispatch(argument, fns, stmt_pos);
+                *argument = Box::new(inner);
+                e.clone()
+            }
+            _ => {
+                recurse_expr(e, fns, stmt_pos);
+                e.clone()
+            }
+        }
+    }
+    fn recurse_expr(e: &mut Expr, fns: &std::collections::HashMap<String, FnInfo>, stmt_pos: bool) {
+        match e {
+            Expr::TemplateLiteral { expressions, .. } => {
+                for x in expressions { *x = rewrite_expr_dispatch(x, fns, false); }
+            }
+            Expr::CallExpression { callee, arguments, .. } => {
+                *callee = Box::new(rewrite_expr_dispatch(callee, fns, false));
+                for a in arguments { *a = rewrite_expr_dispatch(a, fns, false); }
+            }
+            Expr::MemberExpression { object, property, .. } => {
+                *object = Box::new(rewrite_expr_dispatch(object, fns, false));
+                *property = Box::new(rewrite_expr_dispatch(property, fns, false));
+            }
+            Expr::AwaitExpression { argument } => {
+                *argument = Box::new(rewrite_expr_dispatch(argument, fns, false));
+            }
+            Expr::ArrowFunctionExpression { params, body, .. } => {
+                for p in params { *p = rewrite_expr_dispatch(p, fns, false); }
+                match body {
+                    ArrowBody::Expr(x) => *x = Box::new(rewrite_expr_dispatch(x, fns, false)),
+                    ArrowBody::Block(b) => rewrite_stmt(b, fns),
+                }
+            }
+            Expr::FunctionExpression { params, body, .. } => {
+                for p in params { *p = rewrite_expr_dispatch(p, fns, false); }
+                rewrite_stmt(body, fns);
+            }
+            Expr::ObjectExpression { properties } => {
+                for p in properties {
+                    let k = std::mem::replace(&mut p.key, Expr::Identifier { name: "__ph".into() });
+                    p.key = rewrite_expr_dispatch(&mut p.key.clone(), fns, false);
+                    p.key = k;
+                    let v = std::mem::replace(&mut p.value, Expr::Identifier { name: "__ph".into() });
+                    p.value = v;
+                }
+            }
+            Expr::ArrayExpression { elements } => {
+                for el in elements.iter_mut().flatten() { *el = rewrite_expr_dispatch(el, fns, false); }
+            }
+            Expr::SpreadElement { argument } => {
+                *argument = Box::new(rewrite_expr_dispatch(argument, fns, false));
+            }
+            Expr::LogicalExpression { left, right, .. }
+            | Expr::BinaryExpression { left, right, .. }
+            | Expr::AssignmentExpression { left, right, .. } => {
+                *left = Box::new(rewrite_expr_dispatch(left, fns, false));
+                *right = Box::new(rewrite_expr_dispatch(right, fns, false));
+            }
+            Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+                *test = Box::new(rewrite_expr_dispatch(test, fns, false));
+                *consequent = Box::new(rewrite_expr_dispatch(consequent, fns, false));
+                *alternate = Box::new(rewrite_expr_dispatch(alternate, fns, false));
+            }
+            Expr::UnaryExpression { argument, .. } => {
+                *argument = Box::new(rewrite_expr_dispatch(argument, fns, false));
+            }
+            Expr::SequenceExpression { expressions } => {
+                for x in expressions { *x = rewrite_expr_dispatch(x, fns, false); }
+            }
+            Expr::NewExpression { callee, arguments, .. } => {
+                *callee = Box::new(rewrite_expr_dispatch(callee, fns, false));
+                for a in arguments { *a = rewrite_expr_dispatch(a, fns, false); }
+            }
+            Expr::Identifier { .. } | Expr::Literal { .. } => {}
+        }
+    }
+
+    for s in &mut prog.body {
+        rewrite_stmt(s, &fns);
+    }
+    prog
+}
+
+fn scan_fn_stmt(s: &Stmt, has_return: &mut bool, pos_refs: &mut bool) {
+    match s {
+        Stmt::ReturnStatement { .. } => *has_return = true,
+        Stmt::ExpressionStatement { expression } => scan_fn_expr(expression, has_return, pos_refs),
+        Stmt::BlockStatement { body } => {
+            for x in body { scan_fn_stmt(x, has_return, pos_refs); }
+        }
+        Stmt::IfStatement { test, consequent, alternate } => {
+            scan_fn_expr(test, has_return, pos_refs);
+            scan_fn_stmt(consequent, has_return, pos_refs);
+            if let Some(a) = alternate { scan_fn_stmt(a, has_return, pos_refs); }
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            scan_fn_stmt(block, has_return, pos_refs);
+            if let Some(h) = handler {
+                if let Some(p) = &h.param { scan_fn_expr(p, has_return, pos_refs); }
+                scan_fn_stmt(&h.body, has_return, pos_refs);
+            }
+            if let Some(f) = finalizer { scan_fn_stmt(f, has_return, pos_refs); }
+        }
+        Stmt::ThrowStatement { argument } => scan_fn_expr(argument, has_return, pos_refs),
+        Stmt::SwitchStatement { discriminant, cases } => {
+            scan_fn_expr(discriminant, has_return, pos_refs);
+            for c in cases {
+                if let Some(t) = &c.test { scan_fn_expr(t, has_return, pos_refs); }
+                for x in &c.consequent { scan_fn_stmt(x, has_return, pos_refs); }
+            }
+        }
+        Stmt::WhileStatement { test, body } | Stmt::DoWhileStatement { test, body } => {
+            scan_fn_expr(test, has_return, pos_refs);
+            scan_fn_stmt(body, has_return, pos_refs);
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            scan_fn_stmt(init, has_return, pos_refs);
+            scan_fn_expr(test, has_return, pos_refs);
+            scan_fn_expr(update, has_return, pos_refs);
+            scan_fn_stmt(body, has_return, pos_refs);
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            scan_fn_stmt(left, has_return, pos_refs);
+            scan_fn_expr(right, has_return, pos_refs);
+            scan_fn_stmt(body, has_return, pos_refs);
+        }
+        Stmt::FunctionDeclaration { .. } => {}
+        Stmt::VariableDeclaration { declarations, .. } => {
+            for d in declarations {
+                if let Some(i) = &d.init { scan_fn_expr(i, has_return, pos_refs); }
+            }
+        }
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => {}
+    }
+}
+
+fn scan_fn_expr(e: &Expr, has_return: &mut bool, pos_refs: &mut bool) {
+    match e {
+        Expr::MemberExpression { object, property, computed: false, .. }
+            if is_ident_expr(object, "sh2") && is_ident_expr(property, "positional") =>
+        {
+            *pos_refs = true;
+        }
+        _ => {}
+    }
+    match e {
+        Expr::TemplateLiteral { expressions, .. } => {
+            for x in expressions { scan_fn_expr(x, has_return, pos_refs); }
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            scan_fn_expr(callee, has_return, pos_refs);
+            for a in arguments { scan_fn_expr(a, has_return, pos_refs); }
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            scan_fn_expr(object, has_return, pos_refs);
+            scan_fn_expr(property, has_return, pos_refs);
+        }
+        Expr::AwaitExpression { argument } => scan_fn_expr(argument, has_return, pos_refs),
+        Expr::ArrowFunctionExpression { .. } => {}
+        Expr::FunctionExpression { .. } => {}
+        Expr::ObjectExpression { properties } => {
+            for p in properties {
+                scan_fn_expr(&p.key, has_return, pos_refs);
+                scan_fn_expr(&p.value, has_return, pos_refs);
+            }
+        }
+        Expr::ArrayExpression { elements } => {
+            for el in elements.iter().flatten() { scan_fn_expr(el, has_return, pos_refs); }
+        }
+        Expr::SpreadElement { argument } => scan_fn_expr(argument, has_return, pos_refs),
+        Expr::LogicalExpression { left, right, .. }
+        | Expr::BinaryExpression { left, right, .. }
+        | Expr::AssignmentExpression { left, right, .. } => {
+            scan_fn_expr(left, has_return, pos_refs);
+            scan_fn_expr(right, has_return, pos_refs);
+        }
+        Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+            scan_fn_expr(test, has_return, pos_refs);
+            scan_fn_expr(consequent, has_return, pos_refs);
+            scan_fn_expr(alternate, has_return, pos_refs);
+        }
+        Expr::UnaryExpression { argument, .. } => scan_fn_expr(argument, has_return, pos_refs),
+        Expr::SequenceExpression { expressions } => {
+            for x in expressions { scan_fn_expr(x, has_return, pos_refs); }
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            scan_fn_expr(callee, has_return, pos_refs);
+            for a in arguments { scan_fn_expr(a, has_return, pos_refs); }
+        }
+        Expr::Identifier { .. } | Expr::Literal { .. } => {}
+    }
+}
+
+fn is_ident_expr(e: &Expr, name: &str) -> bool {
+    matches!(e, Expr::Identifier { name: n } if n == name)
+}
+
+pub fn compile_head_passes(mut prog: Program) -> Program {
+    prog = strip_process_env(prog);          // #1
+    prog = await_sync_fn_calls(prog);        // #2
+    prog = force_async_file_redirects(prog); // #3
+    prog = mark_async_on_await(prog);        // #4
+    prog = await_async_direct_calls(prog);    // #5
+    prog = normalize_functions(prog);         // #6
+    prog = unwrap_store_string(prog);         // #7
+    prog = null_sentinel(prog);               // #8
+    prog = return_in_loop(prog);              // #9
+    prog = direct_shell_fn_calls(prog);       // #10
+    prog
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1032,6 +6057,71 @@ mod tests {
     fn to_json(input: &str) -> String {
         let commands = Parser::new(input).parse().unwrap();
         serde_json::to_string(&ast_to_estree(&commands)).unwrap()
+    }
+
+    #[test]
+    fn json_writer_matches_serde() {
+        // the hand-rolled writer must produce JSON the browser parses
+        // identically to serde's — compare the parsed VALUES (object
+        // key order is cosmetic) AND the raw bytes.
+        for input in [
+            "x=1; echo hi",
+            "case $1 in a) echo A;; *) echo B;; esac",
+            "for i in 1 2 3; do echo $i; done",
+            "if [ -f x ]; then cat x; else echo no; fi",
+            "f() { local a=1; return $a; }; f",
+            "x='a\\\"b\\\\c\\nd'; echo ${x:-$y}",
+            "a=(1 2 3); echo ${a[1]}",
+            "while true; do sleep 1; done",
+            "echo `echo nested`",
+            "cat <<EOF\\nhi\\nEOF",
+        ] {
+            let commands = Parser::new(input).parse().unwrap();
+            let prog = ast_to_estree(&commands);
+            let serde_out = serde_json::to_string(&prog).unwrap();
+            let mine = estree_to_json(&prog);
+            let a: serde_json::Value = serde_json::from_str(&serde_out).unwrap();
+            let b: serde_json::Value = serde_json::from_str(&mine).unwrap();
+            assert_eq!(a, b, "parsed mismatch for: {input}");
+            assert_eq!(serde_out, mine, "byte mismatch for: {input}");
+        }
+    }
+
+    #[test]
+    fn if_empty_else_lastexit_dropped_when_unread() {
+        // `if c; then ...; fi` with NO else synthesizes a false-path
+        // `sh2.lastExit = 0` (bash: false cond + no else → $? = 0). The
+        // Plan 4 liveness marks it dead when nothing reads the if's
+        // status — the if lowers to a plain `if (c) { ... }`, no else.
+        // NOTE: the PROGRAM-FINAL status IS a reader now (the runner's
+        // `sh2._finish()` exits with `sh2.lastExit` — bash's exit code is
+        // the last command's status and the corpus gate compares exit
+        // codes), so a program-final if KEEPS its false-path write.
+        // The lastExit-tail hoist then LIFTS that write after the if —
+        // semantically identical (the reader still sees 0), structurally
+        // a post-if `sh2.lastExit = 0` instead of an else branch.
+        let json = to_json("if false; then echo yes; fi");
+        assert!(json.contains("\"type\":\"IfStatement\""));
+        assert!(
+            json.contains("\"alternate\":null") && json.contains("\"name\":\"lastExit\""),
+            "program-final status read → the false-path write is lifted after the if"
+        );
+        assert!(!json.contains("unsupported"));
+        // a READER keeps the write: `; echo $?` observes the false-path 0
+        // — the hoisted post-if write still precedes the reader
+        let json2 = to_json("if false; then echo yes; fi; echo $?");
+        assert!(
+            json2.contains("\"name\":\"lastExit\""),
+            "read status → write kept (lifted after the if)"
+        );
+        assert!(!json2.contains("unsupported"));
+        // a later WRITER shadows the if's status → the write is dead again
+        let json3 = to_json("if false; then echo yes; fi; false; echo $?");
+        assert!(
+            json3.contains("\"alternate\":null"),
+            "shadowed by `false` → no else"
+        );
+        assert!(!json3.contains("unsupported"));
     }
 
     #[test]
@@ -1055,14 +6145,115 @@ mod tests {
     }
 
     #[test]
+    fn echo_single_arg_skips_the_join() {
+        // `echo "$i"` — one QUOTED non-literal arg: `[String(i)].join(" ")` is
+        // exactly `String(i)` (a one-element join never inserts the
+        // separator), so the emitter emits the bare value — no array /
+        // join machinery. An UNQUOTED `echo $i` is a field-split arg (the
+        // A1 split marker); when the split is provably a no-op (a
+        // numeric/nospace value — see expr_known_nospace) the arg is a
+        // single provably-scalar value and unwraps to the bare binding
+        // too. An un-scalarizable split (unknown/multi-word value) or an
+        // array-valued arg keeps the flat/join path (the shortcut would
+        // comma-join a multi-word value).
+        let json = to_json("i=42; echo \"$i\"");
+        assert!(json.contains("\"name\":\"String\""));
+        assert!(!json.contains("\"name\":\"join\""), "single arg: no join");
+        assert!(
+            !json.contains("\"type\":\"ArrayExpression\""),
+            "single arg: no array"
+        );
+        assert!(!json.contains("unsupported"));
+        // unquoted but numeric: the field-split is a provable no-op (i is
+        // a numeric var) — the single scalar arg unwraps, no flat/join
+        let json_unq = to_json("i=42; echo $i");
+        assert!(!json_unq.contains("\"name\":\"join\""), "numeric single arg: no join");
+        assert!(
+            !json_unq.contains("\"type\":\"ArrayExpression\""),
+            "numeric single arg: no array"
+        );
+        // two args keep the word-join
+        let json2 = to_json("i=42; echo $i $i");
+        assert!(json2.contains("\"name\":\"join\""));
+        assert!(json2.contains("\"type\":\"ArrayExpression\""));
+        assert!(!json2.contains("unsupported"));
+        // an ARRAY-VALUED single arg (unquoted `$(...)` captureWords — the
+        // runtime splices its words) must still splice + join — it is not
+        // a scalar; a capture ASSIGNED to a var is a scalar string
+        let json3 = to_json("echo $(echo 1 2 3)");
+        assert!(json3.contains("\"name\":\"join\""));
+        assert!(json3.contains("\"name\":\"flat\""));
+        assert!(!json3.contains("unsupported"));
+        let json4 = to_json("x=$(echo 1 2 3); echo \"$x\"");
+        assert!(
+            !json4.contains("\"name\":\"join\""),
+            "capture-assigned var is a scalar"
+        );
+        assert!(!json4.contains("unsupported"));
+    }
+
+    #[test]
+    fn join_of_string_slice_chain_is_identity() {
+        // `${name:0:4}` — the param-slice lowering emits
+        // `String(name).slice(0, 4)` and the interpolation joins it. The
+        // join of a provably-STRING value is identity (the runtime join is
+        // `Array.isArray(v) ? v.join(" ") : String(v)`), so the runtime
+        // call must disappear even when the chain carries call args
+        // (`String(name).slice(0, 4)` is a CallExpression whose callee is
+        // the `.slice` member — the old root-only scan missed it and left
+        // 5 corpus sites on the runtime join).
+        let json = to_json("n=hello; echo \"${n:0:4}\"");
+        assert!(json.contains("\"name\":\"slice\""));
+        assert!(!json.contains("\"name\":\"join\""), "no runtime join");
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn set_double_dash_assigns_positionals_natively() {
+        // `set -- a b c d` — the `--` marker ends the option list: the
+        // remaining args are the POSITIONALS. The flag path must not
+        // swallow them (its `try_native_set_flags` treats `--` as a flag
+        // with no letters and would emit only `(lastExit = 0, true)` —
+        // the positional write lost — parse-at-slice.sh printed ""
+        // instead of "c d").
+        let json = to_json("set -- a b c d; echo \"${@:3}\"");
+        assert!(json.contains("\"property\":{\"type\":\"Identifier\",\"name\":\"positional\"")
+            || json.contains("\"name\":\"positional\""));
+        assert!(
+            json.contains("\"name\":\"set\"") || json.contains("\"value\":\"a\""),
+            "the positionals a b c d are assigned"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn capture_words_single_word_wc_count_is_native() {
+        // `local size=$(wc -c < f)` — the UNQUOTED capture form: the
+        // runtime splits the capture on IFS whitespace. The wc count is
+        // provably a single word (digits), so the machinery collapses to
+        // a native readFile + byte-count inside the promise's success
+        // branch (a failed redirect yields "" — the count must not apply
+        // to the error sentinel, and an empty file must still count 0).
+        let json = to_json(
+            "f() { local size=$(wc -c < /etc/hostname); echo \"size=$size\"; }; f",
+        );
+        assert!(
+            !json.contains("\"name\":\"captureWords\""),
+            "no captureWords machinery"
+        );
+        assert!(json.contains("\"name\":\"readFile\""));
+        assert!(json.contains("\"name\":\"then\""), "the count maps inside the promise");
+        assert!(!json.contains("\"value\":\"wc\""), "no wc dispatch");
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
     fn grep_null_test_lifts_to_contains() {
         // `if echo $x | grep P >/dev/null 2>/dev/null` (discarded-output grep
         // as a test) is a substring test — no echo/grep spawns, no pipeline;
         // the emitter inlines the ShIR `contains` call to a NATIVE
         // `String(h).includes(n)` (src/shir.rs expr_to_estree).
-        let json = to_json(
-            "if echo hi | grep hi > /dev/null 2> /dev/null; then echo yes; fi",
-        );
+        let json = to_json("if echo hi | grep hi > /dev/null 2> /dev/null; then echo yes; fi");
         assert!(json.contains("\"name\":\"includes\""));
         assert!(json.contains("\"name\":\"String\""));
         assert!(!json.contains("pipeline"));
@@ -1102,6 +6293,167 @@ mod tests {
     }
 
     #[test]
+    fn bare_env_lowers_to_sync_builtin() {
+        // `env | grep '^myexport='` — the bare env form (no operands):
+        // the subprocess spawn collapses to the sync builtin dispatch
+        // (builtins.env dumps process.env — sink-correct everywhere). A
+        // flag/carrying form (`env -i`) keeps the exec spawn (the
+        // builtin cannot run commands).
+        let json = to_json("env | grep '^myexport='");
+        assert!(json.contains("\"value\":\"env\""));
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("\"name\":\"exec\""), "no env spawn");
+        assert!(!json.contains("unsupported"));
+        let json2 = to_json("env -i foo");
+        assert!(json2.contains("\"name\":\"exec\""), "flag forms keep the spawn");
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn egrep_lowers_to_sync_builtin() {
+        // `$(egrep PAT FILE)` — GNU's grep -E alias: SYNC_BUILTINS admits
+        // the name, so the exec spawn becomes the sync builtin dispatch
+        // (builtins.egrep = grep with -E prepended).
+        let json = to_json("x=$(egrep '^pattern' /dev/null)");
+        assert!(json.contains("\"value\":\"egrep\""));
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("\"name\":\"exec\""), "no egrep spawn");
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn echo_pipe_bc_statement_folds_to_native_write() {
+        // statement-form `echo "2+3" | bc` with a STATIC program → the
+        // compile-time bc fold (src/bc.rs): the pipeline + bc subprocess
+        // spawn collapse to a native `process.stdout.write("5\n")` +
+        // status sequence (the try_native_echo_bc_stmt twin of the
+        // capture-position fold). A DYNAMIC program (`$x + 1` — no
+        // runtime bc evaluator) keeps the spawn.
+        let json = to_json("echo \"2+3\" | bc");
+        assert!(json.contains("\"name\":\"write\""));
+        assert!(json.contains("\"value\":\"5\\n\""), "folded 2+3 -> 5\n");
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(!json.contains("unsupported"));
+        // multi-statement programs fold too (scale=2; 5/2 -> 2.50)
+        let json2 = to_json("echo \"scale=2; 5/2\" | bc");
+        assert!(json2.contains("\"value\":\"2.50\\n\""));
+        assert!(!json2.contains("\"name\":\"exec\""));
+        // a dynamic program keeps the pipeline + bc spawn
+        let json3 = to_json("x=1; echo \"$x + 1\" | bc");
+        assert!(json3.contains("\"name\":\"pipeline\""));
+        assert!(json3.contains("\"name\":\"exec\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn echo_head_statement_pipeline_folds_to_native_write() {
+        // statement-form `echo "select" | head -1` — a static echo
+        // producer feeding a static head consumer: the whole pipeline
+        // folds to a native `process.stdout.write("select\n")` (the
+        // head output over the echo text computed at emit time — no
+        // pipeline machinery, no builtin dispatch). A DYNAMIC producer
+        // (`$x`) keeps the pipeline.
+        let json = to_json("echo \"select\" | head -1");
+        assert!(json.contains("\"value\":\"select\\n\""));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("\"name\":\"head\""));
+        assert!(!json.contains("unsupported"));
+        // printf producer folds too (`printf 'abcdef' | head -c 3`)
+        let json2 = to_json("printf 'abcdef' | head -c 3");
+        assert!(json2.contains("\"value\":\"abc\""));
+        assert!(!json2.contains("\"name\":\"builtin\""));
+        // a dynamic producer keeps the pipeline
+        let json3 = to_json("echo \"$x\" | head -1");
+        assert!(json3.contains("\"name\":\"pipelineSync\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn echo_wc_capture_with_grep_filter_folds_native() {
+        // `x=$(echo -e "line1\nline2\nline3" | grep -v "line2" | wc -l)`
+        // — the 3-stage echo|grep -v|wc capture: the count is a native
+        // filter chain over the echo text (grepSelect's line model + the
+        // literal pattern's !includes) — no capture/pipeline machinery,
+        // no builtin dispatch.
+        let json = to_json("x=$(echo -e \"line1\\nline2\\nline3\" | grep -v \"line2\" | wc -l)");
+        assert!(json.contains("\"name\":\"filter\""));
+        assert!(json.contains("\"value\":\"line2\""));
+        assert!(!json.contains("\"name\":\"captureSync\""));
+        assert!(!json.contains("\"name\":\"pipelineSync\""));
+        assert!(!json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("unsupported"));
+        // a metachar pattern keeps the runtime pipeline (regex matching)
+        let json2 = to_json("x=$(echo a | grep -v \"a.*\" | wc -l)");
+        assert!(json2.contains("\"name\":\"pipelineSync\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn uname_cmdsub_test_operand_lowers_native() {
+        // `[[ $(uname -r) == 5.4.* ]]` — the cmdsub operand is the
+        // native uname value twin (no bash -c spawn, no sh2.test text
+        // parse): `String(sh2.uname("-r")).startsWith("5.4.")` — the
+        // glob-pattern equality folds to the prefix test.
+        let json = to_json("[[ $(uname -r) == 5.4.* ]]");
+        assert!(json.contains("\"name\":\"uname\""));
+        assert!(json.contains("\"name\":\"startsWith\""));
+        assert!(json.contains("\"value\":\"5.4.\""));
+        assert!(!json.contains("\"name\":\"test\""));
+        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(!json.contains("unsupported"));
+        // `$(pwd)` folds to the cwd field read; `$(echo LIT)` to the
+        // literal (the pre-existing echo fold)
+        let json2 = to_json("[[ \"$(pwd)\" = \"$HOME\" ]]");
+        assert!(json2.contains("\"name\":\"cwd\""));
+        assert!(!json2.contains("\"name\":\"test\""));
+        assert!(!json2.contains("unsupported"));
+        // a cmdsub with a dynamic command keeps the runtime test
+        let json3 = to_json("[[ \"$(cat f)\" = x ]]");
+        assert!(json3.contains("\"name\":\"test\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn quiet_grep_cmdsub_test_folds_constant() {
+        // `[ "$(echo "$v" | grep -q "p")" ]` — grep -q NEVER writes
+        // stdout, so the captured operand value is always "" and the
+        // value test is constant-false (the runtime would run the whole
+        // pipeline per evaluation for a value it cannot observe).
+        let json = to_json("[ \"$(echo \"$v\" | grep -q \"p\")\" ]");
+        assert!(json.contains("\"value\":false"));
+        assert!(!json.contains("\"name\":\"test\""));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("unsupported"));
+        // the `!` form is constant-true
+        let json2 = to_json("[ ! \"$(echo x | grep -q y)\" ]");
+        assert!(json2.contains("\"value\":true"));
+        assert!(!json2.contains("\"name\":\"test\""));
+        // a non-grep cmdsub operand keeps the runtime test
+        let json3 = to_json("[ \"$(echo x)\" ]");
+        assert!(json3.contains("\"name\":\"test\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn case_cmdsub_pattern_folds_to_static_chain() {
+        // `case "w" in $(echo "pattern") )` — the runtime caseMatch
+        // evaluates the $(echo LIT) pattern via runCmdSubst (a bash -c
+        // SPAWN per case evaluation); the fold substitutes the captured
+        // value at emit time so the static case chain sees "pattern" —
+        // no caseMatch dispatch, no spawn.
+        let json = to_json("case \"w\" in $(echo \"pattern\") ) echo m; esac");
+        assert!(json.contains("\"value\":\"pattern\""));
+        assert!(!json.contains("\"name\":\"caseMatch\""));
+        assert!(!json.contains("unsupported"));
+        // a dynamic pattern (a function call) keeps the runtime caseMatch
+        let json2 = to_json("case \"w\" in $(f) ) echo m; esac");
+        assert!(json2.contains("\"name\":\"caseMatch\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
     fn cut_herestring_capture_lifts_to_native() {
         // `$(cut -c2 <<< X)` — the here-string feed is the same per-line
         // selection over the target value; the split has no trailing ''
@@ -1117,11 +6469,313 @@ mod tests {
     #[test]
     fn cut_dynamic_args_not_lifted() {
         // a dynamic cut arg (a variable position list) keeps the runtime
-        // pipeline + builtin
+        // pipeline + builtin — the sync twin (both stages are sync)
         let json = to_json("x=$(echo a:b:c | cut -d: -f$n)");
-        assert!(json.contains("\"name\":\"pipeline\""));
+        assert!(json.contains("\"name\":\"pipelineSync\""));
         assert!(!json.contains("\"name\":\"slice\""));
         assert!(!json.contains("\"name\":\"filter\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    #[test]
+    fn sleep_lowers_to_native_timer() {
+        // `sleep 1` — the exec spawn collapses to a native async timer
+        // `(await new Promise(r => setTimeout(() => r(true), 1000)), …)`:
+        // no exec dispatch, no subprocess. A fractional literal folds to
+        // ms too (`sleep 0.1` → 100); a dynamic arg becomes
+        // `Number(<value>) * 1000` (the runtime's arg flattener turns the
+        // unquoted-expansion split array into one arg for a single-word
+        // value).
+        let json = to_json("sleep 1");
+        assert!(json.contains("\"type\":\"NewExpression\""));
+        assert!(json.contains("setTimeout"));
+        assert!(json.contains("1000"));
+        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(!json.contains("unsupported"));
+        let json2 = to_json("sleep 0.1");
+        assert!(json2.contains("100"), "fractional seconds fold to ms");
+        assert!(!json2.contains("\"name\":\"exec\""));
+        let json3 = to_json("sleep $n");
+        assert!(json3.contains("Number"));
+        assert!(!json3.contains("\"name\":\"exec\""));
+        // a command named sleep with extra args keeps the runtime (bash
+        // would error — the spawn path reports it)
+        let json4 = to_json("sleep 1 2");
+        assert!(json4.contains("\"name\":\"exec\""));
+        // the env-carrying form keeps the runtime (command-scoped env)
+        let json5 = to_json("TZ=UTC sleep 1");
+        assert!(json5.contains("\"name\":\"exec\""));
+    }
+
+    #[test]
+    fn dollar_ref_arith_text_lowers_natively() {
+        // `j=$(( $j*$i ))` INSIDE a for loop (047_for_arithematic): the
+        // runtime arith STRING's `$name` refs strip to a native-lowerable
+        // expression, so the loop body must become bare native JS — no
+        // setVar, no sh2.arith. The refs are PROVABLY SET here (i is the
+        // loop var, j was assigned 0 before the loop... the deletion gate
+        // keeps the unset-j shape on the runtime, see below).
+        let json = to_json("i=0\nj=0\nj=$(( $j*$i ))");
+        assert!(
+            !json.contains("\"name\":\"arith\""),
+            "native-lowerable $ref arith text: no sh2.arith"
+        );
+        assert!(!json.contains("unsupported"));
+        // the UNSET gate: `j=$(( $j*$i ))` with j's ONLY write the arith
+        // text itself — bash substitutes the EMPTY value, `*i` is a
+        // syntax error, the assignment is skipped (047 in the corpus).
+        // The deletion gate must keep the runtime evaluator.
+        let json2 = to_json("for i in 1 2 3; do j=$(( $j*$i )); done");
+        assert!(
+            json2.contains("\"name\":\"arith\""),
+            "unset-at-read $ref arith text keeps sh2.arith"
+        );
+        assert!(!json2.contains("unsupported"));
+        // `let "$n == 5"` — the `(( $n == 5 ))` condition: n is set, the
+        // stripped text parses — the let must lower natively.
+        let json3 = to_json("n=5\nif (( $n == 5 )); then echo equal; fi");
+        assert!(
+            !json3.contains("\"name\":\"builtin\""),
+            "$ref let cond: no builtin dispatch"
+        );
+        assert!(!json3.contains("unsupported"));
+        // `$1` positionals are NOT strip-able — the runtime stays.
+        let json4 = to_json("n=$(( $1 + 0 ))");
+        assert!(json4.contains("\"name\":\"arith\""));
+        assert!(!json4.contains("unsupported"));
+    }
+
+    #[test]
+    fn yes_head_capture_lifts_to_native_repeat() {
+        // `$(yes Hello | head -3)` — the infinite-producer capture: yes
+        // prints `Hello\n` forever, head takes the first 3 lines — the
+        // captured value is exactly `(Hello + "\n").repeat(3)` with the
+        // capture strips: no pipeline, no capture arrow, no spawns.
+        let json = to_json("x=$(yes Hello | head -3)");
+        assert!(json.contains("\"name\":\"repeat\""));
+        assert!(json.contains("Hello"));
+        assert!(!json.contains("\"name\":\"pipeline\""));
+        assert!(!json.contains("\"name\":\"capture\""));
+        assert!(!json.contains("\"name\":\"yes\""));
+        assert!(!json.contains("unsupported"));
+        // `head -n 3` / `head -n3` forms lift too; a dynamic head count
+        // keeps the runtime pipeline.
+        let json2 = to_json("x=$(yes Hi | head -n 3)");
+        assert!(json2.contains("\"name\":\"repeat\""));
+        let json3 = to_json("x=$(yes Hi | head -n $n)");
+        assert!(json3.contains("\"name\":\"pipeline\""));
+        assert!(!json3.contains("\"name\":\"repeat\""));
+    }
+
+    #[test]
+    fn ls_lowers_to_sync_builtin_and_hostname_capture_is_native() {
+        // `ls` is a native sync builtin (the GNU-faithful listing): the
+        // exec dispatch lowers to the sync twin — no spawn.
+        let json = to_json("ls -A");
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(!json.contains("\"name\":\"exec\""));
+        assert!(!json.contains("unsupported"));
+        // `$(hostname)` — the value-returning runtime twin (like uname/
+        // date/readlink): no capture machinery, no spawn.
+        let json2 = to_json("h=$(hostname)");
+        assert!(json2.contains("\"name\":\"hostname\""));
+        assert!(!json2.contains("\"name\":\"capture\""));
+        assert!(!json2.contains("\"name\":\"exec\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn substitute_all_uses_replace_all_for_dollar_free_replacement() {
+        // `${x//p/r}` with a literal pattern — the runtime's literal fast
+        // path is split/join; a `$`-free replacement lowers one step
+        // further to String.replaceAll (single-pass, same literal
+        // semantics). A `$`-bearing replacement keeps split/join (JS
+        // replaceAll would treat `$&`/`$1` as substitution sequences).
+        let json = to_json("echo \"${x//o/0}\"");
+        assert!(json.contains("\"name\":\"replaceAll\""));
+        assert!(!json.contains("unsupported"));
+        // a `$`-bearing replacement keeps the RUNTIME param call (JS
+        // replaceAll would treat `$&`/`$1` as substitution sequences, and
+        // the positional default is not fully liftable anyway)
+        let json2 = to_json(r#"echo "${x//o/$1}""#);
+        assert!(json2.contains("\"name\":\"param\""));
+        assert!(!json2.contains("\"name\":\"replaceAll\""));
+    }
+
+    #[test]
+    fn never_written_var_reads_fold_to_empty() {
+        // SH2_ASSUME_NO_ENV fold: a name with NO write anywhere in the
+        // program reads as the constant "" (the runtime would return the
+        // env fallback, which the documented assumption declares
+        // unobservable). `x`/`y` are never written — `echo "$x $y"`
+        // lowers without a single getVar.
+        let json = to_json("echo \"$x $y\"");
+        assert!(!json.contains("\"getVar\""));
+        // the read-builtin vars are writes: `read x` marks x — the read
+        // stays LIVE, but as the native plain-object store read (the
+        // runtime read's setVar write is the plain path — no dispatch)
+        let json2 = to_json("read x; echo \"$x\"");
+        assert!(json2.contains("\"name\":\"vars\""));
+        assert!(!json2.contains("\"getVar\""));
+        // an eval/source program disables the fold entirely (the eval
+        // may write the name at runtime — the read must stay LIVE): the
+        // native store read `sh2.vars.x ?? env ?? ''` (the runtime's
+        // exact plain path — a getVar CALL would be a dispatch)
+        let json3 = to_json("eval \"echo hi\"; echo \"$x\"");
+        assert!(json3.contains("\"name\":\"vars\""));
+        assert!(json3.contains("\"name\":\"x\""));
+        // a nameref TARGET is a write: `typeset -n r=x` makes `r=5`
+        // write x through the runtime's refVars indirection
+        let json4 = to_json("typeset -n r=x; r=5; echo \"$x\"");
+        assert!(json4.contains("\"name\":\"vars\""));
+        // a runtime `let` writes its arith idents: `let var++` (the JS
+        // keyword keeps the var store-bound) must not fold the read —
+        // the native store read (a `vars.var` property access is legal
+        // JS even for keyword names)
+        let json5 = to_json("let var++; echo \"$var\"");
+        assert!(json5.contains("\"name\":\"vars\""));
+    }
+
+    #[test]
+    fn and_or_chain_store_var_tests_lower_native() {
+        // `[[ "$a" == "x" ]] && [[ "$b" == "y" ]]` — the chain links
+        // branch on lastExit, so each test records its status natively
+        // (`(sh2._g = String(sh2.getVar(a)) === "x", sh2.lastExit =
+        // sh2._g ? 0 : 1, sh2._g)` — the `_g` scratch evaluates the read
+        // EXACTLY ONCE, keeping the call-site count at ONE getVar vs the
+        // single runtime test it replaces). No sh2.test dispatch, no
+        // string tokenize/parse per evaluation.
+        let json = to_json("if [[ \"$a\" == \"x\" ]] && [[ \"$b\" == \"y\" ]]; then echo yes; fi");
+        // the sh2.test DISPATCH is gone (a regex-literal `.test()` method
+        // call has a different callee shape and may legitimately appear)
+        assert!(!json
+            .contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        // `$a`/`$b` are NEVER WRITTEN — the SH2_ASSUME_NO_ENV fold
+        // lowers their reads to the constant "" (no getVar at all); the
+        // `_g` scratch still evaluates the single read exactly once
+        assert!(!json.contains("\"name\":\"getVar\""));
+        assert!(json.contains("\"name\":\"_g\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn compound_test_lowers_to_native_or() {
+        // `[[ "$2" == "test" || "$2" == "debug" ]]` — the test-level
+        // `-o` compound: each leaf lowers (positional reads — ZERO
+        // dispatches) and the leaves join with a native `||` — the
+        // runtime test call (tokenize + parse + dispatch) disappears.
+        let json = to_json(
+            "if [[ \"$1\" =~ ^[0-9]+$ ]] && [[ \"$2\" == \"test\" || \"$2\" == \"debug\" ]]; then echo ok; fi",
+        );
+        assert!(!json
+            .contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        assert!(json.contains("\"name\":\"positional\""));
+        assert!(json.contains("\"operator\":\"||\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn test_lowerings_extglob_and_quoted_spaces_and_lt() {
+        // The test-expression lowering family:
+        // 1. extglob `==` (`[[ $x == !(*.min).js ]]` — bash matches the
+        //    pattern with extglob semantics) → an anchored regex literal
+        //    with the `s` flag (dotAll — the runtime's `*`/`?` match any
+        //    char incl. newlines): `^[\\s\\S]*(?<!(?:\\.min))\\.js$`.
+        // 2. `[[ "a" < "b" ]]` lexical `<` → a native JS string `<`.
+        // 3. `[[ "hello world" =~ ^hello ]]` — a quoted literal WITH a
+        //    space in the `=~` value operand → native regex `.test`.
+        // 4. `[[ ! -e /no/such/file ]]` — the `!` without a space before
+        //    the file-test flag → `!sh2.fileTest(...)`.
+        // 5. `[ "$(echo hello)" = "hello" ]` — a literal echo cmdsub
+        //    operand → the compile-time folded value.
+        let json = to_json(
+            "shopt -s extglob; f=file.js; [[ $f == !(*.min).js ]] && echo a; [[ \"a\" < \"b\" ]] && echo b; [[ \"hello world\" =~ ^hello ]] && echo c; [[ ! -e /no/such/file ]] && echo d; [ \"$(echo hello)\" = \"hello\" ] && echo e",
+        );
+        // no sh2.test DISPATCH anywhere (a regex-literal `.test()` method
+        // call has a different callee shape)
+        assert!(!json
+            .contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        // the extglob lookbehind regex
+        assert!(json.contains("(?<!"));
+        assert!(json.contains("\\\\.min"));
+        // the `s` flag on the regex literal
+        assert!(json.contains("\"flags\":\"s\""));
+        // the lexical `<`
+        assert!(json.contains("\"operator\":\"<\""));
+        // the quoted-space `=~` literal
+        assert!(json.contains("hello world"));
+        // the `!`-file-test
+        assert!(json.contains("\"name\":\"fileTest\""));
+        assert!(json.contains("\"operator\":\"!\""));
+        // the folded echo cmdsub literal
+        assert!(json.contains("\"value\":\"hello\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn dynamic_value_local_decl_lifts_to_let() {
+        // The `declare_sources_dyn` widening: `local x=<dynamic value>`
+        // whose value the runtime builtin receives pre-evaluated lifts to
+        // a native `let` — no sh2.builtin("local") dispatch, no store
+        // round-trip. Shapes: `$(wc -c < f)` (single-word capture — the
+        // one-element array unwraps to the word), `$(echo a b c)`
+        // (multi-word capture — the RAW capture text, bash does not
+        // word-split in assignment context), `${2:-d}` param ops,
+        // `$((x+y))` arith (String-wrapped — the store's string model),
+        // `$?` (the lastExit read) and dynamic interpolates.
+        let json = to_json(
+            "f() { local sz=$(wc -c < \"$f\"); local mw=$(echo a b c); local p=\"${2:-d}\"; local ar=$((x + y)); local ec=$?; local z=\"lit $y\"; echo \"$sz $mw $p $ar $ec $z\"; }; f",
+        );
+        // NO builtin LOCAL dispatch (the echo inside the function stays a
+        // sink-bound builtin — that is not this family)
+        assert!(!json.contains("\"value\":\"local\""));
+        // the single-word wc capture unwraps to the native value
+        assert!(json.contains("\"name\":\"size\"") || json.contains("\"name\":\"sz\""));
+        // the multi-word capture folds to the raw text (the capture
+        // twin's echo fold — "a b c", the no-split assignment value)
+        assert!(json.contains("\"value\":\"a b c\""));
+        // the `$?` value is the native lastExit read
+        assert!(json.contains("\"name\":\"lastExit\""));
+        // the arith value is String-wrapped for the string binding
+        assert!(json.contains("\"name\":\"String\""));
+        // the dynamic interpolate is a template literal value
+        assert!(json.contains("\"type\":\"TemplateLiteral\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn nocase_dynamic_literal_test_folds_when_invariant() {
+        // `shopt -s nocasematch` + `shopt -u nocasematch` both present →
+        // the shopt state is DYNAMIC, so runtime-dependent comparisons
+        // stay on the runtime test call — EXCEPT literal-vs-literal
+        // comparisons whose result is case-folding-invariant (`"abc" ==
+        // "abc"` is true under every state and folds natively; `"ABC"
+        // == "abc"` differs by state and must stay on the runtime).
+        let json = to_json(
+            "shopt -s nocasematch; [[ \"abc\" == \"abc\" ]] && echo a; [[ \"ABC\" == \"abc\" ]] && echo b; shopt -u nocasematch",
+        );
+        // the invariant comparison folded natively (the sh2.test DISPATCH
+        // that remains belongs to the `"ABC" == "abc"` case)
+        assert!(json.contains("\"value\":\"abc\""));
+        assert!(!json.contains("unsupported"));
+        // and the state-dependent one keeps the runtime call
+        let json2 = to_json(
+            "shopt -s nocasematch; [[ \"ABC\" == \"abc\" ]] && echo b; shopt -u nocasematch",
+        );
+        assert!(json2
+            .contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+    }
+
+    #[test]
+    fn status_equality_lowers_to_lastexit_read() {
+        // `[ "$?" = "0" ]` — the `$?` sigil is a status-field read, not
+        // a glob `?`: `String(sh2.lastExit) === "0"`, zero dispatches.
+        let json = to_json("if [ \"$?\" = \"0\" ]; then echo zero; fi");
+        assert!(!json
+            .contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"test\""));
+        assert!(json.contains("\"name\":\"lastExit\""));
+        assert!(json.contains("\"name\":\"String\""));
         assert!(!json.contains("unsupported"));
     }
 
@@ -1129,9 +6783,7 @@ mod tests {
     fn grep_with_regex_pattern_not_lifted() {
         // BRE metacharacters disqualify the lift: `grep 'a.c'` is a regex,
         // not a substring test — the pipeline must stay.
-        let json = to_json(
-            "if echo hi | grep a.c > /dev/null 2> /dev/null; then echo yes; fi",
-        );
+        let json = to_json("if echo hi | grep a.c > /dev/null 2> /dev/null; then echo yes; fi");
         assert!(!json.contains("contains"));
         assert!(json.contains("pipeline"));
     }
@@ -1143,6 +6795,145 @@ mod tests {
         let json = to_json("echo hi | grep hi > /dev/null 2> /dev/null; echo $?");
         assert!(!json.contains("contains"));
         assert!(json.contains("pipeline"));
+    }
+
+    #[test]
+    fn batch_ok_glob_for_lowers_to_forLoopBatch() {
+        // The sync-ok-loops transform's `batch_ok` verdict (the core
+        // request estree-20260805-045731): a top-level for loop whose body
+        // is sync-executable but whose GLOB iterable disqualifies the
+        // native for-of (the runtime must glob-expand) emits the
+        // checkpointed `await sh2.forLoopBatch(iter, body, 1024)` instead
+        // of the blocking `forLoopSync` — sync chunks of 1024 with a
+        // setImmediate yield, same flatten/glob/signal semantics.
+        let json = to_json("for f in *.sh; do echo \"$f\"; done");
+        assert!(json.contains("\"name\":\"forLoopBatch\""));
+        assert!(json.contains("\"value\":1024"));
+        assert!(json.contains("\"type\":\"AwaitExpression\""));
+        assert!(!json.contains("\"name\":\"forLoopSync\""));
+        assert!(!json.contains("\"type\":\"ForOfStatement\""));
+        // a PLAIN (glob-free) iterable keeps the native for-of — no batch
+        let json2 = to_json("for i in a b c; do echo $i; done");
+        assert!(json2.contains("\"type\":\"ForOfStatement\""));
+        assert!(!json2.contains("\"name\":\"forLoopBatch\""));
+        // a batch_ok loop whose body's capture is now SYNC (the *Sync
+        // family: `$(ls)` is a sync builtin → captureSync, no await) has
+        // an await-free body → the loop lifts to the NATIVE for-of (the
+        // best rung) — the old "awaiting body" premise only holds for
+        // genuinely async captures (spawns)
+        let json3 = to_json("for i in 1 2 3; do x=$(ls); done");
+        assert!(!json3.contains("\"name\":\"forLoopBatch\""));
+        assert!(!json3.contains("\"name\":\"forLoopSync\""));
+        assert!(json3.contains("\"type\":\"ForOfStatement\""));
+        assert!(json3.contains("\"name\":\"captureSync\""));
+        assert!(!json3.contains("\"name\":\"forLoop\""));
+        assert!(!json3.contains("unsupported"));
+        // a genuinely async capture (a spawn) keeps the async forLoop
+        let json5 = to_json("for i in 1 2 3; do x=$(awk '{print $1}'); done");
+        assert!(json5.contains("\"type\":\"AwaitExpression\""));
+        assert!(json5.contains("\"name\":\"forLoop\""));
+    }
+
+    #[test]
+    fn seq_range_for_lowers_to_native_for_statement() {
+        // `for i in $(seq 1 10000)` — the seq_range_for transform
+        // rewrites the captureWords iterable to a Range, and the emitter
+        // lowers it to a native JS counter loop
+        // (`for (let i = 1; i <= 10000; i++)`) — the hand-written ideal.
+        // No capture, no runtime loop call, no item list, no per-iteration
+        // coercion.
+        let json = to_json("for i in $(seq 1 3); do echo $i; done");
+        assert!(json.contains("\"type\":\"ForStatement\""));
+        assert!(json.contains("\"operator\":\"<=\""));
+        assert!(json.contains("\"operator\":\"++\""));
+        assert!(!json.contains("\"name\":\"captureWords\""));
+        assert!(!json.contains("\"name\":\"forLoop\""));
+        assert!(!json.contains("\"type\":\"ForOfStatement\""));
+        assert!(!json.contains("unsupported"));
+        // the sqrt1337 shape: the grep test lifts to String(...).includes
+        // AND the loop var lifts to a native number — `i * i`, no
+        // `(Number(i) || 0)` coercion
+        let json2 = to_json(
+            "for i in $(seq 1 10000); do if echo $((i*i)) | grep 1337 >/dev/null 2>/dev/null; then echo $i; fi; done",
+        );
+        assert!(json2.contains("\"type\":\"ForStatement\""));
+        assert!(json2.contains("\"name\":\"includes\""));
+        assert!(json2.contains("\"operator\":\"*\""));
+        assert!(
+            !json2.contains("\"name\":\"Number\""),
+            "no (Number(i) || 0) coercion"
+        );
+        assert!(!json2.contains("\"name\":\"captureWords\""));
+        assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn seq_range_for_conservative_cases() {
+        // 3-arg step forms (`seq A S B`) keep the runtime path — the
+        // capture is sync now (seq is a sync builtin → captureWordsSync)
+        let json = to_json("for i in $(seq 1 2 10); do echo $i; done");
+        assert!(json.contains("\"name\":\"captureWordsSync\""));
+        assert!(!json.contains("\"type\":\"ForStatement\""));
+        // leading-zero args (`seq 01 10` — GNU pads, bash arith is octal)
+        let json2 = to_json("for i in $(seq 01 10); do echo $i; done");
+        assert!(json2.contains("\"name\":\"captureWordsSync\""));
+        assert!(!json2.contains("\"type\":\"ForStatement\""));
+        // a body WRITE to the loop var keeps word-list semantics (a
+        // counter's i++ would read the body-written value)
+        let json3 = to_json("for i in $(seq 1 3); do i=99; echo $i; done");
+        assert!(json3.contains("\"name\":\"captureWordsSync\""));
+        assert!(!json3.contains("\"type\":\"ForStatement\""));
+        // a nested loop binding the SAME var keeps the OUTER on the word
+        // path (bash clobbers i in the body; a counter's i++ would read
+        // the body-written value). The INNER loop — whose own body never
+        // writes its var — still transforms independently.
+        let json4 =
+            to_json("for i in $(seq 1 2); do for i in $(seq 10 12); do echo $i; done; done");
+        assert!(
+            json4.contains("\"name\":\"captureWordsSync\""),
+            "outer keeps the word list"
+        );
+        assert!(
+            json4.contains("\"type\":\"ForOfStatement\""),
+            "outer is a word loop"
+        );
+        assert!(
+            json4.contains("\"type\":\"ForStatement\""),
+            "inner is a counter loop"
+        );
+    }
+
+    #[test]
+    fn seq_range_for_post_loop_read_stores_last_value() {
+        // the loop var read AFTER the loop stays store-backed — the
+        // store-sync elimination emits a pre-loop getVar into a temp, the
+        // per-iteration temp write, and a post-loop setVar of the LAST
+        // value (bash leaves $i = 10000). Since the store-to-native
+        // transform (core request shir-passes-store-to-native-20260806)
+        // the post-loop sync is a NATIVE write `i = __sh2_for_last_i` —
+        // the lifted binding IS the post-loop read target, so the store
+        // round-trip is pure overhead (the runtime would read the same
+        // binding back).
+        let json = to_json("for i in $(seq 1 3); do echo $i; done; echo $i");
+        assert!(json.contains("\"type\":\"ForStatement\""));
+        assert!(json.contains("\"name\":\"__sh2_for_last_i\""));
+        assert!(json.contains("\"type\":\"AssignmentExpression\""));
+        assert!(!json.contains("\"name\":\"setVar\""));
+        assert!(!json.contains("\"name\":\"captureWords\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn sync_ok_capture_loop_stays_native_for_of() {
+        // A cheap capture loop (`{1..1000}`, ~3ms ≤ the 200ms budget) is
+        // sync_ok: the existing sync gate emits the native for-of inside
+        // the capture arrow — no runtime loop call at all.
+        let json = to_json("x=$(for i in {1..1000}; do echo $i; done)\necho ${x:0:1}");
+        assert!(json.contains("\"type\":\"ForOfStatement\""));
+        assert!(!json.contains("\"name\":\"forLoop\""));
+        assert!(!json.contains("\"name\":\"forLoopSync\""));
+        assert!(!json.contains("\"name\":\"forLoopBatch\""));
+        assert!(!json.contains("unsupported"));
     }
 
     #[test]
@@ -1170,17 +6961,26 @@ mod tests {
         assert!(!json3.contains("unsupported"));
         let json4 = to_json("x=$(date)");
         assert!(json4.contains("\"type\":\"AssignmentExpression\""));
-        assert!(json4.contains("\"name\":\"capture\""));
+        // `$(date)` lifts to the native value twin of the sync builtin
+        // (sh2.date — no capture machinery, no spawn); a genuinely
+        // external capture keeps the await sh2.capture call.
+        assert!(json4.contains("\"name\":\"date\""));
+        assert!(!json4.contains("\"name\":\"capture\""));
         assert!(!json4.contains("\"name\":\"setVar\""));
     }
 
     #[test]
     fn if_then_else_lowers_to_if_statement() {
-        // `[ -f /tmp/x ]` is a file test — a native async lstat chain
-        // (no sh2.test string parse, no dispatch, no blocking lstatSync).
+        // `[ -f /tmp/x ]` is a file test — a sync `sh2.fileTest(flag,
+        // path)` runtime call (evalUnary minus the string parse/dispatch;
+        // no async lstat chain — the chain was the last await in
+        // otherwise-sync loop bodies), wrapped in the native-test status
+        // protocol (`sh2._g = ...`, `sh2.lastExit = ...`). No sh2.test
+        // string parse, no dispatch.
         let json = to_json("if [ -f /tmp/x ]; then echo yes; else echo no; fi");
         assert!(json.contains("\"type\":\"IfStatement\""));
-        assert!(json.contains("\"name\":\"lstat\""));
+        assert!(json.contains("\"name\":\"fileTest\""));
+        assert!(!json.contains("\"name\":\"lstat\""));
         assert!(!json.contains("\"name\":\"test\""));
         assert!(!json.contains("unsupported"));
     }
@@ -1194,34 +6994,63 @@ mod tests {
         assert!(!json.contains("\"name\":\"getVar\""));
         assert!(!json.contains("unsupported"));
         // a CAPTURE source lifts to a native binding; a read/write-builtin
-        // var (read/declare/local/export...) stays a store read
+        // var (read/declare/local/export...) stays a store read. The echo
+        // has ONE interpolated arg — the single-arg collapse emits the
+        // bare template, no join.
         let json2 = to_json("name=$(echo world)\necho \"Hello $name\"");
         assert!(!json2.contains("\"name\":\"getVar\""));
-        assert!(json2.contains("\"name\":\"join\""));
+        assert!(
+            !json2.contains("\"name\":\"join\""),
+            "single interpolated arg: no join"
+        );
+        assert!(json2.contains("\"type\":\"TemplateLiteral\""));
         assert!(!json2.contains("unsupported"));
         let json3 = to_json("read name\necho \"Hello $name\"");
-        assert!(json3.contains("\"name\":\"getVar\""));
+        assert!(json3.contains("\"name\":\"vars\""));
+        assert!(!json3.contains("\"name\":\"getVar\""));
         assert!(!json3.contains("unsupported"));
     }
 
     #[test]
     fn pipeline_lowers_to_pipeline_call() {
+        // `ls | grep foo` — every stage is a SYNC builtin (native ls, the
+        // sync grep builtin), so the await-free pipeline dispatches to the
+        // sync twin pipelineSync — identical fd0/fd1 stage swaps minus the
+        // per-stage promise (the *Sync family, see src/shir.rs
+        // SYNC_TWIN_CALLS).
         let json = to_json("ls | grep foo");
-        assert!(json.contains("\"name\":\"pipeline\""));
+        assert!(json.contains("\"name\":\"pipelineSync\""));
         assert!(json.contains("\"type\":\"ArrowFunctionExpression\""));
         assert!(!json.contains("unsupported"));
+        // an exec stage (a spawn) keeps the async pipeline
+        let json2 = to_json("ls | awk '{print $1}'");
+        assert!(json2.contains("\"name\":\"pipeline\""));
+        assert!(json2.contains("\"type\":\"AwaitExpression\""));
     }
 
     #[test]
     fn command_substitution_uses_await_capture() {
         // Unquoted $(...) word-splits: captureWords returns an arg array.
+        // `$(date)` — the captured command is a SYNC builtin, so the
+        // await-free body dispatches to the sync twin captureWordsSync
+        // (the inner spawn is already gone — the sync builtin twin runs
+        // inside either way).
         let json = to_json("echo $(date)");
-        assert!(json.contains("\"type\":\"AwaitExpression\""));
-        assert!(json.contains("\"name\":\"captureWords\""));
+        assert!(json.contains("\"name\":\"captureWordsSync\""));
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(json.contains("\"value\":\"date\""));
         assert!(!json.contains("unsupported"));
-        // Quoted "$(...)" stays a plain template capture (no word splitting).
-        let json2 = to_json("echo \"$(date)\"");
-        assert!(json2.contains("\"name\":\"capture\""));
+        // `$(ls)` is sync-builtin too (native ls) → captureSync, no await
+        let json3 = to_json("echo $(ls)");
+        assert!(!json3.contains("\"type\":\"AwaitExpression\""));
+        assert!(json3.contains("\"name\":\"captureWordsSync\""));
+        // a genuinely async captured command (a spawn) keeps the async
+        // capture machinery: captureWords for unquoted, capture for quoted.
+        let json4 = to_json("echo $(awk '{print $1}')");
+        assert!(json4.contains("\"type\":\"AwaitExpression\""));
+        assert!(json4.contains("\"name\":\"captureWords\""));
+        let json2 = to_json("echo \"$(ls)\"");
+        assert!(json2.contains("\"name\":\"captureSync\""));
         assert!(!json2.contains("captureWords"));
     }
 
@@ -1244,20 +7073,52 @@ mod tests {
         // `String(Math.floor(Math.sqrt(Number(...))))`. No spawn, no
         // pipeline/capture machinery, no async.
         let json = to_json("echo $(echo \"2+3\" | bc)");
-        assert!(json.contains("\"value\":\"5\\n\""), "static bc program folds");
+        assert!(
+            json.contains("\"value\":\"5\\n\""),
+            "static bc program folds"
+        );
         assert!(!json.contains("\"name\":\"capture\""));
         assert!(!json.contains("\"name\":\"pipeline\""));
         assert!(!json.contains("\"name\":\"exec\""));
         assert!(!json.contains("unsupported"));
-        // the runtime-var sqrt form (store-bound $n → sh2.getVar)
+        // the runtime-var sqrt form (store-bound $n → the native store
+        // read — the read-builtin write is a plain setVar, exact as a
+        // property read)
         let json2 = to_json("read n; echo \"$(echo \"sqrt($n)\" | bc)\"");
         assert!(json2.contains("\"name\":\"sqrt\""), "native sqrt expr");
         assert!(json2.contains("\"name\":\"floor\""));
-        assert!(json2.contains("\"name\":\"getVar\""));
+        assert!(json2.contains("\"name\":\"vars\""));
+        assert!(!json2.contains("\"name\":\"getVar\""));
         assert!(!json2.contains("\"name\":\"pipeline\""));
         assert!(!json2.contains("\"name\":\"capture\""));
         assert!(!json2.contains("\"name\":\"exec\""));
         assert!(!json2.contains("unsupported"));
+        // the general var-operand form (`$sum + $i` — the in-loop bc
+        // capture): native `String(Number(sum) + Number(i))`, no spawn
+        let json3 =
+            to_json("sum=0; for i in 1 2 3; do sum=$(echo \"$sum + $i\" | bc); done; echo $sum");
+        assert!(json3.contains("\"name\":\"Number\""), "native var arith");
+        assert!(json3.contains("\"operator\":\"+\""));
+        assert!(!json3.contains("\"name\":\"pipeline\""));
+        assert!(!json3.contains("\"name\":\"capture\""));
+        assert!(!json3.contains("\"name\":\"exec\""));
+        assert!(
+            !json3.contains("\"name\":\"forLoop\""),
+            "the loop goes native for-of"
+        );
+        assert!(!json3.contains("unsupported"));
+        // `/` lowers to Math.trunc with a zero-divisor guard (bc aborts
+        // with no stdout) — the guard is a `divisor === 0` comparison
+        let json4 = to_json("a=7; b=2; echo $(echo \"$a / $b\" | bc)");
+        assert!(json4.contains("\"name\":\"trunc\""), "scale-0 division");
+        assert!(json4.contains("\"operator\":\"===\""), "zero-divisor guard");
+        assert!(!json4.contains("\"name\":\"exec\""));
+        assert!(!json4.contains("unsupported"));
+        // `^` is bc POWER but bash-arith XOR — the var form must NOT
+        // mis-parse it: the spawn stays
+        let json5 = to_json("a=2; echo $(echo \"$a ^ 3\" | bc)");
+        assert!(json5.contains("\"name\":\"exec\""), "^ keeps the spawn");
+        assert!(!json5.contains("unsupported"));
     }
 
     #[test]
@@ -1268,8 +7129,7 @@ mod tests {
         assert!(!json.contains("\"type\":\"SwitchStatement\""));
         assert!(!json.contains("\"name\":\"caseMatch\""));
         assert!(json.contains("\"type\":\"IfStatement\""));
-        assert!(json.contains("\"name\":\"includes\"")
-            || json.contains("\"operator\":\"===\""));
+        assert!(json.contains("\"name\":\"includes\"") || json.contains("\"operator\":\"===\""));
         assert!(!json.contains("unsupported"));
     }
 
@@ -1282,9 +7142,17 @@ mod tests {
         assert!(!json.contains("\"name\":\"redirect\""));
         assert!(!json.contains("\"name\":\"builtin\""));
         assert!(!json.contains("unsupported"));
-        // non-echo bodies keep the runtime redirect
+        // non-echo bodies keep the runtime redirect — `ls` is a sync
+        // builtin and the FILE target is sync-capable in the runtime's
+        // `redirectSync` twin (every _applyRedirectSpecs mode is
+        // synchronous — fs.existsSync/openSync/writeFileSync; the
+        // "async fs bridge" throw the fd-dup-only rule described never
+        // existed in sh2-namespace.mjs — see redirect_specs_sync_ok),
+        // so the await-free body + literal target lowers to the sync
+        // twin: no per-call promise, no microtask.
         let json2 = to_json("ls > out.txt");
-        assert!(json2.contains("\"name\":\"redirect\""));
+        assert!(json2.contains("\"name\":\"redirectSync\""));
+        assert!(!json2.contains("\"name\":\"redirect\""));
         // Property keys serialize as {key: Identifier{name}, value: Literal}.
         assert!(json2.contains("\"name\":\"mode\""));
         assert!(json2.contains("\"value\":\"w\""));
@@ -1292,6 +7160,31 @@ mod tests {
         assert!(json2.contains("\"value\":1"));
         assert!(json2.contains("\"type\":\"ObjectExpression\""));
         assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn file_target_redirect_lowers_to_sync_twin() {
+        // `cat file.txt > out.txt` — a sync builtin body with a literal
+        // FILE target lowers to the runtime's `redirectSync` twin (the
+        // eligibility audit: every _applyRedirectSpecs mode is
+        // synchronous — existsSync/openSync/writeFileSync — so the
+        // await-free body is the only gate; see
+        // redirect_specs_sync_ok).
+        let json = to_json("cat file.txt > out.txt");
+        assert!(json.contains("\"name\":\"redirectSync\""));
+        assert!(!json.contains("\"name\":\"redirect\""));
+        // a DYNAMIC target that lowers await-free (the `$(pwd)` twin is
+        // a native `sh2.cwd` read — no capture) also qualifies.
+        let json2 = to_json("ls > \"$(pwd)/x\"");
+        assert!(json2.contains("\"name\":\"redirectSync\""));
+        assert!(!json2.contains("\"name\":\"redirect\""));
+        // a target whose cmdsub is a real capture (`$(cat ...)` — an
+        // await in the specs) keeps the async `redirect` path: the sync
+        // twin cannot wait for the capture before installing the spec.
+        let json3 = to_json("ls > \"$(cat /etc/hostname)\"");
+        assert!(json3.contains("\"name\":\"redirect\""));
+        assert!(!json3.contains("\"name\":\"redirectSync\""));
+        assert!(!json3.contains("unsupported"));
     }
 
     #[test]
@@ -1304,11 +7197,23 @@ mod tests {
 
     #[test]
     fn heredoc_lowers_to_redirect_with_body() {
+        // `cat << 'EOF'` — the state-free heredoc cat fold (see
+        // try_native_cat_heredoc): a literal quoted heredoc + builtin-cat
+        // pair at the default stdout sink collapses to a native write of
+        // the heredoc content — no redirect spec object, no dispatch.
         let json = to_json("cat << 'EOF'\nhi there\nEOF");
-        assert!(json.contains("\"value\":\"heredoc\""));
         assert!(json.contains("hi there"));
-        assert!(json.contains("\"value\":false"));
+        assert!(!json.contains("\"value\":\"heredoc\""));
+        assert!(json.contains("\"name\":\"stdout\""));
         assert!(!json.contains("unsupported"));
+        // an interpolating heredoc (`$` in the UNQUOTED body) stays on
+        // the runtime redirect + builtin pair (the quoted `<<'EOF'` form
+        // is verbatim by construction and folds)
+        let json2 = to_json("cat << EOF\nhi $name\nEOF");
+        assert!(json2.contains("\"value\":\"heredoc\""));
+        assert!(json2.contains("\"name\":\"builtin\""));
+        assert!(json2.contains("\"value\":\"cat\""));
+        assert!(!json2.contains("unsupported"));
     }
 
     #[test]
@@ -1325,9 +7230,29 @@ mod tests {
 
     #[test]
     fn subshell_lowers_to_subshell_call() {
+        // `(echo hi)` — the body is state-free (a native write + lastExit),
+        // so the subshell collapses to a bare IIFE of the same body +
+        // `sh2.lastExit === 0` (the runtime's exact return protocol) —
+        // no state copy/restore, no dispatch.
         let json = to_json("(echo hi)");
-        assert!(json.contains("\"name\":\"subshell\""));
+        assert!(!json.contains("\"name\":\"subshellSync\""));
+        assert!(json.contains("\"name\":\"lastExit\""));
         assert!(!json.contains("unsupported"));
+        // a state-WRITING body (store write) keeps the sync twin
+        let json1 = to_json("(x=1)");
+        assert!(json1.contains("\"name\":\"subshellSync\""));
+        assert!(!json1.contains("unsupported"));
+        // a spawn inside keeps the async subshell
+        let json2 = to_json("(awk '{print $1}')");
+        assert!(json2.contains("\"name\":\"subshell\""));
+        assert!(json2.contains("\"type\":\"AwaitExpression\""));
+        // a state-free body CONTAINING self-contained machinery (a
+        // pipeline of emits) folds too — the pipeline's fd swaps are
+        // restored in its own finally, identical under the fold
+        let json3 = to_json("(echo a | grep a)");
+        assert!(!json3.contains("\"name\":\"subshellSync\""));
+        assert!(!json3.contains("\"name\":\"pipelineSync\""));
+        assert!(!json3.contains("unsupported"));
     }
 
     #[test]
@@ -1347,9 +7272,22 @@ mod tests {
         assert!(json.contains("\"name\":\"builtin\""));
         assert!(json.contains("FOO"));
         assert!(!json.contains("unsupported"));
+        // `grep` is a native sync builtin now (the file/stdin mini-grep),
+        // so the env-carrying form also lowers to the sync twin; a name
+        // OUTSIDE the sync-builtin set keeps the async exec call.
         let json2 = to_json("FOO=bar grep x");
-        assert!(json2.contains("\"name\":\"exec\""));
+        assert!(json2.contains("\"name\":\"builtin\""));
         assert!(json2.contains("FOO"));
+        // `ls` is a native sync builtin too (the GNU-faithful native
+        // listing — no spawn), so the env-carrying form lowers to the
+        // sync twin as well; a genuinely external name (awk) keeps the
+        // async exec call.
+        let json3 = to_json("FOO=bar ls x");
+        assert!(json3.contains("\"name\":\"builtin\""));
+        assert!(json3.contains("FOO"));
+        let json4 = to_json("FOO=bar awk x");
+        assert!(json4.contains("\"name\":\"exec\""));
+        assert!(json4.contains("FOO"));
     }
 
     #[test]
@@ -1387,14 +7325,125 @@ mod tests {
         assert!(json.contains("\"operator\":\"++\""));
         // a non-numeric source blocks the lift too (the runtime coerces
         // `i=foo` to 0 via the typeset attribute — a native binding would
-        // desync from the store)
+        // desync from the store). The WRITE stays sh2.setVar (the int
+        // coercion); the READ is the native store read (getVar's plain
+        // path for an intVars name is the vars store — the attribute only
+        // alters the write side).
         let json3 = to_json("typeset -i i\ni=foo\n((i++))");
         assert!(json3.contains("\"name\":\"setVar\""));
-        assert!(json3.contains("\"name\":\"getVar\""));
+        assert!(!json3.contains("\"name\":\"getVar\""));
         // the same lift works through `let` statements without any declare
         let json4 = to_json("((i++))");
         assert!(!json4.contains("\"name\":\"setVar\""));
         assert!(!json4.contains("\"name\":\"getVar\""));
+    }
+
+    #[test]
+    fn store_bound_arith_assign_skips_redundant_outer_write() {
+        // `(( i += 2 ))` with a STORE-BOUND target (the dynamic-key
+        // subscript `options["$key"]` keeps `i` store-bound): the
+        // arith-assign expr lowers to `(sh2.setVar(n, String(v)),
+        // <read-back>)` — the inner setVar is the arith's own store
+        // write and the read-back re-reads it, so the old emission's
+        // OUTER statement setVar re-wrote the same value
+        // (`setVar("i", (setVar("i", ...), ...))`). The outer call is
+        // dropped; the sequence keeps a trailing `true` (the statement
+        // value the errexit guard consumes — the old outer setVar
+        // returned true).
+        let src = "complex_function() {\n\
+            local -a args=(\"$@\")\n\
+            local -A options=()\n\
+            local i=0\n\
+            while (( i < ${#args[@]} )); do\n\
+                local key=\"${args[i]#--}\"\n\
+                options[\"$key\"]=\"true\"\n\
+                (( i += 2 ))\n\
+            done\n\
+            echo \"Processed ${#options[@]} options\"\n\
+        }\n\
+        complex_function --flag1 --option1=value1 -abc";
+        let json = to_json(src);
+        // the `(( i += 2 ))` writes the store ONCE (the inner arith
+        // write); the redundant outer setVar is gone
+        assert_eq!(json.matches("\"name\":\"setVar\"").count(), 2);
+        assert!(!json.contains("\"value\":\"i\"},{\"type\":\"SequenceExpression\""));
+    }
+
+    #[test]
+    fn join_of_array_slice_chain_lowers_native() {
+        // `${arr[@]:0:2}` in a template: the IR is `join(param("slice",
+        // "arr", "0", "2"))` — for a provably-array-or-unset name
+        // (array_only_written — the same proof the param slice emission
+        // uses to pick its array path) the value is an array (or "" for
+        // unset, and `[].slice().join(" ")` is "" — identical), so the
+        // runtime join dispatch collapses to the native `.join(" ")`
+        // method on the slice chain.
+        let json = to_json("arr=(a b c d)\necho \"${arr[@]:0:2}\"");
+        // no sh2.join dispatch
+        assert!(!json.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"join\""));
+        // the native chain: arr.slice(...).join(" ") — the array
+        // itself (lowerNativeArrays replaced arrayItems with the bare
+        // binding: the array is provably initialized at top level)
+        assert!(!json.contains("\"name\":\"arrayItems\""));
+        assert!(json.contains("\"name\":\"slice\""));
+        assert!(json.contains("\"name\":\"join\""));
+        assert!(json.contains("\"value\":\" \""));
+        // a DYNAMIC plain-name slice (never-written name — the runtime
+        // may see a scalar) keeps the runtime join
+        let json2 = to_json("echo \"${s:0:2}\"");
+        assert!(json2.contains("\"name\":\"sh2\"},\"property\":{\"type\":\"Identifier\",\"name\":\"join\""));
+    }
+
+    #[test]
+    fn baked_subscript_read_uses_native_key() {
+        // `${map[$k]}` with a lifted `k` (the loop var): the baked-text
+        // store read (`sh2.getVar("map[$k]")` — the runtime resolves
+        // `$k` from the STORE) rewrites to `sh2.arrayIndex("map", k)`
+        // with the native binding — no store sync, no store round-trip.
+        // SH2_ASSUME_SUBSCRIPT_KEYS-gated (see baked_subscript_read).
+        let json = to_json("declare -A map\nmap[foo]=bar\nfor k in \"${!map[@]}\"; do echo \"${map[$k]}\"; done");
+        assert!(json.contains("\"name\":\"arrayIndex\""));
+        assert!(json.contains("\"value\":\"map\""));
+        // no per-iteration store sync of the lifted loop var
+        assert!(!json.contains("\"value\":\"k\""));
+        assert!(!json.contains("\"name\":\"getVar\""));
+        // `[@]`/`[*]` whole-array forms and PIPESTATUS never rewrite
+        // (the join / pipeStatuses arms are getVar-special)
+        let json2 = to_json("declare -A map\nmap[a]=1\necho \"${map[*]}\"\necho \"${PIPESTATUS[0]}\"");
+        assert!(json2.contains("\"name\":\"getVar\""));
+    }
+
+    #[test]
+    fn arith_len_refs_lower_let_and_while_native() {
+        // The `${#name[@]}` / `${#name}` arith-length refs: the runtime's
+        // evalArith arms are `Number(sh.arrayLen(name)) || 0` and
+        // `sh.getVar(name).length` — EXACT native leafs (the length
+        // substitution always yields a digit string, so no unset-var
+        // deletion gate applies; no SH2_ASSUME option needed). A
+        // `(( ${#arr[@]} > 5 ))` condition lowers to the native
+        // comparison: no `let` builtin dispatch, no per-iteration text
+        // parse.
+        let json = to_json("(( ${#arr[@]} > 5 ))");
+        assert!(!json.contains("\"name\":\"builtin\""));
+        assert!(json.contains("\"name\":\"arrayLen\""));
+        assert!(json.contains("\"operator\":\">\""));
+        // `${#s}` — the scalar length is the value's `.length` (the
+        // store read, not a getVar call, for a plain store name)
+        let json2 = to_json("s=abc; (( ${#s} > 2 ))");
+        assert!(!json2.contains("\"name\":\"builtin\""));
+        assert!(!json2.contains("\"name\":\"getVar\""));
+        assert!(json2.contains("\"name\":\"length\""));
+        // a statement-level `while (( i < ${#args[@]} ))` lowers to the
+        // NATIVE while machinery (__sh2_loop_ran protocol) with the
+        // arrayLen cond — no runtime loop, no let dispatch
+        let json3 = to_json("while (( i < ${#args[@]} )); do (( i++ )); done");
+        assert!(json3.contains("__sh2_loop_ran"));
+        assert!(!json3.contains("\"name\":\"builtin\""));
+        assert!(json3.contains("\"name\":\"arrayLen\""));
+        // `${#arr[i]}` — the ELEMENT length (runtime-only shape): keeps
+        // the runtime let dispatch
+        let json4 = to_json("(( ${#arr[i]} > 5 ))");
+        assert!(json4.contains("\"name\":\"builtin\""));
     }
 
     #[test]
@@ -1406,11 +7455,163 @@ mod tests {
         assert!(!json.contains("\"name\":\"shopt\""));
         assert!(!json.contains("unsupported"));
         // the body is `echo $i` — a sync builtin call (no await) → the
-        // c-style loop lowers to the SYNC runtime twin.
+        // C-style loop lowers through the A1 ForInit to the NATIVE while
+        // machinery (core request zsh-sh-go-20260813-153215: the shell
+        // path now emits ForInit, the strip pass lowers it to
+        // init + while(cond){body; step}, and the while cond is the
+        // natively-lowered `let "i<3"` — a plain WhileStatement, no
+        // runtime loop call at all).
         let json2 = to_json("for ((i=0; i<3; i++)); do echo $i; done");
-        assert!(json2.contains("\"name\":\"cstyleForSync\""));
+        assert!(!json2.contains("\"name\":\"cstyleForSync\""));
         assert!(!json2.contains("\"name\":\"cstyleFor\""));
+        assert!(json2.contains("WhileStatement"));
         assert!(!json2.contains("unsupported"));
+    }
+
+    #[test]
+    fn param_default_cmdsub_defaults_lower_native() {
+        // The ${VAR:-$(cmd)} family: the baked-text default the runtime
+        // would run through expandWord (spawning `bash -c` for the
+        // cmdsub) lowers to native reads — `$(pwd)` → `sh2.cwd` (a
+        // property read, no call), `$(whoami)` → the value twin. The
+        // primary read is one `sh2.getVar` (the `_g` single-eval wrap).
+        let json = to_json("echo \"${PWD:-$(pwd)}\"");
+        // the primary read is the runtime special twin `sh2.cwd` (the
+        // `_g` single-eval wrap — the runtime's getVar("PWD") answers
+        // `this.cwd`, never the vars/env store)
+        assert!(json.contains("\"name\":\"cwd\""));
+        assert!(json.contains("\"name\":\"_g\""));
+        assert!(!json.contains("\"name\":\"param\""));
+        assert!(!json.contains("unsupported"));
+        let json2 = to_json("echo \"${USER:-$(whoami)}\"");
+        // USER is env-resident (never written): the primary read is the
+        // native store read `sh2.vars.USER ?? env.USER ?? ''` (the
+        // runtime's exact plain path)
+        assert!(json2.contains("\"name\":\"USER\""));
+        assert!(json2.contains("\"name\":\"whoami\""));
+        assert!(!json2.contains("\"name\":\"param\""));
+        // the tilde default `${HOME:-$(echo ~)}` is the native store
+        // read (the runtime's tilde rule is getVar("HOME") — vars then
+        // env fallback — the property read is the same value without
+        // the dispatch)
+        let json3 = to_json("echo \"${HOME:-$(echo ~)}\"");
+        assert!(json3.contains("\"name\":\"HOME\""));
+        assert!(!json3.contains("\"name\":\"param\""));
+        assert!(!json3.contains("unsupported"));
+    }
+
+    #[test]
+    fn nested_param_default_chain_lowers_to_getvar_ternaries() {
+        // ${var:-${default:-${fallback:-$(echo "computed")}}} — the
+        // nested chain: the runtime's expandWord would spawn bash for
+        // the $(echo) cmdsub; the native is a getVar ternary chain (one
+        // per level, `_g`-scratched) with the literal echo default. No
+        // param call, no spawn.
+        let json = to_json("echo \"${var:-${default:-${fallback:-$(echo \"computed\")}}}\"");
+        // the never-written `var` level folds to the lift-known constant
+        // "" (its store read); the live levels read via the native
+        // store read (env-fallback property reads — no getVar dispatch)
+        assert!(!json.contains("\"name\":\"getVar\""));
+        assert!(json.contains("computed"));
+        assert!(!json.contains("\"name\":\"param\""));
+        assert!(!json.contains("unsupported"));
+        // the array-slice default ${default[@]:0:2} → the native store
+        // read (exact for unset/scalar operands — the documented
+        // assumption); the ${array[${index}]} PRIMARY stays a runtime
+        // getVar (a subscript name — not a plain ident)
+        let json2 = to_json("echo \"${array[${index}]:-${default[@]:0:2}}\"");
+        assert_eq!(json2.matches("\"name\":\"getVar\"").count(), 1);
+        assert!(!json2.contains("\"name\":\"param\""));
+        // a ${NAME} plain-ref default lowers to the native store read too
+        let json3 = to_json("echo ${MOUNTPOINT:-${NAME}}");
+        // the never-written MOUNTPOINT level folds to the constant ""
+        // (its store read); the live NAME level reads natively
+        assert!(!json3.contains("\"name\":\"getVar\""));
+        assert!(!json3.contains("\"name\":\"param\""));
+    }
+
+    #[test]
+    fn param_error_question_lowers_to_stderr_write_and_exit() {
+        // ${x:?msg} — the unset/empty error: the native is the runtime's
+        // exact `process.stderr.write("bash: x: msg\n"); process.exit(1)`
+        // sequence (the corpus gate ignores stderr; the exit code is the
+        // verdict). A never-written var folds to its lift-known constant
+        // "" (the error path fires); a WRITTEN var reads via getVar (the
+        // `_g` single-eval wrap).
+        let json = to_json("echo \"${var:?error message}\"");
+        assert!(json.contains("process"));
+        assert!(json.contains("stderr"));
+        assert!(json.contains("\"name\":\"exit\""));
+        assert!(!json.contains("\"name\":\"param\""));
+        assert!(!json.contains("unsupported"));
+        // empty message → the `name: parameter null or not set` default
+        let json2 = to_json("echo \"${var:?}\"");
+        assert!(json2.contains("parameter null or not set"));
+        assert!(!json2.contains("\"name\":\"param\""));
+        // a STORE-BOUND var (read-builtin — never lifted) keeps the
+        // LIVE read (the `_g` single-eval wrap): the native store read
+        // `sh2.vars.v ?? env ?? ''` — the runtime's exact plain path
+        // (a getVar CALL would be a dispatch)
+        let json4 = to_json("read v <<< \"x\"\necho \"${v:?err}\"");
+        assert!(json4.contains("\"name\":\"vars\""));
+        assert!(!json4.contains("\"name\":\"param\""));
+        let json5 = to_json("v=1\necho \"${v:?err}\"");
+        assert!(!json5.contains("\"name\":\"getVar\""));
+        assert!(!json5.contains("\"name\":\"param\""));
+        // a DYNAMIC message (expandWord would expand the ref) keeps the
+        // runtime param call
+        let json3 = to_json("echo \"${var:?$other}\"");
+        assert!(json3.contains("\"name\":\"param\""));
+    }
+
+    #[test]
+    fn param_assign_default_writes_store_natively() {
+        // ${maybe:=default} — the store `:=` write: the runtime's
+        // getVar + expandWord + setVar lowers to the same getVar (the
+        // `_g` wrap) + a REAL sh2.setVar call (the store authority) +
+        // the value — no dispatch, no text parse. The unset-clean name
+        // takes the native plain-object store paths everywhere: the
+        // primary read is `sh2.vars.maybe ?? env ?? ''` and the write
+        // is `sh2.vars.maybe = "default"` (the runtime setVar's plain
+        // path — no attributes, no env sync).
+        let json = to_json("unset maybe\necho \"${maybe:=default}\"");
+        assert!(json.contains("\"name\":\"vars\""));
+        assert!(!json.contains("\"name\":\"getVar\""));
+        assert!(!json.contains("\"name\":\"setVar\""));
+        assert!(!json.contains("\"name\":\"param\""));
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn export_unset_and_store_declare_lower_to_native_store_paths() {
+        // `export NAME=VALUE` — the runtime builtin's exact writes
+        // (vars + process.env + the exported set) minus the dispatch:
+        // `(sh2.vars.DEBUG = "1", process.env.DEBUG = "1",
+        // sh2.exported.add("DEBUG"), sh2.lastExit = 0)` — no builtin
+        // call. The bare `export NAME` form gets the conditional env
+        // sync (the runtime's `a in vars` check).
+        let json = to_json("export DEBUG=1");
+        assert!(json.contains("\"name\":\"exported\""));
+        assert!(json.contains("\"name\":\"DEBUG\""));
+        assert!(!json.contains("\"name\":\"builtin\""));
+        let json2 = to_json("SHELL_VAR=hello\nexport SHELL_VAR");
+        assert!(json2.contains("\"name\":\"exported\""));
+        assert!(!json2.contains("\"name\":\"builtin\""));
+        // `unset NAME` — the two native deletes (vars + env); a
+        // later read is the native plain-object store read (the unset
+        // name carries no attributes — the store access is exact).
+        let json3 = to_json("unset x\necho \"$x\"");
+        assert!(json3.contains("\"operator\":\"delete\""));
+        assert!(json3.contains("\"name\":\"vars\""));
+        assert!(!json3.contains("\"name\":\"builtin\""));
+        assert!(!json3.contains("\"name\":\"getVar\""));
+        // a STORE-BOUND `local i=0` (the var stays store-bound via the
+        // baked-subscript mark) — the native `sh2.vars.i = "0"` store
+        // write, no builtin dispatch (the lifted-name twin keeps the
+        // identifier write).
+        let json4 = to_json("f() { local i=0; echo ${arr[$i]}; }; f");
+        assert!(json4.contains("\"name\":\"vars\""));
+        assert!(!json4.contains("\"value\":\"local\""));
     }
 
     #[test]
@@ -1523,13 +7724,21 @@ mod tests {
 
     #[test]
     fn unterminated_param_expansion_drops_command() {
-        // `echo "${var:?unset"` (missing closing `}`) is a bash parse error:
-        // the lexer artifact word must never print. The command lowers to
-        // nothing (BlankLine) — an empty program, matching bash's abort.
-        let json = to_json("echo \"${var:?unset\"");
-        assert!(!json.contains("unset"));
-        assert!(!json.contains("\"name\":\"exec\""));
-        assert!(!json.contains("\"name\":\"unsupported\""));
+        // `echo "${var:?unset"` (missing closing `}`) is a bash parse error
+        // (exit 2, nothing runs) — the parser now REJECTS the unterminated
+        // expansion outright (the old literal-`${` artifact + drop-the-
+        // command transform silently exited 0; the CLI's parse-error
+        // fallback reproduces bash's verdict). The artifact detection stays
+        // for other producers (heredoc re-parses), but the canonical parse
+        // must fail.
+        let err = crate::Parser::new("echo \"${var:?unset\"")
+            .parse()
+            .expect_err("unterminated `${` must be a parse error");
+        assert!(
+            format!("{}", err).contains("unterminated"),
+            "unexpected error: {}",
+            err
+        );
         // Legit single-quoted `${x}` text (closing brace present) survives.
         let json2 = to_json("echo '${x}'");
         assert!(json2.contains("${x}"));
@@ -1539,6 +7748,53 @@ mod tests {
         let json3 = to_json("echo '${'");
         assert!(json3.contains("${"));
         assert!(!json3.contains("\"name\":\"unsupported\""));
+    }
+
+    #[test]
+    fn env_assignment_with_redirect_keeps_env_on_command() {
+        // frontends-ifs: `IFS=, read a b c <<< "1,2,3"` — the env vars
+        // must scope the actual command (a redirect-wrapped simple
+        // command), NOT split into a sibling `true` no-op (the old
+        // behavior left read without the env — the read fell back to
+        // whitespace IFS).
+        let json = to_json("IFS=, read a b c <<< \"1,2,3\"");
+        // the redirect wraps the env-carrying read (the env stays on the
+        // command; the no-op `true` split is gone) — a herestring target
+        // is an in-memory string target, sync-capable in the runtime
+        // twin, so the await-free body lowers to `redirectSync` (the
+        // fd-dup-only eligibility rule was retired — see
+        // redirect_specs_sync_ok)
+        assert!(json.contains("\"name\":\"redirectSync\""));
+        assert!(!json.contains("\"name\":\"redirect\""));
+        assert!(json.contains("\"name\":\"builtin\""));
+        assert!(json.contains("\"value\":\"read\""));
+        // the env object's property key is an Identifier (prop() renders
+        // `key: {type: Identifier, name: IFS}`)
+        assert!(json.contains("\"name\":\"IFS\""));
+        assert!(json.contains("\"value\":\",\""));
+        // the env must NOT land on a separate `true` command
+        assert!(!json.contains("\"value\":\"true\""));
+        assert!(!json.contains("\"name\":\"unsupported\""));
+    }
+
+    #[test]
+    fn local_scope_shadows_outer_binding() {
+        // fish-sh-go local-scope request: `local v=1` inside a function
+        // must NOT leak into the outer v (the runtime's flat store model
+        // leaks; the per-function local lift emits a native `let` inside
+        // the define arrow). The emitted function body must contain a
+        // `let v` (block-scope shadow), and the module binding must NOT
+        // be the write target of the decl.
+        let json = to_json("f() { local v=1; echo \"inner=$v\"; }; v=2; f; echo \"outer=$v\"");
+        assert!(json.contains("\"kind\":\"let\""));
+        assert!(json.contains("\"name\":\"v\""));
+        // the first decl inside the arrow is a `let v = 1` VariableDeclaration
+        assert!(json.contains("\"type\":\"VariableDeclaration\""));
+        // local-lifted arith: `local i=3; ((i++))` writes the native
+        // binding, not the store (no setVar for the incdec)
+        let json2 = to_json("g() { local i=3; ((i++)); echo \"i=$i\"; }; g");
+        assert!(!json2.contains("\"name\":\"setVar\""));
+        assert!(json2.contains("\"name\":\"i\""));
     }
 
     #[test]
@@ -1553,14 +7809,737 @@ mod tests {
         assert!(!json.contains("\"name\":\"unsupported\""));
         assert!(!json.contains("\"value\":\"unsupported\""));
         assert!(!json.contains("\"name\":\"trimCapture\""));
-        assert!(json.contains("\"name\":\"exec\""));
+        // diff is a native sync builtin now (the GNU-faithful gnuDiff —
+        // no spawn), so the producer-capture form lowers to the sync
+        // builtin dispatch; an external name (awk) keeps the async exec.
+        let jsona = to_json("awk <(echo a) <(echo b)");
+        assert!(jsona.contains("\"name\":\"exec\""));
         // mapfile is stdin-only: no appended path argument, still no gate leak
         // (the producer's capture is lowered as a here-string fd-0 redirect
         // feeding the sync mapfile builtin — no async capture machinery).
         let json2 = to_json("mapfile -t lines < <(printf 'x\\ny\\n')");
         assert!(!json2.contains("\"name\":\"unsupported\""));
         assert!(!json2.contains("\"value\":\"unsupported\""));
-        assert!(json2.contains("\"name\":\"redirect\""));
+        // the producer + mapfile body are both sync builtins and the
+        // process-substitution fd-0 target is a here-string in-memory
+        // target — sync-capable in the runtime twin, so the redirect
+        // lowers to the sync path (the fd-dup-only rule was retired —
+        // see redirect_specs_sync_ok)
+        assert!(json2.contains("\"name\":\"redirectSync\""));
+        assert!(!json2.contains("\"name\":\"redirect\""));
         assert!(json2.contains("\"name\":\"builtin\""));
+    }
+}
+
+#[cfg(test)]
+mod last_exit_hoist_tests {
+    use super::*;
+    use crate::Parser;
+
+    fn to_json(input: &str) -> String {
+        let commands = Parser::new(input).parse().unwrap();
+        serde_json::to_string(&ast_to_estree(&commands)).unwrap()
+    }
+
+    fn body(json: &str) -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        v["body"].clone()
+    }
+
+    fn lastexit_count(v: &serde_json::Value) -> usize {
+        serde_json::to_string(v)
+            .unwrap()
+            .matches("\"name\":\"lastExit\"")
+            .count()
+    }
+
+    /// `sh2.lastExit = <number>` at the END of the program body?
+    fn last_stmt_is_lastexit_write(json: &str) -> bool {
+        let b = body(json);
+        let stmts = b.as_array().unwrap();
+        let Some(last) = stmts.last() else { return false };
+        last["expression"]["type"] == "AssignmentExpression"
+            && last["expression"]["left"]["object"]["name"] == "sh2"
+            && last["expression"]["left"]["property"]["name"] == "lastExit"
+    }
+
+    /// The exemplar — `for i in $(seq 1 10000)` with an if/else whose both
+    /// branches end in `sh2.lastExit = 0`:
+    ///
+    ///   for i in `seq 1 10000`; do
+    ///     if echo $((i*i)) | grep 1337 >/dev/null 2>/dev/null; then echo $i; fi
+    ///   done
+    ///
+    /// Phase 1 lifts the write out of both branches of the if; phase 2 then
+    /// lifts it out of the native range loop. Result: the if has no
+    /// alternate, the loop body has NO lastExit mention, and the program
+    /// ends with a single `sh2.lastExit = 0`.
+    #[test]
+    fn sqrt1337_lifts_from_if_branches_then_loop() {
+        let json = to_json(
+            "for i in `seq 1 10000`\n\
+             do\n\
+             \tif echo $((i*i)) | grep 1337 > /dev/null 2> /dev/null\n\
+             \tthen\n\
+             \t\techo $i\n\
+             \tfi\n\
+             done",
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // exactly ONE lastExit write left, and it is the program-final
+        // statement (hoisted out of the loop entirely)
+        assert_eq!(lastexit_count(&v), 1, "one write remains: {json}");
+        assert!(
+            last_stmt_is_lastexit_write(&json),
+            "program-final write: {json}"
+        );
+        // the loop is a native range for whose body has no lastExit mention
+        let stmts = v["body"].as_array().unwrap();
+        let for_stmt = &stmts[stmts.len() - 2];
+        assert_eq!(for_stmt["type"], "ForStatement");
+        assert!(
+            !serde_json::to_string(&for_stmt["body"])
+                .unwrap()
+                .contains("lastExit"),
+            "loop body lastExit-free: {json}"
+        );
+        // the if lost its else (the false-path write was hoisted away)
+        let if_stmt = &for_stmt["body"]["body"][0];
+        assert_eq!(if_stmt["type"], "IfStatement");
+        assert!(
+            if_stmt["alternate"].is_null() || if_stmt["alternate"] == serde_json::Value::Null,
+            "no else: {json}"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+
+    /// The if-hoist is independent of the loop: a top-level
+    /// `if c; then echo hi; fi` also collapses its synthesized false-path
+    /// write into a single post-if write. (The `false` TEST expression
+    /// keeps its own status recording — `(sh2.lastExit = 1, false)` —
+    /// that write is the test command's status, not a branch tail.)
+    #[test]
+    fn top_level_if_common_tail_lifted() {
+        let json = to_json("if false; then echo yes; fi");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let stmts = v["body"].as_array().unwrap();
+        assert_eq!(stmts.len(), 2, "if + hoisted write: {json}");
+        assert_eq!(stmts[0]["type"], "IfStatement");
+        assert!(
+            stmts[0]["alternate"].is_null(),
+            "false-path else collapsed: {json}"
+        );
+        // the then-branch's tail sequence lost its status write
+        let cons = serde_json::to_string(&stmts[0]["consequent"]).unwrap();
+        assert!(
+            !cons.contains("lastExit"),
+            "then-branch status write lifted: {json}"
+        );
+        assert!(
+            last_stmt_is_lastexit_write(&json),
+            "post-if write: {json}"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+
+    /// A `$?` read anywhere in the loop body vetoes the LOOP hoist (the
+    /// pre-loop value would be observed mid-loop) but NOT the if hoist —
+    /// the write stays as the body's tail.
+    #[test]
+    fn loop_hoist_vetoed_by_body_read() {
+        // the if's both-branches write still collapses; the loop keeps it
+        // because `x=$?` reads lastExit in the body
+        let json = to_json(
+            "for i in `seq 1 3`\n\
+             do\n\
+             \tx=$?\n\
+             \tif echo $((i*i)) | grep 1337 > /dev/null 2> /dev/null\n\
+             \tthen\n\
+             \t\techo $i\n\
+             \tfi\n\
+             done",
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let stmts = v["body"].as_array().unwrap();
+        let for_stmt = &stmts[stmts.len() - 1];
+        assert_eq!(for_stmt["type"], "ForStatement");
+        // the loop body still carries the tail write (no post-loop write)
+        assert!(
+            serde_json::to_string(&for_stmt["body"])
+                .unwrap()
+                .contains("lastExit"),
+            "write stays in the body: {json}"
+        );
+        assert!(
+            !last_stmt_is_lastexit_write(&json),
+            "no post-loop hoist: {json}"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+
+    /// The loop-hoist on a native range for requires the loop to provably
+    /// run ≥ 1 time — an empty range (`seq 5 1`) must NOT hoist the write
+    /// out (0 iterations would leave `$?` = the pre-loop value in bash).
+    #[test]
+    fn loop_hoist_vetoed_for_empty_range() {
+        let json = to_json(
+            "for i in `seq 5 1`\n\
+             do\n\
+             \tif echo $((i*i)) | grep 1337 > /dev/null 2> /dev/null\n\
+             \tthen\n\
+             \t\techo $i\n\
+             \tfi\n\
+             done",
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            !last_stmt_is_lastexit_write(&json),
+            "no post-loop hoist for an empty range: {json}"
+        );
+        // the if-hoist still fired inside the loop body
+        let stmts = v["body"].as_array().unwrap();
+        let for_stmt = &stmts[stmts.len() - 1];
+        let body = serde_json::to_string(&for_stmt["body"]).unwrap();
+        assert!(body.contains("lastExit"), "if-tail stays in the body: {json}");
+        assert!(!json.contains("unsupported"));
+    }
+
+    /// Different exit values in the two branches (a failing last command on
+    /// one path) veto the if-hoist — the status after the if differs by
+    /// path, so the write cannot move.
+    #[test]
+    fn differing_branch_tails_not_lifted() {
+        let json = to_json("if false; then false; else echo hi; fi");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // the if keeps a lastExit write in at least one branch
+        assert!(
+            lastexit_count(&v) >= 1,
+            "branch status writes kept: {json}"
+        );
+        assert!(
+            !last_stmt_is_lastexit_write(&json),
+            "no unconditional post-if write when statuses differ: {json}"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+}
+
+#[cfg(test)]
+mod migrated_passes_tests {
+    use super::*;
+    use crate::Parser;
+
+    fn to_json(input: &str) -> String {
+        let commands = Parser::new(input).parse().unwrap();
+        serde_json::to_string(&ast_to_estree(&commands)).unwrap()
+    }
+
+    fn count(json: &str, needle: &str) -> usize {
+        json.matches(needle).count()
+    }
+
+    /// lowerNativeArrays — a provably-static array drops its runtime
+    /// store calls: setArray → `let arr = [..]`, element reads →
+    /// `(arr[1] !== undefined ? arr[1] : "")`, `${#arr[@]}` → `arr.length`,
+    /// `${arr[@]}` → the bare array (the emitter's `[..].flat().join`
+    /// path joins it with spaces).
+    #[test]
+    fn static_array_lowers_to_native() {
+        let json = to_json("arr=(alpha beta gamma); echo ${arr[1]}");
+        assert_eq!(count(&json, "\"name\":\"setArray\""), 0, "{json}");
+        assert!(json.contains("\"type\":\"VariableDeclaration\""), "{json}");
+        assert!(json.contains("\"name\":\"arr\""), "{json}");
+        assert!(
+            json.contains("\"operator\":\"!==\"") && json.contains("\"name\":\"undefined\""),
+            "element read → (arr[i] !== undefined ? arr[i] : \"\"): {json}"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn array_length_and_items_lower_to_native() {
+        let json = to_json("arr=(a b c); echo ${#arr[@]}; echo \"${arr[@]}\"");
+        assert_eq!(count(&json, "\"name\":\"arrayLen\""), 0, "{json}");
+        assert_eq!(count(&json, "\"name\":\"arrayItems\""), 0, "{json}");
+        assert!(json.contains("\"name\":\"length\""), "len → arr.length: {json}");
+        assert!(json.contains("\"name\":\"arr\""), "items → bare arr: {json}");
+        assert!(!json.contains("unsupported"));
+    }
+
+    /// Whole-var reads (`$arr`), writes (`arr[1]=x`), refs inside a
+    /// script function, and computed subscripts all veto the lowering —
+    /// the array stays on the runtime store.
+    #[test]
+    fn array_lowering_is_conservative() {
+        // whole-var read
+        let j1 = to_json("arr=(a b c); echo $arr");
+        assert_eq!(count(&j1, "\"name\":\"setArray\""), 1, "whole read keeps runtime: {j1}");
+        // element write
+        let j2 = to_json("arr=(a b c); arr[1]=x; echo ${arr[1]}");
+        assert_eq!(count(&j2, "\"name\":\"setArray\""), 1, "write keeps runtime: {j2}");
+        // ref inside a script function (deferred invocation / shadowing)
+        let j3 = to_json("f() { echo ${arr[1]}; }; arr=(a b c); f");
+        assert_eq!(count(&j3, "\"name\":\"setArray\""), 1, "in-function keeps runtime: {j3}");
+        // computed subscript: `$var` indexes (the game's direction tables
+        // — `DIR_X[$yaw]` per frame) now lower to a NATIVE array read
+        // with the store index (String(arr[Number(sh2.vars.i ?? "")] ??
+        // "") — byte-equivalent to the runtime's expansion)
+        let j4 = to_json("arr=(a b c); i=1; echo ${arr[$i]}");
+        assert_eq!(count(&j4, "\"name\":\"setArray\""), 0, "computed $var index goes native: {j4}");
+        assert_eq!(count(&j4, "arrayIndex"), 0, "no arrayIndex dispatch: {j4}");
+        assert!(j4.contains("\"name\":\"arr\""), "native array identifier: {j4}");
+        // a nested (conditional) setArray can't become a top-level `let`
+        let j5 = to_json("if true; then arr=(a b); fi; echo ${arr[1]}");
+        assert_eq!(count(&j5, "\"name\":\"setArray\""), 1, "nested setArray keeps runtime: {j5}");
+        for j in [&j1, &j2, &j3, &j4, &j5] {
+            assert!(!j.contains("unsupported"));
+        }
+    }
+
+    /// A single provably-scalar echo arg drops the array/join machinery:
+    /// `[i].flat().join(" ")` is exactly `i`, so `echo $i` writes
+    /// `i + "\n"` (the No-Space/numeric skip already scalarized the
+    /// field-split, leaving a stale flat flag). An ARRAY-VALUED single
+    /// arg (${arr[@]}) keeps the flat/join splice.
+    #[test]
+    fn single_scalar_echo_arg_drops_join_machinery() {
+        let json = to_json("i=5; echo $i");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("\"name\":\"flat\""), "no flat: {json}");
+        assert!(!s.contains("\"name\":\"join\""), "no join: {json}");
+        assert!(!s.contains("\"type\":\"ArrayExpression\""), "no array: {json}");
+        assert!(s.contains("\"name\":\"i\""), "bare numeric arg: {json}");
+        assert!(!json.contains("unsupported"));
+        // the loop-counter case from sqrt1337.sh
+        let json2 = to_json("for i in `seq 1 3`; do echo $i; done");
+        assert!(!json2.contains("\"name\":\"flat\""), "loop counter: no flat: {json2}");
+        assert!(!json2.contains("\"name\":\"join\""), "loop counter: no join: {json2}");
+        // an ARRAY-VALUED single arg keeps the flat/join splice
+        let json3 = to_json("arr=(a b c); echo \"${arr[@]}\"");
+        assert!(json3.contains("\"name\":\"flat\""), "array arg keeps flat: {json3}");
+        assert!(json3.contains("\"name\":\"join\""), "array arg keeps join: {json3}");
+        for j in [&json, &json2, &json3] {
+            assert!(!j.contains("unsupported"));
+        }
+    }
+
+    /// dropDeadFlags — every statement except the program's last has a
+    /// dead success flag: `(cmd, true)` unwraps to `cmd` (the flag was
+    /// already stripped from branch tails by the lastExit hoist).
+    #[test]
+    fn dead_flags_dropped_except_program_last() {
+        let json = to_json("if false; then echo yes; fi; echo after");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let stmts = v["body"].as_array().unwrap();
+        // the if's consequent is a bare write — no sequence, no flag
+        let cons = &stmts[0]["consequent"]["body"][0];
+        assert_eq!(cons["expression"]["type"], "CallExpression", "{json}");
+        // the program's LAST statement keeps its sequence (its value is
+        // the exit flag for jtsh's runViaTranspiler)
+        let last = stmts.last().unwrap();
+        assert_eq!(last["expression"]["type"], "SequenceExpression", "{json}");
+        assert!(!json.contains("unsupported"));
+    }
+
+    #[test]
+    fn dead_flags_unwrap_one_element_sequences() {
+        // a non-last statement that is a bare `(flag)` (1-element seq)
+        // after the lastExit hoist unwraps/drops; the last keeps it
+        let json = to_json("echo one; echo two");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let stmts = v["body"].as_array().unwrap();
+        assert_eq!(
+            stmts[0]["expression"]["type"], "CallExpression",
+            "non-last statement unwrapped: {json}"
+        );
+        assert_eq!(
+            stmts.last().unwrap()["expression"]["type"], "SequenceExpression",
+            "last statement keeps its flag: {json}"
+        );
+        assert!(!json.contains("unsupported"));
+    }
+}
+
+// ── dead top-level declaration elimination ────────────────────────────
+//
+// The lifted-numeric/string declarations (`let x = 0` / `let x = ""` at
+// program top) exist so bash's unset-var semantics hold at the top
+// level. A seq-range for (`for (let i = lo; i <= hi; i++)`) declares its
+// OWN `i`, shadowing the hoisted one — if the top-level `i` is never
+// READ (only the for's binding is read inside the loop), the hoisted
+// declaration is dead weight. The walk is scope-aware and conservative:
+// a read inside any scope that re-declares `name` (a nested `let x`, a
+// for-init, a closure param/local) does NOT count; any surviving
+// unshadowed read keeps the declaration.
+pub(crate) fn drop_dead_top_decls(prog: Program) -> Program {
+    let mut body = prog.body;
+    // the leading top-level declarations and their names
+    let mut decl_names: Vec<String> = Vec::new();
+    let mut decl_count = 0;
+    for st in &body {
+        if let Stmt::VariableDeclaration { declarations, .. } = st {
+            for d in declarations {
+                if let Expr::Identifier { name } = &d.id {
+                    decl_names.push(name.clone());
+                }
+            }
+            decl_count += 1;
+        } else {
+            break; // declarations are leading
+        }
+    }
+    if decl_names.is_empty() {
+        return Program { type_: prog.type_, source_type: prog.source_type, body };
+    }
+    // Precompute each top-level statement's READ set (the names it reads,
+    // honouring arrow/catch/loop shadowing) and DECLARED names — ONE tree
+    // walk per statement, instead of the old per-(declaration, statement)
+    // walks that re-walked every expression tree once per leading name
+    // (the estree::expr_read hotspot — 16M block executions on the game).
+    let empty = ReadSet::new();
+    let read_sets: Vec<ReadSet> = body.iter().map(|st| stmt_read_set(st, &empty)).collect();
+    let declared_sets: Vec<ReadSet> = body.iter().map(|st| stmt_declared_set(st)).collect();
+    // per-name sorted read/declared positions (pushed in statement order)
+    let mut read_pos: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut decl_pos: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, rs) in read_sets.iter().enumerate() {
+        for n in rs {
+            read_pos.entry(n).or_default().push(i);
+        }
+    }
+    for (i, ds) in declared_sets.iter().enumerate() {
+        for n in ds {
+            decl_pos.entry(n).or_default().push(i);
+        }
+    }
+    // Scan each leading declaration's name over the statements AFTER that
+    // declaration: a `let x` later (nested, or a for-init) shadows the
+    // top-level binding for its scope, but the declaration itself is the
+    // binding under examination — counting it as a shadow would treat
+    // every later `x = …` / `$x` as shadowed. The OTHER leading
+    // declarations' initializers DO count as reads (`let middle =
+    // [].concat(numbers.slice(…))` reads `numbers`). The name is read iff
+    // a read position r (k < r) exists before the FIRST shadowing
+    // declaration d after k (r < d) — the old `stmts_read(&body[k+1..],
+    // name, false)` semantics, via two sorted-position lookups per name.
+    let mut keep_leading: Vec<bool> = Vec::with_capacity(decl_count);
+    for (k, st) in body[..decl_count].iter().enumerate() {
+        let any_read = match st {
+            Stmt::VariableDeclaration { declarations, .. } => declarations.iter().any(|d| {
+                matches!(&d.id, Expr::Identifier { name }
+                    if leading_decl_read(&read_pos, &decl_pos, name, k))
+            }),
+            _ => false,
+        };
+        keep_leading.push(any_read);
+    }
+    // Drop only the LEADING declarations whose names are all unread — a
+    // VariableDeclaration LATER in the body (e.g. the native-array
+    // `let arr = […]` placed after an errexit/set -o sequence, or any
+    // non-hoist declaration) was never analyzed and must NOT be removed.
+    let mut seen = 0usize;
+    body.retain(|_| {
+        if seen < decl_count {
+            let keep = keep_leading[seen];
+            seen += 1;
+            keep
+        } else {
+            true
+        }
+    });
+    Program { type_: prog.type_, source_type: prog.source_type, body }
+}
+
+/// Is `name` read anywhere in `body[k+1..]` before its first shadowing
+/// declaration? (the old per-name `stmts_read(&body[k+1..], name, false)`.)
+fn leading_decl_read(
+    read_pos: &HashMap<&str, Vec<usize>>,
+    decl_pos: &HashMap<&str, Vec<usize>>,
+    name: &str,
+    k: usize,
+) -> bool {
+    let Some(reads) = read_pos.get(name) else { return false };
+    let Some(&r) = reads.iter().find(|&&r| r > k) else { return false };
+    match decl_pos.get(name) {
+        None => true,
+        Some(decls) => match decls.iter().find(|&&d| d > k) {
+            None => true,
+            Some(&d) => r < d,
+        },
+    }
+}
+
+// Borrowed-name set: the identifiers live in the Program (alive for the
+// whole pass), so the read/declared sets hold &str — no per-identifier
+// String clones (the clone+drop churn showed up in the profile as the
+// sip/hash_one + Vec<u8> drop hotspots). RandomState (the std default)
+// is kept — the sets are keyed by script identifiers, and the std's
+// per-process seed is the deliberate hash-flooding defence.
+type ReadSet<'a> = std::collections::HashSet<&'a str>;
+
+/// The names a statement LIST reads, with the list-level shadowing: a
+/// `let x` shadows `x` for the remaining statements.
+fn stmts_read_set<'a>(stmts: &'a [Stmt], shadow: &ReadSet<'a>) -> ReadSet<'a> {
+    let mut out = ReadSet::new();
+    let mut sh = shadow.clone();
+    for st in stmts {
+        out.extend(stmt_read_set(st, &sh));
+        sh.extend(stmt_declared_set(st));
+    }
+    out
+}
+
+/// The names a statement subtree reads, honouring shadowing — the
+/// set-based twin of the per-name `stmt_read` walk (a `let x` in a block
+/// shadows the rest of the block; loop inits / for-of lefts shadow their
+/// bodies; a catch param shadows its handler).
+fn stmt_read_set<'a>(st: &'a Stmt, shadow: &ReadSet<'a>) -> ReadSet<'a> {
+    match st {
+        Stmt::ExpressionStatement { expression } => expr_read_set(expression, shadow),
+        Stmt::BlockStatement { body } => stmts_read_set(body, shadow),
+        Stmt::IfStatement { test, consequent, alternate } => {
+            let mut out = expr_read_set(test, shadow);
+            out.extend(stmt_read_set(consequent, shadow));
+            if let Some(a) = alternate {
+                out.extend(stmt_read_set(a, shadow));
+            }
+            out
+        }
+        Stmt::SwitchStatement { discriminant, cases } => {
+            let mut out = expr_read_set(discriminant, shadow);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    out.extend(expr_read_set(t, shadow));
+                }
+                out.extend(stmts_read_set(&c.consequent, shadow));
+            }
+            out
+        }
+        Stmt::WhileStatement { test, body } => {
+            let mut out = expr_read_set(test, shadow);
+            out.extend(stmt_read_set(body, shadow));
+            out
+        }
+        Stmt::DoWhileStatement { test, body } => {
+            let mut out = expr_read_set(test, shadow);
+            out.extend(stmt_read_set(body, shadow));
+            out
+        }
+        Stmt::TryStatement { block, handler, finalizer } => {
+            let mut out = stmt_read_set(block, shadow);
+            if let Some(h) = handler {
+                let mut h_shadow = shadow.clone();
+                if let Some(p) = &h.param {
+                    // the catch param binds its own name — reads of that
+                    // name inside the handler are the handler's binding
+                    h_shadow.extend(expr_read_set(p, &ReadSet::new()));
+                }
+                out.extend(stmt_read_set(&h.body, &h_shadow));
+            }
+            if let Some(f) = finalizer {
+                out.extend(stmt_read_set(f, shadow));
+            }
+            out
+        }
+        Stmt::ForStatement { init, test, update, body } => {
+            let mut out = stmt_read_set(init, shadow);
+            let declares = stmt_declared_set(init);
+            let mut inner = shadow.clone();
+            inner.extend(declares);
+            out.extend(expr_read_set(test, &inner));
+            out.extend(expr_read_set(update, &inner));
+            out.extend(stmt_read_set(body, &inner));
+            out
+        }
+        Stmt::ForOfStatement { left, right, body } => {
+            let mut out = stmt_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            let declares = stmt_declared_set(left);
+            let mut inner = shadow.clone();
+            inner.extend(declares);
+            out.extend(stmt_read_set(body, &inner));
+            out
+        }
+        Stmt::FunctionDeclaration { params, body, .. } => {
+            let mut out = ReadSet::new();
+            for p in params {
+                out.extend(expr_read_set(p, &ReadSet::new()));
+            }
+            out.extend(stmt_read_set(body, shadow));
+            out
+        }
+        Stmt::VariableDeclaration { declarations, .. } => {
+            let mut out = ReadSet::new();
+            for d in declarations {
+                if let Some(init) = &d.init {
+                    out.extend(expr_read_set(init, shadow));
+                }
+            }
+            out
+        }
+        Stmt::ReturnStatement { argument } => match argument {
+            Some(a) => expr_read_set(a, shadow),
+            None => ReadSet::new(),
+        },
+        Stmt::BreakStatement { .. } | Stmt::ContinueStatement { .. } => ReadSet::new(),
+        Stmt::ThrowStatement { argument } => expr_read_set(argument, shadow),
+    }
+}
+
+/// The names an expression subtree reads, honouring shadowing — the
+/// set-based twin of the per-name `expr_read` walk (arrow params and
+/// arrow-body declarations shadow inside the arrow).
+fn expr_read_set<'a>(e: &'a Expr, shadow: &ReadSet<'a>) -> ReadSet<'a> {
+    match e {
+        Expr::Identifier { name } => {
+            let mut out = ReadSet::new();
+            if !shadow.contains(name.as_str()) {
+                out.insert(name.as_str());
+            }
+            out
+        }
+        Expr::Literal { .. } => ReadSet::new(),
+        Expr::TemplateLiteral { expressions, .. } => {
+            let mut out = ReadSet::new();
+            for x in expressions {
+                out.extend(expr_read_set(x, shadow));
+            }
+            out
+        }
+        Expr::CallExpression { callee, arguments, .. } => {
+            let mut out = expr_read_set(callee, shadow);
+            for a in arguments {
+                out.extend(expr_read_set(a, shadow));
+            }
+            out
+        }
+        Expr::MemberExpression { object, property, .. } => {
+            let mut out = expr_read_set(object, shadow);
+            out.extend(expr_read_set(property, shadow));
+            out
+        }
+        Expr::AwaitExpression { argument } => expr_read_set(argument, shadow),
+        Expr::ArrowFunctionExpression { params, body, .. } => {
+            let mut inner = shadow.clone();
+            for p in params {
+                inner.extend(expr_read_set(p, &ReadSet::new()));
+            }
+            inner.extend(arrow_body_declared_set(body));
+            arrow_body_read_set(body, &inner)
+        }
+        Expr::FunctionExpression { params, body, .. } => {
+            let mut inner = shadow.clone();
+            for p in params {
+                inner.extend(expr_read_set(p, &ReadSet::new()));
+            }
+            inner.extend(stmt_read_set(body, &inner));
+            inner
+        }
+        Expr::ObjectExpression { properties } => {
+            let mut out = ReadSet::new();
+            for p in properties {
+                out.extend(expr_read_set(&p.value, shadow));
+                if p.computed {
+                    out.extend(expr_read_set(&p.key, shadow));
+                }
+            }
+            out
+        }
+        Expr::ArrayExpression { elements } => {
+            let mut out = ReadSet::new();
+            for x in elements.iter().flatten() {
+                out.extend(expr_read_set(x, shadow));
+            }
+            out
+        }
+        Expr::SpreadElement { argument } => expr_read_set(argument, shadow),
+        Expr::LogicalExpression { left, right, .. } => {
+            let mut out = expr_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            out
+        }
+        Expr::BinaryExpression { left, right, .. } => {
+            let mut out = expr_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            out
+        }
+        Expr::AssignmentExpression { left, right, .. } => {
+            // the assignment target counts as a read (conservative —
+            // any reference keeps the declaration), matching the old walk
+            let mut out = expr_read_set(left, shadow);
+            out.extend(expr_read_set(right, shadow));
+            out
+        }
+        Expr::ConditionalExpression { test, consequent, alternate, .. } => {
+            let mut out = expr_read_set(test, shadow);
+            out.extend(expr_read_set(consequent, shadow));
+            out.extend(expr_read_set(alternate, shadow));
+            out
+        }
+        Expr::UnaryExpression { argument, .. } => expr_read_set(argument, shadow),
+        Expr::SequenceExpression { expressions } => {
+            let mut out = ReadSet::new();
+            for x in expressions {
+                out.extend(expr_read_set(x, shadow));
+            }
+            out
+        }
+        Expr::NewExpression { callee, arguments, .. } => {
+            let mut out = expr_read_set(callee, shadow);
+            for a in arguments {
+                out.extend(expr_read_set(a, shadow));
+            }
+            out
+        }
+    }
+}
+
+fn arrow_body_read_set<'a>(body: &'a ArrowBody, shadow: &ReadSet<'a>) -> ReadSet<'a> {
+    match body {
+        ArrowBody::Expr(e) => expr_read_set(e, shadow),
+        ArrowBody::Block(b) => stmt_read_set(b, shadow),
+    }
+}
+
+fn arrow_body_declared_set<'a>(body: &'a ArrowBody) -> ReadSet<'a> {
+    match body {
+        ArrowBody::Expr(_) => ReadSet::new(),
+        ArrowBody::Block(b) => block_declared_set(b),
+    }
+}
+
+fn block_declared_set<'a>(st: &'a Stmt) -> ReadSet<'a> {
+    match st {
+        Stmt::BlockStatement { body } => {
+            let mut out = ReadSet::new();
+            for s in body {
+                out.extend(stmt_declared_set(s));
+            }
+            out
+        }
+        Stmt::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .filter_map(|d| match &d.id {
+                Expr::Identifier { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => ReadSet::new(),
+    }
+}
+
+fn stmt_declared_set<'a>(st: &'a Stmt) -> ReadSet<'a> {
+    match st {
+        Stmt::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .filter_map(|d| match &d.id {
+                Expr::Identifier { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect(),
+        Stmt::ForStatement { init, .. } => stmt_declared_set(init),
+        Stmt::ForOfStatement { left, .. } => stmt_declared_set(left),
+        _ => ReadSet::new(),
     }
 }
