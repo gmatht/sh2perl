@@ -153,7 +153,7 @@ fn str_forced_vars(prog: &IrProgram) -> BTreeSet<String> {
                         }
                     }
                 }
-                IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
                     // `local result=$(…)` — a decl word `name=` followed
                     // by a stringy VALUE word
                     if let Some(IrExpr::Array(items)) = args.get(1) {
@@ -779,6 +779,37 @@ impl Render {
             IrExpr::Call { func, args } if func == "arrayIndex" => {
                 self.array_index_str(args)
             }
+            IrExpr::Call { func, args } if func == "assocGet" => {
+                // go-sh map reads — assocGet(name, key)
+                if let Some(name) = str_arg(args, 0) {
+                    if self.declared(name) {
+                        let key = args.get(1).map(|a| self.expr_str(a)).unwrap_or_else(|| "String::new()".to_string());
+                        return self.assoc_get(name, &key);
+                    }
+                }
+                "String::new()".to_string()
+            }
+            IrExpr::Call { func, args } if func == "typeof" => {
+                // Go `x.(type)` dispatch (core request
+                // go-sh-20260813-154009): the A1 type-name vocabulary
+                // ("string"/"int"/"float"/"bool"/"array" — sh2.typeOf's
+                // names). The renderer knows each var's slot type, so
+                // typeof(getVar(x)) folds to the type NAME.
+                let name = args.first().and_then(|a| match a {
+                    IrExpr::Str(n, _) => Some(n.clone()),
+                    IrExpr::Call { func: f, args: fa } if f == "getVar" => {
+                        str_arg(fa, 0).map(|s| s.to_string())
+                    }
+                    _ => None,
+                }).unwrap_or_default();
+                if self.is_assoc(&name) || self.is_array(&name) {
+                    "\"array\"".to_string()
+                } else if self.is_num(&name) {
+                    "\"int\"".to_string()
+                } else {
+                    "\"string\"".to_string()
+                }
+            }
             IrExpr::Call { func, args } if func == "arrayLen" => {
                 format!("({}).to_string()", self.expr_num(e))
             }
@@ -803,7 +834,7 @@ impl Render {
                 // a `[ ... ]` test in a string context produces no output
                 "String::new()".to_string()
             }
-            IrExpr::Call { func, args } if func == "exec" => self.exec_value(args),
+            IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_value(args),
             IrExpr::Index { var, key } => {
                 let k = self.expr_num(key);
                 self.array_elem(var, &k)
@@ -888,7 +919,7 @@ impl Render {
                     "false".to_string()
                 }
             }
-            IrExpr::Call { func, args } if func == "exec" => self.exec_bool(args),
+            IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_bool(args),
             IrExpr::Call { func, args } if func == "capture" => {
                 format!("(!{}.is_empty())", self.capture_expr(args))
             }
@@ -1570,7 +1601,7 @@ impl Render {
                 ));
                 self.emit("__SH_RC.store(0, Ordering::SeqCst);");
             }
-            "exec" => {
+            "exec" | "builtin" => {
                 // `exec cmd args` — run the command, then exit with its rc.
                 // `exec 3>&1` (redirects ONLY) just applies the redirects
                 // in a child — the process must NOT exit.
@@ -2129,7 +2160,7 @@ impl Render {
     /// Render an expression as a statement (exec/pipeline dispatch).
     fn expr_stmt_value(&mut self, e: &IrExpr) {
         match e {
-            IrExpr::Call { func, args } if func == "exec" => self.exec_stmt(args),
+            IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_stmt(args),
             IrExpr::Call { func, args } if func == "pipeline" => {
                 let stages = pipeline_stages(args);
                 self.pipeline_stmt(&stages);
@@ -2476,6 +2507,15 @@ impl Render {
             }
             "join" => format!("vec![{}]", self.join_str(args)),
             "arrayIndex" => format!("vec![{}]", self.array_index_str(args)),
+            "assocGet" => {
+                if let Some(name) = str_arg(args, 0) {
+                    if self.declared(name) {
+                        let key = args.get(1).map(|a| self.expr_str(a)).unwrap_or_else(|| "String::new()".to_string());
+                        return format!("vec![{}]", self.assoc_get(name, &key));
+                    }
+                }
+                "vec![String::new()]".to_string()
+            }
             "arrayLen" => format!("vec![{}]", self.expr_str(&IrExpr::Call {
                 func: func.to_string(),
                 args: args.to_vec(),
@@ -2495,7 +2535,7 @@ impl Render {
             "captureWords" => self.capture_words_expr(args),
             "assign" => format!("vec![{}]", self.assign_call_str(args)),
             "test" => "Vec::new()".to_string(),
-            "exec" => "Vec::new()".to_string(),
+            "exec" | "builtin" => "Vec::new()".to_string(),
             "grepMatches" => "Vec::new()".to_string(),
             "contains" => "Vec::new()".to_string(),
             _ => {
@@ -4219,7 +4259,7 @@ impl Render {
             }
             "param" => self.param_str(args),
             "test" => "String::new()".to_string(),
-            "exec" => self.exec_value(args),
+            "exec" | "builtin" => self.exec_value(args),
             "arrayIndex" => self.array_index_str(args),
             "arrayLen" => format!(
                 "({}).to_string()",
@@ -4398,9 +4438,22 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => match e {
-                IrExpr::Call { func, args } if func == "exec" => self.exec_stmt(args),
+                IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_stmt(args),
                 IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
                     self.array_call_stmt_by_name(func, args);
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                }
+                IrExpr::Call { func, args } if func == "assocSet" => {
+                    // go-sh map literals — assocSet(name, key, val) per
+                    // pair; the var is already marked assoc by pass 1
+                    if let Some(name) = str_arg(args, 0) {
+                        self.assoc.insert(name.to_string());
+                        self.mark_written(name);
+                        let key = args.get(1).map(|a| self.expr_str(a)).unwrap_or_else(|| "String::new()".to_string());
+                        let val = args.get(2).map(|a| self.expr_str(a)).unwrap_or_else(|| "String::new()".to_string());
+                        let st = self.assoc_set(name, &key, &val);
+                        self.emit(&st);
+                    }
                     self.emit("__SH_RC.store(0, Ordering::SeqCst);");
                 }
                 IrExpr::Call { func, args } if func == "pipeline" => {
@@ -4526,7 +4579,17 @@ impl Render {
                 // i++ + ++i ))` — the target j is NOT written by the
                 // arith — it still needs the result value.
                 if arith_has_side_effects(expr) {
-                    let x = self.expr_any(expr);
+                    // `((i++))` statement: the value is DISCARDED (`let _`
+                    // below), so an Arith renders straight to i64 — no
+                    // String round-trip. A 50M-iteration loop (t79's go
+                    // corpus) would otherwise blow the gate's 15s timeout
+                    // on the per-iteration to_string/parse. The
+                    // __SH_ARITH_ERR flag (checked div/mod) maps to rc
+                    // exactly as the string path does: error -> 0 -> rc 1.
+                    let (is_i64, x) = match expr {
+                        IrExpr::Arith(a) => (true, self.arith(a)),
+                        e => (false, self.expr_any(e)),
+                    };
                     let arith_writes_target = match expr {
                         IrExpr::Arith(a) => {
                             if let Some(t) = targets.first() {
@@ -4563,16 +4626,27 @@ impl Render {
                             let tvar = t.var.split('[').next().unwrap_or(&t.var).to_string();
                             self.mark_written(&tvar);
                             let stmt = if self.is_num(&tvar) {
-                                self.write_num(&tvar, &format!("({v}).trim().parse::<i64>().unwrap_or(0)"))
+                                if is_i64 {
+                                    self.write_num(&tvar, &v)
+                                } else {
+                                    self.write_num(&tvar, &format!("({v}).trim().parse::<i64>().unwrap_or(0)"))
+                                }
                             } else {
                                 self.write_str(&tvar, &format!("{v}.clone()"))
                             };
                             self.emit(&stmt);
                         }
                     }
-                    self.emit(&format!(
-                        "let _ = {{ let __v = {v}; let __n = __v.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __n != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v }};"
-                    ));
+                    if is_i64 {
+                        self.emit(&format!(
+                            "let __n = if __SH_ARITH_ERR.swap(false, Ordering::SeqCst) {{ 0 }} else {{ {v} }};"
+                        ));
+                        self.emit("__SH_RC.store(if __n != 0 { 0 } else { 1 }, Ordering::SeqCst);");
+                    } else {
+                        self.emit(&format!(
+                            "let _ = {{ let __v = {v}; let __n = __v.trim().parse::<i64>().unwrap_or(0); __SH_RC.store(if __n != 0 {{ 0 }} else {{ 1 }}, Ordering::SeqCst); __v }};"
+                        ));
+                    }
                     return;
                 }
                 let rhs = if let IrExpr::Arith(a) = expr {
@@ -5306,7 +5380,7 @@ struct IrRedirectInfo {
 const HELPER_ORDER: &[&str] = &[
     "q", "q_printf", "wq", "cat", "pow", "echo_esc", "atoi", "atou", "atof", "print_words", "printf",
     "cap_bytes", "capture_rc", "spawn", "run", "readline", "read_fields", "split_ifs",
-    "fnmatch", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
+    "fnmatch", "globlike", "strippre", "stripsuf", "replace", "substr", "case", "len", "basename",
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
@@ -5799,6 +5873,18 @@ fn helper_source(h: &str) -> &'static str {
         if ws { while i < ch.len() && is_sep(ch[i]) { i += 1; } }
     }
     out
+}"#,
+        // the sh2.* runtime's glob-metachar probe (evalTest's `=` fallback
+        // decision — `*`, `?`, `[` anywhere, or an extglob opener)
+        "globlike" => r#"fn __sh_glob_like(s: &str) -> bool {
+    let ch: Vec<char> = s.chars().collect();
+    for i in 0..ch.len() {
+        if matches!(ch[i], '*' | '?' | '[') { return true; }
+        if matches!(ch[i], '!' | '@' | '+' | '?') && i + 1 < ch.len() && ch[i + 1] == '(' {
+            return true;
+        }
+    }
+    false
 }"#,
         "fnmatch" => r#"fn __sh_fnmatch(pat: &str, s: &str) -> bool {
     // bash's pattern matcher treats the pattern as a C string — a NUL
@@ -6341,7 +6427,7 @@ fn pipeline_stages(args: &[IrExpr]) -> Vec<Vec<IrStmt>> {
 fn stage_text_ok(stmts: &[IrStmt]) -> bool {
     match stmts {
         [] => true,
-        [IrStmt::Expr(IrExpr::Call { func, args })] if func == "exec" => {
+        [IrStmt::Expr(IrExpr::Call { func, args })] if func == "exec" || func == "builtin" => {
             let cmd = str_arg(args, 0).unwrap_or("");
             !is_native_cmd(cmd)
         }
@@ -6353,7 +6439,7 @@ fn stage_text_ok(stmts: &[IrStmt]) -> bool {
             stage_text_ok(&inner)
         }
         [IrStmt::Redirect { inner, .. }] => stage_text_ok(inner),
-        [IrStmt::Subshell(b)] => b.iter().all(|s| matches!(s, IrStmt::Expr(IrExpr::Call { func, .. }) if func == "exec")),
+        [IrStmt::Subshell(b)] => b.iter().all(|s| matches!(s, IrStmt::Expr(IrExpr::Call { func, .. }) if func == "exec" || func == "builtin")),
         [IrStmt::Expr(IrExpr::BinOp { op: BinOpKind::And | BinOpKind::Or, lhs, rhs })] => {
             exec_call_text_ok(lhs) && exec_call_text_ok(rhs)
         }
@@ -6363,7 +6449,7 @@ fn stage_text_ok(stmts: &[IrStmt]) -> bool {
 }
 
 fn exec_call_text_ok(e: &IrExpr) -> bool {
-    matches!(e, IrExpr::Call { func, args } if func == "exec" && !is_native_cmd(str_arg(args, 0).unwrap_or("")))
+    matches!(e, IrExpr::Call { func, args } if (func == "exec" || func == "builtin") && !is_native_cmd(str_arg(args, 0).unwrap_or("")))
 }
 
 fn is_native_cmd(cmd: &str) -> bool {
@@ -6378,7 +6464,7 @@ fn is_native_cmd(cmd: &str) -> bool {
 /// A single shell-out exec as command text (String expr).
 fn single_exec_text(r: &mut Render, e: &IrExpr) -> Option<String> {
     if let IrExpr::Call { func, args } = e {
-        if func == "exec" {
+        if func == "exec" || func == "builtin" {
             // the command word (args[0]) + the argument words (args[1])
             let mut words: Vec<&IrExpr> = Vec::new();
             if let Some(first) = args.first() {
@@ -6474,7 +6560,7 @@ impl Render {
                 // through the native path — its store/var effects would
                 // be lost in a child bash
                 if let IrExpr::Call { func, args } = e {
-                    if func == "exec" && is_native_cmd(str_arg(args, 0).unwrap_or("")) {
+                    if (func == "exec" || func == "builtin") && is_native_cmd(str_arg(args, 0).unwrap_or("")) {
                         return None;
                     }
                 }
@@ -6598,7 +6684,7 @@ fn fn_body_line_text(r: &mut Render, s: &IrStmt) -> String {
         }
     }
     match s {
-        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
             let mut words: Vec<&IrExpr> = Vec::new();
             if let Some(first) = args.first() {
                 words.push(first);
@@ -6650,7 +6736,7 @@ fn fn_body_line_text(r: &mut Render, s: &IrStmt) -> String {
 /// out would lose the body — render natively)
 fn contains_fn_call(r: &Render, stmts: &[IrStmt]) -> bool {
     stmts.iter().any(|s| match s {
-        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
             r.functions.contains(str_arg(args, 0).unwrap_or(""))
         }
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "redirect" => {
@@ -6670,7 +6756,7 @@ fn contains_fn_call(r: &Render, stmts: &[IrStmt]) -> bool {
 
 fn contains_shell(stmts: &[IrStmt]) -> bool {
     stmts.iter().any(|s| match s {
-        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
             let cmd = str_arg(args, 0).unwrap_or("");
             !is_native_cmd(cmd)
         }
@@ -6693,7 +6779,7 @@ fn contains_shell(stmts: &[IrStmt]) -> bool {
 
 fn expr_shell(e: &IrExpr) -> bool {
     match e {
-        IrExpr::Call { func, args } if func == "exec" => {
+        IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
             !is_native_cmd(str_arg(args, 0).unwrap_or(""))
         }
         IrExpr::Call { func, .. } if func == "pipeline" => true,
@@ -7196,10 +7282,24 @@ impl<'a, 'r> TestParser<'a, 'r> {
                         format!("({} __sh_fnmatch(&{rhs}, &{lhs}))", if eq { "" } else { "!" })
                     }
                 } else {
-                    let rs = if eq { "==" } else { "!=" };
+                    // the sh2.* runtime's evalTest contract
+                    // (harness/sh2-namespace.mjs): `=`/`==`/`!=` falls
+                    // back to GLOB matching when the RHS carries glob
+                    // metachars — the go-sh frontend lowers
+                    // strings.Contains/HasPrefix to `"$s"=*world*` and
+                    // the corpus relies on the fallback (plain `[ ]`
+                    // bash would compare literally). The metachar test
+                    // runs on the EVALUATED rhs (it may be a variable),
+                    // mirroring the JS side exactly.
+                    self.render.add_helper("fnmatch");
+                    self.render.add_helper("globlike");
                     let l = if lhs_num { format!("{lhs}.to_string()") } else { lhs.to_string() };
                     let r = if rhs_num { format!("{rhs}.to_string()") } else { rhs.to_string() };
-                    format!("({l} {rs} {r})")
+                    if eq {
+                        format!("{{ let __r = {r}; if __sh_glob_like(&__r) {{ __sh_fnmatch(&__r, &{l}) }} else {{ {l} == __r }} }}")
+                    } else {
+                        format!("{{ let __r = {r}; if __sh_glob_like(&__r) {{ !__sh_fnmatch(&__r, &{l}) }} else {{ {l} != __r }} }}")
+                    }
                 }
             }
             "=~" => {
@@ -8121,7 +8221,7 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             }
             // exec builtins that WRITE vars: read targets, let targets,
             // declaration word-assigns, unset — the hoist must know them
-            if func == "exec" {
+            if func == "exec" || func == "builtin" {
                 if let Some(cmd) = str_arg(args, 0) {
                         let words: Vec<&IrExpr> = match args.get(1) {
                             Some(IrExpr::Array(items)) => items.iter().collect(),
@@ -8285,6 +8385,14 @@ fn collect_arrays(stmts: &[IrStmt], arrays: &mut BTreeSet<String>, assoc: &mut B
                         arrays.insert(name.to_string());
                     }
                 }
+                // go-sh's map literal lowering (`m := map[string]string{...}`
+                // → assocSet(m, k, v) / assocGet(m, k) — t54_map) — the
+                // var is an ASSOC map, not an index array
+                "assocSet" | "assocGet" => {
+                    if let Some(name) = str_arg(args, 0) {
+                        assoc.insert(name.to_string());
+                    }
+                }
                 "listVar" => {
                     if let Some(name) = str_arg(args, 0) {
                         if name != "@" && name != "*" {
@@ -8297,7 +8405,7 @@ fn collect_arrays(stmts: &[IrStmt], arrays: &mut BTreeSet<String>, assoc: &mut B
                         arrays.insert(name.to_string());
                     }
                 }
-                "exec" => {
+                "exec" | "builtin" => {
                     // `(( array[i] ... ))` — array refs inside let texts
                     if let Some(cmd) = str_arg(args, 0) {
                         if cmd == "let" {
@@ -8448,6 +8556,11 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
                         arrays.insert(name.to_string());
                     }
                 }
+                "assocSet" | "assocGet" => {
+                    if let Some(name) = str_arg(args, 0) {
+                        assoc.insert(name.to_string());
+                    }
+                }
                 "listVar" => {
                     if let Some(name) = str_arg(args, 0) {
                         if name != "@" && name != "*" {
@@ -8460,7 +8573,7 @@ fn collect_arrays_expr(e: &IrExpr, arrays: &mut BTreeSet<String>, assoc: &mut BT
                         arrays.insert(name.to_string());
                     }
                 }
-                "exec" => {
+                "exec" | "builtin" => {
                     // `(( array[i] ... ))` — array refs inside let texts
                     if let Some(cmd) = str_arg(args, 0) {
                         if cmd == "let" {
@@ -8714,7 +8827,7 @@ fn collect_attrs(
 ) {
     for s in stmts {
         match s {
-            IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+            IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
                 if let Some(cmd) = str_arg(args, 0) {
                     if matches!(cmd, "declare" | "typeset" | "local") {
                         if let Some(IrExpr::Array(words)) = args.get(1) {
