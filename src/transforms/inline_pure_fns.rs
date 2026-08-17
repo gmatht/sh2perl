@@ -14,7 +14,7 @@
 //!   untouched — refuse > guess. Pure leaves have no process/redirect/
 //!   subshell, so inlining is behaviourally identical.
 //! scope: [estree] (the sh2.* fnCall dispatch; other backends may adopt)
-//! updates: none
+//! updates: inline-pure-fns (v1 in done/ had Array-shape compile errors — this re-offer fixes them)
 
 use crate::ir::{IrExpr, IrStmt, InterpPart};
 
@@ -32,7 +32,7 @@ fn expr_pure(e: &IrExpr) -> bool {
             let _ = op;
             expr_pure(lhs) && expr_pure(rhs)
         }
-        IrExpr::Array(elems) => elems.iter().all(|e| e.as_ref().map_or(true, expr_pure)),
+        IrExpr::Array(elems) => elems.iter().all(expr_pure),
         IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
             InterpPart::Lit(_) => true,
             InterpPart::Expr(x) => expr_pure(x),
@@ -70,15 +70,10 @@ fn subst(e: &IrExpr, args: &[IrExpr]) -> IrExpr {
         }
         IrExpr::BinOp { lhs, op, rhs } => IrExpr::BinOp {
             lhs: Box::new(subst(lhs, args)),
-            op: *op,
+            op: op.clone(),
             rhs: Box::new(subst(rhs, args)),
         },
-        IrExpr::Array(elems) => IrExpr::Array(
-            elems
-                .iter()
-                .map(|e| e.as_ref().map(|x| subst(x, args)))
-                .collect(),
-        ),
+        IrExpr::Array(elems) => IrExpr::Array(elems.iter().map(|x| subst(x, args)).collect()),
         IrExpr::Interpolate(parts) => IrExpr::Interpolate(
             parts
                 .iter()
@@ -151,15 +146,10 @@ fn rewrite_expr(e: &IrExpr, leaves: &[(String, IrExpr)], changed: &mut bool) -> 
         },
         IrExpr::BinOp { lhs, op, rhs } => IrExpr::BinOp {
             lhs: Box::new(rewrite_expr(lhs, leaves, changed)),
-            op: *op,
+            op: op.clone(),
             rhs: Box::new(rewrite_expr(rhs, leaves, changed)),
         },
-        IrExpr::Array(elems) => IrExpr::Array(
-            elems
-                .iter()
-                .map(|e| e.as_ref().map(|x| rewrite_expr(x, leaves, changed)))
-                .collect(),
-        ),
+        IrExpr::Array(elems) => IrExpr::Array(elems.iter().map(|x| rewrite_expr(x, leaves, changed)).collect()),
         IrExpr::Interpolate(parts) => IrExpr::Interpolate(
             parts
                 .iter()
