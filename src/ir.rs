@@ -887,6 +887,13 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     // strip; double-strip is a no-op).
     let mut stripped = prog.clone();
     crate::shir_passes::strip_cfor(&mut stripped);
+    // builtin-op normalization (shir-builtin-op-20260816): the A1 may
+    // carry `builtin(cmd, args)` ops (the exec-to-builtin transform); the
+    // estree renderer normalizes them back to exec (its dispatch lowers
+    // exec-of-builtin natively). The perl renderer has no builtin arm —
+    // WITHOUT this it dies "not yet supported" (regressed the perl corpus
+    // 373→47). Same pass the estree path runs.
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut stripped);
     let prog = &stripped;
 
     // Run optimization passes before emitting.
@@ -1609,9 +1616,9 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                                         _ => "<",
                                     };
                                     let frag = match fd {
-                                        0 => format!(" < \"${tmp}\""),
-                                        1 => format!(" > \"${tmp}\""),
-                                        n => format!(" {}> \"${tmp}\"", n),
+                                        0 => format!(" {op} \"${tmp}\""),
+                                        1 => format!(" {op} \"${tmp}\""),
+                                        n => format!(" {n}{op} \"${tmp}\""),
                                     };
                                     cmd.push_str(&frag);
                                 }
