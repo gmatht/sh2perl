@@ -1257,7 +1257,7 @@ impl Render {
     /// shellbench runners are exactly these — skipping them (instead of
     /// a sh2_exec stub) is what makes the loop body render natively.
     fn noop_value(&self, func: &str, args: &[IrExpr]) -> Option<&'static str> {
-        if func == "exec" {
+        if func == "exec" || func == "builtin" {
             if let Some(IrExpr::Str(cmd, _)) = args.first() {
                 return match cmd.as_str() {
                     ":" | "true" => Some("1"),
@@ -2062,14 +2062,20 @@ impl Render {
                                         )),
                                     }
                                 } else {
+                                    // mid-word getVar parts GLUE to the
+                                    // literal before them (`'hello ' "$name"`
+                                    // = ONE word — a space would split it
+                                    // and echo would join with a double
+                                    // space); the first segment is a NEW
+                                    // word, so it keeps the space.
                                     match buf {
                                         CmdBuf::Shared => self.emit(&format!(
-                                            "_sh_addraw({});",
+                                            "_sh_add({});",
                                             Self::cstr(&format!("\"{ref_text}\""))
                                         )),
                                         CmdBuf::Private(id) => self.emit(&format!(
                                             "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
-                                            Self::cstr(&format!(" \"{ref_text}\""))
+                                            Self::cstr(&format!("\"{ref_text}\""))
                                         )),
                                     }
                                 }
@@ -2155,7 +2161,7 @@ impl Render {
             }
             first_stmt = false;
             match s {
-                IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
                     // env prefix: `IFS=: cmd ...` (the Object arg)
                     for a in args {
                         if let IrExpr::Object(fields) = a {
@@ -2462,9 +2468,12 @@ impl Render {
                     }
                 }
                 IrStmt::Block(body) => {
+                    // bash requires the `;` (or newline) before `}` —
+                    // `{ echo data }` is a syntax error; the `block`
+                    // CALL arm above already emits `; }`.
                     self.sh_raw(buf, "{");
                     self.sh_stage(buf, body);
-                    self.sh_raw(buf, "}");
+                    self.sh_raw(buf, "; }");
                 }
                 IrStmt::Continue => self.sh_add(buf, "continue"),
                 IrStmt::Break => self.sh_add(buf, "break"),
@@ -2690,7 +2699,7 @@ impl Render {
                     self.sh_test_text(buf, &t);
                 }
             }
-            IrExpr::Call { func, args } if func == "exec" => {
+            IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
                 self.sh_stage(buf, &[IrStmt::Expr(IrExpr::Call {
                     func: func.clone(),
                     args: args.clone(),
@@ -4292,7 +4301,7 @@ impl Render {
 
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
-            "exec" => self.exec_call(args),
+            "exec" | "builtin" => self.exec_call(args),
             "getVar" => {
                 let Some(name) = Self::str_arg(args, 0) else {
                     return "0".into();
@@ -6853,7 +6862,7 @@ fn collect_capture_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             }
             IrStmt::Expr(e) => {
                 if let IrExpr::Call { func, args } = e {
-                    if func == "exec" {
+                    if func == "exec" || func == "builtin" {
                         if let Some(IrExpr::Str(cmd, _)) = args.first() {
                             if cmd == "local"
                                 || cmd == "declare"
@@ -7157,7 +7166,7 @@ fn collect_assoc_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             }
             IrStmt::Expr(e) => {
                 if let IrExpr::Call { func, args } = e {
-                    if func == "exec" {
+                    if func == "exec" || func == "builtin" {
                         if let Some(IrExpr::Str(cmd, _)) = args.first() {
                             if cmd == "declare" || cmd == "typeset" || cmd == "local" {
                                 if let Some(IrExpr::Array(items)) = args.get(1) {
@@ -7744,7 +7753,7 @@ fn collect_store_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                         out.insert(n.clone());
                     }
                 }
-                "exec" => {
+                "exec" | "builtin" => {
                     if let Some(IrExpr::Str(cmd, _)) = args.first() {
                         if cmd == "read" {
                             if let Some(IrExpr::Array(items)) = args.get(1) {
@@ -7988,7 +7997,7 @@ fn collect_assigned_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
         // as exec("local", ["x=", <value>]) calls; the fn hoist must
         // see these assigns or the var renders undeclared
         IrExpr::Call { func, args }
-            if func == "exec"
+            if (func == "exec" || func == "builtin")
                 && matches!(
                     args.first(),
                     Some(IrExpr::Str(c, _))
@@ -8054,7 +8063,7 @@ fn collect_vars_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                 collect_vars_expr(i, out);
             }
         }
-        IrExpr::Call { func, args } if func == "exec" => {
+        IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
             // `let "i++"` hides its var inside a STRING arg — the hoist
             // must see it or the loop var is undeclared in C.
             if let Some(IrExpr::Str(cmd, _)) = args.first() {
@@ -8235,7 +8244,7 @@ fn seq_capture_words(cap: &IrExpr) -> Option<(i128, i128, i128)> {
     let IrExpr::Call { func, args } = exec_call else {
         return None;
     };
-    if func != "exec" {
+    if !matches!(func.as_str(), "exec" | "builtin") {
         return None;
     }
     let IrExpr::Str(cmd, _) = args.first()? else {
