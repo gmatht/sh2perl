@@ -33,6 +33,7 @@ pub mod shir_native_stmt; // worker-submitted: redirect/herestring/test-chain sh
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
         // (name, <name>::transform) — estree worker adds entries here
+        ("inline-pure-fns", inline_pure_fns::inline_pure_fns),
         ("sync-ok-loops", sync_ok_loops::transform),
         ("seq-range-for", seq_range_for::transform),
         ("grep-o", grep_o::transform),
