@@ -27,6 +27,7 @@ pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native num
 /// into the crate. Each entry is (name, transform_fn).
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
+pub mod shir_native_stmt; // worker-submitted: redirect/herestring/test-chain shapes → native stmt forms
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
@@ -39,6 +40,10 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // the --shir export and the A1 ingress (frontend-emitted JSON).
         ("process-subst", process_subst::transform),
         ("arith-forms", arith_forms::transform),
+        // native-stmt normalisation (fail-shir: perl shell-out elimination):
+        // `echo args > file` → Block-wrapped exec (native select redirect),
+        // empty herestrings → status exec, `test && echo || echo` → If.
+        ("shir-native-stmt", shir_native_stmt::transform),
         // NOTE: exec-to-builtin (shir-builtin-op-20260816) is NOT in the
         // ast_to_ir channel — the rewrite happens at the A1 EXPORT
         // (shir_json::shir_to_shir_json) so the analyses and every
