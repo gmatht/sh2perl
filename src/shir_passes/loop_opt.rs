@@ -265,7 +265,24 @@ fn stmts_read_names(stmts: &[IrStmt], fns: &HashMap<String, FnInfo>) -> HashSet<
 
 fn collect_stmt_reads(st: &IrStmt, fns: &HashMap<String, FnInfo>, out: &mut HashSet<String>) {
     match st {
-        IrStmt::Assign { expr, .. } => collect_expr_reads(expr, fns, out),
+        IrStmt::Assign { targets, expr, .. } => {
+            collect_expr_reads(expr, fns, out);
+            // an indexed TARGET (`mime_lookup[$ml_i] = v`) READS the index
+            // variable — the A1 renders the index INSIDE the var string
+            // (`"mime_lookup[$ml_i]"`), so the loop counter is invisible
+            // to the read set unless decoded. Without it the leading-write
+            // invariance misses the counter and hoists `arr[$i]=…` out of
+            // the loop (the maze-init loops, the mime-slot resets, then
+            // everything derived from them — the turn45 culling corruption).
+            // The base name is NOT added: writes to the same array are
+            // governed by the writes-not-clobbered guard (which keys the
+            // base too); the index operand is the read at stake here.
+            for t in targets {
+                if let Some(b) = t.var.find('[') {
+                    bare_dollar_names(&t.var[b..], out);
+                }
+            }
+        }
         IrStmt::Declare { init, .. } => {
             if let Some(i) = init {
                 collect_expr_reads(i, fns, out);
@@ -422,9 +439,22 @@ fn collect_expr_reads(e: &IrExpr, fns: &HashMap<String, FnInfo>, out: &mut HashS
                 }
             }
             // literal-name ops read the NAME
-            if matches!(func.as_str(), "getVar" | "listVar" | "arrayItems" | "arrayLen" | "setVar" | "setArray" | "arrayIndex") {
+            if matches!(func.as_str(), "getVar" | "listVar" | "arrayItems" | "arrayLen" | "setVar" | "setArray" | "arrayIndex" | "idxassign") {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     out.insert(n.clone());
+                }
+                // the array ops carry the INDEX as an UNEXPANDED string
+                // literal (`arrayIndex("mx", "$um_i")` — a Str, not a Var),
+                // so the counter it names is invisible to the read set
+                // unless decoded — an invariance miss that hoisted
+                // `um_a=mx[$um_i]` out of the mime loop (stale mimes every
+                // step + the turn45 culling corruption). Decode every Str
+                // arg with the same bare_dollar_names the test/arith arm
+                // uses; the NAME arg decodes to nothing (no $).
+                for a in args {
+                    if let IrExpr::Str(s, _) = a {
+                        bare_dollar_names(s, out);
+                    }
                 }
             } else if func == "param" {
                 if let Some(IrExpr::Str(n, _)) = args.get(1) {
@@ -437,6 +467,12 @@ fn collect_expr_reads(e: &IrExpr, fns: &HashMap<String, FnInfo>, out: &mut HashS
                     }
                 }
             }
+            // EVERY arg is a read (the op-KEY operands included): the
+            // name-only arms above miss `arrayIndex("mx", um_i)` reading
+            // um_i, so the invariance analysis marked loop-counter shapes
+            // invariant and hoisted `um_a=mx[um_i]` out of the loop (the
+            // update_mimes stale-mime + turn45-culling corruption). Str
+            // literals add nothing; Var/Index/Call args add their reads.
             for a in args {
                 collect_expr_reads(a, fns, out);
             }
@@ -513,6 +549,14 @@ fn collect_stmt_writes(st: &IrStmt, fns: &HashMap<String, FnInfo>, out: &mut Has
         IrStmt::Assign { targets, expr, .. } => {
             for t in targets {
                 out.insert(t.var.clone());
+                // an indexed target (`rmx[$rm_i]`) writes the BASE array
+                // too — readers record `rmx`, so record both or a
+                // mid-body store to the same array bypasses the
+                // writes-not-clobbered guard (both the base and the
+                // full "[$i]" key are kept for the multi-var case).
+                if let Some(b) = t.var.find('[') {
+                    out.insert(t.var[..b].to_string());
+                }
             }
             if let IrExpr::Arith(a) = expr {
                 collect_arith_writes(a, out);
