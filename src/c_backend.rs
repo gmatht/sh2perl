@@ -1881,12 +1881,16 @@ impl Render {
                                 self.store_read(n)
                             };
                             self.emit(&format!("_sh_export({}, {v});", Self::cstr(n)));
+                            // a BARE getVar word is the QUOTED form (the
+                            // core spells unquoted refs `split(getVar)` —
+                            // the split arm above emits them raw); quote it
+                            // or the child bash re-splits `"$x"`.
                             match buf {
                                 CmdBuf::Shared => self.emit(&format!(
-                                    "_sh_addraw(\"${n}\");"
+                                    "_sh_addraw(\"\\\"${n}\\\"\");"
                                 )),
                                 CmdBuf::Private(id) => self.emit(&format!(
-                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" ${n}\");"
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" \\\"${n}\\\"\");"
                                 )),
                             }
                         }
@@ -3196,6 +3200,25 @@ impl Render {
     fn declare_words(&mut self, words: &[&IrExpr]) {
         let mut i = 0;
         while i < words.len() {
+            // `declare -a arr=(1 2)` — the core passes the literal as a
+            // nested setArray call word (`declare -a` + setArray("arr",
+            // [1, 2], false)); apply it like a plain assignment.
+            if let IrExpr::Call { func, args } = words[i] {
+                if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+                    if let Some(name) = Self::str_arg(args, 0) {
+                        let name_c = name.clone();
+                        // emit_set_array takes the FULL args (name at 0,
+                        // items at 1, assoc Bool at 2) — no shift
+                        if func == "setArray" {
+                            self.emit_set_array(&name_c, args);
+                        } else {
+                            self.emit_set_array_append(&name_c, args);
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
             if let Some(ws) = Self::str_arg(&[(*words[i]).clone()], 0) {
                 if let Some((name, val)) = ws.split_once('=') {
                     if !name.is_empty()
@@ -4527,17 +4550,14 @@ impl Render {
             },
             "setArray" | "setArrayAppend" => {
                 // bare expr position (unusual — Assign normally carries
-                // these): apply to the named array
+                // these): apply to the named array. emit_set_array takes
+                // the FULL args (name at 0, items at 1, assoc at 2).
                 if let Some(name) = Self::str_arg(args, 0) {
                     let name_c = name.clone();
                     if func == "setArray" {
-                        let mut a = args.to_vec();
-                        a.remove(0);
-                        self.emit_set_array(&name_c, &a);
+                        self.emit_set_array(&name_c, args);
                     } else {
-                        let mut a = args.to_vec();
-                        a.remove(0);
-                        self.emit_set_array_append(&name_c, &a);
+                        self.emit_set_array_append(&name_c, args);
                     }
                 }
                 "(_sh_rc = 0, 1)".into()
@@ -4850,11 +4870,40 @@ impl Render {
             }
             return;
         }
+        let ai = format!("_ai{}", self.temp_seq);
+        self.temp_seq += 1;
+        self.emit(&format!("size_t {ai} = 0;"));
         for (i, it) in items.iter().enumerate() {
+            let _ = i;
+            // `arr=($x)` — a split element field-splits at runtime (the
+            // core's A1 split marker on an array literal element)
+            if let IrExpr::Call { func, args } = it {
+                if func == "split" {
+                    let v = self.value_c(args.first().unwrap_or(it));
+                    let t = format!("_sp{}", self.temp_seq);
+                    self.temp_seq += 1;
+                    // copy first — _sh_split NUL-terminates words IN
+                    // PLACE, and the source may be const/read-only
+                    // (string literals, static buffers)
+                    self.emit(&format!(
+                        "char {t}[65536]; strncpy({t}, {v}, 65535); {t}[65535] = 0;"
+                    ));
+                    self.emit(&format!("char *{t}_w[1024];"));
+                    self.emit(&format!(
+                        "size_t _sn{t} = _sh_split({t}, {t}_w, 1024);"
+                    ));
+                    self.emit(&format!(
+                        "for (size_t _sk{t} = 0; _sk{t} < _sn{t}; _sk{t}++) {id}[{ai} + _sk{t}] = strdup({t}_w[_sk{t}]);"
+                    ));
+                    self.emit(&format!("{id}_len = {ai} + _sn{t};"));
+                    self.emit(&format!("{ai} += _sn{t};"));
+                    continue;
+                }
+            }
             let v = self.value_c(it);
-            self.emit(&format!("{id}[{i}] = strdup((char*)({v}));"));
+            self.emit(&format!("{id}[{ai}] = strdup((char*)({v}));"));
+            self.emit(&format!("{id}_len = ++{ai};"));
         }
-        self.emit(&format!("{id}_len = {};", items.len()));
     }
 
     /// `arr+=(x y)` — append elements
