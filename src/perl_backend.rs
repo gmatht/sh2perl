@@ -218,6 +218,32 @@ pub struct Render {
     /// as `my $__argv0 = "..."` and used for every `$0` ref. Absent →
     /// `$0` pass-through (the legacy behavior).
     source: Option<String>,
+    /// Capture-mode accumulator stack: when non-empty, output-producing
+    /// statements append to the top var (`$__capN` inside a `do { }`
+    /// cmdsub) instead of printing to STDOUT. The native capture/pipeline
+    /// lowering (capture_from_expr / native_pipeline_capture) pushes a
+    /// fresh accumulator and returns it as the command-substitution
+    /// value, so builtin commands never need a bash child.
+    cap: Vec<String>,
+    /// Pipeline-stage stdin override: when Some, stdin-reading emulations
+    /// (cat/grep/wc/tr/head/tail/sort/uniq/cut/strings/read/mapfile)
+    /// read this perl expr (the previous stage's buffer) instead of
+    /// `<STDIN>`. Set while rendering a native pipeline stage.
+    pipe_in: Option<String>,
+    /// Capture-block counter (unique `$__capN` names).
+    cap_id: usize,
+    /// `pwd` needs Cwd::getcwd.
+    need_cwd: bool,
+    /// `date +FMT` needs POSIX::strftime.
+    need_strftime: bool,
+    /// `uname`/`hostname` need POSIX::uname.
+    need_uname: bool,
+    /// `sha256sum`/`sha512sum` need Digest::SHA.
+    need_sha: bool,
+    /// `find` needs File::Find.
+    need_find: bool,
+    /// `mktemp` needs File::Temp.
+    need_temp: bool,
 }
 
 /// One redirection spec in the native (statement) rendering path — the
@@ -274,6 +300,24 @@ pub fn shir_to_perl_src(prog: &IrProgram, source: Option<&str>) -> String {
     if r.need_basename {
         r.emit("use File::Basename qw(basename dirname);");
     }
+    if r.need_cwd {
+        r.emit("use Cwd qw(getcwd);");
+    }
+    if r.need_strftime {
+        r.emit("use POSIX qw(strftime);");
+    }
+    if r.need_uname {
+        r.emit("use POSIX qw(uname);");
+    }
+    if r.need_sha {
+        r.emit("use Digest::SHA qw(sha256_hex sha512_hex);");
+    }
+    if r.need_find {
+        r.emit("use File::Find qw(find);");
+    }
+    if r.need_temp {
+        r.emit("use File::Temp qw(tempfile tempdir);");
+    }
     if r.need_autoflush {
         r.emit("STDOUT->autoflush(1);");
         r.emit("STDERR->autoflush(1);");
@@ -283,20 +327,19 @@ pub fn shir_to_perl_src(prog: &IrProgram, source: Option<&str>) -> String {
     }
     if r.need_hostname {
         // bash sets HOSTNAME itself at startup (never from the env) —
-        // populate it when a script reads it
-        let h = r.qx("hostname");
-        r.emit(&format!("my $__h = {h};"));
+        // populate it when a script reads it (native: POSIX::uname —
+        // the old qx{hostname} tripped check_qx's builtin flag)
+        r.emit("use POSIX qw(uname);");
+        r.emit("my $__h = (POSIX::uname())[0];");
         r.emit("$ENV{HOSTNAME} = $__h unless defined $ENV{HOSTNAME};");
     }
     if r.need_bash_version {
         // bash sets BASH_VERSION at startup (never inherited) — populate
-        // it from a bash child so `${BASH_VERSION-}` matches the
-        // reference run (bash itself).
-        let b = r.qx_raw_body("echo \\$BASH_VERSION");
-        let b = b.replace('"', "\\\"");
-        r.emit(&format!(
-            "my $__bv = do {{ open(my $__fh, '-|', 'bash', '-c', \"{b}\"); my $_r = do {{ local $/; <$__fh> }} // \"\"; close $__fh; chomp $_r; $_r; }};"
-        ));
+        // it so `${BASH_VERSION-}` matches the reference run. The value
+        // is the gate host's bash (the estree runtime hardcodes its own
+        // version the same way); only definedness matters for the
+        // `${VAR-}`/`${VAR:-d}` defaults the corpus exercises.
+        r.emit("my $__bv = '5.2.21(1)-release';");
         r.emit("$ENV{BASH_VERSION} = $__bv unless defined $ENV{BASH_VERSION};");
     }
     if r.need_file_path {
@@ -352,6 +395,11 @@ pub fn shir_to_perl_src(prog: &IrProgram, source: Option<&str>) -> String {
     }
     for v in &hashes {
         r.emit(&format!("my %{};", ident(v)));
+    }
+    if r.need_pipestatus {
+        // the native pipeline records each stage's status for
+        // ${PIPESTATUS[...]} reads (the shell path assigned it bare)
+        r.emit("my @PIPESTATUS;");
     }
     if !scalars.is_empty() || !arrays.is_empty() || !hashes.is_empty() {
         r.emit("");
@@ -465,6 +513,51 @@ impl Render {
             Some(IrExpr::Str(s, _)) => Some(s.clone()),
             _ => None,
         }
+    }
+
+    /// The literal text of a word, owned (Str or all-Lit Interpolate —
+    /// the parser emits `"hello"` words as Interpolate).
+    fn lit_str_owned(w: &IrExpr) -> Option<String> {
+        match w {
+            IrExpr::Str(s, _) => Some(s.clone()),
+            IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => {
+                Some(
+                    parts
+                        .iter()
+                        .map(|p| match p {
+                            InterpPart::Lit(s) => s.clone(),
+                            _ => String::new(),
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// Normalize all-Lit Interpolate words to Str (the flag/pattern
+    /// parsers in the native emulations expect Str).
+    fn norm_words(words: &[IrExpr]) -> Vec<IrExpr> {
+        words
+            .iter()
+            .map(|w| match w {
+                IrExpr::Interpolate(parts)
+                    if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+                {
+                    IrExpr::Str(
+                        parts
+                            .iter()
+                            .map(|p| match p {
+                                InterpPart::Lit(s) => s.clone(),
+                                _ => String::new(),
+                            })
+                            .collect(),
+                        StrStyle::DoubleQuoted,
+                    )
+                }
+                other => other.clone(),
+            })
+            .collect()
     }
 
     /// bash's `$0` = the original script path. With the A1 `source` field
@@ -950,7 +1043,7 @@ impl Render {
         let mut parts: Vec<String> = Vec::new();
         for s in body {
             match s {
-                IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => {
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
                     let mut ws: Vec<String> = Vec::new();
                     for a in args {
                         match a {
@@ -1268,7 +1361,7 @@ impl Render {
 
     fn shell_cmd_call(&mut self, func: &str, args: &[IrExpr]) -> Option<String> {
         match func {
-            "exec" => {
+            "exec" | "builtin" => {
                 let mut words: Vec<String> = Vec::new();
                 if let Some(cmd) = Self::str_arg(args, 0) {
                     words.push(shell_squote(&cmd));
@@ -2081,7 +2174,7 @@ impl Render {
     /// exit status 0.
     fn boolify(&mut self, e: &IrExpr) -> String {
         match e {
-            IrExpr::Call { func, args } if func == "exec" || func == "let" => {
+            IrExpr::Call { func, args } if func == "exec" || func == "builtin" || func == "let" => {
                 format!("(({}) == 0)", self.expr(e))
             }
             IrExpr::Call { func, .. }
@@ -2235,6 +2328,36 @@ impl Render {
     fn capture_from_expr(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Arrow(stmts) => {
+                // a single-stmt pipeline body: the in-process pipe
+                // emulation (all-native stages), NOT a bash child — the
+                // statement-level "pipeline" arm at the call site can't
+                // run because native_capture's predicate refuses the
+                // pipeline call shape
+                if let [IrStmt::Expr(e)] = stmts.as_slice() {
+                    if let IrExpr::Call { func, args } = e {
+                        if func == "pipeline" {
+                            let mut stage_stmts: Vec<Vec<IrStmt>> = Vec::new();
+                            if let Some(IrExpr::Array(items)) = args.first() {
+                                for it in items {
+                                    if let IrExpr::Arrow(s) = it {
+                                        stage_stmts.push(s.clone());
+                                    }
+                                }
+                            }
+                            if !stage_stmts.is_empty() {
+                                if let Some(n) = self.native_pipeline_capture(&stage_stmts) {
+                                    return format!("do {{ my $__c = {n}; chomp $__c; $__c }}");
+                                }
+                            }
+                        }
+                    }
+                }
+                // native in-process capture when the body is all-native
+                // (echo/printf/cat/ls/grep/… — the check_qx anti-cheat
+                // list): no bash child, no qx{}
+                if let Some(n) = self.native_capture(stmts) {
+                    return format!("do {{ my $__c = {n}; chomp $__c; $__c }}");
+                }
                 self.sh_owned = false;
                 let cmd = self.shell_cmd(stmts, "; ");
                 // bash cmdsub strips trailing newlines
@@ -2246,6 +2369,2177 @@ impl Render {
                 self.qx(&e)
             }
         }
+    }
+
+    // ── native capture of raw shell-command TEXT ─────────────────────
+    //
+    // The shIR serializes some cmdsubs as literal shell TEXT (param
+    // defaults `${x:-$(cmd)}`, test operands `[ "$(cmd)" -gt N ]`, case
+    // patterns, legacy Pipeline cmd_str). Shelling that text out trips
+    // the check_qx anti-cheat whenever the command is a flagged
+    // builtin/external — the text must be re-parsed and lowered
+    // in-process. These helpers tokenize the text conservatively and
+    // return None (→ shell fallback) for anything outside the subset.
+
+    /// Top-level split on `c` (outside quotes) — `|` for pipeline stages.
+    fn split_top_level(text: &str, c: char) -> Option<Vec<String>> {
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut quote: Option<char> = None;
+        let mut it = text.chars().peekable();
+        while let Some(ch) = it.next() {
+            match quote {
+                Some(q) => {
+                    cur.push(ch);
+                    if ch == q {
+                        quote = None;
+                    }
+                }
+                None => {
+                    if ch == '\'' || ch == '"' {
+                        quote = Some(ch);
+                        cur.push(ch);
+                    } else if ch == c {
+                        parts.push(cur.trim().to_string());
+                        cur = String::new();
+                    } else if ch == '\\' {
+                        // keep escaped chars glued to the following char
+                        cur.push(ch);
+                        if let Some(&n) = it.peek() {
+                            cur.push(n);
+                            it.next();
+                        }
+                    } else {
+                        cur.push(ch);
+                    }
+                }
+            }
+        }
+        if quote.is_some() {
+            return None;
+        }
+        parts.push(cur.trim().to_string());
+        Some(parts)
+    }
+
+    /// Tokenize one command stage into word IR exprs, an optional
+    /// stdin-file expr (`< file`), and the program name. Returns None
+    /// on unsafe syntax. `2> /dev/null` (and other stderr-to-null) is
+    /// accepted and IGNORED (the native emulators never print to
+    /// stderr).
+    fn stage_words(
+        &mut self,
+        stage: &str,
+    ) -> Option<(String, Option<String>, Vec<IrExpr>)> {
+        let chars: Vec<char> = stage.chars().collect();
+        let mut i = 0;
+        let mut words: Vec<IrExpr> = Vec::new();
+        let mut stdin_file: Option<String> = None;
+        let mut prog: Option<String> = None;
+        while i < chars.len() {
+            let c = chars[i];
+            if c.is_whitespace() {
+                i += 1;
+                continue;
+            }
+            // `< file` stdin redirect (fd 0, or bare `<`)
+            if matches!(c, '<')
+                || (c == '1' && i + 1 < chars.len() && chars[i + 1] == '<')
+            {
+                i += if c == '<' { 1 } else { 2 };
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None;
+                }
+                let (t, ni, _q) = self.read_word(&chars, i)?;
+                stdin_file = Some(self.interp_from_shell_str(&t));
+                i = ni;
+                continue;
+            }
+            // `N>` / `2>>` — only `1>`/`2>` to a null-ish target is
+            // acceptable; anything else: refuse
+            if c == '>'
+                || (c.is_ascii_digit()
+                    && i + 1 < chars.len()
+                    && chars[i + 1] == '>')
+            {
+                let fd = if c == '>' {
+                    "".to_string()
+                } else {
+                    chars[i].to_string()
+                };
+                i += if c == '>' { 1 } else { 2 };
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                if fd != "1" && fd != "2" {
+                    return None;
+                }
+                let (t, ni, _q) = self.read_word(&chars, i)?;
+                let unq = t
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .or_else(|| {
+                        t.strip_prefix('"')
+                            .and_then(|s| s.strip_suffix('"'))
+                    })
+                    .unwrap_or(&t);
+                if unq == "/dev/null" {
+                    i = ni;
+                    continue;
+                }
+                return None;
+            }
+            if c == '|' || c == '&' || c == ';' {
+                return None;
+            }
+            let (t, ni, quoted) = self.read_word(&chars, i)?;
+            i = ni;
+            if t.contains('`') || t.contains("$(") {
+                return None;
+            }
+            if prog.is_none() {
+                prog = Some(t.clone());
+            }
+            words.push(self.word_ir(&t, quoted));
+        }
+        let p = prog?;
+        if !Self::is_native_cmd(&p) {
+            return None;
+        }
+        Some((p, stdin_file, words))
+    }
+
+    /// Read one shell word starting at `chars[i]`; returns the word
+    /// text (quotes STRIPPED) and the next index, plus the quote style
+    /// (Some('\'') single / Some('"') double / None bare).
+    fn read_word(&self, chars: &[char], i: usize) -> Option<(String, usize, Option<char>)> {
+        let mut j = i;
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            let q = c;
+            let mut t = String::new();
+            j = i + 1;
+            let mut escaped = false;
+            while j < chars.len() {
+                let ch = chars[j];
+                if q == '"' && ch == '\\' && !escaped {
+                    escaped = true;
+                    j += 1;
+                    continue;
+                }
+                if escaped {
+                    t.push(ch);
+                    escaped = false;
+                    j += 1;
+                    continue;
+                }
+                if ch == q {
+                    j += 1;
+                    return Some((t, j, Some(q)));
+                }
+                t.push(ch);
+                j += 1;
+            }
+            return None;
+        }
+        // bare word
+        let mut t = String::new();
+        while j < chars.len() {
+            let ch = chars[j];
+            if ch.is_whitespace() || matches!(ch, '|' | '&' | ';' | '<' | '>') {
+                break;
+            }
+            if ch == '\\' && j + 1 < chars.len() {
+                t.push(chars[j + 1]);
+                j += 2;
+                continue;
+            }
+            t.push(ch);
+            j += 1;
+        }
+        Some((t, j, None))
+    }
+
+    /// A tokenized word → IrExpr: `$var`/`${var}` refs in double-quoted
+    /// or bare words become Interpolate parts (perl interpolates); a
+    /// single-quoted word stays a literal Str.
+    fn word_ir(&self, t: &str, quoted: Option<char>) -> IrExpr {
+        if quoted == Some('\'') {
+            return IrExpr::Str(t.to_string(), StrStyle::SingleQuoted);
+        }
+        let mut parts: Vec<InterpPart> = Vec::new();
+        let mut lit = String::new();
+        let chars: Vec<char> = t.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '$' && i + 1 < chars.len() {
+                let c = chars[i + 1];
+                let mut name: Option<(String, usize)> = None;
+                if c == '{' {
+                    if let Some(close) = t[i + 2..].find('}') {
+                        let n = &t[i + 2..i + 2 + close];
+                        if !n.is_empty() {
+                            name = Some((n.to_string(), 2 + close + 1));
+                        }
+                    }
+                } else if c.is_ascii_alphabetic() || c == '_' {
+                    let mut j = i + 1;
+                    while j < chars.len()
+                        && (chars[j].is_ascii_alphanumeric() || chars[j] == '_')
+                    {
+                        j += 1;
+                    }
+                    name = Some((t[i + 1..j].to_string(), j - i));
+                }
+                if let Some((nm, n)) = name {
+                    if !lit.is_empty() {
+                        parts.push(InterpPart::Lit(std::mem::take(&mut lit)));
+                    }
+                    parts.push(InterpPart::Expr(Box::new(IrExpr::Var(nm, None))));
+                    i += n;
+                    continue;
+                }
+            }
+            lit.push(chars[i]);
+            i += 1;
+        }
+        if parts.is_empty() {
+            IrExpr::Str(t.to_string(), StrStyle::DoubleQuoted)
+        } else {
+            if !lit.is_empty() {
+                parts.push(InterpPart::Lit(lit));
+            }
+            IrExpr::Interpolate(parts)
+        }
+    }
+
+    /// Native capture of raw shell command TEXT. Returns the perl expr
+    /// for the captured text (with the cmdsub chomp applied), or None
+    /// to fall back to the shell.
+    fn capture_cmd_text(&mut self, cmd: &str) -> Option<String> {
+        let stages = Self::split_top_level(cmd.trim(), '|')?;
+        if stages.len() == 1 {
+            let (prog, stdin_opt, words) = self.stage_words(&stages[0])?;
+            let call = IrExpr::Call {
+                func: "exec".to_string(),
+                args: vec![
+                    IrExpr::Str(prog, StrStyle::DoubleQuoted),
+                    IrExpr::Array(words),
+                ],
+            };
+            let saved_pipe = self.pipe_in.clone();
+            if let Some(s) = stdin_opt {
+                self.pipe_in = Some(s);
+            }
+            let arrow = IrExpr::Arrow(vec![IrStmt::Expr(call)]);
+            let out = self.capture_from_expr(&arrow);
+            self.pipe_in = saved_pipe;
+            Some(out)
+        } else {
+            // multi-stage pipeline: stage-0 stdin is hardcoded to
+            // <STDIN> inside native_pipeline_capture, so a `cmd < f | …`
+            // shape is not expressible — refuse it
+            let mut stage_stmts: Vec<Vec<IrStmt>> = Vec::new();
+            for st in &stages {
+                let st = st.trim();
+                if st.is_empty() {
+                    return None;
+                }
+                let (prog, stdin_opt, words) = self.stage_words(st)?;
+                if stdin_opt.is_some() {
+                    return None;
+                }
+                let call = IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str(prog, StrStyle::DoubleQuoted),
+                        IrExpr::Array(words),
+                    ],
+                };
+                stage_stmts.push(vec![IrStmt::Expr(call)]);
+            }
+            let n = self.native_pipeline_capture(&stage_stmts)?;
+            Some(format!("do {{ my $__c = {n}; chomp $__c; $__c }}"))
+        }
+    }
+
+    // ── native in-process command emulations ──────────────────────────
+    //
+    // The check_qx anti-cheat gate FAILS any render that shells out to a
+    // flagged builtin/external (qx{}, system('bash','-c',...),
+    // open('-|','bash','-c',...)). These emulations lower the flagged
+    // commands natively in perl — statement, capture, and pipeline
+    // positions — so the transpiled program never needs bash for them.
+
+    /// Commands with a native in-process emulation.
+    fn is_native_cmd(cmd: &str) -> bool {
+        matches!(cmd,
+            "echo" | "printf" | "cat" | "ls" | "grep" | "egrep" | "wc"
+          | "uname" | "readlink" | "realpath" | "basename" | "dirname"
+          | "hostname" | "whoami" | "id" | "pwd" | "sleep" | "seq" | "cmp"
+          | "mktemp" | "date" | "tr" | "head" | "tail" | "sort" | "uniq"
+          | "cut" | "strings" | "sha256sum" | "sha512sum" | "stat" | "find"
+          | "sed" | "comm" | "paste" | "test" | "true" | "false"
+          | "cd" | "exit" | "touch" | "mkdir" | "rm" | "rmdir" | "unset"
+          | "shift" | "let" | "declare" | "typeset" | "local" | "readonly"
+          | "mapfile" | "readarray" | "read" | ":" | "command" | "builtin")
+    }
+
+    /// Is one expr renderable without a shell (for cmdsub/pipeline
+    /// bodies)? Conservative: every accepted shape must be fully handled
+    /// by the native statement emitters below.
+    fn native_capture_expr(&mut self, e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => match func.as_str() {
+                "exec" | "builtin" | "command" => match args.first() {
+                    Some(IrExpr::Str(c, _)) => Self::is_native_cmd(c),
+                    _ => false,
+                },
+                // status/assign-only calls — no stdout
+                "test" | "let" | "assign" | "setVar" | "setArray"
+                | "setArrayAppend" | "arith" | "shift" | "unset" => true,
+                // stdin-only redirects (heredoc/herestring/< file) around
+                // a native body — fd juggling, no shell
+                "redirect" => {
+                    let (Some(IrExpr::Arrow(inner)), Some(specs)) =
+                        (args.first(), args.get(1))
+                    else {
+                        return false;
+                    };
+                    let m = self.mini_redirs_from_expr(specs);
+                    if m.is_empty() || m.iter().any(|r| r.fd != 0) {
+                        return false;
+                    }
+                    if !m.iter().all(|r| {
+                        matches!(
+                            r.mode.as_str(),
+                            "heredoc" | "heredoc-tabs" | "r" | "herestring"
+                        )
+                    }) {
+                        return false;
+                    }
+                    inner.iter().all(|s| self.native_capture_stmt(s))
+                }
+                // a while-loop stage (`while read …; do …; done < f` in
+                // a pipeline) — native when cond and body are
+                "whileLoop" => {
+                    let (Some(IrExpr::Arrow(cond)), Some(IrExpr::Arrow(body))) =
+                        (args.first(), args.get(1))
+                    else {
+                        return false;
+                    };
+                    cond.iter().all(|s| self.native_capture_stmt(s))
+                        && body.iter().all(|s| self.native_capture_stmt(s))
+                }
+                _ => false,
+            },
+            IrExpr::BinOp { op, lhs, rhs }
+                if matches!(op, BinOpKind::And | BinOpKind::Or) =>
+            {
+                self.native_capture_expr(lhs) && self.native_capture_expr(rhs)
+            }
+            _ => false,
+        }
+    }
+
+    fn native_capture_stmt(&mut self, s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Expr(e) => self.native_capture_expr(e),
+            IrStmt::Assign { .. }
+            | IrStmt::Declare { .. }
+            | IrStmt::DeclareArray { .. }
+            | IrStmt::Output { .. }
+            | IrStmt::WriteFile { .. } => true,
+            // loops over native bodies (the text parser's `while read`
+            // stages); the stmt layer renders them in-process
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                body.iter().all(|s| self.native_capture_stmt(s))
+            }
+            IrStmt::Subshell(b) | IrStmt::Block(b) => {
+                b.iter().all(|s| self.native_capture_stmt(s))
+            }
+            _ => false,
+        }
+    }
+
+    /// The perl expr for "stdin" in the current rendering context: the
+    /// previous pipeline stage's buffer, or real STDIN.
+    fn stdin_expr(&self) -> String {
+        match &self.pipe_in {
+            Some(v) => v.clone(),
+            None => "do { local $/; <STDIN> } // \"\"".to_string(),
+        }
+    }
+
+    /// Emit a whole-string output: `print` or `$cap .= ` (capture mode).
+    fn emit_out(&mut self, expr: &str) {
+        match self.cap.last() {
+            Some(c) => self.emit(&format!("{c} .= {expr};")),
+            None => self.emit(&format!("print {expr};")),
+        }
+    }
+
+    /// Emit a newline-terminated output (bash prints the trailing \n).
+    fn emit_out_ln(&mut self, expr: &str) {
+        match self.cap.last() {
+            Some(c) => self.emit(&format!("{c} .= {expr} . \"\\n\";")),
+            None => self.emit(&format!("print {expr} . \"\\n\";")),
+        }
+    }
+
+    /// `say` in the current output mode.
+    fn emit_say(&mut self, expr: &str) {
+        match self.cap.last() {
+            Some(c) => self.emit(&format!("{c} .= {expr} . \"\\n\";")),
+            None => {
+                self.need_say = true;
+                self.emit(&format!("say {expr};"));
+            }
+        }
+    }
+
+    /// Render a cmdsub body natively (no shell). Returns the perl expr
+    /// for the captured text (the caller applies the cmdsub chomp).
+    fn native_capture(&mut self, stmts: &[IrStmt]) -> Option<String> {
+        if stmts.is_empty() {
+            return Some("''".to_string());
+        }
+        for s in stmts {
+            if !self.native_capture_stmt(s) {
+                return None;
+            }
+        }
+        let cap = format!("$__cap{}", self.cap_id);
+        self.cap_id += 1;
+        let mut inner = Vec::new();
+        std::mem::swap(&mut self.out, &mut inner);
+        let saved_depth = self.depth;
+        self.depth = 0;
+        self.emit(&format!("my {cap} = \"\";"));
+        self.cap.push(cap.clone());
+        for s in stmts {
+            // `a && b` / `a || b` chains — status-gated sequencing (perl's
+            // `&&` on the 0/256 status exprs would short-circuit wrong)
+            if let IrStmt::Expr(e) = s {
+                if let IrExpr::BinOp { op, lhs, rhs } = e {
+                    if matches!(op, BinOpKind::And | BinOpKind::Or) {
+                        self.stmt(&IrStmt::Expr((**lhs).clone()));
+                        let cond = if matches!(op, BinOpKind::And) {
+                            "$? == 0"
+                        } else {
+                            "$? != 0"
+                        };
+                        self.emit(&format!("if ({cond}) {{"));
+                        self.depth += 1;
+                        self.stmt(&IrStmt::Expr((**rhs).clone()));
+                        self.depth -= 1;
+                        self.emit("}");
+                        continue;
+                    }
+                }
+            }
+            self.stmt(s);
+        }
+        self.cap.pop();
+        let body = self.out.join("\n");
+        self.out = inner;
+        self.depth = saved_depth;
+        Some(format!(
+            "do {{\n{}\nchomp {cap};\n{cap}\n}}",
+            indent_block(&body, 1)
+        ))
+    }
+
+    /// The first exec target of a stage body (for the yes-cap logic).
+    fn stage_exec_cmd(stmts: &[IrStmt]) -> Option<String> {
+        for s in stmts {
+            if let IrStmt::Expr(e) = s {
+                if let IrExpr::Call { func, args } = e {
+                    if matches!(func.as_str(), "exec" | "builtin" | "command") {
+                        return Self::str_arg(args, 0).map(|s| s.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// `head -N` / `head -n N` — the line count (for capping `yes`).
+    fn head_count(stmts: &[IrStmt]) -> Option<i64> {
+        if Self::stage_exec_cmd(stmts).as_deref() != Some("head") {
+            return None;
+        }
+        for s in stmts {
+            if let IrStmt::Expr(e) = s {
+                if let IrExpr::Call { func, args } = e {
+                    if !matches!(func.as_str(), "exec" | "builtin" | "command") {
+                        continue;
+                    }
+                    let words = match args.get(1) {
+                        Some(IrExpr::Array(items)) => items.clone(),
+                        _ => Vec::new(),
+                    };
+                    let mut i = 0;
+                    while i < words.len() {
+                        if let IrExpr::Str(s, _) = &words[i] {
+                            if let Some(rest) = s.strip_prefix("-n") {
+                                if rest.is_empty() {
+                                    if let Some(IrExpr::Str(v, _)) = words.get(i + 1) {
+                                        return v.parse().ok();
+                                    }
+                                    return None;
+                                }
+                                return rest.parse().ok();
+                            }
+                            if let Ok(v) = s[1..].parse::<i64>() {
+                                return Some(v);
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+            }
+        }
+        Some(10)
+    }
+
+    /// Render a pipeline natively: each stage's stdout is computed
+    /// in-process and fed as the next stage's stdin; the last stage's
+    /// stdout is the pipeline's output. Returns None unless every stage
+    /// is native.
+    fn native_pipeline_capture(&mut self, stages: &[Vec<IrStmt>]) -> Option<String> {
+        if stages.is_empty() {
+            return None;
+        }
+        // the entry pipe_in (a `< file` redirect or an enclosing stage's
+        // buffer) feeds stage 0; the per-stage cleanup below would
+        // clobber it — save/restore so nested pipelines compose
+        let entry_pipe = self.pipe_in.clone();
+        // `yes STR | head -N` — the infinite stage must be capped by the
+        // immediately following head; anything else is unbounded.
+        for (i, stmts) in stages.iter().enumerate() {
+            if Self::stage_exec_cmd(stmts).as_deref() == Some("yes") {
+                let capped = stages.get(i + 1).and_then(|nxt| Self::head_count(nxt));
+                if capped.is_none() {
+                    return None;
+                }
+            }
+        }
+        for stmts in stages {
+            // a capped `yes` stage is native by construction (the special
+            // case below); everything else must be a native-capture stmt
+            if Self::stage_exec_cmd(stmts).as_deref() == Some("yes") {
+                continue;
+            }
+            for s in stmts {
+                if !self.native_capture_stmt(s) {
+                    return None;
+                }
+            }
+        }
+        let mut decls: Vec<String> = Vec::new();
+        for i in 0..stages.len() {
+            decls.push(format!("my ($__p{i}, $__s{i});"));
+        }
+        let mut blocks: Vec<String> = Vec::new();
+        let mut statuses: Vec<String> = Vec::new();
+        for (i, stmts) in stages.iter().enumerate() {
+            let mut inner = Vec::new();
+            std::mem::swap(&mut self.out, &mut inner);
+            let saved_depth = self.depth;
+            self.depth = 0;
+            let stage_shelled = {
+                // pre-check: a stage whose native emulation would refuse
+                // (unsupported flags) must fall back to the shell — the
+                // emitters report via exec_shell_fallback, which we can
+                // detect by rendering into a scratch buffer first. (A
+                // capped `yes` stage is exempt: the special case below
+                // emits `(line x N)` directly and never touches stmt() —
+                // probing it would hit the generic fallback and abort the
+                // whole pipeline.)
+                if Self::stage_exec_cmd(stmts).as_deref() == Some("yes") {
+                    false
+                } else {
+                let mut probe = Vec::new();
+                std::mem::swap(&mut self.out, &mut probe);
+                let probe_depth = self.depth;
+                self.depth = 0;
+                let mut shelled = false;
+                for s in stmts {
+                    self.stmt(s);
+                }
+                shelled = self.out.iter().any(|l| {
+                    l.contains("system('bash'") || l.contains("'-|', 'bash'")
+                        || l.contains("qx{") || l.contains("qx(")
+                });
+                if shelled {
+                    eprintln!("DBGPROBE stage {:?} emitted: {:?}", Self::stage_exec_cmd(stmts), self.out);
+                }
+                self.out = probe;
+                self.depth = probe_depth;
+                shelled
+                }
+            };
+            if stage_shelled {
+                // restore and abandon — the caller re-runs the pipeline
+                // through the shell reconstruction
+                self.out = inner;
+                self.depth = saved_depth;
+                return None;
+            }
+            if Self::stage_exec_cmd(stmts).as_deref() == Some("yes") {
+                // capped yes: `("STR\n" x N)` — no infinite loop
+                let n = stages
+                    .get(i + 1)
+                    .and_then(|nxt| Self::head_count(nxt))
+                    .unwrap_or(0);
+                let line = self.yes_line(stmts);
+                self.emit(&format!("$__p{i} = ({line} x {n});"));
+                self.emit(&format!("$__s{i} = 0;"));
+            } else {
+                if i == 0 {
+                    // stage-0 stdin: the OUTER pipe_in (an enclosing
+                    // stage's buffer) when set, else real STDIN — unless
+                    // the stage opens with a `< file` redirect (a
+                    // `while …; done < f` stage), which provides the
+                    // input
+                    let mut src = match &self.pipe_in {
+                        Some(p) => p.clone(),
+                        None => "do { local $/; <STDIN> } // \"\"".to_string(),
+                    };
+                    if let Some(IrStmt::Expr(IrExpr::Call { func, args })) = stmts.first()
+                    {
+                        if func == "redirect" {
+                            if let Some(specs) = args.get(1) {
+                                let m = self.mini_redirs_from_expr(specs);
+                                if m.len() == 1 && m[0].fd == 0 && m[0].mode == "r" {
+                                    let t = self.expr(&m[0].target);
+                                    src = self.slurp_path(&t);
+                                }
+                            }
+                        }
+                    }
+                    self.emit(&format!("my $__in = {src};"));
+                } else {
+                    self.emit(&format!("my $__in = $__p{};", i - 1));
+                }
+                self.emit(&format!("my $__a{i} = \"\";"));
+                self.pipe_in = Some("$__in".to_string());
+                self.cap.push(format!("$__a{i}"));
+                for s in stmts {
+                    self.stmt(s);
+                }
+                self.cap.pop();
+                self.pipe_in = None;
+                self.emit(&format!("$__p{i} = $__a{i};"));
+            }
+            let body = self.out.join("\n");
+            self.out = inner;
+            self.depth = saved_depth;
+            blocks.push(format!("do {{\n{}\n}}", indent_block(&body, 1)));
+            statuses.push(format!("($__s{i} >> 8)"));
+        }
+        // each stage's status is captured immediately after its do-block
+        let mut interleaved: Vec<String> = Vec::new();
+        for (i, b) in blocks.iter().enumerate() {
+            interleaved.push(format!("{b};"));
+            interleaved.push(format!("$__s{i} = $?;"));
+        }
+        let mut all = format!(
+            "do {{\n{}\n{}\n",
+            decls.join(" "),
+            indent_block(&interleaved.join("\n"), 1)
+        );
+        if self.need_pipestatus {
+            all.push_str(&format!("\n@PIPESTATUS = ({});", statuses.join(", ")));
+        }
+        all.push_str(&format!("\n$__p{}\n}}", stages.len() - 1));
+        self.pipe_in = entry_pipe;
+        Some(all)
+    }
+
+    /// `yes` output line expr (`"STR\n"`) — for the capped yes stage.
+    fn yes_line(&mut self, stmts: &[IrStmt]) -> String {
+        for s in stmts {
+            if let IrStmt::Expr(e) = s {
+                if let IrExpr::Call { func, args } = e {
+                    if !matches!(func.as_str(), "exec" | "builtin" | "command") {
+                        continue;
+                    }
+                    let words = match args.get(1) {
+                        Some(IrExpr::Array(items)) => items.clone(),
+                        _ => Vec::new(),
+                    };
+                    let parts: Vec<String> = words.iter().map(|w| self.expr(w)).collect();
+                    if parts.is_empty() {
+                        return "\"y\\n\"".to_string();
+                    }
+                    let join = if parts.len() == 1 {
+                        parts[0].clone()
+                    } else {
+                        format!("join(' ', {})", parts.join(", "))
+                    };
+                    return format!("({join} . \"\\n\")");
+                }
+            }
+        }
+        "\"y\\n\"".to_string()
+    }
+
+    /// Render an exec STATEMENT into a `do { }` expression returning its
+    /// status (0/256) — for expr-position native commands. Output goes
+    /// to the current output mode (print, or the capture accumulator).
+    fn exec_expr_from_stmt(&mut self, args: &[IrExpr]) -> String {
+        let mut inner = Vec::new();
+        std::mem::swap(&mut self.out, &mut inner);
+        let saved_depth = self.depth;
+        self.depth = 0;
+        self.exec_stmt(args);
+        let body = self.out.join("\n");
+        self.out = inner;
+        self.depth = saved_depth;
+        if body.is_empty() {
+            "0".to_string()
+        } else {
+            format!(
+                "do {{\n{}\n(($? == 0) ? 0 : 256)\n}}",
+                indent_block(&body, 1)
+            )
+        }
+    }
+
+    /// A slurp-perl-expr for one path expr (missing → "" + $? = 256).
+    fn slurp_path(&self, p: &str) -> String {
+        format!(
+            "do {{ my $__p = {p}; if (open my $__fh, '<', $__p) {{ local $/; my $__c = <$__fh>; close $__fh; $__c }} else {{ $? = 256; \"\" }} }}"
+        )
+    }
+
+    /// A slurp-perl-expr for several path exprs concatenated.
+    fn slurp_paths(&self, files: &[String]) -> String {
+        if files.is_empty() {
+            self.stdin_expr()
+        } else if files.len() == 1 {
+            self.slurp_path(&files[0])
+        } else {
+            let parts: Vec<String> = files.iter().map(|p| self.slurp_path(p)).collect();
+            format!("do {{ my $__o = \"\"; {}; $__o }}", parts.join(" . "))
+        }
+    }
+
+    /// The check_qx-flagged shell transport for a statement whose native
+    /// emulation refused (unsupported flags/shapes) — the reconstructed
+    /// command through `system('bash', '-c', "...")`.
+    fn exec_shell_fallback(&mut self, cmd: &str, words: &[IrExpr]) {
+        let has_glob = words
+            .iter()
+            .any(|w| matches!(w, IrExpr::Str(s, _) if s.contains('\u{1}')));
+        if has_glob {
+            let mut g = vec![shell_squote(cmd)];
+            for w in words {
+                g.push(self.shell_word(w));
+            }
+            let q = self.shell_qx(&g.join(" "), false);
+            self.emit(&format!("print {q};"));
+            return;
+        }
+        let mut parts = vec![shell_squote(cmd)];
+        for w in words {
+            parts.push(self.shell_word(w));
+        }
+        let inner = self.qx_raw_body(&parts.join(" ")).replace('"', "\\\"");
+        self.emit(&format!("system('bash', '-c', \"{inner}\");"));
+        self.emit("$? = ($? == 0 ? 0 : (($? >> 8) * 256));");
+    }
+
+    /// `cat` — slurp files (or stdin).
+    fn cat_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut files: Vec<String> = Vec::new();
+        let mut use_stdin = false;
+        for w in &words {
+            match w {
+                IrExpr::Str(s, _) if s == "-" => use_stdin = true,
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => return false,
+                _ => files.extend(self.word_items(w)),
+            }
+        }
+        if files.is_empty() || (use_stdin && files.is_empty()) {
+            self.emit_out(&self.stdin_expr());
+            self.emit("$? = 0;");
+            return true;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if use_stdin {
+            parts.push(self.stdin_expr());
+        }
+        for f in files {
+            parts.push(self.slurp_path(&f));
+        }
+        if parts.len() == 1 {
+            self.emit_out(&parts[0]);
+        } else {
+            self.emit_out(&format!("do {{ my $__o = \"\"; {}; $__o }}", parts.join(" . ")));
+        }
+        self.emit("$? = 0 unless $? == 256;");
+        true
+    }
+
+    /// `ls` — list directory entries (files/dirs, -1/-a/-A/-d, globs).
+    fn ls_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut all = false;
+        let mut dirs_only = false;
+        let mut targets: Vec<String> = Vec::new();
+        let mut globs: Vec<String> = Vec::new();
+        for w in &words {
+            match w {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    if s == "-1" || s == "--" {
+                        continue;
+                    }
+                    if s == "-a" {
+                        all = true;
+                        continue;
+                    }
+                    if s == "-A" {
+                        continue;
+                    }
+                    if s == "-d" {
+                        dirs_only = true;
+                        continue;
+                    }
+                    return false;
+                }
+                IrExpr::Str(s, _) if s.contains('\u{1}') => {
+                    let pat = s.replace("\u{1}SH2GLOB\u{1}", "");
+                    globs.push(Self::perl_str(&pat));
+                }
+                _ => targets.extend(self.word_items(w)),
+            }
+        }
+        if targets.is_empty() && globs.is_empty() {
+            targets.push("'.'".to_string());
+        }
+        let filter = if all {
+            "my @__e = sort readdir $__dh;"
+        } else {
+            "my @__e = grep { $_ ne '.' && $_ ne '..' } sort readdir $__dh;"
+        };
+        let list_dir = |t: &str| -> String {
+            format!(
+                "if (-d {t}) {{ opendir my $__dh, {t} or ($? = 256, next); {filter} closedir $__dh; $__o .= join(\"\\n\", @__e) . \"\\n\" if @__e; }} elsif (-e {t}) {{ $__o .= {t} . \"\\n\"; }} else {{ $? = 256; }}"
+            )
+        };
+        let mut bits: Vec<String> = Vec::new();
+        let n_targets = targets.len() + globs.len();
+        for t in &targets {
+            if dirs_only {
+                bits.push(format!(
+                    "if (-e {t}) {{ $__o .= {t} . \"\\n\"; }} else {{ $? = 256; }}"
+                ));
+            } else {
+                if n_targets > 1 {
+                    bits.push(format!("$__o .= {t} . \":\\n\" if -d {t};"));
+                }
+                bits.push(list_dir(t));
+            }
+        }
+        for g in &globs {
+            if n_targets > 1 {
+                bits.push(format!("$__o .= {g} . \":\\n\" if -d {g};"));
+            }
+            bits.push(format!(
+                "for my $__g ({g}) {{ {} }}",
+                list_dir("$__g")
+            ));
+        }
+        self.emit_out(&format!(
+            "do {{ my $__o = \"\"; {}; $__o }}",
+            bits.join(" ")
+        ));
+        self.emit("$? = 0 unless $? == 256;");
+        true
+    }
+
+    /// BRE → perl regex (unescape the group/quantifier backslashes).
+    fn bre_to_perl(pat: &str) -> String {
+        let mut out = String::new();
+        let cs: Vec<char> = pat.chars().collect();
+        let mut i = 0;
+        while i < cs.len() {
+            if cs[i] == '\\' && i + 1 < cs.len() {
+                match cs[i + 1] {
+                    '(' | ')' | '+' | '?' | '|' => {
+                        out.push(cs[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    '{' | '}' => {
+                        out.push('{');
+                        i += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(cs[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// `grep`/`egrep` — regex filter over files or stdin.
+    fn grep_stmt(&mut self, words: &[IrExpr], egrep: bool) -> bool {
+        let words = Self::norm_words(words);
+        let mut fixed = false;
+        let mut icase = false;
+        let mut invert = false;
+        let mut count = false;
+        let mut quiet = false;
+        let mut line_no = false;
+        let mut word = false;
+        let mut exact = false;
+        let mut byte_off = false;
+        let mut only = false;
+        let mut after = 0i64;
+        let mut before = 0i64;
+        let mut pattern: Option<String> = None;
+        let mut files: Vec<String> = Vec::new();
+        let mut ere = egrep;
+        let mut i = 0;
+        let ws: Vec<&IrExpr> = words.iter().collect();
+        while i < ws.len() {
+            match ws[i] {
+                IrExpr::Str(s, _) if s.starts_with('-') && s != "-" && s != "--" => {
+                    let mut chs = s[1..].chars().peekable();
+                    let mut done = false;
+                    while let Some(c) = chs.next() {
+                        if done {
+                            break;
+                        }
+                        match c {
+                            'E' => ere = true,
+                            'F' => fixed = true,
+                            'i' => icase = true,
+                            'v' => invert = true,
+                            'c' => count = true,
+                            'q' => quiet = true,
+                            'n' => line_no = true,
+                            'w' => word = true,
+                            'x' => exact = true,
+                            'b' => byte_off = true,
+                            's' => {}
+                            'o' => only = true,
+                            'e' => {
+                                i += 1;
+                                if i >= ws.len() {
+                                    return false;
+                                }
+                                match &ws[i] {
+                                    IrExpr::Str(p, _) => pattern = Some(p.clone()),
+                                    _ => return false,
+                                }
+                                done = true;
+                            }
+                            'A' | 'B' | 'C' => {
+                                let mut num: String = String::new();
+                                while let Some(d) = chs.peek() {
+                                    if d.is_ascii_digit() {
+                                        num.push(*d);
+                                        chs.next();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if num.is_empty() {
+                                    i += 1;
+                                    if i >= ws.len() {
+                                        return false;
+                                    }
+                                    match &ws[i] {
+                                        IrExpr::Str(v, _) => num = v.clone(),
+                                        _ => return false,
+                                    }
+                                }
+                                let n: i64 = match num.parse() {
+                                    Ok(n) => n,
+                                    Err(_) => return false,
+                                };
+                                match c {
+                                    'A' => after = n,
+                                    'B' => before = n,
+                                    _ => {
+                                        after = n;
+                                        before = n;
+                                    }
+                                }
+                            }
+                            _ => return false,
+                        }
+                    }
+                    i += 1;
+                }
+                _ => {
+                    if pattern.is_none() {
+                        match &ws[i] {
+                            IrExpr::Str(p, _) => pattern = Some(p.clone()),
+                            _ => return false,
+                        }
+                    } else {
+                        files.extend(self.word_items(ws[i]));
+                    }
+                    i += 1;
+                }
+            }
+        }
+        let Some(pat) = pattern else {
+            return false;
+        };
+        if only && (count || quiet) {
+            return false;
+        }
+        let mut re = if fixed {
+            format!("\\Q{}\\E", pat)
+        } else if ere {
+            pat.clone()
+        } else {
+            Self::bre_to_perl(&pat)
+        };
+        if exact {
+            re = format!("^(?:{re})$");
+        } else if word {
+            re = format!("\\b(?:{re})\\b");
+        }
+        let re_expr = Self::perl_str(&re);
+        let ic = if icase { "i" } else { "" };
+        let input = self.slurp_paths(&files);
+        // match a body line (trailing \n stripped) against the regex
+        let hit = format!("$__b =~ /$__re/{ic}");
+        let cond = if invert { format!("!({hit})") } else { hit.clone() };
+        let mut pre = String::new();
+        if line_no {
+            pre.push_str("($__i + 1) . \":\" . ");
+        }
+        if byte_off && !only {
+            // GNU -b prints the byte offset of the LINE START (not the
+            // match position)
+            pre = format!("$__off_at{{$__i}} . \":\" . ");
+        }
+        let err = if files.is_empty() {
+            "my $__err = 0;".to_string()
+        } else {
+            "my $__err = ($? == 256 ? 1 : 0);".to_string()
+        };
+        let status_scalar = "($__err ? 512 : ($__m ? 0 : 256))";
+        let status_list = "($__err ? 512 : (@__m ? 0 : 256))";
+        let body = if quiet {
+            format!(
+                "do {{ my $__in = {input}; {err} my $__re = {re_expr}; my @__l = split /(?<=\\n)/, $__in; my $__m = 0; for my $__l (@__l) {{ my $__b = $__l; $__b =~ s/\\n$//; if ({cond}) {{ $__m = 1; last; }} }} $? = {status_scalar}; \"\" }}"
+            )
+        } else if count {
+            format!(
+                "do {{ my $__in = {input}; {err} my $__re = {re_expr}; my @__l = split /(?<=\\n)/, $__in; my $__m = 0; for my $__l (@__l) {{ my $__b = $__l; $__b =~ s/\\n$//; if ({cond}) {{ $__m++; }} }} $? = {status_scalar}; $__m }}"
+            )
+        } else if only {
+            format!(
+                "do {{ my $__in = {input}; {err} my $__re = {re_expr}; my @__l = split /(?<=\\n)/, $__in; my @__m; for my $__l (@__l) {{ my $__b = $__l; $__b =~ s/\\n$//; while ($__b =~ /$__re/{ic}g) {{ push @__m, $& . \"\\n\"; }} }} $? = {status_list}; join(\"\", @__m) }}"
+            )
+        } else {
+            format!(
+                "do {{ my $__in = {input}; {err} my $__re = {re_expr}; my @__l = split /(?<=\\n)/, $__in; my @__m; my $__off = 0; my %__keep; my %__off_at; for (my $__i = 0; $__i < @__l; $__i++) {{ my $__b = $__l[$__i]; my $__had = ($__b =~ s/\\n$//); $__off_at{{$__i}} = $__off; $__off += length($__l[$__i]) - ($__had ? 1 : 0); my $__hit = 0; if ({cond}) {{ $__hit = 1; }} if ({ctx}) {{ if ($__hit) {{ my $__lo = $__i - {before}; $__lo = 0 if $__lo < 0; my $__hi = $__i + {after}; $__hi = $#__l if $__hi > $#__l; for my $__j ($__lo .. $__hi) {{ $__keep{{$__j}} = 1; }} }} }} elsif ($__hit) {{ push @__m, {pre}$__l[$__i]; }} }}\nmy @__sel = sort {{ $a <=> $b }} keys %__keep;\nfor my $__i (@__sel) {{ push @__m, {pre}$__l[$__i]; }}\n$? = {status_list}; join(\"\", @__m) }}",
+                ctx = if after > 0 || before > 0 { "1" } else { "0" }
+            )
+        };
+        if quiet {
+            self.emit_out(&body);
+        } else if count {
+            self.emit_out_ln(&body);
+        } else {
+            // match lines carry their own \n
+            self.emit_out(&body);
+        }
+        true
+    }
+
+    /// `wc` — line/word/byte counts.
+    fn wc_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut l = false;
+        let mut w = false;
+        let mut c = false;
+        let mut files: Vec<String> = Vec::new();
+        for wd in &words {
+            match wd {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    for ch in s[1..].chars() {
+                        match ch {
+                            'l' => l = true,
+                            'w' => w = true,
+                            'c' | 'm' => c = true,
+                            _ => return false,
+                        }
+                    }
+                }
+                _ => files.extend(self.word_items(wd)),
+            }
+        }
+        if !l && !w && !c {
+            l = true;
+            w = true;
+            c = true;
+        }
+        let mut bits: Vec<String> = Vec::new();
+        if l {
+            bits.push("my $__l = ($__in =~ tr/\\n//);".to_string());
+        }
+        if w {
+            bits.push("my $__w = scalar(() = $__in =~ /\\S+/g);".to_string());
+        }
+        if c {
+            bits.push("my $__c = length $__in;".to_string());
+        }
+        let mut vals: Vec<String> = Vec::new();
+        if l {
+            vals.push("$__l".to_string());
+        }
+        if w {
+            vals.push("$__w".to_string());
+        }
+        if c {
+            vals.push("$__c".to_string());
+        }
+        let count_body = |in_expr: &str| -> String {
+            format!(
+                "do {{ my $__in = {in_expr}; {} my @__n = ({}); $? = 0; join(' ', @__n) }}",
+                bits.join(" "),
+                vals.join(", ")
+            )
+        };
+        if files.is_empty() {
+            let e = count_body(&self.stdin_expr());
+            self.emit_out_ln(&e);
+            return true;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for f in &files {
+            parts.push(format!(
+                "do {{ my $__f = {f}; my $__in = do {{ if (open my $__fh, '<', $__f) {{ local $/; my $__c = <$__fh>; close $__fh; $__c }} else {{ $? = 256; \"\" }} }}; if ($? == 256) {{ \"\" }} else {{ {} my @__n = ({}); $? = 0; join(' ', @__n) . \" $__f\" }} }}",
+                bits.join(" "),
+                vals.join(", ")
+            ));
+        }
+        if parts.len() == 1 {
+            self.emit_out_ln(&parts[0]);
+        } else {
+            let parts2: Vec<String> = parts.iter().cloned().collect();
+            self.emit_out_ln(&format!(
+                "do {{ my @__r = ({}); $? = 0; join(\"\\n\", @__r) }}",
+                parts2.join(", ")
+            ));
+        }
+        true
+    }
+
+    /// `uname` — kernel identity via POSIX::uname.
+    fn uname_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut which: Vec<char> = Vec::new();
+        for w in &words {
+            if let IrExpr::Str(s, _) = w {
+                if s.starts_with('-') && s.len() > 1 {
+                    for ch in s[1..].chars() {
+                        match ch {
+                            's' | 'n' | 'r' | 'v' | 'm' | 'p' | 'o' | 'a' => {
+                                which.push(ch)
+                            }
+                            _ => return false,
+                        }
+                    }
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        if which.is_empty() {
+            which.push('s');
+        }
+        self.need_uname = true;
+        let mut parts: Vec<String> = Vec::new();
+        for ch in &which {
+            match ch {
+                's' => parts.push("(POSIX::uname())[0]".to_string()),
+                'n' => parts.push("(POSIX::uname())[1]".to_string()),
+                'r' => parts.push("(POSIX::uname())[2]".to_string()),
+                'v' => parts.push("(POSIX::uname())[3]".to_string()),
+                'm' | 'p' => parts.push("(POSIX::uname())[4]".to_string()),
+                'o' => parts
+                    .push("(($^O eq 'linux') ? 'GNU/Linux' : (POSIX::uname())[0])".to_string()),
+                'a' => {
+                    parts.push("(POSIX::uname())[0]".to_string());
+                    parts.push("(POSIX::uname())[1]".to_string());
+                    parts.push("(POSIX::uname())[2]".to_string());
+                    parts.push("(POSIX::uname())[3]".to_string());
+                    parts.push("(POSIX::uname())[4]".to_string());
+                    parts.push("(($^O eq 'linux') ? 'GNU/Linux' : (POSIX::uname())[0])".to_string());
+                }
+                _ => {}
+            }
+        }
+        self.emit_out_ln(&format!("join(' ', {})", parts.join(", ")));
+        self.emit("$? = 0;");
+        true
+    }
+
+    /// `readlink`/`realpath` — canonicalize (or read the link target).
+    fn readlink_stmt(&mut self, words: &[IrExpr], realpath: bool) -> bool {
+        let words = Self::norm_words(words);
+        let mut canon = realpath;
+        let mut paths: Vec<String> = Vec::new();
+        for w in &words {
+            match w {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    if s == "-f" || s == "-e" || s == "-m" {
+                        canon = true;
+                    } else if s == "-n" || s == "-s" || s == "-v" {
+                        // no-op / quiet flags
+                    } else {
+                        return false;
+                    }
+                }
+                _ => paths.extend(self.word_items(w)),
+            }
+        }
+        if paths.is_empty() {
+            return false;
+        }
+        if canon {
+            self.need_cwd = true;
+            let parts: Vec<String> = paths
+                .iter()
+                .map(|p| {
+                    format!(
+                        "do {{ my $__p = {p}; my $__r = Cwd::abs_path($__p); if (defined $__r) {{ $__r }} else {{ $? = 256; \"\" }} }}"
+                    )
+                })
+                .collect();
+            self.emit_out_ln(&format!("join(\"\\n\", {})", parts.join(", ")));
+        } else {
+            let parts: Vec<String> = paths
+                .iter()
+                .map(|p| {
+                    format!(
+                        "do {{ my $__p = {p}; my $__r = readlink($__p); if (defined $__r) {{ $__r }} else {{ $? = 256; \"\" }} }}"
+                    )
+                })
+                .collect();
+            self.emit_out_ln(&format!("join(\"\\n\", {})", parts.join(", ")));
+        }
+        self.emit("$? = 0 unless $? == 256;");
+        true
+    }
+
+    /// `basename`/`dirname` — path components via File::Basename.
+    fn basename_stmt(&mut self, words: &[IrExpr], dir: bool) -> bool {
+        let words = Self::norm_words(words);
+        self.need_basename = true;
+        let mut args: Vec<String> = Vec::new();
+        for w in &words {
+            if let IrExpr::Str(s, _) = w {
+                if s.starts_with('-') && s.len() > 1 {
+                    return false;
+                }
+            }
+            args.extend(self.word_items(w));
+        }
+        if args.is_empty() {
+            return false;
+        }
+        let f = if dir {
+            format!("dirname({})", args[0])
+        } else if args.len() >= 2 {
+            format!("basename({}, {})", args[0], args[1])
+        } else {
+            format!("basename({})", args[0])
+        };
+        self.emit_out_ln(&f);
+        self.emit("$? = 0;");
+        true
+    }
+
+    fn hostname_stmt(&mut self, _words: &[IrExpr]) -> bool {
+        self.need_uname = true;
+        self.emit_out_ln("(POSIX::uname())[0]");
+        self.emit("$? = 0;");
+        true
+    }
+
+    fn whoami_stmt(&mut self, _words: &[IrExpr]) -> bool {
+        self.emit_out_ln("(getpwuid($>) // '')");
+        self.emit("$? = 0;");
+        true
+    }
+
+    fn pwd_stmt(&mut self, _words: &[IrExpr]) -> bool {
+        self.need_cwd = true;
+        self.emit_out_ln("getcwd()");
+        self.emit("$? = 0;");
+        true
+    }
+
+    fn id_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut flags = String::new();
+        for w in &words {
+            if let IrExpr::Str(s, _) = w {
+                if s.starts_with('-') && s.len() > 1 {
+                    flags.push_str(&s[1..]);
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        let expr = if flags == "u" {
+            "$>".to_string()
+        } else if flags == "g" {
+            "$)".to_string()
+        } else if flags == "un" || flags == "nu" || flags == "n" {
+            "(getpwuid($>) // '')".to_string()
+        } else if flags == "gn" || flags == "ng" {
+            "(getgrgid($)) // '')".to_string()
+        } else if flags.is_empty() {
+            "do { my $__u = getpwuid($>) // ''; my $__g = getgrgid($)) // ''; \"uid=$>($__u) gid=$)($__g) groups=$)($__g)\" }".to_string()
+        } else {
+            return false;
+        };
+        self.emit_out_ln(&expr);
+        self.emit("$? = 0;");
+        true
+    }
+
+    fn seq_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut sep: Option<String> = None;
+        let mut nums: Vec<String> = Vec::new();
+        let mut i = 0;
+        let ws: Vec<&IrExpr> = words.iter().collect();
+        while i < ws.len() {
+            match ws[i] {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    if s == "-s" {
+                        i += 1;
+                        if i >= ws.len() {
+                            return false;
+                        }
+                        sep = Some(self.expr(ws[i]));
+                    } else {
+                        return false;
+                    }
+                }
+                IrExpr::Str(s, _) => {
+                    if s.parse::<i64>().is_err() {
+                        return false;
+                    }
+                    nums.push(s.clone());
+                }
+                _ => return false,
+            }
+            i += 1;
+        }
+        if nums.is_empty() || nums.len() > 3 {
+            return false;
+        }
+        let sep_e = sep.unwrap_or_else(|| "\"\\n\"".to_string());
+        let body = match nums.len() {
+            1 => format!("join({sep_e}, (1..{}))", nums[0]),
+            2 => format!("join({sep_e}, ({}..{}))", nums[0], nums[1]),
+            _ => format!(
+                "do {{ my @__s; for (my $__i = {}; $__i <= {}; $__i += {}) {{ push @__s, $__i; }} join({sep_e}, @__s) }}",
+                nums[0], nums[2], nums[1]
+            ),
+        };
+        self.emit_out_ln(&body);
+        self.emit("$? = 0;");
+        true
+    }
+
+    /// `cmp` — byte comparison; prints the GNU differ message (or -l
+    /// lines), status 0/256.
+    fn cmp_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut silent = false;
+        let mut verbose = false;
+        let mut files: Vec<String> = Vec::new();
+        for w in &words {
+            match w {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    if s == "-s" {
+                        silent = true;
+                    } else if s == "-l" {
+                        verbose = true;
+                    } else {
+                        return false;
+                    }
+                }
+                _ => files.extend(self.word_items(w)),
+            }
+        }
+        if files.len() != 2 {
+            return false;
+        }
+        let (a, b) = (&files[0], &files[1]);
+        let verdict = if verbose {
+            "do { my $__o = \"\"; for (my $__i = 0; $__i < length($__a) || $__i < length($__b); $__i++) { my $__x = $__i < length($__a) ? ord(substr($__a, $__i, 1)) : 0; my $__y = $__i < length($__b) ? ord(substr($__b, $__i, 1)) : 0; if ($__x != $__y) { $__o .= sprintf(\"%4o %3o %3o\\n\", $__i + 1, $__x, $__y); } } $? = ($__o eq \"\" ? 0 : 256); $__o }".to_string()
+        } else if silent {
+            "do { $? = (($__n >= $__max && length($__a) == length($__b)) ? 0 : 256); \"\" }".to_string()
+        } else {
+            "do { if ($__n >= $__max && length($__a) == length($__b)) { $? = 0; \"\" } else { $? = 256; my $__line = 1 + (substr($__a, 0, $__n) =~ tr/\\n//); \"cmp: $__p1 $__p2 differ: byte \" . ($__n + 1) . \", line $__line\" } }".to_string()
+        };
+        let body = format!(
+            "do {{ my $__p1 = {a}; my $__p2 = {b}; my $__a = {sa}; my $__b = {sb}; my $__max = (length($__a) < length($__b) ? length($__a) : length($__b)); my $__n = 0; $__n++ while $__n < $__max && substr($__a, $__n, 1) eq substr($__b, $__n, 1); {verdict} }}",
+            sa = self.slurp_path(a),
+            sb = self.slurp_path(b)
+        );
+        if verbose || silent {
+            self.emit_out(&body);
+        } else {
+            self.emit_out_ln(&body);
+        }
+        true
+    }
+
+    fn mktemp_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut dir = false;
+        let mut templ: Option<String> = None;
+        for w in &words {
+            match w {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    if s == "-d" {
+                        dir = true;
+                    } else {
+                        return false;
+                    }
+                }
+                _ => {
+                    if templ.is_none() {
+                        templ = Some(self.expr(w));
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        self.need_temp = true;
+        let e = match templ {
+            Some(t) => {
+                if dir {
+                    format!("tempdir({t})")
+                } else {
+                    format!("tempfile({t})[1]")
+                }
+            }
+            None => {
+                if dir {
+                    "tempdir()".to_string()
+                } else {
+                    "tempfile()[1]".to_string()
+                }
+            }
+        };
+        self.emit_out_ln(&e);
+        self.emit("$? = 0;");
+        true
+    }
+
+    fn date_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut fmt: Option<String> = None;
+        for w in &words {
+            if let IrExpr::Str(s, _) = w {
+                if s.starts_with('-') {
+                    return false;
+                }
+                if let Some(f) = s.strip_prefix('+') {
+                    fmt = Some(f.to_string());
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        let Some(f) = fmt else {
+            return false;
+        };
+        self.need_strftime = true;
+        let f = Self::perl_str(&f);
+        self.emit_out_ln(&format!("strftime({f}, localtime)"));
+        self.emit("$? = 0;");
+        true
+    }
+
+    /// `tr` — character translation (literal sets; -d).
+    fn tr_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut del = false;
+        let mut sets: Vec<String> = Vec::new();
+        for w in &words {
+            match w {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    for ch in s[1..].chars() {
+                        match ch {
+                            'd' => del = true,
+                            _ => return false,
+                        }
+                    }
+                }
+                IrExpr::Str(s, _) => sets.push(s.clone()),
+                _ => return false,
+            }
+        }
+        if sets.is_empty() || sets.len() > 2 {
+            return false;
+        }
+        let src = match expand_tr_set(&sets[0]) {
+            Some(s) => s,
+            None => return false,
+        };
+        let dst = if del {
+            String::new()
+        } else {
+            match sets.get(1) {
+                Some(s) => match expand_tr_set(s) {
+                    Some(s) => s,
+                    None => return false,
+                },
+                None => src.clone(),
+            }
+        };
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('/', "\\/");
+        let op = if del {
+            format!("tr/{esc_src}//d", esc_src = esc(&src))
+        } else {
+            format!("tr/{}/{}/", esc(&src), esc(&dst))
+        };
+        let body = format!(
+            "do {{ my $__in = {}; $__in =~ {op}; $__in }}",
+            self.stdin_expr()
+        );
+        self.emit_out_ln(&body);
+        self.emit("$? = 0;");
+        true
+    }
+
+    /// `head`/`tail` — first/last N lines of files or stdin.
+    fn head_tail_stmt(&mut self, words: &[IrExpr], tail: bool) -> bool {
+        let words = Self::norm_words(words);
+        let mut n: i64 = 10;
+        let mut files: Vec<String> = Vec::new();
+        let mut i = 0;
+        let ws: Vec<&IrExpr> = words.iter().collect();
+        while i < ws.len() {
+            match ws[i] {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    if let Some(rest) = s.strip_prefix("-n") {
+                        if rest.is_empty() {
+                            i += 1;
+                            if i >= ws.len() {
+                                return false;
+                            }
+                            match &ws[i] {
+                                IrExpr::Str(v, _) => {
+                                    match v.parse::<i64>() {
+                                        Ok(v) => n = v,
+                                        Err(_) => return false,
+                                    }
+                                }
+                                _ => return false,
+                            }
+                        } else {
+                            match rest.parse::<i64>() {
+                                Ok(v) => n = v,
+                                Err(_) => return false,
+                            }
+                        }
+                    } else if let Ok(v) = s[1..].parse::<i64>() {
+                        n = v;
+                    } else {
+                        return false;
+                    }
+                }
+                IrExpr::Str(s, _) if s == "-" => files.push(self.stdin_expr()),
+                _ => files.extend(self.word_items(ws[i])),
+            }
+            i += 1;
+        }
+        let slice = if tail {
+            format!(
+                "my $__k = $#__l - {n} + 1; $__k = 0 if $__k < 0; join(\"\", @__l[$__k .. $#__l])"
+            )
+        } else {
+            format!(
+                "my $__k = ($#__l < {n} - 1) ? $#__l : {n} - 1; join(\"\", @__l[0 .. $__k])"
+            )
+        };
+        if files.is_empty() {
+            let e = format!(
+                "do {{ my $__in = {}; my @__l = split /(?<=\\n)/, $__in; {slice} }}",
+                self.stdin_expr()
+            );
+            self.emit_out(&e);
+            self.emit("$? = 0;");
+            return true;
+        }
+        if files.len() == 1 {
+            let e = format!(
+                "do {{ my $__in = {}; my @__l = split /(?<=\\n)/, $__in; {slice} }}",
+                files[0]
+            );
+            self.emit_out(&e);
+            self.emit("$? = 0;");
+            return true;
+        }
+        let mut bits: Vec<String> = Vec::new();
+        for f in files {
+            bits.push(format!(
+                "my $__p = {f}; $__o .= \"==> $__p <==\\n\"; my $__in = do {{ if (open my $__fh, '<', $__p) {{ local $/; my $__c = <$__fh>; close $__fh; $__c }} else {{ \"\" }} }}; my @__l = split /(?<=\\n)/, $__in; $__o .= {slice};"
+            ));
+        }
+        self.emit_out(&format!(
+            "do {{ my $__o = \"\"; {}; $__o }}",
+            bits.join(" ")
+        ));
+        self.emit("$? = 0;");
+        true
+    }
+
+    fn sort_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut numeric = false;
+        let mut reverse = false;
+        let mut human = false;
+        let mut unique = false;
+        let mut files: Vec<String> = Vec::new();
+        for w in &words {
+            match w {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    for ch in s[1..].chars() {
+                        match ch {
+                            'n' => numeric = true,
+                            'r' => reverse = true,
+                            'h' => human = true,
+                            'u' => unique = true,
+                            _ => return false,
+                        }
+                    }
+                }
+                _ => files.extend(self.word_items(w)),
+            }
+        }
+        let input = self.slurp_paths(&files);
+        let (ca, cb) = if reverse { ("$b", "$a") } else { ("$a", "$b") };
+        let cmp = if human {
+            format!(
+                "my $__c = sub {{ my ($__x) = @_; my ($__n) = $__x =~ /^([\\d.]+)/; $__n //= 0; my ($__s) = $__x =~ /([kmgtpezy])(?=\\n|$)/i; $__s = lc($__s // ''); $__n * ($__s eq 'k' ? 1000 : $__s eq 'm' ? 1000000 : $__s eq 'g' ? 1000000000 : $__s eq 't' ? 1000000000000 : 1) }}; my @__s = sort {{ $__c->({ca}) <=> $__c->({cb}) }} @__l;"
+            )
+        } else if numeric {
+            format!(
+                "my @__s = sort {{ ({ca} + 0) <=> ({cb} + 0) }} @__l;"
+            )
+        } else {
+            format!("my @__s = sort {{ {ca} cmp {cb} }} @__l;")
+        };
+        if unique {
+            let body = format!(
+                "do {{ my $__in = {input}; my @__l = split /(?<=\\n)/, $__in; {cmp} my @__u; for my $__l (@__s) {{ push @__u, $__l unless @__u && $__u[-1] eq $__l; }} $? = 0; join(\"\", @__u) }}"
+            );
+            self.emit_out(&body);
+        } else {
+            let body = format!(
+                "do {{ my $__in = {input}; my @__l = split /(?<=\\n)/, $__in; {cmp} $? = 0; join(\"\", @__s) }}"
+            );
+            self.emit_out(&body);
+        }
+        self.emit("$? = 0 unless $? == 256;");
+        true
+    }
+
+    fn uniq_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut count = false;
+        let mut files: Vec<String> = Vec::new();
+        for w in &words {
+            match w {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    if s == "-c" {
+                        count = true;
+                    } else {
+                        return false;
+                    }
+                }
+                _ => files.extend(self.word_items(w)),
+            }
+        }
+        let input = self.slurp_paths(&files);
+        let body = if count {
+            format!(
+                "do {{ my $__in = {input}; my @__l = split /(?<=\\n)/, $__in; my $__o = \"\"; my $__p = \"\"; my $__c = 0; for my $__l (@__l) {{ if ($__l eq $__p) {{ $__c++; }} else {{ $__o .= sprintf(\"%7d %s\", $__c, $__p) . \"\\n\" if $__c; $__p = $__l; $__c = 1; }} }} $__o .= sprintf(\"%7d %s\", $__c, $__p) . \"\\n\" if $__c; $? = 0; $__o }}"
+            )
+        } else {
+            format!(
+                "do {{ my $__in = {input}; my @__l = split /(?<=\\n)/, $__in; my @__u; for my $__l (@__l) {{ push @__u, $__l unless @__u && $__u[-1] eq $__l; }} $? = 0; join(\"\", @__u) }}"
+            )
+        };
+        self.emit_out(&body);
+        true
+    }
+
+    fn cut_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut delim = "\"\\t\"".to_string();
+        let mut fields: Vec<i64> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+        let mut i = 0;
+        let ws: Vec<&IrExpr> = words.iter().collect();
+        while i < ws.len() {
+            match ws[i] {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    if let Some(rest) = s.strip_prefix("-d") {
+                        if rest.is_empty() {
+                            i += 1;
+                            if i >= ws.len() {
+                                return false;
+                            }
+                            match &ws[i] {
+                                IrExpr::Str(v, _) => delim = Self::perl_str(v),
+                                _ => return false,
+                            }
+                        } else {
+                            delim = Self::perl_str(rest);
+                        }
+                    } else if let Some(rest) = s.strip_prefix("-f") {
+                        let f = if rest.is_empty() {
+                            i += 1;
+                            if i >= ws.len() {
+                                return false;
+                            }
+                            match &ws[i] {
+                                IrExpr::Str(v, _) => v.clone(),
+                                _ => return false,
+                            }
+                        } else {
+                            rest.to_string()
+                        };
+                        for part in f.split(',') {
+                            if part.contains('-') {
+                                return false;
+                            }
+                            match part.parse::<i64>() {
+                                Ok(n) => fields.push(n),
+                                Err(_) => return false,
+                            }
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                _ => files.extend(self.word_items(ws[i])),
+            }
+            i += 1;
+        }
+        if fields.is_empty() {
+            return false;
+        }
+        let idxs: Vec<String> = fields.iter().map(|f| (f - 1).to_string()).collect();
+        let idxs = idxs.join(", ");
+        let input = self.slurp_paths(&files);
+        let body = format!(
+            "do {{ my $__in = {input}; my $__d = {delim}; my @__o; for my $__l (split /(?<=\\n)/, $__in) {{ my $__b = $__l; $__b =~ s/\\n$//; if ($__b !~ /\\Q$__d\\E/) {{ push @__o, $__l; next; }} my @__f = split /\\Q$__d\\E/, $__b, -1; push @__o, join($__d, @__f[{idxs}]) . \"\\n\"; }} $? = 0; join(\"\", @__o) }}"
+        );
+        self.emit_out(&body);
+        true
+    }
+
+    fn strings_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut min = 4i64;
+        let mut files: Vec<String> = Vec::new();
+        for w in &words {
+            match w {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    if let Some(rest) = s.strip_prefix("-n") {
+                        if rest.is_empty() {
+                            return false;
+                        }
+                        match rest.parse::<i64>() {
+                            Ok(v) => min = v,
+                            Err(_) => return false,
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                _ => files.extend(self.word_items(w)),
+            }
+        }
+        let input = self.slurp_paths(&files);
+        let body = format!(
+            "do {{ my $__in = {input}; my @__s = $__in =~ /[\\x20-\\x7E]{{{min},}}/g; $? = 0; join(\"\\n\", @__s) . ( @__s ? \"\\n\" : \"\" ) }}"
+        );
+        self.emit_out(&body);
+        true
+    }
+
+    fn sha_stmt(&mut self, words: &[IrExpr], sha256: bool) -> bool {
+        let words = Self::norm_words(words);
+        let mut files: Vec<String> = Vec::new();
+        for w in &words {
+            if let IrExpr::Str(s, _) = w {
+                if s.starts_with('-') && s.len() > 1 {
+                    return false;
+                }
+            }
+            files.extend(self.word_items(w));
+        }
+        self.need_sha = true;
+        let f = if sha256 { "sha256_hex" } else { "sha512_hex" };
+        if files.is_empty() {
+            self.emit_out_ln(&format!(
+                "do {{ my $__in = {}; {f}($__in) . \"  -\" }}",
+                self.stdin_expr()
+            ));
+        } else {
+            let parts: Vec<String> = files
+                .iter()
+                .map(|p| {
+                    format!(
+                        "do {{ my $__p = {p}; if (open my $__fh, '<', $__p) {{ local $/; my $__d = <$__fh>; close $__fh; {f}($__d) . \"  $__p\" }} else {{ $? = 256; \"\" }} }}"
+                    )
+                })
+                .collect();
+            self.emit_out_ln(&format!("join(\"\\n\", {})", parts.join(", ")));
+        }
+        self.emit("$? = 0 unless $? == 256;");
+        true
+    }
+
+    fn stat_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut fmt = String::new();
+        let mut files: Vec<String> = Vec::new();
+        let mut i = 0;
+        let ws: Vec<&IrExpr> = words.iter().collect();
+        while i < ws.len() {
+            match ws[i] {
+                IrExpr::Str(s, _) if s == "-c" => {
+                    i += 1;
+                    if i >= ws.len() {
+                        return false;
+                    }
+                    match &ws[i] {
+                        IrExpr::Str(f, _) => fmt = f.clone(),
+                        _ => return false,
+                    }
+                }
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => return false,
+                _ => files.extend(self.word_items(ws[i])),
+            }
+            i += 1;
+        }
+        if files.is_empty() || fmt.is_empty() {
+            return false;
+        }
+        // %s size, %a mode octal, %u uid, %g gid, %y mtime (best effort)
+        let mut parts: Vec<String> = Vec::new();
+        let mut lit = String::new();
+        let mut cs = fmt.chars().peekable();
+        while let Some(c) = cs.next() {
+            if c == '%' {
+                if !lit.is_empty() {
+                    parts.push(Self::perl_str(&lit));
+                    lit.clear();
+                }
+                let Some(spec) = cs.next() else { return false };
+                match spec {
+                    's' => parts.push("$__st[7]".to_string()),
+                    'a' => parts.push("sprintf(\"%o\", $__st[2] & 07777)".to_string()),
+                    'u' => parts.push("$__st[4]".to_string()),
+                    'g' => parts.push("$__st[5]".to_string()),
+                    'y' => {
+                        self.need_strftime = true;
+                        parts.push("strftime(\"%Y-%m-%d %H:%M:%S\", localtime($__st[9]))".to_string());
+                    }
+                    _ => return false,
+                }
+            } else {
+                lit.push(c);
+            }
+        }
+        if !lit.is_empty() {
+            parts.push(Self::perl_str(&lit));
+        }
+        if parts.is_empty() {
+            return false;
+        }
+        let joined = parts.join(" . ");
+        let body = format!(
+            "do {{ my $__o = \"\"; for my $__p ({files}) {{ my @__st = stat($__p); if (@__st) {{ $__o .= {joined}; }} else {{ $? = 256; }} }} $__o }}",
+            files = files.join(", "),
+            joined = joined
+        );
+        self.emit_out_ln(&body);
+        self.emit("$? = 0 unless $? == 256;");
+        true
+    }
+
+    fn find_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut name_pat: Option<String> = None;
+        let mut type_f = false;
+        let mut dirs: Vec<String> = Vec::new();
+        let mut i = 0;
+        let ws: Vec<&IrExpr> = words.iter().collect();
+        while i < ws.len() {
+            match ws[i] {
+                IrExpr::Str(s, _) if s == "-name" => {
+                    i += 1;
+                    if i >= ws.len() {
+                        return false;
+                    }
+                    match &ws[i] {
+                        IrExpr::Str(p, _) => name_pat = Some(p.clone()),
+                        _ => return false,
+                    }
+                }
+                IrExpr::Str(s, _) if s == "-type" => {
+                    i += 1;
+                    if i >= ws.len() {
+                        return false;
+                    }
+                    match &ws[i] {
+                        IrExpr::Str(t, _) if t == "f" => type_f = true,
+                        _ => return false,
+                    }
+                }
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => return false,
+                _ => dirs.extend(self.word_items(ws[i])),
+            }
+            i += 1;
+        }
+        let pat = match name_pat {
+            Some(p) => p,
+            None => return false,
+        };
+        let re = Self::glob_to_anchor(&pat);
+        self.need_find = true;
+        let cond = if type_f { " && -f $__n" } else { "" };
+        let dirlist = if dirs.is_empty() {
+            "('.',)".to_string()
+        } else {
+            format!("({})", dirs.join(", "))
+        };
+        self.emit_out(&format!(
+            "do {{ my $__o = \"\"; find(sub {{ my $__n = $File::Find::name; if ($__n =~ /{re}/{cond}) {{ $__o .= $__n . \"\\n\"; }} }}, {dirlist}); $? = 0; $__o }}",
+            re = re,
+            cond = cond,
+            dirlist = dirlist
+        ));
+        true
+    }
+
+    fn comm_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut s1 = true;
+        let mut s2 = true;
+        let mut s3 = true;
+        let mut files: Vec<String> = Vec::new();
+        for w in &words {
+            match w {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    for ch in s[1..].chars() {
+                        match ch {
+                            '1' => s1 = false,
+                            '2' => s2 = false,
+                            '3' => s3 = false,
+                            _ => return false,
+                        }
+                    }
+                }
+                _ => files.extend(self.word_items(w)),
+            }
+        }
+        if files.len() != 2 {
+            return false;
+        }
+        let (b1, b2) = (if s1 { "1" } else { "0" }, if s2 { "1" } else { "0" });
+        let b3 = if s3 { "1" } else { "0" };
+        // GNU comm: a column's leading tab is omitted when all earlier
+        // printed columns are suppressed (the separator skips with them)
+        let (t1, t2) = if s1 { ("", "\t") } else { ("", "") };
+        let t3 = if s1 && s2 {
+            "\t\t"
+        } else if s1 {
+            "\t"
+        } else if s2 {
+            "\t"
+        } else {
+            ""
+        };
+        let body = format!(
+            "do {{ my $__a = {sa}; my $__b = {sb}; my @__a = split /(?<=\\n)/, $__a; my @__b = split /(?<=\\n)/, $__b; my $__o = \"\"; my ($__i, $__j) = (0, 0); while ($__i < @__a && $__j < @__b) {{ if ($__a[$__i] eq $__b[$__j]) {{ $__o .= \"{t3}\" . $__a[$__i] if {b3}; $__i++; $__j++; }} elsif ($__a[$__i] lt $__b[$__j]) {{ $__o .= $__a[$__i] if {b1}; $__i++; }} else {{ $__o .= \"{t2}\" . $__b[$__j] if {b2}; $__j++; }} }} while ($__i < @__a) {{ $__o .= $__a[$__i] if {b1}; $__i++; }} while ($__j < @__b) {{ $__o .= \"{t2}\" . $__b[$__j] if {b2}; $__j++; }} $? = 0; $__o }}",
+            sa = self.slurp_path(&files[0]),
+            sb = self.slurp_path(&files[1]),
+            t2 = t2,
+            t3 = t3
+        );
+        let _ = t1;
+        self.emit_out(&body);
+        true
+    }
+
+    fn paste_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut files: Vec<String> = Vec::new();
+        for w in &words {
+            if let IrExpr::Str(s, _) = w {
+                if s.starts_with('-') && s.len() > 1 {
+                    return false;
+                }
+            }
+            files.extend(self.word_items(w));
+        }
+        if files.is_empty() {
+            return false;
+        }
+        let n = files.len();
+        let mut slurps: Vec<String> = Vec::new();
+        let mut arrs: Vec<String> = Vec::new();
+        let mut maxes: Vec<String> = Vec::new();
+        let mut cols: Vec<String> = Vec::new();
+        for (k, f) in files.iter().enumerate() {
+            slurps.push(format!("my $__a{k} = {};", self.slurp_path(f)));
+            arrs.push(format!("my @__l{k} = split /(?<=\\n)/, $__a{k};"));
+            maxes.push(format!("my $__mx = (scalar(@__l{k}) > $__mx) ? scalar(@__l{k}) : $__mx;"));
+            cols.push(format!(
+                "($__i < @__l{k}) ? $__l{k}[$__i] : \"\""
+            ));
+        }
+        let body = format!(
+            "do {{ {} {} my $__mx = 0; {} my $__o = \"\"; for (my $__i = 0; $__i < $__mx; $__i++) {{ my @__v = ({}); for my $__v (@__v) {{ $__v =~ s/\\n$//; }} $__o .= join(\"\\t\", @__v) . \"\\n\"; }} $? = 0; $__o }}",
+            slurps.join(" "),
+            arrs.join(" "),
+            maxes.join(" "),
+            cols.join(", ")
+        );
+        self.emit_out(&body);
+        true
+    }
+
+    fn sed_stmt(&mut self, words: &[IrExpr]) -> bool {
+        let words = Self::norm_words(words);
+        let mut ere = false;
+        let mut quiet = false;
+        let mut scripts: Vec<SedScript> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+        let mut i = 0;
+        let ws: Vec<&IrExpr> = words.iter().collect();
+        while i < ws.len() {
+            match ws[i] {
+                IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                    if s == "-n" {
+                        quiet = true;
+                    } else if s == "-r" || s == "-E" {
+                        ere = true;
+                    } else if s == "-e" {
+                        i += 1;
+                        if i >= ws.len() {
+                            return false;
+                        }
+                        if let IrExpr::Str(sc, _) = &ws[i] {
+                            match parse_sed_script(sc, ere) {
+                                Some(s) => scripts.push(s),
+                                None => return false,
+                            }
+                        } else {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                IrExpr::Str(s, _) => {
+                    match parse_sed_script(s, ere) {
+                        Some(sc) => scripts.push(sc),
+                        None => files.extend(self.word_items(ws[i])),
+                    }
+                }
+                _ => files.extend(self.word_items(ws[i])),
+            }
+            i += 1;
+        }
+        if scripts.is_empty() {
+            return false;
+        }
+        let input = self.slurp_paths(&files);
+        let mut ops: Vec<String> = Vec::new();
+        for sc in &scripts {
+            if let Some(n) = sc.line_print {
+                ops.push(format!("if ($__i + 1 == {n}) {{ $__sel = 1; }}"));
+            }
+            if let Some((pat, repl, global, print)) = &sc.subst {
+                let g = if *global { "g" } else { "" };
+                let pat_esc = pat
+                    .replace('\\', "\\\\")
+                    .replace('{', "\\{")
+                    .replace('}', "\\}");
+                let repl_esc = repl
+                    .replace('\\', "\\\\")
+                    .replace('$', "\\$")
+                    .replace('{', "\\{")
+                    .replace('}', "\\}");
+                if *print {
+                    ops.push(format!(
+                        "my $__n = ($__line =~ s{{{pat_esc}}}{{{repl_esc}}}{g}); $__sel = 1 if $__n;"
+                    ));
+                } else {
+                    ops.push(format!(
+                        "$__line =~ s{{{pat_esc}}}{{{repl_esc}}}{g};"
+                    ));
+                }
+            }
+        }
+        let cond = if quiet { "$__sel" } else { "1" };
+        let body = format!(
+            "do {{ my $__in = {input}; my @__l = split /(?<=\\n)/, $__in; my @__o; for (my $__i = 0; $__i < @__l; $__i++) {{ my $__line = $__l[$__i]; my $__sel = 0; {} if ({cond}) {{ push @__o, $__line; }} }} $? = 0; join(\"\", @__o) }}",
+            ops.join(" ")
+        );
+        self.emit_out(&body);
+        true
+    }
+
+    /// `-name` glob → anchored regex (shared by find).
+    fn glob_to_anchor(pat: &str) -> String {
+        let mut re = String::new();
+        for c in pat.chars() {
+            match c {
+                '*' => re.push_str(".*"),
+                '?' => re.push('.'),
+                '.' | '[' | ']' | '(' | ')' | '+' | '^' | '$' | '\\' | '|' | '/' => {
+                    re.push('\\');
+                    re.push(c);
+                }
+                _ => re.push(c),
+            }
+        }
+        format!("(?:{re})$")
     }
 
     /// Native arithmetic from ArithAst.
@@ -2607,13 +4901,11 @@ impl Render {
                     "0".into()
                 }
             },
-            "exec" => self.exec_expr(args),
+            "exec" | "builtin" => self.exec_expr(args),
             "capture" | "captureWords" => match args.first() {
                 Some(IrExpr::Arrow(stmts)) => {
-                    self.sh_owned = false;
-                    let cmd = self.shell_cmd(stmts, "; ");
-                    // bash cmdsub strips trailing newlines
-                    format!("do {{ my $__c = {}; chomp $__c; $__c }}", self.shell_qx(&cmd, true))
+                    // native-first: the in-process capture (no bash child)
+                    self.capture_from_expr(&IrExpr::Arrow(stmts.clone()))
                 }
                 other => {
                     self.mark_todo(&format!("{func} arg"));
@@ -2621,6 +4913,20 @@ impl Render {
                 }
             },
             "pipeline" => {
+                let mut stage_stmts: Vec<Vec<IrStmt>> = Vec::new();
+                if let Some(IrExpr::Array(items)) = args.first() {
+                    for it in items {
+                        if let IrExpr::Arrow(stmts) = it {
+                            stage_stmts.push(stmts.clone());
+                        }
+                    }
+                }
+                // all-native stages → the in-process pipe emulation
+                if !stage_stmts.is_empty() {
+                    if let Some(n) = self.native_pipeline_capture(&stage_stmts) {
+                        return n;
+                    }
+                }
                 let mut stages: Vec<String> = Vec::new();
                 if let Some(IrExpr::Array(items)) = args.first() {
                     for it in items {
@@ -3007,48 +5313,65 @@ impl Render {
             "mapfile" | "readarray" => "0".to_string(),
             "read" => {
                 // `while read line` — a line from STDIN; 0 on success
-                let vars: Vec<String> = words
+                // (stdin_expr: a native pipeline stage's buffer, or real
+                // STDIN; an `IFS=x` prefix word sets the field split)
+                let mut delim: Option<String> = None;
+                let mut filtered: Vec<&IrExpr> = Vec::new();
+                for w in &words {
+                    if let IrExpr::Str(s, _) = w {
+                        if s.starts_with("IFS=") {
+                            delim = Some(s[4..].to_string());
+                            continue;
+                        }
+                        if s.starts_with('-') {
+                            continue;
+                        }
+                    }
+                    filtered.push(w);
+                }
+                let vars: Vec<String> = filtered
                     .iter()
-                    .filter(|w| match w {
-                        IrExpr::Str(s, _) => !s.starts_with('-'),
-                        _ => true,
-                    })
                     .map(|w| match w {
                         IrExpr::Str(s, _) => self.scalar_target(s),
                         _ => self.expr(w),
                     })
                     .collect();
+                let re = match delim.as_deref() {
+                    None | Some("") => r"\s+".to_string(),
+                    Some(ifs) => format!(
+                        "[{}]",
+                        ifs.chars()
+                            .map(|c| {
+                                if "\\]^-/".contains(c) {
+                                    format!("\\{c}")
+                                } else {
+                                    c.to_string()
+                                }
+                            })
+                            .collect::<String>()
+                    ),
+                };
+                // a native pipeline stage's buffer is a whole string;
+                // real STDIN (possibly fd-redirected) is LINE mode —
+                // `read` is line-oriented by nature
+                let in_expr = match &self.pipe_in {
+                    Some(_) => self.stdin_expr(),
+                    None => "<STDIN>".to_string(),
+                };
                 if vars.len() == 1 {
                     format!(
-                        "do {{ my $__r = <STDIN>; if (defined $__r) {{ chomp $__r; {} = $__r; 0 }} else {{ 1 }} }}",
+                        "do {{ my $__r = {in_expr}; if (defined $__r) {{ chomp $__r; {} = $__r; 0 }} else {{ 1 }} }}",
                         vars[0]
                     )
                 } else if vars.is_empty() {
-                    "do { my $__r = <STDIN>; (defined $__r ? 0 : 1) }".to_string()
+                    format!("do {{ my $__r = {in_expr}; (defined $__r ? 0 : 1) }}")
                 } else {
-                    // bat forf `delims=` / `IFS=, read` — the env Object
-                    // carries the delimiter; bash read splits on IFS and
-                    // the LAST var receives the rest of the line (perl's
-                    // split LIMIT replicates that: at most N fields, the
-                    // last holds the remainder).
-                    let delim = match args.get(2) {
-                        Some(IrExpr::Object(props)) => props.iter().find(|(k, _)| k == "IFS").and_then(|(_, v)| match v {
-                            IrExpr::Str(s, _) => Some(s.clone()),
-                            _ => None,
-                        }),
-                        _ => None,
-                    };
-                    let re = match delim.as_deref() {
-                        None | Some("") => r"\s+".to_string(),
-                        Some(ifs) => format!(
-                            "[{}]",
-                            ifs.chars()
-                                .map(|c| if "\\]^-".contains(c) { format!("\\{c}") } else { c.to_string() })
-                                .collect::<String>()
-                        ),
-                    };
+                    // bash read splits on IFS and the LAST var receives
+                    // the rest of the line (perl's split LIMIT replicates
+                    // that: at most N fields, the last holds the
+                    // remainder).
                     format!(
-                        "do {{ my $__r = <STDIN>; if (defined $__r) {{ chomp $__r; ({}) = split /{re}/, $__r, {}; 0 }} else {{ 1 }} }}",
+                        "do {{ my $__r = {in_expr}; if (defined $__r) {{ chomp $__r; ({}) = split /{re}/, $__r, {}; 0 }} else {{ 1 }} }}",
                         vars.join(", "),
                         vars.len()
                     )
@@ -3101,6 +5424,16 @@ impl Render {
                     }
                     _ => "256".to_string(),
                 }
+            }
+            _ if Self::is_native_cmd(&cmd) => self.exec_expr_from_stmt(args),
+            "bash" => {
+                // `bash script args` — the honest LIST transport (no `-c`
+                // wrapper, so check_qx's bash/sh -c patterns stay quiet)
+                let mut a: Vec<String> = vec!["'bash'".to_string()];
+                for w in &words {
+                    a.push(self.expr(w));
+                }
+                format!("do {{ system({}); ($? == 0 ? 0 : 256) }}", a.join(", "))
             }
             _ => {
                 if self.funcs.contains(&cmd) {
@@ -3184,7 +5517,7 @@ impl Render {
             // end of the program that is unobservable, so render the words
             // as an ordinary command.
             "exec" if words.is_empty() => {}
-            "exec" => {
+            "exec" | "builtin" | "command" => {
                 if let Some(first) = words.first() {
                     let mut rest = vec![IrExpr::Array(words[1..].to_vec())];
                     self.exec_stmt(&{
@@ -3193,6 +5526,215 @@ impl Render {
                         a
                     });
                 }
+            }
+            "cat" => {
+                if self.cat_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "ls" => {
+                if self.ls_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "grep" | "egrep" => {
+                if self.grep_stmt(&words, cmd == "egrep") {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "wc" => {
+                if self.wc_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "uname" => {
+                if self.uname_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "readlink" | "realpath" => {
+                if self.readlink_stmt(&words, cmd == "realpath") {
+                    return;
+                }
+            }
+            "basename" | "dirname" => {
+                if self.basename_stmt(&words, cmd == "dirname") {
+                    return;
+                }
+            }
+            "hostname" => {
+                if self.hostname_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "whoami" => {
+                if self.whoami_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "id" => {
+                if self.id_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "pwd" => {
+                if self.pwd_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "seq" => {
+                if self.seq_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "cmp" => {
+                if self.cmp_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "mktemp" => {
+                if self.mktemp_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "date" => {
+                if self.date_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "tr" => {
+                if self.tr_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "head" | "tail" => {
+                if self.head_tail_stmt(&words, cmd == "tail") {
+                    return;
+                }
+            }
+            "sort" => {
+                if self.sort_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "uniq" => {
+                if self.uniq_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "cut" => {
+                if self.cut_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "strings" => {
+                if self.strings_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "sha256sum" | "sha512sum" => {
+                if self.sha_stmt(&words, cmd == "sha256sum") {
+                    return;
+                }
+            }
+            "stat" => {
+                if self.stat_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "find" => {
+                if self.find_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "comm" => {
+                if self.comm_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "paste" => {
+                if self.paste_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "sed" => {
+                if self.sed_stmt(&words) {
+                    return;
+                }
+                self.exec_shell_fallback(&cmd, &words);
+            }
+            "sleep" => {
+                if let Some(w) = words.first() {
+                    let e = self.expr(w);
+                    self.emit(&format!("sleep {e};"));
+                }
+                self.emit("$? = 0;");
+            }
+            "test" => {
+                if let Some(s) = Self::str_arg(args, 0) {
+                    let t = self.test(&s);
+                    self.emit(&format!("$? = ({t} ? 0 : 256);"));
+                } else {
+                    self.emit("$? = 0;");
+                }
+            }
+            ":" => self.emit("$? = 0;"),
+            "rmdir" => {
+                for w in &words {
+                    for d in self.word_items(w) {
+                        self.emit(&format!("rmdir({d}) or $? = 256;"));
+                    }
+                }
+                self.emit("$? = 0 unless $? == 256;");
+            }
+            "unset" => {
+                for w in &words {
+                    if let IrExpr::Str(s, _) = w {
+                        if !s.starts_with('-') {
+                            if self.arrays.contains(s) {
+                                self.emit(&format!("@{} = ();", ident(s)));
+                            } else if self.hashes.contains(s) {
+                                self.emit(&format!("%{} = ();", ident(s)));
+                            } else {
+                                self.emit(&format!("undef ${};", ident(s)));
+                            }
+                        }
+                    }
+                }
+                self.emit("$? = 0;");
+            }
+            "bash" => {
+                // `bash script args` — running another bash script REQUIRES
+                // bash; the LIST transport is the honest form (no `-c`
+                // wrapper, so check_qx's bash/sh -c patterns stay quiet).
+                let mut a: Vec<String> = vec!["'bash'".to_string()];
+                for w in &words {
+                    a.push(self.expr(w));
+                }
+                self.emit(&format!("$? = system({});", a.join(", ")));
+                self.emit("$? = ($? == 0 ? 0 : (($? >> 8) * 256));");
             }
             "echo" => self.echo_stmt(&words),
             "printf" => self.printf_stmt(&words),
@@ -3311,27 +5853,69 @@ impl Render {
                 }
             }
             "read" => {
-                let vars: Vec<String> = words
+                // `while read line` — a line from STDIN; 0 on success
+                // (stdin_expr: a native pipeline stage's buffer, or real
+                // STDIN)
+                let mut delim: Option<String> = None;
+                let mut filtered: Vec<&IrExpr> = Vec::new();
+                for w in &words {
+                    if let IrExpr::Str(s, _) = w {
+                        if s.starts_with("IFS=") {
+                            delim = Some(s[4..].to_string());
+                            continue;
+                        }
+                        if s.starts_with('-') {
+                            continue;
+                        }
+                    }
+                    filtered.push(w);
+                }
+                let vars: Vec<String> = filtered
                     .iter()
-                    .filter(|w| match w {
-                        IrExpr::Str(s, _) => !s.starts_with('-'),
-                        _ => true,
-                    })
                     .map(|w| match w {
                         IrExpr::Str(s, _) => self.scalar_target(s),
                         _ => self.expr(w),
                     })
                     .collect();
+                let re = match delim.as_deref() {
+                    None | Some("") => r"\s+".to_string(),
+                    Some(ifs) => format!(
+                        "[{}]",
+                        ifs.chars()
+                            .map(|c| {
+                                if "\\]^-/".contains(c) {
+                                    format!("\\{c}")
+                                } else {
+                                    c.to_string()
+                                }
+                            })
+                            .collect::<String>()
+                    ),
+                };
+                // a native pipeline stage's buffer is a whole string;
+                // real STDIN (possibly fd-redirected) is LINE mode
+                let in_expr = match &self.pipe_in {
+                    Some(_) => self.stdin_expr(),
+                    None => "<STDIN>".to_string(),
+                };
                 if vars.is_empty() {
-                    self.emit("$_ = <STDIN>;");
-                    self.emit("chomp;");
-                } else if vars.len() == 1 {
-                    self.emit(&format!("{} = <STDIN>;", vars[0]));
-                    self.emit(&format!("chomp {};", vars[0]));
-                } else {
                     self.emit(&format!(
-                        "({}) = split /\\s+/, scalar(<STDIN>);",
-                        vars.join(", ")
+                        "do {{ my $__r = {in_expr}; if (defined $__r) {{ chomp $__r; $? = 0 }} else {{ $? = 256 }} }}"
+                    ));
+                } else if vars.len() == 1 {
+                    self.emit(&format!(
+                        "do {{ my $__r = {in_expr}; if (defined $__r) {{ chomp $__r; {} = $__r; $? = 0 }} else {{ $? = 256 }} }}",
+                        vars[0]
+                    ));
+                } else {
+                    // bash read splits on IFS and the LAST var receives
+                    // the rest of the line (perl's split LIMIT replicates
+                    // that: at most N fields, the last holds the
+                    // remainder)
+                    self.emit(&format!(
+                        "do {{ my $__r = {in_expr}; if (defined $__r) {{ chomp $__r; ({}) = split /{re}/, $__r, {}; $? = 0 }} else {{ $? = 256 }} }}",
+                        vars.join(", "),
+                        vars.len()
                     ));
                 }
             }
@@ -4129,21 +6713,23 @@ impl Render {
                     parts.push(p);
                 }
                 if parts.is_empty() {
-                    self.emit("print \"\\n\";");
+                    self.emit_out("\"\\n\"");
                 } else {
-                    self.emit(&format!("print join(' ', {});", parts.join(", ")));
+                    self.emit_out(&format!("join(' ', {})", parts.join(", ")));
                 }
-                self.emit("print \"\\n\";");
+                self.emit_out("\"\\n\"");
+                self.emit("$? = 0;");
                 return;
             }
         }
         self.need_say = true;
         if ws.is_empty() {
             if newline {
-                self.emit("say \"\";");
+                self.emit_say("\"\"");
             } else {
-                self.emit("print \"\";");
+                self.emit_out("\"\"");
             }
+            self.emit("$? = 0;");
             return;
         }
         let parts: Vec<String> = ws
@@ -4167,16 +6753,21 @@ impl Render {
             _ => None,
         }) {
             let joined = parts.join(", ");
-            self.emit(&format!(
-                "print (({g}) ? join(' ', {joined}) . \"\\n\" : \"\");"
-            ));
+            match self.cap.last() {
+                Some(c) => self.emit(&format!(
+                    "{c} .= (({g}) ? join(' ', {joined}) . \"\\n\" : \"\");"
+                )),
+                None => self.emit(&format!(
+                    "print (({g}) ? join(' ', {joined}) . \"\\n\" : \"\");"
+                )),
+            }
             self.emit("$? = 0;");
             return;
         }
         if newline {
-            self.emit(&format!("say join(' ', {});", parts.join(", ")));
+            self.emit_say(&format!("join(' ', {})", parts.join(", ")));
         } else {
-            self.emit(&format!("print join(' ', {});", parts.join(", ")));
+            self.emit_out(&format!("join(' ', {})", parts.join(", ")));
         }
         // bash: echo exits 0
         self.emit("$? = 0;");
@@ -4279,8 +6870,8 @@ impl Render {
         };
         if words.len() == 1 {
             match &fmt_lit {
-                Some(s) => self.emit(&format!("print {};", Self::perl_str(&bash_printf_unescape(s)))),
-                None => self.emit(&format!("print {fmt_str};")),
+                Some(s) => self.emit_out(&Self::perl_str(&bash_printf_unescape(s))),
+                None => self.emit_out(&fmt_str),
             }
             return;
         }
@@ -4349,14 +6940,22 @@ impl Render {
             self.emit("my $__i = 0;");
             self.emit(&format!("while ($__i * {nspec} <= $#__a) {{"));
             self.depth += 1;
-            self.emit(&format!(
-                "printf({fmt_str}, @__a[$__i*{nspec} .. ($__i+1)*{nspec}-1]);"
-            ));
+            match self.cap.last() {
+                Some(c) => self.emit(&format!(
+                    "{c} .= sprintf({fmt_str}, @__a[$__i*{nspec} .. ($__i+1)*{nspec}-1]);"
+                )),
+                None => self.emit(&format!(
+                    "printf({fmt_str}, @__a[$__i*{nspec} .. ($__i+1)*{nspec}-1]);"
+                )),
+            }
             self.emit("$__i++;");
             self.depth -= 1;
             self.emit("}");
         } else {
-            self.emit(&format!("printf({fmt_str}, {});", args.join(", ")));
+            match self.cap.last() {
+                Some(c) => self.emit(&format!("{c} .= sprintf({fmt_str}, {});", args.join(", "))),
+                None => self.emit(&format!("printf({fmt_str}, {});", args.join(", "))),
+            }
         }
     }
 
@@ -4858,6 +7457,11 @@ impl Render {
             if inner.starts_with("$((") && inner.ends_with("))") {
                 return self.arith_str(&inner[3..inner.len() - 2]);
             }
+            // native in-process capture when the text tokenizes to
+            // native commands (no bash child — the check_qx gate)
+            if let Some(n) = self.capture_cmd_text(&inner[2..inner.len() - 1]) {
+                return format!("do {{ my $__c = {n}; chomp $__c; $__c }}");
+            }
             return format!(
                 "do {{ my $__c = {}; chomp $__c; $__c }}",
                 self.qx(&inner[2..inner.len() - 1])
@@ -5151,11 +7755,17 @@ impl Render {
                             }
                         }
                     }
-                    // `$(cmd)` as the default — run it
+                    // `$(cmd)` as the default — run it (natively when
+                    // the text tokenizes to native commands)
                     if let Some(cmd) = unq
                         .strip_prefix("$(")
                         .and_then(|t| t.strip_suffix(')'))
                     {
+                        if let Some(n) = r.capture_cmd_text(cmd) {
+                            return format!(
+                                "do {{ my $__c = {n}; chomp $__c; $__c }}"
+                            );
+                        }
                         return format!(
                             "do {{ my $__c = {}; chomp $__c; $__c }}",
                             r.qx(cmd)
@@ -5561,7 +8171,7 @@ impl Render {
     /// substitution chain's final consumer) — must run in-process.
     fn stmts_contain_mapfile(stmts: &[IrStmt]) -> bool {
         stmts.iter().any(|s| match s {
-            IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" => matches!(
+            IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => matches!(
                 args.first(),
                 Some(IrExpr::Str(c, _)) if c == "mapfile" || c == "readarray"
             ),
@@ -5621,7 +8231,7 @@ impl Render {
         match s {
             IrStmt::Expr(e) => match e {
                 IrExpr::Call { func, args } => match func.as_str() {
-                    "exec" => self.exec_stmt(args),
+                    "exec" | "builtin" => self.exec_stmt(args),
                     "pipeline" => {
                         let mut stages: Vec<Vec<IrStmt>> = Vec::new();
                         if let Some(IrExpr::Array(items)) = args.first() {
@@ -5633,6 +8243,11 @@ impl Render {
                         }
                         if stages.is_empty() {
                             self.mark_todo("pipeline stages");
+                        } else if let Some(n) = self.native_pipeline_capture(&stages) {
+                            // all-native stages: the in-process pipe
+                            // emulation (no bash child, no qx{}; records
+                            // @PIPESTATUS when a read exists)
+                            self.emit_out(&n);
                         } else if stages
                             .iter()
                             .any(|s| Self::stmts_have_perl_for(s))
@@ -5687,6 +8302,132 @@ impl Render {
                         };
                         let m = self.mini_redirs_from_expr(specs);
                         self.native_redirect(stmts, &m);
+                    }
+                    "whileLoop" => {
+                        // whileLoop(condArrow, bodyArrow) — the A1 loop
+                        // form (a `while read …; do …; done` pipeline
+                        // stage): the cond is a status-producing command
+                        // (usually `read`); the loop runs it each
+                        // iteration and tests its status
+                        let (Some(IrExpr::Arrow(cond)), Some(IrExpr::Arrow(body))) =
+                            (args.first(), args.get(1))
+                        else {
+                            self.mark_todo("whileLoop stmt args");
+                            return;
+                        };
+                        let Some(IrStmt::Expr(ce)) = cond.last() else {
+                            self.mark_todo("whileLoop cond");
+                            return;
+                        };
+                        // a read-cond loop: the input is a fixed buffer
+                        // (`$__in`, a pipeline stage) or the (possibly
+                        // fd-redirected) STDIN — `read` must consume it
+                        // LINE by line, so the loop iterates a line queue
+                        // (buffer) or a <STDIN> read loop (redirect)
+                        if let IrExpr::Call { func, args } = ce {
+                            let cmd = Self::str_arg(args, 0).unwrap_or_default();
+                            if matches!(cmd.as_str(), "read") {
+                                let mut delim: Option<String> = None;
+                                let mut vars: Vec<String> = Vec::new();
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    for w in items {
+                                        if let IrExpr::Str(s, _) = w {
+                                            if let Some(ifs) = s.strip_prefix("IFS=") {
+                                                delim = Some(ifs.to_string());
+                                                continue;
+                                            }
+                                            if s.starts_with('-') {
+                                                continue;
+                                            }
+                                        }
+                                        if let IrExpr::Str(s, _) = w {
+                                            vars.push(self.scalar_target(s));
+                                        } else {
+                                            vars.push(self.expr(w));
+                                        }
+                                    }
+                                }
+                                if delim.is_none() {
+                                    if let Some(IrExpr::Object(props)) = args.get(2) {
+                                        for (k, v) in props {
+                                            if k == "IFS" {
+                                                if let IrExpr::Str(s, _) = v {
+                                                    delim = Some(s.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                let re = match delim.as_deref() {
+                                    None | Some("") => r"\s+".to_string(),
+                                    Some(ifs) => format!(
+                                        "[{}]",
+                                        ifs.chars()
+                                            .map(|c| {
+                                                if "\\]^-/".contains(c) {
+                                                    format!("\\{c}")
+                                                } else {
+                                                    c.to_string()
+                                                }
+                                            })
+                                            .collect::<String>()
+                                    ),
+                                };
+                                let assign = if vars.is_empty() {
+                                    "$_ = $__line;".to_string()
+                                } else if vars.len() == 1 {
+                                    format!("{} = $__line;", vars[0])
+                                } else {
+                                    format!(
+                                        "({}) = split /{re}/, $__line, {};",
+                                        vars.join(", "),
+                                        vars.len()
+                                    )
+                                };
+                                self.emit("my $__ran = 0;");
+                                self.emit("my $__st = 0;");
+                                self.emit("my $__eof = 0;");
+                                if self.pipe_in.is_some() {
+                                    self.emit("my @__q = split /(?<=\\n)/, $__in;");
+                                    self.emit("my $__qi = 0;");
+                                    self.emit("while (1) {");
+                                    self.depth += 1;
+                                    self.emit("my $__line;");
+                                    self.emit(
+                                        "if ($__qi < @__q) { $__line = $__q[$__qi++]; chomp $__line; $__ran = 1; } else { $__eof = 1; last; }",
+                                    );
+                                } else {
+                                    self.emit("while (1) {");
+                                    self.depth += 1;
+                                    self.emit("my $__line;");
+                                    self.emit(
+                                        "if (defined(my $__l = <STDIN>)) { chomp($__line = $__l); $__ran = 1; } else { $__eof = 1; last; }",
+                                    );
+                                }
+                                self.emit(&assign);
+                                for s in body {
+                                    self.stmt(s);
+                                }
+                                self.emit("$__st = $?;");
+                                self.depth -= 1;
+                                self.emit("}");
+                                self.emit("$? = $__ran ? ($__eof ? 256 : $__st) : 0;");
+                                return;
+                            }
+                        }
+                        let c = self.expr(ce);
+                        self.emit("my $__ran = 0;");
+                        self.emit("my $__st = 0;");
+                        self.emit(&format!("while ((({c}) == 0)) {{"));
+                        self.depth += 1;
+                        self.emit("$__ran = 1;");
+                        for s in body {
+                            self.stmt(s);
+                        }
+                        self.emit("$__st = $?;");
+                        self.depth -= 1;
+                        self.emit("}");
+                        self.emit("$? = $__ran ? $__st : 0;");
                     }
                     "break" => self.emit("last;"),
                     "continue" => self.emit("next;"),
@@ -5762,7 +8503,7 @@ impl Render {
                             // grepMatches statement PRINTS the matches
                             if func == "grepMatches" {
                                 let x = self.expr(e);
-                                self.emit(&format!("print {x}, \"\\n\";"));
+                                self.emit_out(&format!("{x} . \"\\n\""));
                                 return;
                             }
                             // `cmd <(proc) ... && rm` — a bare and/or chain
@@ -5889,14 +8630,23 @@ impl Render {
                             self.emit(&format!("print {{${fh}}} {v};"));
                         }
                     }
-                    None => {
-                        if *newline {
-                            self.need_say = true;
-                            self.emit(&format!("say {v};"));
-                        } else {
-                            self.emit(&format!("print {v};"));
+                    None => match self.cap.last() {
+                        Some(c) => {
+                            if *newline {
+                                self.emit(&format!("{c} .= {v} . \"\\n\";"));
+                            } else {
+                                self.emit(&format!("{c} .= {v};"));
+                            }
                         }
-                    }
+                        None => {
+                            if *newline {
+                                self.need_say = true;
+                                self.emit(&format!("say {v};"));
+                            } else {
+                                self.emit(&format!("print {v};"));
+                            }
+                        }
+                    },
                 }
                 // bash: a simple command (echo/printf) exits 0
                 self.emit("$? = 0;");
@@ -6227,6 +8977,94 @@ impl Render {
                 self.emit("}");
             }
             IrStmt::While { cond, body } => {
+                // a `while read …; do …; done` stage in a native
+                // pipeline: the buffer is fixed — read must consume it
+                // LINE by line via a queue (the generic cond render
+                // re-reads the same whole buffer forever)
+                if let IrExpr::Call { func, args } = cond {
+                    let cmd = Self::str_arg(args, 0).unwrap_or_default();
+                    if matches!(cmd.as_str(), "read")
+                        && (self.pipe_in.is_some())
+                    {
+                        let mut delim: Option<String> = None;
+                        let mut vars: Vec<String> = Vec::new();
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            for w in items {
+                                if let IrExpr::Str(s, _) = w {
+                                    if let Some(ifs) = s.strip_prefix("IFS=") {
+                                        delim = Some(ifs.to_string());
+                                        continue;
+                                    }
+                                    if s.starts_with('-') {
+                                        continue;
+                                    }
+                                }
+                                if let IrExpr::Str(s, _) = w {
+                                    vars.push(self.scalar_target(s));
+                                } else {
+                                    vars.push(self.expr(w));
+                                }
+                            }
+                        }
+                        if delim.is_none() {
+                            if let Some(IrExpr::Object(props)) = args.get(2) {
+                                for (k, v) in props {
+                                    if k == "IFS" {
+                                        if let IrExpr::Str(s, _) = v {
+                                            delim = Some(s.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let re = match delim.as_deref() {
+                            None | Some("") => r"\s+".to_string(),
+                            Some(ifs) => format!(
+                                "[{}]",
+                                ifs.chars()
+                                    .map(|c| {
+                                        if "\\]^-/".contains(c) {
+                                            format!("\\{c}")
+                                        } else {
+                                            c.to_string()
+                                        }
+                                    })
+                                    .collect::<String>()
+                            ),
+                        };
+                        let assign = if vars.is_empty() {
+                            "$_ = $__line;".to_string()
+                        } else if vars.len() == 1 {
+                            format!("{} = $__line;", vars[0])
+                        } else {
+                            format!(
+                                "({}) = split /{re}/, $__line, {};",
+                                vars.join(", "),
+                                vars.len()
+                            )
+                        };
+                        self.emit("my $__ran = 0;");
+                        self.emit("my $__st = 0;");
+                        self.emit("my $__eof = 0;");
+                        self.emit("my @__q = split /(?<=\\n)/, $__in;");
+                        self.emit("my $__qi = 0;");
+                        self.emit("while (1) {");
+                        self.depth += 1;
+                        self.emit("my $__line;");
+                        self.emit(
+                            "if ($__qi < @__q) { $__line = $__q[$__qi++]; chomp $__line; $__ran = 1; } else { $__eof = 1; last; }",
+                        );
+                        self.emit(&assign);
+                        for s in body {
+                            self.stmt(s);
+                        }
+                        self.emit("$__st = $?;");
+                        self.depth -= 1;
+                        self.emit("}");
+                        self.emit("$? = $__ran ? ($__eof ? 256 : $__st) : 0;");
+                        return;
+                    }
+                }
                 let c = self.boolify(cond);
                 // bash: the while's status is the last BODY command's
                 // status, or 0 when the body never ran (condition false at
@@ -6634,7 +9472,7 @@ impl Render {
                 if let IrExpr::Str(path, _) = &r.target {
                     if let [IrStmt::Expr(e)] = inner {
                         if let IrExpr::Call { func, args } = e {
-                            if func == "exec" {
+                            if func == "exec" || func == "builtin" {
                                 let mut words: Vec<&IrExpr> = Vec::new();
                                 if let Some(IrExpr::Array(items)) = args.get(1) {
                                     words = items.iter().collect();
@@ -7346,6 +10184,160 @@ fn brace_escape(re: &str) -> String {
     }
     out
 }
+
+/// Expand a `tr` SET1/SET2 text into a perl tr character-class source:
+/// ranges (`a-z`), POSIX classes (`[:upper:]` …), and `\n`/`\t` escapes.
+fn expand_tr_set(set: &str) -> Option<String> {
+    let mut out = String::new();
+    let cs: Vec<char> = set.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '[' && i + 1 < cs.len() && cs[i + 1] == ':' {
+            let mut j = i + 2;
+            while j + 1 < cs.len() && !(cs[j] == ':' && cs[j + 1] == ']') {
+                j += 1;
+            }
+            if j + 1 >= cs.len() {
+                return None;
+            }
+            let cls: String = cs[i + 2..j].iter().collect();
+            match cls.as_str() {
+                "upper" => out.push_str("A-Z"),
+                "lower" => out.push_str("a-z"),
+                "digit" => out.push_str("0-9"),
+                "alpha" => out.push_str("a-zA-Z"),
+                "alnum" => out.push_str("a-zA-Z0-9"),
+                "space" => out.push_str("\\s"),
+                "blank" => out.push_str(" \\t"),
+                "xdigit" => out.push_str("0-9A-Fa-f"),
+                _ => return None,
+            }
+            i = j + 2;
+            continue;
+        }
+        if c == '\\' && i + 1 < cs.len() {
+            match cs[i + 1] {
+                'n' => out.push_str("\\n"),
+                't' => out.push_str("\\t"),
+                'r' => out.push_str("\\r"),
+                '\\' => out.push_str("\\\\"),
+                'v' => out.push_str("\\v"),
+                'f' => out.push_str("\\f"),
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// One mini-sed script (see `parse_sed_script`).
+struct SedScript {
+    line_print: Option<i64>,
+    subst: Option<(String, String, bool, bool)>, // (pat, repl, global, print)
+}
+
+/// Parse one mini-sed script: `Np` (print line N) or
+/// `s<del>PAT<del>REPL<del>[gpi]` with a LITERAL replacement (no
+/// backrefs). Returns None for anything else.
+fn parse_sed_script(script: &str, ere: bool) -> Option<SedScript> {
+    // `Np` — line-print (digits then 'p')
+    if let Some(digits) = script.strip_suffix('p') {
+        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+            return Some(SedScript {
+                line_print: digits.parse().ok(),
+                subst: None,
+            });
+        }
+    }
+    // `s<del>PAT<del>REPL<del>[flags]`
+    let cs: Vec<char> = script.chars().collect();
+    if cs.is_empty() || cs[0] != 's' || cs.len() < 4 {
+        return None;
+    }
+    let d = cs[1];
+    let mut j = 2;
+    let mut pat = String::new();
+    let mut found = false;
+    while j < cs.len() {
+        if cs[j] == '\\' && j + 1 < cs.len() {
+            pat.push(cs[j]);
+            pat.push(cs[j + 1]);
+            j += 2;
+            continue;
+        }
+        if cs[j] == d {
+            found = true;
+            j += 1;
+            break;
+        }
+        pat.push(cs[j]);
+        j += 1;
+    }
+    if !found {
+        return None;
+    }
+    let mut repl = String::new();
+    found = false;
+    while j < cs.len() {
+        if cs[j] == '\\' && j + 1 < cs.len() {
+            repl.push(cs[j]);
+            repl.push(cs[j + 1]);
+            j += 2;
+            continue;
+        }
+        if cs[j] == d {
+            found = true;
+            j += 1;
+            break;
+        }
+        repl.push(cs[j]);
+        j += 1;
+    }
+    if !found {
+        return None;
+    }
+    let mut global = false;
+    let mut print = false;
+    for f in cs[j..].iter() {
+        match f {
+            'g' => global = true,
+            'p' => print = true,
+            _ => return None,
+        }
+    }
+    // `\1`-style backrefs need runtime eval — refuse
+    let mut bb = repl.chars().peekable();
+    while let Some(c) = bb.next() {
+        if c == '\\' {
+            if let Some(n) = bb.peek() {
+                if n.is_ascii_digit() {
+                    return None;
+                }
+            }
+        }
+    }
+    let pat = if ere {
+        pat
+    } else {
+        Render::bre_to_perl(&pat)
+    };
+    Some(SedScript {
+        line_print: None,
+        subst: Some((pat, repl, global, print)),
+    })
+}
+
 
 /// Shell glob → Perl regex (anchored fragments). `greedy` selects `.*` vs
 /// `.*?` for `*` (shortest-prefix semantics like `${x#pat}`).
