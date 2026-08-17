@@ -15518,6 +15518,14 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
     if program_defines_function("echo") {
         return None;
     }
+    // A Block-wrapped single exec (the shir-native-stmt transform wraps
+    // `echo args > file` inners in a Block so the perl renderer's
+    // shell-text rebuild refuses them) is the SAME shape semantically —
+    // peel it before the pattern match.
+    let inner: &[IrStmt] = match inner {
+        [IrStmt::Block(b)] => b.as_slice(),
+        _ => inner,
+    };
     let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else {
         return None;
     };

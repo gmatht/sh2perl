@@ -5119,6 +5119,14 @@ fn redirect_stmt_text(r: &crate::ir::IrRedirect) -> Option<String> {
     let fd = r.fd.unwrap_or(0).to_string();
     let t = match &r.target {
         IrExpr::Str(s, _) => s.clone(),
+        // a variable redirect target (`echo hi > "$f"` — bat-sh-go
+        // t36_redirect_var): render `$name` — redirRun's bash child sees
+        // the var's value through env_lit (every written var ships as
+        // `name=<value>` env).
+        IrExpr::Call { func, args } if func == "getVar" => match args.first() {
+            Some(IrExpr::Str(n, _)) => format!("${{{n}}}"),
+            _ => return None,
+        },
         _ => return None,
     };
     match r.mode.as_str() {

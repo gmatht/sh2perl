@@ -22,7 +22,7 @@
 //! like bash); `**` goes through a small `sh2_pow` helper so the emitted
 //! code stays typed and compiles.
 
-use crate::ir::{ArithAst, BinOpKind, InterpPart, IrExpr, IrProgram, IrStmt, IrType};
+use crate::ir::{ArithAst, BinOpKind, InterpPart, IrExpr, IrProgram, IrStmt, IrType, StrStyle};
 use std::collections::{BTreeSet, HashMap};
 
 enum Part {
@@ -1020,8 +1020,30 @@ impl Render {
                             }
                         }
                         "target" => {
-                            if let IrExpr::Str(t, _) = v {
-                                target = t.clone();
+                            match v {
+                                IrExpr::Str(t, _) => target = t.clone(),
+                                // a variable redirect target (`echo hi > "$f"`
+                                // — bat-sh-go t36_redirect_var): the hoisted
+                                // native var's CURRENT value (every written
+                                // var is a `let mut` binding; the value is
+                                // read at the redirect site). Marked, then
+                                // expanded by the open() builder below — a
+                                // var target is a Rust String expression, not
+                                // a literal.
+                                IrExpr::Call { func, args } if func == "getVar" => {
+                                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                                        if self.declared(n) {
+                                            let m = self.rust_ident(n);
+                                            self.mark_read(n);
+                                            target = format!("@var:{m}");
+                                        } else {
+                                            ok = false;
+                                        }
+                                    } else {
+                                        ok = false;
+                                    }
+                                }
+                                _ => ok = false,
                             }
                         }
                         _ => {}
@@ -1054,16 +1076,21 @@ impl Render {
             self.emit(&format!("let __sh2_fd{fd}_saved = unsafe {{ dup({fd}) }};"));
         }
         for (fd, mode, target) in &specs {
+            // `@var:<ident>` — a getVar redirect target: the Rust String
+            // expression (a clone of the hoisted native var). Literal
+            // targets go through rust_str as before.
+            let tgt_expr = match target.strip_prefix("@var:") {
+                Some(ident) => format!("{ident}.clone()"),
+                None => Self::rust_str(target),
+            };
             let open = match mode.as_str() {
                 "w" => format!(
-                    "std::fs::OpenOptions::new().write(true).create(true).truncate(true).open({}).unwrap()",
-                    Self::rust_str(target)
+                    "std::fs::OpenOptions::new().write(true).create(true).truncate(true).open({tgt_expr}).unwrap()"
                 ),
                 "a" => format!(
-                    "std::fs::OpenOptions::new().append(true).create(true).open({}).unwrap()",
-                    Self::rust_str(target)
+                    "std::fs::OpenOptions::new().append(true).create(true).open({tgt_expr}).unwrap()"
                 ),
-                "r" => format!("std::fs::File::open({}).unwrap()", Self::rust_str(target)),
+                "r" => format!("std::fs::File::open({tgt_expr}).unwrap()", ),
                 _ => unreachable!("file modes only"),
             };
             self.emit(&format!("let __sh2_f{fd} = {open};"));
@@ -1136,6 +1163,30 @@ impl Render {
                             {
                                 return;
                             }
+                            // generic exec: run the command with the args
+                            // (stdout inherited — bash child semantics; the
+                            // mirror's rc model is the gate's stdout-only
+                            // comparison). Every word renders through
+                            // expr_any (literals, hoisted vars, format! for
+                            // interpolations).
+                            let mut cargs: Vec<String> = Vec::new();
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                for w in items {
+                                    cargs.push(self.expr_any(w));
+                                }
+                            }
+                            let cname = Self::rust_str(cmd);
+                            if cargs.is_empty() {
+                                self.emit(&format!(
+                                    "let _ = std::process::Command::new({cname}).status();"
+                                ));
+                            } else {
+                                self.emit(&format!(
+                                    "let _ = std::process::Command::new({cname}).args([{}]).status();",
+                                    cargs.join(", ")
+                                ));
+                            }
+                            return;
                         }
                     }
                     if func == "break" && self.loop_depth > 0 {
@@ -1366,6 +1417,25 @@ impl Render {
                 }
                 self.depth -= 1;
                 self.emit("}");
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                // Statement-level redirect (bat-sh-go t36_redirect_var,
+                // posix-sh-go t32_redirect): the expr-level twin of the
+                // `Call("redirect", …)` shape — same native dup/dup2 fd
+                // swap, targets resolved from getVar/Str (a getVar target
+                // reads the hoisted native var — every written var is a
+                // `let mut` binding in program()).
+                let specs: Vec<IrExpr> = redirects
+                    .iter()
+                    .map(|r| {
+                        IrExpr::Object(vec![
+                            ("fd".to_string(), IrExpr::Int(r.fd.unwrap_or(0) as i64)),
+                            ("mode".to_string(), IrExpr::Str(r.mode.clone(), StrStyle::DoubleQuoted)),
+                            ("target".to_string(), r.target.clone()),
+                        ])
+                    })
+                    .collect();
+                self.redirect_stmt(&[IrExpr::Arrow(inner.clone()), IrExpr::Array(specs)]);
             }
             IrStmt::Pipeline { .. }
             | IrStmt::Die { .. }
