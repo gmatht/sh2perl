@@ -13581,6 +13581,20 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                     collect_assigns(b, assigns);
                 }
             }
+            IrStmt::ForInit { init, step, body, .. } => {
+                // c-style `for ((i=2; i<=n; i++))` — the counter writes live
+                // in init/step stmts and the body holds the loop's assigns;
+                // all are assignment sources (mirror of the For arm).
+                for b in init {
+                    collect_assigns(b, assigns);
+                }
+                for b in step {
+                    collect_assigns(b, assigns);
+                }
+                for b in body {
+                    collect_assigns(b, assigns);
+                }
+            }
             IrStmt::Exec { args, .. } => {
                 // a native `(( ))` / `let` statement's written vars and an
                 // `-i` declaration's bare names are numeric assignment
@@ -29449,6 +29463,20 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
             IrStmt::For { var, body, .. } => {
                 // the loop iteration is a source even with no body writes
                 assigns.entry(var.clone()).or_default();
+                for b in body {
+                    collect_assigns(b, assigns);
+                }
+            }
+            IrStmt::ForInit { init, step, body, .. } => {
+                // c-style `for ((i=2; i<=n; i++))` — the counter writes live
+                // in init/step stmts and the body holds the loop's assigns;
+                // all are assignment sources (mirror of the For arm).
+                for b in init {
+                    collect_assigns(b, assigns);
+                }
+                for b in step {
+                    collect_assigns(b, assigns);
+                }
                 for b in body {
                     collect_assigns(b, assigns);
                 }
