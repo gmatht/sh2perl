@@ -1168,7 +1168,11 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         .replace("{", "\\{")
                         .replace("}", "\\}"))
                 } else {
-                    format!("'{}'", s.replace('\'', "\\'"))
+                    // Escape backslashes BEFORE quotes: in Perl 'single
+                    // quoted' strings \\ and \' are the two escapes, and a
+                    // literal backslash followed by a quote would otherwise
+                    // produce \\' (escaped backslash + string terminator).
+                    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
                 }
             },
             StrStyle::DoubleQuoted => {

@@ -710,6 +710,9 @@ fn needs_shell_quoting_literal(s: &str) -> bool {
         || s.contains('{')
         || s.contains('}')
         || s.contains('$')
+        || s.contains('(')
+        || s.contains(')')
+        || s.contains('`')
 }
 
 // True when a literal would be quoted solely because of glob metacharacters

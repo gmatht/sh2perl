@@ -11,9 +11,9 @@ pub fn generate_logical_and(generator: &mut Generator, left: &Command, right: &C
     output.push_str(&generator.indent());
 
     // For TestExpression, use the test expression directly as the condition
-    if let Command::TestExpression(_) = left {
+    if let Command::TestExpression(te) = left {
         output.push_str("if (");
-        let test_result = generator.generate_command(left);
+        let test_result = generator.generate_test_expression(te);
         output.push_str(&test_result);
         output.push_str(") {\n");
         generator.indent_level += 1;
@@ -200,7 +200,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
     output.push_str(&generator.indent());
 
     // Check if left is a test expression
-    if let Command::TestExpression(_) = left {
+    if let Command::TestExpression(te) = left {
         // Pre-declare variables assigned in the right branch so that `my $var = ...`
         // does not end up inside the conditional body.
         {
@@ -211,7 +211,7 @@ pub fn generate_logical_or(generator: &mut Generator, left: &Command, right: &Co
         // For test expressions, generate: if (!left) { right }
         output.push_str("if (!(");
         generator.suppress_set_e_depth += 1;
-        output.push_str(&generator.generate_command(left));
+        output.push_str(&generator.generate_test_expression(te));
         generator.suppress_set_e_depth -= 1;
         output.push_str(")) {\n");
         generator.indent_level += 1;

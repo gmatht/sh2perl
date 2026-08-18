@@ -2260,10 +2260,13 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     crate::ir::emit_indent(&mut do_body, 1);
                     do_body.push_str(&format!("my ${} = {};\n", left_var, left_wrapped));
                     // if ($CHILD_ERROR == 0) { ... } else { ... }
+                    // bash captures each command's full stdout: `$(a && b)`
+                    // yields "out_a\nout_b" — join the chomped halves with a
+                    // newline, not bare concatenation.
                     let then_raw = format!(
-                        "{}my ${} = {};\n{}${} . ${};\n",
+                        "{}my ${} = {};\n{}(${} eq q{{}} ? ${} : ${} . \"\\n\" . ${});\n",
                         "        ", right_var, right_wrapped,
-                        "        ", left_var, right_var,
+                        "        ", left_var, right_var, left_var, right_var,
                     );
                     crate::ir::emit_stmt(
                         &mut do_body,

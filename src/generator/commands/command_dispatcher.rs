@@ -45,7 +45,15 @@ pub fn generate_command_impl_with_input(
             result
         }
         Command::ShoptCommand(cmd) => generator.generate_shopt_command(cmd),
-        Command::TestExpression(test_expr) => generator.generate_test_expression(test_expr),
+        Command::TestExpression(test_expr) => {
+            // A standalone `[ ... ]` / `test ...` command: evaluate the
+            // expression for its exit status.  Condition contexts (if/while/
+            // &&/||) handle TestExpression themselves and never come through
+            // here, so emit a complete statement — a bare expression fragment
+            // is a Perl syntax error at statement position.
+            let expr = generator.generate_test_expression(test_expr);
+            format!("$CHILD_ERROR = ({}) ? 0 : 1;\n", expr)
+        }
         Command::Pipeline(pipeline) => {
             //             eprintln!("DEBUG: Found Pipeline, commands: {:?}", pipeline.commands);
             // This is now a pure pipe pipeline since logical operators are handled separately

@@ -416,9 +416,9 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 // Test expressions generate a boolean expression directly
                 // (e.g., "$line" ne q{}). Other commands generate code that
                 // sets $CHILD_ERROR.
-                if matches!(cond, Command::TestExpression(_)) {
+                if let Command::TestExpression(te) = cond {
                     generator.suppress_set_e_depth += 1;
-                    let cond_code = generator.generate_command(cond);
+                    let cond_code = generator.generate_test_expression(te);
                     generator.suppress_set_e_depth -= 1;
                     let cond_code = cond_code.trim().to_string();
                     if is_and {
@@ -511,9 +511,9 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                             let is_and = matches!(cmd, Command::And(_, _));
                             flatten_conditions(cmd, &mut conds);
                             for cond in &conds {
-                                if matches!(cond, Command::TestExpression(_)) {
+                                if let Command::TestExpression(te) = cond {
                                     generator.suppress_set_e_depth += 1;
-                                    let cond_code = generator.generate_command(cond);
+                                    let cond_code = generator.generate_test_expression(te);
                                     generator.suppress_set_e_depth -= 1;
                                     let cond_code = cond_code.trim().to_string();
                                     if is_and {
