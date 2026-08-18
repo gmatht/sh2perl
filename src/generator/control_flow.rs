@@ -715,6 +715,11 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");
+            // bash: the while command's exit status is that of the last body
+            // command (or 0 if none ran) — the final failing condition test
+            // must not leak into $?.
+            output.push_str(&generator.indent());
+            output.push_str("$CHILD_ERROR = 0;\n");
         }
     }
 
