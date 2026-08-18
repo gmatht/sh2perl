@@ -69,3 +69,6 @@ file_00[0-9]
 ?*${*
 test.py
 x.py
+
+# Purify test-suite scratch outputs
+.tmp_purify/
