@@ -6,6 +6,7 @@ pub mod parser;
 pub mod debug;
 pub mod estree;
 pub mod ir;
+pub mod pipeline_native;
 pub mod shir;
 pub mod shir_json;
 pub mod transforms;
