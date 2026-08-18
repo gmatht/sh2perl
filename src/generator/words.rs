@@ -3065,6 +3065,29 @@ pub fn convert_string_interpolation_to_perl_impl(
                             } else {
                                 format!("${{{}}}", pe.variable)
                             }
+                        } else if let Some(rest) = pe.variable.strip_prefix('#') {
+                            // ${#var} — string length.  The parser stores the
+                            // '#' in the variable name with operator None.
+                            let base =
+                                super::expansions::parameter_var_scalar_ref(generator, rest);
+                            // Un-brace plain ${name} (code context; avoids
+                            // "Ambiguous use of ${s}" warnings).
+                            let base = match base
+                                .strip_prefix("${")
+                                .and_then(|r| r.strip_suffix('}'))
+                            {
+                                Some(name)
+                                    if !name.is_empty()
+                                        && name
+                                            .chars()
+                                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                        && !name.chars().next().unwrap().is_ascii_digit() =>
+                                {
+                                    format!("${}", name)
+                                }
+                                _ => base,
+                            };
+                            format!("length({} // q{{}})", base)
                         } else {
                             // Simple variable reference - use the base variable reference.
                             // IMPORTANT: Do NOT call generator.generate_parameter_expansion(pe)
@@ -3072,6 +3095,29 @@ pub fn convert_string_interpolation_to_perl_impl(
                             // The operator transformation is applied once below, so we only
                             // need the base variable name.
                             super::expansions::parameter_var_scalar_ref(generator, &pe.variable)
+                        };
+
+                        // These expressions land in CODE context (concatenated
+                        // with " . "), where the braced ${name} form triggers
+                        // "Ambiguous use of ${s} resolved to $s" warnings for
+                        // names colliding with quote-like operators (s, m, y,
+                        // q, tr...).  Un-brace plain scalars.
+                        let expr = {
+                            let inner = expr
+                                .strip_prefix("${")
+                                .and_then(|r| r.strip_suffix('}'));
+                            match inner {
+                                Some(name)
+                                    if !name.is_empty()
+                                        && name
+                                            .chars()
+                                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                        && !name.chars().next().unwrap().is_ascii_digit() =>
+                                {
+                                    format!("${}", name)
+                                }
+                                _ => expr,
+                            }
                         };
 
                         // Apply operator transformation if present
@@ -3085,8 +3131,12 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 format!("({} =~ s/^{}//sr)", expr, regex)
                             }
                             ParameterExpansionOperator::RemoveShortestSuffix(pattern) => {
+                                // Shortest SUFFIX must start as late as possible;
+                                // a bare s/REGEX$// matches from the LEFTMOST
+                                // position (removing the longest suffix).  A
+                                // greedy ^(.*) prefix pushes the match right.
                                 let regex = super::expansions::glob_to_perl_regex_nongreedy(pattern);
-                                format!("({} =~ s/{}$//r)", expr, regex)
+                                format!("({} =~ s/^(.*)(?:{})$/$1/sr)", expr, regex)
                             }
                             ParameterExpansionOperator::RemoveLongestSuffix(pattern) => {
                                 let regex = super::expansions::glob_to_perl_regex_greedy(pattern);
@@ -3114,9 +3164,21 @@ pub fn convert_string_interpolation_to_perl_impl(
                                     expr, expr, expr, default_expr
                                 )
                             }
+                            ParameterExpansionOperator::SubstituteAll(pattern, replacement) => {
+                                // ${var//pat/rep} (the parser maps ${var/pat/rep}
+                                // here too).  Convert the glob pattern and
+                                // escape the replacement for s///.
+                                let regex =
+                                    super::expansions::glob_to_perl_regex_greedy(pattern);
+                                let rep = replacement
+                                    .replace('\\', "\\\\")
+                                    .replace('/', "\\/")
+                                    .replace('$', "\\$")
+                                    .replace('@', "\\@");
+                                format!("({} =~ s/{}/{}/gr)", expr, regex, rep)
+                            }
                             // For operators already handled above (ArraySlice) or None,
-                            // or operators that don't apply to scalar expressions (like SubstituteAll
-                            // on array elements which should be handled separately), use expr directly.
+                            // or operators that don't apply to scalar expressions, use expr directly.
                             _ => expr,
                         };
                         parts.push(result);
