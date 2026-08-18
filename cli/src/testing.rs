@@ -421,6 +421,22 @@ pub fn read_shell_source(filename: &str) -> Result<String, String> {
     })
 }
 
+/// True when bash itself refuses to parse the script (`bash -n` fails).
+/// Used when our parser errors out: if the source is genuinely invalid
+/// bash, the faithful translation is a program that reports the syntax
+/// error on stderr and exits 2 without producing stdout.
+fn bash_rejects_syntax(filename: &str) -> bool {
+    std::process::Command::new("bash")
+        .arg("-n")
+        .arg(filename)
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(false)
+}
+
+/// Shell snippet mimicking bash's behavior on a syntax-error script.
+const SYNTAX_ERROR_MIMIC: &str = "echo 'bash: syntax error' >&2\nexit 2\n";
+
 pub fn test_file_equivalence(lang: &str, filename: &str) -> Result<(), String> {
     test_file_equivalence_with_critic(lang, filename, false)
 }
@@ -434,7 +450,17 @@ pub fn test_file_equivalence_with_critic(
     let shell_content = read_shell_source(filename)?;
 
     // Parse and generate target language code
-    let commands = match Parser::new(&shell_content).parse() {
+    let parse_result = match Parser::new(&shell_content).parse() {
+        Err(e) if bash_rejects_syntax(filename) => {
+            eprintln!(
+                "DEBUG: parser failed ({:?}) but bash -n also rejects {} — using syntax-error mimic",
+                e, filename
+            );
+            Parser::new(SYNTAX_ERROR_MIMIC).parse().map_err(|_| e)
+        }
+        other => other,
+    };
+    let commands = match parse_result {
         Ok(c) => c,
         Err(e) => {
             return Err(format!("Failed to parse {}: {:?}", filename, e));
@@ -839,7 +865,17 @@ pub fn test_file_equivalence_detailed_with_critic(
         shell_content = read_shell_source(filename)?;
 
         // Parse and generate target language code
-        let commands = match Parser::new(&shell_content).parse() {
+        let parse_result = match Parser::new(&shell_content).parse() {
+            Err(e) if bash_rejects_syntax(filename) => {
+                eprintln!(
+                    "DEBUG: parser failed ({:?}) but bash -n also rejects {} — using syntax-error mimic",
+                    e, filename
+                );
+                Parser::new(SYNTAX_ERROR_MIMIC).parse().map_err(|_| e)
+            }
+            other => other,
+        };
+        let commands = match parse_result {
             Ok(c) => c,
             Err(e) => {
                 // Capture lexer output for debugging

@@ -2590,7 +2590,21 @@ fn generate_buffered_pipeline(
         if !raw_cmd.is_empty() {
             // Genuine approach: use the command string directly.
             // The evasion builtin-list and `command` prefix are gone.
-            let reconstructed_cmd = raw_cmd;
+            let mut reconstructed_cmd = raw_cmd;
+
+            // `type <fn>` on a script-defined function: the bash -c child
+            // doesn't know the script's functions, so define a stub first —
+            // bash then reports "<fn> is a function" just like the original.
+            if let Some(caps) = regex::Regex::new(r"^type\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+                .ok()
+                .and_then(|re| re.captures(&reconstructed_cmd))
+            {
+                let fn_name = caps[1].to_string();
+                if generator.declared_functions.contains(&fn_name) {
+                    reconstructed_cmd =
+                        format!("{}() {{ :; }}; {}", fn_name, reconstructed_cmd);
+                }
+            }
 
             let unique_id = generator.get_unique_id();
             let output_var = format!("output_{}", unique_id);
