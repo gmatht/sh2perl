@@ -124,6 +124,7 @@ fn gen_node(n: &NodeDecl) -> String {
     let mut json_build = String::new();
     let mut json_read = String::new();
     let mut children = String::new();
+    let mut children_ref = String::new();
     for (fname, ftype) in &n.fields {
         let rust_ty = match ftype.as_str() {
             "string" => "String",
@@ -161,6 +162,7 @@ fn gen_node(n: &NodeDecl) -> String {
         ));
         if ftype == "stmts" {
             children.push_str(&format!("        out.extend(self.{fname}.iter_mut());\n"));
+            children_ref.push_str(&format!("        out.extend(self.{fname}.iter());\n"));
         }
     }
 
@@ -188,6 +190,13 @@ impl crate::shir_nodes::ExtNode for {name} {{
         let mut out = Vec::new();
 {children}        out
     }}
+    fn children(&self) -> Vec<&crate::ir::IrStmt> {{
+        let mut out = Vec::new();
+{children_ref}        out
+    }}
+    fn clone_box(&self) -> Box<dyn crate::shir_nodes::ExtNode> {{
+        Box::new(self.clone())
+    }}
 }}
 
 "#,
@@ -197,6 +206,7 @@ impl crate::shir_nodes::ExtNode for {name} {{
         json_read = json_read,
         json_build = json_build,
         children = children,
+        children_ref = children_ref,
     )
 }
 

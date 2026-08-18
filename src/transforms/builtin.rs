@@ -150,6 +150,7 @@ fn rewrite_arith(ast: &mut ArithAst) -> bool {
 
 fn rewrite_stmt(st: &mut IrStmt) -> bool {
     match st {
+        IrStmt::Ext(n) => { let mut c = false; for s in crate::shir_nodes::ExtNode::children_mut(&mut **n) { c |= rewrite_stmt(s); } c }
         IrStmt::Expr(e) => rewrite_expr(e),
         IrStmt::Assign { targets, expr, .. } => {
             let mut changed = rewrite_expr(expr);
@@ -362,6 +363,7 @@ fn erase(st: &mut IrStmt) -> bool {
         changed
     }
     match st {
+        IrStmt::Ext(n) => { let mut c = false; for s in crate::shir_nodes::ExtNode::children_mut(&mut **n) { c |= erase(s); } c }
         IrStmt::Expr(expr) => erase_expr(expr),
         IrStmt::Assign { targets, expr, .. } => {
             let mut changed = erase_expr(expr);

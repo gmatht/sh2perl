@@ -122,6 +122,7 @@ pub struct CalleeCount {
 /// coverage oracle — an unrecognised variant just contributes zero).
 fn walk_stmt(stmt: &IrStmt, counts: &mut HashMap<String, usize>) {
     match stmt {
+        IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { walk_stmt(c, counts); } }
         IrStmt::Label(_) | IrStmt::Goto(_) => {} // no sh2.* call sites
         IrStmt::RawText(_) => {
             // Raw text: no sh2.* call sites can be known without parsing

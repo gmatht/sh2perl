@@ -1215,6 +1215,7 @@ impl Render {
 
     fn stmt(&mut self, s: &IrStmt) {
         match s {
+            IrStmt::Ext(_) => panic!("zig backend: Ext node unsupported"),
             IrStmt::Expr(e) => {
                 if let IrExpr::Call { func, args } = e {
                     if func == "exec" {

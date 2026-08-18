@@ -1112,6 +1112,7 @@ impl Render {
 
     fn stmt(&mut self, s: &IrStmt) {
         match s {
+            IrStmt::Ext(_) => panic!("rust backend: Ext node unsupported"),
             IrStmt::Expr(e) => {
                 if let IrExpr::Call { func, args } = e {
                     if func == "redirect" {

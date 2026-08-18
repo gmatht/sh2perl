@@ -132,6 +132,7 @@ fn sub_json(s: &IrSub) -> Value {
 
 fn stmt_json(s: &IrStmt) -> Value {
     match s {
+        IrStmt::Ext(n) => n.to_json(),
         IrStmt::Output {
             value,
             newline,

@@ -517,6 +517,10 @@ pub struct AsmSpec {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum IrStmt {
+    /// A transform-declared node (shir_nodes): the extensible slot of the
+    /// otherwise-closed enum. Renderers that don't know the node refuse
+    /// loudly; traversers reach its children via ExtNode::children_mut.
+    Ext(Box<dyn crate::shir_nodes::ExtNode>),
     /// Output: print/say with optional trailing newline
     /// If `target` is Some(filehandle_name), output goes to that filehandle
     /// (e.g. `$fh`) instead of STDOUT.  The name is emitted without a leading `$`.
@@ -1377,6 +1381,7 @@ pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
 
 pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
     match stmt {
+        IrStmt::Ext(_) => { emit_indent(out, indent); out.push_str("die \"debashc: shIR Ext node not supported by the Perl backend\\n\";\n"); }
         IrStmt::RawText(text) => {
             // Splice verbatim — no transformation
             out.push_str(text);
@@ -6488,6 +6493,7 @@ fn try_embed_newline_in_string_literal(expr: &str) -> Option<String> {
 /// Check whether an IR statement references `$main_exit_code`.
 fn stmt_refers_to_main_exit(stmt: &IrStmt) -> bool {
     match stmt {
+        IrStmt::Ext(n) => crate::shir_nodes::ExtNode::children(&**n).into_iter().any(stmt_refers_to_main_exit),
         IrStmt::RawText(t) => t.contains("$main_exit_code") || t.contains("main_exit_code"),
         IrStmt::Label(_) | IrStmt::Goto(_) => false,
         IrStmt::Case { .. }
@@ -6648,6 +6654,7 @@ fn collect_referenced_vars(stmts: &[IrStmt]) -> std::collections::HashSet<String
 
 fn collect_vars_in_stmt(stmt: &IrStmt, vars: &mut std::collections::HashSet<String>) {
     match stmt {
+        IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { collect_vars_in_stmt(c, vars); } }
         IrStmt::RawText(t) => {
             // Scrape $identifier patterns from raw text
             for cap in regex_lite_find_all(r"\$([a-zA-Z_][a-zA-Z0-9_]*)", t) {

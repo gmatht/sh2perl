@@ -4695,6 +4695,7 @@ use std::collections::{HashMap, HashSet};
 
     fn walk_stmt(st: &IrStmt, acc: &mut Acc, multi_run: bool) {
         match st {
+            IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { walk_stmt(c, acc, multi_run); } }
             IrStmt::Label(_) | IrStmt::Goto(_) => {}
             // inline asm: the operand exprs may read/write store vars;
             // walk them like an assignment's value side (core requests
@@ -6543,6 +6544,7 @@ fn loop_fixpoint(
 
 fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
     match s {
+        IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { walk_stmt_ranges(c, state); } }
         IrStmt::Label(_) | IrStmt::Goto(_) => {}
         // inline asm operands are runtime exprs — no static range
         IrStmt::Asm { .. } => {}
@@ -15054,6 +15056,7 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
     }
     fn scan_stmt(s: &IrStmt) -> bool {
         match s {
+            IrStmt::Ext(n) => crate::shir_nodes::ExtNode::children(&**n).into_iter().any(scan_stmt),
             IrStmt::Label(_) | IrStmt::Goto(_) => false,
             // inline asm operands never carry shopt set-calls
             IrStmt::Asm { .. } => false,
@@ -15227,6 +15230,7 @@ fn ir_nocase_shopt_mask(prog: &IrProgram) -> u8 {
     }
     fn scan_stmt(s: &IrStmt, mask: &mut u8) {
         match s {
+            IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { scan_stmt(c, mask); } }
             IrStmt::Label(_) | IrStmt::Goto(_) => {}
             // inline asm operands never carry shopt set-calls
             IrStmt::Asm { .. } => {}

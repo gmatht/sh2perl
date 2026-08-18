@@ -1803,6 +1803,7 @@ impl Render {
 
     fn stmt(&mut self, s: &IrStmt) {
         match s {
+            IrStmt::Ext(_) => panic!("perl backend: Ext node unsupported"),
             IrStmt::Expr(e) => match e {
                 IrExpr::Call { func, args } => match func.as_str() {
                     "exec" => self.exec_stmt(args),

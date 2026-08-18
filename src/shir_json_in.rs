@@ -321,6 +321,11 @@ fn stmt_from(v: &Value, where_: &str) -> Result<IrStmt, String> {
     let o = require_obj(v, where_)?;
     let t = req_str(o, "type", where_)?;
     if !KNOWN_STMT.contains(&t) {
+        // a transform-declared node (shir_nodes): the generated union is the
+        // parser for its own tag, so an Ext node round-trips through the A1.
+        if let Some(ctor) = crate::shir_nodes::node_ctor(&t) {
+            return Ok(IrStmt::Ext(ctor(v)?));
+        }
         return Err(format!("{where_}.type: unknown stmt type {t:?}"));
     }
     Ok(match t {
