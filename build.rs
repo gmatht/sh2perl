@@ -1,19 +1,25 @@
 //! build.rs — generate the `pipeline_native` capability tree
-//! (PLUGGABLE_NESTED_TRANSFORMS.md §1).
+//! (PLUGGABLE_NESTED_TRANSFORMS.md §1) and the `shir_nodes` transform-
+//! declared IR-node union + JSON (PLUGGABLE_NESTED_TRANSFORMS.md §2).
 //!
-//! Each `.rs` file in `src/pipeline_native/capabilities/` is one capability
-//! leaf exposing `pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit>`
-//! (self-gating on `ctx.cmd`). This script emits:
-//!   1. `src/pipeline_native/capabilities/mod.rs` — the `mod` list (the real
-//!      modules must live in the source tree for `mod path` resolution).
-//!   2. `OUT_DIR/pipeline_native_gen.rs` — the linear `native_pipeline_dispatch`.
-//! Adding a consumer = dropping a `.rs` file into the directory.
+//! Part 1 — capabilities: each `.rs` in
+//! `src/pipeline_native/capabilities/` is a leaf exposing
+//! `pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit>`. Emits the
+//! `mod` list (source tree, for `mod path` resolution) + a linear
+//! `native_dispatch` (OUT_DIR).
+//!
+//! Part 2 — IR nodes: each `src/shir_nodes/*.node` is a node declaration
+//! (`node NAME` / `tag "X"` / `field NAME: string|int|bool|expr|stmts`).
+//! Emits, into OUT_DIR: the generated `struct` + inherent `from_json` +
+//! `impl ExtNode` (to_json / tag / children_mut) + `all_nodes()` — the
+//! union of every transform-declared node, with JSON generator and parser
+//! both derived from the same declaration (they cannot drift).
 use std::{env, fs, path::Path};
 
 fn main() {
+    // ── Part 1: capability tree ────────────────────────────────────────
     let caps_dir = Path::new("src/pipeline_native/capabilities");
     println!("cargo:rerun-if-changed={}", caps_dir.display());
-
     let mut leaves: Vec<String> = Vec::new();
     if let Ok(rd) = fs::read_dir(caps_dir) {
         for entry in rd
@@ -52,4 +58,165 @@ fn main() {
          pub(crate) fn native_dispatch(ctx: &NativeCtx) -> Option<NativeEmit> {{\n{chain}    None\n    }}\n"
     );
     fs::write(format!("{out}/pipeline_native_gen.rs"), gen).unwrap();
+
+    // ── Part 2: transform-declared IR nodes ────────────────────────────
+    let nodes_dir = Path::new("src/shir_nodes");
+    println!("cargo:rerun-if-changed={}", nodes_dir.display());
+    let nodes = parse_nodes(nodes_dir);
+    let node_gen = gen_nodes(&nodes);
+    fs::write(format!("{out}/shir_nodes_gen.rs"), node_gen).unwrap();
+}
+
+/// One parsed node declaration.
+struct NodeDecl {
+    name: String,
+    tag: String,
+    fields: Vec<(String, String)>, // (field name, field type)
+}
+
+fn parse_nodes(dir: &Path) -> Vec<NodeDecl> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().map(|e| e == "node").unwrap_or(false) {
+                if let Ok(text) = fs::read_to_string(&path) {
+                    if let Some(n) = parse_one_node(&text) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn parse_one_node(text: &str) -> Option<NodeDecl> {
+    let mut name = None;
+    let mut tag = None;
+    let mut fields = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("node ") {
+            name = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("tag ") {
+            tag = Some(rest.trim_matches('"').to_string());
+        } else if let Some(rest) = line.strip_prefix("field ") {
+            if let Some((fname, ftype)) = rest.split_once(':') {
+                fields.push((fname.trim().to_string(), ftype.trim().to_string()));
+            }
+        }
+    }
+    Some(NodeDecl {
+        name: name?,
+        tag: tag.unwrap_or_default(),
+        fields,
+    })
+}
+
+/// The Rust type for a field's JSON value in `to_json`/`from_json`.
+fn gen_node(n: &NodeDecl) -> String {
+    let mut fields = String::new();
+    let mut json_build = String::new();
+    let mut json_read = String::new();
+    let mut children = String::new();
+    for (fname, ftype) in &n.fields {
+        let rust_ty = match ftype.as_str() {
+            "string" => "String",
+            "int" => "i64",
+            "bool" => "bool",
+            "expr" => "crate::ir::IrExpr",
+            "stmts" => "Vec<crate::ir::IrStmt>",
+            other => panic!("unknown shir_nodes field type {other}"),
+        };
+        fields.push_str(&format!("    pub {fname}: {rust_ty},\n"));
+        json_build.push_str(&match ftype.as_str() {
+            "string" => format!("            \"{fname}\": self.{fname}.clone(),\n"),
+            "int" => format!("            \"{fname}\": self.{fname},\n"),
+            "bool" => format!("            \"{fname}\": self.{fname},\n"),
+            "expr" => format!(
+                "            \"{fname}\": crate::shir_nodes::enc::expr_to_json(&self.{fname}),\n"
+            ),
+            "stmts" => format!(
+                "            \"{fname}\": crate::shir_nodes::enc::stmts_to_json(&self.{fname}),\n"
+            ),
+            _ => String::new(),
+        });
+        json_read.push_str(&format!(
+            "            {fname}: {},\n",
+            match ftype.as_str() {
+                "string" => {
+                    format!("v[\"{fname}\"].as_str().ok_or(\"{}.{fname}\")?.to_string()", n.name)
+                }
+                "int" => format!("v[\"{fname}\"].as_i64().ok_or(\"{}.{fname}\")?", n.name),
+                "bool" => format!("v[\"{fname}\"].as_bool().ok_or(\"{}.{fname}\")?", n.name),
+                "expr" => format!("crate::shir_nodes::enc::json_to_expr(&v[\"{fname}\"])?"),
+                "stmts" => format!("crate::shir_nodes::enc::json_to_stmts(&v[\"{fname}\"])?"),
+                _ => String::new(),
+            }
+        ));
+        if ftype == "stmts" {
+            children.push_str(&format!("        out.extend(self.{fname}.iter_mut());\n"));
+        }
+    }
+
+    format!(
+        r#"// @generated by build.rs from a shir_nodes/*.node declaration — do not edit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct {name} {{
+{fields}}}
+
+impl {name} {{
+    fn from_json(v: &serde_json::Value) -> Result<Self, String> {{
+        Ok({name} {{
+{json_read}        }})
+    }}
+}}
+
+impl crate::shir_nodes::ExtNode for {name} {{
+    fn tag(&self) -> &'static str {{ "{tag}" }}
+    fn to_json(&self) -> serde_json::Value {{
+        serde_json::json!({{
+            "type": "{tag}",
+{json_build}        }})
+    }}
+    fn children_mut(&mut self) -> Vec<&mut crate::ir::IrStmt> {{
+        let mut out = Vec::new();
+{children}        out
+    }}
+}}
+
+"#,
+        name = n.name,
+        tag = n.tag,
+        fields = fields,
+        json_read = json_read,
+        json_build = json_build,
+        children = children,
+    )
+}
+
+fn gen_nodes(nodes: &[NodeDecl]) -> String {
+    let mut out = String::new();
+    for n in nodes {
+        out.push_str(&gen_node(n));
+    }
+    let mut registry = String::new();
+    for n in nodes {
+        registry.push_str(&format!(
+            "        (\"{tag}\", |v| Ok(Box::new({name}::from_json(v)?))),\n",
+            tag = n.tag,
+            name = n.name
+        ));
+    }
+    out.push_str(&format!(
+        "// @generated by build.rs — the union of transform-declared nodes.\n\
+         pub(crate) fn all_nodes() -> Vec<(&'static str, crate::shir_nodes::NodeCtor)> {{\n\
+         vec![\n{registry}    ]\n}}\n"
+    ));
+    out
 }
