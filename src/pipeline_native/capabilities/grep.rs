@@ -1,6 +1,8 @@
-//! Capabilities: quiet file-grep (`grep -q PAT FILE` → native "does the
-//! file contain") in condition position, and the `(grep -q && echo A) ||
-//! echo B` control chain → native if/else.
+//! Capabilities: file-grep over a single literal file, in condition
+//! position (`grep -q PAT FILE` → boolean) and in the `(grep && echo A) ||
+//! echo B` control chain (→ native if/else; -c/-l/-L print their output
+//! first). Only output-quiet / literal-safe forms lift — regex patterns,
+//! globs, multiple files and bare grep (which prints matching lines) refuse.
 
 use crate::ir::BinOpKind;
 use crate::ir::IrExpr;
@@ -8,17 +10,21 @@ use crate::pipeline_native::{NativeCtx, NativeEmit};
 
 pub(crate) fn emit(ctx: &NativeCtx) -> Option<NativeEmit> {
     match ctx {
-        NativeCtx::Exec { call, cond: true } => grep_file_contains(call).map(NativeEmit::Cond),
-        NativeCtx::Chain(e) => grep_echo_chain(e).map(NativeEmit::Stmt),
+        NativeCtx::Exec { call, cond: true } => grep_boolean(call).map(NativeEmit::Cond),
+        NativeCtx::Chain(e) => grep_chain(e).map(NativeEmit::Stmt),
         _ => None,
     }
 }
 
-/// `grep [-q|-i|-s] PAT FILE` in condition position → a boolean perl
-/// expression (read the file + `index`). Only the output-quiet forms lift
-/// (grep -q discards stdout; the status is exactly "a line contains the
-/// literal"). Regex patterns, globs, multiple files → refuse.
-fn grep_file_contains(call: &IrExpr) -> Option<String> {
+/// A verified `grep [-q|c|l|L] [-i] [-s] PAT FILE` (single literal file).
+struct GrepSpec {
+    flags: String, // the flag characters actually present (q/c/l/L/i/s)
+    pat: String,
+    file: String,
+    ci: bool,
+}
+
+fn grep_spec(call: &IrExpr) -> Option<GrepSpec> {
     let IrExpr::Call { func, args } = call else {
         return None;
     };
@@ -29,16 +35,18 @@ fn grep_file_contains(call: &IrExpr) -> Option<String> {
         return None;
     }
     let words: Vec<&IrExpr> = crate::ir::exec_word_args(args);
-    let mut ci = false;
+    let mut flags = String::new();
     let mut nonflag: Vec<&IrExpr> = Vec::new();
+    let mut ci = false;
     for w in words {
         match w {
             IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
-                let f: String = s[1..].chars().filter(|c| "qis".contains(*c)).collect();
+                let f: String = s[1..].chars().filter(|c| "qclLis".contains(*c)).collect();
                 if f.len() != s.len() - 1 {
                     return None; // an unsupported flag char
                 }
-                ci |= s.contains('i');
+                flags.push_str(&f);
+                ci |= f.contains('i');
             }
             _ => nonflag.push(w),
         }
@@ -54,26 +62,39 @@ fn grep_file_contains(call: &IrExpr) -> Option<String> {
     if file.contains('*') || file.contains('?') {
         return None; // a glob expends to many files — not a single read
     }
-    let (hay, ndl) = if ci {
-        (
-            "lc($__grep_c)".to_string(),
-            format!("lc({})", crate::ir::safe_perl_q_string(&pat)),
-        )
-    } else {
-        ("$__grep_c".to_string(), crate::ir::safe_perl_q_string(&pat))
-    };
-    Some(format!(
-        "(sub {{ open(my $__grep_h, '<', {}) or return 0; local $/; \
-            my $__grep_c = <$__grep_h>; close $__grep_h; \
-            return (index({hay}, {ndl}) >= 0 ? 1 : 0); }}->())",
-        crate::ir::safe_perl_q_string(&file)
-    ))
+    Some(GrepSpec { flags, pat, file, ci })
 }
 
-/// `(grep -q PAT FILE && echo A) || echo B` → native if/else: -q is quiet
-/// and a literal echo body always succeeds, so `X && A || B ≡ if X {A}
-/// else {B}`.
-fn grep_echo_chain(e: &IrExpr) -> Option<String> {
+/// A perl expression counting the lines of FILE that contain PAT (0/1 is
+/// the -q boolean; -c/-l/-L use the count).
+fn count_expr(spec: &GrepSpec) -> String {
+    let file = crate::ir::safe_perl_q_string(&spec.file);
+    let (pat, line) = if spec.ci {
+        (
+            format!("lc({})", crate::ir::safe_perl_q_string(&spec.pat)),
+            "lc($__gl)".to_string(),
+        )
+    } else {
+        (crate::ir::safe_perl_q_string(&spec.pat), "$__gl".to_string())
+    };
+    format!(
+        "(sub {{ open(my $__gh, '<', {file}) or return 0; local $/; my $__gc = <$__gh>; close $__gh; my $__gn = 0; for my $__gl (split(/\\n/, $__gc)) {{ $__gn++ if index({line}, {pat}) >= 0; }} $__gn }})->()"
+    )
+}
+
+/// `grep -q PAT FILE` in condition position → the files-equal boolean.
+fn grep_boolean(call: &IrExpr) -> Option<String> {
+    let spec = grep_spec(call)?;
+    if spec.flags.chars().any(|c| matches!(c, 'c' | 'l' | 'L')) {
+        return None; // these print output, not a plain boolean
+    }
+    Some(format!("({} > 0)", count_expr(&spec)))
+}
+
+/// `(grep [-q|-c|-l|-L] PAT FILE && echo A) || echo B` → native statement:
+/// -q prints nothing, -c prints the count, -l prints FILE when matched,
+/// -L prints FILE when NOT matched; the exit status drives the if/else.
+fn grep_chain(e: &IrExpr) -> Option<String> {
     let IrExpr::BinOp {
         lhs,
         op: BinOpKind::Or,
@@ -90,17 +111,31 @@ fn grep_echo_chain(e: &IrExpr) -> Option<String> {
     else {
         return None;
     };
-    let cond_perl = grep_file_contains(cond)?;
+    let spec = grep_spec(cond)?;
+    let cnt = count_expr(&spec);
     let then_perl = literal_echo(then_body)?;
     let else_perl = literal_echo(rhs)?;
+    let file_perl = crate::ir::safe_perl_q_string(&spec.file);
+    // NOTE: grep's EXIT STATUS is always "did any line match" (0) — the
+    // -c/-l/-L flags only change the OUTPUT (count / matched filename /
+    // non-matched filename). So the if/else status is `cnt > 0` for every
+    // flag; only the printed payload differs.
+    let output = match spec.flags.as_str() {
+        f if f.contains('q') => String::new(),
+        f if f.contains('c') => format!("print({cnt}, \"\\n\");"),
+        f if f.contains('l') => format!("print({file_perl}, \"\\n\") if {cnt} > 0;"),
+        f if f.contains('L') => format!("print({file_perl}, \"\\n\") if {cnt} == 0;"),
+        _ => return None,
+    };
+    let hit_test = format!("({cnt} > 0)");
     Some(format!(
-        "if ({cond_perl}) {{ {then_perl} }} else {{ {else_perl} }}"
+        "{output} if ({hit_test}) {{ {then_perl} }} else {{ {else_perl} }}"
     ))
 }
 
 /// A bare `exec echo LITERAL` renders as native `print` (always exit 0),
 /// so it can be a `&&`/`||` chain body without a shell-out.
-fn literal_echo(e: &IrExpr) -> Option<String> {
+pub(crate) fn literal_echo(e: &IrExpr) -> Option<String> {
     let IrExpr::Call { func, args } = e else {
         return None;
     };
