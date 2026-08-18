@@ -8093,20 +8093,14 @@ fn try_lift_grep_contains(cond: &IrExpr) -> Option<IrExpr> {
     let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
         return None;
     };
-    // stage 1: exec("echo", [arg])
-    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+    // stage 1: a single-line producer: `echo ARG`, or the echo-equivalent
+    // `printf '%s\n' ARG` / `printf '%s' ARG` (one `%s`; a multi-line
+    // format or extra conversions change the line shape). The payload is
+    // the `contains` haystack.
+    let [IrStmt::Expr(stage1)] = s1.as_slice() else {
         return None;
     };
-    if f1 != "exec" {
-        return None;
-    }
-    let [IrExpr::Str(name1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
-        return None;
-    };
-    if name1 != "echo" || echo_args.len() != 1 {
-        return None;
-    }
-    let arg = echo_args[0].clone();
+    let arg = single_line_payload(stage1)?;
     // stage 2: Expr(Call("redirect", [Arrow([exec grep]), Array([spec...])]))
     let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
         return None;
@@ -8169,6 +8163,47 @@ fn try_lift_grep_contains(cond: &IrExpr) -> Option<IrExpr> {
 /// leading `-` (would parse as an option), no real newline (grep matches
 /// within a single line; a substring test would cross line boundaries).
 /// BRE treats `+ ? ( ) { } |` as literals, so they are safe.
+/// The single-line payload of a pipeline stage's producer: `echo ARG`, or
+/// the echo-equivalent `printf '%s\n' ARG` / `printf '%s' ARG` (one `%s`,
+/// nothing else — a multi-line/extra-conversion format is not a single
+/// line and is refused). Returns the ARG expression to feed `contains`.
+fn single_line_payload(e: &IrExpr) -> Option<IrExpr> {
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    // args[0] = the command name, args[1] = Array of command words
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    match cmd.as_str() {
+        "echo" => {
+            if words.len() != 1 {
+                return None;
+            }
+            Some(words[0].clone())
+        }
+        "printf" => {
+            // [fmt, payload] — fmt must be a literal `%s\n` (shell passes
+            // backslash-n, not a real newline) or a bare `%s`
+            let [IrExpr::Interpolate(parts), payload] = words.as_slice() else {
+                return None;
+            };
+            let fmt = match parts.as_slice() {
+                [crate::ir::InterpPart::Lit(t)] => t,
+                _ => return None,
+            };
+            if fmt != "%s\\n" && fmt != "%s" {
+                return None;
+            }
+            Some((*payload).clone())
+        }
+        _ => None,
+    }
+}
+
 fn is_safe_grep_literal(pat: &str) -> bool {
     !pat.starts_with('-')
         && !pat
@@ -29482,7 +29517,7 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
                 }
             }
             IrExpr::Call { func, args } => {
-                if func == "exec" {
+                if func == "exec" || func == "builtin" {
                     collect_native_arith_sources(args, assigns);
                 }
                 for a in args {
@@ -35459,6 +35494,26 @@ mod range_analysis_tests {
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = ast_to_ir(&cmds);
         analyze_var_ranges(&prog)
+    }
+
+    /// The grep-contains lift treats `printf '%s\n' ARG | grep PAT >/dev/null`
+    /// as echo-equivalent (single line), so it lowers to native `contains`
+    /// (index) with no bash -c — printf must match echo.
+    #[test]
+    fn printf_grep_test_lifts_to_contains() {
+        let src = r#"x="hello world"
+if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("index($x, 'world') >= 0"),
+            "printf|grep must lift to native contains: {perl}"
+        );
+        assert!(
+            !perl.contains("system('bash'"),
+            "printf|grep must not shell out: {perl}"
+        );
     }
 
     /// The Try node lowers to a JS try/catch/finally (core request
