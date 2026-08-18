@@ -252,7 +252,11 @@ waitpid $pid, 0;\n",
                         "0" => "STDIN",
                         _ => "STDOUT",
                     };
-                    output.push_str("local *STDERR;\n");
+                    // Save stderr with a dup, then reopen STDERR so the new
+                    // handle takes fd 2 — a `local *STDERR` glob swap leaves
+                    // fd 2 pointing at the old stderr, so child processes
+                    // (system/open) would bypass the redirect entirely.
+                    output.push_str("open my $__stderr_save, '>&', STDERR or croak \"Cannot save STDERR: $OS_ERROR\\n\";\n");
                     output.push_str(&format!(
                         "open STDERR, '>&', {} or die \"Cannot dup stderr: $OS_ERROR\\n\";\n",
                         fd_name
@@ -261,7 +265,7 @@ waitpid $pid, 0;\n",
             } else {
                 // Regular stderr redirect to a file
                 let target = generator.perl_string_literal(&redirect.target);
-                output.push_str("local *STDERR;\n");
+                output.push_str("open my $__stderr_save, '>&', STDERR or croak \"Cannot save STDERR: $OS_ERROR\\n\";\n");
                 output.push_str(&format!(
                     "open STDERR, '>', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
                     target
@@ -1645,6 +1649,27 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 }
             } else {
                 output.push_str("# Builtin command 'trap' with insufficient arguments\n");
+            }
+        }
+        "shift" => {
+            // Drop the first N positional parameters: @_ inside a function,
+            // @ARGV at top level.
+            let n = cmd
+                .args
+                .first()
+                .and_then(|a| {
+                    if let Word::Literal(s, _) = a {
+                        s.parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1);
+            output.push_str(&generator.indent());
+            if generator.fn_nesting_depth > 0 {
+                output.push_str(&format!("splice(@_, 0, {});\n", n));
+            } else {
+                output.push_str(&format!("splice(@ARGV, 0, {});\n", n));
             }
         }
         "exec" => {

@@ -43,7 +43,7 @@ fn push_string_expr(parts: &mut Vec<String>, current_string: &mut String) {
                 '\r' => "\\r".to_string(),
                 '$' => "\\$".to_string(),
                 _ if c.is_ascii() => c.to_string(),
-                _ => format!("\\x{{{:04X}}}", c as u32),
+                _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
             }
         }).collect::<Vec<_>>().join("");
         format!("\"{}\"", escaped)

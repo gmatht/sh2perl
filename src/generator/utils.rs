@@ -240,7 +240,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                         '@' => "\\@".to_string(),
                         '$' => "\\$".to_string(),
                         _ if c.is_ascii() => c.to_string(),
-                        _ => format!("\\x{{{:04X}}}", c as u32),
+                        _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
                     }
                 }).collect::<Vec<_>>().join("");
                 format!("\"{}\"", escaped)
@@ -301,7 +301,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 '{' => "\\{".to_string(),
                                 '}' => "\\}".to_string(),
                                 _ if c.is_ascii() => c.to_string(),
-                                _ => format!("\\x{{{:04X}}}", c as u32),
+                                _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
                             }
                         }).collect::<Vec<_>>().join("");
                         format!("q{{{}}}", escaped_q)
@@ -318,7 +318,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 '@' => "\\@".to_string(),
                                 '$' => "\\$".to_string(),
                                 _ if c.is_ascii() => c.to_string(),
-                                _ => format!("\\x{{{:04X}}}", c as u32),
+                                _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
                             }
                         }).collect::<Vec<_>>().join("");
                         format!("\"{}\"", escaped)

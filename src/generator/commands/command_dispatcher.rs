@@ -996,6 +996,10 @@ pub fn generate_command_impl_with_input(
 
                             if stderr_scope_opened {
                                 stderr_scope_opened = false;
+                                result.push_str(&generator.indent());
+                                result.push_str("open STDERR, '>&', $__stderr_save or die \"Cannot restore STDERR: $OS_ERROR\\n\";\n");
+                                result.push_str(&generator.indent());
+                                result.push_str("close $__stderr_save;\n");
                                 generator.indent_level -= 1;
                                 result.push_str(&generator.indent());
                                 result.push_str("};
@@ -1379,6 +1383,9 @@ pub fn generate_command_impl_with_input(
                                 || t.starts_with("print(")
                                 || t.starts_with("printf ")
                                 || t.starts_with("printf(")
+                                // system() children write to the (redirected)
+                                // STDOUT themselves.
+                                || t.contains("system(")
                             {
                                 return true;
                             }
@@ -1451,6 +1458,12 @@ pub fn generate_command_impl_with_input(
             }
 
             if has_output_redirect {
+                if has_stderr_redirect {
+                    result.push_str(&generator.indent());
+                    result.push_str("open STDERR, '>&', $__stderr_save or die \"Cannot restore STDERR: $OS_ERROR\\n\";\n");
+                    result.push_str(&generator.indent());
+                    result.push_str("close $__stderr_save;\n");
+                }
                 result.push_str(&generator.indent());
                 result.push_str("open STDOUT, '>&', $original_stdout\n");
                 result.push_str("      or die \"Cannot restore STDOUT: $OS_ERROR\\n\";\n");
@@ -1462,6 +1475,10 @@ pub fn generate_command_impl_with_input(
                 result.push_str("};\n");
             }
                         if stderr_scope_opened {
+                result.push_str(&generator.indent());
+                result.push_str("open STDERR, '>&', $__stderr_save or die \"Cannot restore STDERR: $OS_ERROR\\n\";\n");
+                result.push_str(&generator.indent());
+                result.push_str("close $__stderr_save;\n");
                 generator.indent_level -= 1;
                 result.push_str(&generator.indent());
                 result.push_str("};

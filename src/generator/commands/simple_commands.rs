@@ -11,6 +11,29 @@ static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut output = String::new();
 
+    // `"$@"` (or "$*") used as the command itself: execute the positional
+    // parameters as a command, e.g. the common `capture() { ...; "$@"; }`
+    // wrapper.  Positional parameters are @_ inside a function, @ARGV at
+    // top level.
+    if let Word::StringInterpolation(si, _) = &cmd.name {
+        if si.parts.len() == 1
+            && matches!(&si.parts[0], StringPart::Variable(v) if v == "@" || v == "*")
+            && cmd.args.is_empty()
+        {
+            let arr = if generator.fn_nesting_depth > 0 {
+                "@_"
+            } else {
+                "@ARGV"
+            };
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "$CHILD_ERROR = {arr} ? (system({arr}) >> 8) : 0;\n",
+                arr = arr
+            ));
+            return output;
+        }
+    }
+
     // Handle array assignments first (these need to be in the main scope)
     // Collect all env vars (both array and scalar) and sort by dependency order
     // so that variables referenced by other variables are declared first.

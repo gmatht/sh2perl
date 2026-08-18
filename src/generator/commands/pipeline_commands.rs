@@ -2247,6 +2247,41 @@ fn has_heredoc_redirect(cmd: &Command) -> bool {
 }
 
 /// Generate a buffered pipeline that processes all input at once
+/// Collect shell variable references (`$name` / `${name}`) in a reconstructed
+/// bash command string that correspond to Perl-side lexicals.  A `bash -c`
+/// subprocess can only see them through the environment, so the caller wraps
+/// the capture in `local $ENV{name} = $name;` for each returned name.
+fn env_exports_for_cmd(generator: &Generator, cmd: &str) -> Vec<String> {
+    let mut vars = std::collections::BTreeSet::new();
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let mut j = i + 1;
+            if j < bytes.len() && bytes[j] == b'{' {
+                j += 1;
+            }
+            let start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j > start {
+                let name = &cmd[start..j];
+                if !name.chars().next().unwrap().is_ascii_digit()
+                    && (generator.declared_locals.contains(name)
+                        || generator.function_level_vars.contains(name))
+                {
+                    vars.insert(name.to_string());
+                }
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    vars.into_iter().collect()
+}
+
 fn generate_buffered_pipeline(
     generator: &mut Generator,
     pipeline: &Pipeline,
@@ -2316,18 +2351,25 @@ fn generate_buffered_pipeline(
     // `bash -c` subprocess would never see.  Generate the construct natively
     // with STDOUT captured into a scalar, then feed that text through the
     // remaining (serializable) pipeline stages.
+    fn is_control_flow_head(cmd: &Command) -> bool {
+        match cmd {
+            Command::For(_)
+            | Command::While(_)
+            | Command::If(_)
+            | Command::Case(_)
+            | Command::CStyleFor(_)
+            | Command::Block(_) => true,
+            // e.g. `while read ...; done < file | head` parses as a Redirect
+            // wrapping the loop; the native generator handles the redirect.
+            Command::Redirect(rc) => is_control_flow_head(&rc.command),
+            _ => false,
+        }
+    }
+
     if !has_output_redirect_early
         && !has_heredoc
         && pipeline.commands.len() >= 2
-        && matches!(
-            pipeline.commands[0],
-            Command::For(_)
-                | Command::While(_)
-                | Command::If(_)
-                | Command::Case(_)
-                | Command::CStyleFor(_)
-                | Command::Block(_)
-        )
+        && is_control_flow_head(&pipeline.commands[0])
     {
         let rest = Pipeline {
             commands: pipeline.commands[1..].to_vec(),
@@ -2427,16 +2469,28 @@ fn generate_buffered_pipeline(
             let unique_id = generator.get_unique_id();
             let output_var = format!("output_{}", unique_id);
 
+            // Perl lexicals referenced by the command string must reach the
+            // bash -c subprocess through the environment.
+            let exports = env_exports_for_cmd(generator, &reconstructed_cmd);
+            let export_prefix: String = exports
+                .iter()
+                .map(|v| format!("local $ENV{{{v}}} = ${v} // q{{}}; ", v = v))
+                .collect();
+
             if should_print {
                 // For top-level pipelines, print the captured output verbatim.
                 // bash prints exactly what the pipeline emitted; chomping and
                 // unconditionally re-adding "\n" would print a spurious blank
                 // line when the pipeline emits nothing at all.
-                output.push_str(&format!(
-                    "my ${} = {};\n",
-                    output_var,
-                    crate::ir::cmd_str_to_open_perl_raw(&reconstructed_cmd)
-                ));
+                let open_expr = crate::ir::cmd_str_to_open_perl_raw(&reconstructed_cmd);
+                if export_prefix.is_empty() {
+                    output.push_str(&format!("my ${} = {};\n", output_var, open_expr));
+                } else {
+                    output.push_str(&format!(
+                        "my ${} = do {{ {}{} }};\n",
+                        output_var, export_prefix, open_expr
+                    ));
+                }
                 output.push_str(&format!("print ${};\n", output_var));
             } else {
                 // Build a clean IR statement for pipeline capture (chomped,
@@ -2445,9 +2499,17 @@ fn generate_buffered_pipeline(
                     stages: vec![],  // Not used when capture is set
                     last_output: None,
                     capture: Some(output_var.clone()),
-                    cmd_str: Some(reconstructed_cmd),
+                    cmd_str: Some(reconstructed_cmd.clone()),
                 };
-                output.push_str(&stmt_to_perl(&pipeline_stmt, 0));
+                if export_prefix.is_empty() {
+                    output.push_str(&stmt_to_perl(&pipeline_stmt, 0));
+                } else {
+                    let open_expr = crate::ir::cmd_str_to_open_perl(&reconstructed_cmd);
+                    output.push_str(&format!(
+                        "my ${} = do {{ {}{} }};\n",
+                        output_var, export_prefix, open_expr
+                    ));
+                }
                 // For command substitution, emit the captured variable as the last expression
                 // so the do{...} returns it.  The backend's Pipeline { capture } emits
                 // `my $var = qx{...}; chomp $var;` which are statements, not expressions,
