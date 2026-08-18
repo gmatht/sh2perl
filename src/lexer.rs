@@ -1077,8 +1077,10 @@ impl Lexer {
                                 found_close = true;
                                 break;
                             }
-                            b'"' if p_depth > 0 || bt_depth > 0 => {
+                            b'"' if (p_depth > 0 || bt_depth > 0) && sq_depth == 0 => {
                                 // Toggle double-quote depth inside $() or backtick.
+                                // A " inside a single-quoted span (e.g. sed 's/"//g')
+                                // is a literal character and must not toggle.
                                 dq_depth = if dq_depth == 0 { 1 } else { 0 };
                                 end += 1;
                             }
@@ -1094,10 +1096,11 @@ impl Lexer {
                                     end += 2; // skip escaped char
                                 }
                             }
-                            b'`' => {
+                            b'`' if sq_depth == 0 => {
                                 // Toggle backtick depth — backticks inside double
                                 // quotes are command substitutions and should not
                                 // cause the inner " to close the outer string.
+                                // Inside a single-quoted span a backtick is literal.
                                 bt_depth = if bt_depth == 0 { 1 } else { 0 };
                                 end += 1;
                             }

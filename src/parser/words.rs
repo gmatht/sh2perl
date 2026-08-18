@@ -3199,20 +3199,18 @@ fn parse_string_interpolation(lexer: &mut Lexer) -> Result<Word, ParserError> {
                         continue;
                     }
                     match content[i..].chars().next() {
-                        Some('"') if dq_depth == 0 => {
-                            // Toggle double-quote depth.
-                            dq_depth = 1;
-                        }
-                        Some('"') => {
-                            dq_depth = 0;
+                        Some('"') if !sq_depth => {
+                            // Toggle double-quote depth — but a " inside a
+                            // single-quoted span (sed 's/"//g') is literal.
+                            dq_depth = if dq_depth == 0 { 1 } else { 0 };
                         }
                         Some('\'') if dq_depth == 0 => {
                             // Toggle single-quote depth, but only when NOT
                             // inside a double-quoted string within $().
                             sq_depth = !sq_depth;
                         }
-                        Some('(') if !sq_depth => paren_count += 1,
-                        Some(')') if !sq_depth => paren_count -= 1,
+                        Some('(') if !sq_depth && dq_depth == 0 => paren_count += 1,
+                        Some(')') if !sq_depth && dq_depth == 0 => paren_count -= 1,
                         _ => {}
                     }
                     let ch = content[i..].chars().next().unwrap_or('?');
@@ -3658,6 +3656,63 @@ pub fn parse_string_interpolation_from_literal(
                 // Unmatched backtick, treat as literal
                 parts.push(StringPart::Literal("`".to_string()));
                 i = cmd_start;
+            }
+        } else if content[i..].starts_with("$(") && !content[i..].starts_with("$((") {
+            // $(...) command substitution: find the matching close paren,
+            // skipping over single- and double-quoted spans so quotes inside
+            // embedded programs (awk '{ print $1 }', sed 's/"//g') don't
+            // derail the match.
+            let rest = &content[i + 2..];
+            let mut depth = 1i32;
+            let mut in_sq = false;
+            let mut in_dq = false;
+            let mut prev_backslash = false;
+            let mut end = None;
+            for (j, c) in rest.char_indices() {
+                if prev_backslash {
+                    prev_backslash = false;
+                    continue;
+                }
+                match c {
+                    '\\' if !in_sq => prev_backslash = true,
+                    '\'' if !in_dq => in_sq = !in_sq,
+                    '"' if !in_sq => in_dq = !in_dq,
+                    '(' if !in_sq && !in_dq => depth += 1,
+                    ')' if !in_sq && !in_dq => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(j) = end {
+                let inner = &rest[..j];
+                if !current_literal.is_empty() {
+                    parts.push(StringPart::Literal(current_literal.clone()));
+                    current_literal.clear();
+                }
+                match crate::parser::commands::parse_commands_from_text(inner) {
+                    Ok(cmds) if cmds.len() == 1 => {
+                        parts.push(StringPart::CommandSubstitution(Box::new(
+                            cmds.into_iter().next().unwrap(),
+                        )));
+                    }
+                    Ok(cmds) if !cmds.is_empty() => {
+                        parts.push(StringPart::CommandSubstitution(Box::new(
+                            Command::Block(crate::ast::Block { commands: cmds }),
+                        )));
+                    }
+                    _ => {
+                        parts.push(StringPart::Literal(format!("$({})", inner)));
+                    }
+                }
+                i += 2 + j + 1;
+            } else {
+                current_literal.push('$');
+                i += 1;
             }
         } else if content[i..].starts_with("${") {
             // ${name} or ${name<op>...}: find the matching close brace.
