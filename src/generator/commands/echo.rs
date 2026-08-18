@@ -155,14 +155,33 @@ pub fn generate_echo_command(
                         } else {
                             // For multi-part string interpolation with -e flag, handle each part
                             if has_e_flag {
-                                // Process the string interpolation with -e flag interpretation
-                                let mut result = String::new();
+                                // Build a concatenation: literal chunks are
+                                // -e-decoded then escaped as quoted strings,
+                                // while variables/expansions stay live Perl
+                                // expressions (escaping them printed literal
+                                // text like "hello \@ARGV").
+                                let mut exprs: Vec<String> = Vec::new();
+                                let mut lit = String::new();
+                                let flush =
+                                    |lit: &mut String, exprs: &mut Vec<String>| {
+                                        if lit.is_empty() {
+                                            return;
+                                        }
+                                        let escaped = lit
+                                            .replace('\\', "\\\\")
+                                            .replace('"', "\\\"")
+                                            .replace('\n', "\\n")
+                                            .replace('\t', "\\t")
+                                            .replace('\r', "\\r")
+                                            .replace('@', "\\@")
+                                            .replace('$', "\\$");
+                                        exprs.push(format!("\"{}\"", escaped));
+                                        lit.clear();
+                                    };
                                 for part in &interp.parts {
                                     match part {
                                         crate::ast::StringPart::Literal(literal) => {
-                                            // Interpret backslash escapes
                                             let mut interpreted = literal.clone();
-                                            // Remove outer quotes if present
                                             if (interpreted.starts_with('"')
                                                 && interpreted.ends_with('"'))
                                                 || (interpreted.starts_with('\'')
@@ -171,53 +190,65 @@ pub fn generate_echo_command(
                                                 interpreted = interpreted[1..interpreted.len() - 1]
                                                     .to_string();
                                             }
-
-                                            // Interpret backslash escapes
                                             interpreted = interpreted
                                                 .replace("\\n", "\n")
                                                 .replace("\\t", "\t")
                                                 .replace("\\r", "\r")
                                                 .replace("\\\\", "\\");
-
-                                            result.push_str(&interpreted);
+                                            lit.push_str(&interpreted);
                                         }
                                         crate::ast::StringPart::Variable(var) => {
-                                            // Handle variables in string interpolation
-                                            match var.as_str() {
-                                                "#" => result.push_str("scalar(@ARGV)"),
-                                                "@" => result.push_str("@ARGV"),
-                                                "*" => result.push_str("@ARGV"),
-                                                "?" => result.push_str("$CHILD_ERROR"),
-                                                "!" => result.push_str(""),
-                                                "-" => result.push_str("$ENV{SH2PERL_SHELLOPTS}"),
-                                                _ => {
-                                                    if generator.declared_locals.contains(var)
-                                                        || generator.function_level_vars.contains(var)
-                                                    {
-                                                        result.push_str(&format!("${}", var));
+                                            flush(&mut lit, &mut exprs);
+                                            let expr = match var.as_str() {
+                                                "#" => {
+                                                    if generator.fn_nesting_depth > 0 {
+                                                        "scalar(@_)".to_string()
                                                     } else {
-                                                        result.push_str(&format!("$ENV{{{}}}", var));
+                                                        "scalar(@ARGV)".to_string()
                                                     }
                                                 }
-                                            }
+                                                "@" | "*" => {
+                                                    if generator.fn_nesting_depth > 0 {
+                                                        "join(q{ }, @_)".to_string()
+                                                    } else {
+                                                        "join(q{ }, @ARGV)".to_string()
+                                                    }
+                                                }
+                                                "?" => "$CHILD_ERROR".to_string(),
+                                                "!" => "q{}".to_string(),
+                                                "-" => "$ENV{SH2PERL_SHELLOPTS}".to_string(),
+                                                _ => {
+                                                    if generator.declared_locals.contains(var)
+                                                        || generator
+                                                            .function_level_vars
+                                                            .contains(var)
+                                                    {
+                                                        format!("${}", var)
+                                                    } else {
+                                                        format!("($ENV{{{}}} // q{{}})", var)
+                                                    }
+                                                }
+                                            };
+                                            exprs.push(expr);
                                         }
                                         crate::ast::StringPart::CommandSubstitution(cmd) => {
-                                            // Handle command substitutions in string interpolation
+                                            flush(&mut lit, &mut exprs);
                                             let cmd_result = generator.word_to_perl(
                                                 &Word::CommandSubstitution(cmd.clone(), None),
                                             );
-                                            result.push_str(&cmd_result);
+                                            exprs.push(format!("({})", cmd_result));
                                         }
                                         crate::ast::StringPart::ParameterExpansion(pe) => {
-                                            // Handle parameter expansions
-                                            result.push_str(
-                                                &generator.generate_parameter_expansion(pe),
-                                            );
+                                            flush(&mut lit, &mut exprs);
+                                            exprs.push(format!(
+                                                "({})",
+                                                generator.generate_parameter_expansion(pe)
+                                            ));
                                         }
                                         _ => {
-                                            // For other parts, use default processing
-                                            result.push_str(
-                                                &generator.convert_string_interpolation_to_perl(
+                                            flush(&mut lit, &mut exprs);
+                                            exprs.push(
+                                                generator.convert_string_interpolation_to_perl(
                                                     &crate::ast::StringInterpolation {
                                                         parts: vec![part.clone()],
                                                     },
@@ -226,18 +257,12 @@ pub fn generate_echo_command(
                                         }
                                     }
                                 }
-                                // Return as a quoted string literal with proper escaping for Perl
-                                // For -e flag, escape newlines to prevent multiline string literals with indentation issues
-                                format!(
-                                    "\"{}\"",
-                                    result
-                                        .replace("\\", "\\\\")
-                                        .replace("\"", "\\\"")
-                                        .replace("\n", "\\n")
-                                        .replace("\t", "\\t")
-                                        .replace("\r", "\\r")
-                                        .replace("@", "\\@")
-                                )
+                                flush(&mut lit, &mut exprs);
+                                if exprs.is_empty() {
+                                    "\"\"".to_string()
+                                } else {
+                                    exprs.join(" . ")
+                                }
                             } else {
                                 // For multi-part string interpolation without -e flag, use the general string interpolation handler
                                 // multi-part string interpolation: fall through to generic handler

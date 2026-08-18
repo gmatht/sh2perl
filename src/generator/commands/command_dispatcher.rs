@@ -52,7 +52,12 @@ pub fn generate_command_impl_with_input(
             // here, so emit a complete statement — a bare expression fragment
             // is a Perl syntax error at statement position.
             let expr = generator.generate_test_expression(test_expr);
-            format!("$CHILD_ERROR = ({}) ? 0 : 1;\n", expr)
+            let mut code = format!("$CHILD_ERROR = ({}) ? 0 : 1;\n", expr);
+            // Under set -e a failing test aborts the script.
+            if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+                code.push_str("exit $CHILD_ERROR if $__set_e && $CHILD_ERROR != 0;\n");
+            }
+            code
         }
         Command::Pipeline(pipeline) => {
             //             eprintln!("DEBUG: Found Pipeline, commands: {:?}", pipeline.commands);

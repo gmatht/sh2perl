@@ -1108,8 +1108,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                     // Handle variables in string interpolation
                                                     match var.as_str() {
                                                         "#" => result.push_str("scalar(@ARGV)"),
-                                                        "@" => result.push_str("@ARGV"),
-                                                        "*" => result.push_str("@ARGV"),
+                                                        "@" | "*" => result.push_str("\u{1}POSARGS\u{1}"),
                                                         "?" => result.push_str("$CHILD_ERROR"),
                                                         "!" => result.push_str(""),
                                                         "-" => result.push_str("$ENV{SH2PERL_SHELLOPTS}"),
@@ -1166,7 +1165,15 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             .replace("\r", "\\r")
                                             .replace("$", "\\$")
                                             .replace("@", "\\@");
-                                        format!("\"{}\"", escaped)
+                                        {
+                                            let quoted = format!("\"{}\"", escaped);
+                                            let posargs = if generator.fn_nesting_depth > 0 {
+                                                "join(q{ }, @_)"
+                                            } else {
+                                                "join(q{ }, @ARGV)"
+                                            };
+                                            quoted.replace("\u{1}POSARGS\u{1}", &format!("\" . {} . \"", posargs))
+                                        }
                                     } else {
                                         generator.perl_string_literal(arg)
                                     }
@@ -1635,6 +1642,13 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                         } else {
                             output.push_str(&generator.indent());
                             output.push_str(&format!("$CHILD_ERROR = ({}) ? 0 : 1;\n", expr));
+                        }
+                        // Under set -e a failing test aborts the script.
+                        if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+                            output.push_str(&generator.indent());
+                            output.push_str(
+                                "exit $CHILD_ERROR if $__set_e && $CHILD_ERROR != 0;\n",
+                            );
                         }
                     }
                     "type" => {

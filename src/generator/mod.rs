@@ -917,7 +917,12 @@ impl Generator {
                         // pattern, not a comment.  Simple heuristic: if there is an odd
                         // number of `/` before `#` (counting from the last `s` or `m`),
                         // then `#` is inside the regex part of s/// or m//.
-                        let no_comment = if let Some(pos) = trimmed.find('#') {
+                        // Never strip from multi-line values: a `#` inside a
+                        // multi-line do{} block is an interior comment, and
+                        // cutting there truncates the whole expression.
+                        let no_comment = if trimmed.contains('\n') {
+                            trimmed.to_string()
+                        } else if let Some(pos) = trimmed.find('#') {
                             let before_hash = &trimmed[..pos];
                             let quotes_before = before_hash.chars().filter(|&c| c == '"').count();
                             // Check whether # is inside a s/// or m// operator by counting
