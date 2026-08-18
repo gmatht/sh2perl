@@ -41,6 +41,9 @@ pub mod words;
 pub struct Generator {
     pub indent_level: usize,
     pub declared_locals: HashSet<String>,
+    /// Re-entrancy flag for the unset-positional arithmetic guard in
+    /// generate_simple_command_impl (prevents infinite recursion).
+    pub arith_guard_active: bool,
     pub declared_functions: HashSet<String>,
     pub file_handle_counter: usize,
     pub extglob_enabled: bool,
@@ -129,6 +132,7 @@ impl Drop for PipelineOutputIdGuard {
 impl Generator {
     pub fn new() -> Self {
         Self {
+            arith_guard_active: false,
             indent_level: 0,
             declared_locals: HashSet::new(),
             declared_functions: HashSet::new(),
@@ -157,6 +161,7 @@ impl Generator {
 
     pub fn new_translation_mode() -> Self {
         Self {
+            arith_guard_active: false,
             indent_level: 0,
             declared_locals: HashSet::new(),
             declared_functions: HashSet::new(),
@@ -185,6 +190,7 @@ impl Generator {
 
     pub fn new_inline_mode() -> Self {
         Self {
+            arith_guard_active: false,
             indent_level: 0,
             declared_locals: HashSet::new(),
             declared_functions: HashSet::new(),

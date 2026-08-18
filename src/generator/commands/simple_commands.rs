@@ -18,6 +18,76 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
             output.push_str("$CHILD_ERROR = 0;\n");
             return output;
         }
+        // `echo $(($1 * 100 + $2))` with unset positionals: bash substitutes
+        // the empty text into the arithmetic, hits a syntax error, and skips
+        // the whole command with $? = 1.  Guard on the referenced positionals
+        // being set.  Only expressions with an operator can become invalid —
+        // a bare `$(($1))` evaluates to 0.
+        if name == "echo" && !generator.arith_guard_active {
+            let mut pos_refs: std::collections::BTreeSet<usize> = Default::default();
+            let pos_re = regex::Regex::new(r"\$(\d+)").unwrap();
+            for arg in &cmd.args {
+                if let Word::Arithmetic(expr, _) = arg {
+                    if expr.expression.contains(['+', '-', '*', '/', '%']) {
+                        for cap in pos_re.captures_iter(&expr.expression) {
+                            if let Ok(n) = cap[1].parse::<usize>() {
+                                if n >= 1 {
+                                    pos_refs.insert(n);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !pos_refs.is_empty() {
+                generator.arith_guard_active = true;
+                let inner = generate_simple_command_impl(generator, cmd);
+                generator.arith_guard_active = false;
+                let in_fn = generator.fn_nesting_depth > 0;
+                let checks: Vec<String> = pos_refs
+                    .iter()
+                    .map(|n| {
+                        if in_fn {
+                            format!("defined $_[{}]", n - 1)
+                        } else {
+                            format!("defined $ARGV[{}]", n - 1)
+                        }
+                    })
+                    .collect();
+                let mut guarded = String::new();
+                guarded.push_str(&generator.indent());
+                guarded.push_str(&format!("if ({}) {{\n", checks.join(" && ")));
+                for line in inner.lines() {
+                    guarded.push_str(&generator.indent());
+                    guarded.push_str("    ");
+                    guarded.push_str(line);
+                    guarded.push('\n');
+                }
+                guarded.push_str(&generator.indent());
+                guarded.push_str("} else {\n");
+                guarded.push_str(&generator.indent());
+                guarded.push_str(
+                    "    print {*STDERR} q{bash: syntax error: operand expected}, \"\\n\";\n",
+                );
+                guarded.push_str(&generator.indent());
+                guarded.push_str("    $CHILD_ERROR = 1;\n");
+                guarded.push_str(&generator.indent());
+                guarded.push_str("}\n");
+                return guarded;
+            }
+        }
+
+        // A stray `}` at command position is a bash syntax error: bash
+        // reports it and aborts the script (exit 2) — nothing after runs.
+        if name == "}" && cmd.args.is_empty() {
+            output.push_str(&generator.indent());
+            output.push_str(
+                "print {*STDERR} \"bash: syntax error near unexpected token `}'\\n\";\n",
+            );
+            output.push_str(&generator.indent());
+            output.push_str("exit 2;\n");
+            return output;
+        }
     }
 
     // `"$@"` (or "$*") used as the command itself: execute the positional
