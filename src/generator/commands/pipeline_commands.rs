@@ -824,13 +824,93 @@ pub fn generate_pipeline_for_substitution(
     // Use IrExpr::Capture to produce a clean `do { chomp(my $_r = qx{...}); $_r; }`
     // expression. This replaces the raw format!() with an IR node that the
     // backend formats consistently, addressing Patterns A and G.
+    // Positional parameters ($1..$9) in the reconstructed shell string can't
+    // survive: the function generator later does a textual $N → $_[N-1]
+    // replace over the whole body (mangling shell strings), and the spawned
+    // shell has no positional args anyway.  Rewrite them to env-var
+    // references with names immune to that replace, and export the values.
+    let mut final_cmd = final_cmd;
+    let mut pos_exports: Vec<usize> = Vec::new();
+    {
+        // Quote-aware scan: $N inside shell single quotes is NOT a positional
+        // parameter (e.g. awk '{print $1}').
+        let chars: Vec<char> = final_cmd.chars().collect();
+        let mut out = String::with_capacity(final_cmd.len());
+        let mut in_sq = false;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\'' {
+                in_sq = !in_sq;
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            if !in_sq && c == '$' {
+                // $N (single digit 1-9, not followed by another digit)
+                if i + 1 < chars.len()
+                    && chars[i + 1].is_ascii_digit()
+                    && chars[i + 1] != '0'
+                    && !(i + 2 < chars.len() && chars[i + 2].is_ascii_digit())
+                {
+                    let n = chars[i + 1].to_digit(10).unwrap() as usize;
+                    pos_exports.push(n);
+                    out.push_str(&format!("${{SH2PERL_ARG_{}}}", n));
+                    i += 2;
+                    continue;
+                }
+                // ${N}
+                if i + 3 < chars.len()
+                    && chars[i + 1] == '{'
+                    && chars[i + 2].is_ascii_digit()
+                    && chars[i + 2] != '0'
+                    && chars[i + 3] == '}'
+                {
+                    let n = chars[i + 2].to_digit(10).unwrap() as usize;
+                    pos_exports.push(n);
+                    out.push_str(&format!("${{SH2PERL_ARG_{}}}", n));
+                    i += 4;
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
+        }
+        final_cmd = out;
+        pos_exports.sort_unstable();
+        pos_exports.dedup();
+    }
+
     let backtick_expr = IrExpr::Capture {
-        expr: Box::new(IrExpr::RawExpr(final_cmd)),
+        expr: Box::new(IrExpr::RawExpr(final_cmd.clone())),
         native: false,
     };
     let simplified = expr_to_perl(&backtick_expr);
 
-    simplified
+    // Shell variable references that are Perl lexicals (function locals,
+    // declared vars) are invisible to the spawned shell — pass them through
+    // the environment for the duration of the capture.
+    let exports = env_exports_for_cmd(generator, &final_cmd);
+    let mut prefix = String::new();
+    for n in &pos_exports {
+        let perl_ref = if generator.fn_nesting_depth > 0 {
+            format!("$_[{}]", n - 1)
+        } else {
+            format!("$ARGV[{}]", n - 1)
+        };
+        prefix.push_str(&format!(
+            "local $ENV{{SH2PERL_ARG_{}}} = {} // q{{}}; ",
+            n, perl_ref
+        ));
+    }
+    for v in &exports {
+        prefix.push_str(&format!("local $ENV{{{v}}} = ${v} // q{{}}; ", v = v));
+    }
+    if prefix.is_empty() {
+        simplified
+    } else {
+        format!("do {{ {}{} }}", prefix, simplified)
+    }
 }
 
 /// Generate a simple pipe pipeline with print option
@@ -2247,6 +2327,87 @@ fn has_heredoc_redirect(cmd: &Command) -> bool {
 }
 
 /// Generate a buffered pipeline that processes all input at once
+/// Collect shell variable references (`$name` / `${name}`) in a reconstructed
+/// bash command string that correspond to Perl-side lexicals.  A `bash -c`
+/// subprocess can only see them through the environment, so the caller wraps
+/// the capture in `local $ENV{name} = $name;` for each returned name.
+/// Rewrite a reconstructed bash command that expands a Perl-side array
+/// (`"${name[@]}"`) so the child `bash -c` actually sees the elements.
+/// Arrays cannot travel through the environment directly, so the elements are
+/// serialized as a single shell-quoted string in $ENV{SH2PERL_ARRAY_<name>}
+/// and re-split with `set --` inside the child; the expansion itself becomes
+/// `"$@"`. Returns (rewritten command, Perl export prefix), or None when the
+/// command references no known array (or more than one, which this scheme
+/// cannot express).
+pub(crate) fn array_passthrough_for_cmd(
+    generator: &Generator,
+    cmd: &str,
+) -> Option<(String, String)> {
+    let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}").ok()?;
+    let mut names = std::collections::BTreeSet::new();
+    for cap in re.captures_iter(cmd) {
+        names.insert(cap[1].to_string());
+    }
+    if names.len() != 1 {
+        return None;
+    }
+    let name = names.into_iter().next().unwrap();
+    if !(generator.indexed_arrays.contains(&name)
+        || generator.declared_locals.contains(&name)
+        || generator.function_level_vars.contains(&name))
+    {
+        return None;
+    }
+    let quoted_at = format!("\"${{{}[@]}}\"", name);
+    let quoted_star = format!("\"${{{}[*]}}\"", name);
+    let bare_at = format!("${{{}[@]}}", name);
+    let bare_star = format!("${{{}[*]}}", name);
+    let rewritten = cmd
+        .replace(&quoted_at, "\"$@\"")
+        .replace(&quoted_star, "\"$*\"")
+        .replace(&bare_at, "$@")
+        .replace(&bare_star, "$*");
+    let env_name = format!("SH2PERL_ARRAY_{}", name);
+    let rewritten = format!("eval \"set -- ${{{}}}\"; {}", env_name, rewritten);
+    let export = format!(
+        "local $ENV{{{env}}} = join(q{{ }}, map {{ my $__x = $_; $__x =~ s/'/'\\\\''/g; \"'\" . $__x . \"'\" }} @{name}); ",
+        env = env_name,
+        name = name
+    );
+    Some((rewritten, export))
+}
+
+fn env_exports_for_cmd(generator: &Generator, cmd: &str) -> Vec<String> {
+    let mut vars = std::collections::BTreeSet::new();
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let mut j = i + 1;
+            if j < bytes.len() && bytes[j] == b'{' {
+                j += 1;
+            }
+            let start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j > start {
+                let name = &cmd[start..j];
+                if !name.chars().next().unwrap().is_ascii_digit()
+                    && (generator.declared_locals.contains(name)
+                        || generator.function_level_vars.contains(name))
+                {
+                    vars.insert(name.to_string());
+                }
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    vars.into_iter().collect()
+}
+
 fn generate_buffered_pipeline(
     generator: &mut Generator,
     pipeline: &Pipeline,
@@ -2310,6 +2471,110 @@ fn generate_buffered_pipeline(
         has_heredoc_redirect(cmd)
     });
 
+    // Pipelines whose first stage is a shell control-flow construct (e.g.
+    // `for k in "${!map[@]}"; do ...; done | sort`) cannot be reconstructed
+    // as a bash string: the construct reads Perl-side variables that a
+    // `bash -c` subprocess would never see.  Generate the construct natively
+    // with STDOUT captured into a scalar, then feed that text through the
+    // remaining (serializable) pipeline stages.
+    fn is_control_flow_head(cmd: &Command) -> bool {
+        match cmd {
+            Command::For(_)
+            | Command::While(_)
+            | Command::If(_)
+            | Command::Case(_)
+            | Command::CStyleFor(_)
+            | Command::Block(_) => true,
+            // e.g. `while read ...; done < file | head` parses as a Redirect
+            // wrapping the loop; the native generator handles the redirect.
+            Command::Redirect(rc) => is_control_flow_head(&rc.command),
+            _ => false,
+        }
+    }
+
+    if !has_output_redirect_early
+        && !has_heredoc
+        && pipeline.commands.len() >= 2
+        && is_control_flow_head(&pipeline.commands[0])
+    {
+        let rest = Pipeline {
+            commands: pipeline.commands[1..].to_vec(),
+            source_text: None,
+            stdout_used: pipeline.stdout_used,
+            stderr_used: pipeline.stderr_used,
+        };
+        let rest_cmd = generator.generate_command_string_for_system(&Command::Pipeline(rest));
+        if !rest_cmd.is_empty() && !rest_cmd.contains("Complex command not supported") {
+            let unique_id = generator.get_unique_id();
+            let head_code = generator.generate_command(&pipeline.commands[0]);
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my $output_{} = do {{\n", unique_id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    my $__head_buf_{} = q{{}};\n", unique_id));
+            output.push_str(&generator.indent());
+            output.push_str("    {\n");
+            output.push_str(&generator.indent());
+            output.push_str("        local *STDOUT;\n");
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "        open STDOUT, '>', \\$__head_buf_{} or die \"Cannot capture STDOUT: $!\\n\";\n",
+                unique_id
+            ));
+            for line in head_code.lines() {
+                output.push_str(&generator.indent());
+                output.push_str("        ");
+                output.push_str(line);
+                output.push('\n');
+            }
+            output.push_str(&generator.indent());
+            output.push_str("        close STDOUT;\n");
+            output.push_str(&generator.indent());
+            output.push_str("    }\n");
+            output.push_str(&generator.indent());
+            output.push_str("    require IPC::Open2;\n");
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "    my $__pid_{id} = IPC::Open2::open2(my $__rd_{id}, my $__wr_{id}, 'bash', '-c', {cmd});\n",
+                id = unique_id,
+                cmd = crate::ir::safe_perl_q_string(&rest_cmd)
+            ));
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "    print {{$__wr_{id}}} $__head_buf_{id};\n",
+                id = unique_id
+            ));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    close $__wr_{id};\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "    my $__out_{id} = do {{ local $/; <$__rd_{id}> }} // q{{}};\n",
+                id = unique_id
+            ));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    close $__rd_{id};\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    waitpid $__pid_{id}, 0;\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str("    $CHILD_ERROR = $? >> 8;\n");
+            if !should_print {
+                // Command-substitution semantics: strip the trailing newline.
+                output.push_str(&generator.indent());
+                output.push_str(&format!("    chomp $__out_{id};\n", id = unique_id));
+            }
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    $__out_{id};\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str("};\n");
+            if should_print {
+                output.push_str(&generator.indent());
+                output.push_str(&format!("print $output_{};\n", unique_id));
+            } else {
+                output.push_str(&format!("do {{ $output_{} }}\n", unique_id));
+            }
+            return output;
+        }
+    }
+
     // Only take the clean path when there are no output redirects and no heredocs.
     // Also skip if the pipeline has a source-text comment but no actual commands
     // (the old code handles edge cases with better fidelity).
@@ -2325,31 +2590,66 @@ fn generate_buffered_pipeline(
         if !raw_cmd.is_empty() {
             // Genuine approach: use the command string directly.
             // The evasion builtin-list and `command` prefix are gone.
-            let reconstructed_cmd = raw_cmd;
+            let mut reconstructed_cmd = raw_cmd;
+
+            // `type <fn>` on a script-defined function: the bash -c child
+            // doesn't know the script's functions, so define a stub first —
+            // bash then reports "<fn> is a function" just like the original.
+            if let Some(caps) = regex::Regex::new(r"^type\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+                .ok()
+                .and_then(|re| re.captures(&reconstructed_cmd))
+            {
+                let fn_name = caps[1].to_string();
+                if generator.declared_functions.contains(&fn_name) {
+                    reconstructed_cmd =
+                        format!("{}() {{ :; }}; {}", fn_name, reconstructed_cmd);
+                }
+            }
 
             let unique_id = generator.get_unique_id();
             let output_var = format!("output_{}", unique_id);
 
-            // Build a clean IR statement for pipeline capture.
-            let pipeline_stmt = IrStmt::Pipeline {
-                stages: vec![],  // Not used when capture is set
-                last_output: None,
-                capture: Some(output_var.clone()),
-                cmd_str: Some(reconstructed_cmd),
-            };
-            output.push_str(&stmt_to_perl(&pipeline_stmt, 0));
+            // Perl lexicals referenced by the command string must reach the
+            // bash -c subprocess through the environment.
+            let exports = env_exports_for_cmd(generator, &reconstructed_cmd);
+            let export_prefix: String = exports
+                .iter()
+                .map(|v| format!("local $ENV{{{v}}} = ${v} // q{{}}; ", v = v))
+                .collect();
 
             if should_print {
-                // For top-level pipelines, print the captured output with a trailing newline.
-                // Use `print $var, "\n";` which is idiomatic Perl and avoids the
-                // verbose `if (... ne q{} && !defined ...) { print ...; if (!... =~ m{\n\z})` dance.
-                let print_stmt = IrStmt::Output {
-                    value: IrExpr::Var(output_var.clone(), Some(Sigil::Scalar)),
-                    newline: true,
-                    target: None,
-                };
-                output.push_str(&stmt_to_perl(&print_stmt, 0));
+                // For top-level pipelines, print the captured output verbatim.
+                // bash prints exactly what the pipeline emitted; chomping and
+                // unconditionally re-adding "\n" would print a spurious blank
+                // line when the pipeline emits nothing at all.
+                let open_expr = crate::ir::cmd_str_to_open_perl_raw(&reconstructed_cmd);
+                if export_prefix.is_empty() {
+                    output.push_str(&format!("my ${} = {};\n", output_var, open_expr));
+                } else {
+                    output.push_str(&format!(
+                        "my ${} = do {{ {}{} }};\n",
+                        output_var, export_prefix, open_expr
+                    ));
+                }
+                output.push_str(&format!("print ${};\n", output_var));
             } else {
+                // Build a clean IR statement for pipeline capture (chomped,
+                // matching command-substitution semantics).
+                let pipeline_stmt = IrStmt::Pipeline {
+                    stages: vec![],  // Not used when capture is set
+                    last_output: None,
+                    capture: Some(output_var.clone()),
+                    cmd_str: Some(reconstructed_cmd.clone()),
+                };
+                if export_prefix.is_empty() {
+                    output.push_str(&stmt_to_perl(&pipeline_stmt, 0));
+                } else {
+                    let open_expr = crate::ir::cmd_str_to_open_perl(&reconstructed_cmd);
+                    output.push_str(&format!(
+                        "my ${} = do {{ {}{} }};\n",
+                        output_var, export_prefix, open_expr
+                    ));
+                }
                 // For command substitution, emit the captured variable as the last expression
                 // so the do{...} returns it.  The backend's Pipeline { capture } emits
                 // `my $var = qx{...}; chomp $var;` which are statements, not expressions,

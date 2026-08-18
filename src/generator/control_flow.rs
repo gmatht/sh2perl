@@ -234,8 +234,51 @@ pub fn generate_case_statement_impl(
                             format!("($ENV{{{}}} // q{{}})", var_name)
                         }
                     }
+                    // "${arr[idx]}" of an array the script never declares is
+                    // "" in bash; emitting the raw subscript would reference
+                    // an undeclared Perl array and fail under strict.
+                    Word::StringInterpolation(interp, _) if interp.parts.len() == 1 => {
+                        if let crate::ast::StringPart::ParameterExpansion(pe) = &interp.parts[0] {
+                            let base = pe
+                                .variable
+                                .split('[')
+                                .next()
+                                .unwrap_or(pe.variable.as_str());
+                            if pe.variable.contains('[')
+                                && !generator.indexed_arrays.contains(base)
+                                && !generator.associative_arrays.contains(base)
+                                && !generator.declared_locals.contains(base)
+                                && !generator.function_level_vars.contains(base)
+                            {
+                                "q{}".to_string()
+                            } else {
+                                word_str
+                            }
+                        } else {
+                            word_str
+                        }
+                    }
                     _ => word_str,
                 };
+
+                // A `$(...)` pattern is evaluated at match time in bash; run
+                // the substitution and compare against its output instead of
+                // the literal source text.
+                if pattern_str.starts_with("$(") && pattern_str.ends_with(')') {
+                    let inner = &pattern_str[2..pattern_str.len() - 1];
+                    if let Ok(cmds) = crate::parser::commands::parse_commands_from_text(inner)
+                    {
+                        if let Some(cmd) = cmds.into_iter().next() {
+                            let capture = generator.word_to_perl(&Word::CommandSubstitution(
+                                Box::new(cmd),
+                                None,
+                            ));
+                            pattern_conditions
+                                .push(format!("({}) eq ({})", processed_word, capture));
+                            continue;
+                        }
+                    }
+                }
 
                 // Handle positional parameters in case statements
                 // $1, $2, … are now translated to $_[0], $_[1], … by
@@ -416,9 +459,9 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 // Test expressions generate a boolean expression directly
                 // (e.g., "$line" ne q{}). Other commands generate code that
                 // sets $CHILD_ERROR.
-                if matches!(cond, Command::TestExpression(_)) {
+                if let Command::TestExpression(te) = cond {
                     generator.suppress_set_e_depth += 1;
-                    let cond_code = generator.generate_command(cond);
+                    let cond_code = generator.generate_test_expression(te);
                     generator.suppress_set_e_depth -= 1;
                     let cond_code = cond_code.trim().to_string();
                     if is_and {
@@ -511,9 +554,9 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                             let is_and = matches!(cmd, Command::And(_, _));
                             flatten_conditions(cmd, &mut conds);
                             for cond in &conds {
-                                if matches!(cond, Command::TestExpression(_)) {
+                                if let Command::TestExpression(te) = cond {
                                     generator.suppress_set_e_depth += 1;
-                                    let cond_code = generator.generate_command(cond);
+                                    let cond_code = generator.generate_test_expression(te);
                                     generator.suppress_set_e_depth -= 1;
                                     let cond_code = cond_code.trim().to_string();
                                     if is_and {
@@ -660,23 +703,40 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 // Multi-statement condition: wrap in do { ... } and check exit code
                 output.push_str(&format!("{} (do {{\n", loop_keyword));
                 generator.indent_level += 1;
-                for line in cond_raw.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        output.push_str(&generator.indent());
-                        output.push_str(trimmed);
-                        // Ensure each statement ends with ;
-                        if !trimmed.ends_with(';') {
-                            output.push(';');
-                        }
-                        output.push('\n');
+                let lines: Vec<&str> = cond_raw
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                for (idx, trimmed) in lines.iter().enumerate() {
+                    output.push_str(&generator.indent());
+                    output.push_str(trimmed);
+                    // Terminate statements with ';' — but NOT when the line is
+                    // continued (next line starts with `or`/`and`/operators) or
+                    // opens a block.
+                    let next_is_continuation = lines
+                        .get(idx + 1)
+                        .map(|n| {
+                            n.starts_with("or ")
+                                || n.starts_with("and ")
+                                || n.starts_with('.')
+                                || n.starts_with('?')
+                                || n.starts_with(':')
+                        })
+                        .unwrap_or(false);
+                    if !trimmed.ends_with(';')
+                        && !trimmed.ends_with('{')
+                        && !next_is_continuation
+                    {
+                        output.push(';');
                     }
+                    output.push('\n');
                 }
                 // The last expression in the do block must be truthy when the
-                // command succeeds (exit code 0). $main_exit_code holds the
-                // exit code from the system() call generated above; use it.
+                // condition command succeeds (exit status 0).  Generated
+                // condition code records that status in $CHILD_ERROR.
                 output.push_str(&generator.indent());
-                output.push_str("$main_exit_code == 0\n");
+                output.push_str("$CHILD_ERROR == 0\n");
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
                 output.push_str("}) {\n");
@@ -698,6 +758,11 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
             generator.indent_level -= 1;
             output.push_str(&generator.indent());
             output.push_str("}\n");
+            // bash: the while command's exit status is that of the last body
+            // command (or 0 if none ran) — the final failing condition test
+            // must not leak into $?.
+            output.push_str(&generator.indent());
+            output.push_str("$CHILD_ERROR = 0;\n");
         }
     }
 
@@ -1101,6 +1166,22 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                         .map(|item| format!("\"{}\"", item))
                         .collect();
                     all_items.extend(items);
+                } else if word
+                    .as_literal()
+                    .map(|_| {
+                        matches!(word, Word::Literal(_, None))
+                            && (s.contains('*') || s.contains('?'))
+                            && !s.contains(' ')
+                    })
+                    .unwrap_or(false)
+                {
+                    // Bare glob item (for f in /dev/pts/*): expand at runtime,
+                    // falling back to the literal pattern when nothing matches
+                    // (bash keeps the unexpanded word).
+                    all_items.push(format!(
+                        "do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}",
+                        s, s
+                    ));
                 } else {
                     all_items.push(generator.word_to_perl(word));
                 }
@@ -1729,7 +1810,14 @@ fn generate_combined_test_condition(generator: &mut Generator, cmd: &Command) ->
                     .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                     .trim_end_matches(';')
                     .to_string();
-                format!("!do {{ local $CHILD_ERROR; {} }}", c)
+                // Success = exit status 0.  Test $CHILD_ERROR explicitly
+                // inside the local scope — negating the do-block's last
+                // expression is unreliable (for redirect-wrapped commands the
+                // last expression is a close() result, not the exit code).
+                format!(
+                    "do {{ local $CHILD_ERROR = 0; {}; $CHILD_ERROR == 0 }}",
+                    c
+                )
             }
         }
     }
@@ -1756,7 +1844,18 @@ fn flatten_conditions(cmd: &Command, conds: &mut Vec<Command>) {
 pub fn collect_assigned_vars(cmd: &Command, vars: &mut std::collections::HashSet<String>) {
     match cmd {
         Command::Assignment(assignment) => {
-            vars.insert(assignment.variable.clone());
+            // Subscripted names (arr[0]=..., map[key]=...) are ELEMENT
+            // assignments — hoisting would emit invalid `my $arr[0];`.
+            // The container is declared by its own declaration statement.
+            if !assignment.variable.contains('[') {
+                if matches!(assignment.value, Word::Array(_, _, _)) {
+                    // arr=(...) / arr+=(...) needs an array declaration;
+                    // the "@" prefix tells hoist_my_declarations the sigil.
+                    vars.insert(format!("@{}", assignment.variable));
+                } else {
+                    vars.insert(assignment.variable.clone());
+                }
+            }
         }
         Command::Block(block) => {
             for c in &block.commands {
@@ -1820,8 +1919,14 @@ pub fn collect_assigned_vars(cmd: &Command, vars: &mut std::collections::HashSet
 /// Perl::Critic's `ProhibitConditionalDeclarations` policy.
 pub fn hoist_my_declarations(generator: &mut Generator, vars: &std::collections::HashSet<String>, output: &mut String) {
     for var in vars {
-        if !generator.declared_locals.contains(var)
-            && !generator.function_level_vars.contains(var)
+        // A "@" prefix from collect_assigned_vars marks an array assignment
+        // (arr=(...)), which must be declared with the array sigil.
+        let (sigil, name) = match var.strip_prefix('@') {
+            Some(stripped) => ('@', stripped),
+            None => ('$', var.as_str()),
+        };
+        if !generator.declared_locals.contains(name)
+            && !generator.function_level_vars.contains(name)
         {
             // Ensure there's a newline before the declaration if the output
             // doesn't end with one (avoids joining with a previous closing brace).
@@ -1829,8 +1934,11 @@ pub fn hoist_my_declarations(generator: &mut Generator, vars: &std::collections:
                 output.push('\n');
             }
             output.push_str(&generator.indent());
-            output.push_str(&format!("my ${};\n", var));
-            generator.declared_locals.insert(var.clone());
+            output.push_str(&format!("my {}{};\n", sigil, name));
+            generator.declared_locals.insert(name.to_string());
+            if sigil == '@' {
+                generator.indexed_arrays.insert(name.to_string());
+            }
         }
     }
 }

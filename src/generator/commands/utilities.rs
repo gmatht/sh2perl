@@ -14,7 +14,11 @@ pub fn escape_perl_string(s: &str) -> String {
                 // Escape non-ASCII characters as \x{...} so that the generated
                 // Perl source remains pure ASCII and PPI does not choke on
                 // multi-byte UTF-8 sequences.
-                result.push_str(&format!("\\x{{{:04X}}}", ch as u32));
+                if (0xF880..=0xF8FF).contains(&(ch as u32)) {
+                    result.push_str(&format!("\\x{{{:02X}}}", ch as u32 - 0xF800));
+                } else {
+                    result.push_str(&ch.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>());
+                }
             }
         }
     }

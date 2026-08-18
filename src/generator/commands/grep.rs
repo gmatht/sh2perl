@@ -16,7 +16,7 @@ pub fn generate_grep_command(
     let mut line_numbers = false;
     let mut ignore_case = false;
     let mut invert_match = false;
-    let mut _word_match = false;
+    let mut word_match = false;
     let mut only_matching = false;
     let mut quiet_mode = false;
     let mut max_count = None;
@@ -146,7 +146,7 @@ pub fn generate_grep_command(
                     invert_match = true;
                 }
                 if s.contains('w') {
-                    _word_match = true;
+                    word_match = true;
                 }
                 if s.contains('o') {
                     only_matching = true;
@@ -300,6 +300,8 @@ pub fn generate_grep_command(
         // File-based grep - read from files
         output.push_str(&format!("my @grep_lines_{} = ();\n", command_index));
         output.push_str(&format!("my @grep_filenames_{} = ();\n", command_index));
+        // Tracks unreadable file arguments: bash's grep exits 2 in that case.
+        output.push_str(&format!("my $grep_file_error_{} = 0;\n", command_index));
 
         if recursive {
             // Recursive search
@@ -471,8 +473,8 @@ pub fn generate_grep_command(
                     output.push_str("        or croak \"Close failed: $OS_ERROR\";\n");
                     output.push_str("}\n");
                     output.push_str(&format!(
-                        "else {{ print {{*STDERR}} \"grep: {}: No such file or directory\\n\"; }}\n",
-                        file
+                        "else {{ print {{*STDERR}} \"grep: {}: No such file or directory\\n\"; $grep_file_error_{} = 1; }}\n",
+                        file, command_index
                     ));
                 }
             }
@@ -670,6 +672,14 @@ pub fn generate_grep_command(
         // Convert \. to . (shell extended regex to Perl) - but keep \. for literal dot
         // Actually, \. in shell regex means literal dot, so we should keep it as \. in Perl
         // No conversion needed for \.
+
+        // -w: match only whole words (GNU grep semantics: the match may not
+        // be adjacent to word-constituent characters).  Lookarounds rather
+        // than \b — patterns whose edges are non-word chars (e.g. "#foo")
+        // would never match with \b anchors.
+        if word_match {
+            regex_pattern = format!("(?<!\\w)(?:{})(?!\\w)", regex_pattern);
+        }
 
         // Apply grep filtering
         if invert_match {
@@ -989,12 +999,13 @@ pub fn generate_grep_command(
             ));
         }
         if should_print && !quiet_mode {
-            output.push_str(&format!("print $grep_result_{};\n", command_index));
-            if null_terminated {
-                output.push_str("print \"\\0\";\n");
-            } else {
-                output.push_str("print \"\\n\";\n");
-            }
+            // bash's grep -l/-L prints nothing at all when no filenames
+            // qualify; guard so we don't emit a bare terminator.
+            let term = if null_terminated { "\\0" } else { "\\n" };
+            output.push_str(&format!(
+                "if ($grep_result_{} ne q{{}}) {{ print $grep_result_{}; print \"{}\"; }}\n",
+                command_index, command_index, term
+            ));
         }
     } else if files_without_match {
         // Handle -L flag: only show filenames that do NOT contain matches
@@ -1070,12 +1081,13 @@ pub fn generate_grep_command(
             ));
         }
         if should_print && !quiet_mode {
-            output.push_str(&format!("print $grep_result_{};\n", command_index));
-            if null_terminated {
-                output.push_str("print \"\\0\";\n");
-            } else {
-                output.push_str("print \"\\n\";\n");
-            }
+            // bash's grep -l/-L prints nothing at all when no filenames
+            // qualify; guard so we don't emit a bare terminator.
+            let term = if null_terminated { "\\0" } else { "\\n" };
+            output.push_str(&format!(
+                "if ($grep_result_{} ne q{{}}) {{ print $grep_result_{}; print \"{}\"; }}\n",
+                command_index, command_index, term
+            ));
         }
     } else {
         // Default case: output matching lines with various formatting options
@@ -1211,12 +1223,19 @@ pub fn generate_grep_command(
 
     // Set exit status for all grep commands
     // For quiet mode, set exit code based on whether matches were found
-    let exit_condition = if files_without_match {
-        format!("$grep_result_{} ne q{{}}", command_index)
+    // Note: even for -L (files_without_match) GNU grep's exit status
+    // reflects whether any *lines* matched, not whether files were listed:
+    // `grep -L pat file` prints the file yet exits 1 when pat is absent.
+    let exit_condition = format!("scalar @grep_filtered_{} > 0", command_index);
+    if has_file_args {
+        // bash's grep exits 2 when a named file could not be read.
+        output.push_str(&format!(
+            "$CHILD_ERROR = $grep_file_error_{} ? 2 : ({} ? 0 : 1);\n",
+            command_index, exit_condition
+        ));
     } else {
-        format!("scalar @grep_filtered_{} > 0", command_index)
-    };
-    output.push_str(&format!("$CHILD_ERROR = {} ? 0 : 1;\n", exit_condition));
+        output.push_str(&format!("$CHILD_ERROR = {} ? 0 : 1;\n", exit_condition));
+    }
 
     if quiet_mode {
         output.push_str(&format!("$grep_result_{} = q{{}};\n", command_index));

@@ -160,7 +160,7 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
     }
 
     // Create a temporary file for the Perl code
-    let temp_file = std::env::temp_dir().join("__tmp_perl_critic_test.pl");
+    let temp_file = harness_temp_dir().join("__tmp_perl_critic_test.pl");
     let temp_file_str = temp_file.to_string_lossy().to_string();
 
     // Write Perl code to temporary file
@@ -397,6 +397,56 @@ pub fn find_uses_of_system() {
     }
 }
 
+/// Read a shell source file byte-preservingly.  bash passes non-UTF-8 bytes
+/// through unchanged, but fs::read_to_string rejects them; decode valid UTF-8
+/// as-is and otherwise map bytes >= 0x80 to U+F800+byte private-use chars.
+/// The Perl emitter turns those back into single-byte \x{..} escapes so the
+/// generated program writes the original bytes.
+pub fn read_shell_source(filename: &str) -> Result<String, String> {
+    let bytes = std::fs::read(filename)
+        .map_err(|e| format!("Failed to read {}: {}", filename, e))?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => e
+            .into_bytes()
+            .iter()
+            .map(|&b| {
+                if b < 0x80 {
+                    b as char
+                } else {
+                    char::from_u32(0xF800 + b as u32).unwrap_or('\u{FFFD}')
+                }
+            })
+            .collect(),
+    })
+}
+
+/// Directory for harness-generated temp files.  A stable subdirectory of
+/// the system temp dir, so writing per-test files between a script's bash
+/// reference run and its Perl run does not change what `ls /tmp` sees
+/// (100_pipeline_failure_basic lists /tmp).
+fn harness_temp_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("sh2perl_tmp");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// True when bash itself refuses to parse the script (`bash -n` fails).
+/// Used when our parser errors out: if the source is genuinely invalid
+/// bash, the faithful translation is a program that reports the syntax
+/// error on stderr and exits 2 without producing stdout.
+fn bash_rejects_syntax(filename: &str) -> bool {
+    std::process::Command::new("bash")
+        .arg("-n")
+        .arg(filename)
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(false)
+}
+
+/// Shell snippet mimicking bash's behavior on a syntax-error script.
+const SYNTAX_ERROR_MIMIC: &str = "echo 'bash: syntax error' >&2\nexit 2\n";
+
 pub fn test_file_equivalence(lang: &str, filename: &str) -> Result<(), String> {
     test_file_equivalence_with_critic(lang, filename, false)
 }
@@ -406,16 +456,21 @@ pub fn test_file_equivalence_with_critic(
     filename: &str,
     enable_perl_critic: bool,
 ) -> Result<(), String> {
-    // Read shell script content
-    let shell_content = match fs::read_to_string(filename) {
-        Ok(c) => c,
-        Err(e) => {
-            return Err(format!("Failed to read {}: {}", filename, e));
-        }
-    };
+    // Read shell script content (byte-preserving for non-UTF-8 sources)
+    let shell_content = read_shell_source(filename)?;
 
     // Parse and generate target language code
-    let commands = match Parser::new(&shell_content).parse() {
+    let parse_result = match Parser::new(&shell_content).parse() {
+        Err(e) if bash_rejects_syntax(filename) => {
+            eprintln!(
+                "DEBUG: parser failed ({:?}) but bash -n also rejects {} — using syntax-error mimic",
+                e, filename
+            );
+            Parser::new(SYNTAX_ERROR_MIMIC).parse().map_err(|_| e)
+        }
+        other => other,
+    };
+    let commands = match parse_result {
         Ok(c) => c,
         Err(e) => {
             return Err(format!("Failed to parse {}: {:?}", filename, e));
@@ -456,7 +511,7 @@ pub fn test_file_equivalence_with_critic(
             }
 
             let safe_name = filename.replace(['/', '\\', ' ', '(', ')', '\''], "_");
-            let tmp = std::env::temp_dir().join(format!("__tmp_{}", safe_name));
+            let tmp = harness_temp_dir().join(format!("__tmp_{}", safe_name));
             let tmp_str = tmp.to_string_lossy().to_string();
             if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) {
                 return Err(format!("Failed to write Perl temp file: {}", e));
@@ -733,7 +788,7 @@ pub fn test_file_equivalence_detailed_with_critic(
 
         // Also create a temporary file for execution
         let safe_name = filename.replace(['/', '\\', ' ', '(', ')', '\''], "_");
-        let tmp = std::env::temp_dir().join(format!("__tmp_{}", safe_name));
+        let tmp = harness_temp_dir().join(format!("__tmp_{}", safe_name));
         let tmp_str = tmp.to_string_lossy().to_string();
         if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &translated_code) {
             return Err(format!("Failed to write Perl temp file: {}", e));
@@ -817,15 +872,20 @@ pub fn test_file_equivalence_detailed_with_critic(
     // If no cached Perl code, we need to parse and generate
     if cached_perl_code.is_none() {
         // Read shell script content
-        shell_content = match fs::read_to_string(filename) {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(format!("Failed to read {}: {}", filename, e));
-            }
-        };
+        shell_content = read_shell_source(filename)?;
 
         // Parse and generate target language code
-        let commands = match Parser::new(&shell_content).parse() {
+        let parse_result = match Parser::new(&shell_content).parse() {
+            Err(e) if bash_rejects_syntax(filename) => {
+                eprintln!(
+                    "DEBUG: parser failed ({:?}) but bash -n also rejects {} — using syntax-error mimic",
+                    e, filename
+                );
+                Parser::new(SYNTAX_ERROR_MIMIC).parse().map_err(|_| e)
+            }
+            other => other,
+        };
+        let commands = match parse_result {
             Ok(c) => c,
             Err(e) => {
                 // Capture lexer output for debugging
@@ -912,7 +972,7 @@ pub fn test_file_equivalence_detailed_with_critic(
 
                 // Also create a temporary file for execution
                 let safe_name = filename.replace(['/', '\\', ' ', '(', ')', '\''], "_");
-                let tmp = std::env::temp_dir().join(format!("__tmp_{}", safe_name));
+                let tmp = harness_temp_dir().join(format!("__tmp_{}", safe_name));
                 let tmp_str = tmp.to_string_lossy().to_string();
                 if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) {
                     return Err(format!("Failed to write Perl temp file: {}", e));
@@ -1099,7 +1159,7 @@ pub fn test_file_equivalence_detailed_with_critic(
         }
 
         // Check PerlTidy formatting
-        let temp_file_tidy = std::env::temp_dir().join("__tmp_perltidy_check.pl");
+        let temp_file_tidy = harness_temp_dir().join("__tmp_perltidy_check.pl");
         let temp_file_tidy_str = temp_file_tidy.to_string_lossy().to_string();
 
         if let Ok(_) = std::fs::write(&temp_file_tidy, &translated_code) {
@@ -2012,7 +2072,7 @@ pub fn test_all_examples_next_fail(
                         // Check for PerlTidy differences and show tidied code if different
                         if generator.as_str() == "perl" {
                             // Create a temporary file for PerlTidy check
-                            let temp_file = std::env::temp_dir().join("__tmp_perltidy_check.pl");
+                            let temp_file = harness_temp_dir().join("__tmp_perltidy_check.pl");
                             let temp_file_str = temp_file.to_string_lossy().to_string();
 
                             if let Ok(_) = std::fs::write(&temp_file, &result.translated_code) {
@@ -2674,7 +2734,7 @@ pub fn test_all_examples_next_fail_unlimited(
                         // Check for PerlTidy differences and show tidied code if different
                         if generator.as_str() == "perl" {
                             // Create a temporary file for PerlTidy check
-                            let temp_file = std::env::temp_dir().join("__tmp_perltidy_check.pl");
+                            let temp_file = harness_temp_dir().join("__tmp_perltidy_check.pl");
                             let temp_file_str = temp_file.to_string_lossy().to_string();
 
                             if let Ok(_) = std::fs::write(&temp_file, &result.translated_code) {

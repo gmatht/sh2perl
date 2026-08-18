@@ -45,7 +45,20 @@ pub fn generate_command_impl_with_input(
             result
         }
         Command::ShoptCommand(cmd) => generator.generate_shopt_command(cmd),
-        Command::TestExpression(test_expr) => generator.generate_test_expression(test_expr),
+        Command::TestExpression(test_expr) => {
+            // A standalone `[ ... ]` / `test ...` command: evaluate the
+            // expression for its exit status.  Condition contexts (if/while/
+            // &&/||) handle TestExpression themselves and never come through
+            // here, so emit a complete statement — a bare expression fragment
+            // is a Perl syntax error at statement position.
+            let expr = generator.generate_test_expression(test_expr);
+            let mut code = format!("$CHILD_ERROR = ({}) ? 0 : 1;\n", expr);
+            // Under set -e a failing test aborts the script.
+            if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+                code.push_str("exit $CHILD_ERROR if $__set_e && $CHILD_ERROR != 0;\n");
+            }
+            code
+        }
         Command::Pipeline(pipeline) => {
             //             eprintln!("DEBUG: Found Pipeline, commands: {:?}", pipeline.commands);
             // This is now a pure pipe pipeline since logical operators are handled separately
@@ -949,6 +962,13 @@ pub fn generate_command_impl_with_input(
                             result.push_str(&format!("$ENV{{DIFF_TEMP_FILE1}} = {};\n", file1.1));
                             result.push_str(&generator.indent());
                             result.push_str(&format!("$ENV{{DIFF_TEMP_FILE2}} = {};\n", file2.1));
+                            // The reconstructed command may reference the temp
+                            // files as "$<varname>" under bash -c; export them
+                            // under those names too.
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("$ENV{{{}}} = {};\n", file1.0, file1.1));
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("$ENV{{{}}} = {};\n", file2.0, file2.1));
 
                             // Generate the actual diff command
                             let mut modified_diff_cmd = cmd.clone();
@@ -988,6 +1008,10 @@ pub fn generate_command_impl_with_input(
 
                             if stderr_scope_opened {
                                 stderr_scope_opened = false;
+                                result.push_str(&generator.indent());
+                                result.push_str("open STDERR, '>&', $__stderr_save or die \"Cannot restore STDERR: $OS_ERROR\\n\";\n");
+                                result.push_str(&generator.indent());
+                                result.push_str("close $__stderr_save;\n");
                                 generator.indent_level -= 1;
                                 result.push_str(&generator.indent());
                                 result.push_str("};
@@ -1090,6 +1114,8 @@ pub fn generate_command_impl_with_input(
                                 if let Some(redirect) = all_redirects.iter().find(|r| {
                                     matches!(r.operator, RedirectOperator::Output)
                                 }) {
+                                    let target_is_literal =
+                                        matches!(&redirect.target, Word::Literal(_, _));
                                     let target_str = match &redirect.target {
                                         Word::Literal(s, _) => s.clone(),
                                         _ => generator.word_to_perl(&redirect.target),
@@ -1098,24 +1124,40 @@ pub fn generate_command_impl_with_input(
                                         .filter_map(|a| is_simple_literal_arg(a))
                                         .collect::<Vec<_>>()
                                         .join(" ");
-                                    let target_lit = generator.perl_string_literal(
-                                        &Word::literal(target_str.clone()),
-                                    );
+                                    // Convert the target word ONCE — re-quoting
+                                    // an already-converted Perl expression turns
+                                    // "$tmpf" into a literal filename.
+                                    let target_lit =
+                                        generator.perl_string_literal(&redirect.target);
+                                    let die_desc = if target_is_literal {
+                                        target_str.clone()
+                                    } else {
+                                        "Cannot write file".to_string()
+                                    };
                                     let expr = IrExpr::Str(content, StrStyle::DoubleQuoted);
                                     let output_stmt = IrStmt::Output {
                                         value: expr,
                                         newline: true,
                                         target: Some("fh".to_string()),
                                     };
+                                    // Scope $fh in a block: several of these
+                                    // fast-path writes can land in the same
+                                    // enclosing scope, and repeated `my $fh`
+                                    // triggers "masks earlier declaration"
+                                    // warnings on stderr.
+                                    result.push_str(&generator.indent());
+                                    result.push_str("{\n");
                                     result.push_str(&generator.indent());
                                     result.push_str(&format!(
                                         "open my $fh, '>', {} or die \"{}: $!\\n\";\n",
                                         target_lit,
-                                        target_str
+                                        die_desc.replace('\\', "").replace('"', "")
                                     ));
                                     result.push_str(&stmt_to_perl(&output_stmt, generator.indent_level));
                                     result.push_str(&generator.indent());
                                     result.push_str("close $fh;\n");
+                                    result.push_str(&generator.indent());
+                                    result.push_str("}\n");
                                     // Skip the rest of the redirect handler
                                     return result;
                                 }
@@ -1154,7 +1196,10 @@ pub fn generate_command_impl_with_input(
                     };
                     result.push_str(&generator.indent());
                     result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
-                    result.push_str("      or die \"Cannot access file: $OS_ERROR\\n\";\n");
+                    result.push_str(&format!(
+                        "      or do {{ print {{*STDERR}} 'bash: ' . {} . \": $OS_ERROR\\n\"; $CHILD_ERROR = 1; open STDOUT, '>', '/dev/null'; }};\n",
+                        target
+                    ));
                 } else {
                     result.push_str(&generator.indent());
                     result.push_str("open STDOUT, '>', 'temp_file.txt'\n");
@@ -1362,6 +1407,9 @@ pub fn generate_command_impl_with_input(
                                 || t.starts_with("print(")
                                 || t.starts_with("printf ")
                                 || t.starts_with("printf(")
+                                // system() children write to the (redirected)
+                                // STDOUT themselves.
+                                || t.contains("system(")
                             {
                                 return true;
                             }
@@ -1379,6 +1427,14 @@ pub fn generate_command_impl_with_input(
                         generator.indent_level -= 1;
                         result.push_str(&generator.indent());
                         result.push_str("};\n");
+                        // Builtins assemble their result with join "\n" (no
+                        // trailing newline), but the real commands write
+                        // complete lines; without this the redirected file's
+                        // last line has no "\n" and `wc -l` undercounts.
+                        result.push_str(&generator.indent());
+                        result.push_str(
+                            "if ($tmp ne q{} && $tmp !~ m{\\n\\z}) { $tmp .= \"\\n\"; }\n",
+                        );
                         result.push_str(&generator.indent());
                         result.push_str("print $tmp;\n");
 
@@ -1426,6 +1482,12 @@ pub fn generate_command_impl_with_input(
             }
 
             if has_output_redirect {
+                if has_stderr_redirect {
+                    result.push_str(&generator.indent());
+                    result.push_str("open STDERR, '>&', $__stderr_save or die \"Cannot restore STDERR: $OS_ERROR\\n\";\n");
+                    result.push_str(&generator.indent());
+                    result.push_str("close $__stderr_save;\n");
+                }
                 result.push_str(&generator.indent());
                 result.push_str("open STDOUT, '>&', $original_stdout\n");
                 result.push_str("      or die \"Cannot restore STDOUT: $OS_ERROR\\n\";\n");
@@ -1437,6 +1499,10 @@ pub fn generate_command_impl_with_input(
                 result.push_str("};\n");
             }
                         if stderr_scope_opened {
+                result.push_str(&generator.indent());
+                result.push_str("open STDERR, '>&', $__stderr_save or die \"Cannot restore STDERR: $OS_ERROR\\n\";\n");
+                result.push_str(&generator.indent());
+                result.push_str("close $__stderr_save;\n");
                 generator.indent_level -= 1;
                 result.push_str(&generator.indent());
                 result.push_str("};

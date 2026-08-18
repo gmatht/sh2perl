@@ -79,7 +79,10 @@ pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String 
                     &Word::CommandSubstitution(Box::new(cmd), None),
                 );
                 if !result.contains("qx{") && !result.is_empty() {
-                    return result;
+                    // Unquoted command substitution in an array assignment is
+                    // word-split on IFS (whitespace) by bash; `split ' '` also
+                    // yields an empty list for empty output instead of ("").
+                    return format!("split(' ', {})", result);
                 }
             }
         }
@@ -98,7 +101,10 @@ pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String 
                     &Word::CommandSubstitution(Box::new(cmd), None),
                 );
                 if !result.contains("qx{") && !result.is_empty() {
-                    return result;
+                    // Unquoted command substitution in an array assignment is
+                    // word-split on IFS (whitespace) by bash; `split ' '` also
+                    // yields an empty list for empty output instead of ("").
+                    return format!("split(' ', {})", result);
                 }
             }
         }
@@ -187,11 +193,18 @@ fn try_extract_sort_herestring_var(inner: &str) -> Option<&str> {
 
 pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s, _) => {
+        Word::Literal(s, quoted) => {
             // Apply bash quote removal: in unquoted words, \X → X
             // (backslash is removed, the following character is kept literally).
-            // This matches how the shell processes unquoted words.
-            let s = apply_shell_quote_removal(s);
+            // This matches how the shell processes unquoted words.  Inside
+            // single quotes backslashes are VERBATIM — except the \' the
+            // parser leaves behind when merging the '\'' embedded-quote
+            // idiom, which does denote a literal quote.
+            let s = if quoted.is_some() {
+                s.replace("\\'", "'")
+            } else {
+                apply_shell_quote_removal(s)
+            };
             
             let has_standalone_system = {
                 let mut found = false;
@@ -240,7 +253,10 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                         '@' => "\\@".to_string(),
                         '$' => "\\$".to_string(),
                         _ if c.is_ascii() => c.to_string(),
-                        _ => format!("\\x{{{:04X}}}", c as u32),
+                        // U+F880..F8FF marks a raw non-UTF-8 source byte
+                        // (see cli read fallback): emit it as that single byte.
+                        _ if (0xF880..=0xF8FF).contains(&(c as u32)) => format!("\\x{{{:02X}}}", c as u32 - 0xF800),
+                        _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
                     }
                 }).collect::<Vec<_>>().join("");
                 format!("\"{}\"", escaped)
@@ -301,7 +317,10 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 '{' => "\\{".to_string(),
                                 '}' => "\\}".to_string(),
                                 _ if c.is_ascii() => c.to_string(),
-                                _ => format!("\\x{{{:04X}}}", c as u32),
+                                // U+F880..F8FF marks a raw non-UTF-8 source byte
+                        // (see cli read fallback): emit it as that single byte.
+                        _ if (0xF880..=0xF8FF).contains(&(c as u32)) => format!("\\x{{{:02X}}}", c as u32 - 0xF800),
+                        _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
                             }
                         }).collect::<Vec<_>>().join("");
                         format!("q{{{}}}", escaped_q)
@@ -318,7 +337,10 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 '@' => "\\@".to_string(),
                                 '$' => "\\$".to_string(),
                                 _ if c.is_ascii() => c.to_string(),
-                                _ => format!("\\x{{{:04X}}}", c as u32),
+                                // U+F880..F8FF marks a raw non-UTF-8 source byte
+                        // (see cli read fallback): emit it as that single byte.
+                        _ if (0xF880..=0xF8FF).contains(&(c as u32)) => format!("\\x{{{:02X}}}", c as u32 - 0xF800),
+                        _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
                             }
                         }).collect::<Vec<_>>().join("");
                         format!("\"{}\"", escaped)
@@ -338,7 +360,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 "$" => "$$".to_string(),       // $$ -> $$ (process ID)
                 "?" => "($? == -1 ? 0 : $? >> 8)".to_string(), // $? -> exit code
                 "!" => "''".to_string(), // $! -> empty (last background PID, not tracked)
-                "-" => "''".to_string(), // $- -> empty (shell options not tracked)
+                "-" => "$ENV{SH2PERL_SHELLOPTS}".to_string(), // $- (see prelude)
                 "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
                 _ => format!("${}", var),           // Regular variables
             }

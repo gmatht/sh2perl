@@ -114,6 +114,38 @@ pub fn generate_printf_command(
         // No format string provided, return error
         output.push_str("carp \"printf: no format string specified\";\n");
         output.push_str("exit 1;\n");
+    } else if decoded_format.contains("%q") {
+        // %q (bash: shell-quote the argument) does not exist in Perl's
+        // printf.  Replace with %s and quote each argument at runtime,
+        // approximating bash: $'...' for control chars, '...' for other
+        // specials, verbatim otherwise.
+        let fmt2 = decoded_format.replace("%q", "%s");
+        let fmt_lit = generator.perl_string_literal(&Word::literal(fmt2));
+        const Q_TMPL: &str = r#"(do { my $__qv = __ARG__ // q{}; if ($__qv eq q{}) { q{''} } elsif ($__qv =~ /[\x00-\x1f\x7f]/) { (my $__qe = $__qv) =~ s/\\/\\\\/g; $__qe =~ s/'/\\'/g; $__qe =~ s/\n/\\n/g; $__qe =~ s/\t/\\t/g; $__qe =~ s/\r/\\r/g; q{$'} . $__qe . q{'} } elsif ($__qv =~ m{[^\w@%+=:,./-]}) { (my $__qe = $__qv) =~ s/'/'\\''/g; q{'} . $__qe . q{'} } else { $__qv } })"#;
+        let mapped: Vec<String> = args
+            .iter()
+            .map(|a| Q_TMPL.replace("__ARG__", a))
+            .collect();
+        let call_args = if mapped.is_empty() {
+            fmt_lit.clone()
+        } else {
+            format!("{}, {}", fmt_lit, mapped.join(", "))
+        };
+        if let Some(var) = output_var {
+            output.push_str(&format!("my ${};\n", var));
+            output.push_str("{\n");
+            output.push_str("    local *STDOUT;\n");
+            output.push_str(&format!(
+                "    open STDOUT, '>', \\${} or die \"Cannot redirect STDOUT\";\n",
+                var
+            ));
+            output.push_str(&format!("    printf({});\n", call_args));
+            output.push_str("}\n");
+        } else if is_expression {
+            output.push_str(&format!("sprintf({})", call_args));
+        } else {
+            output.push_str(&format!("printf({});\n", call_args));
+        }
     } else {
         // Handle special case for array expansion like "${lines[@]}" or @"lines"
         if args.len() == 1

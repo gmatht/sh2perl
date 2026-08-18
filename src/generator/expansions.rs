@@ -359,6 +359,36 @@ pub fn generate_parameter_expansion_impl(
                     } else {
                         "scalar(@ARGV)".to_string()
                     }
+                } else if let Some(base) = pe
+                    .variable
+                    .strip_suffix("[@]")
+                    .or_else(|| pe.variable.strip_suffix("[*]"))
+                {
+                    // ${arr[@]:offset:length} — slice of an array's elements,
+                    // joined with spaces in scalar/string context.
+                    // An array not (yet) declared expands to nothing — and
+                    // referencing @name would be a strict-mode compile error.
+                    if !generator.indexed_arrays.contains(base)
+                        && !generator.associative_arrays.contains(base)
+                        && !generator.declared_locals.contains(base)
+                    {
+                        return "q{}".to_string();
+                    }
+                    let start = offset.trim();
+                    if let Some(length_str) = length {
+                        format!(
+                            "join(q{{ }}, grep {{ defined }} @{}[({})..(({})+({})-1)])",
+                            base,
+                            start,
+                            start,
+                            length_str.trim()
+                        )
+                    } else {
+                        format!(
+                            "join(q{{ }}, grep {{ defined }} @{}[({})..$#{}])",
+                            base, start, base
+                        )
+                    }
                 } else {
                     // Check if the variable is a scalar (not an array).
                     // If scalar, use substr(); otherwise use array slice.

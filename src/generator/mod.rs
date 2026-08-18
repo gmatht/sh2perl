@@ -41,6 +41,9 @@ pub mod words;
 pub struct Generator {
     pub indent_level: usize,
     pub declared_locals: HashSet<String>,
+    /// Re-entrancy flag for the unset-positional arithmetic guard in
+    /// generate_simple_command_impl (prevents infinite recursion).
+    pub arith_guard_active: bool,
     pub declared_functions: HashSet<String>,
     pub file_handle_counter: usize,
     pub extglob_enabled: bool,
@@ -129,6 +132,7 @@ impl Drop for PipelineOutputIdGuard {
 impl Generator {
     pub fn new() -> Self {
         Self {
+            arith_guard_active: false,
             indent_level: 0,
             declared_locals: HashSet::new(),
             declared_functions: HashSet::new(),
@@ -157,6 +161,7 @@ impl Generator {
 
     pub fn new_translation_mode() -> Self {
         Self {
+            arith_guard_active: false,
             indent_level: 0,
             declared_locals: HashSet::new(),
             declared_functions: HashSet::new(),
@@ -185,6 +190,7 @@ impl Generator {
 
     pub fn new_inline_mode() -> Self {
         Self {
+            arith_guard_active: false,
             indent_level: 0,
             declared_locals: HashSet::new(),
             declared_functions: HashSet::new(),
@@ -545,6 +551,56 @@ impl Generator {
             output.push('\n');
         }
 
+        // $$ (PID): interpolations reference a plain scalar $__pid.
+        if output.contains("$__pid") {
+            let init = "my $__pid = $$;\n";
+            let anchor = "our $CHILD_ERROR = 0;\n";
+            if let Some(pos) = output.find(anchor) {
+                output.insert_str(pos + anchor.len(), init);
+            } else {
+                output.insert_str(0, init);
+            }
+        }
+
+        // $$ inside reconstructed bash -c strings: every child would see its
+        // own fresh PID, but the source script's $$ names the single main
+        // process. Export the Perl PID so all children resolve consistently.
+        if output.contains("${SH2PERL_PPID}") {
+            let init = "$ENV{SH2PERL_PPID} = $$;\n";
+            let anchor = "our $CHILD_ERROR = 0;\n";
+            if let Some(pos) = output.find(anchor) {
+                output.insert_str(pos + anchor.len(), init);
+            } else {
+                output.insert_str(0, init);
+            }
+        }
+
+        // $- (shell option flags): populate once from a real bash, stripping
+        // the 'c' flag that bash -c itself adds.
+        if output.contains("$ENV{SH2PERL_SHELLOPTS}") {
+            let init = "$ENV{SH2PERL_SHELLOPTS} //= do { open(my $__fh, '-|', 'bash', '-c', 'printf %s \"$-\"') or die \"cmd failed: $!\\n\"; my $_o = do { local $/; <$__fh> } // q{}; close $__fh; $_o =~ s/c//; $_o; };\n";
+            let anchor = "our $CHILD_ERROR = 0;\n";
+            if let Some(pos) = output.find(anchor) {
+                output.insert_str(pos + anchor.len(), init);
+            } else {
+                output.insert_str(0, init);
+            }
+        }
+
+        // Scripts probing the running shell via $BASH_VERSION would see an
+        // empty value under perl (bash only exports it to itself).  When the
+        // generated program reads it, initialize it from a real bash so the
+        // translation observes the same value the original script would.
+        if output.contains("$ENV{BASH_VERSION}") {
+            let init = "$ENV{BASH_VERSION} //= do { open(my $__fh, '-|', 'bash', '-c', 'printf %s \"$BASH_VERSION\"') or die \"cmd failed: $!\\n\"; local $/; my $_v = <$__fh> // q{}; close $__fh; $_v; };\n";
+            let anchor = "our $CHILD_ERROR = 0;\n";
+            if let Some(pos) = output.find(anchor) {
+                output.insert_str(pos + anchor.len(), init);
+            } else {
+                output.insert_str(0, init);
+            }
+        }
+
         // Balance braces: count opens/closes and add missing closing braces.
         // Some generated code paths emit unbalanced braces which cause
         // perlcritic violations ("Nested named subroutine", "Variable
@@ -880,7 +936,12 @@ impl Generator {
                         // pattern, not a comment.  Simple heuristic: if there is an odd
                         // number of `/` before `#` (counting from the last `s` or `m`),
                         // then `#` is inside the regex part of s/// or m//.
-                        let no_comment = if let Some(pos) = trimmed.find('#') {
+                        // Never strip from multi-line values: a `#` inside a
+                        // multi-line do{} block is an interior comment, and
+                        // cutting there truncates the whole expression.
+                        let no_comment = if trimmed.contains('\n') {
+                            trimmed.to_string()
+                        } else if let Some(pos) = trimmed.find('#') {
                             let before_hash = &trimmed[..pos];
                             let quotes_before = before_hash.chars().filter(|&c| c == '"').count();
                             // Check whether # is inside a s/// or m// operator by counting
@@ -1920,6 +1981,22 @@ impl Generator {
                     }
                 }
                 false
+            }
+            Command::Assignment(assign) => self.word_needs_basename(&assign.value),
+            Command::Block(block) => block
+                .commands
+                .iter()
+                .any(|c| self.command_needs_basename(c)),
+            Command::Subshell(inner) | Command::Background(inner) | Command::Not(inner) => {
+                self.command_needs_basename(inner)
+            }
+            Command::Function(func) => func
+                .body
+                .commands
+                .iter()
+                .any(|c| self.command_needs_basename(c)),
+            Command::BuiltinCommand(bc) => {
+                bc.args.iter().any(|arg| self.word_needs_basename(arg))
             }
             _ => false,
         }

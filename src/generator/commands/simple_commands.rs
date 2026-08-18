@@ -11,6 +11,108 @@ static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut output = String::new();
 
+    // `:` — the null builtin: does nothing, succeeds.
+    if let Word::Literal(name, _) = &cmd.name {
+        if name == ":" {
+            output.push_str(&generator.indent());
+            output.push_str("$CHILD_ERROR = 0;\n");
+            return output;
+        }
+        // `echo $(($1 * 100 + $2))` with unset positionals: bash substitutes
+        // the empty text into the arithmetic, hits a syntax error, and skips
+        // the whole command with $? = 1.  Guard on the referenced positionals
+        // being set.  Only expressions with an operator can become invalid —
+        // a bare `$(($1))` evaluates to 0.
+        if name == "echo" && !generator.arith_guard_active {
+            let mut pos_refs: std::collections::BTreeSet<usize> = Default::default();
+            let pos_re = regex::Regex::new(r"\$(\d+)").unwrap();
+            for arg in &cmd.args {
+                if let Word::Arithmetic(expr, _) = arg {
+                    if expr.expression.contains(['+', '-', '*', '/', '%']) {
+                        for cap in pos_re.captures_iter(&expr.expression) {
+                            if let Ok(n) = cap[1].parse::<usize>() {
+                                if n >= 1 {
+                                    pos_refs.insert(n);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !pos_refs.is_empty() {
+                generator.arith_guard_active = true;
+                let inner = generate_simple_command_impl(generator, cmd);
+                generator.arith_guard_active = false;
+                let in_fn = generator.fn_nesting_depth > 0;
+                let checks: Vec<String> = pos_refs
+                    .iter()
+                    .map(|n| {
+                        if in_fn {
+                            format!("defined $_[{}]", n - 1)
+                        } else {
+                            format!("defined $ARGV[{}]", n - 1)
+                        }
+                    })
+                    .collect();
+                let mut guarded = String::new();
+                guarded.push_str(&generator.indent());
+                guarded.push_str(&format!("if ({}) {{\n", checks.join(" && ")));
+                for line in inner.lines() {
+                    guarded.push_str(&generator.indent());
+                    guarded.push_str("    ");
+                    guarded.push_str(line);
+                    guarded.push('\n');
+                }
+                guarded.push_str(&generator.indent());
+                guarded.push_str("} else {\n");
+                guarded.push_str(&generator.indent());
+                guarded.push_str(
+                    "    print {*STDERR} q{bash: syntax error: operand expected}, \"\\n\";\n",
+                );
+                guarded.push_str(&generator.indent());
+                guarded.push_str("    $CHILD_ERROR = 1;\n");
+                guarded.push_str(&generator.indent());
+                guarded.push_str("}\n");
+                return guarded;
+            }
+        }
+
+        // A stray `}` at command position is a bash syntax error: bash
+        // reports it and aborts the script (exit 2) — nothing after runs.
+        if name == "}" && cmd.args.is_empty() {
+            output.push_str(&generator.indent());
+            output.push_str(
+                "print {*STDERR} \"bash: syntax error near unexpected token `}'\\n\";\n",
+            );
+            output.push_str(&generator.indent());
+            output.push_str("exit 2;\n");
+            return output;
+        }
+    }
+
+    // `"$@"` (or "$*") used as the command itself: execute the positional
+    // parameters as a command, e.g. the common `capture() { ...; "$@"; }`
+    // wrapper.  Positional parameters are @_ inside a function, @ARGV at
+    // top level.
+    if let Word::StringInterpolation(si, _) = &cmd.name {
+        if si.parts.len() == 1
+            && matches!(&si.parts[0], StringPart::Variable(v) if v == "@" || v == "*")
+            && cmd.args.is_empty()
+        {
+            let arr = if generator.fn_nesting_depth > 0 {
+                "@_"
+            } else {
+                "@ARGV"
+            };
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "$CHILD_ERROR = {arr} ? (system({arr}) >> 8) : 0;\n",
+                arr = arr
+            ));
+            return output;
+        }
+    }
+
     // Handle array assignments first (these need to be in the main scope)
     // Collect all env vars (both array and scalar) and sort by dependency order
     // so that variables referenced by other variables are declared first.
@@ -962,7 +1064,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                 "*" => "@ARGV".to_string(),
                                 "?" => "$CHILD_ERROR".to_string(),
                                 "!" => "''".to_string(),
-                                "-" => "''".to_string(),
+                                "-" => "$ENV{SH2PERL_SHELLOPTS}".to_string(),
                                 _ => {
                                     if generator.declared_locals.contains(var)
                                         || generator.function_level_vars.contains(var)
@@ -984,7 +1086,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             "*" => "@ARGV".to_string(),
                                             "?" => "$CHILD_ERROR".to_string(),
                                             "!" => "''".to_string(),
-                                            "-" => "''".to_string(),
+                                            "-" => "$ENV{SH2PERL_SHELLOPTS}".to_string(),
                                             _ => {
                                                 if generator.declared_locals.contains(var)
                                                     || generator.function_level_vars.contains(var)
@@ -1076,11 +1178,10 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                                     // Handle variables in string interpolation
                                                     match var.as_str() {
                                                         "#" => result.push_str("scalar(@ARGV)"),
-                                                        "@" => result.push_str("@ARGV"),
-                                                        "*" => result.push_str("@ARGV"),
+                                                        "@" | "*" => result.push_str("\u{1}POSARGS\u{1}"),
                                                         "?" => result.push_str("$CHILD_ERROR"),
                                                         "!" => result.push_str(""),
-                                                        "-" => result.push_str(""),
+                                                        "-" => result.push_str("$ENV{SH2PERL_SHELLOPTS}"),
                                                         _ => {
                                                             if generator.declared_locals.contains(var)
                                                                 || generator.function_level_vars.contains(var)
@@ -1134,7 +1235,15 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                             .replace("\r", "\\r")
                                             .replace("$", "\\$")
                                             .replace("@", "\\@");
-                                        format!("\"{}\"", escaped)
+                                        {
+                                            let quoted = format!("\"{}\"", escaped);
+                                            let posargs = if generator.fn_nesting_depth > 0 {
+                                                "join(q{ }, @_)"
+                                            } else {
+                                                "join(q{ }, @ARGV)"
+                                            };
+                                            quoted.replace("\u{1}POSARGS\u{1}", &format!("\" . {} . \"", posargs))
+                                        }
                                     } else {
                                         generator.perl_string_literal(arg)
                                     }
@@ -1154,7 +1263,26 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     substitution
                                 )
                             }
-                            Word::Literal(literal, _) => {
+                            Word::Literal(literal, lit_quoted) => {
+                                // A bare literal with an embedded ${...}
+                                // expansion (e.g. --x="${VAR}"): re-parse as
+                                // string interpolation so the variable expands.
+                                if lit_quoted.is_none() && literal.contains("${") {
+                                    if let Ok(interp) =
+                                        crate::parser::words::parse_string_interpolation_from_literal(
+                                            literal,
+                                        )
+                                    {
+                                        if interp
+                                            .parts
+                                            .iter()
+                                            .any(|p| !matches!(p, StringPart::Literal(_)))
+                                        {
+                                            return generator
+                                                .convert_string_interpolation_to_perl(&interp);
+                                        }
+                                    }
+                                }
                                 if has_e_flag {
                                     // If -e flag is present, interpret backslash escapes
                                     let mut interpreted = literal.clone();
@@ -1585,6 +1713,13 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                             output.push_str(&generator.indent());
                             output.push_str(&format!("$CHILD_ERROR = ({}) ? 0 : 1;\n", expr));
                         }
+                        // Under set -e a failing test aborts the script.
+                        if generator.set_e_active && generator.suppress_set_e_depth == 0 {
+                            output.push_str(&generator.indent());
+                            output.push_str(
+                                "exit $CHILD_ERROR if $__set_e && $CHILD_ERROR != 0;\n",
+                            );
+                        }
                     }
                     "type" => {
                         // Implement `type` natively in Perl: search PATH for the command.
@@ -1660,8 +1795,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&format!("{}();\n", call_prefix));
                 } else {
                     // Check if any argument contains glob patterns
+                    // Only bare (unquoted) literals are glob candidates — a
+                    // quoted argument containing * or ? (e.g. a 'bash -c'
+                    // script with $?) is passed through verbatim by the shell.
                     let has_glob_patterns = cmd.args.iter().any(|arg| match arg {
-                        Word::Literal(s, _) => s.contains('*') || s.contains('?'),
+                        Word::Literal(s, None) => s.contains('*') || s.contains('?'),
                         _ => false,
                     });
 
@@ -1673,7 +1811,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
 
                         for arg in &cmd.args {
                             match arg {
-                                Word::Literal(s, _) if s.contains('*') || s.contains('?') => {
+                                Word::Literal(s, None) if s.contains('*') || s.contains('?') => {
                                     // Collect glob patterns
                                     glob_patterns.push(s);
                                 }
@@ -2022,7 +2160,7 @@ pub fn generate_echo_command(
                             "*" => "@ARGV".to_string(),
                             "?" => "$CHILD_ERROR".to_string(),
                             "!" => "''".to_string(),
-                            "-" => "''".to_string(),
+                            "-" => "$ENV{SH2PERL_SHELLOPTS}".to_string(),
                             _ => {
                                 if generator.declared_locals.contains(var)
                                     || generator.function_level_vars.contains(var)
@@ -2044,7 +2182,7 @@ pub fn generate_echo_command(
                                     "*" => "@ARGV".to_string(),
                                     "?" => "$CHILD_ERROR".to_string(),
                                     "!" => "''".to_string(),
-                                    "-" => "''".to_string(),
+                                    "-" => "$ENV{SH2PERL_SHELLOPTS}".to_string(),
                                     _ => {
                                         if generator.declared_locals.contains(var)
                                             || generator.function_level_vars.contains(var)

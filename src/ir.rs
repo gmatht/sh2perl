@@ -851,7 +851,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             if a_str.starts_with('\'') || a_str.starts_with('"') || a_str.starts_with('q') {
                                 arg_parts.push(a_str);
                             } else {
-                                arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("$", "\\$").replace("@", "\\@")));
+                                // Keep $ unescaped: the string is passed to
+                                // bash -c inside a NON-interpolating q{...},
+                                // so "\$var" would reach bash as a literal
+                                // dollar and never expand (the callers export
+                                // the referenced values into %ENV).
+                                arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("@", "\\@")));
                             }
                         }
                     }
@@ -860,7 +865,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // Use open()-based capture with safe quoting
                 emit_indent(out, indent);
                 out.push_str(&format!(
-                    "my ${} = do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }};\n",
+                    "my ${} = do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $_r =~ s/\\n+\\z//; $CHILD_ERROR = $? >> 8; $_r; }};\n",
                     var,
                     safe_perl_q_string(&full_cmd)
                 ));
@@ -879,7 +884,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             if a_str.starts_with('\'') || a_str.starts_with('"') || a_str.starts_with('q') {
                                 arg_parts.push(a_str);
                             } else {
-                                arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("$", "\\$").replace("@", "\\@")));
+                                // Keep $ unescaped: the string is passed to
+                                // bash -c inside a NON-interpolating q{...},
+                                // so "\$var" would reach bash as a literal
+                                // dollar and never expand (the callers export
+                                // the referenced values into %ENV).
+                                arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("@", "\\@")));
                             }
                         }
                     }
@@ -1168,7 +1178,11 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                         .replace("{", "\\{")
                         .replace("}", "\\}"))
                 } else {
-                    format!("'{}'", s.replace('\'', "\\'"))
+                    // Escape backslashes BEFORE quotes: in Perl 'single
+                    // quoted' strings \\ and \' are the two escapes, and a
+                    // literal backslash followed by a quote would otherwise
+                    // produce \\' (escaped backslash + string terminator).
+                    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
                 }
             },
             StrStyle::DoubleQuoted => {
@@ -1407,7 +1421,20 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
     // the content (e.g. broke awk `{print ...}` programs).
     let quoted = safe_perl_q_string(cmd);
     format!(
-        "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }}",
+        "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $_r =~ s/\\n+\\z//; $CHILD_ERROR = $? >> 8; $_r; }}",
+        quoted
+    )
+}
+
+/// Like `cmd_str_to_open_perl`, but WITHOUT the trailing `chomp`.  Used when
+/// the captured pipeline output is printed verbatim (top-level pipelines):
+/// bash prints exactly what the pipeline emitted, so stripping a trailing
+/// newline and unconditionally re-adding one would print a spurious blank
+/// line for pipelines that emit nothing.
+pub(crate) fn cmd_str_to_open_perl_raw(cmd: &str) -> String {
+    let quoted = safe_perl_q_string(cmd);
+    format!(
+        "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
         quoted
     )
 }
@@ -1474,7 +1501,7 @@ pub(crate) fn expr_to_open_perl(cmd_expr: &str, chomp_result: bool) -> String {
     if chomp_result {
         // chomp must happen without local $/ in scope (see cmd_str_to_open_perl).
         format!(
-            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }}",
+            "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $_r =~ s/\\n+\\z//; $CHILD_ERROR = $? >> 8; $_r; }}",
             cmd_expr
         )
     } else {

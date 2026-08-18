@@ -29,7 +29,7 @@ fn convert_arith_subexprs(s: &str, generator: &Generator) -> String {
 }
 
 // Helper function to convert shell variables to Perl equivalents
-fn convert_shell_var_to_perl(generator: &Generator, var: &str) -> String {
+fn convert_shell_var_to_perl(generator: &mut Generator, var: &str) -> String {
     let s = var.trim().to_string();
     
     // Remember the original quote style to re-apply it if no conversion happened
@@ -65,7 +65,7 @@ fn convert_shell_var_to_perl(generator: &Generator, var: &str) -> String {
                     let cmd: String = result[cmd_start..cmd_end].to_string();
                     let quoted = crate::ir::safe_perl_q_string(&cmd);
                     let replacement = format!(
-                        "(do {{ open(my $__fh, '-|', 'bash', '-c', {}) or croak \"cmd failed: $!\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }})",
+                        "(do {{ open(my $__fh, '-|', 'bash', '-c', {}) or croak \"cmd failed: $!\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $_r =~ s/\\n+\\z//; $CHILD_ERROR = $? >> 8; $_r; }})",
                         quoted
                     );
                     result.truncate(start.unwrap());
@@ -81,6 +81,20 @@ fn convert_shell_var_to_perl(generator: &Generator, var: &str) -> String {
         unquoted
     };
     
+    // `${var#pat}` / `${var%pat}` / other brace expansions: delegate to the
+    // parameter-expansion generator so removal operators work as operands.
+    if processed.starts_with("${") && processed.ends_with('}') {
+        let content = &processed[2..processed.len() - 1];
+        if content.contains('#') || content.contains('%') || content.contains('/') {
+            if let Ok(pe) =
+                crate::parser::words::parse_parameter_expansion_content(content)
+            {
+                return generator
+                    .word_to_perl(&crate::ast::Word::ParameterExpansion(pe, None));
+            }
+        }
+    }
+
     // Determine the final Perl expression
     match processed.as_str() {
         "$#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
@@ -498,7 +512,17 @@ pub fn generate_test_expression_impl(
                 right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
             }
 
-            format!("({} > {})", left_perl, right_perl)
+            if left.starts_with("${") && right.starts_with("${") {
+                // Unquoted expansions: when both expand empty, the shell sees
+                // `[ -gt ]` — a one-argument (non-empty string) test — which
+                // is TRUE, not a numeric comparison.
+                format!(
+                    "do {{ my $__tl = {} // q{{}}; my $__tr = {} // q{{}}; ($__tl eq q{{}} && $__tr eq q{{}}) ? 1 : ($__tl > $__tr) }}",
+                    left_perl, right_perl
+                )
+            } else {
+                format!("({} > {})", left_perl, right_perl)
+            }
         } else {
             "0".to_string()
         }
@@ -952,7 +976,7 @@ pub fn generate_test_expression_impl(
                         let cmd: String = result_chars[cmd_start..cmd_end].iter().collect();
                         // Replace $(cmd) with open()-based bash -c call
                         // instead of qx'...' to avoid check_qx.pl violations.
-                        let replacement = format!("(do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"cmd failed: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; }})", cmd);
+                        let replacement = format!("(do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"cmd failed: $!\"; local $/; my $_r = <$__fh> // q{{}}; $_r =~ s/\\n+\\z//; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }})", cmd);
                         result_chars.truncate(start.unwrap());
                         for c in replacement.chars() {
                             result_chars.push(c);
@@ -1084,8 +1108,11 @@ fn convert_shell_param_expansion_in_test_expr(generator: &Generator, expr: &str)
                             var_ref, var_ref, var_ref, error)
                     }
                     _ => {
-                        // Simple variable reference: ${var}
-                        format!("{}", var_ref)
+                        // Simple variable reference: ${var} (also ${var-} with
+                        // an empty default).  Guard with // q{} — an unset
+                        // variable expands to the empty string in bash, and a
+                        // bare undef here would warn under `use warnings`.
+                        format!("({} // q{{}})", var_ref)
                     }
                 };
 
@@ -1252,8 +1279,91 @@ pub fn convert_extglob_to_perl_regex_impl(generator: &Generator, pattern: &str) 
     result
 }
 
+// Decode `$'...'` (ANSI-C quoting) segments embedded in a glob pattern into
+// their literal characters. Bash strings are NUL-terminated internally, so a
+// decoded segment is truncated at the first NUL (e.g. `$'x\x00y'` -> "x",
+// making `*$'\x00'*` an always-true `**` pattern).
+fn decode_ansi_c_segments(pattern: &str) -> String {
+    let mut out = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek() == Some(&'\'') {
+            chars.next(); // consume opening quote
+            let mut decoded = String::new();
+            let mut truncated = false;
+            while let Some(&n) = chars.peek() {
+                if n == '\'' {
+                    chars.next();
+                    break;
+                }
+                chars.next();
+                let ch = if n == '\\' {
+                    match chars.next() {
+                        Some('n') => '\n',
+                        Some('t') => '\t',
+                        Some('r') => '\r',
+                        Some('a') => '\x07',
+                        Some('b') => '\x08',
+                        Some('e') | Some('E') => '\x1b',
+                        Some('f') => '\x0c',
+                        Some('v') => '\x0b',
+                        Some('\\') => '\\',
+                        Some('\'') => '\'',
+                        Some('"') => '"',
+                        Some('x') => {
+                            let mut hex = String::new();
+                            while hex.len() < 2
+                                && chars.peek().map_or(false, |c| c.is_ascii_hexdigit())
+                            {
+                                hex.push(chars.next().unwrap());
+                            }
+                            u32::from_str_radix(&hex, 16)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .unwrap_or('\0')
+                        }
+                        Some('0') => {
+                            let mut oct = String::new();
+                            while oct.len() < 3
+                                && chars.peek().map_or(false, |c| ('0'..='7').contains(c))
+                            {
+                                oct.push(chars.next().unwrap());
+                            }
+                            if oct.is_empty() {
+                                '\0'
+                            } else {
+                                u32::from_str_radix(&oct, 8)
+                                    .ok()
+                                    .and_then(char::from_u32)
+                                    .unwrap_or('\0')
+                            }
+                        }
+                        Some(other) => other,
+                        None => break,
+                    }
+                } else {
+                    n
+                };
+                if ch == '\0' {
+                    truncated = true;
+                } else if !truncated {
+                    decoded.push(ch);
+                }
+            }
+            out.push_str(&decoded);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub fn convert_glob_to_regex_impl(_generator: &Generator, pattern: &str) -> String {
-    let mut result = pattern.to_string();
+    let mut result = if pattern.contains("$'") {
+        decode_ansi_c_segments(pattern)
+    } else {
+        pattern.to_string()
+    };
 
     // Debug output
     //     eprintln!("DEBUG: convert_glob_to_regex called with pattern: '{}'", pattern);
@@ -1392,7 +1502,7 @@ pub fn convert_test_args_to_expression_impl(
                 // command generation.
                 // Native Perl: read ARGV files
                 expr_parts.push(
-                    "do {{ my $_r = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ if (open my $__fh, q{{<}}, $__f) {{ $_r .= <$__fh>; close $__fh }} }} }} chomp $_r; $_r; }}".to_string()
+                    "do {{ my $_r = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ if (open my $__fh, q{{<}}, $__f) {{ $_r .= <$__fh>; close $__fh }} }} }} $_r =~ s/\\n+\\z//; $_r; }}".to_string()
                 );
             }
             _ => expr_parts.push(format!("{:?}", arg)),

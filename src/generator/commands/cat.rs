@@ -111,13 +111,11 @@ pub fn generate_cat_command(
         ) {
             has_heredoc = true;
         }
-        // Check for output redirect: > file or >> file
+        // Check for output redirect: > file or >> file.  Convert the target
+        // to a Perl string literal once, here — converting again at the use
+        // site would double-escape interpolated targets like "$tmpf".
         if matches!(redir.operator, RedirectOperator::Output | RedirectOperator::Append) {
-            if let Word::Literal(filename, _) = &redir.target {
-                output_file = Some(filename.clone());
-            } else {
-                output_file = Some(generator.perl_string_literal(&redir.target));
-            }
+            output_file = Some(generator.perl_string_literal(&redir.target));
         }
     }
 
@@ -158,7 +156,7 @@ pub fn generate_cat_command(
 
         if let Some(filename) = output_file {
             // Write heredoc content to the output file (raw text for now)
-            let filename_pl = generator.perl_string_literal(&Word::literal(filename));
+            let filename_pl = filename;
             output.push_str(&format!(
                 "open my $fh_cat, '>', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
                 filename_pl

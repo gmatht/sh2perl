@@ -1082,18 +1082,24 @@ pub fn generate_generic_builtin(
             // !(...) wrapping produces a truthy Perl value (0 is falsy,
             // so !0 is truthy, matching shell semantics where exit 0
             // means "success/true").
+            // ($CHILD_ERROR = 0) evaluates to 0, so condition wrappers that
+            // use the last expression value still work, while a standalone
+            // `true` statement now resets $? like the real builtin.
             if output_var.is_empty() {
-                "0;\n".to_string()
+                "$CHILD_ERROR = 0;\n".to_string()
             } else {
-                format!("0;\n${} = q{};\n", output_var, "")
+                format!("$CHILD_ERROR = 0;\n${} = q{};\n", output_var, "")
             }
         }
         "false" => {
             // false command always fails (exit status 1)
+            // ($CHILD_ERROR = 1) evaluates to 1 (truthy exit code) for
+            // condition wrappers; standalone `false` must NOT exit the
+            // program — bash just sets $? = 1 and continues.
             if output_var.is_empty() {
-                "exit 1;\n".to_string()
+                "$CHILD_ERROR = 1;\n".to_string()
             } else {
-                format!("exit 1;\n${} = q{};\n", output_var, "")
+                format!("$CHILD_ERROR = 1;\n${} = q{};\n", output_var, "")
             }
         }
         "whoami" => {
@@ -1350,8 +1356,11 @@ fn generate_system_call_fallback(
 
     // Check if this is a function call with glob patterns (use cmd_basename)
     if generator.declared_functions.contains(cmd_basename) {
+        // Only bare (unquoted) literals are glob candidates — a quoted
+        // argument containing * or ? (e.g. a 'bash -c' script with $?)
+        // is passed through verbatim by the shell.
         let has_glob_patterns = cmd.args.iter().any(|arg| match arg {
-            Word::Literal(s, _) => s.contains('*') || s.contains('?'),
+            Word::Literal(s, None) => s.contains('*') || s.contains('?'),
             _ => false,
         });
 
@@ -1392,8 +1401,16 @@ fn generate_system_call_fallback(
                 return format!("$CHILD_ERROR = 0;\n");
             }
             let arg_expr = args.join(", ");
-            // readlink -f / -e / -m → Cwd::abs_path()
-            if flags.iter().any(|f| f == "-f" || f == "-e" || f == "-m") {
+            // readlink -m: canonicalize even when the path does not exist
+            // (lexical resolution, like GNU readlink -m).
+            if flags.iter().any(|f| f == "-m") {
+                return format!(
+                    "do {{ use Cwd qw(abs_path getcwd); my $_p = {}; my $_r = abs_path($_p); unless (defined $_r) {{ $_p = getcwd() . q{{/}} . $_p unless $_p =~ m{{^/}}; my @_seg; for my $_s (split m{{/}}, $_p) {{ next if $_s eq q{{}} || $_s eq q{{.}}; if ($_s eq q{{..}}) {{ pop @_seg; }} else {{ push @_seg, $_s; }} }} $_r = q{{/}} . join(q{{/}}, @_seg); }} $_r; }}",
+                    arg_expr
+                );
+            }
+            // readlink -f / -e → Cwd::abs_path()
+            if flags.iter().any(|f| f == "-f" || f == "-e") {
                 return format!(
                     "do {{ use Cwd qw(abs_path); my $_r = abs_path({}); defined $_r ? $_r : q{{}}; }}",
                     arg_expr
@@ -1426,9 +1443,13 @@ fn generate_system_call_fallback(
         .join(", ");
     let out_name = output_var.trim_start_matches('$');
     let in_name = input_var.trim_start_matches('$');
-    if input_var.is_empty() {
+    if out_name.is_empty() {
+        // Statement context (no capture variable): run the command directly;
+        // it inherits the (possibly redirected) STDIN/STDOUT.
+        format!("$CHILD_ERROR = system({}) >> 8;\n", all_args)
+    } else if input_var.is_empty() {
         format!(
-            "\n${{{out_name}}} = do {{ open(my $__fh, '-|', {}) or croak \"failed: $ERRNO\"; chomp(my $_r = do {{ local $/; <$__fh> }}); close $__fh; $_r; }};\n",
+            "\n${{{out_name}}} = do {{ open(my $__fh, '-|', {}) or croak \"failed: $ERRNO\"; my $_r = do {{ local $/; <$__fh> }}; $_r =~ s/\\n+\\z//; close $__fh; $_r; }};\n",
             all_args,
             out_name = out_name,
         )

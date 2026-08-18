@@ -120,11 +120,13 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
 
     match &redirect.operator {
         RedirectOperator::Input => {
-            // Input redirection: command < file
+            // Input redirection: command < file.  A failed open is not fatal in
+            // bash — it reports the error, sets $? = 1, and moves on — so warn,
+            // flag the failure, and give the command an empty stdin.
             let target = generator.perl_string_literal(&redirect.target);
             output.push_str(&format!(
-                "open STDIN, '<', {} or croak \"Cannot read file: $OS_ERROR\\n\";\n",
-                target
+                "open STDIN, '<', {t} or do {{ print {{*STDERR}} 'bash: ' . {t} . \": $OS_ERROR\\n\"; $CHILD_ERROR = 1; open STDIN, '<', '/dev/null'; }};\n",
+                t = target
             ));
         }
         RedirectOperator::Output => {
@@ -252,7 +254,11 @@ waitpid $pid, 0;\n",
                         "0" => "STDIN",
                         _ => "STDOUT",
                     };
-                    output.push_str("local *STDERR;\n");
+                    // Save stderr with a dup, then reopen STDERR so the new
+                    // handle takes fd 2 — a `local *STDERR` glob swap leaves
+                    // fd 2 pointing at the old stderr, so child processes
+                    // (system/open) would bypass the redirect entirely.
+                    output.push_str("open my $__stderr_save, '>&', STDERR or croak \"Cannot save STDERR: $OS_ERROR\\n\";\n");
                     output.push_str(&format!(
                         "open STDERR, '>&', {} or die \"Cannot dup stderr: $OS_ERROR\\n\";\n",
                         fd_name
@@ -261,7 +267,7 @@ waitpid $pid, 0;\n",
             } else {
                 // Regular stderr redirect to a file
                 let target = generator.perl_string_literal(&redirect.target);
-                output.push_str("local *STDERR;\n");
+                output.push_str("open my $__stderr_save, '>&', STDERR or croak \"Cannot save STDERR: $OS_ERROR\\n\";\n");
                 output.push_str(&format!(
                     "open STDERR, '>', {} or croak \"Cannot access file: $OS_ERROR\\n\";\n",
                     target
@@ -297,7 +303,36 @@ waitpid $pid, 0;\n",
 }
 
 // Helper function to generate bash command strings for process substitution
+// Bash sees a fresh PID in every `bash -c` child, but `$$` in the source
+// script always names the one main-script process.  Route `$$` (outside
+// single quotes, where it is literal) through $ENV{SH2PERL_PPID}, which the
+// generated program sets to the Perl process's PID, so every child agrees.
+fn rewrite_pid_outside_squotes(s: &str) -> String {
+    if !s.contains("$$") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut in_squote = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            in_squote = !in_squote;
+            out.push(c);
+        } else if c == '$' && !in_squote && chars.peek() == Some(&'$') {
+            chars.next();
+            out.push_str("${SH2PERL_PPID}");
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub fn generate_bash_command_string(cmd: &Command) -> String {
+    rewrite_pid_outside_squotes(&generate_bash_command_string_inner(cmd))
+}
+
+fn generate_bash_command_string_inner(cmd: &Command) -> String {
     match cmd {
         Command::Simple(simple_cmd) => {
             let args: Vec<String> = simple_cmd
@@ -599,10 +634,23 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             } else {
                                 tgt.clone()
                             };
-                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
-                            result.push_str(&format!(" 2>&{}", tgt_unquoted));
+                        // Honor the source fd: `4>&1` must not collapse to `2>&1`,
+                        // `>&4` (fd None) means "dup stdout", and `3>&-` closes fd 3.
+                        if !tgt_unquoted.is_empty()
+                            && (tgt_unquoted == "-"
+                                || tgt_unquoted.chars().all(|c| c.is_ascii_digit()))
+                        {
+                            let fd_str = redirect
+                                .fd
+                                .map(|n| n.to_string())
+                                .unwrap_or_default();
+                            result.push_str(&format!(" {}>&{}", fd_str, tgt_unquoted));
                         } else {
-                            result.push_str(&format!(" 2> {}", tgt));
+                            let fd_str = redirect
+                                .fd
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "2".to_string());
+                            result.push_str(&format!(" {}> {}", fd_str, tgt));
                         }
                     }
                     RedirectOperator::StderrAppend => {
@@ -627,10 +675,21 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             } else {
                                 tgt.clone()
                             };
-                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
-                            result.push_str(&format!(" 2<&{}", tgt_unquoted));
+                        if !tgt_unquoted.is_empty()
+                            && (tgt_unquoted == "-"
+                                || tgt_unquoted.chars().all(|c| c.is_ascii_digit()))
+                        {
+                            let fd_str = redirect
+                                .fd
+                                .map(|n| n.to_string())
+                                .unwrap_or_default();
+                            result.push_str(&format!(" {}<&{}", fd_str, tgt_unquoted));
                         } else {
-                            result.push_str(&format!(" 2< {}", tgt));
+                            let fd_str = redirect
+                                .fd
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "2".to_string());
+                            result.push_str(&format!(" {}< {}", fd_str, tgt));
                         }
                     }
                     RedirectOperator::InputOutput => {
@@ -710,15 +769,37 @@ fn needs_shell_quoting_literal(s: &str) -> bool {
         || s.contains('{')
         || s.contains('}')
         || s.contains('$')
+        || s.contains('(')
+        || s.contains(')')
+        || s.contains('`')
+}
+
+// True when a literal would be quoted solely because of glob metacharacters
+// (* ? [ ]).  A bare (unquoted) glob in the source must stay unquoted in the
+// reconstructed command so bash expands it — quoting `*.txt` would make grep
+// look for a file literally named "*.txt".
+fn quoting_only_for_globs(s: &str) -> bool {
+    let stripped: String = s
+        .chars()
+        .filter(|c| !matches!(c, '*' | '?' | '[' | ']'))
+        .collect();
+    stripped.len() != s.len() && !needs_shell_quoting_literal(&stripped)
 }
 
 fn word_to_bash_string(word: &Word) -> String {
     match word {
-        Word::Literal(s, _) => {
+        Word::Literal(s, quoted) => {
             // Preserve original quoting where possible. If the literal was
             // originally double-quoted, keep it so inner bash -c invocations
             // still perform variable expansions.
             if s.starts_with('"') && s.ends_with('"') {
+                return s.clone();
+            }
+
+            // A bare word that only needs quoting because of glob
+            // metacharacters was an unquoted glob in the source; keep it
+            // bare so bash expands it the same way.
+            if quoted.is_none() && quoting_only_for_globs(s) {
                 return s.clone();
             }
 
@@ -1073,6 +1154,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             if opt.contains('p') {
                                 is_print = true;
                             }
+                            i += 1;
                             continue;
                         }
                         // Handle declare -p (print variable definition)
@@ -1107,6 +1189,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("print \"declare -- {}\\\n\";\n", var));
                             }
+                            i += 1;
                         } else {
                             // Check if it's an assignment (var=value)
                             if opt.contains('=') {
@@ -1524,7 +1607,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 // Perl::Critic's "Expression form of eval" false positive.
                 // bash -c "..." is semantically equivalent to eval "...".
                 output.push_str(&format!(
-                    "do {{ my $eval_input = {}; $CHILD_ERROR = 0; }};  # native Perl\n",
+                    "do {{ my $eval_input = {}; open(my $__fh, '-|', 'bash', '-c', $eval_input) or die \"cmd failed: $!\\n\"; my $__out = do {{ local $/; <$__fh> }} // q{{}}; close $__fh; $CHILD_ERROR = $? >> 8; print $__out; }};\n",
                     concat_expr
                 ));
             }
@@ -1565,7 +1648,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             .replace("\\", "\\\\")
                             .replace("\'", "\\\'");
                         output.push_str(&format!(
-                            "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = do {{ open(my $__fh, \'-|\', \'sh\', \'-c\', \'{} 2>&1\') or croak \"cmd: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $_r; }}; print $end_out if $end_out ne q{{}}; }}\n",
+                            "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = do {{ open(my $__fh, \'-|\', \'sh\', \'-c\', \'{} 2>&1\') or croak \"cmd: $!\"; local $/; my $_r = <$__fh> // q{{}}; $_r =~ s/\\n+\\z//; close $__fh; $_r; }}; print $end_out if $end_out ne q{{}}; }}\n",
                             handler_perl_escaped
                         ));
                     } else if signal_name == "DEBUG" {
@@ -1621,6 +1704,46 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 }
             } else {
                 output.push_str("# Builtin command 'trap' with insufficient arguments\n");
+            }
+        }
+        "shift" => {
+            // Drop the first N positional parameters: @_ inside a function,
+            // @ARGV at top level.
+            let n = cmd
+                .args
+                .first()
+                .and_then(|a| {
+                    if let Word::Literal(s, _) = a {
+                        s.parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1);
+            output.push_str(&generator.indent());
+            if generator.fn_nesting_depth > 0 {
+                output.push_str(&format!("splice(@_, 0, {});\n", n));
+            } else {
+                output.push_str(&format!("splice(@ARGV, 0, {});\n", n));
+            }
+        }
+        "exec" => {
+            // `exec cmd args...` replaces the shell with cmd; Perl's exec has
+            // the same semantics.  (`exec` with only redirections is not
+            // supported.)
+            if cmd.args.is_empty() {
+                output.push_str("# Builtin command 'exec' without a command not implemented\n");
+            } else {
+                let args: Vec<String> = cmd
+                    .args
+                    .iter()
+                    .map(|a| generator.word_to_perl(a))
+                    .collect();
+                output.push_str(&generator.indent());
+                output.push_str(&format!(
+                    "exec({}) or croak \"exec failed: $OS_ERROR\";\n",
+                    args.join(", ")
+                ));
             }
         }
         _ => {
