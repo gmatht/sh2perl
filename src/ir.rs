@@ -3775,6 +3775,98 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
 /// fd redirect specs) — used in condition and statement positions.
 /// `exec(cmd, …)` in condition position → the reconstructed shell
 /// command string (the same shape `pipeline_call_to_cmd` handles).
+/// Native file-contains for `grep -q PAT FILE` in condition position.
+///
+/// grep's exit status with its stdout suppressed by `-q` is exactly "does
+/// a line of FILE contain the pattern". We read the file and do a
+/// substring `index` when: every flag is one of `-q`/`-i`/`-s` (quiet /
+/// case-fold / suppress-errors — none produce output or alter the line-
+/// match semantics), the pattern is a BRE-literal (no metachars, so
+/// substring == grep match), and there is exactly ONE file operand (a
+/// literal path). Anything else (`-c -l -m -b -n -A -B -C -v -w -x
+/// -E -F -Z`, globs, multiple files, a variable/arith pattern) keeps the
+/// shell-out: it is not a plain boolean (grep would print matches/files/
+/// counts).
+fn try_native_grep_test(call: &IrExpr) -> Option<String> {
+    let IrExpr::Call { func, args } = call else { return None };
+    if func != "exec" {
+        return None;
+    }
+    // command name must be `grep`
+    if !matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "grep") {
+        return None;
+    }
+    let words: Vec<&IrExpr> = exec_word_args(args);
+    // parse flags (only q/i/s), then pattern, then file
+    let mut ci = false;
+    let mut nonflag: Vec<&IrExpr> = Vec::new();
+    for w in words {
+        match w {
+            IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
+                let f: String = s[1..].chars().filter(|c| "qis".contains(*c)).collect();
+                if f.len() != s.len() - 1 {
+                    return None; // an unsupported flag char
+                }
+                ci |= s.contains('i');
+            }
+            _ => nonflag.push(w),
+        }
+    }
+    if nonflag.len() != 2 {
+        return None; // need exactly pattern + one file
+    }
+    let pat = grep_lit_str(nonflag[0])?;
+    if !grep_literal_safe(&pat) {
+        return None;
+    }
+    let file = grep_lit_str(nonflag[1])?;
+    if file.contains('*') || file.contains('?') {
+        return None; // a glob expends to many files — not a single read
+    }
+    let (hay, ndl) = if ci {
+        ("lc($__grep_c)".to_string(), format!("lc({})", safe_perl_q_string(&pat)))
+    } else {
+        ("$__grep_c".to_string(), safe_perl_q_string(&pat))
+    };
+    Some(format!(
+        "(sub {{ open(my $__grep_h, '<', {}) or return 0; local $/; \
+            my $__grep_c = <$__grep_h>; close $__grep_h; \
+            return (index({hay}, {ndl}) >= 0 ? 1 : 0); }}->())",
+        safe_perl_q_string(&file)
+    ))
+}
+
+/// Extract a literal string from a pattern/file arg: a `Str`, a `Num`, or
+/// an `Interpolate` whose parts are all literal text. Variables/arith /
+/// captures → None (refuse).
+fn grep_lit_str(e: &IrExpr) -> Option<String> {
+    match e {
+        IrExpr::Str(s, _) => Some(s.clone()),
+        IrExpr::Int(n) => Some(n.to_string()),
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    crate::ir::InterpPart::Lit(t) => out.push_str(t),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// A pattern is a plain substring iff grep's BRE would treat it as a
+/// literal: no *leading* `-` (parsed as an option), no BRE metacharacters
+/// (`^ $ . [ ] * \\`), and no real newline (grep is line-scoped).
+fn grep_literal_safe(pat: &str) -> bool {
+    !pat.starts_with('-')
+        && !pat
+            .chars()
+            .any(|c| matches!(c, '^' | '$' | '.' | '[' | ']' | '*' | '\\' | '\n'))
+}
+
 fn exec_call_to_cmd(call: &IrExpr) -> Option<String> {
     if let IrExpr::Call { func, args } = call {
         if func == "exec" {
@@ -5879,12 +5971,27 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 // process instead of returning a status, so run the
                 // command via bash -c and test its exit status (the same
                 // lowering the `redirect`/`block` arms use).
-                "exec" => match exec_call_to_cmd(expr) {
-                    Some(cmd) => format!(
-                        "(system('bash', '-c', {}) == 0)",
-                        safe_perl_q_string(&cmd)
-                    ),
-                    None => "0".to_string(),
+                "exec" => {
+                    // Native file-contains: `grep -q PAT FILE` (quiet — no
+                    // stdout side effect) lowers to read-the-file + a
+                    // substring test, matching bash's grep exit status
+                    // (0 = a line contains the literal). Refuse unless the
+                    // flags are only quiet/case-insensitive, the pattern is
+                    // a BRE-literal, and there is exactly one file operand
+                    // (grep over many/globbed files or with output-
+                    // producing flags -c/-l/-m/-b/-n/-A… is NOT a boolean
+                    // and stays a shell-out).
+                    if let Some(native) = try_native_grep_test(expr) {
+                        native
+                    } else {
+                        match exec_call_to_cmd(expr) {
+                            Some(cmd) => format!(
+                                "(system('bash', '-c', {}) == 0)",
+                                safe_perl_q_string(&cmd)
+                            ),
+                            None => "0".to_string(),
+                        }
+                    }
                 },
                 // The C frontend's user-function dispatch (the estree
                 // lowers the same A1 to sh2.fnCall) — a direct Perl sub
@@ -7178,6 +7285,28 @@ mod tests {
         assert!(
             !perl.contains("contains("),
             "no bare contains() sub call: {perl}"
+        );
+    }
+
+    /// grep's `-q` flag over a single literal file lowers to a native
+    /// file-contains (read + index), not a bash -c shell-out: with -q the
+    /// stdout side-effect is gone, so the boolean "does file contain pa"
+    /// is exact. A regex/metachar pattern (`.` etc.) is refused and stays
+    /// a shell-out (substring would not equal a grep regex match).
+    #[test]
+    fn grep_q_file_renders_native_contains() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"If","cond":{"type":"Call","func":"exec","purity":"Emulable","args":[{"type":"Str","value":"grep","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"-q","style":"DoubleQuoted"},{"type":"Str","value":"world","style":"DoubleQuoted"},{"type":"Str","value":"/tmp/hello.txt","style":"DoubleQuoted"}]}]},"elsifs":[],"then":[{"type":"Expr","expr":{"type":"Call","func":"exec","args":[{"type":"Str","value":"echo","style":"DoubleQuoted"},{"type":"Array","elements":[{"type":"Str","value":"yes","style":"DoubleQuoted"}]}]}}],"else":[]}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("grep -q A1 ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(
+            perl.contains("index($__grep_c, 'world') >= 0"),
+            "grep -q file should render native contains: {perl}"
+        );
+        assert!(
+            !perl.contains("system('bash'"),
+            "grep -q file must not shell out: {perl}"
         );
     }
 
