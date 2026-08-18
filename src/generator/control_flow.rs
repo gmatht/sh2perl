@@ -1123,6 +1123,22 @@ pub fn generate_for_loop_impl(generator: &mut Generator, for_loop: &ForLoop) -> 
                         .map(|item| format!("\"{}\"", item))
                         .collect();
                     all_items.extend(items);
+                } else if word
+                    .as_literal()
+                    .map(|_| {
+                        matches!(word, Word::Literal(_, None))
+                            && (s.contains('*') || s.contains('?'))
+                            && !s.contains(' ')
+                    })
+                    .unwrap_or(false)
+                {
+                    // Bare glob item (for f in /dev/pts/*): expand at runtime,
+                    // falling back to the literal pattern when nothing matches
+                    // (bash keeps the unexpanded word).
+                    all_items.push(format!(
+                        "do {{ my @_g = sort glob(\"{}\"); @_g ? @_g : (\"{}\") }}",
+                        s, s
+                    ));
                 } else {
                     all_items.push(generator.word_to_perl(word));
                 }
