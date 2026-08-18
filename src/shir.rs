@@ -35516,6 +35516,24 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         );
     }
 
+    /// `printf LITERAL | sort` lowers natively (no bash -c): the content is
+    /// a known literal, so sort is a pure in-Perl text op.
+    #[test]
+    fn printf_sort_lowers_native() {
+        let src = "printf \"c\\na\\nb\\n\" | sort\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            !perl.contains("system('bash'"),
+            "printf|sort must not shell out: {perl}"
+        );
+        assert!(
+            perl.contains("sort") && perl.contains("@__pl"),
+            "printf|sort should emit a native sort: {perl}"
+        );
+    }
+
     /// The Try node lowers to a JS try/catch/finally (core request
     /// py-sh-go 20260813): the guarded suite → the try block; except
     /// arms → an `e instanceof <match>` if/else-if ladder inside the
