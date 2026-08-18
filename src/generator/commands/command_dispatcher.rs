@@ -1196,7 +1196,10 @@ pub fn generate_command_impl_with_input(
                     };
                     result.push_str(&generator.indent());
                     result.push_str(&format!("open STDOUT, '{}', {}\n", mode, target));
-                    result.push_str("      or die \"Cannot access file: $OS_ERROR\\n\";\n");
+                    result.push_str(&format!(
+                        "      or do {{ print {{*STDERR}} 'bash: ' . {} . \": $OS_ERROR\\n\"; $CHILD_ERROR = 1; open STDOUT, '>', '/dev/null'; }};\n",
+                        target
+                    ));
                 } else {
                     result.push_str(&generator.indent());
                     result.push_str("open STDOUT, '>', 'temp_file.txt'\n");

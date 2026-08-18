@@ -120,11 +120,13 @@ pub fn generate_redirect_impl(generator: &mut Generator, redirect: &Redirect) ->
 
     match &redirect.operator {
         RedirectOperator::Input => {
-            // Input redirection: command < file
+            // Input redirection: command < file.  A failed open is not fatal in
+            // bash — it reports the error, sets $? = 1, and moves on — so warn,
+            // flag the failure, and give the command an empty stdin.
             let target = generator.perl_string_literal(&redirect.target);
             output.push_str(&format!(
-                "open STDIN, '<', {} or croak \"Cannot read file: $OS_ERROR\\n\";\n",
-                target
+                "open STDIN, '<', {t} or do {{ print {{*STDERR}} 'bash: ' . {t} . \": $OS_ERROR\\n\"; $CHILD_ERROR = 1; open STDIN, '<', '/dev/null'; }};\n",
+                t = target
             ));
         }
         RedirectOperator::Output => {
@@ -301,7 +303,36 @@ waitpid $pid, 0;\n",
 }
 
 // Helper function to generate bash command strings for process substitution
+// Bash sees a fresh PID in every `bash -c` child, but `$$` in the source
+// script always names the one main-script process.  Route `$$` (outside
+// single quotes, where it is literal) through $ENV{SH2PERL_PPID}, which the
+// generated program sets to the Perl process's PID, so every child agrees.
+fn rewrite_pid_outside_squotes(s: &str) -> String {
+    if !s.contains("$$") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut in_squote = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            in_squote = !in_squote;
+            out.push(c);
+        } else if c == '$' && !in_squote && chars.peek() == Some(&'$') {
+            chars.next();
+            out.push_str("${SH2PERL_PPID}");
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub fn generate_bash_command_string(cmd: &Command) -> String {
+    rewrite_pid_outside_squotes(&generate_bash_command_string_inner(cmd))
+}
+
+fn generate_bash_command_string_inner(cmd: &Command) -> String {
     match cmd {
         Command::Simple(simple_cmd) => {
             let args: Vec<String> = simple_cmd
@@ -603,10 +634,23 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             } else {
                                 tgt.clone()
                             };
-                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
-                            result.push_str(&format!(" 2>&{}", tgt_unquoted));
+                        // Honor the source fd: `4>&1` must not collapse to `2>&1`,
+                        // `>&4` (fd None) means "dup stdout", and `3>&-` closes fd 3.
+                        if !tgt_unquoted.is_empty()
+                            && (tgt_unquoted == "-"
+                                || tgt_unquoted.chars().all(|c| c.is_ascii_digit()))
+                        {
+                            let fd_str = redirect
+                                .fd
+                                .map(|n| n.to_string())
+                                .unwrap_or_default();
+                            result.push_str(&format!(" {}>&{}", fd_str, tgt_unquoted));
                         } else {
-                            result.push_str(&format!(" 2> {}", tgt));
+                            let fd_str = redirect
+                                .fd
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "2".to_string());
+                            result.push_str(&format!(" {}> {}", fd_str, tgt));
                         }
                     }
                     RedirectOperator::StderrAppend => {
@@ -631,10 +675,21 @@ pub fn generate_bash_command_string(cmd: &Command) -> String {
                             } else {
                                 tgt.clone()
                             };
-                        if tgt_unquoted.chars().all(|c| c.is_ascii_digit()) {
-                            result.push_str(&format!(" 2<&{}", tgt_unquoted));
+                        if !tgt_unquoted.is_empty()
+                            && (tgt_unquoted == "-"
+                                || tgt_unquoted.chars().all(|c| c.is_ascii_digit()))
+                        {
+                            let fd_str = redirect
+                                .fd
+                                .map(|n| n.to_string())
+                                .unwrap_or_default();
+                            result.push_str(&format!(" {}<&{}", fd_str, tgt_unquoted));
                         } else {
-                            result.push_str(&format!(" 2< {}", tgt));
+                            let fd_str = redirect
+                                .fd
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "2".to_string());
+                            result.push_str(&format!(" {}< {}", fd_str, tgt));
                         }
                     }
                     RedirectOperator::InputOutput => {

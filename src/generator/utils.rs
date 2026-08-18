@@ -79,7 +79,10 @@ pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String 
                     &Word::CommandSubstitution(Box::new(cmd), None),
                 );
                 if !result.contains("qx{") && !result.is_empty() {
-                    return result;
+                    // Unquoted command substitution in an array assignment is
+                    // word-split on IFS (whitespace) by bash; `split ' '` also
+                    // yields an empty list for empty output instead of ("").
+                    return format!("split(' ', {})", result);
                 }
             }
         }
@@ -98,7 +101,10 @@ pub fn array_element_to_perl_impl(generator: &mut Generator, s: &str) -> String 
                     &Word::CommandSubstitution(Box::new(cmd), None),
                 );
                 if !result.contains("qx{") && !result.is_empty() {
-                    return result;
+                    // Unquoted command substitution in an array assignment is
+                    // word-split on IFS (whitespace) by bash; `split ' '` also
+                    // yields an empty list for empty output instead of ("").
+                    return format!("split(' ', {})", result);
                 }
             }
         }

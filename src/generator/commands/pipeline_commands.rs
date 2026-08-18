@@ -2331,6 +2331,52 @@ fn has_heredoc_redirect(cmd: &Command) -> bool {
 /// bash command string that correspond to Perl-side lexicals.  A `bash -c`
 /// subprocess can only see them through the environment, so the caller wraps
 /// the capture in `local $ENV{name} = $name;` for each returned name.
+/// Rewrite a reconstructed bash command that expands a Perl-side array
+/// (`"${name[@]}"`) so the child `bash -c` actually sees the elements.
+/// Arrays cannot travel through the environment directly, so the elements are
+/// serialized as a single shell-quoted string in $ENV{SH2PERL_ARRAY_<name>}
+/// and re-split with `set --` inside the child; the expansion itself becomes
+/// `"$@"`. Returns (rewritten command, Perl export prefix), or None when the
+/// command references no known array (or more than one, which this scheme
+/// cannot express).
+pub(crate) fn array_passthrough_for_cmd(
+    generator: &Generator,
+    cmd: &str,
+) -> Option<(String, String)> {
+    let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}").ok()?;
+    let mut names = std::collections::BTreeSet::new();
+    for cap in re.captures_iter(cmd) {
+        names.insert(cap[1].to_string());
+    }
+    if names.len() != 1 {
+        return None;
+    }
+    let name = names.into_iter().next().unwrap();
+    if !(generator.indexed_arrays.contains(&name)
+        || generator.declared_locals.contains(&name)
+        || generator.function_level_vars.contains(&name))
+    {
+        return None;
+    }
+    let quoted_at = format!("\"${{{}[@]}}\"", name);
+    let quoted_star = format!("\"${{{}[*]}}\"", name);
+    let bare_at = format!("${{{}[@]}}", name);
+    let bare_star = format!("${{{}[*]}}", name);
+    let rewritten = cmd
+        .replace(&quoted_at, "\"$@\"")
+        .replace(&quoted_star, "\"$*\"")
+        .replace(&bare_at, "$@")
+        .replace(&bare_star, "$*");
+    let env_name = format!("SH2PERL_ARRAY_{}", name);
+    let rewritten = format!("eval \"set -- ${{{}}}\"; {}", env_name, rewritten);
+    let export = format!(
+        "local $ENV{{{env}}} = join(q{{ }}, map {{ my $__x = $_; $__x =~ s/'/'\\\\''/g; \"'\" . $__x . \"'\" }} @{name}); ",
+        env = env_name,
+        name = name
+    );
+    Some((rewritten, export))
+}
+
 fn env_exports_for_cmd(generator: &Generator, cmd: &str) -> Vec<String> {
     let mut vars = std::collections::BTreeSet::new();
     let bytes = cmd.as_bytes();

@@ -726,8 +726,21 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                 unreachable!()
                             }
                         } else {
-                            let command_str =
+                            let mut command_str =
                                 crate::generator::redirects::generate_bash_command_string(cmd);
+                            // Arrays referenced as "${name[@]}" cannot reach the
+                            // bash -c child through the environment; serialize the
+                            // elements and re-split them with `set --` inside bash.
+                            let mut array_export = String::new();
+                            if let Some((rewritten, export)) =
+                                crate::generator::commands::pipeline_commands::array_passthrough_for_cmd(
+                                    generator,
+                                    &command_str,
+                                )
+                            {
+                                command_str = rewritten;
+                                array_export = export;
+                            }
                             // Use a non-interpolating Perl string literal so that shell
                             // variable references (e.g. $LOG_FILE, $HOME) in the command
                             // string are preserved for bash to expand at runtime (the Perl
@@ -738,7 +751,12 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             let command_lit = generator
                                 .perl_string_literal_no_interp(&Word::literal(command_str));
 
-                            crate::ir::expr_to_open_perl(&command_lit, true)
+                            let open_expr = crate::ir::expr_to_open_perl(&command_lit, true);
+                            if array_export.is_empty() {
+                                open_expr
+                            } else {
+                                format!("do {{ {}{} }}", array_export, open_expr)
+                            }
                         }
                     }
                 }
@@ -3320,6 +3338,27 @@ pub fn convert_arithmetic_to_perl_impl(generator: &Generator, expr: &str) -> Str
     // Additionally, before the normal conversion, extract any `$(...)` command
     // substitutions from the expression and replace them with Perl code that
     // runs the command via qx{} and captures its output.
+
+    // Bash rejects `$((echo "test"))`-style expressions (an identifier
+    // juxtaposed with a quoted string is not valid arithmetic): it prints a
+    // syntax error, leaves the target unset, and carries on.  Emulate that
+    // instead of emitting Perl that doesn't compile.
+    {
+        let re_bad = regex::Regex::new(
+            r#"^\s*[a-zA-Z_][a-zA-Z0-9_]*\s+["'].*["']\s*$"#,
+        )
+        .unwrap();
+        if re_bad.is_match(expr) {
+            let msg = crate::ir::safe_perl_q_string(&format!(
+                "bash: {}: syntax error in expression",
+                expr
+            ));
+            return format!(
+                "do {{ print {{*STDERR}} {}, \"\\n\"; $CHILD_ERROR = 1; q{{}} }}",
+                msg
+            );
+        }
+    }
 
     let mut result = expr.to_string();
 

@@ -1279,8 +1279,91 @@ pub fn convert_extglob_to_perl_regex_impl(generator: &Generator, pattern: &str) 
     result
 }
 
+// Decode `$'...'` (ANSI-C quoting) segments embedded in a glob pattern into
+// their literal characters. Bash strings are NUL-terminated internally, so a
+// decoded segment is truncated at the first NUL (e.g. `$'x\x00y'` -> "x",
+// making `*$'\x00'*` an always-true `**` pattern).
+fn decode_ansi_c_segments(pattern: &str) -> String {
+    let mut out = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek() == Some(&'\'') {
+            chars.next(); // consume opening quote
+            let mut decoded = String::new();
+            let mut truncated = false;
+            while let Some(&n) = chars.peek() {
+                if n == '\'' {
+                    chars.next();
+                    break;
+                }
+                chars.next();
+                let ch = if n == '\\' {
+                    match chars.next() {
+                        Some('n') => '\n',
+                        Some('t') => '\t',
+                        Some('r') => '\r',
+                        Some('a') => '\x07',
+                        Some('b') => '\x08',
+                        Some('e') | Some('E') => '\x1b',
+                        Some('f') => '\x0c',
+                        Some('v') => '\x0b',
+                        Some('\\') => '\\',
+                        Some('\'') => '\'',
+                        Some('"') => '"',
+                        Some('x') => {
+                            let mut hex = String::new();
+                            while hex.len() < 2
+                                && chars.peek().map_or(false, |c| c.is_ascii_hexdigit())
+                            {
+                                hex.push(chars.next().unwrap());
+                            }
+                            u32::from_str_radix(&hex, 16)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .unwrap_or('\0')
+                        }
+                        Some('0') => {
+                            let mut oct = String::new();
+                            while oct.len() < 3
+                                && chars.peek().map_or(false, |c| ('0'..='7').contains(c))
+                            {
+                                oct.push(chars.next().unwrap());
+                            }
+                            if oct.is_empty() {
+                                '\0'
+                            } else {
+                                u32::from_str_radix(&oct, 8)
+                                    .ok()
+                                    .and_then(char::from_u32)
+                                    .unwrap_or('\0')
+                            }
+                        }
+                        Some(other) => other,
+                        None => break,
+                    }
+                } else {
+                    n
+                };
+                if ch == '\0' {
+                    truncated = true;
+                } else if !truncated {
+                    decoded.push(ch);
+                }
+            }
+            out.push_str(&decoded);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub fn convert_glob_to_regex_impl(_generator: &Generator, pattern: &str) -> String {
-    let mut result = pattern.to_string();
+    let mut result = if pattern.contains("$'") {
+        decode_ansi_c_segments(pattern)
+    } else {
+        pattern.to_string()
+    };
 
     // Debug output
     //     eprintln!("DEBUG: convert_glob_to_regex called with pattern: '{}'", pattern);

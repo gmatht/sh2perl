@@ -556,6 +556,19 @@ impl Generator {
             }
         }
 
+        // $$ inside reconstructed bash -c strings: every child would see its
+        // own fresh PID, but the source script's $$ names the single main
+        // process. Export the Perl PID so all children resolve consistently.
+        if output.contains("${SH2PERL_PPID}") {
+            let init = "$ENV{SH2PERL_PPID} = $$;\n";
+            let anchor = "our $CHILD_ERROR = 0;\n";
+            if let Some(pos) = output.find(anchor) {
+                output.insert_str(pos + anchor.len(), init);
+            } else {
+                output.insert_str(0, init);
+            }
+        }
+
         // $- (shell option flags): populate once from a real bash, stripping
         // the 'c' flag that bash -c itself adds.
         if output.contains("$ENV{SH2PERL_SHELLOPTS}") {
