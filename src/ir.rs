@@ -4219,6 +4219,36 @@ fn word_iter_to_perl(iter: &IrExpr) -> String {
     }
 }
 
+/// Native `declare`/`typeset` — the SAFE subset only: `declare -A NAME` /
+/// `declare -a NAME` (a bare NAME with no init) renders the empty
+/// hash/array declaration `my %NAME = ();` / `my @NAME = ();`. Everything
+/// else (integer/readonly/export attributes, `NAME=(…)` array literals,
+/// `-p`/`-f`/`-n` forms) is REFUSED (false, no emit) and keeps the bash -c
+/// fallback — `-i` changes later-assignment semantics and `-r` forbids
+/// reassignment, neither of which a plain `my` decl expresses.
+fn try_native_declare_stmt(out: &mut String, indent: usize, words: &[&IrExpr]) -> bool {
+    if words.len() != 2 {
+        return false;
+    }
+    let (f, name) = match (&words[0], &words[1]) {
+        (IrExpr::Str(f, _), IrExpr::Str(n, _)) => (f.as_str(), n.as_str()),
+        _ => return false,
+    };
+    let sigil = match f {
+        "-A" => '%',
+        "-a" => '@',
+        _ => return false,
+    };
+    if !crate::shared_utils::SharedUtils::is_variable_name(name) {
+        return false;
+    }
+    emit_indent(out, indent);
+    out.push_str(&format!("my {sigil}{name} = ();\n"));
+    emit_indent(out, indent);
+    out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+    true
+}
+
 /// Lower a modern-IR `exec` Call in statement position.
 fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
     let (cmd, mut words) = match call {
@@ -4542,6 +4572,7 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             emit_indent(out, indent);
             out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
         }
+        "declare" | "typeset" if try_native_declare_stmt(out, indent, &words) => {}
         _ => {
             // External command — first try the AST Generator's in-Perl
             // emulation (verified-safe commands only: native Perl, no bash
