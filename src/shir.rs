@@ -35582,6 +35582,20 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         );
     }
 
+    /// `ls <literal args> 2>/dev/null || echo FALLBACK` lowers to a native
+    /// file/dir listing with a missing-operand fallback (no bash -c).
+    #[test]
+    fn ls_or_echo_lowers_native() {
+        let src = "ls a.txt b.txt 2>/dev/null || echo \"No test files found\"\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("readdir") && !perl.contains("system('bash'"),
+            "ls || echo should be a native listing, not a shell-out: {perl}"
+        );
+    }
+
     /// `printf LITERAL | sort` lowers natively (no bash -c): the content is
     /// a known literal, so sort is a pure in-Perl text op.
     #[test]

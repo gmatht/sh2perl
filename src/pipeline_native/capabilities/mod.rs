@@ -3,6 +3,7 @@ pub(crate) mod cat;
 pub(crate) mod cmp;
 pub(crate) mod grep;
 pub(crate) mod head;
+pub(crate) mod ls;
 pub(crate) mod sort;
 pub(crate) mod tail;
 pub(crate) mod wc;
