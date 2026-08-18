@@ -712,13 +712,32 @@ fn needs_shell_quoting_literal(s: &str) -> bool {
         || s.contains('$')
 }
 
+// True when a literal would be quoted solely because of glob metacharacters
+// (* ? [ ]).  A bare (unquoted) glob in the source must stay unquoted in the
+// reconstructed command so bash expands it — quoting `*.txt` would make grep
+// look for a file literally named "*.txt".
+fn quoting_only_for_globs(s: &str) -> bool {
+    let stripped: String = s
+        .chars()
+        .filter(|c| !matches!(c, '*' | '?' | '[' | ']'))
+        .collect();
+    stripped.len() != s.len() && !needs_shell_quoting_literal(&stripped)
+}
+
 fn word_to_bash_string(word: &Word) -> String {
     match word {
-        Word::Literal(s, _) => {
+        Word::Literal(s, quoted) => {
             // Preserve original quoting where possible. If the literal was
             // originally double-quoted, keep it so inner bash -c invocations
             // still perform variable expansions.
             if s.starts_with('"') && s.ends_with('"') {
+                return s.clone();
+            }
+
+            // A bare word that only needs quoting because of glob
+            // metacharacters was an unquoted glob in the source; keep it
+            // bare so bash expands it the same way.
+            if quoted.is_none() && quoting_only_for_globs(s) {
                 return s.clone();
             }
 
@@ -1108,6 +1127,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                                 output.push_str(&generator.indent());
                                 output.push_str(&format!("print \"declare -- {}\\\n\";\n", var));
                             }
+                            i += 1;
                         } else {
                             // Check if it's an assignment (var=value)
                             if opt.contains('=') {

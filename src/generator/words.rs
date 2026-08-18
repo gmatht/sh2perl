@@ -475,7 +475,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                                             let grep_output = crate::generator::commands::grep::generate_grep_command(
                                                 generator, simple_cmd, &format!("${}", "input_data"), &unique_id.to_string(), false,
                                             );
-                                            Some(format!("do {{ {} {} }}", input_data, grep_output))
+                                            Some(format!(
+                                                "do {{ {} {} $grep_result_{}; }}",
+                                                input_data, grep_output, unique_id
+                                            ))
                                         }
                                         _ => None,
                                     }

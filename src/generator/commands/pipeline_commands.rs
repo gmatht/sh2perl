@@ -2388,19 +2388,18 @@ fn generate_buffered_pipeline(
             output.push_str(&format!("    waitpid $__pid_{id}, 0;\n", id = unique_id));
             output.push_str(&generator.indent());
             output.push_str("    $CHILD_ERROR = $? >> 8;\n");
-            output.push_str(&generator.indent());
-            output.push_str(&format!("    chomp $__out_{id};\n", id = unique_id));
+            if !should_print {
+                // Command-substitution semantics: strip the trailing newline.
+                output.push_str(&generator.indent());
+                output.push_str(&format!("    chomp $__out_{id};\n", id = unique_id));
+            }
             output.push_str(&generator.indent());
             output.push_str(&format!("    $__out_{id};\n", id = unique_id));
             output.push_str(&generator.indent());
             output.push_str("};\n");
             if should_print {
-                let print_stmt = IrStmt::Output {
-                    value: IrExpr::Var(format!("output_{}", unique_id), Some(Sigil::Scalar)),
-                    newline: true,
-                    target: None,
-                };
-                output.push_str(&stmt_to_perl(&print_stmt, 0));
+                output.push_str(&generator.indent());
+                output.push_str(&format!("print $output_{};\n", unique_id));
             } else {
                 output.push_str(&format!("do {{ $output_{} }}\n", unique_id));
             }
@@ -2428,26 +2427,27 @@ fn generate_buffered_pipeline(
             let unique_id = generator.get_unique_id();
             let output_var = format!("output_{}", unique_id);
 
-            // Build a clean IR statement for pipeline capture.
-            let pipeline_stmt = IrStmt::Pipeline {
-                stages: vec![],  // Not used when capture is set
-                last_output: None,
-                capture: Some(output_var.clone()),
-                cmd_str: Some(reconstructed_cmd),
-            };
-            output.push_str(&stmt_to_perl(&pipeline_stmt, 0));
-
             if should_print {
-                // For top-level pipelines, print the captured output with a trailing newline.
-                // Use `print $var, "\n";` which is idiomatic Perl and avoids the
-                // verbose `if (... ne q{} && !defined ...) { print ...; if (!... =~ m{\n\z})` dance.
-                let print_stmt = IrStmt::Output {
-                    value: IrExpr::Var(output_var.clone(), Some(Sigil::Scalar)),
-                    newline: true,
-                    target: None,
-                };
-                output.push_str(&stmt_to_perl(&print_stmt, 0));
+                // For top-level pipelines, print the captured output verbatim.
+                // bash prints exactly what the pipeline emitted; chomping and
+                // unconditionally re-adding "\n" would print a spurious blank
+                // line when the pipeline emits nothing at all.
+                output.push_str(&format!(
+                    "my ${} = {};\n",
+                    output_var,
+                    crate::ir::cmd_str_to_open_perl_raw(&reconstructed_cmd)
+                ));
+                output.push_str(&format!("print ${};\n", output_var));
             } else {
+                // Build a clean IR statement for pipeline capture (chomped,
+                // matching command-substitution semantics).
+                let pipeline_stmt = IrStmt::Pipeline {
+                    stages: vec![],  // Not used when capture is set
+                    last_output: None,
+                    capture: Some(output_var.clone()),
+                    cmd_str: Some(reconstructed_cmd),
+                };
+                output.push_str(&stmt_to_perl(&pipeline_stmt, 0));
                 // For command substitution, emit the captured variable as the last expression
                 // so the do{...} returns it.  The backend's Pipeline { capture } emits
                 // `my $var = qx{...}; chomp $var;` which are statements, not expressions,

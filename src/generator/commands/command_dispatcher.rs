@@ -1107,6 +1107,13 @@ pub fn generate_command_impl_with_input(
                                         newline: true,
                                         target: Some("fh".to_string()),
                                     };
+                                    // Scope $fh in a block: several of these
+                                    // fast-path writes can land in the same
+                                    // enclosing scope, and repeated `my $fh`
+                                    // triggers "masks earlier declaration"
+                                    // warnings on stderr.
+                                    result.push_str(&generator.indent());
+                                    result.push_str("{\n");
                                     result.push_str(&generator.indent());
                                     result.push_str(&format!(
                                         "open my $fh, '>', {} or die \"{}: $!\\n\";\n",
@@ -1116,6 +1123,8 @@ pub fn generate_command_impl_with_input(
                                     result.push_str(&stmt_to_perl(&output_stmt, generator.indent_level));
                                     result.push_str(&generator.indent());
                                     result.push_str("close $fh;\n");
+                                    result.push_str(&generator.indent());
+                                    result.push_str("}\n");
                                     // Skip the rest of the redirect handler
                                     return result;
                                 }
@@ -1379,6 +1388,14 @@ pub fn generate_command_impl_with_input(
                         generator.indent_level -= 1;
                         result.push_str(&generator.indent());
                         result.push_str("};\n");
+                        // Builtins assemble their result with join "\n" (no
+                        // trailing newline), but the real commands write
+                        // complete lines; without this the redirected file's
+                        // last line has no "\n" and `wc -l` undercounts.
+                        result.push_str(&generator.indent());
+                        result.push_str(
+                            "if ($tmp ne q{} && $tmp !~ m{\\n\\z}) { $tmp .= \"\\n\"; }\n",
+                        );
                         result.push_str(&generator.indent());
                         result.push_str("print $tmp;\n");
 

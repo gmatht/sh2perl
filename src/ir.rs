@@ -1412,6 +1412,19 @@ pub(crate) fn cmd_str_to_open_perl(cmd: &str) -> String {
     )
 }
 
+/// Like `cmd_str_to_open_perl`, but WITHOUT the trailing `chomp`.  Used when
+/// the captured pipeline output is printed verbatim (top-level pipelines):
+/// bash prints exactly what the pipeline emitted, so stripping a trailing
+/// newline and unconditionally re-adding one would print a spurious blank
+/// line for pipelines that emit nothing.
+pub(crate) fn cmd_str_to_open_perl_raw(cmd: &str) -> String {
+    let quoted = safe_perl_q_string(cmd);
+    format!(
+        "do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', {}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }}",
+        quoted
+    )
+}
+
 /// Pick a safe Perl `q<delim>...<delim>` delimiter for a string that may
 /// contain arbitrary characters.  Returns a properly delimited Perl literal.
 pub(crate) fn safe_perl_q_string(s: &str) -> String {
