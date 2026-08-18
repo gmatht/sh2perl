@@ -2310,6 +2310,104 @@ fn generate_buffered_pipeline(
         has_heredoc_redirect(cmd)
     });
 
+    // Pipelines whose first stage is a shell control-flow construct (e.g.
+    // `for k in "${!map[@]}"; do ...; done | sort`) cannot be reconstructed
+    // as a bash string: the construct reads Perl-side variables that a
+    // `bash -c` subprocess would never see.  Generate the construct natively
+    // with STDOUT captured into a scalar, then feed that text through the
+    // remaining (serializable) pipeline stages.
+    if !has_output_redirect_early
+        && !has_heredoc
+        && pipeline.commands.len() >= 2
+        && matches!(
+            pipeline.commands[0],
+            Command::For(_)
+                | Command::While(_)
+                | Command::If(_)
+                | Command::Case(_)
+                | Command::CStyleFor(_)
+                | Command::Block(_)
+        )
+    {
+        let rest = Pipeline {
+            commands: pipeline.commands[1..].to_vec(),
+            source_text: None,
+            stdout_used: pipeline.stdout_used,
+            stderr_used: pipeline.stderr_used,
+        };
+        let rest_cmd = generator.generate_command_string_for_system(&Command::Pipeline(rest));
+        if !rest_cmd.is_empty() && !rest_cmd.contains("Complex command not supported") {
+            let unique_id = generator.get_unique_id();
+            let head_code = generator.generate_command(&pipeline.commands[0]);
+            output.push_str(&generator.indent());
+            output.push_str(&format!("my $output_{} = do {{\n", unique_id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    my $__head_buf_{} = q{{}};\n", unique_id));
+            output.push_str(&generator.indent());
+            output.push_str("    {\n");
+            output.push_str(&generator.indent());
+            output.push_str("        local *STDOUT;\n");
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "        open STDOUT, '>', \\$__head_buf_{} or die \"Cannot capture STDOUT: $!\\n\";\n",
+                unique_id
+            ));
+            for line in head_code.lines() {
+                output.push_str(&generator.indent());
+                output.push_str("        ");
+                output.push_str(line);
+                output.push('\n');
+            }
+            output.push_str(&generator.indent());
+            output.push_str("        close STDOUT;\n");
+            output.push_str(&generator.indent());
+            output.push_str("    }\n");
+            output.push_str(&generator.indent());
+            output.push_str("    require IPC::Open2;\n");
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "    my $__pid_{id} = IPC::Open2::open2(my $__rd_{id}, my $__wr_{id}, 'bash', '-c', {cmd});\n",
+                id = unique_id,
+                cmd = crate::ir::safe_perl_q_string(&rest_cmd)
+            ));
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "    print {{$__wr_{id}}} $__head_buf_{id};\n",
+                id = unique_id
+            ));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    close $__wr_{id};\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!(
+                "    my $__out_{id} = do {{ local $/; <$__rd_{id}> }} // q{{}};\n",
+                id = unique_id
+            ));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    close $__rd_{id};\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    waitpid $__pid_{id}, 0;\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str("    $CHILD_ERROR = $? >> 8;\n");
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    chomp $__out_{id};\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str(&format!("    $__out_{id};\n", id = unique_id));
+            output.push_str(&generator.indent());
+            output.push_str("};\n");
+            if should_print {
+                let print_stmt = IrStmt::Output {
+                    value: IrExpr::Var(format!("output_{}", unique_id), Some(Sigil::Scalar)),
+                    newline: true,
+                    target: None,
+                };
+                output.push_str(&stmt_to_perl(&print_stmt, 0));
+            } else {
+                output.push_str(&format!("do {{ $output_{} }}\n", unique_id));
+            }
+            return output;
+        }
+    }
+
     // Only take the clean path when there are no output redirects and no heredocs.
     // Also skip if the pipeline has a source-text comment but no actual commands
     // (the old code handles edge cases with better fidelity).

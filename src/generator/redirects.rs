@@ -1073,6 +1073,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             if opt.contains('p') {
                                 is_print = true;
                             }
+                            i += 1;
                             continue;
                         }
                         // Handle declare -p (print variable definition)
