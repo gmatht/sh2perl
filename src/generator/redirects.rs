@@ -1593,7 +1593,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                             .replace("\\", "\\\\")
                             .replace("\'", "\\\'");
                         output.push_str(&format!(
-                            "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = do {{ open(my $__fh, \'-|\', \'sh\', \'-c\', \'{} 2>&1\') or croak \"cmd: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $_r; }}; print $end_out if $end_out ne q{{}}; }}\n",
+                            "END {{ local $INPUT_RECORD_SEPARATOR = undef; my $end_out = do {{ open(my $__fh, \'-|\', \'sh\', \'-c\', \'{} 2>&1\') or croak \"cmd: $!\"; local $/; my $_r = <$__fh> // q{{}}; $_r =~ s/\\n+\\z//; close $__fh; $_r; }}; print $end_out if $end_out ne q{{}}; }}\n",
                             handler_perl_escaped
                         ));
                     } else if signal_name == "DEBUG" {

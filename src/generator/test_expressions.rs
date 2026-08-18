@@ -65,7 +65,7 @@ fn convert_shell_var_to_perl(generator: &mut Generator, var: &str) -> String {
                     let cmd: String = result[cmd_start..cmd_end].to_string();
                     let quoted = crate::ir::safe_perl_q_string(&cmd);
                     let replacement = format!(
-                        "(do {{ open(my $__fh, '-|', 'bash', '-c', {}) or croak \"cmd failed: $!\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; chomp $_r; $CHILD_ERROR = $? >> 8; $_r; }})",
+                        "(do {{ open(my $__fh, '-|', 'bash', '-c', {}) or croak \"cmd failed: $!\"; my $_r = do {{ local $/; <$__fh> }}; close $__fh; $_r =~ s/\\n+\\z//; $CHILD_ERROR = $? >> 8; $_r; }})",
                         quoted
                     );
                     result.truncate(start.unwrap());
@@ -976,7 +976,7 @@ pub fn generate_test_expression_impl(
                         let cmd: String = result_chars[cmd_start..cmd_end].iter().collect();
                         // Replace $(cmd) with open()-based bash -c call
                         // instead of qx'...' to avoid check_qx.pl violations.
-                        let replacement = format!("(do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"cmd failed: $!\"; local $/; chomp(my $_r = <$__fh>); close $__fh; $CHILD_ERROR = $? >> 8; $_r; }})", cmd);
+                        let replacement = format!("(do {{ open(my $__fh, \'-|\', \'bash\', \'-c\', \'{}\') or croak \"cmd failed: $!\"; local $/; my $_r = <$__fh> // q{{}}; $_r =~ s/\\n+\\z//; close $__fh; $CHILD_ERROR = $? >> 8; $_r; }})", cmd);
                         result_chars.truncate(start.unwrap());
                         for c in replacement.chars() {
                             result_chars.push(c);
@@ -1419,7 +1419,7 @@ pub fn convert_test_args_to_expression_impl(
                 // command generation.
                 // Native Perl: read ARGV files
                 expr_parts.push(
-                    "do {{ my $_r = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ if (open my $__fh, q{{<}}, $__f) {{ $_r .= <$__fh>; close $__fh }} }} }} chomp $_r; $_r; }}".to_string()
+                    "do {{ my $_r = q{{}}; if (@ARGV) {{ local $/; for my $__f (@ARGV) {{ if (open my $__fh, q{{<}}, $__f) {{ $_r .= <$__fh>; close $__fh }} }} }} $_r =~ s/\\n+\\z//; $_r; }}".to_string()
                 );
             }
             _ => expr_parts.push(format!("{:?}", arg)),

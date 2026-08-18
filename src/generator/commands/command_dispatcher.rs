@@ -1109,6 +1109,8 @@ pub fn generate_command_impl_with_input(
                                 if let Some(redirect) = all_redirects.iter().find(|r| {
                                     matches!(r.operator, RedirectOperator::Output)
                                 }) {
+                                    let target_is_literal =
+                                        matches!(&redirect.target, Word::Literal(_, _));
                                     let target_str = match &redirect.target {
                                         Word::Literal(s, _) => s.clone(),
                                         _ => generator.word_to_perl(&redirect.target),
@@ -1117,9 +1119,16 @@ pub fn generate_command_impl_with_input(
                                         .filter_map(|a| is_simple_literal_arg(a))
                                         .collect::<Vec<_>>()
                                         .join(" ");
-                                    let target_lit = generator.perl_string_literal(
-                                        &Word::literal(target_str.clone()),
-                                    );
+                                    // Convert the target word ONCE — re-quoting
+                                    // an already-converted Perl expression turns
+                                    // "$tmpf" into a literal filename.
+                                    let target_lit =
+                                        generator.perl_string_literal(&redirect.target);
+                                    let die_desc = if target_is_literal {
+                                        target_str.clone()
+                                    } else {
+                                        "Cannot write file".to_string()
+                                    };
                                     let expr = IrExpr::Str(content, StrStyle::DoubleQuoted);
                                     let output_stmt = IrStmt::Output {
                                         value: expr,
@@ -1137,7 +1146,7 @@ pub fn generate_command_impl_with_input(
                                     result.push_str(&format!(
                                         "open my $fh, '>', {} or die \"{}: $!\\n\";\n",
                                         target_lit,
-                                        target_str
+                                        die_desc.replace('\\', "").replace('"', "")
                                     ));
                                     result.push_str(&stmt_to_perl(&output_stmt, generator.indent_level));
                                     result.push_str(&generator.indent());

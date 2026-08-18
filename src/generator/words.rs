@@ -333,7 +333,7 @@ fn generate_shell_command_substitution(generator: &mut Generator, cmd: &Command)
 
     let (in_var, out_var, err_var, pid_var, _result_var) = generator.get_unique_ipc_vars();
     format!(
-        "do {{\n{}    my ({}, {});\n    my $pid = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid $pid, 0;\n    $CHILD_ERROR = $? >> 8;\n    chomp $result;\n    $result;\n}}",
+        "do {{\n{}    my ({}, {});\n    my $pid = open3({}, {}, '>&STDERR', 'bash', '-c', {});\n    close {} or croak 'Close failed: $OS_ERROR';\n    my $result = do {{ local $INPUT_RECORD_SEPARATOR = undef; <{}> }};\n    close {} or croak 'Close failed: $OS_ERROR';\n    waitpid $pid, 0;\n    $CHILD_ERROR = $? >> 8;\n    $result =~ s/\\n+\\z// if defined $result;\n    $result;\n}}",
         env_setup,
         in_var,
         out_var,
@@ -2354,13 +2354,17 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
             // Only skip wrapping when the result already chomps at the TOP level
             // (e.g. bash -c fallback uses `chomp $_r`).  Do NOT skip for internal
             // chomps used inside file-reading loops like `chomp $line`.
-            let has_top_chomp = result.contains("chomp $_r") || result.contains("chomp(my $_r") || result.contains("chomp(my $__r");
+            let has_top_chomp = result.contains("chomp $_r")
+                || result.contains("chomp(my $_r")
+                || result.contains("chomp(my $__r")
+                || result.contains("$_r =~ s/\\n+\\z//")
+                || result.contains("$__cs =~ s/\\n+\\z//");
             if !has_top_chomp && (trimmed.starts_with("do {") || trimmed.starts_with("{")) {
                 // Already a do/block: wrap the whole thing so we can chomp its value.
-                format!("do {{ my $__cs = {}; chomp $__cs; $__cs; }}", result)
+                format!("do {{ my $__cs = {}; $__cs =~ s/\\n+\\z//; $__cs; }}", result)
             } else if !has_top_chomp {
                 // Simple expression: wrap in do-block with chomp
-                format!("do {{ my $__cs = {}; chomp $__cs; $__cs; }}", result)
+                format!("do {{ my $__cs = {}; $__cs =~ s/\\n+\\z//; $__cs; }}", result)
             } else {
                 // Result already has its own chomp handling (e.g. bash -c path)
                 result
@@ -2847,6 +2851,10 @@ pub fn convert_string_interpolation_to_perl_impl(
                             // prelude populates $ENV{SH2PERL_SHELLOPTS} from a
                             // real bash when referenced.
                             current_string.push_str("$ENV{SH2PERL_SHELLOPTS}");
+                        } else if var == "$" {
+                            // $$ (PID): use a plain scalar the string escaper
+                            // leaves alone; the prelude defines my $__pid = $$.
+                            current_string.push_str("$__pid");
                         } else if var == "?" {
                             // Shell's $? is the exit code (0-255), but Perl's $? is
                             // the raw 16-bit wait status (exit_code << 8).  Translate
@@ -2864,7 +2872,7 @@ pub fn convert_string_interpolation_to_perl_impl(
                             current_string.push_str("$ENV{SH2PERL_SHELLOPTS}");
                         } else if generator.declared_locals.contains(var)
                             || generator.function_level_vars.contains(var)
-                            || matches!(var.as_str(), "#" | "@" | "*" | "0" | "$")
+                            || matches!(var.as_str(), "#" | "@" | "*" | "0")
                         {
                             // Regular declared variable - add directly for interpolation
                             // Use ${var} syntax to prevent merging with adjacent literal text

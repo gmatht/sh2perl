@@ -545,6 +545,17 @@ impl Generator {
             output.push('\n');
         }
 
+        // $$ (PID): interpolations reference a plain scalar $__pid.
+        if output.contains("$__pid") {
+            let init = "my $__pid = $$;\n";
+            let anchor = "our $CHILD_ERROR = 0;\n";
+            if let Some(pos) = output.find(anchor) {
+                output.insert_str(pos + anchor.len(), init);
+            } else {
+                output.insert_str(0, init);
+            }
+        }
+
         // $- (shell option flags): populate once from a real bash, stripping
         // the 'c' flag that bash -c itself adds.
         if output.contains("$ENV{SH2PERL_SHELLOPTS}") {

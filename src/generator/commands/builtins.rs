@@ -1446,7 +1446,7 @@ fn generate_system_call_fallback(
         format!("$CHILD_ERROR = system({}) >> 8;\n", all_args)
     } else if input_var.is_empty() {
         format!(
-            "\n${{{out_name}}} = do {{ open(my $__fh, '-|', {}) or croak \"failed: $ERRNO\"; chomp(my $_r = do {{ local $/; <$__fh> }}); close $__fh; $_r; }};\n",
+            "\n${{{out_name}}} = do {{ open(my $__fh, '-|', {}) or croak \"failed: $ERRNO\"; my $_r = do {{ local $/; <$__fh> }}; $_r =~ s/\\n+\\z//; close $__fh; $_r; }};\n",
             all_args,
             out_name = out_name,
         )
