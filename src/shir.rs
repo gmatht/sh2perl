@@ -35582,6 +35582,19 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         );
     }
 
+    /// `unset VAR` lowers to a native type-agnostic undef (no bash -c).
+    #[test]
+    fn unset_lowers_native_undef() {
+        let src = "unset maybe\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("no strict 'refs'") && !perl.contains("system('bash'"),
+            "unset should be a native undef, not a shell-out: {perl}"
+        );
+    }
+
     /// `ls <literal args> 2>/dev/null || echo FALLBACK` lowers to a native
     /// file/dir listing with a missing-operand fallback (no bash -c).
     #[test]

@@ -6,5 +6,7 @@ pub(crate) mod head;
 pub(crate) mod ls;
 pub(crate) mod sort;
 pub(crate) mod tail;
+pub(crate) mod typeset;
+pub(crate) mod unset;
 pub(crate) mod wc;
 
