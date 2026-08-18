@@ -4094,6 +4094,61 @@ fn native_cat_heredoc(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<Stri
     ))
 }
 
+fn native_cmp_boolean(words: &[&IrExpr]) -> Option<String> {
+    // cmp -s [-n N] F1 F2 — silent byte compare (exit 0 iff the files are
+    // equal). Only the SILENT form is lifted (bare `cmp` prints a differ
+    // message we won't reproduce); -l/-b/-i and non-literal paths refuse.
+    let mut quiet = false;
+    let mut limit: Option<i64> = None;
+    let mut files: Vec<&IrExpr> = Vec::new();
+    let mut it = words.iter();
+    while let Some(w) = it.next() {
+        match w {
+            IrExpr::Str(s, _) if s == "-s" => quiet = true,
+            IrExpr::Str(s, _) if s == "-n" => {
+                limit = it
+                    .next()
+                    .and_then(|v| grep_lit_str(v))
+                    .and_then(|v| v.parse().ok())
+                    .or(limit);
+            }
+            IrExpr::Str(s, _) if s.starts_with('-') => return None,
+            _ => files.push(w),
+        }
+    }
+    if !quiet || files.len() != 2 {
+        return None;
+    }
+    let f1 = grep_lit_str(files[0])?;
+    let f2 = grep_lit_str(files[1])?;
+    if f1.contains('*') || f2.contains('*') {
+        return None;
+    }
+    let p1 = safe_perl_q_string(&f1);
+    let p2 = safe_perl_q_string(&f2);
+    let compare = match limit {
+        Some(n) => format!("substr($__c1,0,{n}) eq substr($__c2,0,{n})"),
+        None => "$__c1 eq $__c2".to_string(),
+    };
+    Some(format!(
+        "(sub {{ open(my $__f1,'<',{p1}) && open(my $__f2,'<',{p2}) or return 0; local $/; my $__c1=<$__f1>; my $__c2=<$__f2>; close $__f1; close $__f2; return ({compare}) ? 1 : 0; }}->())",
+        p1 = p1,
+        p2 = p2,
+        compare = compare
+    ))
+}
+
+
+/// Condition-position `cmp -s F1 F2`: the exec cond is `exec(cmp,[-s,F1,F2])`;
+/// return the files-equal boolean (reuses native_cmp_boolean).
+fn native_cmp_condition(call: &IrExpr) -> Option<String> {
+    let IrExpr::Call { func, args } = call else { return None };
+    if !matches!(func.as_str(), "exec" | "builtin") { return None; }
+    if !matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "cmp") { return None; }
+    let words: Vec<&IrExpr> = exec_word_args(args);
+    native_cmp_boolean(&words)
+}
+
 fn exec_call_to_cmd(call: &IrExpr) -> Option<String> {
     if let IrExpr::Call { func, args } = call {
         if func == "exec" || func == "builtin" {
@@ -4479,6 +4534,14 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         }
         _ => true,
     });
+    if cmd == "cmp" {
+        if let Some(b) = native_cmp_boolean(&words) {
+            emit_indent(out, indent);
+            out.push_str(&format!("$main_exit_code = $CHILD_ERROR = ({b}) ? 0 : 1;\n"));
+            return;
+        }
+        // else fall through: 'cmp' has no native arm -> default shell-out
+    }
     match cmd.as_str() {
         "echo" => emit_echo(out, &words, indent),
         "printf" => {
@@ -6364,7 +6427,9 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // (grep over many/globbed files or with output-
                     // producing flags -c/-l/-m/-b/-n/-A… is NOT a boolean
                     // and stays a shell-out).
-                    if let Some(native) = try_native_grep_test(expr) {
+                    if let Some(native) = native_cmp_condition(expr) {
+                        native
+                    } else if let Some(native) = try_native_grep_test(expr) {
                         native
                     } else {
                         match exec_call_to_cmd(expr) {
