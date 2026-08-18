@@ -33,6 +33,9 @@ pub trait ExtNode: std::fmt::Debug {
     /// Clone-erasure so `Box<dyn ExtNode>` can be `Clone` (needed by the
     /// `IrStmt::Ext` variant's `#[derive(Clone)]`).
     fn clone_box(&self) -> Box<dyn ExtNode>;
+    /// Type-erased downcast (the per-backend render registries downcast by
+    /// tag to the concrete generated struct).
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 // The `IrStmt` enum derives Debug/Clone/PartialEq; the `Ext(Box<dyn
@@ -160,5 +163,68 @@ mod tests {
             "Ext node survived the A1 round-trip: {json}"
         );
         assert_eq!(back_ext.unwrap()["var"], "i");
+    }
+
+    /// The per-backend (perl) drop-in render registry, end to end: an
+    /// IrStmt::Ext(CountedFor) is rendered by render_ext's generated
+    /// dispatch → the CountedFor handler → children rendered recursively via
+    /// the perl renderer's own emitters (ir_expr_to_perl for the cond,
+    /// emit_stmt for the body). The emitted perl actually RUNS and prints
+    /// the counted loop's output.
+    #[test]
+    fn ext_node_renders_and_runs_on_perl() {
+        use crate::ir::IrProgram;
+        use std::process::Command;
+        let ext = IrStmt::Ext(Box::new(CountedFor {
+            var: "i".to_string(),
+            init: 0,
+            step: 1,
+            cond: crate::ir::IrExpr::Int(5),
+            body: vec![
+                IrStmt::Expr(crate::ir::IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        crate::ir::IrExpr::Str("echo".to_string(), crate::ir::StrStyle::DoubleQuoted),
+                        crate::ir::IrExpr::Array(vec![crate::ir::IrExpr::Var("i".to_string(), None)]),
+                    ],
+                }),
+            ],
+        }));
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![ext],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("for (my $i = 0; $i < 5; $i += 1) {"),
+            "CountedFor should render a native perl loop: {perl}"
+        );
+        // run it — the body echo (recursively emitted) prints 0..4
+        let out = Command::new("perl")
+            .arg("-e")
+            .arg(&perl)
+            .output()
+            .expect("perl");
+        assert!(
+            out.status.success(),
+            "rendered perl must run: {}\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            perl
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout,
+            "0\n1\n2\n3\n4\n",
+            "counted loop ran: {stdout}"
+        );
     }
 }
