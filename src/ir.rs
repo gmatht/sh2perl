@@ -1780,7 +1780,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                         // `printf … | sort/head/tail/wc`), otherwise rebuild
                         // the shell command string and run it via bash -c
                         // (matches bash stdout by running the same tools).
-                        if let Some(s) = native_literal_pipeline(e) {
+                        if let Some(s) = crate::pipeline_native::native_pipeline(e) {
                             out.push_str(&s);
                             out.push('\n');
                             return;
@@ -3863,7 +3863,7 @@ fn try_native_grep_test(call: &IrExpr) -> Option<String> {
 /// Extract a literal string from a pattern/file arg: a `Str`, a `Num`, or
 /// an `Interpolate` whose parts are all literal text. Variables/arith /
 /// captures → None (refuse).
-fn grep_lit_str(e: &IrExpr) -> Option<String> {
+pub(crate) fn grep_lit_str(e: &IrExpr) -> Option<String> {
     match e {
         IrExpr::Str(s, _) => Some(s.clone()),
         IrExpr::Int(n) => Some(n.to_string()),
@@ -3944,121 +3944,6 @@ fn native_grep_chain(e: &IrExpr) -> Option<String> {
     ))
 }
 
-fn native_literal_pipeline(e: &IrExpr) -> Option<String> {
-    let IrExpr::Call { func, args } = e else { return None };
-    if func != "pipeline" { return None; }
-    let [IrExpr::Array(stages)] = args.as_slice() else { return None; };
-    if stages.len() != 2 { return None; }
-    let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else { return None; };
-    let content = pipe_printf_content(s1)?;
-    let (cmd, words) = pipe_cmd_and_words(s2)?;
-    let cp = safe_perl_q_string(&content);
-    match cmd.as_str() {
-        "sort" => {
-            let body = sort_body(&words)?;
-            Some(format!(
-                "my @__pl = split(/\\n/, {}); pop @__pl if @__pl && $__pl[$#__pl] eq ''; @__pl = {}; print(join(\"\\n\", @__pl), \"\\n\"); $main_exit_code = $CHILD_ERROR = 0;",
-                cp, body
-            ))
-        }
-        "head" | "tail" => {
-            let n = exact_num(&words, "-c")?;
-            let off = if cmd == "head" { format!("0, {n}") } else { format!("-{n}") };
-            Some(format!("print(substr({cp}, {off})); $main_exit_code = $CHILD_ERROR = 0;"))
-        }
-        "wc" => {
-            if words == ["-L"] {
-                Some(format!(
-                    "my $__m = 0; for my $__l (split(/\\n/, {cp})) {{ $__m = $__m < length($__l) ? length($__l) : $__m; }} print $__m, \"\\n\"; $main_exit_code = $CHILD_ERROR = 0;"
-                ))
-            } else if words == ["-l"] {
-                Some(format!(
-                    "my @__pl = split(/\\n/, {cp}); print scalar(@__pl), \"\\n\"; $main_exit_code = $CHILD_ERROR = 0;"
-                ))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn pipe_printf_content(s: &[IrStmt]) -> Option<String> {
-    let [IrStmt::Expr(e)] = s else { return None };
-    let IrExpr::Call { func, args } = e else { return None };
-    if !matches!(func.as_str(), "exec" | "builtin") { return None; }
-    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return None; };
-    if cmd != "printf" { return None; }
-    if words.len() != 1 { return None; }
-    let fmt = grep_lit_str(&words[0])?;
-    if fmt.contains('%') { return None; }
-    Some(printf_unescape(&fmt))
-}
-
-fn pipe_cmd_and_words(s: &[IrStmt]) -> Option<(String, Vec<String>)> {
-    let [IrStmt::Expr(e)] = s else { return None };
-    let IrExpr::Call { func, args } = e else { return None };
-    if !matches!(func.as_str(), "exec" | "builtin") { return None; }
-    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return None; };
-    if !matches!(cmd.as_str(), "sort" | "head" | "tail" | "wc") { return None; }
-    let words: Vec<String> = words.iter().filter_map(|w| grep_lit_str(w)).collect();
-    Some((cmd.clone(), words))
-}
-
-fn sort_body(words: &[String]) -> Option<String> {
-    let (mut num, mut rev, mut fold) = (false, false, false);
-    for w in words {
-        let f = w.strip_prefix('-')?;
-        for c in f.chars() {
-            match c {
-                'n' => num = true,
-                'r' => rev = true,
-                'f' => fold = true,
-                _ => return None,
-            }
-        }
-    }
-    let op = if num { "<=>" } else { "cmp" };
-    let cmp = if fold { format!("lc($a) {op} lc($b)") } else { format!("$a {op} $b") };
-    let base = format!("sort {{ {cmp} }} @__pl");
-    if rev { Some(format!("reverse({base})")) } else { Some(base) }
-}
-
-fn exact_num(words: &[String], opt: &str) -> Option<i64> {
-    let mut n = None;
-    let mut it = words.iter();
-    while let Some(w) = it.next() {
-        if w == opt {
-            n = it.next().and_then(|v| v.parse().ok());
-        } else if !w.starts_with('-') {
-            return None;
-        }
-    }
-    n
-}
-
-fn printf_unescape(s: &str) -> String {
-    let mut out = String::new();
-    let mut it = s.chars();
-    while let Some(c) = it.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match it.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('\\') => out.push('\\'),
-            Some(o) => {
-                out.push('\\');
-                out.push(o);
-            }
-            None => {}
-        }
-    }
-    out
-}
 
 /// `cat <<'EOF' … EOF` (and the unquoted form with a fully-literal body)
 /// is the canonical print-heredoc idiom: cat with no args and a single
