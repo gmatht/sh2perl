@@ -1381,7 +1381,14 @@ pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
 
 pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
     match stmt {
-        IrStmt::Ext(_) => { emit_indent(out, indent); out.push_str("die \"debashc: shIR Ext node not supported by the Perl backend\\n\";\n"); }
+        IrStmt::Ext(n) => {
+            // per-backend drop-in handlers (render_ext) render transform-
+            // declared nodes; a node with no handler keeps the refusal.
+            if !crate::render_ext::render_ext(out, &**n, indent) {
+                emit_indent(out, indent);
+                out.push_str("die \"debashc: shIR Ext node not supported by the Perl backend\\n\";\n");
+            }
+        }
         IrStmt::RawText(text) => {
             // Splice verbatim — no transformation
             out.push_str(text);
@@ -7493,7 +7500,7 @@ mod tests {
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("grep -q A1 ingress");
         let perl = shir_to_perl(&prog);
         assert!(
-            perl.contains("index($__grep_c, 'world') >= 0"),
+            perl.contains("index($__gl, 'world') >= 0"),
             "grep -q file should render native contains: {perl}"
         );
         assert!(
@@ -7513,7 +7520,7 @@ mod tests {
         let prog = crate::shir_json_in::shir_json_to_ir(src).expect("grep-chain A1 ingress");
         let perl = shir_to_perl(&prog);
         assert!(
-            perl.contains("if ((sub { open(my $__grep_h, '<', '/tmp/shirtest/f.txt')")
+            perl.contains("open(my $__gh, '<', '/tmp/shirtest/f.txt')")
                 && perl.contains("print('found'")
                 && perl.contains("else {"),
             "grep -q chain should lower to native if/else: {perl}"
