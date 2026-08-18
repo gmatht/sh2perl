@@ -887,13 +887,12 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     // strip; double-strip is a no-op).
     let mut stripped = prog.clone();
     crate::shir_passes::strip_cfor(&mut stripped);
-    // builtin-op normalization (shir-builtin-op-20260816): the A1 may
-    // carry `builtin(cmd, args)` ops (the exec-to-builtin transform); the
-    // estree renderer normalizes them back to exec (its dispatch lowers
-    // exec-of-builtin natively). The perl renderer has no builtin arm —
-    // WITHOUT this it dies "not yet supported" (regressed the perl corpus
-    // 373→47). Same pass the estree path runs.
-    crate::transforms::builtin::fallback_builtin_to_exec(&mut stripped);
+    // builtin-op native arm (shir-builtin-op-20260816): the A1 carries
+    // `builtin(cmd, args)` ops (the exec-to-builtin transform). The perl
+    // renderer ACCEPTS the op — emit_stmt's builtin arms (statement,
+    // chain, condition, reconstruction) dispatch native commands to their
+    // Perl emulations and shell out only the still-unsupported remainder.
+    // No erasure: the op is the single native-lowering point.
     let prog = &stripped;
 
     // Run optimization passes before emitting.
@@ -1191,9 +1190,9 @@ pub fn shir_to_perl_embed(prog: &IrProgram, ctx: &EmbedCtx) -> EmbedResult {
     // keeps the shared pass honest).
     let mut stripped = prog.clone();
     crate::shir_passes::strip_cfor(&mut stripped);
-    // builtin-op fallback arm (shir-builtin-op-20260816): the embed
-    // renderer has NOT accepted the `builtin` op — render as exec.
-    crate::transforms::builtin::fallback_builtin_to_exec(&mut stripped);
+    // builtin-op native arm (shir-builtin-op-20260816): the embed renderer
+    // ACCEPTS the op — same builtin arms as the standalone renderer; no
+    // erasure.
     let stmts = optimize_stmts(&stripped.stmts);
 
     // Refuse constructs that only make sense in a standalone program (v1):
@@ -3804,7 +3803,7 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
 /// counts).
 fn try_native_grep_test(call: &IrExpr) -> Option<String> {
     let IrExpr::Call { func, args } = call else { return None };
-    if func != "exec" {
+    if func != "exec" && func != "builtin" {
         return None;
     }
     // command name must be `grep`
@@ -3886,7 +3885,7 @@ fn grep_literal_safe(pat: &str) -> bool {
 /// so it can be a `&&`/`||` chain body without a shell-out.
 fn native_literal_echo(e: &IrExpr) -> Option<String> {
     let IrExpr::Call { func, args } = e else { return None };
-    if func != "exec" {
+    if func != "exec" && func != "builtin" {
         return None;
     }
     if !matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "echo") {
@@ -4099,21 +4098,38 @@ fn try_native_echo_tr_pipeline(out: &mut String, call: &IrExpr, indent: usize) -
     if stage_exprs.len() != 2 {
         return false;
     }
-    let (f0, a0) = match stage_exprs[0] {
+    let a0 = match stage_exprs[0] {
         IrExpr::Arrow(stmts) => match stmts.as_slice() {
-            [IrStmt::Expr(IrExpr::Call { func, args })] => (func.as_str(), args.as_slice()),
+            [IrStmt::Expr(IrExpr::Call { func, args })]
+                if func == "builtin" || func == "exec" =>
+            {
+                args.as_slice()
+            }
             _ => return false,
         },
         _ => return false,
     };
-    let (f1, a1) = match stage_exprs[1] {
+    let a1 = match stage_exprs[1] {
         IrExpr::Arrow(stmts) => match stmts.as_slice() {
-            [IrStmt::Expr(IrExpr::Call { func, args })] => (func.as_str(), args.as_slice()),
+            [IrStmt::Expr(IrExpr::Call { func, args })]
+                if func == "builtin" || func == "exec" =>
+            {
+                args.as_slice()
+            }
             _ => return false,
         },
         _ => return false,
     };
-    // stage 0: echo with literal, non-flag words
+    // stage 0: `builtin("echo", [words…])`/`exec("echo", …)` — the
+    // command name is args[0]; the function name is the op (builtin/exec).
+    let f0 = match a0.first().and_then(call_arg_str) {
+        Some(s) => s,
+        None => return false,
+    };
+    let f1 = match a1.first().and_then(call_arg_str) {
+        Some(s) => s,
+        None => return false,
+    };
     if f0 != "echo" {
         return false;
     }
@@ -6162,7 +6178,9 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     format!("(index({hay}, {needle}) >= 0)")
                 }
                 // (( arith )) as a condition — the `let` builtin form.
-                "exec" if args.first().and_then(call_arg_str).as_deref() == Some("let") => {
+                "exec" | "builtin"
+                    if args.first().and_then(call_arg_str).as_deref() == Some("let") =>
+                {
                     let words = exec_word_args(args);
                     let text = words
                         .first()
@@ -7534,6 +7552,29 @@ mod tests {
         assert!(
             !perl.contains("system('bash'"),
             "grep -q chain must not shell out: {perl}"
+        );
+    }
+
+    /// `echo hi | tr a-z A-Z` folds to a native Perl string + `tr///` + print
+    /// (the try_native_echo_tr_pipeline native fold) instead of a whole
+    /// `bash -c` pipeline shell-out.
+    #[test]
+    fn echo_tr_pipeline_renders_native_transliterate() {
+        let src = r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"var_types":[],"stmt_lines":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[],"var_bash_env":[],"subs":[],"stmts":[
+            {"type":"Expr","expr":{"args":[{"elements":[
+                {"body":[{"expr":{"args":[{"style":"DoubleQuoted","type":"Str","value":"echo"},{"elements":[{"style":"DoubleQuoted","type":"Str","value":"hi"}],"type":"Array"}],"func":"builtin","purity":"Emulable","type":"Call"},"type":"Expr"}],"type":"Arrow"},
+                {"body":[{"expr":{"args":[{"style":"DoubleQuoted","type":"Str","value":"tr"},{"elements":[{"style":"DoubleQuoted","type":"Str","value":"a-z"},{"style":"DoubleQuoted","type":"Str","value":"A-Z"}],"type":"Array"}],"func":"builtin","purity":"Emulable","type":"Call"},"type":"Expr"}],"type":"Arrow"}
+            ],"type":"Array"}],"func":"pipeline","purity":"Spawn","type":"Call"}}
+        ]}"#;
+        let prog = crate::shir_json_in::shir_json_to_ir(src).expect("echo|tr A1 ingress");
+        let perl = shir_to_perl(&prog);
+        assert!(
+            perl.contains("$__tr_out =~ tr/a-z/A-Z/") && perl.contains("; print $__tr_out;"),
+            "echo|tr should fold to a native Perl transliteration: {perl}"
+        );
+        assert!(
+            !perl.contains("system('bash'"),
+            "echo|tr pipeline must not shell out: {perl}"
         );
     }
 
