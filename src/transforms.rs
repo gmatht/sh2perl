@@ -18,6 +18,7 @@ use crate::ir::IrStmt;
 pub type TransformFn = fn(&mut Vec<IrStmt>) -> bool;
 
 pub mod arith_forms;
+pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identity)
 pub mod builtin;
 pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod grep_o; // `grep -o PAT` → the generic grepMatches(text, pattern, flags) op
@@ -29,6 +30,19 @@ pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native num
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
 pub mod shir_native_stmt; // worker-submitted: redirect/herestring/test-chain shapes → native stmt forms
+// OFFERED transforms (core-requests/transforms/offered/) — staged for per-backend bisect
+pub mod const_capture_fold;
+pub mod const_condition_elim;
+pub mod copy_propagation;
+pub mod dead_store_elim;
+pub mod div_mod_pow2;
+pub mod hoist_loop_invariants;
+pub mod redundant_store_elim;
+pub mod string_accumulator;
+pub mod test_simplification;
+pub mod unreachable_after_exit;
+pub mod counted_while_forinit;
+pub mod merge_init_assignments;
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
@@ -46,6 +60,20 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // `echo args > file` → Block-wrapped exec (native select redirect),
         // empty herestrings → status exec, `test && echo || echo` → If.
         ("shir-native-stmt", shir_native_stmt::transform),
+        // ── OFFERED (core-requests/transforms/offered/) — staged for the per-backend bisect —
+        ("arith-identity", arith_identity::transform),
+        ("const-capture-fold", const_capture_fold::transform),
+        ("const-condition-elim", const_condition_elim::transform),
+        ("copy-propagation", copy_propagation::transform),
+        ("dead-store-elim", dead_store_elim::transform),
+        ("div-mod-pow2", div_mod_pow2::transform),
+        ("hoist-loop-invariants", hoist_loop_invariants::transform),
+        ("redundant-store-elim", redundant_store_elim::transform),
+        ("string-accumulator", string_accumulator::transform),
+        ("test-simplification", test_simplification::transform),
+        ("unreachable-after-exit", unreachable_after_exit::transform),
+        ("counted-while-forinit", counted_while_forinit::transform),
+        ("merge-init-assignments", merge_init_assignments::transform),
         // NOTE: exec-to-builtin (shir-builtin-op-20260816) is NOT in the
         // ast_to_ir channel — the rewrite happens at the A1 EXPORT
         // (shir_json::shir_to_shir_json) so the analyses and every
