@@ -1834,6 +1834,7 @@ impl Render {
     fn cmd_text_stmt(&mut self, s: &IrStmt) -> Option<String> {
         match s {
             IrStmt::Expr(e) => self.cmd_text_expr(e),
+            IrStmt::Ext(_) => None,
             // try/except has no shell text — a bash -c fallback cannot
             // express it
             IrStmt::Try { .. } => None,
@@ -2470,6 +2471,7 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => self.stmt_expr(e),
+            IrStmt::Ext(_) => panic!("go backend: Ext node unsupported"),
             IrStmt::Assign { targets, expr, .. } => self.stmt_assign(targets, expr),
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {

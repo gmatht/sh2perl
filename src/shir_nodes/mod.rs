@@ -24,10 +24,32 @@ pub mod enc;
 /// A transform-declared node. The `tag` is the JSON discriminator
 /// (`{"type": <tag>, …}`); `children_mut` lets pre-existing walkers descend
 /// into a node they don't understand (structural traversal, §1 of the doc).
-pub(crate) trait ExtNode {
+pub trait ExtNode: std::fmt::Debug {
     fn tag(&self) -> &'static str;
     fn to_json(&self) -> serde_json::Value;
     fn children_mut(&mut self) -> Vec<&mut IrStmt>;
+    /// Immutable children (for the analysis passes that recurse on `&IrStmt`).
+    fn children(&self) -> Vec<&IrStmt>;
+    /// Clone-erasure so `Box<dyn ExtNode>` can be `Clone` (needed by the
+    /// `IrStmt::Ext` variant's `#[derive(Clone)]`).
+    fn clone_box(&self) -> Box<dyn ExtNode>;
+}
+
+// The `IrStmt` enum derives Debug/Clone/PartialEq; the `Ext(Box<dyn
+// ExtNode>)` variant needs those on `Box<dyn ExtNode>`. Rust's blanket
+// `impl Debug for Box<T>` already covers us (ExtNode: Debug, and the
+// generated structs derive Debug); implement Clone (via clone_box — the
+// blanket needs `dyn ExtNode: Clone`, impossible) and PartialEq (compare
+// tag + JSON — semantic equality for generated nodes).
+impl Clone for Box<dyn ExtNode> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+impl PartialEq for Box<dyn ExtNode> {
+    fn eq(&self, other: &Self) -> bool {
+        self.tag() == other.tag() && self.to_json() == other.to_json()
+    }
 }
 
 /// Registry constructor: (JSON) → boxed node.
@@ -99,5 +121,44 @@ mod tests {
         };
         let children = node.children_mut();
         assert_eq!(children.len(), 1, "the body Vec<IrStmt> is reachable");
+    }
+
+    /// The full enum wiring: an `IrStmt::Ext` node survives the A1
+    /// round-trip (export via stmt_json → the node's own JSON; import via
+    /// the generated union registry → an IrStmt::Ext again).
+    #[test]
+    fn ext_node_round_trips_through_a1() {
+        use crate::ir::IrProgram;
+        let ext = IrStmt::Ext(Box::new(CountedFor {
+            var: "i".to_string(),
+            init: 0,
+            step: 1,
+            cond: crate::ir::IrExpr::Int(10),
+            body: vec![IrStmt::Expr(crate::ir::IrExpr::Int(1))],
+        }));
+        let prog = IrProgram {
+            imports: vec![],
+            requires: vec![],
+            stmts: vec![ext],
+            subs: vec![],
+            var_types: vec![],
+            stmt_lines: vec![],
+            var_lengths: vec![],
+            var_const: vec![],
+            var_lifetimes: vec![],
+            var_nospace: vec![],
+            var_bash_env: vec![],
+        };
+        let json = crate::shir_json::shir_to_shir_json(&prog);
+        let back = crate::shir_json_in::shir_json_to_ir(&json).expect("re-import");
+        let back_ext = back.stmts.iter().find_map(|s| match s {
+            IrStmt::Ext(n) => Some(crate::shir_nodes::ExtNode::to_json(n.as_ref())),
+            _ => None,
+        });
+        assert!(
+            back_ext.is_some(),
+            "Ext node survived the A1 round-trip: {json}"
+        );
+        assert_eq!(back_ext.unwrap()["var"], "i");
     }
 }

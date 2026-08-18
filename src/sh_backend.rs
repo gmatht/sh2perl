@@ -111,6 +111,7 @@ fn array_names(prog: &IrProgram) -> HashSet<String> {
         for st in sts {
             match st {
                 IrStmt::Expr(e) => expr_names(e, names),
+                IrStmt::Ext(_) => {}
                 IrStmt::Assign { expr, targets, .. } => {
                     expr_names(expr, names);
                     for t in targets {
@@ -367,6 +368,7 @@ fn needs_arr_helper(prog: &IrProgram) -> bool {
         for st in sts {
             let hit = match st {
                 IrStmt::Expr(e) => expr_uses_arr(e),
+                IrStmt::Ext(_) => false,
                 IrStmt::Assign { expr, .. } => expr_uses_arr(expr),
                 IrStmt::If {
                     cond,
@@ -983,6 +985,7 @@ fn range_of(iter: &IrExpr) -> Option<(i64, i64)> {
 
 fn stmt_to_sh(st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
     match st {
+        IrStmt::Ext(_) => return Err("sh renderer: Ext node unsupported".to_string()),
         IrStmt::Expr(e) => {
             indent(out, d);
             if let IrExpr::Call { func, .. } = e {
@@ -4719,6 +4722,7 @@ fn stmts_inline(stmts: &[IrStmt]) -> Result<String, String> {
 fn stmt_inline(st: &IrStmt) -> Result<String, String> {
     match st {
         IrStmt::Expr(e) => cmd_to_sh(e),
+        IrStmt::Ext(_) => return Err("sh renderer: Ext node unsupported".to_string()),
         IrStmt::Assign { targets, expr, .. } => assign_to_sh(targets, expr),
         IrStmt::If {
             cond,

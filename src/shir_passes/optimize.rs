@@ -168,6 +168,7 @@ pub fn stmts_read(name: &str, stmts: &[IrStmt]) -> bool {
 
 pub fn stmt_reads(name: &str, st: &IrStmt) -> bool {
     match st {
+        IrStmt::Ext(n) => crate::shir_nodes::ExtNode::children(&**n).into_iter().any(|c| stmt_reads(name, c)),
         IrStmt::Expr(e) => expr_reads(name, e),
         IrStmt::Assign { targets, expr, .. } => {
             expr_reads(name, expr)
