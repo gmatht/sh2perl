@@ -338,7 +338,7 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                 "$" => "$$".to_string(),       // $$ -> $$ (process ID)
                 "?" => "($? == -1 ? 0 : $? >> 8)".to_string(), // $? -> exit code
                 "!" => "''".to_string(), // $! -> empty (last background PID, not tracked)
-                "-" => "''".to_string(), // $- -> empty (shell options not tracked)
+                "-" => "$ENV{SH2PERL_SHELLOPTS}".to_string(), // $- (see prelude)
                 "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
                 _ => format!("${}", var),           // Regular variables
             }

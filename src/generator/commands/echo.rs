@@ -56,7 +56,7 @@ pub fn generate_echo_command(
                             "*" => "@ARGV".to_string(),
                             "?" => "$CHILD_ERROR".to_string(),
                             "!" => "''".to_string(),
-                            "-" => "''".to_string(),
+                            "-" => "$ENV{SH2PERL_SHELLOPTS}".to_string(),
                             _ => {
                                 if generator.declared_locals.contains(var)
                                     || generator.function_level_vars.contains(var)
@@ -78,7 +78,7 @@ pub fn generate_echo_command(
                                     "*" => "@ARGV".to_string(),
                                     "?" => "$CHILD_ERROR".to_string(),
                                     "!" => "''".to_string(),
-                                    "-" => "''".to_string(),
+                                    "-" => "$ENV{SH2PERL_SHELLOPTS}".to_string(),
                                     _ => {
                                         if generator.declared_locals.contains(var)
                                             || generator.function_level_vars.contains(var)
@@ -189,7 +189,7 @@ pub fn generate_echo_command(
                                                 "*" => result.push_str("@ARGV"),
                                                 "?" => result.push_str("$CHILD_ERROR"),
                                                 "!" => result.push_str(""),
-                                                "-" => result.push_str(""),
+                                                "-" => result.push_str("$ENV{SH2PERL_SHELLOPTS}"),
                                                 _ => {
                                                     if generator.declared_locals.contains(var)
                                                         || generator.function_level_vars.contains(var)

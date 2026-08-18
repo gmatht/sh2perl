@@ -851,7 +851,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             if a_str.starts_with('\'') || a_str.starts_with('"') || a_str.starts_with('q') {
                                 arg_parts.push(a_str);
                             } else {
-                                arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("$", "\\$").replace("@", "\\@")));
+                                // Keep $ unescaped: the string is passed to
+                                // bash -c inside a NON-interpolating q{...},
+                                // so "\$var" would reach bash as a literal
+                                // dollar and never expand (the callers export
+                                // the referenced values into %ENV).
+                                arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("@", "\\@")));
                             }
                         }
                     }
@@ -879,7 +884,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                             if a_str.starts_with('\'') || a_str.starts_with('"') || a_str.starts_with('q') {
                                 arg_parts.push(a_str);
                             } else {
-                                arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("$", "\\$").replace("@", "\\@")));
+                                // Keep $ unescaped: the string is passed to
+                                // bash -c inside a NON-interpolating q{...},
+                                // so "\$var" would reach bash as a literal
+                                // dollar and never expand (the callers export
+                                // the referenced values into %ENV).
+                                arg_parts.push(format!("\"{}\"", a_str.replace("\"", "\\\"").replace("@", "\\@")));
                             }
                         }
                     }

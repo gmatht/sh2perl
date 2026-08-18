@@ -957,6 +957,13 @@ pub fn generate_command_impl_with_input(
                             result.push_str(&format!("$ENV{{DIFF_TEMP_FILE1}} = {};\n", file1.1));
                             result.push_str(&generator.indent());
                             result.push_str(&format!("$ENV{{DIFF_TEMP_FILE2}} = {};\n", file2.1));
+                            // The reconstructed command may reference the temp
+                            // files as "$<varname>" under bash -c; export them
+                            // under those names too.
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("$ENV{{{}}} = {};\n", file1.0, file1.1));
+                            result.push_str(&generator.indent());
+                            result.push_str(&format!("$ENV{{{}}} = {};\n", file2.0, file2.1));
 
                             // Generate the actual diff command
                             let mut modified_diff_cmd = cmd.clone();

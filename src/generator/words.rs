@@ -2408,7 +2408,9 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                     "$" => "$$".to_string(),         // $$ -> $$ (process ID)
                     "?" => "$CHILD_ERROR".to_string(), // $? -> exit code
                     "!" => "''".to_string(), // $! -> empty (last background PID, not tracked)
-                    "-" => "''".to_string(), // $- -> empty (shell options not tracked)
+                    // $- — current shell option flags; populated once in the
+                    // prelude (see generate()) when referenced.
+                    "-" => "$ENV{SH2PERL_SHELLOPTS}".to_string(),
                     "0" => "$0".to_string(), // Use $0 directly to avoid requiring the English module
                     _ => {
                         // Shell positional parameters ($1, $2, …) map to
@@ -2824,9 +2826,10 @@ pub fn convert_string_interpolation_to_perl_impl(
                             // omit it entirely (empty string matches bash when
                             // no background command has been run).
                         } else if var == "-" {
-                            // Shell's $- is the current option flags.
-                            // Generated Perl does not track shell options;
-                            // omit it entirely (empty string).
+                            // Shell's $- is the current option flags; the
+                            // prelude populates $ENV{SH2PERL_SHELLOPTS} from a
+                            // real bash when referenced.
+                            current_string.push_str("$ENV{SH2PERL_SHELLOPTS}");
                         } else if var == "?" {
                             // Shell's $? is the exit code (0-255), but Perl's $? is
                             // the raw 16-bit wait status (exit_code << 8).  Translate
@@ -2839,9 +2842,12 @@ pub fn convert_string_interpolation_to_perl_impl(
                                 push_string_expr(&mut parts, &mut current_string);
                             }
                             parts.push("$CHILD_ERROR".to_string());
+                        } else if var == "-" {
+                            // $- (shell option flags): populated in the prelude.
+                            current_string.push_str("$ENV{SH2PERL_SHELLOPTS}");
                         } else if generator.declared_locals.contains(var)
                             || generator.function_level_vars.contains(var)
-                            || matches!(var.as_str(), "#" | "@" | "*" | "-" | "0" | "$")
+                            || matches!(var.as_str(), "#" | "@" | "*" | "0" | "$")
                         {
                             // Regular declared variable - add directly for interpolation
                             // Use ${var} syntax to prevent merging with adjacent literal text

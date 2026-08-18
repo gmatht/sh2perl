@@ -545,6 +545,18 @@ impl Generator {
             output.push('\n');
         }
 
+        // $- (shell option flags): populate once from a real bash, stripping
+        // the 'c' flag that bash -c itself adds.
+        if output.contains("$ENV{SH2PERL_SHELLOPTS}") {
+            let init = "$ENV{SH2PERL_SHELLOPTS} //= do { open(my $__fh, '-|', 'bash', '-c', 'printf %s \"$-\"') or die \"cmd failed: $!\\n\"; my $_o = do { local $/; <$__fh> } // q{}; close $__fh; $_o =~ s/c//; $_o; };\n";
+            let anchor = "our $CHILD_ERROR = 0;\n";
+            if let Some(pos) = output.find(anchor) {
+                output.insert_str(pos + anchor.len(), init);
+            } else {
+                output.insert_str(0, init);
+            }
+        }
+
         // Scripts probing the running shell via $BASH_VERSION would see an
         // empty value under perl (bash only exports it to itself).  When the
         // generated program reads it, initialize it from a real bash so the
