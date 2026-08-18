@@ -340,16 +340,17 @@ pub fn generate_find_for_substitution(
     let start_dir_ir = start_dir_to_ir_expr(&args);
     let start_dir_expr = ir::expr_to_perl(&start_dir_ir);
 
-    // Build conditions for the callback
+    // Build conditions for the walker: file tests use the full path ($__p),
+    // name tests use the basename ($__e).
     let mut conditions = Vec::new();
 
     // Type filter
     if let Some(ref ftype) = args.file_type {
         let test = match ftype.as_str() {
-            "f" => "-f $_",
-            "d" => "-d $_",
-            "l" => "-l $_",
-            _ => "-e $_",
+            "f" => "-f $__p",
+            "d" => "-d $__p",
+            "l" => "-l $__p",
+            _ => "-e $__p",
         };
         conditions.push(test.to_string());
     }
@@ -357,7 +358,7 @@ pub fn generate_find_for_substitution(
     // Name filter (convert glob pattern to regex)
     if let Some(ref pat) = args.name_pattern {
         let regex = escape_glob_to_regex(pat);
-        conditions.push(format!("$_ =~ /{}/", regex));
+        conditions.push(format!("$__e =~ /{}/", regex));
     }
 
     let condition_code = if conditions.is_empty() {
@@ -366,12 +367,12 @@ pub fn generate_find_for_substitution(
         conditions.join(" && ")
     };
 
-    // Maxdepth condition for inside the callback
+    // Maxdepth condition for inside the walker loop
     let mut maxdepth_cond = String::new();
     if let Some(ref depth) = args.maxdepth {
         if let Ok(d) = depth.parse::<usize>() {
             maxdepth_cond = format!(
-                "my $maxdepth = {}; my $depth = ($File::Find::dir =~ tr/\\///) + 1; next if $depth > $maxdepth; ",
+                "my $__depth = ($__p =~ tr{{/}}{{}}); next if $__depth > {}; ",
                 d
             );
         }
@@ -382,9 +383,6 @@ pub fn generate_find_for_substitution(
     // Build IR statements for the do-block body
     let mut stmts: Vec<IrStmt> = Vec::new();
 
-    // require File::Find;
-    stmts.push(IrStmt::Require("File::Find".to_string()));
-
     // my @find_results;
     stmts.push(IrStmt::DeclareArray {
         var: "find_results".to_string(),
@@ -392,11 +390,12 @@ pub fn generate_find_for_substitution(
         elements: vec![],
     });
 
-    // File::Find::find(sub { ... }, start_dir);
-    // `no warnings 'once'`: with a single mention of $File::Find::name, Perl
-    // otherwise prints a "used only once: possible typo" warning to stderr.
+    // Custom recursive walker instead of File::Find: real find(1) descends
+    // into a subdirectory at its position in readdir order, while File::Find
+    // visits all of a directory's entries before descending — the output
+    // order differed from the shell.
     let find_call = format!(
-        "{indent}File::Find::find(sub {{ no warnings qw(once); {maxdepth_cond}if ({condition_code}) {{ push @find_results, $File::Find::name; }} }}, {start_dir});\n",
+        "{indent}my $__find_walk; $__find_walk = sub {{ my ($__dir) = @_; opendir(my $__dh, $__dir) or return; my @__entries = readdir($__dh); closedir($__dh); for my $__e (@__entries) {{ next if $__e eq q{{.}} || $__e eq q{{..}}; my $__p = \"$__dir/$__e\"; {maxdepth_cond}if ({condition_code}) {{ push @find_results, $__p; }} if (-d $__p && !-l $__p) {{ $__find_walk->($__p); }} }} }}; do {{ my $__p = {start_dir}; my $__e = $__p; if ({condition_code}) {{ push @find_results, $__p; }} }}; $__find_walk->({start_dir});\n",
         indent = indent_str,
         condition_code = condition_code,
         start_dir = start_dir_expr,
