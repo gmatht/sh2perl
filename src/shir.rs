@@ -35558,8 +35558,8 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         let prog = ast_to_ir(&cmds);
         let perl = crate::ir::shir_to_perl(&prog);
         assert!(
-            perl.contains("open(my $__f1,'<','/tmp/a')")
-                && perl.contains("eq $__c2"),
+            perl.contains("open(my $__h, '<', '/tmp/a')")
+                && perl.contains("eq (sub"),
             "cmp -s should lower to a native byte compare: {perl}"
         );
         assert!(
@@ -35592,6 +35592,22 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         assert!(
             perl.contains("no strict 'refs'") && !perl.contains("system('bash'"),
             "unset should be a native undef, not a shell-out: {perl}"
+        );
+    }
+
+    /// Bare `cmp F1 F2` (literal paths) lowers to a native differ-message
+    /// compare (no bash -c).
+    #[test]
+    fn cmp_bare_lowers_native_differ() {
+        let src = "cmp /tmp/a /tmp/b\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("differ: byte")
+                && perl.contains("%s %s differ")
+                && !perl.contains("system('bash'"),
+            "bare cmp should lower to a native differ compare: {perl}"
         );
     }
 
