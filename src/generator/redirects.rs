@@ -1552,7 +1552,7 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 // Perl::Critic's "Expression form of eval" false positive.
                 // bash -c "..." is semantically equivalent to eval "...".
                 output.push_str(&format!(
-                    "do {{ my $eval_input = {}; $CHILD_ERROR = 0; }};  # native Perl\n",
+                    "do {{ my $eval_input = {}; open(my $__fh, '-|', 'bash', '-c', $eval_input) or die \"cmd failed: $!\\n\"; my $__out = do {{ local $/; <$__fh> }} // q{{}}; close $__fh; $CHILD_ERROR = $? >> 8; print $__out; }};\n",
                     concat_expr
                 ));
             }

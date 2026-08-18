@@ -11,6 +11,15 @@ static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleCommand) -> String {
     let mut output = String::new();
 
+    // `:` — the null builtin: does nothing, succeeds.
+    if let Word::Literal(name, _) = &cmd.name {
+        if name == ":" {
+            output.push_str(&generator.indent());
+            output.push_str("$CHILD_ERROR = 0;\n");
+            return output;
+        }
+    }
+
     // `"$@"` (or "$*") used as the command itself: execute the positional
     // parameters as a command, e.g. the common `capture() { ...; "$@"; }`
     // wrapper.  Positional parameters are @_ inside a function, @ARGV at

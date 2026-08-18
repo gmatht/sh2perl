@@ -366,6 +366,14 @@ pub fn generate_parameter_expansion_impl(
                 {
                     // ${arr[@]:offset:length} — slice of an array's elements,
                     // joined with spaces in scalar/string context.
+                    // An array not (yet) declared expands to nothing — and
+                    // referencing @name would be a strict-mode compile error.
+                    if !generator.indexed_arrays.contains(base)
+                        && !generator.associative_arrays.contains(base)
+                        && !generator.declared_locals.contains(base)
+                    {
+                        return "q{}".to_string();
+                    }
                     let start = offset.trim();
                     if let Some(length_str) = length {
                         format!(

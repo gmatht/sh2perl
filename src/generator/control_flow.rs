@@ -660,23 +660,40 @@ pub fn generate_while_loop_impl(generator: &mut Generator, while_loop: &WhileLoo
                 // Multi-statement condition: wrap in do { ... } and check exit code
                 output.push_str(&format!("{} (do {{\n", loop_keyword));
                 generator.indent_level += 1;
-                for line in cond_raw.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        output.push_str(&generator.indent());
-                        output.push_str(trimmed);
-                        // Ensure each statement ends with ;
-                        if !trimmed.ends_with(';') {
-                            output.push(';');
-                        }
-                        output.push('\n');
+                let lines: Vec<&str> = cond_raw
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                for (idx, trimmed) in lines.iter().enumerate() {
+                    output.push_str(&generator.indent());
+                    output.push_str(trimmed);
+                    // Terminate statements with ';' — but NOT when the line is
+                    // continued (next line starts with `or`/`and`/operators) or
+                    // opens a block.
+                    let next_is_continuation = lines
+                        .get(idx + 1)
+                        .map(|n| {
+                            n.starts_with("or ")
+                                || n.starts_with("and ")
+                                || n.starts_with('.')
+                                || n.starts_with('?')
+                                || n.starts_with(':')
+                        })
+                        .unwrap_or(false);
+                    if !trimmed.ends_with(';')
+                        && !trimmed.ends_with('{')
+                        && !next_is_continuation
+                    {
+                        output.push(';');
                     }
+                    output.push('\n');
                 }
                 // The last expression in the do block must be truthy when the
-                // command succeeds (exit code 0). $main_exit_code holds the
-                // exit code from the system() call generated above; use it.
+                // condition command succeeds (exit status 0).  Generated
+                // condition code records that status in $CHILD_ERROR.
                 output.push_str(&generator.indent());
-                output.push_str("$main_exit_code == 0\n");
+                output.push_str("$CHILD_ERROR == 0\n");
                 generator.indent_level -= 1;
                 output.push_str(&generator.indent());
                 output.push_str("}) {\n");
@@ -1763,7 +1780,12 @@ fn flatten_conditions(cmd: &Command, conds: &mut Vec<Command>) {
 pub fn collect_assigned_vars(cmd: &Command, vars: &mut std::collections::HashSet<String>) {
     match cmd {
         Command::Assignment(assignment) => {
-            vars.insert(assignment.variable.clone());
+            // Subscripted names (arr[0]=..., map[key]=...) are ELEMENT
+            // assignments — hoisting would emit invalid `my $arr[0];`.
+            // The container is declared by its own declaration statement.
+            if !assignment.variable.contains('[') {
+                vars.insert(assignment.variable.clone());
+            }
         }
         Command::Block(block) => {
             for c in &block.commands {

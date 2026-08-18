@@ -2011,11 +2011,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                         } else if name == "readlink" || name == "realpath" {
                             // Native Perl: Cwd::abs_path() canonizalizes symlinks.
                             let mut args: Vec<String> = Vec::new();
-                            let mut has_f_flag = false;
+                            let mut has_m_flag = false;
                             for arg in &simple_cmd.args {
                                 if let Word::Literal(s, _) = arg {
-                                    if s == "-f" || s == "-e" || s == "-m" {
-                                        has_f_flag = true;
+                                    if s == "-m" {
+                                        has_m_flag = true;
                                     } else if !s.starts_with('-') {
                                         args.push(generator.word_to_perl(arg));
                                     }
@@ -2023,9 +2023,11 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                             }
                             if args.is_empty() {
                                 "do { $CHILD_ERROR = 0; q{} };\n".to_string()
-                            } else if has_f_flag {
+                            } else if has_m_flag {
+                                // -m: canonicalize lexically even when the
+                                // path does not exist (GNU readlink -m).
                                 format!(
-                                    "do {{ use Cwd qw(abs_path); my $_r = abs_path({}); defined $_r ? $_r : q{{}}; }}",
+                                    "do {{ use Cwd qw(abs_path getcwd); my $_p = {}; my $_r = abs_path($_p); unless (defined $_r) {{ $_p = getcwd() . q{{/}} . $_p unless $_p =~ m{{^/}}; my @_seg; for my $_s (split m{{/}}, $_p) {{ next if $_s eq q{{}} || $_s eq q{{.}}; if ($_s eq q{{..}}) {{ pop @_seg; }} else {{ push @_seg, $_s; }} }} $_r = q{{/}} . join(q{{/}}, @_seg); }} $_r; }}",
                                     args.join(", ")
                                 )
                             } else {

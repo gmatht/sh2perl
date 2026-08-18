@@ -1398,8 +1398,16 @@ fn generate_system_call_fallback(
                 return format!("$CHILD_ERROR = 0;\n");
             }
             let arg_expr = args.join(", ");
-            // readlink -f / -e / -m → Cwd::abs_path()
-            if flags.iter().any(|f| f == "-f" || f == "-e" || f == "-m") {
+            // readlink -m: canonicalize even when the path does not exist
+            // (lexical resolution, like GNU readlink -m).
+            if flags.iter().any(|f| f == "-m") {
+                return format!(
+                    "do {{ use Cwd qw(abs_path getcwd); my $_p = {}; my $_r = abs_path($_p); unless (defined $_r) {{ $_p = getcwd() . q{{/}} . $_p unless $_p =~ m{{^/}}; my @_seg; for my $_s (split m{{/}}, $_p) {{ next if $_s eq q{{}} || $_s eq q{{.}}; if ($_s eq q{{..}}) {{ pop @_seg; }} else {{ push @_seg, $_s; }} }} $_r = q{{/}} . join(q{{/}}, @_seg); }} $_r; }}",
+                    arg_expr
+                );
+            }
+            // readlink -f / -e → Cwd::abs_path()
+            if flags.iter().any(|f| f == "-f" || f == "-e") {
                 return format!(
                     "do {{ use Cwd qw(abs_path); my $_r = abs_path({}); defined $_r ? $_r : q{{}}; }}",
                     arg_expr
@@ -1432,7 +1440,11 @@ fn generate_system_call_fallback(
         .join(", ");
     let out_name = output_var.trim_start_matches('$');
     let in_name = input_var.trim_start_matches('$');
-    if input_var.is_empty() {
+    if out_name.is_empty() {
+        // Statement context (no capture variable): run the command directly;
+        // it inherits the (possibly redirected) STDIN/STDOUT.
+        format!("$CHILD_ERROR = system({}) >> 8;\n", all_args)
+    } else if input_var.is_empty() {
         format!(
             "\n${{{out_name}}} = do {{ open(my $__fh, '-|', {}) or croak \"failed: $ERRNO\"; chomp(my $_r = do {{ local $/; <$__fh> }}); close $__fh; $_r; }};\n",
             all_args,
