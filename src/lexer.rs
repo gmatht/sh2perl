@@ -572,6 +572,11 @@ impl Lexer {
         // with existing ones, run split_overgreedy_sq again to fix them.
         Self::split_overgreedy_sq(input, &mut tokens);
 
+        // The SQS split re-lexes tails with a fresh logos instance, which can
+        // introduce DoubleQuotedString/DoubleQuote tokens (and overlaps) that
+        // never saw merge treatment — run the merge once more to fix them.
+        Self::merge_double_quoted_strings(input, &mut tokens);
+
         // Resolve (( ambiguity: if (( cannot be closed by )), it is two
         // nested subshells rather than an arithmetic evaluation.
         Self::resolve_double_paren_ambiguity(input, &mut tokens);
@@ -1043,6 +1048,59 @@ impl Lexer {
         let mut merged: Vec<(Token, usize, usize)> = Vec::new();
         let mut i = 0;
         while i < tokens.len() {
+            // A token that starts inside the previously emitted token's span
+            // is stale (its opening quote was really the previous token's
+            // closing quote).  Drop the overlapped part and re-lex any tail
+            // that extends beyond, splicing the fresh tokens back into the
+            // stream so they get full merge treatment.
+            if let Some(&(_, _, prev_end)) = merged.last() {
+                let (tok_start, tok_end) = (tokens[i].1, tokens[i].2);
+                if tok_start < prev_end {
+                    if tok_end > prev_end {
+                        let tail = &input[prev_end..tok_end];
+                        let mut new_toks: Vec<(Token, usize, usize)> = Vec::new();
+                        let mut off = 0;
+                        while off < tail.len() {
+                            let mut sub = Token::lexer(&tail[off..]);
+                            let mut local: Vec<(Token, usize, usize)> = Vec::new();
+                            while let Some(tr) = sub.next() {
+                                let sp = sub.span();
+                                if let Ok(tok) = tr {
+                                    local.push((
+                                        tok,
+                                        prev_end + off + sp.start,
+                                        prev_end + off + sp.end,
+                                    ));
+                                }
+                            }
+                            if let Some(&(_, _, last_end)) = local.last() {
+                                new_toks.extend(local);
+                                off = last_end - prev_end;
+                            } else {
+                                let ch = tail.as_bytes()[off];
+                                if ch == b'\'' {
+                                    new_toks.push((
+                                        Token::SingleQuote,
+                                        prev_end + off,
+                                        prev_end + off + 1,
+                                    ));
+                                } else if ch == b'"' {
+                                    new_toks.push((
+                                        Token::DoubleQuote,
+                                        prev_end + off,
+                                        prev_end + off + 1,
+                                    ));
+                                }
+                                off += 1;
+                            }
+                        }
+                        tokens.splice(i..i + 1, new_toks);
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
             if tokens[i].0 == Token::DoubleQuotedString || tokens[i].0 == Token::DoubleQuote {
                 let start = tokens[i].1;
                 let bytes = input.as_bytes();
