@@ -1542,6 +1542,11 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str("}\n");
         }
         IrStmt::Redirect { inner, redirects } => {
+            if let Some(s) = native_cat_heredoc(inner, redirects) {
+                out.push_str(&s);
+                out.push('\n');
+                return;
+            }
             // Rebuild the shell command with shell redirection syntax and
             // run it via bash -c — stdout matches bash exactly (redirects
             // are shell-level semantics).
@@ -4053,6 +4058,40 @@ fn printf_unescape(s: &str) -> String {
         }
     }
     out
+}
+
+/// `cat <<'EOF' … EOF` (and the unquoted form with a fully-literal body)
+/// is the canonical print-heredoc idiom: cat with no args and a single
+/// stdin heredoc redirect just echoes the body to stdout. Emit that as a
+/// native `print` instead of a bash -c. Refused when cat has args/flags,
+/// when there is any non-stdin redirect (a `> file` would re-target the
+/// output), or when the body isn't a literal (a $var heredoc needs bash).
+fn native_cat_heredoc(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<String> {
+    // inner must be exactly: exec cat (no args)
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else { return None };
+    if func != "exec" {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return None };
+    if cmd != "cat" || !words.is_empty() {
+        return None;
+    }
+    // exactly one redirect, a stdin heredoc, with a literal body
+    if redirects.len() != 1 {
+        return None;
+    }
+    let r = &redirects[0];
+    if r.mode != "heredoc" {
+        return None;
+    }
+    if r.fd.is_some() && r.fd.unwrap() != 0 {
+        return None;
+    }
+    let body = call_arg_str(&r.target)?;
+    Some(format!(
+        "print({}); $main_exit_code = $CHILD_ERROR = 0;",
+        safe_perl_q_string(&body)
+    ))
 }
 
 fn exec_call_to_cmd(call: &IrExpr) -> Option<String> {

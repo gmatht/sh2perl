@@ -35516,6 +35516,20 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         );
     }
 
+    /// `cat <<'EOF' … EOF` (the print-heredoc idiom) lowers to a native
+    /// `print` with no bash -c.
+    #[test]
+    fn cat_heredoc_lowers_native() {
+        let src = "cat <<EOF\nalpha\nbeta\nEOF\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("print(") && !perl.contains("system('bash'"),
+            "cat <<EOF should be a native print, not a shell-out: {perl}"
+        );
+    }
+
     /// `printf LITERAL | sort` lowers natively (no bash -c): the content is
     /// a known literal, so sort is a pure in-Perl text op.
     #[test]
