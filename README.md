@@ -1,4 +1,4 @@
-# Debashc - Shell Script Converter
+# sh2perl (debashc) — Shell Script to Perl Converter
 
 [![Tests](https://github.com/gmatht/sh2perl/actions/workflows/test.yml/badge.svg)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
 
@@ -6,137 +6,129 @@
 [![Purify tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/purify.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
 [![Main tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gmatht/sh2perl/gh-pages/.github/badges/main-tests.json)](https://github.com/gmatht/sh2perl/actions/workflows/test.yml)
 
-A comprehensive Rust library and command-line tool for parsing and converting shell/bash scripts to other programming languages. This project provides a robust foundation for analyzing shell scripts, converting them to Perl, Rust, Python, and more, or building shell script analysis tools.
+A Rust library and command-line tool that parses shell/bash scripts and converts
+them to equivalent Perl. The goal is behavioral fidelity: the generated Perl
+should produce the same stdout as `LANG=C bash` would on Linux/WSL. A corpus of
+530 example scripts is used to verify this, comparing the output of each script
+under bash against the output of its Perl translation.
 
-**🌐 [Try the Live Demo](https://dansted.org/Debashc8/) - Convert shell scripts to Perl, Rust, and other languages in your browser!**
+**🌐 [Try the Live Demo](https://dansted.org/Debashc8/) — convert shell scripts in your browser (WebAssembly build).**
+
+The binary is currently named `debashc`. If you see references to `sh2perl`,
+that is the repository/project name; in the future there may be separate
+`sh2perl`, `sh2rust`, etc. front-ends.
 
 ## Features
 
-- **Complete Lexer**: Tokenizes shell/bash scripts with support for all major shell constructs
-- **AST Parser**: Converts tokens into a structured Abstract Syntax Tree
-- **Multi-language Code Generation**: Convert shell scripts to Perl, Rust, and Python
-- **Web Assembly Support**: Run in the browser with a beautiful web interface
-- **Shell Constructs Support**:
-  - Simple commands and arguments
-  - Pipelines and redirections
-  - Control flow (if/else, loops, functions)
-  - Variable expansions
-  - Command substitutions
-  - Arithmetic expressions
-  - File test operators
-  - Comments and whitespace
+- **Complete lexer** — tokenizes shell/bash scripts, including nested quoting,
+  command substitution, here-documents, and ANSI-C quoting
+- **AST parser** — converts tokens into a structured Abstract Syntax Tree
+- **Perl code generation** — produces standalone Perl programs
+  (`use strict; use warnings;` clean, checked with Perl::Critic)
+- **Intermediate representations** — can export language-neutral ShIR and MIR
+  as JSON, and standard ESTree JSON, for building other back-ends
+- **WebAssembly support** — run the converter in the browser
+- **Shell constructs supported**: pipelines and redirections, control flow
+  (if/elif/else, for, while/until, case, select), functions, variable and
+  parameter expansions, command substitution, arithmetic expansion, arrays
+  (indexed and associative), here-documents/here-strings, process substitution,
+  file test operators, and many common external commands (grep, awk, sed, sort,
+  wc, find, ls, …) translated to native Perl
 
 ## Why Not Use an LLM Instead?
 
-While Large Language Models (LLMs) like GPT-4 or Claude can translate shell scripts to other languages, this specialized transcoder offers several key advantages:
+While Large Language Models can translate shell scripts, this specialized
+transcoder offers:
 
-### **Reliability & Consistency**
-- **Deterministic Output**: Every conversion produces identical, predictable results
-- **No Hallucinations**: Unlike LLMs, this tool won't invent non-existent functions or syntax
-- **Consistent Style**: Maintains uniform code formatting and structure across all conversions
-
-### **Performance & Cost**
-- **Lightning Fast**: Converts scripts in milliseconds without API calls or network latency
-- **Zero Cost**: No API usage fees, token costs, or rate limits
-- **Offline Operation**: Works completely offline without internet connectivity
-
-### **Accuracy & Understanding**
-- **Deep Shell Knowledge**: Built specifically for shell script semantics, not general text understanding
-- **Proper AST Parsing**: Creates accurate Abstract Syntax Trees that preserve script logic
-- **Language-Specific Optimizations**: Generates idiomatic code for target language
-
-### **Integration & Automation**
-- **CI/CD Ready**: Can be integrated into build pipelines and automated workflows
-- **Library API**: Provides programmatic access for embedding in other tools
-- **Batch Processing**: Efficiently handles multiple files without API constraints
-
-### **When This Transcoder Excels**
-This tool is ideal for:
-- Automated conversion pipelines
-- Performance-critical applications
-- Offline or air-gapped systems
-- Consistent, repeatable conversions
+- **Deterministic output** — every conversion produces identical, predictable
+  results; no hallucinated functions or syntax
+- **Speed and cost** — converts scripts in milliseconds, offline, with no API
+  fees or rate limits
+- **Verified fidelity** — every change is checked against a 530-script corpus
+  comparing bash output with the generated Perl's output
+- **CI/CD ready** — a library API and CLI that can be embedded in build
+  pipelines and batch workflows
 
 ## Installation
 
 ```bash
-git clone https://github.com/gmatht/debashc.git
-cd debashc
+git clone https://github.com/gmatht/sh2perl.git
+cd sh2perl
 cargo build --release
 ```
+
+See [INSTALL.md](INSTALL.md) for dependency details (Perl modules used by the
+test harness) and [DOCKER.md](DOCKER.md) for a containerized environment.
 
 ## Usage
 
 ### Command Line Interface
 
-The `debashc` binary provides several commands for analyzing and converting shell scripts:
-
 ```bash
 # Tokenize a shell script
-debashc lex "echo hello world"
+debashc lex 'echo hello world'
 
 # Parse a shell script to AST
-debashc parse "ls | grep test"
+debashc parse 'ls | grep test'
 
-# Parse a shell script from file
-debashc file examples/simple.sh
+# Convert a shell script to Perl
+debashc parse --perl 'ls | grep test'
 
-# Convert shell script to Perl
-debashc parse --perl "ls | grep test"
+# Convert a shell script file to Perl
+debashc file --perl examples/001_echo_basic.sh
 
-# Convert shell script to Rust
-debashc parse --rust "ls | grep test"
+# Export the language-neutral ShIR as JSON
+debashc file --shir examples/001_echo_basic.sh
 
-# Convert shell script to Python
-debashc parse --python "ls | grep test"
-
-# Convert shell script file to Perl
-debashc file --perl examples/simple.sh
+# Generate and run the Perl translation
+debashc file --run perl examples/001_echo_basic.sh
 
 # Interactive mode
 debashc interactive
 ```
 
+Run `debashc --help` for the full command list.
+
+### Testing commands
+
+```bash
+# Run one corpus test (compares bash output vs generated-Perl output)
+debashc --test-file perl examples/001_echo_basic.sh
+
+# Run the whole corpus, stopping at each failure
+debashc --next-fail
+
+# Run the corpus starting from the first failing test, with Perl::Critic checks
+debashc fail --perl-critic
+
+# Clear the cached outputs used by the test harness
+debashc --clear-cache
+```
+
 ### Library Usage
 
 ```rust
-use debashc::{Lexer, Parser, Generator, RustGenerator, PythonGenerator};
+use debashl::{Lexer, Parser, Generator};
 
-// Tokenize a shell script
 let input = "echo hello world";
-let mut lexer = Lexer::new(input);
-while let Some(token) = lexer.next() {
-    println!("Token: {:?}", token);
-}
 
 // Parse a shell script
 let mut parser = Parser::new(input);
-match parser.parse() {
-    Ok(commands) => {
-        for command in commands {
-            println!("Command: {:?}", command);
-        }
-    }
-    Err(e) => eprintln!("Parse error: {}", e),
-}
+let commands = parser.parse().expect("parse error");
 
 // Convert to Perl
 let mut generator = Generator::new();
 let perl_code = generator.generate(&commands);
-println!("Perl code: {}", perl_code);
+println!("{}", perl_code);
 ```
 
 ## Web Interface
 
-Debashc includes a beautiful web interface powered by WebAssembly. You can run shell script conversions directly in your browser!
-
-**🌐 [Live Demo](https://dansted.org/Debashc4/) - Try it now!**
-
-### Building and Running the Web Demo
+A WebAssembly build powers an in-browser converter.
 
 ```bash
 # Build the WASM target
-./build-wasm.sh
+./scripts/build-wasm.sh
 
 # Or manually:
 cargo install wasm-pack
@@ -148,152 +140,20 @@ python3 -m http.server 8000
 # Then open http://localhost:8000 in your browser
 ```
 
-The web interface provides:
-- Real-time shell script tokenization
-- AST visualization
-- Conversion to Perl, Rust, and Python
-- Interactive examples
-- Responsive design for mobile and desktop
+See [docs/WASM.md](docs/WASM.md) for the Windows PowerShell workflow and
+`scripts/build-wasi.sh` for the WASI build.
 
-## Examples
+## Example Conversion
 
-### Simple Command
 ```bash
-echo "Hello, World!"
-```
-Parses to a `SimpleCommand` with name "echo" and arguments.
-
-### Pipeline
-```bash
-ls | grep "\.txt$" | wc -l
-```
-Parses to a `Pipeline` with multiple commands connected by pipe operators.
-
-### Control Flow
-```bash
-if [ -f file.txt ]; then
-    echo "File exists"
-else
-    echo "File does not exist"
-fi
-```
-Parses to an `IfStatement` with condition, then branch, and else branch.
-
-### Function Definition
-```bash
-function greet() {
-    echo "Hello, $1!"
-}
-```
-Parses to a `Function` with name and body.
-
-## Shell to Perl Conversion
-
-The `--perl` flag allows you to convert shell scripts to equivalent Perl code:
-
-### Basic Command Conversion
-```bash
-# Shell script
-echo "Hello, World!"
-
-# Convert to Perl
-sh2perl parse --perl 'echo "Hello, World!"'
+debashc parse --perl 'if [ -f file.txt ]; then echo "File exists"; fi'
 ```
 
-Output:
-```perl
-print "Hello, World!\n";
-```
+Output (excerpt):
 
-### Pipeline Conversion
-```bash
-# Shell script
-ls | grep "\.txt$" | wc -l
-
-# Convert to Perl
-sh2perl parse --perl 'ls | grep "\.txt$" | wc -l'
-```
-
-Output:
-```perl
-my $output;
-$output = `ls`;
-$output = `echo "$output" | grep "\.txt$"`;
-print $output;
-```
-
-### Control Flow Conversion
-```bash
-# Shell script
-if [ -f file.txt ]; then
-    echo "File exists"
-else
-    echo "File does not exist"
-fi
-
-# Convert to Perl
-sh2perl parse --perl 'if [ -f file.txt ]; then echo "File exists"; else echo "File does not exist"; fi'
-```
-
-Output:
 ```perl
 if (-f 'file.txt') {
     print "File exists\n";
-} else {
-    print "File does not exist\n";
-}
-```
-
-### File Operations
-```bash
-# Shell script
-mkdir newdir
-cp file.txt newdir/
-rm oldfile.txt
-
-# Convert to Perl
-sh2perl parse --perl 'mkdir newdir; cp file.txt newdir/; rm oldfile.txt'
-```
-
-Output:
-```perl
-mkdir('newdir') or die "Cannot create directory: $!\n";
-use File::Copy;
-copy('file.txt', 'newdir/') or die "Cannot copy file: $!\n";
-unlink('oldfile.txt') or die "Cannot remove file: $!\n";
-```
-
-### Converting Shell Script Files
-
-You can also convert entire shell script files to Perl:
-
-```bash
-# Create a shell script file
-cat > example.sh << 'EOF'
-#!/bin/bash
-if [ -d /tmp ]; then
-    echo "Directory exists"
-    ls /tmp | head -5
-else
-    echo "Directory does not exist"
-fi
-EOF
-
-# Convert the file to Perl
-sh2perl file --perl example.sh
-```
-
-Output:
-```perl
-if (-d '/tmp') {
-    print "Directory exists\n";
-    opendir(my $dh, '/tmp') or die "Cannot open directory: $!\n";
-    while (my $file = readdir($dh)) {
-        print "$file\n" unless $file =~ /^\.\.?$/;
-    }
-    closedir($dh);
-} else {
-    print "Directory does not exist\n";
 }
 ```
 
@@ -301,253 +161,91 @@ if (-d '/tmp') {
 
 ```
 sh2perl/
-├── src/
-│   ├── lib.rs          # Library entry point
-│   ├── main.rs         # Binary entry point
-│   ├── lexer.rs        # Tokenizer implementation
-│   ├── parser.rs       # Parser implementation
-│   └── ast.rs          # Abstract Syntax Tree definitions
-├── examples/           # Example shell scripts
-├── tests/              # Test files
-└── Cargo.toml          # Project configuration
+├── src/                # The transpiler library (crate `debashl`)
+│   ├── lexer.rs        # Tokenizer
+│   ├── parser/         # Token stream → AST
+│   ├── ast.rs          # AST definitions
+│   ├── generator/      # AST → Perl code generation
+│   ├── ir.rs           # Perl-oriented IR helpers
+│   ├── shir.rs         # Language-neutral ShIR (JSON export)
+│   ├── estree.rs       # ESTree JSON export
+│   └── bin/            # Debugging utilities (token/AST dumpers)
+├── cli/                # The `debashc` command-line tool (crate `debashcl`)
+├── examples/           # The 530-script test corpus
+├── examples.impurl/    # Inputs for the purify.pl test suite
+├── docs/               # Design notes and developer documentation
+├── scripts/            # Build, benchmark, and maintenance scripts
+├── ideom/              # Idiom reviews of generated code
+├── www/                # Web interface for the WASM build
+├── purify.pl           # Post-processor that cleans generated Perl
+├── test_purify.pl      # Test suite for purify.pl (run by CI)
+└── Cargo.toml          # Workspace configuration
 ```
-
-## API Documentation
-
-### Lexer
-
-The `Lexer` struct provides tokenization of shell scripts:
-
-```rust
-pub struct Lexer {
-    tokens: Vec<(Token, usize, usize)>,
-    current: usize,
-}
-
-impl Lexer {
-    pub fn new(input: &str) -> Self;
-    pub fn next(&mut self) -> Option<&Token>;
-    pub fn peek(&self) -> Option<&Token>;
-    pub fn is_eof(&self) -> bool;
-}
-```
-
-### Parser
-
-The `Parser` struct converts tokens into an AST:
-
-```rust
-pub struct Parser {
-    lexer: Lexer,
-}
-
-impl Parser {
-    pub fn new(input: &str) -> Self;
-    pub fn parse(&mut self) -> Result<Vec<Command>, ParserError>;
-}
-```
-
-### AST Nodes
-
-The AST is composed of various command types:
-
-- `SimpleCommand`: Basic commands with arguments and redirections
-- `Pipeline`: Multiple commands connected by operators
-- `IfStatement`: Conditional execution
-- `WhileLoop`: Loop constructs
-- `ForLoop`: Iteration over lists
-- `Function`: Function definitions
-- `Subshell`: Commands in subshells
 
 ## Testing
 
-Run the test suite:
-
 ```bash
+# Rust unit/integration tests
 cargo test
+
+# Purify test suite
+perl test_purify.pl --all
+
+# Full corpus equivalence run
+./target/debug/debashc --next-fail
 ```
 
-Run specific test categories:
-
-```bash
-cargo test lexer
-cargo test parser
-```
+The corpus runner compares stdout of each `examples/*.sh` under bash against
+the generated Perl's stdout. Cached outputs are stored in
+`command_cache.json` and generated Perl in `examples.out/` (both are local
+artifacts, ignored by git).
 
 ## Creating Good Examples
 
-When contributing examples to test the shell-to-Perl converter, follow these guidelines to create effective test cases that both validate important features and make debugging easier:
+When contributing examples to the corpus:
 
-### 1. **Test Specific Features**
-- Focus on one or two shell constructs per example
-- Cover edge cases and complex scenarios
-- Test both basic and advanced usage patterns
-- Include examples that stress-test the parser and generator
+1. **Test specific features** — focus on one or two shell constructs per
+   example, including edge cases.
+2. **Use clear names** — `001_simple.sh`, `030_arrays_associative.sh`, …
+3. **Add validation comments** where useful:
+   - `#PERL_MUST_CONTAIN: pattern` — generated Perl must contain this pattern
+   - `#PERL_MUST_NOT_CONTAIN: pattern` — generated Perl must NOT contain it
+   - `#AST_MUST_CONTAIN:` / `#AST_MUST_NOT_CONTAIN:` — same for the AST dump
+4. **Make examples self-contained** — create and clean up any files they need;
+   avoid depending on external state.
+5. **Produce meaningful output** — the corpus compares stdout, so silent
+   operations are not tested.
+6. **Run the tests locally** before submitting:
+   ```bash
+   ./target/debug/debashc --test-file perl examples/your_example.sh
+   ```
 
-### 2. **Use Clear, Descriptive Names**
-- Use descriptive filenames: `001_simple.sh`, `002_control_flow.sh`, `030_arrays_associative.sh`
-- Include comments explaining what the example demonstrates
-- Group related examples with consistent naming patterns
+## Documentation
 
-### 3. **Add Validation Comments**
-Use special comment directives to validate the generated Perl code:
-
-```bash
-#!/bin/bash
-
-# Test basic echo functionality
-echo "Hello, World!"
-
-# Ensure the generated Perl uses print with newline
-#PERL_MUST_CONTAIN: print "Hello, World!\n"
-
-# Ensure it doesn't use unnecessary backticks
-#PERL_MUST_NOT_CONTAIN: `echo
-```
-
-**Available directives:**
-- `#PERL_MUST_CONTAIN: pattern` - Generated Perl must contain this pattern
-- `#PERL_MUST_NOT_CONTAIN: pattern` - Generated Perl must NOT contain this pattern
-- `#AST_MUST_CONTAIN: pattern` - AST representation must contain this pattern
-- `#AST_MUST_NOT_CONTAIN: pattern` - AST representation must NOT contain this pattern
-
-### 4. **Make Examples Self-Contained**
-- Include all necessary setup and cleanup
-- Use temporary files with predictable names
-- Clean up after the test completes
-- Avoid dependencies on external files or system state
-
-```bash
-#!/bin/bash
-
-# Create test files
-echo "test content" > test_file.txt
-cp test_file.txt test_file_copy.txt
-
-# Test file operations
-if [ -f test_file.txt ]; then
-    echo "File exists"
-fi
-
-# Cleanup
-rm -f test_file.txt test_file_copy.txt
-```
-
-### 5. **Test Both Success and Failure Cases**
-- Include examples that should work correctly
-- Test error handling and edge cases
-- Verify that both shell and Perl versions produce identical output
-
-### 6. **Use Meaningful Output**
-- Include `echo` statements to verify correct execution
-- Use descriptive output that makes it easy to spot differences
-- Avoid silent operations that don't produce observable results
-
-```bash
-#!/bin/bash
-
-echo "=== Testing file operations ==="
-if [ -f "nonexistent.txt" ]; then
-    echo "File exists (unexpected)"
-else
-    echo "File does not exist (expected)"
-fi
-```
-
-### 7. **Test Complex Constructs Gradually**
-- Start with simple examples and build complexity
-- Test nested constructs (loops in functions, conditionals in loops)
-- Include examples with multiple shell features combined
-
-### 8. **Document Expected Behavior**
-- Add comments explaining what the script should do
-- Note any special considerations or edge cases
-- Include expected output in comments when helpful
-
-### 9. **Run Tests Locally**
-Before submitting, test your examples:
-
-```bash
-# Test a specific example
-cargo run --bin debashc -- test examples/your_example.sh
-
-# Run all tests
-cargo run --bin debashc -- test-all
-
-# Test with Perl::Critic enabled
-cargo run --bin debashc -- test-all --perl-critic
-```
-
-### 10. **Example Structure Template**
-
-```bash
-#!/bin/bash
-
-# Brief description of what this example tests
-# This example demonstrates [specific shell feature]
-
-echo "=== [Test Category] ==="
-
-# Setup (if needed)
-# Create test files, set variables, etc.
-
-# Test the main functionality
-# [Shell commands being tested]
-
-# Validation comments
-#PERL_MUST_CONTAIN: expected_pattern
-#PERL_MUST_NOT_CONTAIN: forbidden_pattern
-
-# Cleanup (if needed)
-# Remove temporary files, reset state
-```
-
-### 11. **Common Patterns to Test**
-- **File operations**: `cp`, `mv`, `rm`, `mkdir`, `touch`
-- **Text processing**: `grep`, `sed`, `awk`, `sort`, `uniq`
-- **Control flow**: `if/else`, `for` loops, `while` loops, `case` statements
-- **Functions**: Definition, calling, parameter passing, return values
-- **Variables**: Assignment, expansion, parameter expansion
-- **Pipelines**: Simple and complex command chains
-- **Redirections**: Input/output redirection, here documents
-- **Arrays**: Indexed and associative arrays
-- **Arithmetic**: Basic and complex expressions
-- **Error handling**: Exit codes, error conditions
-
-Following these guidelines will help create robust test cases that effectively validate the converter's functionality and make it easier to identify and fix issues.
+- [docs/AST.md](docs/AST.md) — AST reference
+- [docs/ir-design.md](docs/ir-design.md) — IR design notes
+- [docs/backend-universal-contract.md](docs/backend-universal-contract.md) — contract for additional back-ends
+- [docs/ideom-workflow.md](docs/ideom-workflow.md) — idiom review workflow
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — benchmarking the generated code
+- [docs/WASM.md](docs/WASM.md) — WebAssembly build details
+- [docs/TRANSLATIONS.md](docs/TRANSLATIONS.md) — catalog of shell→Perl translations
+- [AGENTS.md](AGENTS.md) — ground rules for AI-assisted development in this repo
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Run the test suite
-6. Submit a pull request
-
-## License
-
-This project is licensed under the GPLv3 License - see the LICENSE file for details.
+3. Make your changes and add tests/examples for new functionality
+4. Run `cargo test` and the corpus (`./target/debug/debashc --next-fail`)
+5. Submit a pull request
 
 ## Roadmap
 
-- [ ] Support for more shell features (case statements etc.)
-- [ ] Support for more builtins (build in awk, sed, sleep etc.)
-- [ ] Shell script to other language converters
-- [ ] Test more examples
+- [ ] Support for more shell features and builtins
+- [ ] Additional target languages via the ShIR/ESTree back-end contract
+- [ ] Get the remaining corpus tests passing
 
-## NOTES
-- The binary is currently debashc. If you see references to sh2perl, well in the future I might have seperate sh2perl, sh2rust etc. Alas not yet../f
+## License
 
-- We are trying to generate the same output as `LANG=C bash` on Linux/WSL would generate
-
-## WASM Optimization
-
-The project includes several optimizations to reduce WASM file size:
-- Release mode builds with size optimization (`opt-level = "z"`)
-- Link-time optimization (LTO)
-- wasm-opt post-processing with `-O4` optimization level
-- Panic abort to remove unwinding code
-- Symbol stripping
-
-Expected size reduction: 60-80% (from ~776KB to ~150-300KB)
+This project is licensed under the GPLv3 License — see the [LICENSE](LICENSE)
+file for details.

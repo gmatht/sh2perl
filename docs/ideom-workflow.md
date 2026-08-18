@@ -31,7 +31,7 @@ Each `.md` file follows a standard template (see below).
 
 ### Trigger
 
-Run `next-ideom-review` (or similar) after `./fail` and
+Run `scripts/next-ideom-review` (or similar) after `./fail` and
 `check_sh_files.pl` both pass.  The script:
 
 1. Finds the first script in `examples/` or `sh/` that doesn't have
@@ -102,6 +102,6 @@ Order of reviews (by expected impact):
 ## Next steps
 
 1. Create `ideom/` directories
-2. Write `next-ideom-review` script
+2. Write `scripts/next-ideom-review` script
 3. Run first review on `examples/001_simple.sh`
 4. Implement first IR migration based on review findings
