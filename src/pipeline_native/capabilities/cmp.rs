@@ -162,7 +162,7 @@ fn cmp_stmt(s: &CmpSpec) -> String {
             "printf(\"%s %s differ: byte %d, line %d\\n\", {f1}, {f2}, $__i+1, $__line); $main_exit_code = $CHILD_ERROR = 1; "
         ));
     }
-    b.push_str("} elsif (length($__c1) == length($__c2)) { $main_exit_code = $CHILD_ERROR = 0; } elsif (length($__short) == 0) { printf(\"cmp: EOF on %s which is empty\\n\", $__sn); $main_exit_code = $CHILD_ERROR = 1; } else { my $__sl = 1 + (() = $__short =~ /\\n/g); if (substr($__short, -1) eq \"\\n\") { printf(\"cmp: EOF on %s after byte %d, line %d\\n\", $__sn, length($__short), $__sl); } else { printf(\"cmp: EOF on %s after byte %d, in line %d\\n\", $__sn, length($__short), $__sl); } $main_exit_code = $CHILD_ERROR = 1; }");
+    b.push_str("} elsif (length($__c1) == length($__c2)) { $main_exit_code = $CHILD_ERROR = 0; } elsif (length($__short) == 0) { printf STDERR (\"cmp: EOF on %s which is empty\\n\", $__sn); $main_exit_code = $CHILD_ERROR = 1; } else { my $__sl = 1 + (() = $__short =~ /\\n/g); if (substr($__short, -1) eq \"\\n\") { printf STDERR (\"cmp: EOF on %s after byte %d, line %d\\n\", $__sn, length($__short), $__sl); } else { printf STDERR (\"cmp: EOF on %s after byte %d, in line %d\\n\", $__sn, length($__short), $__sl); } $main_exit_code = $CHILD_ERROR = 1; }");
     out.push_str(&b);
     out
 }
