@@ -348,7 +348,22 @@ fn generate_shell_command_substitution(generator: &mut Generator, cmd: &Command)
 
 pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s, _) => {
+        Word::Literal(s, quoted) => {
+            // A bare (unquoted) literal containing ${...} kept an embedded
+            // shell expansion the lexer didn't split (e.g. --x="${VAR}").
+            // Re-parse it as string interpolation so the expansion happens.
+            if quoted.is_none() && s.contains("${") && !s.starts_with('`') {
+                if let Ok(interp) =
+                    crate::parser::words::parse_string_interpolation_from_literal(s)
+                {
+                    let has_expansion = interp.parts.iter().any(|p| {
+                        !matches!(p, StringPart::Literal(_))
+                    });
+                    if has_expansion {
+                        return generator.convert_string_interpolation_to_perl(&interp);
+                    }
+                }
+            }
             // Handle literal strings
             if s.len() >= 2 && s.starts_with('`') && s.ends_with('`') {
                 let command_str = s[1..s.len() - 1].to_string();
@@ -3190,6 +3205,15 @@ pub fn convert_string_interpolation_to_perl_impl(
                         parts.push(result);
                     }
                 }
+            }
+            StringPart::Arithmetic(arith) => {
+                // $((expr)) inside a double-quoted string: convert the
+                // arithmetic to a Perl expression and concatenate.
+                if !current_string.is_empty() {
+                    push_string_expr(&mut parts, &mut current_string);
+                }
+                let expr = generator.convert_arithmetic_to_perl(&arith.expression);
+                parts.push(format!("({})", expr));
             }
             _ => {
                 // Handle other StringPart variants by converting them to debug format for now

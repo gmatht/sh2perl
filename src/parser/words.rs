@@ -3659,6 +3659,66 @@ pub fn parse_string_interpolation_from_literal(
                 parts.push(StringPart::Literal("`".to_string()));
                 i = cmd_start;
             }
+        } else if content[i..].starts_with("${") {
+            // ${name} or ${name<op>...}: find the matching close brace.
+            let rest = &content[i + 2..];
+            let mut depth = 1usize;
+            let mut end = None;
+            for (j, c) in rest.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(j) = end {
+                let inner = &rest[..j];
+                if !current_literal.is_empty() {
+                    parts.push(StringPart::Literal(current_literal.clone()));
+                    current_literal.clear();
+                }
+                if !inner.is_empty()
+                    && inner
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    parts.push(StringPart::Variable(inner.to_string()));
+                } else if let Ok(pe) = parse_parameter_expansion_content(inner) {
+                    parts.push(StringPart::ParameterExpansion(pe));
+                } else {
+                    parts.push(StringPart::Literal(format!("${{{}}}", inner)));
+                }
+                i += 2 + j + 1;
+            } else {
+                current_literal.push('$');
+                i += 1;
+            }
+        } else if content[i..].starts_with('$')
+            && content[i + 1..]
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_')
+                .unwrap_or(false)
+        {
+            // $name variable reference
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+            let rest = &content[i + 1..];
+            let name_len = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count();
+            let name: String = rest.chars().take(name_len).collect();
+            parts.push(StringPart::Variable(name));
+            i += 1 + name_len;
         } else {
             // Add to current literal
             let ch = content[i..].chars().next().unwrap();

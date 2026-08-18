@@ -280,8 +280,13 @@ pub fn generate_echo_command(
                                         .replace("@", "\\@")
                             )
                         } else {
-                            // Check if the literal contains backticks that should be processed as command substitutions
-                            if literal.contains("\\`") || literal.contains("`") {
+                            // Check if the literal contains backticks (command
+                            // substitutions) or ${...} variable expansions the
+                            // lexer left embedded (e.g. --x="${VAR}").
+                            if literal.contains("\\`")
+                                || literal.contains("`")
+                                || literal.contains("${")
+                            {
                                 // Parse the string as string interpolation to handle backticks
                                 if let Ok(interp) =
                                     crate::parser::words::parse_string_interpolation_from_literal(

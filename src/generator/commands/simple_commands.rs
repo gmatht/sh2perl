@@ -1177,7 +1177,26 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                                     substitution
                                 )
                             }
-                            Word::Literal(literal, _) => {
+                            Word::Literal(literal, lit_quoted) => {
+                                // A bare literal with an embedded ${...}
+                                // expansion (e.g. --x="${VAR}"): re-parse as
+                                // string interpolation so the variable expands.
+                                if lit_quoted.is_none() && literal.contains("${") {
+                                    if let Ok(interp) =
+                                        crate::parser::words::parse_string_interpolation_from_literal(
+                                            literal,
+                                        )
+                                    {
+                                        if interp
+                                            .parts
+                                            .iter()
+                                            .any(|p| !matches!(p, StringPart::Literal(_)))
+                                        {
+                                            return generator
+                                                .convert_string_interpolation_to_perl(&interp);
+                                        }
+                                    }
+                                }
                                 if has_e_flag {
                                     // If -e flag is present, interpret backslash escapes
                                     let mut interpreted = literal.clone();
