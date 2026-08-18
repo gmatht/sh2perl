@@ -149,6 +149,36 @@ pub fn generate_awk_command(
 ) -> String {
     let mut output = String::new();
 
+    // The native translator only understands simple print/field programs.
+    // Programs with control flow (while/for/getline/function definitions)
+    // would be mistranslated — run the real awk over the buffered input.
+    {
+        let program_text: String = cmd
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                Word::Literal(s, _) if s.contains('{') => Some(s.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let unsupported = ["getline", "while", "for (", "for(", "function ", "do {"]
+            .iter()
+            .any(|k| program_text.contains(k));
+        if unsupported {
+            let awk_cmd = crate::generator::redirects::generate_bash_command_string(
+                &crate::ast::Command::Simple(cmd.clone()),
+            );
+            let full = format!("printf %s \"$SH2PERL_AWK_IN\" | {}", awk_cmd);
+            let lit = crate::ir::safe_perl_q_string(&full);
+            return format!(
+                "${iv} = do {{ local $ENV{{SH2PERL_AWK_IN}} = ${iv} // q{{}}; open(my $__awk_fh, '-|', 'bash', '-c', {lit}) or die \"cmd failed: $!\\n\"; my $_r = do {{ local $/; <$__awk_fh> }} // q{{}}; close $__awk_fh; $CHILD_ERROR = $? >> 8; $_r; }};\n",
+                iv = input_var,
+                lit = lit
+            );
+        }
+    }
+
     // Parse awk arguments conservatively. Support an optional -F<sep>
     // field separator and extract the action block {...} along with an
     // optional condition before the block (eg. "$4 > 90 { print ... }").

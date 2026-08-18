@@ -234,8 +234,51 @@ pub fn generate_case_statement_impl(
                             format!("($ENV{{{}}} // q{{}})", var_name)
                         }
                     }
+                    // "${arr[idx]}" of an array the script never declares is
+                    // "" in bash; emitting the raw subscript would reference
+                    // an undeclared Perl array and fail under strict.
+                    Word::StringInterpolation(interp, _) if interp.parts.len() == 1 => {
+                        if let crate::ast::StringPart::ParameterExpansion(pe) = &interp.parts[0] {
+                            let base = pe
+                                .variable
+                                .split('[')
+                                .next()
+                                .unwrap_or(pe.variable.as_str());
+                            if pe.variable.contains('[')
+                                && !generator.indexed_arrays.contains(base)
+                                && !generator.associative_arrays.contains(base)
+                                && !generator.declared_locals.contains(base)
+                                && !generator.function_level_vars.contains(base)
+                            {
+                                "q{}".to_string()
+                            } else {
+                                word_str
+                            }
+                        } else {
+                            word_str
+                        }
+                    }
                     _ => word_str,
                 };
+
+                // A `$(...)` pattern is evaluated at match time in bash; run
+                // the substitution and compare against its output instead of
+                // the literal source text.
+                if pattern_str.starts_with("$(") && pattern_str.ends_with(')') {
+                    let inner = &pattern_str[2..pattern_str.len() - 1];
+                    if let Ok(cmds) = crate::parser::commands::parse_commands_from_text(inner)
+                    {
+                        if let Some(cmd) = cmds.into_iter().next() {
+                            let capture = generator.word_to_perl(&Word::CommandSubstitution(
+                                Box::new(cmd),
+                                None,
+                            ));
+                            pattern_conditions
+                                .push(format!("({}) eq ({})", processed_word, capture));
+                            continue;
+                        }
+                    }
+                }
 
                 // Handle positional parameters in case statements
                 // $1, $2, … are now translated to $_[0], $_[1], … by
@@ -1805,7 +1848,13 @@ pub fn collect_assigned_vars(cmd: &Command, vars: &mut std::collections::HashSet
             // assignments — hoisting would emit invalid `my $arr[0];`.
             // The container is declared by its own declaration statement.
             if !assignment.variable.contains('[') {
-                vars.insert(assignment.variable.clone());
+                if matches!(assignment.value, Word::Array(_, _, _)) {
+                    // arr=(...) / arr+=(...) needs an array declaration;
+                    // the "@" prefix tells hoist_my_declarations the sigil.
+                    vars.insert(format!("@{}", assignment.variable));
+                } else {
+                    vars.insert(assignment.variable.clone());
+                }
             }
         }
         Command::Block(block) => {
@@ -1870,8 +1919,14 @@ pub fn collect_assigned_vars(cmd: &Command, vars: &mut std::collections::HashSet
 /// Perl::Critic's `ProhibitConditionalDeclarations` policy.
 pub fn hoist_my_declarations(generator: &mut Generator, vars: &std::collections::HashSet<String>, output: &mut String) {
     for var in vars {
-        if !generator.declared_locals.contains(var)
-            && !generator.function_level_vars.contains(var)
+        // A "@" prefix from collect_assigned_vars marks an array assignment
+        // (arr=(...)), which must be declared with the array sigil.
+        let (sigil, name) = match var.strip_prefix('@') {
+            Some(stripped) => ('@', stripped),
+            None => ('$', var.as_str()),
+        };
+        if !generator.declared_locals.contains(name)
+            && !generator.function_level_vars.contains(name)
         {
             // Ensure there's a newline before the declaration if the output
             // doesn't end with one (avoids joining with a previous closing brace).
@@ -1879,8 +1934,11 @@ pub fn hoist_my_declarations(generator: &mut Generator, vars: &std::collections:
                 output.push('\n');
             }
             output.push_str(&generator.indent());
-            output.push_str(&format!("my ${};\n", var));
-            generator.declared_locals.insert(var.clone());
+            output.push_str(&format!("my {}{};\n", sigil, name));
+            generator.declared_locals.insert(name.to_string());
+            if sigil == '@' {
+                generator.indexed_arrays.insert(name.to_string());
+            }
         }
     }
 }
