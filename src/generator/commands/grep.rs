@@ -673,9 +673,12 @@ pub fn generate_grep_command(
         // Actually, \. in shell regex means literal dot, so we should keep it as \. in Perl
         // No conversion needed for \.
 
-        // -w: match only whole words (GNU grep semantics).
+        // -w: match only whole words (GNU grep semantics: the match may not
+        // be adjacent to word-constituent characters).  Lookarounds rather
+        // than \b — patterns whose edges are non-word chars (e.g. "#foo")
+        // would never match with \b anchors.
         if word_match {
-            regex_pattern = format!("\\b(?:{})\\b", regex_pattern);
+            regex_pattern = format!("(?<!\\w)(?:{})(?!\\w)", regex_pattern);
         }
 
         // Apply grep filtering

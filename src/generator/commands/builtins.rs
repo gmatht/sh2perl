@@ -1082,18 +1082,24 @@ pub fn generate_generic_builtin(
             // !(...) wrapping produces a truthy Perl value (0 is falsy,
             // so !0 is truthy, matching shell semantics where exit 0
             // means "success/true").
+            // ($CHILD_ERROR = 0) evaluates to 0, so condition wrappers that
+            // use the last expression value still work, while a standalone
+            // `true` statement now resets $? like the real builtin.
             if output_var.is_empty() {
-                "0;\n".to_string()
+                "$CHILD_ERROR = 0;\n".to_string()
             } else {
-                format!("0;\n${} = q{};\n", output_var, "")
+                format!("$CHILD_ERROR = 0;\n${} = q{};\n", output_var, "")
             }
         }
         "false" => {
             // false command always fails (exit status 1)
+            // ($CHILD_ERROR = 1) evaluates to 1 (truthy exit code) for
+            // condition wrappers; standalone `false` must NOT exit the
+            // program — bash just sets $? = 1 and continues.
             if output_var.is_empty() {
-                "exit 1;\n".to_string()
+                "$CHILD_ERROR = 1;\n".to_string()
             } else {
-                format!("exit 1;\n${} = q{};\n", output_var, "")
+                format!("$CHILD_ERROR = 1;\n${} = q{};\n", output_var, "")
             }
         }
         "whoami" => {

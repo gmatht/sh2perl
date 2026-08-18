@@ -824,13 +824,57 @@ pub fn generate_pipeline_for_substitution(
     // Use IrExpr::Capture to produce a clean `do { chomp(my $_r = qx{...}); $_r; }`
     // expression. This replaces the raw format!() with an IR node that the
     // backend formats consistently, addressing Patterns A and G.
+    // Positional parameters ($1..$9) in the reconstructed shell string can't
+    // survive: the function generator later does a textual $N → $_[N-1]
+    // replace over the whole body (mangling shell strings), and the spawned
+    // shell has no positional args anyway.  Rewrite them to env-var
+    // references with names immune to that replace, and export the values.
+    let mut final_cmd = final_cmd;
+    let mut pos_exports: Vec<usize> = Vec::new();
+    {
+        let re = regex::Regex::new(r"\$\{?([1-9])\}?").unwrap();
+        let rewritten = re
+            .replace_all(&final_cmd, |caps: &regex::Captures| {
+                let n: usize = caps[1].parse().unwrap();
+                pos_exports.push(n);
+                format!("${{SH2PERL_ARG_{}}}", n)
+            })
+            .to_string();
+        final_cmd = rewritten;
+        pos_exports.sort_unstable();
+        pos_exports.dedup();
+    }
+
     let backtick_expr = IrExpr::Capture {
-        expr: Box::new(IrExpr::RawExpr(final_cmd)),
+        expr: Box::new(IrExpr::RawExpr(final_cmd.clone())),
         native: false,
     };
     let simplified = expr_to_perl(&backtick_expr);
 
-    simplified
+    // Shell variable references that are Perl lexicals (function locals,
+    // declared vars) are invisible to the spawned shell — pass them through
+    // the environment for the duration of the capture.
+    let exports = env_exports_for_cmd(generator, &final_cmd);
+    let mut prefix = String::new();
+    for n in &pos_exports {
+        let perl_ref = if generator.fn_nesting_depth > 0 {
+            format!("$_[{}]", n - 1)
+        } else {
+            format!("$ARGV[{}]", n - 1)
+        };
+        prefix.push_str(&format!(
+            "local $ENV{{SH2PERL_ARG_{}}} = {} // q{{}}; ",
+            n, perl_ref
+        ));
+    }
+    for v in &exports {
+        prefix.push_str(&format!("local $ENV{{{v}}} = ${v} // q{{}}; ", v = v));
+    }
+    if prefix.is_empty() {
+        simplified
+    } else {
+        format!("do {{ {}{} }}", prefix, simplified)
+    }
 }
 
 /// Generate a simple pipe pipeline with print option

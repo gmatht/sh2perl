@@ -1729,7 +1729,14 @@ fn generate_combined_test_condition(generator: &mut Generator, cmd: &Command) ->
                     .trim_end_matches(|c: char| c == ';' || c == '\n' || c == ' ' || c == '\t')
                     .trim_end_matches(';')
                     .to_string();
-                format!("!do {{ local $CHILD_ERROR; {} }}", c)
+                // Success = exit status 0.  Test $CHILD_ERROR explicitly
+                // inside the local scope — negating the do-block's last
+                // expression is unreliable (for redirect-wrapped commands the
+                // last expression is a close() result, not the exit code).
+                format!(
+                    "do {{ local $CHILD_ERROR = 0; {}; $CHILD_ERROR == 0 }}",
+                    c
+                )
             }
         }
     }
