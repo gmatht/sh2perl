@@ -160,7 +160,7 @@ pub fn run_perl_critic_brutal(perl_code: &str) -> Result<String, String> {
     }
 
     // Create a temporary file for the Perl code
-    let temp_file = std::env::temp_dir().join("__tmp_perl_critic_test.pl");
+    let temp_file = harness_temp_dir().join("__tmp_perl_critic_test.pl");
     let temp_file_str = temp_file.to_string_lossy().to_string();
 
     // Write Perl code to temporary file
@@ -421,6 +421,16 @@ pub fn read_shell_source(filename: &str) -> Result<String, String> {
     })
 }
 
+/// Directory for harness-generated temp files.  A stable subdirectory of
+/// the system temp dir, so writing per-test files between a script's bash
+/// reference run and its Perl run does not change what `ls /tmp` sees
+/// (100_pipeline_failure_basic lists /tmp).
+fn harness_temp_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("sh2perl_tmp");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// True when bash itself refuses to parse the script (`bash -n` fails).
 /// Used when our parser errors out: if the source is genuinely invalid
 /// bash, the faithful translation is a program that reports the syntax
@@ -501,7 +511,7 @@ pub fn test_file_equivalence_with_critic(
             }
 
             let safe_name = filename.replace(['/', '\\', ' ', '(', ')', '\''], "_");
-            let tmp = std::env::temp_dir().join(format!("__tmp_{}", safe_name));
+            let tmp = harness_temp_dir().join(format!("__tmp_{}", safe_name));
             let tmp_str = tmp.to_string_lossy().to_string();
             if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) {
                 return Err(format!("Failed to write Perl temp file: {}", e));
@@ -778,7 +788,7 @@ pub fn test_file_equivalence_detailed_with_critic(
 
         // Also create a temporary file for execution
         let safe_name = filename.replace(['/', '\\', ' ', '(', ')', '\''], "_");
-        let tmp = std::env::temp_dir().join(format!("__tmp_{}", safe_name));
+        let tmp = harness_temp_dir().join(format!("__tmp_{}", safe_name));
         let tmp_str = tmp.to_string_lossy().to_string();
         if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &translated_code) {
             return Err(format!("Failed to write Perl temp file: {}", e));
@@ -962,7 +972,7 @@ pub fn test_file_equivalence_detailed_with_critic(
 
                 // Also create a temporary file for execution
                 let safe_name = filename.replace(['/', '\\', ' ', '(', ')', '\''], "_");
-                let tmp = std::env::temp_dir().join(format!("__tmp_{}", safe_name));
+                let tmp = harness_temp_dir().join(format!("__tmp_{}", safe_name));
                 let tmp_str = tmp.to_string_lossy().to_string();
                 if let Err(e) = shared_utils::SharedUtils::write_utf8_file(&tmp_str, &code) {
                     return Err(format!("Failed to write Perl temp file: {}", e));
@@ -1149,7 +1159,7 @@ pub fn test_file_equivalence_detailed_with_critic(
         }
 
         // Check PerlTidy formatting
-        let temp_file_tidy = std::env::temp_dir().join("__tmp_perltidy_check.pl");
+        let temp_file_tidy = harness_temp_dir().join("__tmp_perltidy_check.pl");
         let temp_file_tidy_str = temp_file_tidy.to_string_lossy().to_string();
 
         if let Ok(_) = std::fs::write(&temp_file_tidy, &translated_code) {
@@ -2062,7 +2072,7 @@ pub fn test_all_examples_next_fail(
                         // Check for PerlTidy differences and show tidied code if different
                         if generator.as_str() == "perl" {
                             // Create a temporary file for PerlTidy check
-                            let temp_file = std::env::temp_dir().join("__tmp_perltidy_check.pl");
+                            let temp_file = harness_temp_dir().join("__tmp_perltidy_check.pl");
                             let temp_file_str = temp_file.to_string_lossy().to_string();
 
                             if let Ok(_) = std::fs::write(&temp_file, &result.translated_code) {
@@ -2724,7 +2734,7 @@ pub fn test_all_examples_next_fail_unlimited(
                         // Check for PerlTidy differences and show tidied code if different
                         if generator.as_str() == "perl" {
                             // Create a temporary file for PerlTidy check
-                            let temp_file = std::env::temp_dir().join("__tmp_perltidy_check.pl");
+                            let temp_file = harness_temp_dir().join("__tmp_perltidy_check.pl");
                             let temp_file_str = temp_file.to_string_lossy().to_string();
 
                             if let Ok(_) = std::fs::write(&temp_file, &result.translated_code) {
