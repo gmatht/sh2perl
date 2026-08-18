@@ -412,8 +412,10 @@ pub fn word_to_perl_impl(generator: &mut Generator, word: &Word) -> String {
                 // helper so quoting/escaping rules are consistent and we avoid
                 // accidental Perl interpolation of shell snippets (like awk/sed)
                 // which may contain "$" or "@". Using generator.perl_string_literal
-                // ensures single-quoting is used when safe.
-                generator.perl_string_literal(&Word::literal(s.clone()))
+                // ensures single-quoting is used when safe.  Pass the ORIGINAL
+                // word so the single-quoted annotation survives (it controls
+                // whether backslash quote-removal applies).
+                generator.perl_string_literal(&Word::Literal(s.clone(), *quoted))
             }
         }
         Word::ParameterExpansion(pe, _) => generator.generate_parameter_expansion(pe),

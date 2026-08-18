@@ -187,11 +187,18 @@ fn try_extract_sort_herestring_var(inner: &str) -> Option<&str> {
 
 pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> String {
     match word {
-        Word::Literal(s, _) => {
+        Word::Literal(s, quoted) => {
             // Apply bash quote removal: in unquoted words, \X → X
             // (backslash is removed, the following character is kept literally).
-            // This matches how the shell processes unquoted words.
-            let s = apply_shell_quote_removal(s);
+            // This matches how the shell processes unquoted words.  Inside
+            // single quotes backslashes are VERBATIM — except the \' the
+            // parser leaves behind when merging the '\'' embedded-quote
+            // idiom, which does denote a literal quote.
+            let s = if quoted.is_some() {
+                s.replace("\\'", "'")
+            } else {
+                apply_shell_quote_removal(s)
+            };
             
             let has_standalone_system = {
                 let mut found = false;
