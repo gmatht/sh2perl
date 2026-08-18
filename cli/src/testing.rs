@@ -397,6 +397,30 @@ pub fn find_uses_of_system() {
     }
 }
 
+/// Read a shell source file byte-preservingly.  bash passes non-UTF-8 bytes
+/// through unchanged, but fs::read_to_string rejects them; decode valid UTF-8
+/// as-is and otherwise map bytes >= 0x80 to U+F800+byte private-use chars.
+/// The Perl emitter turns those back into single-byte \x{..} escapes so the
+/// generated program writes the original bytes.
+pub fn read_shell_source(filename: &str) -> Result<String, String> {
+    let bytes = std::fs::read(filename)
+        .map_err(|e| format!("Failed to read {}: {}", filename, e))?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => e
+            .into_bytes()
+            .iter()
+            .map(|&b| {
+                if b < 0x80 {
+                    b as char
+                } else {
+                    char::from_u32(0xF800 + b as u32).unwrap_or('\u{FFFD}')
+                }
+            })
+            .collect(),
+    })
+}
+
 pub fn test_file_equivalence(lang: &str, filename: &str) -> Result<(), String> {
     test_file_equivalence_with_critic(lang, filename, false)
 }
@@ -406,13 +430,8 @@ pub fn test_file_equivalence_with_critic(
     filename: &str,
     enable_perl_critic: bool,
 ) -> Result<(), String> {
-    // Read shell script content
-    let shell_content = match fs::read_to_string(filename) {
-        Ok(c) => c,
-        Err(e) => {
-            return Err(format!("Failed to read {}: {}", filename, e));
-        }
-    };
+    // Read shell script content (byte-preserving for non-UTF-8 sources)
+    let shell_content = read_shell_source(filename)?;
 
     // Parse and generate target language code
     let commands = match Parser::new(&shell_content).parse() {
@@ -817,12 +836,7 @@ pub fn test_file_equivalence_detailed_with_critic(
     // If no cached Perl code, we need to parse and generate
     if cached_perl_code.is_none() {
         // Read shell script content
-        shell_content = match fs::read_to_string(filename) {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(format!("Failed to read {}: {}", filename, e));
-            }
-        };
+        shell_content = read_shell_source(filename)?;
 
         // Parse and generate target language code
         let commands = match Parser::new(&shell_content).parse() {

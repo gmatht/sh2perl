@@ -253,6 +253,9 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                         '@' => "\\@".to_string(),
                         '$' => "\\$".to_string(),
                         _ if c.is_ascii() => c.to_string(),
+                        // U+F880..F8FF marks a raw non-UTF-8 source byte
+                        // (see cli read fallback): emit it as that single byte.
+                        _ if (0xF880..=0xF8FF).contains(&(c as u32)) => format!("\\x{{{:02X}}}", c as u32 - 0xF800),
                         _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
                     }
                 }).collect::<Vec<_>>().join("");
@@ -314,7 +317,10 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 '{' => "\\{".to_string(),
                                 '}' => "\\}".to_string(),
                                 _ if c.is_ascii() => c.to_string(),
-                                _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
+                                // U+F880..F8FF marks a raw non-UTF-8 source byte
+                        // (see cli read fallback): emit it as that single byte.
+                        _ if (0xF880..=0xF8FF).contains(&(c as u32)) => format!("\\x{{{:02X}}}", c as u32 - 0xF800),
+                        _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
                             }
                         }).collect::<Vec<_>>().join("");
                         format!("q{{{}}}", escaped_q)
@@ -331,7 +337,10 @@ pub fn perl_string_literal_impl(generator: &mut Generator, word: &Word) -> Strin
                                 '@' => "\\@".to_string(),
                                 '$' => "\\$".to_string(),
                                 _ if c.is_ascii() => c.to_string(),
-                                _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
+                                // U+F880..F8FF marks a raw non-UTF-8 source byte
+                        // (see cli read fallback): emit it as that single byte.
+                        _ if (0xF880..=0xF8FF).contains(&(c as u32)) => format!("\\x{{{:02X}}}", c as u32 - 0xF800),
+                        _ => c.to_string().into_bytes().iter().map(|b| format!("\\x{{{:02X}}}", b)).collect::<String>(),
                             }
                         }).collect::<Vec<_>>().join("");
                         format!("\"{}\"", escaped)
