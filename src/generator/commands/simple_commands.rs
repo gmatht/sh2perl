@@ -1725,8 +1725,11 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
                     output.push_str(&format!("{}();\n", call_prefix));
                 } else {
                     // Check if any argument contains glob patterns
+                    // Only bare (unquoted) literals are glob candidates — a
+                    // quoted argument containing * or ? (e.g. a 'bash -c'
+                    // script with $?) is passed through verbatim by the shell.
                     let has_glob_patterns = cmd.args.iter().any(|arg| match arg {
-                        Word::Literal(s, _) => s.contains('*') || s.contains('?'),
+                        Word::Literal(s, None) => s.contains('*') || s.contains('?'),
                         _ => false,
                     });
 
@@ -1738,7 +1741,7 @@ pub fn generate_simple_command_impl(generator: &mut Generator, cmd: &SimpleComma
 
                         for arg in &cmd.args {
                             match arg {
-                                Word::Literal(s, _) if s.contains('*') || s.contains('?') => {
+                                Word::Literal(s, None) if s.contains('*') || s.contains('?') => {
                                     // Collect glob patterns
                                     glob_patterns.push(s);
                                 }

@@ -1356,8 +1356,11 @@ fn generate_system_call_fallback(
 
     // Check if this is a function call with glob patterns (use cmd_basename)
     if generator.declared_functions.contains(cmd_basename) {
+        // Only bare (unquoted) literals are glob candidates — a quoted
+        // argument containing * or ? (e.g. a 'bash -c' script with $?)
+        // is passed through verbatim by the shell.
         let has_glob_patterns = cmd.args.iter().any(|arg| match arg {
-            Word::Literal(s, _) => s.contains('*') || s.contains('?'),
+            Word::Literal(s, None) => s.contains('*') || s.contains('?'),
             _ => false,
         });
 
