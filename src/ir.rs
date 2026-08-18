@@ -2340,6 +2340,19 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     safe_perl_q_string(&full_cmd)
                 ));
             } else {
+                // Without capture: try the native capability tree first (the
+                // Exec node's cmd+args adapt to the shared `exec` call shape,
+                // so rm -f … / cmp … / unset … drop in as before).
+                let adapted = IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![cmd.clone(), IrExpr::Array(args.clone())],
+                };
+                if let Some(native) = crate::pipeline_native::native_exec_stmt(&adapted) {
+                    emit_indent(out, indent);
+                    out.push_str(&native);
+                    out.push('\n');
+                    return;
+                }
                 // Without capture: run the command via system() for side effects.
                 let mut arg_parts: Vec<String> = Vec::new();
                 arg_parts.push(cmd_str.clone());
@@ -2372,7 +2385,13 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 }
                 let full_cmd = arg_parts.join(" ");
                 emit_indent(out, indent);
-                out.push_str(&format!("system({});\\n", full_cmd));
+                // Side-effect run via bash -c (the args are bash-quoted words; a
+                // bare `system(<joined words>)` concatenates them into one broken
+                // perl expression). Track the status for `$?`/`&&`/`||`.
+                out.push_str(&format!(
+                    "system('bash', '-c', {}); $main_exit_code = $CHILD_ERROR = $? >> 8;\n",
+                    safe_perl_q_string(&full_cmd)
+                ));
             }
         }
 
@@ -4226,36 +4245,6 @@ fn word_iter_to_perl(iter: &IrExpr) -> String {
     }
 }
 
-/// Native `declare`/`typeset` — the SAFE subset only: `declare -A NAME` /
-/// `declare -a NAME` (a bare NAME with no init) renders the empty
-/// hash/array declaration `my %NAME = ();` / `my @NAME = ();`. Everything
-/// else (integer/readonly/export attributes, `NAME=(…)` array literals,
-/// `-p`/`-f`/`-n` forms) is REFUSED (false, no emit) and keeps the bash -c
-/// fallback — `-i` changes later-assignment semantics and `-r` forbids
-/// reassignment, neither of which a plain `my` decl expresses.
-fn try_native_declare_stmt(out: &mut String, indent: usize, words: &[&IrExpr]) -> bool {
-    if words.len() != 2 {
-        return false;
-    }
-    let (f, name) = match (&words[0], &words[1]) {
-        (IrExpr::Str(f, _), IrExpr::Str(n, _)) => (f.as_str(), n.as_str()),
-        _ => return false,
-    };
-    let sigil = match f {
-        "-A" => '%',
-        "-a" => '@',
-        _ => return false,
-    };
-    if !crate::shared_utils::SharedUtils::is_variable_name(name) {
-        return false;
-    }
-    emit_indent(out, indent);
-    out.push_str(&format!("my {sigil}{name} = ();\n"));
-    emit_indent(out, indent);
-    out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
-    true
-}
-
 /// Lower a modern-IR `exec` Call in statement position.
 fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
     let (cmd, mut words) = match call {
@@ -4579,7 +4568,6 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             emit_indent(out, indent);
             out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
         }
-        "declare" | "typeset" if try_native_declare_stmt(out, indent, &words) => {}
         _ => {
             // External command — first try the AST Generator's in-Perl
             // emulation (verified-safe commands only: native Perl, no bash
