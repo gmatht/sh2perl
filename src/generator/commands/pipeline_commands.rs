@@ -832,15 +832,51 @@ pub fn generate_pipeline_for_substitution(
     let mut final_cmd = final_cmd;
     let mut pos_exports: Vec<usize> = Vec::new();
     {
-        let re = regex::Regex::new(r"\$\{?([1-9])\}?").unwrap();
-        let rewritten = re
-            .replace_all(&final_cmd, |caps: &regex::Captures| {
-                let n: usize = caps[1].parse().unwrap();
-                pos_exports.push(n);
-                format!("${{SH2PERL_ARG_{}}}", n)
-            })
-            .to_string();
-        final_cmd = rewritten;
+        // Quote-aware scan: $N inside shell single quotes is NOT a positional
+        // parameter (e.g. awk '{print $1}').
+        let chars: Vec<char> = final_cmd.chars().collect();
+        let mut out = String::with_capacity(final_cmd.len());
+        let mut in_sq = false;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\'' {
+                in_sq = !in_sq;
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            if !in_sq && c == '$' {
+                // $N (single digit 1-9, not followed by another digit)
+                if i + 1 < chars.len()
+                    && chars[i + 1].is_ascii_digit()
+                    && chars[i + 1] != '0'
+                    && !(i + 2 < chars.len() && chars[i + 2].is_ascii_digit())
+                {
+                    let n = chars[i + 1].to_digit(10).unwrap() as usize;
+                    pos_exports.push(n);
+                    out.push_str(&format!("${{SH2PERL_ARG_{}}}", n));
+                    i += 2;
+                    continue;
+                }
+                // ${N}
+                if i + 3 < chars.len()
+                    && chars[i + 1] == '{'
+                    && chars[i + 2].is_ascii_digit()
+                    && chars[i + 2] != '0'
+                    && chars[i + 3] == '}'
+                {
+                    let n = chars[i + 2].to_digit(10).unwrap() as usize;
+                    pos_exports.push(n);
+                    out.push_str(&format!("${{SH2PERL_ARG_{}}}", n));
+                    i += 4;
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
+        }
+        final_cmd = out;
         pos_exports.sort_unstable();
         pos_exports.dedup();
     }

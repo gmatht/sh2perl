@@ -393,8 +393,10 @@ pub fn generate_find_for_substitution(
     });
 
     // File::Find::find(sub { ... }, start_dir);
+    // `no warnings 'once'`: with a single mention of $File::Find::name, Perl
+    // otherwise prints a "used only once: possible typo" warning to stderr.
     let find_call = format!(
-        "{indent}File::Find::find(sub {{ {maxdepth_cond}if ({condition_code}) {{ push @find_results, $File::Find::name; }} }}, {start_dir});\n",
+        "{indent}File::Find::find(sub {{ no warnings qw(once); {maxdepth_cond}if ({condition_code}) {{ push @find_results, $File::Find::name; }} }}, {start_dir});\n",
         indent = indent_str,
         condition_code = condition_code,
         start_dir = start_dir_expr,
