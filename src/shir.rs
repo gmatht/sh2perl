@@ -35516,6 +35516,26 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
         );
     }
 
+    /// `cmp -s F1 F2` (silent byte compare) lowers to a native read-both +
+    /// eq check (exit status only; cmp's "differ" message needs -s-less
+    /// output we won't reproduce, so only -s lifts).
+    #[test]
+    fn cmp_s_lowers_native_compare() {
+        let src = "if cmp -s /tmp/a /tmp/b; then echo eq; fi\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("open(my $__f1,'<','/tmp/a')")
+                && perl.contains("eq $__c2"),
+            "cmp -s should lower to a native byte compare: {perl}"
+        );
+        assert!(
+            !perl.contains("system('bash'"),
+            "cmp -s must not shell out: {perl}"
+        );
+    }
+
     /// `cat <<'EOF' … EOF` (the print-heredoc idiom) lowers to a native
     /// `print` with no bash -c.
     #[test]
