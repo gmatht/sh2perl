@@ -1542,10 +1542,12 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
             out.push_str("}\n");
         }
         IrStmt::Redirect { inner, redirects } => {
-            if let Some(s) = native_cat_heredoc(inner, redirects) {
-                out.push_str(&s);
-                out.push('\n');
-                return;
+            if let Some(body) = cat_heredoc_body(inner, redirects) {
+                if let Some(s) = crate::pipeline_native::native_heredoc(&body) {
+                    out.push_str(&s);
+                    out.push('\n');
+                    return;
+                }
             }
             // Rebuild the shell command with shell redirection syntax and
             // run it via bash -c — stdout matches bash exactly (redirects
@@ -1911,7 +1913,7 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                 // Non-Call expressions: bare `&&`/`||` chains of execs,
                 // redirects, pipelines — run the reconstructed shell command.
                 other_expr => {
-                    if let Some(s) = native_grep_chain(other_expr) {
+                    if let Some(s) = crate::pipeline_native::native_chain(other_expr) {
                         emit_indent(out, indent);
                         out.push_str(&s);
                         out.push('\n');
@@ -2470,7 +2472,7 @@ pub(crate) fn emit_sub(out: &mut String, sub: &IrSub) {
 // with an actionable message instead of a panic.
 
 /// Extract a plain string from a word-shaped expression (Str / Var / Ident).
-fn call_arg_str(e: &IrExpr) -> Option<String> {
+pub(crate) fn call_arg_str(e: &IrExpr) -> Option<String> {
     match e {
         IrExpr::Str(s, _) => Some(s.clone()),
         IrExpr::Var(name, _) => Some(name.clone()),
@@ -3454,7 +3456,7 @@ fn is_emulatable_var_name(name: &str) -> bool {
 
 /// The modern IR packs all of a command's word arguments into a single
 /// `Array` element: exec(cmd, Array([w1, w2, …])). Flatten to the word list.
-fn exec_word_args(args: &[IrExpr]) -> Vec<&IrExpr> {
+pub(crate) fn exec_word_args(args: &[IrExpr]) -> Vec<&IrExpr> {
     if args.len() == 2 {
         if let IrExpr::Array(elems) = &args[1] {
             return elems.iter().collect();
@@ -3811,58 +3813,34 @@ fn append_redirect_frag(cmd: &mut String, fd: i64, mode: &str, target: &str) -> 
 /// -E -F -Z`, globs, multiple files, a variable/arith pattern) keeps the
 /// shell-out: it is not a plain boolean (grep would print matches/files/
 /// counts).
-fn try_native_grep_test(call: &IrExpr) -> Option<String> {
-    let IrExpr::Call { func, args } = call else { return None };
-    if func != "exec" && func != "builtin" {
+/// The body of a verified `cat <<'EOF' … EOF` (cat with no args, exactly
+/// one stdin heredoc redirect with a literal body). Shape check only — the
+/// native emission lives in the pipeline_native cat capability.
+fn cat_heredoc_body(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<String> {
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else { return None };
+    if func != "exec" {
         return None;
     }
-    // command name must be `grep`
-    if !matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "grep") {
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return None };
+    if cmd != "cat" || !words.is_empty() {
         return None;
     }
-    let words: Vec<&IrExpr> = exec_word_args(args);
-    // parse flags (only q/i/s), then pattern, then file
-    let mut ci = false;
-    let mut nonflag: Vec<&IrExpr> = Vec::new();
-    for w in words {
-        match w {
-            IrExpr::Str(s, _) if s.starts_with('-') && s.len() > 1 => {
-                let f: String = s[1..].chars().filter(|c| "qis".contains(*c)).collect();
-                if f.len() != s.len() - 1 {
-                    return None; // an unsupported flag char
-                }
-                ci |= s.contains('i');
-            }
-            _ => nonflag.push(w),
-        }
-    }
-    if nonflag.len() != 2 {
-        return None; // need exactly pattern + one file
-    }
-    let pat = grep_lit_str(nonflag[0])?;
-    if !grep_literal_safe(&pat) {
+    if redirects.len() != 1 {
         return None;
     }
-    let file = grep_lit_str(nonflag[1])?;
-    if file.contains('*') || file.contains('?') {
-        return None; // a glob expends to many files — not a single read
+    let r = &redirects[0];
+    if r.mode != "heredoc" {
+        return None;
     }
-    let (hay, ndl) = if ci {
-        ("lc($__grep_c)".to_string(), format!("lc({})", safe_perl_q_string(&pat)))
-    } else {
-        ("$__grep_c".to_string(), safe_perl_q_string(&pat))
-    };
-    Some(format!(
-        "(sub {{ open(my $__grep_h, '<', {}) or return 0; local $/; \
-            my $__grep_c = <$__grep_h>; close $__grep_h; \
-            return (index({hay}, {ndl}) >= 0 ? 1 : 0); }}->())",
-        safe_perl_q_string(&file)
-    ))
+    if r.fd.is_some() && r.fd.unwrap() != 0 {
+        return None;
+    }
+    call_arg_str(&r.target)
 }
 
-/// Extract a literal string from a pattern/file arg: a `Str`, a `Num`, or
-/// an `Interpolate` whose parts are all literal text. Variables/arith /
-/// captures → None (refuse).
+/// Extract a literal string from a pattern/file arg: a `Str`, an `Int`,
+/// or an `Interpolate` whose parts are all literal text. Variables/arith /
+/// captures → None (refuse). Shared with the pipeline_native capabilities.
 pub(crate) fn grep_lit_str(e: &IrExpr) -> Option<String> {
     match e {
         IrExpr::Str(s, _) => Some(s.clone()),
@@ -3879,159 +3857,6 @@ pub(crate) fn grep_lit_str(e: &IrExpr) -> Option<String> {
         }
         _ => None,
     }
-}
-
-/// A pattern is a plain substring iff grep's BRE would treat it as a
-/// literal: no *leading* `-` (parsed as an option), no BRE metacharacters
-/// (`^ $ . [ ] * \\`), and no real newline (grep is line-scoped).
-fn grep_literal_safe(pat: &str) -> bool {
-    !pat.starts_with('-')
-        && !pat
-            .chars()
-            .any(|c| matches!(c, '^' | '$' | '.' | '[' | ']' | '*' | '\\' | '\n'))
-}
-
-/// A bare `exec echo LITERAL` renders as native `print` (always exit 0),
-/// so it can be a `&&`/`||` chain body without a shell-out.
-fn native_literal_echo(e: &IrExpr) -> Option<String> {
-    let IrExpr::Call { func, args } = e else { return None };
-    if func != "exec" && func != "builtin" {
-        return None;
-    }
-    if !matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "echo") {
-        return None;
-    }
-    let words: Vec<&IrExpr> = exec_word_args(args);
-    if words.len() != 1 {
-        return None; // native form is a single literal payload
-    }
-    let text = grep_lit_str(words[0])?;
-    Some(format!(
-        "print({}, \"\\n\"); $main_exit_code = $CHILD_ERROR = 0;",
-        safe_perl_q_string(&text)
-    ))
-}
-
-/// `grep -q PAT FILE && echo A || echo B` lowers to a clean native
-/// if/else: `-q` is quiet (pure boolean status, no stdout side-effect)
-/// and a literal `echo` body always succeeds, so `X && A || B ≡ if X {A}
-/// else {B}`. Both the grep condition and the echo bodies render natively
-/// (no bash -c), removing the shell-out. Refused (stays a shell-out)
-/// whenever the grep isn't a quiet single-file literal, or the then/else
-/// aren't native-able literal echoes.
-fn native_grep_chain(e: &IrExpr) -> Option<String> {
-    let IrExpr::BinOp {
-        lhs,
-        op: BinOpKind::Or,
-        rhs,
-    } = e
-    else {
-        return None;
-    };
-    let IrExpr::BinOp {
-        lhs: cond,
-        op: BinOpKind::And,
-        rhs: then_body,
-    } = lhs.as_ref()
-    else {
-        return None;
-    };
-    let cond_perl = try_native_grep_test(cond)?;
-    let then_perl = native_literal_echo(then_body)?;
-    let else_perl = native_literal_echo(rhs)?;
-    Some(format!(
-        "if ({cond_perl}) {{ {then_perl} }} else {{ {else_perl} }}"
-    ))
-}
-
-
-/// `cat <<'EOF' … EOF` (and the unquoted form with a fully-literal body)
-/// is the canonical print-heredoc idiom: cat with no args and a single
-/// stdin heredoc redirect just echoes the body to stdout. Emit that as a
-/// native `print` instead of a bash -c. Refused when cat has args/flags,
-/// when there is any non-stdin redirect (a `> file` would re-target the
-/// output), or when the body isn't a literal (a $var heredoc needs bash).
-fn native_cat_heredoc(inner: &[IrStmt], redirects: &[IrRedirect]) -> Option<String> {
-    // inner must be exactly: exec cat (no args)
-    let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else { return None };
-    if func != "exec" {
-        return None;
-    }
-    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return None };
-    if cmd != "cat" || !words.is_empty() {
-        return None;
-    }
-    // exactly one redirect, a stdin heredoc, with a literal body
-    if redirects.len() != 1 {
-        return None;
-    }
-    let r = &redirects[0];
-    if r.mode != "heredoc" {
-        return None;
-    }
-    if r.fd.is_some() && r.fd.unwrap() != 0 {
-        return None;
-    }
-    let body = call_arg_str(&r.target)?;
-    Some(format!(
-        "print({}); $main_exit_code = $CHILD_ERROR = 0;",
-        safe_perl_q_string(&body)
-    ))
-}
-
-fn native_cmp_boolean(words: &[&IrExpr]) -> Option<String> {
-    // cmp -s [-n N] F1 F2 — silent byte compare (exit 0 iff the files are
-    // equal). Only the SILENT form is lifted (bare `cmp` prints a differ
-    // message we won't reproduce); -l/-b/-i and non-literal paths refuse.
-    let mut quiet = false;
-    let mut limit: Option<i64> = None;
-    let mut files: Vec<&IrExpr> = Vec::new();
-    let mut it = words.iter();
-    while let Some(w) = it.next() {
-        match w {
-            IrExpr::Str(s, _) if s == "-s" => quiet = true,
-            IrExpr::Str(s, _) if s == "-n" => {
-                limit = it
-                    .next()
-                    .and_then(|v| grep_lit_str(v))
-                    .and_then(|v| v.parse().ok())
-                    .or(limit);
-            }
-            IrExpr::Str(s, _) if s.starts_with('-') => return None,
-            _ => files.push(w),
-        }
-    }
-    if !quiet || files.len() != 2 {
-        return None;
-    }
-    let f1 = grep_lit_str(files[0])?;
-    let f2 = grep_lit_str(files[1])?;
-    if f1.contains('*') || f2.contains('*') {
-        return None;
-    }
-    let p1 = safe_perl_q_string(&f1);
-    let p2 = safe_perl_q_string(&f2);
-    let compare = match limit {
-        Some(n) => format!("substr($__c1,0,{n}) eq substr($__c2,0,{n})"),
-        None => "$__c1 eq $__c2".to_string(),
-    };
-    Some(format!(
-        "(sub {{ open(my $__f1,'<',{p1}) && open(my $__f2,'<',{p2}) or return 0; local $/; my $__c1=<$__f1>; my $__c2=<$__f2>; close $__f1; close $__f2; return ({compare}) ? 1 : 0; }}->())",
-        p1 = p1,
-        p2 = p2,
-        compare = compare
-    ))
-}
-
-
-/// Condition-position `cmp -s F1 F2`: the exec cond is `exec(cmp,[-s,F1,F2])`;
-/// return the files-equal boolean (reuses native_cmp_boolean).
-fn native_cmp_condition(call: &IrExpr) -> Option<String> {
-    let IrExpr::Call { func, args } = call else { return None };
-    if !matches!(func.as_str(), "exec" | "builtin") { return None; }
-    if !matches!(args.first(), Some(IrExpr::Str(s, _)) if s == "cmp") { return None; }
-    let words: Vec<&IrExpr> = exec_word_args(args);
-    native_cmp_boolean(&words)
 }
 
 fn exec_call_to_cmd(call: &IrExpr) -> Option<String> {
@@ -4419,13 +4244,11 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
         }
         _ => true,
     });
-    if cmd == "cmp" {
-        if let Some(b) = native_cmp_boolean(&words) {
-            emit_indent(out, indent);
-            out.push_str(&format!("$main_exit_code = $CHILD_ERROR = ({b}) ? 0 : 1;\n"));
-            return;
-        }
-        // else fall through: 'cmp' has no native arm -> default shell-out
+    if let Some(native) = crate::pipeline_native::native_exec_stmt(call) {
+        emit_indent(out, indent);
+        out.push_str(&native);
+        out.push('\n');
+        return;
     }
     match cmd.as_str() {
         "echo" => emit_echo(out, &words, indent),
@@ -6312,9 +6135,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // (grep over many/globbed files or with output-
                     // producing flags -c/-l/-m/-b/-n/-A… is NOT a boolean
                     // and stays a shell-out).
-                    if let Some(native) = native_cmp_condition(expr) {
-                        native
-                    } else if let Some(native) = try_native_grep_test(expr) {
+                    if let Some(native) = crate::pipeline_native::native_exec_cond(expr) {
                         native
                     } else {
                         match exec_call_to_cmd(expr) {
