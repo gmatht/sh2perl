@@ -545,6 +545,20 @@ impl Generator {
             output.push('\n');
         }
 
+        // Scripts probing the running shell via $BASH_VERSION would see an
+        // empty value under perl (bash only exports it to itself).  When the
+        // generated program reads it, initialize it from a real bash so the
+        // translation observes the same value the original script would.
+        if output.contains("$ENV{BASH_VERSION}") {
+            let init = "$ENV{BASH_VERSION} //= do { open(my $__fh, '-|', 'bash', '-c', 'printf %s \"$BASH_VERSION\"') or die \"cmd failed: $!\\n\"; local $/; my $_v = <$__fh> // q{}; close $__fh; $_v; };\n";
+            let anchor = "our $CHILD_ERROR = 0;\n";
+            if let Some(pos) = output.find(anchor) {
+                output.insert_str(pos + anchor.len(), init);
+            } else {
+                output.insert_str(0, init);
+            }
+        }
+
         // Balance braces: count opens/closes and add missing closing braces.
         // Some generated code paths emit unbalanced braces which cause
         // perlcritic violations ("Nested named subroutine", "Variable
@@ -1920,6 +1934,22 @@ impl Generator {
                     }
                 }
                 false
+            }
+            Command::Assignment(assign) => self.word_needs_basename(&assign.value),
+            Command::Block(block) => block
+                .commands
+                .iter()
+                .any(|c| self.command_needs_basename(c)),
+            Command::Subshell(inner) | Command::Background(inner) | Command::Not(inner) => {
+                self.command_needs_basename(inner)
+            }
+            Command::Function(func) => func
+                .body
+                .commands
+                .iter()
+                .any(|c| self.command_needs_basename(c)),
+            Command::BuiltinCommand(bc) => {
+                bc.args.iter().any(|arg| self.word_needs_basename(arg))
             }
             _ => false,
         }

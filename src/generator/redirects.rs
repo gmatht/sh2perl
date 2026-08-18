@@ -1644,6 +1644,25 @@ pub fn generate_builtin_command_impl(generator: &mut Generator, cmd: &BuiltinCom
                 output.push_str("# Builtin command 'trap' with insufficient arguments\n");
             }
         }
+        "exec" => {
+            // `exec cmd args...` replaces the shell with cmd; Perl's exec has
+            // the same semantics.  (`exec` with only redirections is not
+            // supported.)
+            if cmd.args.is_empty() {
+                output.push_str("# Builtin command 'exec' without a command not implemented\n");
+            } else {
+                let args: Vec<String> = cmd
+                    .args
+                    .iter()
+                    .map(|a| generator.word_to_perl(a))
+                    .collect();
+                output.push_str(&generator.indent());
+                output.push_str(&format!(
+                    "exec({}) or croak \"exec failed: $OS_ERROR\";\n",
+                    args.join(", ")
+                ));
+            }
+        }
         _ => {
             // Other builtin commands
             output.push_str(&format!(

@@ -29,7 +29,7 @@ fn convert_arith_subexprs(s: &str, generator: &Generator) -> String {
 }
 
 // Helper function to convert shell variables to Perl equivalents
-fn convert_shell_var_to_perl(generator: &Generator, var: &str) -> String {
+fn convert_shell_var_to_perl(generator: &mut Generator, var: &str) -> String {
     let s = var.trim().to_string();
     
     // Remember the original quote style to re-apply it if no conversion happened
@@ -81,6 +81,20 @@ fn convert_shell_var_to_perl(generator: &Generator, var: &str) -> String {
         unquoted
     };
     
+    // `${var#pat}` / `${var%pat}` / other brace expansions: delegate to the
+    // parameter-expansion generator so removal operators work as operands.
+    if processed.starts_with("${") && processed.ends_with('}') {
+        let content = &processed[2..processed.len() - 1];
+        if content.contains('#') || content.contains('%') || content.contains('/') {
+            if let Ok(pe) =
+                crate::parser::words::parse_parameter_expansion_content(content)
+            {
+                return generator
+                    .word_to_perl(&crate::ast::Word::ParameterExpansion(pe, None));
+            }
+        }
+    }
+
     // Determine the final Perl expression
     match processed.as_str() {
         "$#" => "scalar(@ARGV)".to_string(), // $# -> scalar(@ARGV) for argument count
@@ -498,7 +512,17 @@ pub fn generate_test_expression_impl(
                 right_perl = right_perl.replace(&value_str, &format!("${}", const_name));
             }
 
-            format!("({} > {})", left_perl, right_perl)
+            if left.starts_with("${") && right.starts_with("${") {
+                // Unquoted expansions: when both expand empty, the shell sees
+                // `[ -gt ]` — a one-argument (non-empty string) test — which
+                // is TRUE, not a numeric comparison.
+                format!(
+                    "do {{ my $__tl = {} // q{{}}; my $__tr = {} // q{{}}; ($__tl eq q{{}} && $__tr eq q{{}}) ? 1 : ($__tl > $__tr) }}",
+                    left_perl, right_perl
+                )
+            } else {
+                format!("({} > {})", left_perl, right_perl)
+            }
         } else {
             "0".to_string()
         }
@@ -1084,8 +1108,11 @@ fn convert_shell_param_expansion_in_test_expr(generator: &Generator, expr: &str)
                             var_ref, var_ref, var_ref, error)
                     }
                     _ => {
-                        // Simple variable reference: ${var}
-                        format!("{}", var_ref)
+                        // Simple variable reference: ${var} (also ${var-} with
+                        // an empty default).  Guard with // q{} — an unset
+                        // variable expands to the empty string in bash, and a
+                        // bare undef here would warn under `use warnings`.
+                        format!("({} // q{{}})", var_ref)
                     }
                 };
 

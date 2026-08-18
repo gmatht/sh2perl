@@ -2629,6 +2629,10 @@ impl Parser {
                                 // text after `}` as re-lexed tokens (e.g. `]; then`).
                                 let text = self.lexer.handle_comment_with_brace(brace_depth)?;
                                 expansion.push_str(&text);
+                                // handle_comment_with_brace consumed the `}`
+                                // without emitting it; restore it so the raw
+                                // expression string stays well-formed.
+                                expansion.push('}');
                                 brace_depth = 0;
                                 break;
                             }
