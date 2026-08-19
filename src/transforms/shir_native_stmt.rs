@@ -189,6 +189,7 @@ fn transform_stmt(
             x |= native_echo_tr_sort_stmt(st);
             x |= native_literal_subshell_wc_stmt(st);
             x |= native_ls_stmt(st);
+            x |= native_rm_rf_stmt(st);
             x |= native_trap_stmt(st);
             x |= native_diff_files_stmt(st);
             x |= native_head_tail_stmt(st);
@@ -4698,6 +4699,110 @@ fn native_diff_files_stmt(st: &mut IrStmt) -> bool {
     let code = format!(
         r#"my $__rc = 0; do {{ my @__a = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {f1}) or die "diff: {f1}: $ERRNO"; my $__c = <$__f>; close $__f; $__c }}, -1); pop @__a if @__a && $__a[-1] eq q{{}}; my @__b = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__g, '<', {f2}) or die "diff: {f2}: $ERRNO"; my $__c = <$__g>; close $__g; $__c }}, -1); pop @__b if @__b && $__b[-1] eq q{{}}; my @__dp; for my $__i (0..$#__a) {{ for my $__j (0..$#__b) {{ if ($__a[$__i] eq $__b[$__j]) {{ $__dp[$__i+1][$__j+1] = $__dp[$__i][$__j] + 1; }} else {{ $__dp[$__i+1][$__j+1] = ($__dp[$__i][$__j+1] > $__dp[$__i+1][$__j]) ? $__dp[$__i][$__j+1] : $__dp[$__i+1][$__j]; }} }} }} my ($__i, $__j) = ($#__a, $#__b); my @__ops; while ($__i >= 0 && $__j >= 0) {{ if ($__a[$__i] eq $__b[$__j]) {{ unshift @__ops, [0, $__i, $__j]; $__i--; $__j--; }} elsif ($__dp[$__i][$__j+1] >= $__dp[$__i+1][$__j]) {{ unshift @__ops, [-1, $__i, $__j]; $__i--; }} else {{ unshift @__ops, [1, $__i, $__j]; $__j--; }} }} while ($__i >= 0) {{ unshift @__ops, [-1, $__i, -1]; $__i--; }} while ($__j >= 0) {{ unshift @__ops, [1, -1, $__j]; $__j--; }} {out_code}my $__changed = 0; my $__idx = 0; while ($__idx < @__ops) {{ if ($__ops[$__idx][0] == 0) {{ $__idx++; next; }} my @__dels; my @__adds; my $__last_a = -1; my $__last_b = -1; while ($__idx < @__ops && $__ops[$__idx][0] != 0) {{ if ($__ops[$__idx][0] == -1) {{ push @__dels, $__ops[$__idx][1]; $__last_a = $__ops[$__idx][1]; }} else {{ push @__adds, $__ops[$__idx][2]; $__last_b = $__ops[$__idx][2]; }} $__idx++; }} $__changed = 1; my $__a1 = $__dels[0] + 1; my $__a2 = $__dels[-1] + 1; my $__b1 = $__adds[0] + 1; my $__b2 = $__adds[-1] + 1; my $__astr = $__a1 == $__a2 ? "$__a1" : "$__a1,$__a2"; my $__bstr = $__b1 == $__b2 ? "$__b1" : "$__b1,$__b2"; my $__opch = (@__dels && @__adds) ? "c" : (@__dels ? "d" : "a"); my $__hdr; if ($__opch eq "c") {{ $__hdr = "$__astr$__opch$__bstr"; }} elsif ($__opch eq "d") {{ $__hdr = "$__astr$__opch" . (defined $__last_b ? $__last_b + 1 : 1); }} else {{ my $__apos = $__last_a + 1; $__hdr = "$__apos$__opch$__bstr"; }} print $__fh "$__hdr\n"; for my $__k (@__dels) {{ print $__fh "< $__a[$__k]\n"; }} if (@__dels && @__adds) {{ print $__fh "---\n"; }} for my $__k (@__adds) {{ print $__fh "> $__b[$__k]\n"; }} }} $__rc = $__changed ? 1 : 0; close $__fh if $__is_out; }}; $main_exit_code = $CHILD_ERROR = $__rc; "#,
         f1 = f1, f2 = f2
+    );
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `rm -r -f LITPATH [2>/dev/null] [|| true]` (perl-only): recursive
+/// delete of a literal path (missing path is fine — exit 0).
+fn native_rm_rf_stmt(st: &mut IrStmt) -> bool {
+    // unwrap: the stmt may be BinOp(Or, <rm>, true) or a redirect wrapper
+    let inner_expr: IrExpr = match st {
+        IrStmt::Expr(IrExpr::BinOp {
+            op: BinOpKind::Or,
+            lhs,
+            rhs,
+        }) => {
+            // the lhs may be a fd2->/dev/null redirect wrapping the rm
+            let mut lhs_e: &IrExpr = lhs;
+            if let IrExpr::Call { func, args } = lhs.as_ref() {
+                if func == "redirect" {
+                    let Some(IrExpr::Arrow(body)) = args.first() else {
+                        return false;
+                    };
+                    let [IrStmt::Expr(e)] = body.as_slice() else { return false; };
+                    lhs_e = e;
+                }
+            }
+            // the rhs must be `true`
+            let Ok(_) = (|| -> Result<(), ()> {
+                let IrExpr::Call { func, args } = rhs.as_ref() else {
+                    return Err(());
+                };
+                if !matches!(func.as_str(), "builtin" | "exec") {
+                    return Err(());
+                }
+                let [IrExpr::Str(cmd, _), ..] = args.as_slice() else {
+                    return Err(());
+                };
+                if cmd != "true" {
+                    return Err(());
+                }
+                Ok(())
+            })()
+            else {
+                return false;
+            };
+            lhs_e.clone()
+        }
+        IrStmt::Redirect { inner, .. } => {
+            let [IrStmt::Expr(e)] = inner.as_slice() else { return false; };
+            e.clone()
+        }
+        _ => return false,
+    };
+    let IrExpr::Call { func, args } = &inner_expr else { return false; };
+    if !matches!(func.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return false; };
+    if cmd != "rm" {
+        return false;
+    }
+    let mut recursive = false;
+    let mut force = false;
+    let mut path: Option<String> = None;
+    for w in words {
+        match w {
+            IrExpr::Str(sv, _) if sv == "-r" || sv == "-R" => recursive = true,
+            IrExpr::Str(sv, _) if sv == "-f" => force = true,
+            IrExpr::Str(sv, _) if sv == "-rf" || sv == "-fr" => {
+                recursive = true;
+                force = true;
+            }
+            IrExpr::Str(sv, _) => {
+                if path.is_some() {
+                    return false;
+                }
+                path = Some(sv.clone());
+            }
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                if path.is_some() {
+                    return false;
+                }
+                let t: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(x) => Some(x.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                path = Some(t);
+            }
+            _ => return false,
+        }
+    }
+    let _ = force;
+    if !recursive {
+        return false;
+    }
+    let Some(path) = path else { return false; };
+    let pq = crate::ir::safe_perl_q_string(&path);
+    let code = format!(
+        r#"do {{ my $__rm; $__rm = sub {{ my ($__d) = @_; if (-d $__d) {{ opendir(my $__h, $__d) or return; for my $__e (readdir($__h)) {{ next if $__e eq '.' || $__e eq '..'; my $__p = "$__d/$__e"; if (-d $__p) {{ $__rm->($__p); }} else {{ unlink $__p; }} }} closedir $__h; rmdir $__d; }} else {{ unlink $__d; }} }}; if (-e {pq}) {{ $__rm->({pq}); }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
     );
     *st = IrStmt::RawText(code);
     true
