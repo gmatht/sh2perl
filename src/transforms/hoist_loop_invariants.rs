@@ -109,15 +109,16 @@ fn hoist_body(body: &[IrStmt], fns: &[(String, Vec<IrStmt>)]) -> Vec<IrStmt> {
         if writes_elsewhere {
             continue;
         }
-        // expr reads only loop-invariant vars (the self var is allowed —
-        // it is re-derived identically each iteration, but only if the
-        // read is AFTER the write; the order check below handles that)
+        // expr reads only loop-invariant vars. A read of the target itself
+        // is loop-carried too: `i=$((i+1))` must remain the loop update,
+        // not be hoisted once before the loop. Refuse every body-written
+        // input, including the candidate's own name.
         if !expr_pure(expr, fns) {
             continue;
         }
         let reads = read_set(expr);
-        if reads.iter().any(|v| v != target && assigned.contains(v)) {
-            continue; // loop-carried input
+        if reads.iter().any(|v| assigned.contains(v)) {
+            continue; // loop-carried input (including self)
         }
         // `target` not read before this write in the body
         let read_before = body.iter().take(j).any(|s| stmt_reads(s, target));

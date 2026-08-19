@@ -353,7 +353,9 @@ fn purge(st: IrStmt, dead: &[String]) -> Option<IrStmt> {
             // for calls/captures/raw expressions. Indexed writes could also
             // matter to the array's lifetime, so those remain kept as before.
             let all_plain_dead = !targets.is_empty()
-                && targets.iter().all(|t| t.indices.is_empty() && dead.contains(&t.var));
+                && targets
+                    .iter()
+                    .all(|t| t.indices.is_empty() && !t.var.contains('[') && dead.contains(&t.var));
             if all_plain_dead && expr_pure(&expr) {
                 return None;
             }
@@ -386,7 +388,7 @@ fn purge(st: IrStmt, dead: &[String]) -> Option<IrStmt> {
                 IrExpr::Call { func, args }
                     if func.ends_with("setVar") || func == "setArray" =>
                 {
-                    matches!(args.first(), Some(IrExpr::Str(n, _)) if dead.contains(n))
+                    matches!(args.first(), Some(IrExpr::Str(n, _)) if dead.contains(n) && !n.contains('['))
                         && args.iter().skip(1).all(expr_pure)
                 }
                 _ => false,
