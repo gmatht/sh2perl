@@ -281,29 +281,100 @@ fn arith_census(
     }
 }
 
+/// Whether evaluating an expression is free of observable work. This is
+/// deliberately narrower than the renderer's "pure function" analysis:
+/// DCE must not erase a command substitution, a runtime call, an arithmetic
+/// assignment/incdec, or any opaque/raw expression merely because its result
+/// flows into a dead variable.
+fn expr_pure(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Int(_)
+        | IrExpr::Str(_, _)
+        | IrExpr::Var(_, _)
+        | IrExpr::Regex { .. }
+        | IrExpr::Range { .. }
+        | IrExpr::Bool(_)
+        | IrExpr::Json(_) => true,
+        IrExpr::Index { key, .. } => expr_pure(key),
+        IrExpr::BinOp { lhs, rhs, .. } => expr_pure(lhs) && expr_pure(rhs),
+        IrExpr::Ternary { cond, then, else_ } => {
+            expr_pure(cond) && expr_pure(then) && expr_pure(else_)
+        }
+        IrExpr::DefinedOr { expr, default } => expr_pure(expr) && expr_pure(default),
+        IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+            crate::ir::InterpPart::Lit(_) => true,
+            crate::ir::InterpPart::Expr(x) => expr_pure(x),
+        }),
+        IrExpr::Arith(a) => arith_pure(a),
+        IrExpr::Array(items) => items.iter().all(expr_pure),
+        IrExpr::Object(items) => items.iter().all(|(_, x)| expr_pure(x)),
+        IrExpr::Splice(x) => expr_pure(x),
+        // Calls, captures, method calls, arrows/lambdas and comprehensions
+        // can execute work or observe shell state. Keep their enclosing
+        // assignment rather than trying to prove more here.
+        IrExpr::Call { .. }
+        | IrExpr::MethodCall { .. }
+        | IrExpr::Capture { .. }
+        | IrExpr::RawExpr(_)
+        | IrExpr::Arrow(_)
+        | IrExpr::ArrayComp { .. }
+        | IrExpr::Lambda { .. }
+        | IrExpr::Ident(_) => false,
+    }
+}
+
+fn arith_pure(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Num(_)
+        | ArithAst::Var(_)
+        | ArithAst::Ident(_)
+        | ArithAst::Sizeof(_) => true,
+        ArithAst::Index { key, .. } => arith_pure(key),
+        ArithAst::Bin { lhs, rhs, .. } => arith_pure(lhs) && arith_pure(rhs),
+        ArithAst::Un { arg, .. } => arith_pure(arg),
+        ArithAst::Cond { test, then, else_ } => {
+            arith_pure(test) && arith_pure(then) && arith_pure(else_)
+        }
+        ArithAst::Cast { arg, .. } => arith_pure(arg),
+        ArithAst::Assign { .. } | ArithAst::IncDec { .. } => false,
+    }
+}
+
 /// Recursively remove statements that only touch dead vars. Returns
 /// `None` when the statement is dropped, `Some` (possibly with trimmed
 /// nested bodies) when kept.
 fn purge(st: IrStmt, dead: &[String]) -> Option<IrStmt> {
     match st {
         IrStmt::Assign { targets, expr, .. } => {
-            // drop a plain scalar assign of a dead var (indexed writes
-            // could still matter to the array's own lifetime — kept)
+            // An assignment's RHS is evaluated even when its destination is
+            // dead. In particular, `dead=$(cmd)` is a side-effecting command
+            // substitution (and can contain redirects, writes, etc.). Drop
+            // only a dead store whose RHS is provably pure; refuse > guess
+            // for calls/captures/raw expressions. Indexed writes could also
+            // matter to the array's lifetime, so those remain kept as before.
             let all_plain_dead = !targets.is_empty()
                 && targets.iter().all(|t| t.indices.is_empty() && dead.contains(&t.var));
-            if all_plain_dead {
+            if all_plain_dead && expr_pure(&expr) {
                 return None;
             }
             Some(IrStmt::Assign { targets, expr, asm: None })
         }
         IrStmt::Declare { vars, init, local } => {
-            if vars.iter().all(|v| dead.contains(&v.name)) {
+            // A declaration initializer has the same RHS evaluation
+            // semantics as an assignment (`dead=$(cmd)` can occur here
+            // through a frontend). A bare declaration is pure; an impure
+            // initializer must survive even when every name is dead.
+            if vars.iter().all(|v| dead.contains(&v.name))
+                && init.as_ref().map_or(true, expr_pure)
+            {
                 return None;
             }
             Some(IrStmt::Declare { vars, init, local })
         }
         IrStmt::DeclareArray { var, sigil, elements } => {
-            if dead.contains(&var) {
+            // Array elements may themselves be captures or calls. Keep the
+            // declaration unless evaluating every element is side-effect free.
+            if dead.contains(&var) && elements.iter().all(expr_pure) {
                 return None;
             }
             Some(IrStmt::DeclareArray { var, sigil, elements })
@@ -316,6 +387,7 @@ fn purge(st: IrStmt, dead: &[String]) -> Option<IrStmt> {
                     if func.ends_with("setVar") || func == "setArray" =>
                 {
                     matches!(args.first(), Some(IrExpr::Str(n, _)) if dead.contains(n))
+                        && args.iter().skip(1).all(expr_pure)
                 }
                 _ => false,
             };
