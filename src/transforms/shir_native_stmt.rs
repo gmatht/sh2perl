@@ -164,7 +164,7 @@ fn transform_stmt(
             if is_pipeline {
                 // only the echo|grep fold applies to a pipeline expression
                 // (the echo|tr / printf|sort folds are the renderer's job)
-                return x | native_echo_grep_stmt(st);
+                return x | native_echo_grep_stmt(st) | native_echo_bc_stmt(st);
             }
             x |= normalize_literal_exec_words(st);
             x |= native_declare_typeset_stmt(st);
@@ -229,6 +229,7 @@ fn transform_stmt(
             x |= file_redirect_block(st);
             x |= native_sort_file_stmt(st);
             x |= native_echo_grep_stmt(st);
+            x |= native_echo_bc_stmt(st);
             x |= native_cat_heredoc_writefile(st);
             x |= native_grep_herestring(st);
             x |= native_grep_o_herestring(st);
@@ -751,11 +752,11 @@ fn native_echo_bc_stmt(st: &mut IrStmt) -> bool {
     let [IrExpr::Str(cmd, _), IrExpr::Array(bc_args)] = a2.as_slice() else { return false; };
     if cmd != "bc" || !bc_args.is_empty() { return false; }
     let Ok(out) = bc_eval(&expr) else { return false; };
-    let out = if out.is_empty() { out } else { format!("{out}\n") };
+    let out = if out.is_empty() { String::new() } else { out };
     *st = IrStmt::Block(vec![
         IrStmt::Output {
             value: IrExpr::Str(out, StrStyle::Raw),
-            newline: false,
+            newline: true,
             target: None,
         },
         status_exec(true),
