@@ -2888,37 +2888,42 @@ fn native_grep_file_pipeline(st: &mut IrStmt) -> bool {
     let Some(ws0) = literal_words(&stages[0]) else {
         return false;
     };
-    if ws0[0] != "grep" {
-        return false;
-    }
-    // grep flags: -v (invert), -E/-P (regex flavour note; perl regex covers)
+    // input stage: `cat FILE` (plain reader) or `grep [-v] PAT FILE`
     let mut invert = false;
     let mut pat: Option<String> = None;
     let mut file: Option<String> = None;
-    let mut i = 1;
-    while i < ws0.len() {
-        let w = &ws0[i];
-        if w.starts_with('-') && w.len() > 1 {
-            for ch in w[1..].chars() {
-                match ch {
-                    'v' => invert = true,
-                    'E' | 'P' => {} // perl regex is a superset for our corpus
-                    _ => return false, // -l -c -o -q -A -B -C -w -i -m -e...
-                }
-            }
-            i += 1;
-            continue;
-        }
-        if pat.is_none() {
-            pat = Some(w.clone());
-        } else if file.is_none() {
-            file = Some(w.clone());
-        } else {
+    if ws0[0] == "cat" {
+        if ws0.len() != 2 {
             return false;
         }
-        i += 1;
+        file = Some(ws0[1].clone());
+    } else if ws0[0] == "grep" {
+        let mut i = 1;
+        while i < ws0.len() {
+            let w = &ws0[i];
+            if w.starts_with('-') && w.len() > 1 {
+                for ch in w[1..].chars() {
+                    match ch {
+                        'v' => invert = true,
+                        'E' | 'P' => {} // perl regex is a superset for our corpus
+                        _ => return false, // -l -c -o -q -A -B -C -w -i -m -e...
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            if pat.is_none() {
+                pat = Some(w.clone());
+            } else if file.is_none() {
+                file = Some(w.clone());
+            } else {
+                return false;
+            }
+            i += 1;
+        }
+    } else {
+        return false;
     }
-    let Some(pat) = pat else { return false; };
     let Some(file) = file else { return false; };
     // ── stages 1..: cut / sort / head / tail ──
     let mut ops: Vec<String> = Vec::new();
@@ -3013,8 +3018,12 @@ fn native_grep_file_pipeline(st: &mut IrStmt) -> bool {
     // ── build the perl ──
     let fq = crate::ir::safe_perl_q_string(&file);
     let invert_op = if invert { "!" } else { "" };
+    let filter = match &pat {
+        Some(p) => format!(" @__lp = grep {{ {invert_op}/{p}/ }} @__lp;"),
+        None => String::new(),
+    };
     let mut code = format!(
-        "do {{ my @__lp = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {fq}) or die \"grep: {fq}: $ERRNO\"; my $__c = <$__f>; close $__f; split(/\\n/, $__c) }}; pop @__lp if @__lp && $__lp[-1] eq q{{}}; @__lp = grep {{ {invert_op}/{pat}/ }} @__lp;"
+        "do {{ my @__lp = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {fq}) or die \"grep: {fq}: $ERRNO\"; my $__c = <$__f>; close $__f; split(/\\n/, $__c) }}; pop @__lp if @__lp && $__lp[-1] eq q{{}};{filter}"
     );
     for op in &ops {
         code.push_str(op);
@@ -3079,9 +3088,13 @@ fn emit_file_op(ops: &mut Vec<String>, ws: &[String]) -> bool {
             }
             let dq = crate::ir::safe_perl_q_string(d);
             let fs: Vec<String> = fields.iter().map(|f| format!("{f}")).collect();
-            let pick = format!("[{}]", fs.join(","));
+            let pick = if fs.len() == 1 {
+                format!("$__f[{}]", fs[0])
+            } else {
+                format!("@__f[{}]", fs.join(","))
+            };
             ops.push(format!(
-                " @__lp = map {{ my @__f = split({dq}, $_); join({dq}, @__f{pick}) }} @__lp;"
+                " @__lp = map {{ my @__f = split({dq}, $_); join({dq}, {pick}) }} @__lp;"
             ));
             true
         }
@@ -3165,6 +3178,50 @@ fn emit_file_op(ops: &mut Vec<String>, ws: &[String]) -> bool {
             ops.push(format!(
                 " if (@__lp > {n}) {{ splice(@__lp, {n}); }}"
             ));
+            true
+        }
+        "grep" => {
+            // grep [-v] PAT as a middle-stage filter
+            let mut invert = false;
+            let mut pat: Option<&str> = None;
+            for w in &ws[1..] {
+                if w.starts_with('-') && w.len() > 1 {
+                    for ch in w[1..].chars() {
+                        match ch {
+                            'v' => invert = true,
+                            _ => return false,
+                        }
+                    }
+                } else if pat.is_none() {
+                    pat = Some(w);
+                } else {
+                    return false;
+                }
+            }
+            let Some(p) = pat else { return false; };
+            let inv = if invert { "!" } else { "" };
+            ops.push(format!(" @__lp = grep {{ {inv}/{p}/ }} @__lp;"));
+            true
+        }
+        "uniq" => {
+            let mut count = false;
+            for w in &ws[1..] {
+                match w.as_str() {
+                    "-c" => count = true,
+                    _ => return false,
+                }
+            }
+            if !count {
+                ops.push(
+                    " @__lp = do { my @__u; for my $__l (@__lp) { push @__u, $__l if !@__u || $__u[-1] ne $__l; } @__u };"
+                        .to_string(),
+                );
+                return true;
+            }
+            ops.push(
+                " my @__u; my @__n; for my $__l (@__lp) { if (@__u && $__u[-1] eq $__l) { $__n[-1]++; } else { push @__u, $__l; push @__n, 1; } } @__lp = map { sprintf('%7d %s', $__n[$_], $__u[$_]) } 0..$#__u;"
+                    .to_string(),
+            );
             true
         }
         "tail" => {
