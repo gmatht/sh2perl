@@ -190,6 +190,7 @@ fn transform_stmt(
             x |= native_literal_subshell_wc_stmt(st);
             x |= native_ls_stmt(st);
             x |= native_trap_stmt(st);
+            x |= native_diff_files_stmt(st);
             x |= native_head_tail_stmt(st);
             x |= native_sort_stmt(st);
             x |= native_perl_e_stmt(st);
@@ -244,6 +245,7 @@ fn transform_stmt(
             x |= file_redirect_block(st);
             x |= native_sort_file_stmt(st);
             x |= native_echo_write_file_stmt(st);
+            x |= native_diff_files_stmt(st);
             x |= native_grep_file_pipeline(st);
             x |= native_echo_grep_stmt(st);
             x |= native_echo_bc_stmt(st);
@@ -4641,6 +4643,61 @@ fn native_literal_subshell_wc_stmt(st: &mut IrStmt) -> bool {
     let code = format!(
         "print {cq}, \"\\n\"; $main_exit_code = $CHILD_ERROR = 0;",
         cq = crate::ir::safe_perl_q_string(&count.to_string())
+    );
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `diff FILE1 FILE2 [> OUT]` (perl-only): native LCS-based line diff in
+/// GNU normal format (hunks of < / --- / > lines, exit 0 identical / 1
+/// different). The files are literal paths or process-substitution temps
+/// (Var/Ident names).
+fn native_diff_files_stmt(st: &mut IrStmt) -> bool {
+    let (inner, out): (IrStmt, Option<String>) = match st {
+        IrStmt::Redirect { inner, redirects } => {
+            let [r] = redirects.as_slice() else { return false; };
+            if r.fd.unwrap_or(1) != 1 || !matches!(r.mode.as_str(), "w" | "wc") {
+                return false;
+            }
+            let o = match &r.target {
+                IrExpr::Str(s, _) => Some(crate::ir::safe_perl_q_string(s)),
+                IrExpr::Var(n, _) | IrExpr::Ident(n) => {
+                    Some(crate::ir::safe_perl_q_string(n))
+                }
+                _ => return false,
+            };
+            let [IrStmt::Expr(e)] = inner.as_slice() else { return false; };
+            (IrStmt::Expr(e.clone()), o)
+        }
+        _ => (st.clone(), None),
+    };
+    let IrStmt::Expr(IrExpr::Call { func, args }) = &inner else { return false; };
+    if !matches!(func.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return false; };
+    if cmd != "diff" || words.len() != 2 {
+        return false;
+    }
+    let file_q = |w: &IrExpr| -> Option<String> {
+        match w {
+            IrExpr::Str(s, _) => Some(crate::ir::safe_perl_q_string(s)),
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(crate::ir::safe_perl_q_string(n)),
+            _ => None,
+        }
+    };
+    let (Some(f1), Some(f2)) = (file_q(&words[0]), file_q(&words[1])) else {
+        return false;
+    };
+    let out_code = match &out {
+        Some(oq) => format!(
+            " my $__is_out = 1; open(my $__ofh, '>', {oq}) or die \"diff: {oq}: $ERRNO\"; my $__fh = $__ofh; "
+        ),
+        None => r#" my $__is_out = 0; my $__fh = \*STDOUT; "#.to_string(),
+    };
+    let code = format!(
+        r#"my $__rc = 0; do {{ my @__a = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {f1}) or die "diff: {f1}: $ERRNO"; my $__c = <$__f>; close $__f; $__c }}, -1); pop @__a if @__a && $__a[-1] eq q{{}}; my @__b = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__g, '<', {f2}) or die "diff: {f2}: $ERRNO"; my $__c = <$__g>; close $__g; $__c }}, -1); pop @__b if @__b && $__b[-1] eq q{{}}; my @__dp; for my $__i (0..$#__a) {{ for my $__j (0..$#__b) {{ if ($__a[$__i] eq $__b[$__j]) {{ $__dp[$__i+1][$__j+1] = $__dp[$__i][$__j] + 1; }} else {{ $__dp[$__i+1][$__j+1] = ($__dp[$__i][$__j+1] > $__dp[$__i+1][$__j]) ? $__dp[$__i][$__j+1] : $__dp[$__i+1][$__j]; }} }} }} my ($__i, $__j) = ($#__a, $#__b); my @__ops; while ($__i >= 0 && $__j >= 0) {{ if ($__a[$__i] eq $__b[$__j]) {{ unshift @__ops, [0, $__i, $__j]; $__i--; $__j--; }} elsif ($__dp[$__i][$__j+1] >= $__dp[$__i+1][$__j]) {{ unshift @__ops, [-1, $__i, $__j]; $__i--; }} else {{ unshift @__ops, [1, $__i, $__j]; $__j--; }} }} while ($__i >= 0) {{ unshift @__ops, [-1, $__i, -1]; $__i--; }} while ($__j >= 0) {{ unshift @__ops, [1, -1, $__j]; $__j--; }} {out_code}my $__changed = 0; my $__idx = 0; while ($__idx < @__ops) {{ if ($__ops[$__idx][0] == 0) {{ $__idx++; next; }} my @__dels; my @__adds; my $__last_a = -1; my $__last_b = -1; while ($__idx < @__ops && $__ops[$__idx][0] != 0) {{ if ($__ops[$__idx][0] == -1) {{ push @__dels, $__ops[$__idx][1]; $__last_a = $__ops[$__idx][1]; }} else {{ push @__adds, $__ops[$__idx][2]; $__last_b = $__ops[$__idx][2]; }} $__idx++; }} $__changed = 1; my $__a1 = $__dels[0] + 1; my $__a2 = $__dels[-1] + 1; my $__b1 = $__adds[0] + 1; my $__b2 = $__adds[-1] + 1; my $__astr = $__a1 == $__a2 ? "$__a1" : "$__a1,$__a2"; my $__bstr = $__b1 == $__b2 ? "$__b1" : "$__b1,$__b2"; my $__opch = (@__dels && @__adds) ? "c" : (@__dels ? "d" : "a"); my $__hdr; if ($__opch eq "c") {{ $__hdr = "$__astr$__opch$__bstr"; }} elsif ($__opch eq "d") {{ $__hdr = "$__astr$__opch" . (defined $__last_b ? $__last_b + 1 : 1); }} else {{ my $__apos = $__last_a + 1; $__hdr = "$__apos$__opch$__bstr"; }} print $__fh "$__hdr\n"; for my $__k (@__dels) {{ print $__fh "< $__a[$__k]\n"; }} if (@__dels && @__adds) {{ print $__fh "---\n"; }} for my $__k (@__adds) {{ print $__fh "> $__b[$__k]\n"; }} }} $__rc = $__changed ? 1 : 0; close $__fh if $__is_out; }}; $main_exit_code = $CHILD_ERROR = $__rc; "#,
+        f1 = f1, f2 = f2
     );
     *st = IrStmt::RawText(code);
     true
