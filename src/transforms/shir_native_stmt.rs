@@ -182,6 +182,7 @@ fn transform_stmt(
             x |= native_echo_or_chain(st);
             x |= native_echo_grep_test_chain(st);
             x |= native_ls_stmt(st);
+            x |= native_trap_stmt(st);
             x |= native_head_tail_stmt(st);
             x |= native_sort_stmt(st);
             x |= native_perl_e_stmt(st);
@@ -3876,6 +3877,63 @@ fn native_echo_grep_test_chain(st: &mut IrStmt) -> bool {
     let code = format!(
         r#"do {{ if ({vq} =~ /{pat}/) {{ print STDOUT {aq}, "\n"; }} else {{ print STDOUT {bq}, "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
     );
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `trap HANDLER SIGNAL` (perl-only): register the handler natively.
+/// EXIT/0 -> an END block, INT -> $SIG{INT}, ERR -> no-op (a shell-out
+/// trap registers in a throwaway bash, so it is a no-op in perl too —
+/// dropping it changes nothing). Handler commands: echo "TEXT" and
+/// rm -f GLOB... (the corpus's EXIT handlers).
+fn native_trap_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
+    if !matches!(func.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return false; };
+    if cmd != "trap" {
+        return false;
+    }
+    if words.len() != 2 {
+        return false;
+    }
+    let (handler, signal) = match (&words[0], &words[1]) {
+        (IrExpr::Str(h, _), IrExpr::Str(sg, _)) => (h.as_str(), sg.as_str()),
+        _ => return false,
+    };
+    // handler -> perl statements (echo/rm only; anything else refuses)
+    let mut perl_handler = String::new();
+    for part in handler.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(text) = part.strip_prefix("echo ") {
+            let t = text.trim();
+            let t = t.trim_start_matches('"').trim_end_matches('"');
+            let tq = crate::ir::safe_perl_q_string(t);
+            perl_handler.push_str(&format!("print {tq}, \"\\n\";\n"));
+        } else if part.starts_with("rm ") {
+            let rest = part[3..].trim();
+            let rest = rest.strip_prefix("-f ").unwrap_or(rest);
+            for pat in rest.split_whitespace() {
+                let pq = crate::ir::safe_perl_q_string(pat);
+                perl_handler.push_str(&format!("unlink glob({pq});\n"));
+            }
+        } else if part == "exit 1" || part.starts_with("exit ") {
+            continue; // handled by the runner, not the handler body
+        } else {
+            return false;
+        }
+    }
+    let code = match signal {
+        "EXIT" | "0" => format!("END {{\n{perl_handler}}}\n"),
+        "INT" => format!("$SIG{{INT}} = sub {{\n{perl_handler}}};\n"),
+        // ERR / other signals: a no-op (the current shell-out registers in
+        // a throwaway bash, so it has no effect on this perl process either)
+        _ => "$main_exit_code = $CHILD_ERROR = 0;".to_string(),
+    };
     *st = IrStmt::RawText(code);
     true
 }
