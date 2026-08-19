@@ -169,7 +169,8 @@ fn transform_stmt(
                     | native_echo_bc_stmt(st)
                     | native_grep_file_pipeline(st)
                     | native_echo_filter_stmt(st)
-                    | native_echo_xargs_stmt(st);
+                    | native_echo_xargs_stmt(st)
+                    | native_echo_tr_sort_stmt(st);
             }
             x |= native_echo_grep_stmt(st);
             x |= normalize_literal_exec_words(st);
@@ -184,6 +185,7 @@ fn transform_stmt(
             x |= native_echo_or_chain(st);
             x |= native_echo_grep_test_chain(st);
             x |= native_echo_xargs_stmt(st);
+            x |= native_echo_tr_sort_stmt(st);
             x |= native_ls_stmt(st);
             x |= native_trap_stmt(st);
             x |= native_head_tail_stmt(st);
@@ -4201,6 +4203,183 @@ fn native_echo_xargs_stmt(st: &mut IrStmt) -> bool {
     let joined = argq.join(", ");
     let code = format!(
         r#"do {{ my $__it = {lq} . "\n"; if (length($__it)) {{ print STDOUT join(' ', {joined}), " ", $__it, "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+    );
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `echo LIT | tr SET1 SET2 [| sort] [| head -N]` (perl-only): char
+/// translation followed by optional sort and head on the lines.
+fn native_echo_tr_sort_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
+    if func != "pipeline" {
+        return false;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
+    if stages.len() < 2 || stages.len() > 4 {
+        return false;
+    }
+    // stage 0: literal echo
+    let IrExpr::Arrow(s0) = &stages[0] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: _, args: a0 })] = s0.as_slice() else {
+        return false;
+    };
+    let [IrExpr::Str(cmd0, _), IrExpr::Array(w0)] = a0.as_slice() else { return false; };
+    if cmd0 != "echo" {
+        return false;
+    }
+    let mut content: Option<String> = None;
+    for w in w0 {
+        match w {
+            IrExpr::Str(sv, _) if sv == "-e" || sv == "-E" || sv == "-n" => return false,
+            IrExpr::Str(sv, _) => {
+                if content.is_some() {
+                    return false;
+                }
+                content = Some(sv.clone());
+            }
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                if content.is_some() {
+                    return false;
+                }
+                let t: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(x) => Some(x.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                content = Some(t);
+            }
+            _ => return false,
+        }
+    }
+    let Some(content) = content else { return false; };
+    let cq = crate::ir::safe_perl_q_string(&content);
+    // stage 1: tr SET1 SET2
+    let IrExpr::Arrow(s1) = &stages[1] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return false;
+    };
+    if !matches!(f1.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd1, _), IrExpr::Array(w1)] = a1.as_slice() else { return false; };
+    if cmd1 != "tr" {
+        return false;
+    }
+    let word_text = |w: &IrExpr| -> Option<String> {
+        match w {
+            IrExpr::Str(sv, _) => Some(sv.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                Some(
+                    parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            InterpPart::Lit(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    };
+    if w1.len() != 2 {
+        return false;
+    }
+    let (Some(set1), Some(set2)) = (word_text(&w1[0]), word_text(&w1[1])) else {
+        return false;
+    };
+    // no '/' (delimiter clash) in the raw sets
+    if set1.contains('/') || set2.contains('/') {
+        return false;
+    }
+    // the sets may carry literal backslash escapes (tr ' ' '\n')
+    let decode_set = |s: &str| -> Option<String> {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('\\') => out.push('\\'),
+                    Some(o) => {
+                        out.push('\\');
+                        out.push(o);
+                    }
+                    None => out.push('\\'),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        Some(out)
+    };
+    let Some(tr1) = decode_set(&set1) else { return false; };
+    let Some(tr2) = decode_set(&set2) else { return false; };
+    // single decoded chars only
+    if tr1.len() != 1 || tr2.len() != 1 {
+        return false;
+    }
+    // optional stage 2: sort [flags]; stage 3: head -N
+    let mut sort_flag = false;
+    let mut head_n: Option<usize> = None;
+    for (idx, stage) in stages.iter().enumerate().skip(2) {
+        let IrExpr::Arrow(body) = stage else { return false; };
+        let [IrStmt::Expr(IrExpr::Call { func: f, args: a })] = body.as_slice() else {
+            return false;
+        };
+        if !matches!(f.as_str(), "builtin" | "exec") {
+            return false;
+        }
+        let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = a.as_slice() else { return false; };
+        match cmd.as_str() {
+            "sort" => {
+                if idx != 2 {
+                    return false;
+                }
+                for w in words {
+                    let Some(t) = word_text(w) else { return false; };
+                    match t.as_str() {
+                        "-n" | "-r" | "-nr" | "-rn" => return false, // plain sort only
+                        _ => return false,
+                    }
+                }
+                sort_flag = true;
+            }
+            "head" => {
+                if idx != 3 {
+                    return false;
+                }
+                if words.len() != 1 {
+                    return false;
+                }
+                let Some(t) = word_text(&words[0]) else { return false; };
+                let Some(n) = t.strip_prefix('-') else { return false; };
+                let Ok(v) = n.parse() else { return false; };
+                head_n = Some(v);
+            }
+            _ => return false,
+        }
+    }
+    let mut code = format!(
+        r#"do {{ my $__x = {cq}; $__x =~ tr/{tr1}/{tr2}/; my @__l = split(/\n/, $__x, -1); pop @__l if @__l && $__l[-1] eq q{{}};"#
+    );
+    if sort_flag {
+        code.push_str(" @__l = sort @__l;");
+    }
+    if let Some(n) = head_n {
+        code.push_str(&format!(" splice(@__l, {n}) if @__l > {n};"));
+    }
+    code.push_str(
+        r#" if (@__l) { print STDOUT join("\n", @__l), "\n"; } }; $main_exit_code = $CHILD_ERROR = 0;"#,
     );
     *st = IrStmt::RawText(code);
     true
