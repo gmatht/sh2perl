@@ -27650,7 +27650,19 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     let value: Option<Expr> = if is_lifted(name) {
         Some(Expr::Identifier { name: name.clone() })
     } else {
-        positional_read(name).or_else(|| Some(store_var_read(name)))
+        positional_read(name).or_else(|| {
+            // param ops need the actual store value even when the var
+            // appears never-written (the optimizer may have eliminated
+            // the only write while preserving the param read).
+            let r = store_var_read(name);
+            if matches!(&r, Expr::Literal { value, .. } if value == "")
+                && never_written_read(name)
+            {
+                Some(sh2_call("getVar", vec![str_lit(name)]))
+            } else {
+                Some(r)
+            }
+        })
     };
     let value = value?;
     // positional writes (`${1:=d}`) and `:?` exits stay on the runtime.

@@ -2508,6 +2508,19 @@ pub(crate) fn call_arg_str(e: &IrExpr) -> Option<String> {
         IrExpr::Str(s, _) => Some(s.clone()),
         IrExpr::Var(name, _) => Some(name.clone()),
         IrExpr::Ident(name) => Some(name.clone()),
+        // An Interpolate whose parts are all literal text is a plain
+        // string (e.g. a herestring `<<< "hello"`). Without this, the
+        // renderer rebuilds the herestring as empty.
+        IrExpr::Interpolate(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    InterpPart::Lit(t) => out.push_str(t),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
         _ => None,
     }
 }
@@ -4567,6 +4580,16 @@ fn emit_exec_call(out: &mut String, call: &IrExpr, indent: usize) {
             }
             emit_indent(out, indent);
             out.push_str("$main_exit_code = $CHILD_ERROR = 0;\n");
+        }
+        "test" => {
+            // `test` builtin: reconstruct the `[ ... ]` condition and
+            // evaluate it as a Perl boolean. The exit status is 0 for
+            // true, 1 for false.
+            let cond = render_test_call(&words.iter().map(|w| {
+                IrExpr::Str(render_word(w), StrStyle::DoubleQuoted)
+            }).collect::<Vec<_>>());
+            emit_indent(out, indent);
+            out.push_str(&format!("$main_exit_code = $CHILD_ERROR = ({}) ? 0 : 1;\n", cond));
         }
         _ => {
             // External command — first try the AST Generator's in-Perl
@@ -6894,7 +6917,15 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
             collect_vars_in_expr(rhs, vars);
         }
         IrExpr::Capture { expr, .. } => collect_vars_in_expr(expr, vars),
-        IrExpr::Call { args, .. } => {
+        IrExpr::Call { func, args, .. } => {
+            // param calls reference a variable by name (args[1] is the
+            // Str literal name) — register it so the optimizer doesn't
+            // dead-eliminate the var's assignment.
+            if func == "param" {
+                if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                    vars.insert(name.clone());
+                }
+            }
             for a in args {
                 collect_vars_in_expr(a, vars);
             }
