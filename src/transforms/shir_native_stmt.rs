@@ -127,7 +127,9 @@ fn transform_stmt(
             x
         }
         IrStmt::While { cond, body, .. } => {
-            let mut x = transform_with_printf(body, lower_printf, files);
+            let mut x = native_while_multi_cond(st);
+            let IrStmt::While { cond, body, .. } = st else { return x; };
+            x |= transform_with_printf(body, lower_printf, files);
             x |= transform_expr(cond, files);
             x
         }
@@ -190,6 +192,7 @@ fn transform_stmt(
             x |= native_test_chain(st);
             x |= native_echo_or_chain(st);
             x |= native_if_test_cond(st);
+            x |= native_test_exit_stmt(st);
             x |= native_echo_grep_test_chain(st);
             x |= native_echo_xargs_stmt(st);
             x |= native_echo_tr_sort_stmt(st);
@@ -886,6 +889,32 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
                     }
                 }
                 Some(s)
+            }
+            // a direct getVar word: `test -f "$exec"`
+            IrExpr::Call { func, args }
+                if func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(_, _)]) =>
+            {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    Some(format!("${{{}}}", name))
+                } else {
+                    None
+                }
+            }
+            // unquoted expansion (split(getVar)): single-element paths
+            IrExpr::Call { func, args }
+                if func == "split"
+                    && matches!(
+                        args.as_slice(),
+                        [IrExpr::Call { func: vf, args: vargs }]
+                            if vf == "getVar" && matches!(vargs.as_slice(), [IrExpr::Str(_, _)])
+                    ) =>
+            {
+                let IrExpr::Call { args: vargs, .. } = &args[0] else { return None; };
+                if let Some(IrExpr::Str(name, _)) = vargs.first() {
+                    Some(format!("${{{}}}", name))
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -4936,6 +4965,192 @@ fn native_if_test_cond(st: &mut IrStmt) -> bool {
     };
     let new_cond = render_test_words(&cond_words);
     *cond = new_cond;
+    true
+}
+
+/// `test COND || exit N` (perl-only): native unless/exit.
+fn native_test_exit_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::BinOp {
+        op: BinOpKind::Or,
+        lhs,
+        rhs,
+    }) = st
+    else {
+        return false;
+    };
+    // lhs = test (Call(test) or exec("test", ...)); rhs = exit N
+    let cond_words: Option<Vec<&IrExpr>> = match lhs.as_ref() {
+        IrExpr::Call { func, args } if matches!(func.as_str(), "test" | "[" | "[[" ) => {
+            match args.as_slice() {
+                [IrExpr::Str(_, _), IrExpr::Array(words)] => Some(words.iter().collect()),
+                _ => Some(args.iter().collect()),
+            }
+        }
+        IrExpr::Call { func, args }
+            if matches!(func.as_str(), "exec" | "builtin") =>
+        {
+            match args.as_slice() {
+                [IrExpr::Str(c, _), IrExpr::Array(words)] if c == "test" || c == "[" => {
+                    Some(words.iter().collect())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let Some(cond_words) = cond_words else { return false; };
+    let IrExpr::Call { func, args } = rhs.as_ref() else { return false; };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return false; };
+    if cmd != "exit" {
+        return false;
+    }
+    // the exit code: literal int (default 0)
+    let mut code_n: i64 = 0;
+    for w in words {
+        let Some(t) = literal_text(w) else { return false; };
+        let Ok(v) = t.parse() else { return false; };
+        code_n = v;
+    }
+    let cond = render_test_words(&cond_words);
+    let cond_p = crate::ir::ir_expr_to_perl(&cond);
+    let code = format!(
+        r#"do {{ unless ({cond_p}) {{ exit {code_n}; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+    );
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `while { echo LIT; test COND } do BODY done` (perl-only): the cond
+/// runs the echo (side effect) then the test; restructure to
+/// `while (1) { print LIT; last unless COND; BODY }`.
+fn native_while_multi_cond(st: &mut IrStmt) -> bool {
+    let IrStmt::While { cond, body, .. } = st else { return false; };
+    // the cond may be a pipeline Call wrapping the Arrow
+    let arrow: &IrExpr = match cond {
+        IrExpr::Arrow(_) => cond,
+        IrExpr::Call { func, args } if func == "pipeline" => match args.as_slice() {
+            [IrExpr::Array(elems)] => match elems.first() {
+                Some(IrExpr::Arrow(_)) => &elems[0],
+                _ => return false,
+            },
+            _ => return false,
+        },
+        IrExpr::Call { func, args } if func == "block" => match args.as_slice() {
+            [IrExpr::Arrow(_)] => &args[0],
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let IrExpr::Arrow(stmts) = arrow else { return false; };
+    let Some((last, prefix)) = stmts.split_last() else { return false; };
+    // prefix stmts must all be literal echoes
+    let mut prefix_echoes: Vec<IrStmt> = Vec::new();
+    for s in prefix {
+        // the cond stmts arrive Block-wrapped
+        let s = match s {
+            IrStmt::Block(inner) => match inner.as_slice() {
+                [st] => st,
+                _ => return false,
+            },
+            other => other,
+        };
+        match s {
+            IrStmt::Expr(IrExpr::Call { func, args }) => {
+                if !matches!(func.as_str(), "builtin" | "exec") {
+                    return false;
+                }
+                let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+                    return false;
+                };
+                if cmd != "echo" {
+                    return false;
+                }
+                let mut content: Option<String> = None;
+                for w in words {
+                    match w {
+                        IrExpr::Str(sv, _) if sv == "-e" || sv == "-E" || sv == "-n" => {
+                            return false;
+                        }
+                        IrExpr::Str(sv, _) => {
+                            if content.is_some() {
+                                return false;
+                            }
+                            content = Some(sv.clone());
+                        }
+                        IrExpr::Interpolate(parts)
+                            if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+                        {
+                            if content.is_some() {
+                                return false;
+                            }
+                            let t: String = parts
+                                .iter()
+                                .filter_map(|p| match p {
+                                    InterpPart::Lit(x) => Some(x.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            content = Some(t);
+                        }
+                        _ => return false,
+                    }
+                }
+                let Some(c) = content else { return false; };
+                prefix_echoes.push(IrStmt::Output {
+                    value: IrExpr::Str(c, StrStyle::DoubleQuoted),
+                    newline: true,
+                    target: None,
+                });
+            }
+            _ => return false,
+        }
+    }
+    // last stmt: the test condition (Call(test) or exec("test", ...))
+    let cond_words: Option<Vec<&IrExpr>> = match last {
+        IrStmt::Expr(IrExpr::Call { func, args })
+            if matches!(func.as_str(), "test" | "[" | "[[" ) =>
+        {
+            match args.as_slice() {
+                [IrExpr::Str(_, _), IrExpr::Array(words)] => Some(words.iter().collect()),
+                _ => Some(args.iter().collect()),
+            }
+        }
+        IrStmt::Expr(IrExpr::Call { func, args })
+            if matches!(func.as_str(), "exec" | "builtin") =>
+        {
+            match args.as_slice() {
+                [IrExpr::Str(c, _), IrExpr::Array(words)] if c == "test" || c == "[" => {
+                    Some(words.iter().collect())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let Some(cond_words) = cond_words else { return false; };
+    let rendered = render_test_words(&cond_words);
+    // build: while (1) { echo...; last unless COND; BODY }
+    let mut new_body: Vec<IrStmt> = prefix_echoes;
+    new_body.push(IrStmt::If {
+        cond: rendered,
+        then: vec![],
+        elsifs: vec![],
+        else_: vec![IrStmt::Expr(IrExpr::Call {
+            func: "break".to_string(),
+            args: vec![],
+        })],
+    });
+    new_body.extend(body.iter().cloned());
+    match st {
+        IrStmt::While { cond, body, .. } => {
+            *cond = IrExpr::Bool(true);
+            *body = new_body;
+        }
+        _ => return false,
+    }
     true
 }
 
