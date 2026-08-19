@@ -228,6 +228,7 @@ fn transform_stmt(
             x |= empty_herestring_to_status(st);
             x |= file_redirect_block(st);
             x |= native_sort_file_stmt(st);
+            x |= native_echo_write_file_stmt(st);
             x |= native_echo_grep_stmt(st);
             x |= native_echo_bc_stmt(st);
             x |= native_cat_heredoc_writefile(st);
@@ -2708,6 +2709,99 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
 }
 
 /// Escape a literal grep pattern for use inside a Perl regex (quotemeta).
+/// `echo [-e|-n|-E] LIT > LITFILE` (perl-only): a literal echo redirect
+/// writes the (escapes-decoded) content directly instead of shelling out.
+/// The target is a literal Str path, or a Var/Ident whose NAME is the
+/// literal filename (process-substitution temps like `__ps_tmp0`).
+fn native_echo_write_file_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Redirect { inner, redirects } = st else { return false; };
+    let [r] = redirects.as_slice() else { return false; };
+    if r.fd.unwrap_or(1) != 1 {
+        return false;
+    }
+    if !matches!(r.mode.as_str(), "w" | "wc") {
+        return false;
+    }
+    let out = match &r.target {
+        IrExpr::Str(s, _) => crate::ir::safe_perl_q_string(s),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
+        _ => return false,
+    };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = inner.as_slice() else { return false; };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return false; };
+    // literal content of one echo/printf word (Str or all-literal Interpolate)
+    let word_text = |w: &IrExpr| -> Option<String> {
+        match w {
+            IrExpr::Str(sv, _) => Some(sv.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                Some(
+                    parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            InterpPart::Lit(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    };
+    let mut content: Option<String> = None;
+    let mut escapes = false;
+    let mut newline = true;
+    if cmd == "echo" {
+        for w in words {
+            match w {
+                IrExpr::Str(sv, _) if sv == "-e" => escapes = true,
+                IrExpr::Str(sv, _) if sv == "-E" => escapes = false,
+                IrExpr::Str(sv, _) if sv == "-n" => newline = false,
+                _ => {
+                    if content.is_some() {
+                        return false;
+                    }
+                    let Some(t) = word_text(w) else { return false; };
+                    content = Some(t);
+                }
+            }
+        }
+    } else if cmd == "printf" {
+        // printf FMT > FILE: exactly one literal format word, no args,
+        // no %-directives (those need argument substitution)
+        if words.len() != 1 {
+            return false;
+        }
+        let Some(t) = word_text(&words[0]) else { return false; };
+        if t.contains('%') {
+            return false;
+        }
+        content = Some(t);
+        escapes = true; // printf always interprets backslash escapes
+        newline = false; // printf does not append a newline
+    } else {
+        return false;
+    }
+    let Some(content) = content else { return false; };
+    let decoded = if escapes {
+        let Some(d) = decode_echo_escapes(&content) else { return false; };
+        d
+    } else {
+        content
+    };
+    let cq = crate::ir::safe_perl_q_string(&decoded);
+    let nl = if newline { ", \"\\n\"" } else { "" };
+    let code = format!(
+        "open(my $__ofh, '>', {out}) or die \"echo: {out}: $ERRNO\"; print $__ofh {cq}{nl}; close $__ofh; $main_exit_code = $CHILD_ERROR = 0;"
+    );
+    *st = IrStmt::RawText(code);
+    true
+}
+
 fn regex_escape_literal(s: &str) -> String {
     s.chars().map(|c| match c {
         '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' => {
