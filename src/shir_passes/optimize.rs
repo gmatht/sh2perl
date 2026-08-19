@@ -1316,7 +1316,22 @@ fn drop_dead_store(st: &IrStmt, reads: &HashSet<String>, guarded: &HashSet<Strin
     match st {
         IrStmt::Assign { targets, expr, .. } => {
             let all_dead = targets.iter().all(|t| {
-                t.indices.is_empty() && !reads.contains(&t.var) && !guarded.contains(&t.var)
+                if !t.indices.is_empty() {
+                    return false;
+                }
+                if reads.contains(&t.var) || guarded.contains(&t.var) {
+                    return false;
+                }
+                // baked-subscript write (`aa[one]=1`): the read signal
+                // registers the BASE name (`aa` from arrayIndex("aa",
+                // "one")) — keep the write when the base is read.
+                if let Some(pos) = t.var.find('[') {
+                    let base = &t.var[..pos];
+                    if reads.contains(base) || guarded.contains(base) {
+                        return false;
+                    }
+                }
+                true
             });
             if targets.is_empty() || !all_dead {
                 return false;
@@ -1600,6 +1615,13 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                 // the NAME arg (args[1]) is a READ (go-sh-20260816-164300)
                 if let Some(IrExpr::Str(n, _)) = args.get(1) {
                     out.push(n.clone());
+                    // baked-subscript read (`aa[$k]` / `aa[one]`): the
+                    // base name is the array — register it so a
+                    // baked-subscript WRITE (`aa[two]=2`) is not
+                    // dead-eliminated when the array is read dynamically.
+                    if let Some(pos) = n.find('[') {
+                        out.push(n[..pos].to_string());
+                    }
                 }
             } else if matches!(
                 func.as_str(),
@@ -1607,6 +1629,9 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
             ) {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     out.push(n.clone());
+                    if let Some(pos) = n.find('[') {
+                        out.push(n[..pos].to_string());
+                    }
                 }
             } else if func == "arrayIndex" {
                 if let Some(IrExpr::Str(n, _)) = args.first() {

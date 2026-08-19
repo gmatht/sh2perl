@@ -46,7 +46,18 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 
     let dead: Vec<String> = writes
         .iter()
-        .filter(|v| !reads.contains(*v) && !escapes.contains(*v))
+        .filter(|v| {
+            if reads.contains(*v) || escapes.contains(*v) {
+                return false;
+            }
+            if let Some(pos) = v.find('[') {
+                let base = &v[..pos];
+                if reads.contains(base) || escapes.contains(base) {
+                    return false;
+                }
+            }
+            true
+        })
         .cloned()
         .collect();
     if dead.is_empty() {
