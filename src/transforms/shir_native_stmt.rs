@@ -2493,8 +2493,14 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
         }
     }
     let Some(file) = file else { return false; };
-    let IrExpr::Str(fname, _) = file else { return false; };
-    let fq = crate::ir::safe_perl_q_string(fname);
+    // process-substitution temps arrive as Var/Ident (`sort "$__ps_tmp0"`):
+    // the NAME is the literal filename.
+    let fname = match file {
+        IrExpr::Str(fname, _) => fname.clone(),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => n.clone(),
+        _ => return false,
+    };
+    let fq = crate::ir::safe_perl_q_string(&fname);
     let cmp = if numeric { "{ $a <=> $b }" } else { "{ $a cmp $b }" };
     let reverse = if reverse { " @__sl = reverse @__sl;" } else { "" };
     let code = format!(
