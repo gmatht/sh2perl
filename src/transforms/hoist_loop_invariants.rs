@@ -154,7 +154,18 @@ fn expr_reads(e: &IrExpr, var: &str) -> bool {
         IrExpr::Index { var: v, .. } => v == var,
         IrExpr::BinOp { lhs, rhs, .. } => expr_reads(lhs, var) || expr_reads(rhs, var),
         IrExpr::Arith(a) => arith_reads(a, var),
-        IrExpr::Call { args, .. } => args.iter().any(|a| expr_reads(a, var)),
+        IrExpr::Call { func, args } => {
+            // param(op, name, …) reads name (args[1]) — same rule as
+            // dead_store_elim and shir_passes::expr_reads (go-sh-20260816-164300)
+            if func == "param" {
+                if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                    if n == var {
+                        return true;
+                    }
+                }
+            }
+            args.iter().any(|a| expr_reads(a, var))
+        }
         IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
             crate::ir::InterpPart::Expr(x) => expr_reads(x, var),
             _ => false,
@@ -228,7 +239,13 @@ fn read_set_into(e: &IrExpr, out: &mut HashSet<String>) {
             read_set_into(rhs, out);
         }
         IrExpr::Arith(a) => arith_read_set(a, out),
-        IrExpr::Call { args, .. } => {
+        IrExpr::Call { func, args } => {
+            // param(op, name, …) reads name (args[1])
+            if func == "param" {
+                if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                    out.insert(n.clone());
+                }
+            }
             for a in args {
                 read_set_into(a, out);
             }
