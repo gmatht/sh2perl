@@ -164,7 +164,10 @@ fn transform_stmt(
             if is_pipeline {
                 // only the echo|grep fold applies to a pipeline expression
                 // (the echo|tr / printf|sort folds are the renderer's job)
-                return x | native_echo_grep_stmt(st) | native_echo_bc_stmt(st);
+                return x
+                    | native_echo_grep_stmt(st)
+                    | native_echo_bc_stmt(st)
+                    | native_grep_file_pipeline(st);
             }
             x |= normalize_literal_exec_words(st);
             x |= native_declare_typeset_stmt(st);
@@ -229,6 +232,7 @@ fn transform_stmt(
             x |= file_redirect_block(st);
             x |= native_sort_file_stmt(st);
             x |= native_echo_write_file_stmt(st);
+            x |= native_grep_file_pipeline(st);
             x |= native_echo_grep_stmt(st);
             x |= native_echo_bc_stmt(st);
             x |= native_cat_heredoc_writefile(st);
@@ -2800,6 +2804,384 @@ fn native_echo_write_file_stmt(st: &mut IrStmt) -> bool {
     );
     *st = IrStmt::RawText(code);
     true
+}
+
+/// A pipeline over a literal file whose stages are literal
+/// grep/cut/sort/head/tail invocations (perl-only). Reads the file
+/// natively and applies the filters; the last stage may carry a
+/// redirect (fd1 w -> literal file). Refuses dynamic patterns/files,
+/// -l/-c/-o/-q/-A/-B/-C flags, and glob inputs.
+fn native_grep_file_pipeline(st: &mut IrStmt) -> bool {
+    // ── unwrap the outer form: Redirect(pipeline) or bare pipeline ──
+    let (stages, outer_out): (Vec<&IrExpr>, Option<String>) = match st {
+        IrStmt::Redirect { inner, redirects } => {
+            let [r] = redirects.as_slice() else { return false; };
+            if r.fd.unwrap_or(1) != 1 || !matches!(r.mode.as_str(), "w" | "wc") {
+                return false;
+            }
+            let out = match &r.target {
+                IrExpr::Str(s, _) => crate::ir::safe_perl_q_string(s),
+                IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
+                _ => return false,
+            };
+            let [IrStmt::Expr(IrExpr::Call { func, args })] = inner.as_slice() else {
+                return false;
+            };
+            if func != "pipeline" {
+                return false;
+            }
+            let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
+            (stages.iter().collect(), Some(out))
+        }
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
+            let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
+            (stages.iter().collect(), None)
+        }
+        _ => return false,
+    };    if stages.is_empty() || stages.len() > 6 {
+        return false;
+    }
+    // ── stage 0: grep with a literal file input ──
+    let literal_words = |stage: &IrExpr| -> Option<Vec<String>> {
+        let IrExpr::Arrow(body) = stage else { return None; };
+        let [IrStmt::Expr(IrExpr::Call { func, args })] = body.as_slice() else {
+            return None;
+        };
+        if !matches!(func.as_str(), "builtin" | "exec") {
+            return None;
+        }
+        let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+            return None;
+        };
+        let mut ws = vec![cmd.clone()];
+        for w in words {
+            match w {
+                IrExpr::Str(sv, _) => ws.push(sv.clone()),
+                IrExpr::Interpolate(parts)
+                    if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+                {
+                    let t: String = parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            InterpPart::Lit(x) => Some(x.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    ws.push(t);
+                }
+                _ => return None,
+            }
+        }
+        Some(ws)
+    };
+    let Some(ws0) = literal_words(&stages[0]) else {
+        return false;
+    };
+    if ws0[0] != "grep" {
+        return false;
+    }
+    // grep flags: -v (invert), -E/-P (regex flavour note; perl regex covers)
+    let mut invert = false;
+    let mut pat: Option<String> = None;
+    let mut file: Option<String> = None;
+    let mut i = 1;
+    while i < ws0.len() {
+        let w = &ws0[i];
+        if w.starts_with('-') && w.len() > 1 {
+            for ch in w[1..].chars() {
+                match ch {
+                    'v' => invert = true,
+                    'E' | 'P' => {} // perl regex is a superset for our corpus
+                    _ => return false, // -l -c -o -q -A -B -C -w -i -m -e...
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if pat.is_none() {
+            pat = Some(w.clone());
+        } else if file.is_none() {
+            file = Some(w.clone());
+        } else {
+            return false;
+        }
+        i += 1;
+    }
+    let Some(pat) = pat else { return false; };
+    let Some(file) = file else { return false; };
+    // ── stages 1..: cut / sort / head / tail ──
+    let mut ops: Vec<String> = Vec::new();
+    let mut last_is_redirect = false;
+    let mut stage_out: Option<String> = outer_out.clone();
+    let n = stages.len();
+    for (idx, stage) in stages.iter().enumerate().skip(1) {
+        if idx == n - 1 {
+            // the last stage may be redirect-wrapped
+            let IrExpr::Arrow(body) = stage else { return false; };
+            let [IrStmt::Expr(IrExpr::Call { func, args })] = body.as_slice() else {
+                return false;
+            };
+            if func == "redirect" {
+                // args[0] = Arrow([Expr(cmd)]); args[1..] = specs
+                let Some(IrExpr::Arrow(inner)) = args.first() else { return false; };
+                let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] =
+                    inner.as_slice()
+                else {
+                    return false;
+                };
+                if !matches!(f2.as_str(), "builtin" | "exec") {
+                    return false;
+                }
+                let [IrExpr::Str(cmd2, _), IrExpr::Array(words2)] = a2.as_slice() else {
+                    return false;
+                };
+                let mut ws2 = vec![cmd2.clone()];
+                for w in words2 {
+                    match w {
+                        IrExpr::Str(sv, _) => ws2.push(sv.clone()),
+                        _ => return false,
+                    }
+                }
+                // the fd1 w target
+                let mut o: Option<String> = None;
+                for spec in args.iter().skip(1) {
+                    let obj = match spec {
+                        IrExpr::Object(fields) => Some(fields),
+                        IrExpr::Array(elems) => match elems.first() {
+                            Some(IrExpr::Object(fields)) => Some(fields),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(fields) = obj {
+                        let mut fd = 1;
+                        let mut mode = String::new();
+                        let mut target: Option<&IrExpr> = None;
+                        for (k, v) in fields {
+                            if k == "fd" {
+                                if let IrExpr::Int(nv) = v {
+                                    fd = *nv as i32;
+                                }
+                            }
+                            if k == "mode" {
+                                if let IrExpr::Str(m, _) = v {
+                                    mode = m.clone();
+                                }
+                            }
+                            if k == "target" {
+                                target = Some(v);
+                            }
+                        }
+                        if fd == 1 && (mode == "w" || mode == "wc") {
+                            if let Some(IrExpr::Str(t, _)) = target {
+                                o = Some(crate::ir::safe_perl_q_string(t));
+                            }
+                        }
+                    }
+                }
+                stage_out = o.or(stage_out);
+                last_is_redirect = true;
+                if !emit_file_op(&mut ops, &ws2) {
+                    return false;
+                }
+                continue;
+            }
+            // plain last stage (e.g. `... | sort`)
+        }
+        let Some(ws) = literal_words(stage) else { return false; };
+        if !emit_file_op(&mut ops, &ws) {
+            return false;
+        }
+        if idx == n - 1 {
+            last_is_redirect = true;
+        }
+    }
+    if !last_is_redirect && stage_out.is_none() && outer_out.is_some() {
+        // outer redirect already handled
+    }
+    // ── build the perl ──
+    let fq = crate::ir::safe_perl_q_string(&file);
+    let invert_op = if invert { "!" } else { "" };
+    let mut code = format!(
+        "do {{ my @__lp = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {fq}) or die \"grep: {fq}: $ERRNO\"; my $__c = <$__f>; close $__f; split(/\\n/, $__c) }}; pop @__lp if @__lp && $__lp[-1] eq q{{}}; @__lp = grep {{ {invert_op}/{pat}/ }} @__lp;"
+    );
+    for op in &ops {
+        code.push_str(op);
+    }
+    let print_code = match &stage_out {
+        Some(oq) => format!(
+            " if (@__lp) {{ open(my $__ofh, '>', {oq}) or die \"grep: {oq}: $ERRNO\"; print $__ofh join(\"\\n\", @__lp), \"\\n\"; close $__ofh; }} }}; $main_exit_code = $CHILD_ERROR = 0;"
+        ),
+        None => format!(
+            " if (@__lp) {{ print join(\"\\n\", @__lp), \"\\n\"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"
+        ),
+    };
+    code.push_str(&print_code);
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// Emit one native perl operation for a literal cut/sort/head/tail stage.
+/// Returns false for anything outside the supported subset.
+fn emit_file_op(ops: &mut Vec<String>, ws: &[String]) -> bool {
+    match ws[0].as_str() {
+        "cut" => {
+            let mut delim = "\t";
+            let mut fields: Vec<usize> = Vec::new();
+            let mut i = 1;
+            while i < ws.len() {
+                match ws[i].as_str() {
+                    "-d" => {
+                        i += 1;
+                        if i >= ws.len() {
+                            return false;
+                        }
+                        delim = &ws[i];
+                    }
+                    "-f" => {
+                        i += 1;
+                        if i >= ws.len() {
+                            return false;
+                        }
+                        for f in ws[i].split(',') {
+                            let Ok(v) = f.parse::<usize>() else { return false; };
+                            if v == 0 || v > 1000 {
+                                return false;
+                            }
+                            fields.push(v - 1);
+                        }
+                    }
+                    "-s" => {} // suppress lines without the delimiter
+                    _ => return false,
+                }
+                i += 1;
+            }
+            if fields.is_empty() || fields.len() > 4 {
+                return false;
+            }
+            if delim.len() > 1 {
+                return false; // multi-char delimiter -> regex, refuse for now
+            }
+            let d = if delim == "\\t" { "\t" } else { delim };
+            if d.len() != 1 {
+                return false;
+            }
+            let dq = crate::ir::safe_perl_q_string(d);
+            let fs: Vec<String> = fields.iter().map(|f| format!("{f}")).collect();
+            let pick = format!("[{}]", fs.join(","));
+            ops.push(format!(
+                " @__lp = map {{ my @__f = split({dq}, $_); join({dq}, @__f{pick}) }} @__lp;"
+            ));
+            true
+        }
+        "sort" => {
+            let mut sep: Option<&str> = None;
+            let mut key: Option<usize> = None;
+            let mut numeric = false;
+            let mut reverse = false;
+            let mut i = 1;
+            while i < ws.len() {
+                match ws[i].as_str() {
+                    "-t" => {
+                        i += 1;
+                        if i >= ws.len() {
+                            return false;
+                        }
+                        sep = Some(&ws[i]);
+                    }
+                    "-k" => {
+                        i += 1;
+                        if i >= ws.len() {
+                            return false;
+                        }
+                        let Ok(k) = ws[i].parse::<usize>() else { return false; };
+                        if k == 0 {
+                            return false;
+                        }
+                        key = Some(k - 1);
+                    }
+                    "-n" => numeric = true,
+                    "-r" => reverse = true,
+                    "-h" => return false, // human sort: not here
+                    _ => return false,
+                }
+                i += 1;
+            }
+            let (sa, sb) = match (sep, key) {
+                (Some(sp), Some(k)) => {
+                    if sp.len() != 1 {
+                        return false;
+                    }
+                    let dq = crate::ir::safe_perl_q_string(sp);
+                    let kq = crate::ir::safe_perl_q_string(sp);
+                    (
+                        format!("(split({dq}, $a))[{k}]"),
+                        format!("(split({kq}, $b))[{k}]"),
+                    )
+                }
+                (None, None) => ("$a".to_string(), "$b".to_string()),
+                _ => return false, // -t without -k (or -k without -t): skip
+            };
+            let cmp = if numeric { "<=>" } else { "cmp" };
+            let r = if reverse { " @__lp = reverse @__lp;" } else { "" };
+            ops.push(format!(" @__lp = sort {{ {sa} {cmp} {sb} }} @__lp;{r}"));
+            true
+        }
+        "head" => {
+            let mut n: usize = 10;
+            let mut i = 1;
+            while i < ws.len() {
+                match ws[i].as_str() {
+                    "-n" => {
+                        i += 1;
+                        if i >= ws.len() {
+                            return false;
+                        }
+                        let Ok(nv) = ws[i].parse::<usize>() else { return false; };
+                        n = nv;
+                    }
+                    s if s.starts_with('-') && s[1..].chars().all(|c| c.is_ascii_digit()) => {
+                        let Ok(nv) = s[1..].parse::<usize>() else { return false; };
+                        n = nv;
+                    }
+                    _ => return false,
+                }
+                i += 1;
+            }
+            if n == 0 || n > 100000 {
+                return false;
+            }
+            ops.push(format!(
+                " if (@__lp > {n}) {{ splice(@__lp, {n}); }}"
+            ));
+            true
+        }
+        "tail" => {
+            let mut n: usize = 10;
+            let mut i = 1;
+            while i < ws.len() {
+                match ws[i].as_str() {
+                    "-n" => {
+                        i += 1;
+                        if i >= ws.len() {
+                            return false;
+                        }
+                        let Ok(nv) = ws[i].parse::<usize>() else { return false; };
+                        n = nv;
+                    }
+                    s if s.starts_with('-') && s[1..].chars().all(|c| c.is_ascii_digit()) => {
+                        let Ok(nv) = s[1..].parse::<usize>() else { return false; };
+                        n = nv;
+                    }
+                    _ => return false,
+                }
+                i += 1;
+            }
+            ops.push(format!(" splice(@__lp, 0, $#__lp - {n} + 1) if @__lp > {n};"));
+            true
+        }
+        _ => false,
+    }
 }
 
 fn regex_escape_literal(s: &str) -> String {
