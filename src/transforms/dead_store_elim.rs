@@ -203,10 +203,12 @@ fn census_expr(
             census_expr(rhs, reads, writes, escapes, escaping);
         }
         IrExpr::Call { func, args } => {
-            // getVar / arrayIndex read their name args; setVar / setArray
-            // / SetChildError-style writes are recorded by their targets
-            if matches!(func.as_str(), "getVar" | "arrayIndex") {
-                if let Some(IrExpr::Str(n, _)) = args.first() {
+            // getVar / arrayIndex / param read their name args;
+            // setVar / setArray / SetChildError-style writes are
+            // recorded by their targets
+            if matches!(func.as_str(), "getVar" | "arrayIndex" | "param") {
+                let idx = if func == "param" { 1 } else { 0 };
+                if let Some(IrExpr::Str(n, _)) = args.get(idx) {
                     reads.insert(n.clone());
                 }
             }
