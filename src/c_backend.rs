@@ -3082,7 +3082,17 @@ impl Render {
                 }
                 self.shell_exec(args)
             }
-            "printf" => self.shell_exec(args),
+            "printf" => {
+                // native printf for the safe format subset (%s/%d/%% etc.),
+                // falling back to shell-out for bash-specific conversions
+                // (%b, %q, %(…)T, \c, recycling) — favour native C
+                if let Some(p) = self.try_native_printf(&words) {
+                    self.need_sh = true;
+                    format!("(_sh_rc = 0, {p})")
+                } else {
+                    self.shell_exec(args)
+                }
+            }
             "cd" => {
                 let dir = match words.first() {
                     Some(w) => self.value_c(w),
@@ -5384,6 +5394,136 @@ impl Render {
             format!("fputs({}, stdout)", Self::cstr(&fmt))
         } else {
             format!("printf({}, {})", Self::cstr(&fmt), cargs.join(", "))
+        }
+    }
+
+    /// Native `printf` when the format uses only conversions the C printf
+    /// shares with bash's (`%s %d %i %u %o %x %X %%`), with the arg count
+    /// exactly matching the conversion count. Returns None (caller shells
+    /// out) for bash-specific conversions (`%b`, `%q`, `%(...)T`), the
+    /// `\c` / `\0NNN` escapes, and format-recycling (extra/insufficient
+    /// args) — the conservative path keeps those on `bash -c`.
+    fn try_native_printf(&mut self, words: &[&IrExpr]) -> Option<String> {
+        let fmt_str = match words.first() {
+            Some(IrExpr::Str(s, _)) => s.clone(),
+            _ => return None,
+        };
+        let args = &words[1..];
+        let mut fmt = String::new();
+        let mut cargs: Vec<String> = Vec::new();
+        let mut arg_i = 0usize;
+        let mut it = fmt_str.chars().peekable();
+        while let Some(ch) = it.next() {
+            match ch {
+                '\\' => match it.next() {
+                    Some('c') => return None, // bash: stop output
+                    Some('0') => return None, // octal escape differs
+                    Some('n') => fmt.push('\n'),
+                    Some('t') => fmt.push('\t'),
+                    Some('r') => fmt.push('\r'),
+                    Some('a') => fmt.push('\x07'),
+                    Some('b') => fmt.push('\x08'),
+                    Some('f') => fmt.push('\x0c'),
+                    Some('v') => fmt.push('\x0b'),
+                    Some('\\') => fmt.push('\\'),
+                    Some('\'') => fmt.push('\''),
+                    Some('"') => fmt.push('"'),
+                    // unknown escape — keep conservative, shell out
+                    Some(_) => return None,
+                    None => fmt.push('\\'),
+                },
+                '%' => {
+                    let mut pre = String::from("%");
+                    while let Some(&c) = it.peek() {
+                        if "-+ #0".contains(c) {
+                            pre.push(c);
+                            it.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    while let Some(&c) = it.peek() {
+                        if c.is_ascii_digit() {
+                            pre.push(c);
+                            it.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if it.peek() == Some(&'.') {
+                        pre.push('.');
+                        it.next();
+                        while let Some(&c) = it.peek() {
+                            if c.is_ascii_digit() {
+                                pre.push(c);
+                                it.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let conv = it.next()?;
+                    match conv {
+                        '%' => {
+                            fmt.push('%');
+                            continue;
+                        }
+                        's' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push('s');
+                            cargs.push(self.value_c(a));
+                        }
+                        'd' | 'i' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push_str("lld");
+                            cargs.push(format!("(long long)({})", self.value_num(a)));
+                        }
+                        'u' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push_str("llu");
+                            cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
+                        }
+                        'o' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push_str("llo");
+                            cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
+                        }
+                        'x' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push_str("llx");
+                            cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
+                        }
+                        'X' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push_str("llX");
+                            cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
+                        }
+                        _ => return None,
+                    }
+                }
+                other => fmt.push(other),
+            }
+        }
+        // format-recycling (bash reuses fmt for leftover args) needs shell-out
+        if arg_i != args.len() {
+            return None;
+        }
+        if cargs.is_empty() {
+            Some(format!("fputs({}, stdout)", Self::cstr(&fmt)))
+        } else {
+            Some(format!("printf({}, {})", Self::cstr(&fmt), cargs.join(", ")))
         }
     }
 
