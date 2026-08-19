@@ -203,6 +203,7 @@ fn transform_stmt(
             x |= native_literal_subshell_wc_stmt(st);
             x |= native_find_stmt(st);
             x |= native_cat_heredoc_wc_stmt(st);
+            x |= native_comm_stmt(st);
             x |= native_ls_stmt(st);
             x |= native_rm_rf_stmt(st);
             x |= native_trap_stmt(st);
@@ -5630,6 +5631,46 @@ fn native_command_noop_cond(st: &mut IrStmt) -> bool {
     }
     // the command fails -> rc 1; Not inverts it
     *cond = IrExpr::Bool(not_wrapped);
+    true
+}
+
+/// `comm -12 FILE1 FILE2` (perl-only): the intersection of two sorted
+/// files (merge-walk; the files are usually process-substitution temps).
+fn native_comm_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
+    if !matches!(func.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return false; };
+    if cmd != "comm" {
+        return false;
+    }
+    let mut only_common = false;
+    let mut files: Vec<&IrExpr> = Vec::new();
+    for w in words {
+        match w {
+            IrExpr::Str(sv, _) if sv == "-12" => only_common = true,
+            IrExpr::Str(sv, _) if sv.starts_with('-') => return false,
+            _ => files.push(w),
+        }
+    }
+    if !only_common || files.len() != 2 {
+        return false;
+    }
+    let file_q = |w: &IrExpr| -> Option<String> {
+        match w {
+            IrExpr::Str(s, _) => Some(crate::ir::safe_perl_q_string(s)),
+            IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(crate::ir::safe_perl_q_string(n)),
+            _ => None,
+        }
+    };
+    let (Some(f1), Some(f2)) = (file_q(files[0]), file_q(files[1])) else {
+        return false;
+    };
+    let code = format!(
+        r#"do {{ my @__a = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {f1}) or die "comm: {f1}: $ERRNO"; my $__c = <$__f>; close $__f; $__c }}, -1); pop @__a if @__a && $__a[-1] eq q{{}}; my @__b = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__g, '<', {f2}) or die "comm: {f2}: $ERRNO"; my $__c = <$__g>; close $__g; $__c }}, -1); pop @__b if @__b && $__b[-1] eq q{{}}; my ($__i, $__j) = (0, 0); my @__out; while ($__i < @__a && $__j < @__b) {{ my $__c = $__a[$__i] cmp $__b[$__j]; if ($__c == 0) {{ push @__out, $__a[$__i]; $__i++; $__j++; }} elsif ($__c < 0) {{ $__i++; }} else {{ $__j++; }} }} if (@__out) {{ print STDOUT join("\n", @__out), "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+    );
+    *st = IrStmt::RawText(code);
     true
 }
 
