@@ -87,13 +87,14 @@ pub fn expr_reads(name: &str, e: &IrExpr) -> bool {
                         return true;
                     }
                 }
-            } else if func == "test" {
-                // `[ "$x" -eq 5 ]` string operands carry $names
-                for a in args {
-                    if let IrExpr::Str(s, _) = a {
-                        if test_string_reads(name, s) {
-                            return true;
-                        }
+            }
+            // $name references inside ANY string argument are reads — the
+            // `test` operands (`[ "$x" -eq 5 ]`) AND the slice start of
+            // `${s:$i:1}` (param's "slice" carries the index as Str("$i"))
+            for a in args {
+                if let IrExpr::Str(s, _) = a {
+                    if test_string_reads(name, s) {
+                        return true;
                     }
                 }
             }
