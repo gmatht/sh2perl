@@ -180,6 +180,7 @@ fn transform_stmt(
             x |= native_grep_devnull_or(st);
             x |= native_test_chain(st);
             x |= native_echo_or_chain(st);
+            x |= native_echo_grep_test_chain(st);
             x |= native_ls_stmt(st);
             x |= native_head_tail_stmt(st);
             x |= native_sort_stmt(st);
@@ -3658,6 +3659,166 @@ fn native_echo_filter_stmt(st: &mut IrStmt) -> bool {
         _ => return false,
     };
     let _ = &mut code;
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `echo $VAR | grep [-m N] PAT > /dev/null && echo A || echo B`
+/// (perl-only): the grep-with-discarded-output is a pure "does the value
+/// match the pattern" test. Rewrites to a native if/else over the two
+/// literal echoes.
+fn native_echo_grep_test_chain(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::BinOp {
+        op: BinOpKind::Or,
+        lhs,
+        rhs,
+    }) = st
+    else {
+        return false;
+    };
+    let IrExpr::BinOp {
+        op: BinOpKind::And,
+        lhs: and_lhs,
+        rhs: and_rhs,
+    } = lhs.as_ref()
+    else {
+        return false;
+    };
+    // and_lhs = the pipeline; and_rhs = echo A; rhs = echo B
+    let IrExpr::Call { func: pf, args: pargs } = and_lhs.as_ref() else { return false; };
+    if pf != "pipeline" {
+        return false;
+    }
+    let [IrExpr::Array(stages)] = pargs.as_slice() else { return false; };
+    if stages.len() != 2 {
+        return false;
+    }
+    // stage 0: echo $VAR (single getVar content)
+    let IrExpr::Arrow(s0) = &stages[0] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: _, args: a0 })] = s0.as_slice() else {
+        return false;
+    };
+    let [IrExpr::Str(cmd0, _), IrExpr::Array(w0)] = a0.as_slice() else { return false; };
+    if cmd0 != "echo" {
+        return false;
+    }
+    let Some(IrExpr::Call { func: vf, args: vargs }) = w0.first().map(|w| w) else {
+        return false;
+    };
+    if vf != "getVar" {
+        return false;
+    }
+    let Some(IrExpr::Str(vname, _)) = vargs.first().map(|w| w) else { return false; };
+    // stage 1: redirect(Arrow([grep [-m N] PAT]), [fd1 -> /dev/null])
+    let IrExpr::Arrow(s1) = &stages[1] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: r1, args: rargs })] = s1.as_slice() else {
+        return false;
+    };
+    if r1 != "redirect" {
+        return false;
+    }
+    let Some(IrExpr::Arrow(inner)) = rargs.first() else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: g1, args: gargs })] = inner.as_slice() else {
+        return false;
+    };
+    if !matches!(g1.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(gcmd, _), IrExpr::Array(gwords)] = gargs.as_slice() else { return false; };
+    if gcmd != "grep" {
+        return false;
+    }
+    let mut pat: Option<String> = None;
+    let mut i = 0;
+    while i < gwords.len() {
+        match &gwords[i] {
+            IrExpr::Str(sv, _) if sv == "-m" => {
+                i += 1;
+                if i >= gwords.len() {
+                    return false;
+                }
+                // count ignored — only the boolean matters
+                i += 1;
+            }
+            IrExpr::Str(sv, _) if sv.starts_with('-') => return false,
+            IrExpr::Str(sv, _) => {
+                if pat.is_some() {
+                    return false;
+                }
+                pat = Some(sv.clone());
+                i += 1;
+            }
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                if pat.is_some() {
+                    return false;
+                }
+                let t: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(x) => Some(x.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                pat = Some(t);
+                i += 1;
+            }
+            _ => return false,
+        }
+    }
+    let Some(pat) = pat else { return false; };
+    // both echoes literal
+    let literal_echo = |e: &IrExpr| -> Option<String> {
+        let IrExpr::Call { func, args } = e else { return None; };
+        if !matches!(func.as_str(), "builtin" | "exec") {
+            return None;
+        }
+        let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+            return None;
+        };
+        if cmd != "echo" {
+            return None;
+        }
+        let mut content: Option<String> = None;
+        for w in words {
+            match w {
+                IrExpr::Str(sv, _) if sv == "-e" || sv == "-E" || sv == "-n" => return None,
+                IrExpr::Str(sv, _) => {
+                    if content.is_some() {
+                        return None;
+                    }
+                    content = Some(sv.clone());
+                }
+                IrExpr::Interpolate(parts)
+                    if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+                {
+                    if content.is_some() {
+                        return None;
+                    }
+                    let t: String = parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            InterpPart::Lit(x) => Some(x.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    content = Some(t);
+                }
+                _ => return None,
+            }
+        }
+        content
+    };
+    let (Some(echo_a), Some(echo_b)) = (literal_echo(and_rhs), literal_echo(rhs)) else {
+        return false;
+    };
+    let vq = format!("${vname}");
+    let aq = crate::ir::safe_perl_q_string(&echo_a);
+    let bq = crate::ir::safe_perl_q_string(&echo_b);
+    let code = format!(
+        r#"do {{ if ({vq} =~ /{pat}/) {{ print STDOUT {aq}, "\n"; }} else {{ print STDOUT {bq}, "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+    );
     *st = IrStmt::RawText(code);
     true
 }
