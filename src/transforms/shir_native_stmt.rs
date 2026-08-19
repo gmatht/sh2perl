@@ -2180,7 +2180,7 @@ fn native_echo_stmt(st: &mut IrStmt) -> bool {
     let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
         return false;
     };
-    if cmd != "echo" {
+    if cmd != "echo" && cmd != "/bin/echo" && cmd != "/usr/bin/echo" {
         return false;
     }
     let literal_words: Option<Vec<String>> = words.iter().map(literal_text).collect();
@@ -2230,10 +2230,21 @@ fn native_echo_stmt(st: &mut IrStmt) -> bool {
     } else {
         // A direct getVar call is the quoted `$x` shape. The unquoted form
         // is represented by split(...) and is intentionally refused.
-        if !words.iter().all(is_quoted_echo_expr) {
-            return false;
+        // Leading option words (-e/-E/-n) are skipped.
+        let mut ws: Vec<IrExpr> = Vec::new();
+        for w in words {
+            if matches!(
+                w,
+                IrExpr::Str(sv, _) if sv == "-e" || sv == "-E" || sv == "-n"
+            ) {
+                continue;
+            }
+            if !is_quoted_echo_expr(w) {
+                return false;
+            }
+            ws.push(w.clone());
         }
-        words.to_vec()
+        ws
     };
 
     let mut value = IrExpr::Str(String::new(), StrStyle::DoubleQuoted);
@@ -2388,8 +2399,25 @@ fn native_printf_stmt(st: &mut IrStmt) -> bool {
 }
 
 fn is_quoted_echo_expr(e: &IrExpr) -> bool {
-    matches!(e, IrExpr::Call { func, args } if func == "getVar"
-        && matches!(args.as_slice(), [IrExpr::Str(_, _)]))
+    match e {
+        IrExpr::Call { func, args }
+            if func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(_, _)]) =>
+        {
+            true
+        }
+        // an Interpolate whose expr parts are all getVars is still
+        // quote-safe (`"hello @ARGV"` — no word splitting)
+        IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+            InterpPart::Lit(_) => true,
+            InterpPart::Expr(x) => matches!(
+                x.as_ref(),
+                IrExpr::Call { func, args }
+                    if func == "getVar" && matches!(args.as_slice(), [IrExpr::Str(_, _)])
+            ),
+            _ => false,
+        }),
+        _ => false,
+    }
 }
 
 /// Return text only when an expression is already a literal.  Interpolation
