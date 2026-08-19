@@ -157,7 +157,7 @@ fn transform_stmt(
             // fold (native_head_tail_pipeline) is the only rewrite.
             let _ = stages;
             let _ = lower_printf;
-            native_head_tail_pipeline(st)
+            native_head_tail_pipeline(st) | native_ls_dir_pipeline_stmt(st)
         }
         IrStmt::Expr(e) => {
             // A pipeline EXPRESSION (`printf … | sort`, `echo … | tr`, …):
@@ -181,7 +181,8 @@ fn transform_stmt(
                     | native_echo_tr_sort_stmt(st)
                     | native_literal_subshell_wc_stmt(st)
                     | native_find_stmt(st)
-                    | native_cat_heredoc_wc_stmt(st);
+                    | native_cat_heredoc_wc_stmt(st)
+                    | native_ls_dir_pipeline_stmt(st);
             }
             x |= native_echo_grep_stmt(st);
             x |= normalize_literal_exec_words(st);
@@ -205,6 +206,7 @@ fn transform_stmt(
             x |= native_find_stmt(st);
             x |= native_cat_heredoc_wc_stmt(st);
             x |= native_comm_stmt(st);
+            x |= native_ls_dir_pipeline_stmt(st);
             x |= native_ls_stmt(st);
             x |= native_rm_rf_stmt(st);
             x |= native_trap_stmt(st);
@@ -2918,20 +2920,31 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
 /// The target is a literal Str path, or a Var/Ident whose NAME is the
 /// literal filename (process-substitution temps like `__ps_tmp0`).
 fn native_echo_write_file_stmt(st: &mut IrStmt) -> bool {
-    let IrStmt::Redirect { inner, redirects } = st else { return false; };
-    let [r] = redirects.as_slice() else { return false; };
+    let IrStmt::Redirect { inner, redirects } = st else { eprintln!("DWF: not redirect {:?}", std::mem::discriminant(st)); return false; };
+    let [r] = redirects.as_slice() else { eprintln!("DWF: n redirects {}", redirects.len()); return false; };
     if r.fd.unwrap_or(1) != 1 {
+        eprintln!("DWF: fd {}", r.fd.unwrap_or(1));
         return false;
     }
     if !matches!(r.mode.as_str(), "w" | "wc") {
+        eprintln!("DWF: mode {:?}", r.mode);
         return false;
     }
+
     let out = match &r.target {
         IrExpr::Str(s, _) => crate::ir::safe_perl_q_string(s),
         IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
         _ => return false,
     };
-    let [IrStmt::Expr(IrExpr::Call { func, args })] = inner.as_slice() else { return false; };
+    // the inner stmt may arrive Block-wrapped
+    let inner_stmts: &Vec<IrStmt> = match inner.as_slice() {
+        [IrStmt::Expr(_)] => inner,
+        [IrStmt::Block(b)] => b,
+        _ => return false,
+    };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = inner_stmts.as_slice() else {
+        return false;
+    };
     if !matches!(func.as_str(), "exec" | "builtin") {
         return false;
     }
@@ -2975,6 +2988,7 @@ fn native_echo_write_file_stmt(st: &mut IrStmt) -> bool {
             }
         }
     } else if cmd == "printf" {
+        eprintln!("DWF: printf stmt");
         // printf FMT > FILE: exactly one literal format word, no args,
         // no %-directives (those need argument substitution)
         if words.len() != 1 {
@@ -2999,8 +3013,11 @@ fn native_echo_write_file_stmt(st: &mut IrStmt) -> bool {
     };
     let cq = crate::ir::safe_perl_q_string(&decoded);
         let nl = if newline { ", \"\\n\"" } else { "" };
+    static WF_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let wf = WF_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ofh = format!("__ofh{wf}");
     let code = format!(
-        "open(my $__ofh, '>', {out}) or die \"echo: {out}: $ERRNO\"; print $__ofh {cq}{nl}; close $__ofh; $main_exit_code = $CHILD_ERROR = 0;"
+        "open(my ${ofh}, '>', {out}) or die \"echo: {out}: $ERRNO\"; print ${ofh} {cq}{nl}; close ${ofh}; $main_exit_code = $CHILD_ERROR = 0;"
     );
     *st = IrStmt::RawText(code);
     true
@@ -5812,6 +5829,106 @@ fn native_subshell_eval_noop_stmt(st: &mut IrStmt) -> bool {
         return false;
     }
     *st = IrStmt::RawText("$main_exit_code = $CHILD_ERROR = 0;".to_string());
+    true
+}
+
+/// `ls [-1] | head -N` (perl-only): sorted current-directory listing,
+/// one per line, truncated to N.
+fn native_ls_dir_pipeline_stmt(st: &mut IrStmt) -> bool {
+    // the pipeline may be Expr(Call pipeline) or the older IrStmt::Pipeline
+    let (stage0, stage1): (IrExpr, IrExpr) = match st {
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
+            let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
+            if stages.len() != 2 {
+                return false;
+            }
+            (stages[0].clone(), stages[1].clone())
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            if stages.len() != 2 {
+                return false;
+            }
+            let s0 = match stages[0].as_slice() {
+                [IrStmt::Expr(e)] => e.clone(),
+                _ => return false,
+            };
+            let s1 = match stages[1].as_slice() {
+                [IrStmt::Expr(e)] => e.clone(),
+                _ => return false,
+            };
+            (s0, s1)
+        }
+        _ => return false,
+    };
+    // the stages may be Arrows (Expr pipeline) or direct Calls (IrStmt::Pipeline)
+    let call0: &IrExpr = match &stage0 {
+        IrExpr::Call { .. } => &stage0,
+        IrExpr::Arrow(body) => match body.as_slice() {
+            [IrStmt::Expr(e @ IrExpr::Call { .. })] => e,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let call1: &IrExpr = match &stage1 {
+        IrExpr::Call { .. } => &stage1,
+        IrExpr::Arrow(body) => match body.as_slice() {
+            [IrStmt::Expr(e @ IrExpr::Call { .. })] => e,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let IrExpr::Call { func: _, args: a0 } = call0 else { return false; };
+    let [IrExpr::Str(cmd0, _), IrExpr::Array(w0)] = a0.as_slice() else { return false; };
+    if cmd0 != "ls" {
+        return false;
+    }
+    for w in w0 {
+        if let IrExpr::Str(sv, _) = w {
+            if sv != "-1" && sv != "--" {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    let IrExpr::Call { func: _, args: a1 } = call1 else { return false; };
+    let [IrExpr::Str(cmd1, _), IrExpr::Array(w1)] = a1.as_slice() else { return false; };
+    let mut head_n: Option<usize> = None;
+    let mut wc_l = false;
+    if cmd1 == "head" && w1.len() == 1 {
+        let n: usize = match &w1[0] {
+            IrExpr::Str(sv, _) => {
+                let Some(v) = sv.strip_prefix('-') else { return false; };
+                let Ok(v) = v.parse() else { return false; };
+                v
+            }
+            _ => return false,
+        };
+        head_n = Some(n);
+    } else if cmd1 == "wc" && w1.len() == 1 {
+        let flag = match &w1[0] {
+            IrExpr::Str(sv, _) => sv.as_str(),
+            _ => return false,
+        };
+        if flag != "-l" {
+            return false;
+        }
+        wc_l = true;
+    } else {
+        return false;
+    }
+    if wc_l {
+        let code = format!(
+            r#"do {{ opendir(my $__h, '.') or return; my $__n = grep {{ !/^\.\.?$/ }} readdir($__h); closedir $__h; print STDOUT "$__n\n"; }}; $main_exit_code = $CHILD_ERROR = 0;"#
+        );
+        *st = IrStmt::RawText(code);
+        return true;
+    }
+    let n = head_n.unwrap_or(0);
+    let code = format!(
+        r#"do {{ opendir(my $__h, '.') or return; my @__l = sort grep {{ !/^\.\.?$/ }} readdir($__h); closedir $__h; splice(@__l, {n}) if @__l > {n}; if (@__l) {{ print STDOUT join("\n", @__l), "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+    );
+    *st = IrStmt::RawText(code);
     true
 }
 
