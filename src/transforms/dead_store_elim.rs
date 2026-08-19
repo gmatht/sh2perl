@@ -485,6 +485,19 @@ fn census_expr(
                     reads.insert(n.clone());
                 }
             }
+            // a $name reference inside ANY string argument is a read —
+            // the `test` operands (`[ "$x" -gt "$y" ]`) and the slice
+            // start (`${s:$i:1}` → Str("$i")) carry $vars in Str nodes,
+            // invisible to the walk above. Without this, DSE judged
+            // `RD_VR=16000` / `sm_tex_total=15` (constants read ONLY
+            // inside test brackets) dead and dropped them — the culling
+            // compared against 0 (blocks culled), the texture menu loops
+            // ran zero iterations (no preload, no thumbnails).
+            for a in args {
+                if let IrExpr::Str(s, _) = a {
+                    string_read_names(s, reads);
+                }
+            }
             for a in args {
                 census_expr(a, reads, writes, escapes, escaping);
             }
@@ -516,6 +529,43 @@ fn census_expr(
             }
         }
         _ => {}
+    }
+}
+
+/// Insert every bare `$name` / `${name}` reference in `s` into `reads`.
+/// (The `test` operands `[ "$x" -gt "$y" ]` and the slice start
+/// `${s:$i:1}` carry $vars inside Str nodes — a Str is opaque to the
+/// census walk, so they must be decoded here.)
+fn string_read_names(s: &str, reads: &mut HashSet<String>) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '$' && i + 1 < bytes.len() {
+            let start = i + 1;
+            let mut j = start;
+            if bytes[j] == b'{' {
+                j += 1;
+                let w = j;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'}' {
+                    if j > w { reads.insert(String::from_utf8_lossy(&bytes[w..j]).into_owned()); }
+                    i = j + 1;
+                    continue;
+                }
+            }
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j > start { reads.insert(String::from_utf8_lossy(&bytes[start..j]).into_owned()); }
+            i = j;
+        } else {
+            i += 1;
+        }
     }
 }
 
