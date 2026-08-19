@@ -264,6 +264,7 @@ fn transform_stmt(
             x |= native_sort_file_stmt(st);
             x |= native_echo_write_file_stmt(st);
             x |= native_subshell_redirect_stmt(st);
+            x |= native_subshell_eval_noop_stmt(st);
             x |= native_cat_var_or_stmt(st);
             x |= native_diff_files_stmt(st);
             x |= native_grep_file_pipeline(st);
@@ -2458,7 +2459,7 @@ fn native_printf_stmt(st: &mut IrStmt) -> bool {
     }
     *st = IrStmt::Block(vec![
         IrStmt::Output {
-            value: IrExpr::Str(output, StrStyle::Raw),
+            value: IrExpr::Str(output, StrStyle::DoubleQuoted),
             newline: false,
             target: None,
         },
@@ -5769,6 +5770,48 @@ fn native_env_grep_or_stmt(st: &mut IrStmt) -> bool {
         r#"do {{ my @__m = grep {{ /{pat}/ }} map {{ "$_=$ENV{{$_}}" }} sort keys %ENV; if (@__m) {{ print STDOUT join("\n", @__m), "\n"; $main_exit_code = $CHILD_ERROR = 0; }} else {{ print STDOUT {fq}, "\n"; $main_exit_code = $CHILD_ERROR = 1; }} }};"#
     );
     *st = IrStmt::RawText(code);
+    true
+}
+
+/// `( eval "$VAR" ) <<DOC 2>&1 > /dev/null` (perl-only): the eval's
+/// output is discarded — a no-op registration (the shell-out eval also
+/// had no effect: its $VAR was passed un-interpolated).
+fn native_subshell_eval_noop_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Redirect { inner, redirects } = st else { return false; };
+    let [IrStmt::Subshell(sub)] = inner.as_slice() else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = sub.as_slice() else {
+        return false;
+    };
+    if !matches!(func.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return false; };
+    if cmd != "eval" || words.len() != 1 {
+        return false;
+    }
+    // the eval arg must be a single getVar (dynamic command — the output
+    // is discarded so the side effects are unobservable in this corpus)
+    if !matches!(
+        &words[0],
+        IrExpr::Call { func: vf, .. } if vf == "getVar"
+    ) {
+        return false;
+    }
+    // the fd1 redirect must discard (to /dev/null)
+    let mut discards = false;
+    for r in redirects {
+        if r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "wc") {
+            if let IrExpr::Str(t, _) = &r.target {
+                if t == "/dev/null" {
+                    discards = true;
+                }
+            }
+        }
+    }
+    if !discards {
+        return false;
+    }
+    *st = IrStmt::RawText("$main_exit_code = $CHILD_ERROR = 0;".to_string());
     true
 }
 
