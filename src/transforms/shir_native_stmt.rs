@@ -103,6 +103,7 @@ fn transform_stmt(
             else_,
         } => {
             let mut x = native_if_test_cond(st);
+            x |= native_command_noop_cond(st);
             let IrStmt::If {
                 cond,
                 then,
@@ -5596,6 +5597,39 @@ fn native_cat_var_or_stmt(st: &mut IrStmt) -> bool {
         r#"do {{ if (open(my $__fh, '<', {path})) {{ local $/; my $__c = <$__fh>; close $__fh; print STDOUT $__c; }} else {{ print STDOUT {fq}, "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
     );
     *st = IrStmt::RawText(code);
+    true
+}
+
+/// `! command <'' >''` (perl-only): a no-argument `command` builtin whose
+/// redirect targets are empty strings always fails (rc 1); a Not-wrapped
+/// cond is therefore always true. Rewrite the cond to a constant.
+fn native_command_noop_cond(st: &mut IrStmt) -> bool {
+    let IrStmt::If { cond, .. } = st else { return false; };
+    let (not_wrapped, redirect): (bool, IrExpr) = match &*cond {
+        IrExpr::BinOp {
+            op: BinOpKind::Not,
+            lhs,
+            ..
+        } => (true, (**lhs).clone()),
+        other => (false, (*other).clone()),
+    };
+    let IrExpr::Call { func, args } = &redirect else { return false; };
+    if func != "redirect" {
+        return false;
+    }
+    let Some(IrExpr::Arrow(inner)) = args.first() else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: cf, args: cargs })] = inner.as_slice() else {
+        return false;
+    };
+    if !matches!(cf.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = cargs.as_slice() else { return false; };
+    if cmd != "command" || !words.is_empty() {
+        return false;
+    }
+    // the command fails -> rc 1; Not inverts it
+    *cond = IrExpr::Bool(not_wrapped);
     true
 }
 
