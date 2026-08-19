@@ -37,17 +37,152 @@ use std::collections::HashSet;
 
 use crate::ir::{ArithAst, IrExpr, IrStmt};
 
+/// Is a Call a dynamic write (eval/source/.)? The A1 carries these as
+/// `builtin("eval", …)` / `exec("eval", …)` — the command name is
+/// args[0], not the func.
+fn is_dynamic_write_call(func: &str, args: &[IrExpr]) -> bool {
+    if matches!(func, "eval" | "source" | ".") {
+        return true;
+    }
+    if matches!(func, "builtin" | "exec") {
+        if let Some(IrExpr::Str(cmd, _)) = args.first() {
+            if matches!(cmd.as_str(), "eval" | "source" | ".") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Does the program contain a dynamic write (eval/source/.)? Such a
+/// call can write ANY variable, so the const analysis classifies every
+/// var Var — removing any store would change the verdicts. Skip the
+/// whole transform.
+fn has_dynamic_write(stmts: &[IrStmt]) -> bool {
+    fn walk_stmt(st: &IrStmt) -> bool {
+        match st {
+            IrStmt::Expr(IrExpr::Call { func, args }) => {
+                if is_dynamic_write_call(func, args) {
+                    return true;
+                }
+                args.iter().any(walk_expr)
+            }
+            IrStmt::Assign { targets, expr, .. } => {
+                targets.iter().any(|t| t.indices.iter().any(walk_expr)) || walk_expr(expr)
+            }
+            IrStmt::Declare { init, .. } => init.as_ref().map(walk_expr).unwrap_or(false),
+            IrStmt::DeclareArray { elements, .. } => elements.iter().any(walk_expr),
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                walk_expr(cond)
+                    || then.iter().any(walk_stmt)
+                    || elsifs.iter().any(|(_, b)| b.iter().any(walk_stmt))
+                    || else_.iter().any(walk_stmt)
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { body, cond, .. } => {
+                walk_expr(cond) || body.iter().any(walk_stmt)
+            }
+            IrStmt::For { iter, body, .. } => walk_expr(iter) || body.iter().any(walk_stmt),
+            IrStmt::ForInit { init, cond, step, body, .. } => {
+                init.iter().any(walk_stmt)
+                    || walk_expr(cond)
+                    || step.iter().any(walk_stmt)
+                    || body.iter().any(walk_stmt)
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                walk_expr(discriminant) || clauses.iter().any(|c| c.body.iter().any(walk_stmt))
+            }
+            IrStmt::Function { body, .. } | IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                body.iter().any(walk_stmt)
+            }
+            IrStmt::Pipeline { stages, .. } => stages.iter().any(|st| st.iter().any(walk_stmt)),
+            IrStmt::Redirect { inner, .. } => inner.iter().any(walk_stmt),
+            IrStmt::Expr(e) => walk_expr(e),
+            IrStmt::Output { value, .. } => walk_expr(value),
+            IrStmt::WriteFile { path, content, .. } => walk_expr(path) || walk_expr(content),
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) | IrStmt::SetChildError(e) | IrStmt::Die { expr: e, .. } | IrStmt::Warn { expr: e, .. } => walk_expr(e),
+            _ => false,
+        }
+    }
+    fn walk_expr(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Arrow(stmts) | IrExpr::Lambda { body: stmts, .. } => stmts.iter().any(walk_stmt),
+            IrExpr::Call { func, args } => {
+                if is_dynamic_write_call(func, args) {
+                    return true;
+                }
+                args.iter().any(walk_expr)
+            }
+            IrExpr::Array(items) => items.iter().any(walk_expr),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| matches!(p, crate::ir::InterpPart::Expr(x) if walk_expr(x))),
+            IrExpr::BinOp { lhs, rhs, .. } => walk_expr(lhs) || walk_expr(rhs),
+            IrExpr::Ternary { cond, then, else_, .. } => walk_expr(cond) || walk_expr(then) || walk_expr(else_),
+            IrExpr::DefinedOr { expr, default } => walk_expr(expr) || walk_expr(default),
+            IrExpr::Capture { expr, .. } => walk_expr(expr),
+            IrExpr::Index { key, .. } => walk_expr(key),
+            IrExpr::MethodCall { obj, args, .. } => walk_expr(obj) || args.iter().any(walk_expr),
+            IrExpr::Object(props) => props.iter().any(|(_, v)| walk_expr(v)),
+            IrExpr::ArrayComp { iter, elem, cond, .. } => walk_expr(iter) || walk_expr(elem) || cond.as_ref().map(|c| walk_expr(c)).unwrap_or(false),
+            IrExpr::Splice(inner) => walk_expr(inner),
+            IrExpr::Arith(ast) => walk_arith(ast),
+            _ => false,
+        }
+    }
+    fn walk_arith(ast: &ArithAst) -> bool {
+        match ast {
+            ArithAst::Bin { lhs, rhs, .. } => walk_arith(lhs) || walk_arith(rhs),
+            ArithAst::Un { arg, .. } => walk_arith(arg),
+            ArithAst::Cond { test, then, else_, .. } => walk_arith(test) || walk_arith(then) || walk_arith(else_),
+            ArithAst::Assign { rhs, .. } => walk_arith(rhs),
+            ArithAst::Index { key, .. } => walk_arith(key),
+            ArithAst::Cast { arg, .. } => walk_arith(arg),
+            _ => false,
+        }
+    }
+    stmts.iter().any(walk_stmt)
+}
+
 /// Apply the transform. Returns whether anything changed.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
+    if has_dynamic_write(stmts) {
+        return false;
+    }
     let mut reads: HashSet<String> = HashSet::new();
     let mut writes: HashSet<String> = HashSet::new();
     let mut escapes: HashSet<String> = HashSet::new();
     census(stmts, &mut reads, &mut writes, &mut escapes);
 
+    // Only remove stores for CONST variables (single assignment site,
+    // never changed) that are never read. The const analysis
+    // (analyze_var_const) classifies a var Var when it is multi-assigned,
+    // written by a runtime store, in a function body, or under eval —
+    // those stores MUST survive (the analysis needs to see them to
+    // produce the Var verdict). Removing a Const var's single dead store
+    // is the mimecroft win (the per-function *_tmp / g_* scratch).
+    let consts: HashSet<String> = crate::shir::analyze_var_const(&crate::ir::IrProgram {
+        imports: vec![],
+        requires: vec![],
+        stmts: stmts.clone(),
+        subs: vec![],
+        var_types: vec![],
+        stmt_lines: vec![],
+        var_lengths: vec![],
+        var_const: vec![],
+        var_lifetimes: vec![],
+        var_nospace: vec![],
+        var_bash_env: vec![],
+    })
+    .into_iter()
+    .filter(|(_, k)| matches!(k, crate::ir::VarKind::Const))
+    .map(|(n, _)| n)
+    .collect();
+
     let dead: Vec<String> = writes
         .iter()
         .filter(|v| {
             if reads.contains(*v) || escapes.contains(*v) {
+                return false;
+            }
+            if !consts.contains(*v) {
                 return false;
             }
             if let Some(pos) = v.find('[') {
@@ -66,6 +201,130 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     let before = stmts.len();
     *stmts = stmts.drain(..).filter_map(|s| purge(s, &dead)).collect();
     stmts.len() != before
+}
+
+/// Count how many times each variable is WRITTEN (Assign targets,
+/// Declare vars, DeclareArray var, setVar calls). The const analysis
+/// needs the multiplicity — a var assigned twice is Var, once is Const.
+fn count_writes(stmts: &[IrStmt]) -> std::collections::HashMap<String, usize> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    fn bump(counts: &mut std::collections::HashMap<String, usize>, name: &str) {
+        *counts.entry(name.to_string()).or_insert(0) += 1;
+    }
+    fn walk_stmt(st: &IrStmt, counts: &mut std::collections::HashMap<String, usize>) {
+        match st {
+            IrStmt::Assign { targets, expr, .. } => {
+                for t in targets {
+                    bump(counts, &t.var);
+                }
+                walk_expr(expr, counts);
+            }
+            IrStmt::Declare { vars, init, .. } => {
+                for v in vars {
+                    bump(counts, &v.name);
+                }
+                if let Some(i) = init {
+                    walk_expr(i, counts);
+                }
+            }
+            IrStmt::DeclareArray { var, elements, .. } => {
+                bump(counts, var);
+                for e in elements {
+                    walk_expr(e, counts);
+                }
+            }
+            IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" => {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    bump(counts, n);
+                }
+                for a in args {
+                    walk_expr(a, counts);
+                }
+            }
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                walk_expr(cond, counts);
+                for b in then { walk_stmt(b, counts); }
+                for (_, b) in elsifs { for s in b { walk_stmt(s, counts); } }
+                for b in else_ { walk_stmt(b, counts); }
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { body, cond, .. } => {
+                walk_expr(cond, counts);
+                for b in body { walk_stmt(b, counts); }
+            }
+            IrStmt::For { var, iter, body, .. } => {
+                bump(counts, var);
+                walk_expr(iter, counts);
+                for b in body { walk_stmt(b, counts); }
+            }
+            IrStmt::ForInit { init, cond, step, body, .. } => {
+                for b in init { walk_stmt(b, counts); }
+                walk_expr(cond, counts);
+                for b in step { walk_stmt(b, counts); }
+                for b in body { walk_stmt(b, counts); }
+            }
+            IrStmt::Case { discriminant, clauses, .. } => {
+                walk_expr(discriminant, counts);
+                for c in clauses { for b in &c.body { walk_stmt(b, counts); } }
+            }
+            IrStmt::Function { body, .. } | IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                for b in body { walk_stmt(b, counts); }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for stage in stages { for b in stage { walk_stmt(b, counts); } }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for b in inner { walk_stmt(b, counts); }
+            }
+            IrStmt::Expr(e) => walk_expr(e, counts),
+            IrStmt::Output { value, .. } => walk_expr(value, counts),
+            IrStmt::WriteFile { path, content, .. } => {
+                walk_expr(path, counts);
+                walk_expr(content, counts);
+            }
+            IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) | IrStmt::SetChildError(e) | IrStmt::Die { expr: e, .. } | IrStmt::Warn { expr: e, .. } => walk_expr(e, counts),
+            _ => {}
+        }
+    }
+    fn walk_expr(e: &IrExpr, counts: &mut std::collections::HashMap<String, usize>) {
+        match e {
+            IrExpr::Arrow(stmts) | IrExpr::Lambda { body: stmts, .. } => {
+                for s in stmts { walk_stmt(s, counts); }
+            }
+            IrExpr::Call { args, .. } => {
+                for a in args { walk_expr(a, counts); }
+            }
+            IrExpr::Array(items) => { for i in items { walk_expr(i, counts); } }
+            IrExpr::Interpolate(parts) => {
+                for p in parts { if let crate::ir::InterpPart::Expr(x) = p { walk_expr(x, counts); } }
+            }
+            IrExpr::BinOp { lhs, rhs, .. } => { walk_expr(lhs, counts); walk_expr(rhs, counts); }
+            IrExpr::Ternary { cond, then, else_, .. } => { walk_expr(cond, counts); walk_expr(then, counts); walk_expr(else_, counts); }
+            IrExpr::DefinedOr { expr, default } => { walk_expr(expr, counts); walk_expr(default, counts); }
+            IrExpr::Capture { expr, .. } => walk_expr(expr, counts),
+            IrExpr::Index { key, .. } => walk_expr(key, counts),
+            IrExpr::MethodCall { obj, args, .. } => { walk_expr(obj, counts); for a in args { walk_expr(a, counts); } }
+            IrExpr::Object(props) => { for (_, v) in props { walk_expr(v, counts); } }
+            IrExpr::ArrayComp { iter, elem, cond, .. } => { walk_expr(iter, counts); walk_expr(elem, counts); if let Some(c) = cond { walk_expr(c, counts); } }
+            IrExpr::Splice(inner) => walk_expr(inner, counts),
+            IrExpr::Arith(ast) => walk_arith(ast, counts),
+            _ => {}
+        }
+    }
+    fn walk_arith(ast: &ArithAst, counts: &mut std::collections::HashMap<String, usize>) {
+        match ast {
+            ArithAst::Bin { lhs, rhs, .. } => { walk_arith(lhs, counts); walk_arith(rhs, counts); }
+            ArithAst::Un { arg, .. } => walk_arith(arg, counts),
+            ArithAst::Cond { test, then, else_, .. } => { walk_arith(test, counts); walk_arith(then, counts); walk_arith(else_, counts); }
+            ArithAst::Assign { rhs, .. } => walk_arith(rhs, counts),
+            ArithAst::Index { key, .. } => walk_arith(key, counts),
+            ArithAst::Cast { arg, .. } => walk_arith(arg, counts),
+            _ => {}
+        }
+    }
+    for st in stmts {
+        walk_stmt(st, &mut counts);
+    }
+    counts
 }
 
 fn census(stmts: &[IrStmt], reads: &mut HashSet<String>, writes: &mut HashSet<String>, escapes: &mut HashSet<String>) {
@@ -171,8 +430,11 @@ fn census_stmt(
             }
         }
         IrStmt::Function { body, .. } => {
+            // function writes are multi-run (the const analysis marks
+            // them Var) — treat them as escaping so they are never
+            // dead-eliminated
             for s in body {
-                census_stmt(s, reads, writes, escapes, escaping);
+                census_stmt(s, reads, writes, escapes, true);
             }
         }
         IrStmt::Subshell(v) | IrStmt::Background(v) => {
