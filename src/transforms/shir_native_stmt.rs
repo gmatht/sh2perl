@@ -168,7 +168,8 @@ fn transform_stmt(
                     | native_echo_grep_stmt(st)
                     | native_echo_bc_stmt(st)
                     | native_grep_file_pipeline(st)
-                    | native_echo_filter_stmt(st);
+                    | native_echo_filter_stmt(st)
+                    | native_echo_xargs_stmt(st);
             }
             x |= native_echo_grep_stmt(st);
             x |= normalize_literal_exec_words(st);
@@ -182,6 +183,7 @@ fn transform_stmt(
             x |= native_test_chain(st);
             x |= native_echo_or_chain(st);
             x |= native_echo_grep_test_chain(st);
+            x |= native_echo_xargs_stmt(st);
             x |= native_ls_stmt(st);
             x |= native_trap_stmt(st);
             x |= native_head_tail_stmt(st);
@@ -4101,6 +4103,105 @@ fn native_trap_stmt(st: &mut IrStmt) -> bool {
         // a throwaway bash, so it has no effect on this perl process either)
         _ => "$main_exit_code = $CHILD_ERROR = 0;".to_string(),
     };
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `echo LIT | xargs -0 [--no-run-if-empty] echo ARGS...` (perl-only):
+/// the echo output (no NUL bytes) is a single xargs item (with its
+/// trailing newline); the command runs once with the item appended.
+fn native_echo_xargs_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
+    if func != "pipeline" {
+        return false;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
+    if stages.len() != 2 {
+        return false;
+    }
+    // stage 0: literal echo
+    let IrExpr::Arrow(s0) = &stages[0] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: _, args: a0 })] = s0.as_slice() else {
+        return false;
+    };
+    let [IrExpr::Str(cmd0, _), IrExpr::Array(w0)] = a0.as_slice() else { return false; };
+    if cmd0 != "echo" {
+        return false;
+    }
+    let mut content: Option<String> = None;
+    for w in w0 {
+        match w {
+            IrExpr::Str(sv, _) if sv == "-e" || sv == "-E" || sv == "-n" => return false,
+            IrExpr::Str(sv, _) => {
+                if content.is_some() {
+                    return false;
+                }
+                content = Some(sv.clone());
+            }
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                if content.is_some() {
+                    return false;
+                }
+                let t: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(x) => Some(x.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                content = Some(t);
+            }
+            _ => return false,
+        }
+    }
+    let Some(content) = content else { return false; };
+    // stage 1: xargs flags, then the command (must be echo)
+    let IrExpr::Arrow(s1) = &stages[1] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return false;
+    };
+    if !matches!(f1.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd1, _), IrExpr::Array(w1)] = a1.as_slice() else { return false; };
+    if cmd1 != "xargs" {
+        return false;
+    }
+    let mut cmd_words: Vec<String> = Vec::new();
+    for w in w1 {
+        match w {
+            IrExpr::Str(sv, _) if sv == "-0" => continue,
+            IrExpr::Str(sv, _) if sv == "--no-run-if-empty" || sv == "-r" => continue,
+            IrExpr::Str(sv, _) => cmd_words.push(sv.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                let t: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(x) => Some(x.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                cmd_words.push(t);
+            }
+            _ => return false,
+        }
+    }
+    if cmd_words.is_empty() || cmd_words[0] != "echo" {
+        return false;
+    }
+    let lq = crate::ir::safe_perl_q_string(&content);
+    let argq: Vec<String> = cmd_words[1..]
+        .iter()
+        .map(|a| crate::ir::safe_perl_q_string(a))
+        .collect();
+    let joined = argq.join(", ");
+    let code = format!(
+        r#"do {{ my $__it = {lq} . "\n"; if (length($__it)) {{ print STDOUT join(' ', {joined}), " ", $__it, "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+    );
     *st = IrStmt::RawText(code);
     true
 }
