@@ -179,7 +179,8 @@ fn transform_stmt(
                     | native_echo_xargs_stmt(st)
                     | native_echo_tr_sort_stmt(st)
                     | native_literal_subshell_wc_stmt(st)
-                    | native_find_stmt(st);
+                    | native_find_stmt(st)
+                    | native_cat_heredoc_wc_stmt(st);
             }
             x |= native_echo_grep_stmt(st);
             x |= normalize_literal_exec_words(st);
@@ -199,6 +200,7 @@ fn transform_stmt(
             x |= native_echo_tr_sort_stmt(st);
             x |= native_literal_subshell_wc_stmt(st);
             x |= native_find_stmt(st);
+            x |= native_cat_heredoc_wc_stmt(st);
             x |= native_ls_stmt(st);
             x |= native_rm_rf_stmt(st);
             x |= native_trap_stmt(st);
@@ -5292,6 +5294,103 @@ fn native_find_stmt(st: &mut IrStmt) -> bool {
     };
     let code = format!(
         r#"do {{ my @__out; my $__walk; $__walk = sub {{ my ($__d) = @_; opendir(my $__h, $__d) or return; my @__e = readdir($__h); closedir $__h; for my $__e (@__e) {{ next if $__e eq '.' || $__e eq '..'; my $__p = "$__d/$__e"; {matcher} }} }}; $__walk->({dq});{head} if (@__out) {{ print STDOUT join("\n", @__out), "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+    );
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `( cat <<'DOC' … ) | wc -l` (perl-only): the cat heredoc content is
+/// literal — fold to the line count (number of newlines).
+fn native_cat_heredoc_wc_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
+    if func != "pipeline" {
+        return false;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
+    if stages.len() != 2 {
+        return false;
+    }
+    // stage 0: Arrow([Subshell([Expr(Call redirect [Arrow([Expr(exec cat [])]),
+    //   [Object(fd 0, heredoc, content)])])])
+    let IrExpr::Arrow(s0) = &stages[0] else { return false; };
+    let [IrStmt::Subshell(sub)] = s0.as_slice() else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: rf, args: rargs })] = sub.as_slice() else {
+        return false;
+    };
+    if rf != "redirect" {
+        return false;
+    }
+    let Some(IrExpr::Arrow(inner)) = rargs.first() else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: cf, args: cargs })] = inner.as_slice() else {
+        return false;
+    };
+    if !matches!(cf.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = cargs.as_slice() else { return false; };
+    if cmd != "cat" || !words.is_empty() {
+        return false;
+    }
+    let mut content: Option<String> = None;
+    for spec in rargs.iter().skip(1) {
+        let obj = match spec {
+            IrExpr::Object(fields) => Some(fields),
+            IrExpr::Array(elems) => match elems.first() {
+                Some(IrExpr::Object(fields)) => Some(fields),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(fields) = obj else { return false; };
+        let mut fd = 0;
+        let mut mode = String::new();
+        for (k, v) in fields {
+            if k == "fd" {
+                if let IrExpr::Int(n) = v {
+                    fd = *n as i32;
+                }
+            }
+            if k == "mode" {
+                if let IrExpr::Str(m, _) = v {
+                    mode = m.clone();
+                }
+            }
+            if k == "target" {
+                if let IrExpr::Str(t, _) = v {
+                    content = Some(t.clone());
+                }
+            }
+        }
+        if fd != 0 || mode != "heredoc" {
+            return false;
+        }
+    }
+    let Some(content) = content else { return false; };
+    // stage 1: wc -l
+    let IrExpr::Arrow(s1) = &stages[1] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: wf, args: wargs })] = s1.as_slice() else {
+        return false;
+    };
+    if !matches!(wf.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(wcmd, _), IrExpr::Array(wwords)] = wargs.as_slice() else {
+        return false;
+    };
+    if wcmd != "wc" || wwords.len() != 1 {
+        return false;
+    }
+    let flag = match &wwords[0] {
+        IrExpr::Str(sv, _) => sv.as_str(),
+        _ => return false,
+    };
+    if flag != "-l" {
+        return false;
+    }
+    let count = content.matches('\n').count();
+    let code = format!(
+        "print {cq}, \"\\n\"; $main_exit_code = $CHILD_ERROR = 0;",
+        cq = crate::ir::safe_perl_q_string(&count.to_string())
     );
     *st = IrStmt::RawText(code);
     true
