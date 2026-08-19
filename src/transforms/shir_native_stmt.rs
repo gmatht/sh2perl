@@ -167,7 +167,8 @@ fn transform_stmt(
                 return x
                     | native_echo_grep_stmt(st)
                     | native_echo_bc_stmt(st)
-                    | native_grep_file_pipeline(st);
+                    | native_grep_file_pipeline(st)
+                    | native_echo_filter_stmt(st);
             }
             x |= normalize_literal_exec_words(st);
             x |= native_declare_typeset_stmt(st);
@@ -237,6 +238,7 @@ fn transform_stmt(
             x |= native_grep_file_pipeline(st);
             x |= native_echo_grep_stmt(st);
             x |= native_echo_bc_stmt(st);
+            x |= native_echo_filter_stmt(st);
             x |= native_cat_heredoc_writefile(st);
             x |= native_grep_herestring(st);
             x |= native_grep_o_herestring(st);
@@ -3457,6 +3459,205 @@ fn native_ls_stmt(st: &mut IrStmt) -> bool {
     } else {
         code.push_str("$main_exit_code = $CHILD_ERROR = 0;");
     }
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `echo [-e] LIT | CMD` (perl-only) for the simple literal consumers:
+/// `head [-n] N` (first N lines), `sed [-r|-E] 's/PAT/REPL/[g]'` (perl
+/// regex substitution), and `perl -ne 'SCRIPT'` (run the one-liner over
+/// each line with $_ set). The echo content is decoded (-e escapes).
+fn native_echo_filter_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
+    if func != "pipeline" {
+        return false;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
+    if stages.len() != 2 {
+        return false;
+    }
+    // stage 0: literal echo
+    let IrExpr::Arrow(s0) = &stages[0] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: _, args: a0 })] = s0.as_slice() else {
+        return false;
+    };
+    let [IrExpr::Str(cmd0, _), IrExpr::Array(w0)] = a0.as_slice() else { return false; };
+    if cmd0 != "echo" {
+        return false;
+    }
+    let mut content: Option<String> = None;
+    let mut escapes = false;
+    for w in w0 {
+        match w {
+            IrExpr::Str(sv, _) if sv == "-e" => escapes = true,
+            IrExpr::Str(sv, _) if sv == "-E" => escapes = false,
+            IrExpr::Str(sv, _) if sv == "-n" => return false,
+            IrExpr::Str(sv, _) => {
+                if content.is_some() {
+                    return false;
+                }
+                content = Some(sv.clone());
+            }
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                if content.is_some() {
+                    return false;
+                }
+                let t: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(x) => Some(x.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                content = Some(t);
+            }
+            _ => return false,
+        }
+    }
+    let Some(content) = content else { return false; };
+    let content = if escapes {
+        let Some(d) = decode_echo_escapes(&content) else { return false; };
+        d
+    } else {
+        content
+    };
+    let cq = crate::ir::safe_perl_q_string(&content);
+    // stage 1: the consumer
+    let IrExpr::Arrow(s1) = &stages[1] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return false;
+    };
+    if !matches!(f1.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd1, _), IrExpr::Array(w1)] = a1.as_slice() else { return false; };
+    let word_text = |w: &IrExpr| -> Option<String> {
+        match w {
+            IrExpr::Str(sv, _) => Some(sv.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                Some(
+                    parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            InterpPart::Lit(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    };
+    let mut code = match cmd1.as_str() {
+        "head" => {
+            // head [-n] N — print the first N lines of the content
+            let mut n: usize = 10;
+            let mut i = 0;
+            while i < w1.len() {
+                let Some(t) = word_text(&w1[i]) else { return false; };
+                if t == "-n" {
+                    i += 1;
+                    if i >= w1.len() {
+                        return false;
+                    }
+                    let Some(t2) = word_text(&w1[i]) else { return false; };
+                    let Ok(v) = t2.parse() else { return false; };
+                    n = v;
+                } else if t.starts_with('-') && t[1..].chars().all(|c| c.is_ascii_digit()) {
+                    let Ok(v) = t[1..].parse() else { return false; };
+                    n = v;
+                } else {
+                    return false;
+                }
+                i += 1;
+            }
+            if n == 0 || n > 100000 {
+                return false;
+            }
+            format!(
+                r#"do {{ my @__h = split(/\n/, {cq}, -1); pop @__h if @__h && $__h[-1] eq q{{}}; splice(@__h, {n}) if @__h > {n}; if (@__h) {{ print STDOUT join("\n", @__h), "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+            )
+        }
+        "sed" => {
+            // sed [-r|-E] 's/PAT/REPL/[g]' — one s/// command, literal script
+            let mut script: Option<String> = None;
+            for w in w1 {
+                let Some(t) = word_text(w) else { return false; };
+                if t == "-r" || t == "-E" {
+                    continue;
+                }
+                if script.is_some() {
+                    return false;
+                }
+                script = Some(t);
+            }
+            let Some(sc) = script else { return false; };
+            let sc = sc.trim();
+            if !sc.starts_with('s') {
+                return false;
+            }
+            let Some(&delim_b) = sc.as_bytes().get(1) else { return false; };
+            let delim = delim_b as char;
+            // s<delim>PAT<delim>REPL<delim>[flags]
+            let rest = &sc[2..];
+            let mut parts = rest.split(delim as char);
+            let (Some(pat), Some(repl)) = (parts.next(), parts.next()) else {
+                return false;
+            };
+            let flags = parts.next().unwrap_or("");
+            let mut global = false;
+            for ch in flags.chars() {
+                match ch {
+                    'g' => global = true,
+                    'p' | 'n' => return false, // print suppression: skip
+                    _ => return false,
+                }
+            }
+            // replacement must be plain text (& and \N backrefs refused)
+            if repl.contains('&') || repl.contains('\\') {
+                return false;
+            }
+            let g = if global { "g" } else { "" };
+            // guard: PAT must be a valid perl regex (refuse { in PAT which
+            // would clash with the s{} delimiter)
+            if pat.contains('{') || pat.contains('}') {
+                return false;
+            }
+            format!(
+                r#"do {{ my $__x = {cq}; $__x =~ s{{{pat}}}{{{repl}}}{g}; print STDOUT $__x, "\n"; }}; $main_exit_code = $CHILD_ERROR = 0;"#
+            )
+        }
+        "perl" => {
+            // perl -ne 'SCRIPT' — run the one-liner per line with $_ set
+            let mut script: Option<String> = None;
+            let mut i = 0;
+            while i < w1.len() {
+                let Some(t) = word_text(&w1[i]) else { return false; };
+                if t == "-ne" || t == "-n" || t == "-e" {
+                    i += 1;
+                    continue;
+                }
+                if script.is_some() {
+                    return false;
+                }
+                script = Some(t);
+                i += 1;
+            }
+            let Some(sc) = script else { return false; };
+            if sc.contains("<>") || sc.contains("$_ =") {
+                return false;
+            }
+            format!(
+                r#"do {{ my @__l = split(/\n/, {cq}, -1); pop @__l if @__l && $__l[-1] eq q{{}}; for my $__l (@__l) {{ local $_ = $__l . "\n"; {sc} }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+            )
+        }
+        _ => return false,
+    };
+    let _ = &mut code;
     *st = IrStmt::RawText(code);
     true
 }
