@@ -155,13 +155,15 @@ fn expr_reads(e: &IrExpr, var: &str) -> bool {
         IrExpr::BinOp { lhs, rhs, .. } => expr_reads(lhs, var) || expr_reads(rhs, var),
         IrExpr::Arith(a) => arith_reads(a, var),
         IrExpr::Call { func, args } => {
-            // param(op, name, …) reads name (args[1]) — same rule as
-            // dead_store_elim and shir_passes::expr_reads (go-sh-20260816-164300)
+            // param(op, name, …) reads name (args[1])
             if func == "param" {
                 if let Some(IrExpr::Str(n, _)) = args.get(1) {
-                    if n == var {
-                        return true;
-                    }
+                    if n == var { return true; }
+                }
+            // getVar/listVar/arrayItems/arrayLen/arrayIndex read name (args[0])
+            } else if matches!(func.as_str(), "getVar" | "listVar" | "arrayItems" | "arrayLen" | "arrayIndex") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if n == var { return true; }
                 }
             }
             args.iter().any(|a| expr_reads(a, var))
@@ -243,6 +245,11 @@ fn read_set_into(e: &IrExpr, out: &mut HashSet<String>) {
             // param(op, name, …) reads name (args[1])
             if func == "param" {
                 if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                    out.insert(n.clone());
+                }
+            // getVar/listVar/arrayItems/arrayLen/arrayIndex read name (args[0])
+            } else if matches!(func.as_str(), "getVar" | "listVar" | "arrayItems" | "arrayLen" | "arrayIndex") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
                     out.insert(n.clone());
                 }
             }
