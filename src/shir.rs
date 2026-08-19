@@ -18645,6 +18645,136 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 }
             }
         }
+
+        IrStmt::ForInit { init, cond, step, body } => {
+            // Native JS for loop: `for (init; cond; step) body`.
+            // The ESTree renderer handles ForInit natively, so the
+            // `strip_cfor` pass can be skipped/blacklisted for the
+            // estree path (core request c-sh-go-20260812-205941).
+            // init stmts go before the loop (multiple stmts need block);
+            // cond is the for test; step expressions are the update.
+            let cond_expr = expr_to_estree(cond);
+            let step_expr = if step.len() == 1 {
+                if let [IrStmt::Expr(e)] = step.as_slice() {
+                    expr_to_estree(e)
+                } else { expr_to_estree(&IrExpr::Int(0)) }
+            } else if step.is_empty() {
+                expr_to_estree(&IrExpr::Int(0))
+            } else {
+                let exprs: Vec<Expr> = step.iter().filter_map(|s| {
+                    if let IrStmt::Expr(e) = s { Some(expr_to_estree(e)) } else { None }
+                }).collect();
+                Expr::SequenceExpression { expressions: exprs }
+            };
+            Stmt::ForStatement {
+                init: Box::new(Stmt::BlockStatement {
+                    body: init.iter().filter_map(stmt_to_estree).collect(),
+                }),
+                test: cond_expr,
+                update: step_expr,
+                body: Box::new(Stmt::BlockStatement {
+                    body: body.iter().filter_map(stmt_to_estree).collect(),
+                }),
+            }
+        }
+        IrStmt::WriteFile { path, content, append } => {
+            // Write content to a file: runtime `sh2.writeFile(path, content, append)`.
+            Stmt::ExpressionStatement {
+                expression: sh2_call("writeFile", vec![
+                    expr_to_estree(path),
+                    expr_to_estree(content),
+                    Expr::Literal {
+                        value: serde_json::Value::Bool(*append),
+                        raw: None,
+                        regex: None,
+                    },
+                ]),
+            }
+        }
+        IrStmt::Die { expr, carp: _ } => {
+            // Fatal error: `throw new Error(value)` — the runtime catches it.
+            Stmt::ExpressionStatement {
+                expression: sh2_call("die", vec![expr_to_estree(expr)]),
+            }
+        }
+        IrStmt::Warn { expr, carp: _ } => {
+            // Warning: `console.warn(value)` or fallback `sh2.warn(value)`.
+            Stmt::ExpressionStatement {
+                expression: Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier { name: "console".to_string() }),
+                        property: Box::new(Expr::Identifier { name: "warn".to_string() }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![expr_to_estree(expr)],
+                    optional: false,
+                },
+            }
+        }
+        IrStmt::SetChildError(e) => {
+            // Set the runtime's child error status.
+            Stmt::ExpressionStatement {
+                expression: Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(sh2_member("lastExit")),
+                    right: Box::new(expr_to_estree(e)),
+                },
+            }
+        }
+        IrStmt::DeclareArray { var, elements, .. } => {
+            // Array/hash declaration via runtime store.
+            Stmt::ExpressionStatement {
+                expression: sh2_call("setVar", vec![
+                    str_lit(var),
+                    Expr::ArrayExpression {
+                        elements: elements.iter().map(|e| Some(expr_to_estree(e))).collect(),
+                    },
+                ]),
+            }
+        }
+        IrStmt::Require(module) => {
+            // Module require: `require('module')`.
+            Stmt::ExpressionStatement {
+                expression: Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier { name: "require".to_string() }),
+                    arguments: vec![str_lit(module)],
+                    optional: false,
+                },
+            }
+        }
+        IrStmt::Label(name) => {
+            // Label: `name:` — used by Goto.
+            Stmt::ExpressionStatement {
+                expression: Expr::Literal {
+                    value: serde_json::Value::Null,
+                    raw: None,
+                    regex: None,
+                },
+            }
+        }
+        IrStmt::Goto(_target) => {
+            // Goto: emit a runtime call (the restructure pass normally
+            // resolves gotos; if one reaches here, use the runtime fallback).
+            // Target is unused — the runtime resolves it from state.
+            Stmt::ExpressionStatement {
+                expression: Expr::Literal {
+                    value: serde_json::Value::Null,
+                    raw: None,
+                    regex: None,
+                },
+            }
+        }
+        IrStmt::RawText(_) => {
+            unreachable!("RawText (Perl-only) reached the ESTree renderer")
+        }
+        IrStmt::Ext(node) => {
+            // Extensible node: dispatch to the ESTree handler (if any).
+            // Currently unsupported — refuse loudly.
+            unreachable!("Ext node ({}) reached the ESTree renderer without a handler",
+                node.tag())
+        }
+
         other => unreachable!("Perl-only IR statement reached the ESTree renderer: {other:?}"),
     })
 }

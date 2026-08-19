@@ -961,11 +961,10 @@ exit $main_exit_code;
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
-            // C-family `for (init; cond; step)` A1: lower the rich
-            // ForInit to init + while (core request
-            // c-sh-go-20260812-205941 — the ESTree renderer panics on an
-            // UNSTRIPPED ForInit).
-            debashl::shir_passes::strip_cfor(&mut prog);
+            // ForInit (c-style `for`) is handled natively by the
+            // ESTree renderer (native JS `for` loop), so strip_cfor
+            // is not needed here (core request
+            // c-sh-go-20260812-205941).
             debashl::shir_passes::restructure_goto_only(&mut prog);
             // process substitution: materialize frontend-emitted
             // process-in/out into temp-file form (core request
