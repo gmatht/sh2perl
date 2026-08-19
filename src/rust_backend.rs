@@ -22,7 +22,7 @@
 //! like bash); `**` goes through a small `sh2_pow` helper so the emitted
 //! code stays typed and compiles.
 
-use crate::ir::{ArithAst, BinOpKind, InterpPart, IrExpr, IrProgram, IrStmt, IrType};
+use crate::ir::{ArithAst, BinOpKind, InterpPart, IrExpr, IrProgram, IrStmt, IrType, StrStyle};
 use std::collections::{BTreeSet, HashMap};
 
 enum Part {
@@ -45,6 +45,9 @@ pub struct Render {
     /// Rust identifier per shell var name (sanitize + de-dup)
     mangle: HashMap<String, String>,
     need_pow: bool,
+    /// the redirect lowering needs the extern dup/dup2/close decls
+    /// (fd-1/-2 file redirects — triage-rust-20260816 / zsh-sh-go t80)
+    need_dup: bool,
     loop_depth: usize,
     /// gensym counter for loop temporaries (_sh2_items0, _sh2_i0, …)
     gensym: usize,
@@ -63,6 +66,9 @@ const RUST_RESERVED: &[&str] = &[
 /// Render an `IrProgram` to Rust source (fn main()).
 pub fn shir_to_rust(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
+    // builtin-op fallback arm (shir-builtin-op-20260816): the rust
+    // backend has NOT accepted the `builtin` op — render as exec.
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
     // A2: the type verdicts are computed at serialization time in the JSON
     // path; the library path must run the same analysis.
     prog.var_types = crate::shir::analyze_var_types(&prog);
@@ -979,10 +985,146 @@ impl Render {
 
     // ── statements ───────────────────────────────────────────────────
 
+    /// `Call("redirect", [Arrow(body), Array(specs)])` — the A1's
+    /// expr-level redirect (zsh-sh-go t80 `(exec >/dev/null)`,
+    /// triage-rust-20260816). Plain file targets on fds 0/1/2 lower to a
+    /// SCOPED fd swap around the inner body: save the originals with
+    /// `dup`, point the fd at the opened target with `dup2`, run the
+    /// body, restore. The extern decls (no crate deps — libc is linked
+    /// by std) are emitted in the preamble on first use. Non-file
+    /// shapes (fd dups `&N`, "unsupported" modes) stay a TODO marker.
+    fn redirect_stmt(&mut self, args: &[IrExpr]) {
+        let (Some(IrExpr::Arrow(stmts)), Some(IrExpr::Array(spec_objs))) =
+            (args.first(), args.get(1))
+        else {
+            self.mark_todo("redirect (non-arrow shape)");
+            return;
+        };
+        let mut specs: Vec<(i64, String, String)> = Vec::new();
+        let mut ok = true;
+        for so in spec_objs {
+            if let IrExpr::Object(props) = so {
+                let mut fd = 0i64;
+                let mut mode = String::new();
+                let mut target = String::new();
+                for (k, v) in props {
+                    match k.as_str() {
+                        "fd" => {
+                            if let IrExpr::Int(i) = v {
+                                fd = *i;
+                            }
+                        }
+                        "mode" => {
+                            if let IrExpr::Str(m, _) = v {
+                                mode = m.clone();
+                            }
+                        }
+                        "target" => {
+                            match v {
+                                IrExpr::Str(t, _) => target = t.clone(),
+                                // a variable redirect target (`echo hi > "$f"`
+                                // — bat-sh-go t36_redirect_var): the hoisted
+                                // native var's CURRENT value (every written
+                                // var is a `let mut` binding; the value is
+                                // read at the redirect site). Marked, then
+                                // expanded by the open() builder below — a
+                                // var target is a Rust String expression, not
+                                // a literal.
+                                IrExpr::Call { func, args } if func == "getVar" => {
+                                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                                        if self.declared(n) {
+                                            let m = self.rust_ident(n);
+                                            self.mark_read(n);
+                                            target = format!("@var:{m}");
+                                        } else {
+                                            ok = false;
+                                        }
+                                    } else {
+                                        ok = false;
+                                    }
+                                }
+                                _ => ok = false,
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if mode.is_empty() || target.is_empty() {
+                    ok = false;
+                }
+                specs.push((fd, mode, target));
+            } else {
+                ok = false;
+            }
+        }
+        if !ok || specs.is_empty() {
+            self.mark_todo("redirect (spec parse)");
+            return;
+        }
+        for (fd, mode, _) in &specs {
+            if *fd < 0 || *fd > 2 || !matches!(mode.as_str(), "w" | "a" | "r") {
+                self.mark_todo(&format!("redirect fd {fd} mode {mode}"));
+                return;
+            }
+        }
+        self.need_dup = true;
+        // save the pre-redirect fd targets (dup) before any dup2
+        let mut fds: Vec<i64> = specs.iter().map(|(fd, _, _)| *fd).collect();
+        fds.sort_unstable();
+        fds.dedup();
+        for fd in &fds {
+            self.emit(&format!("let __sh2_fd{fd}_saved = unsafe {{ dup({fd}) }};"));
+        }
+        for (fd, mode, target) in &specs {
+            // `@var:<ident>` — a getVar redirect target: the Rust String
+            // expression (a clone of the hoisted native var). Literal
+            // targets go through rust_str as before.
+            let tgt_expr = match target.strip_prefix("@var:") {
+                Some(ident) => format!("{ident}.clone()"),
+                None => Self::rust_str(target),
+            };
+            let open = match mode.as_str() {
+                "w" => format!(
+                    "std::fs::OpenOptions::new().write(true).create(true).truncate(true).open({tgt_expr}).unwrap()"
+                ),
+                "a" => format!(
+                    "std::fs::OpenOptions::new().append(true).create(true).open({tgt_expr}).unwrap()"
+                ),
+                "r" => format!("std::fs::File::open({tgt_expr}).unwrap()", ),
+                _ => unreachable!("file modes only"),
+            };
+            self.emit(&format!("let __sh2_f{fd} = {open};"));
+            self.emit(&format!("unsafe {{ dup2(__sh2_f{fd}.as_raw_fd(), {fd}); }}"));
+        }
+        self.emit("{");
+        self.depth += 1;
+        for s in stmts {
+            self.stmt(s);
+        }
+        self.depth -= 1;
+        self.emit("}");
+        for fd in &fds {
+            self.emit(&format!(
+                "unsafe {{ dup2(__sh2_fd{fd}_saved, {fd}); close(__sh2_fd{fd}_saved); }}"
+            ));
+        }
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
         match s {
+            IrStmt::Ext(_) => panic!("rust backend: Ext node unsupported"),
             IrStmt::Expr(e) => {
                 if let IrExpr::Call { func, args } = e {
+                    if func == "redirect" {
+                        // (triage-rust-20260816 / zsh-sh-go t80
+                        // `(exec >/dev/null)`): a redirect around an inner
+                        // arrow. File targets on fds 0/1/2 lower to a
+                        // scoped fd swap (the extern dup/dup2/close — std
+                        // cannot re-point fds); anything else stays a TODO
+                        // (the scaffold gate counts it).
+                        self.redirect_stmt(args);
+                        return;
+                    }
                     if func == "exec" {
                         if let Some(IrExpr::Str(cmd, _)) = args.first() {
                             if cmd == "exit" {
@@ -1011,6 +1153,41 @@ impl Render {
                                     return;
                                 }
                             }
+                            // `exec` with NO command: a no-op in the rust
+                            // model (the surrounding redirect wrapper owns
+                            // the fd effects — the zsh-sh-go t80 shape
+                            // `(exec >/dev/null)`; a bare `exec` with no
+                            // redirects does nothing in bash/zsh either).
+                            if cmd == "exec"
+                                && (args.len() == 1
+                                    || matches!(args.get(1), Some(IrExpr::Array(items)) if items.is_empty()))
+                            {
+                                return;
+                            }
+                            // generic exec: run the command with the args
+                            // (stdout inherited — bash child semantics; the
+                            // mirror's rc model is the gate's stdout-only
+                            // comparison). Every word renders through
+                            // expr_any (literals, hoisted vars, format! for
+                            // interpolations).
+                            let mut cargs: Vec<String> = Vec::new();
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                for w in items {
+                                    cargs.push(self.expr_any(w));
+                                }
+                            }
+                            let cname = Self::rust_str(cmd);
+                            if cargs.is_empty() {
+                                self.emit(&format!(
+                                    "let _ = std::process::Command::new({cname}).status();"
+                                ));
+                            } else {
+                                self.emit(&format!(
+                                    "let _ = std::process::Command::new({cname}).args([{}]).status();",
+                                    cargs.join(", ")
+                                ));
+                            }
+                            return;
                         }
                     }
                     if func == "break" && self.loop_depth > 0 {
@@ -1230,6 +1407,37 @@ impl Render {
                     self.stmt(s);
                 }
             }
+            IrStmt::Subshell(b) => {
+                // A subshell body — the child scope. The rust model
+                // approximates the scope with a block (stdout-faithful;
+                // var-scope isolation is a known model gap).
+                self.emit("{");
+                self.depth += 1;
+                for s in b {
+                    self.stmt(s);
+                }
+                self.depth -= 1;
+                self.emit("}");
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                // Statement-level redirect (bat-sh-go t36_redirect_var,
+                // posix-sh-go t32_redirect): the expr-level twin of the
+                // `Call("redirect", …)` shape — same native dup/dup2 fd
+                // swap, targets resolved from getVar/Str (a getVar target
+                // reads the hoisted native var — every written var is a
+                // `let mut` binding in program()).
+                let specs: Vec<IrExpr> = redirects
+                    .iter()
+                    .map(|r| {
+                        IrExpr::Object(vec![
+                            ("fd".to_string(), IrExpr::Int(r.fd.unwrap_or(0) as i64)),
+                            ("mode".to_string(), IrExpr::Str(r.mode.clone(), StrStyle::DoubleQuoted)),
+                            ("target".to_string(), r.target.clone()),
+                        ])
+                    })
+                    .collect();
+                self.redirect_stmt(&[IrExpr::Arrow(inner.clone()), IrExpr::Array(specs)]);
+            }
             IrStmt::Pipeline { .. }
             | IrStmt::Die { .. }
             | IrStmt::Warn { .. }
@@ -1295,6 +1503,18 @@ impl Render {
         self.depth = 0;
 
         // Preamble: sh2.* stubs, then main with the rendered body.
+        if self.need_dup {
+            // fd redirects (triage-rust-20260816): the extern decls link
+            // against libc (always linked by std) — no crate deps. The
+            // `use` brings AsRawFd into scope for the dup2 call sites.
+            self.emit("use std::os::unix::io::AsRawFd;");
+            self.emit("extern \"C\" {");
+            self.emit("    fn dup(fd: i32) -> i32;");
+            self.emit("    fn dup2(oldfd: i32, newfd: i32) -> i32;");
+            self.emit("    fn close(fd: i32) -> i32;");
+            self.emit("}");
+            self.emit("");
+        }
         if !self.sh2_calls.is_empty() || self.need_pow {
             self.emit("// sh2.* runtime stubs — TODO: implement (harness/sh2-namespace.json)");
             self.emit("");

@@ -1,0 +1,14 @@
+# shir_nodes/counted_for.node — a transform-declared IR node.
+#
+# build.rs parses this and generates the Rust struct + to_json/from_json +
+# the all_nodes() union registry (see shir_nodes/mod.rs). Field types:
+#   string | int | bool | expr | stmts
+# `expr`/`stmts` embed core IR via shir_nodes::enc (clean standalone JSON).
+
+node CountedFor
+tag "CountedFor"
+field var: string
+field init: int
+field step: int
+field cond: expr
+field body: stmts

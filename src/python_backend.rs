@@ -368,6 +368,9 @@ fn scan_rc_expr(e: &IrExpr, out: &mut bool) {
 /// Render an `IrProgram` to python source (a runnable script).
 pub fn shir_to_python(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
+    // builtin-op fallback arm (shir-builtin-op-20260816): the python
+    // backend has NOT accepted the `builtin` op — render as exec.
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
     // A2: the type verdicts are computed at serialization time in the JSON
     // path; the library path must run the same analysis. A frontend that
     // EMITTED typed var_types (the imperative C-family frontends: Int32/

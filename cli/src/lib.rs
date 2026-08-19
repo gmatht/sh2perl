@@ -64,7 +64,7 @@ pub(crate) fn with_virtual_stdin<T>(f: impl FnOnce(Option<&[u8]>) -> T) -> T {
 // Import from our new modules
 use crate::cli_commands::{
     export_mir, export_shir, interactive_mode, lex_input, parse_backticks_to_perl, parse_file,
-    parse_file_to_estree, parse_file_to_perl, parse_file_to_shir, export_shir_raw, parse_shir_json_to_estree, parse_shir_json_to_js, parse_shir_json_to_perl, parse_file_to_estree_raw, parse_input, parse_system_to_perl,
+    parse_file_to_estree, parse_file_to_perl, parse_file_to_shir, export_shir_raw, parse_shir_json_to_estree, parse_shir_json_to_perl, parse_file_to_estree_raw, parse_input, parse_system_to_perl,
     parse_to_perl,
     parse_to_perl_embed, parse_to_perl_inline, parse_to_perl_with_opts,
     run_generated,
@@ -772,13 +772,6 @@ exit $main_exit_code;
                 }
                 let filename = &args[3];
                 parse_shir_json_to_estree(filename);
-            } else if args.len() >= 3 && args[2] == "--shir-in-js" {
-                if args.len() < 4 {
-                    println!("Error: file --shir-in-js requires filename");
-                    return;
-                }
-                let filename = &args[3];
-                parse_shir_json_to_js(filename);
             } else if args.len() >= 3 && args[2] == "--perl-critic-only" {
                 if args.len() < 4 {
                     println!("Error: file --perl-critic-only requires filename");
@@ -968,11 +961,10 @@ exit $main_exit_code;
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
-            // C-family `for (init; cond; step)` A1: lower the rich
-            // ForInit to init + while (core request
-            // c-sh-go-20260812-205941 — the ESTree renderer panics on an
-            // UNSTRIPPED ForInit).
-            debashl::shir_passes::strip_cfor(&mut prog);
+            // ForInit (c-style `for`) is handled natively by the
+            // ESTree renderer (native JS `for` loop), so strip_cfor
+            // is not needed here (core request
+            // c-sh-go-20260812-205941).
             debashl::shir_passes::restructure_goto_only(&mut prog);
             // process substitution: materialize frontend-emitted
             // process-in/out into temp-file form (core request
@@ -1036,8 +1028,14 @@ exit $main_exit_code;
                 Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
             });
         }
-        "--shir-in-js" => {
-            if args.len() < 3 { println!("Error: --shir-in-js requires input"); return; }
+        "--shir-in-go" | "--shir-in-c" | "--shir-in-python" | "--shir-in-java" | "--shir-in-rust" | "--shir-in-zig" | "--shir-in-js" | "--shir-in-glsl" => {
+            // core dispatcher parity (marketplace triage gate): the
+            // co-owned mirror renderers render through the same A1-ingress
+            // (strip_cfor + RestructureGoto + process-subst + optimize),
+            // so the CORE can gate a triage pair against MAIN without
+            // needing a per-backend worktree build. Each co-owned backend
+            // worktree may keep an identical arm in its own cli.
+            if args.len() < 3 { println!("Error: {} requires input", args[1]); return; }
             let input = &args[2];
             let content = if input == "-" {
                 let mut s = String::new();
@@ -1056,16 +1054,25 @@ exit $main_exit_code;
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
-            // the shared core pipeline (mirrors the --shir-in-estree arm):
-            // strip_cfor lowers the C-style ForInit (step spliced before
-            // every continue), restructure_goto_only folds goto/label
-            // pairs (cpp-sh-go t29_goto.cc — the un-restructured Goto hit
-            // the TODO stub and the loop ran once), process_subst
-            // materializes captures.
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
-            print!("{}", debashl::js_backend::shir_to_js(&prog));
+            debashl::shir_passes::optimize::optimize(&mut prog);
+            let out = match args[1].as_str() {
+                "--shir-in-c" => Ok(debashl::c_backend::shir_to_c(&prog)),
+                "--shir-in-go" => Ok(debashl::go_backend::shir_to_go(&prog)),
+                "--shir-in-python" => Ok(debashl::python_backend::shir_to_python(&prog)),
+                "--shir-in-java" => debashl::java_backend::shir_to_java(&prog),
+                "--shir-in-rust" => Ok(debashl::rust_backend::shir_to_rust(&prog)),
+                "--shir-in-zig" => Ok(debashl::zig_backend::shir_to_zig(&prog)),
+                "--shir-in-js" => Ok(debashl::js_backend::shir_to_js(&prog)),
+                "--shir-in-glsl" => Ok(debashl::glsl_backend::shir_to_glsl(&prog)),
+                _ => unreachable!(),
+            };
+            print!("{}", match out {
+                Ok(s) => s,
+                Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
+            });
         }
         "--mir" => {
             if args.len() < 3 {

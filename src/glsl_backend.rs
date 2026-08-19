@@ -405,6 +405,9 @@ pub fn shir_to_glsl(prog: &IrProgram) -> String {
 /// Render with options (see [`ShGlslOptions`]).
 pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
     let mut prog = prog.clone();
+    // builtin-op fallback arm (shir-builtin-op-20260816): the glsl
+    // backend has NOT accepted the `builtin` op — render as exec.
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
     // A2: the raw ShIR carries no type verdicts; run the analysis so
     // int vars become native GLSL ints (like the C backend does).
     prog.var_types = crate::shir::analyze_var_types(&prog);
@@ -3275,6 +3278,7 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => self.expr_stmt(e),
+            IrStmt::Ext(_) => panic!("glsl backend: Ext node unsupported"),
             IrStmt::Assign { targets, expr, asm, .. } => {
                 // Declarator-position asm label (core request
                 // c-sh-go-toplevelasmargument-20260814-042952) — no GLSL
@@ -4601,6 +4605,7 @@ fn walk_stmts(stmts: &[IrStmt], vars: &mut std::collections::HashMap<String, Opt
 
 fn walk_stmt(s: &IrStmt, vars: &mut std::collections::HashMap<String, Option<Range>>) -> bool {
     match s {
+        IrStmt::Ext(n) => crate::shir_nodes::ExtNode::children(&**n).into_iter().any(|c| walk_stmt(c, vars)),
         IrStmt::Assign { targets, expr, .. } => {
             let r = expr_range(expr, vars);
             if r.is_none() {
@@ -5019,10 +5024,14 @@ mod tests {
     #[test]
     fn bridges_tex_group_dependency() {
         // referencing tex_r must pull in vUv + the uv seeds (the sample
-        // coordinate reads them) but NOT the crack/damage machinery.
+        // coordinate reads them) but NOT the crack/damage machinery. The
+        // uv seed is gated on a DIRECT uv_x/uv_y read (b5ae282: the
+        // texture sample itself uses fract(vUv), only programs that read
+        // the uv bridges need the seed), so the program reads uv_x too.
         let shader = render_opts(
             r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
               {"type":"Assign","targets":[{"var":"t","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Var","name":"tex_r"}}},
+              {"type":"Assign","targets":[{"var":"u","indices":[],"sigil":null}],"expr":{"type":"Var","name":"uv_x","sigil":null}},
               {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
             ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 32, max_view: 0 },
@@ -5031,7 +5040,9 @@ mod tests {
         assert!(shader.contains("uniform sampler2D uTex;"), "uTex missing for tex bridge");
         assert!(shader.contains("int g_uv_x;"), "uv_x not declared (the tex seeds write it)");
         assert!(shader.contains("int g_uv_y;"), "uv_y not declared (the tex seeds write it)");
-        assert!(shader.contains("g_uv_x = int(vUv.x * 16.0);"), "uv seed missing");
+        // the grid is tex_size (the test opts use 32 — ac19fa4 moved the
+        // MIME name textures to 32×32; the assert tracks the option).
+        assert!(shader.contains("g_uv_x = int(vUv.x * 32.0);"), "uv seed missing");
         assert!(shader.contains("vec4 _tex = texture2D(uTex"), "uTex sample missing");
         assert!(shader.contains("g_tex_r = int(_tex.r * 255.0);"), "tex_r seed missing");
         assert!(!shader.contains("g_tex_g"), "tex_g seeded unused");
