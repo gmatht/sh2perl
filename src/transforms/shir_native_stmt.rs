@@ -178,6 +178,7 @@ fn transform_stmt(
             x |= native_echo_bc_stmt(st);
             x |= native_grep_devnull_or(st);
             x |= native_test_chain(st);
+            x |= native_echo_or_chain(st);
             x |= native_head_tail_stmt(st);
             x |= native_sort_stmt(st);
             x |= native_perl_e_stmt(st);
@@ -3188,6 +3189,91 @@ fn emit_file_op(ops: &mut Vec<String>, ws: &[String]) -> bool {
         }
         _ => false,
     }
+}
+
+/// `LHS || echo LIT` / `LHS && echo LIT` (perl-only): when the branch
+/// is a literal echo, evaluate the condition and print natively. The
+/// LHS may be a compound test expression (rendered via ir_expr_to_perl
+/// as a boolean perl expression). The echo branch always exits 0.
+fn native_echo_or_chain(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::BinOp { op, lhs, rhs }) = st else { return false; };
+    if !matches!(op, BinOpKind::Or | BinOpKind::And) {
+        return false;
+    }
+    let IrExpr::Call { func, args } = rhs.as_ref() else { return false; };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return false;
+    };
+    if cmd != "echo" {
+        return false;
+    }
+    let mut content: Option<String> = None;
+    let mut escapes = false;
+    let mut newline = true;
+    for w in words {
+        match w {
+            IrExpr::Str(sv, _) if sv == "-e" => escapes = true,
+            IrExpr::Str(sv, _) if sv == "-E" => escapes = false,
+            IrExpr::Str(sv, _) if sv == "-n" => newline = false,
+            IrExpr::Str(sv, _) => {
+                if content.is_some() {
+                    return false;
+                }
+                content = Some(sv.clone());
+            }
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                if content.is_some() {
+                    return false;
+                }
+                let t: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(x) => Some(x.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                content = Some(t);
+            }
+            other => {
+                return false;
+            }
+        }
+    }
+    let Some(content) = content else { return false; };
+    let content = if escapes {
+        let Some(d) = decode_echo_escapes(&content) else { return false; };
+        d
+    } else {
+        content
+    };
+    // Rewrite to an If with the LHS as the condition (an IR form, so the
+    // variable references stay visible to the var-declaration pass; the
+    // perl renderer renders test/compound conds natively).
+    let cond = match op {
+        BinOpKind::Or => IrExpr::BinOp {
+            op: BinOpKind::Not,
+            lhs: Box::new((**lhs).clone()),
+            rhs: Box::new((**lhs).clone()),
+        },
+        BinOpKind::And => (**lhs).clone(),
+        _ => return false,
+    };
+    *st = IrStmt::If {
+        cond,
+        then: vec![IrStmt::Output {
+            value: IrExpr::Str(content, StrStyle::DoubleQuoted),
+            newline,
+            target: None,
+        }],
+        elsifs: vec![],
+        else_: vec![],
+    };
+    true
 }
 
 fn regex_escape_literal(s: &str) -> String {
