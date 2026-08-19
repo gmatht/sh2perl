@@ -162,7 +162,9 @@ fn transform_stmt(
             let is_pipeline = matches!(e, IrExpr::Call { func, .. } if func == "pipeline");
             let mut x = transform_expr(e, files);
             if is_pipeline {
-                return x;
+                // only the echo|grep fold applies to a pipeline expression
+                // (the echo|tr / printf|sort folds are the renderer's job)
+                return x | native_echo_grep_stmt(st);
             }
             x |= normalize_literal_exec_words(st);
             x |= native_declare_typeset_stmt(st);
@@ -226,6 +228,7 @@ fn transform_stmt(
             x |= empty_herestring_to_status(st);
             x |= file_redirect_block(st);
             x |= native_sort_file_stmt(st);
+            x |= native_echo_grep_stmt(st);
             x |= native_cat_heredoc_writefile(st);
             x |= native_grep_herestring(st);
             x |= native_grep_o_herestring(st);
@@ -2452,12 +2455,17 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
     let [r] = redirects.as_slice() else { return false; };
     if r.fd.unwrap_or(1) != 1 { return false; }
     if !matches!(r.mode.as_str(), "w" | "wc") { return false; }
-    // only a literal Str output path is safe: a Var/Ident target
-    // (process-substitution temps like `__ps_tmp0`) is not declared as a
-    // perl scalar by the renderer, so emitting `$name` would be an
-    // undeclared-symbol error — refuse those (stay a shell-out).
-    let IrExpr::Str(out, _) = &r.target else { return false; };
-    let out = crate::ir::safe_perl_q_string(out);
+    // The output target: a literal Str path, or a plain Var/Ident whose
+    // NAME is the literal filename (process-substitution temps like
+    // `__ps_tmp0` — bash single-quotes them `> '__ps_tmp0'`, so the
+    // filename is the name itself; the perl scalar `$__ps_tmp0` is a
+    // separate empty binding). A dynamic target (Interpolate/getVar)
+    // is refused — the real path isn't known at IR time.
+    let out = match &r.target {
+        IrExpr::Str(s, _) => crate::ir::safe_perl_q_string(s),
+        IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
+        _ => return false,
+    };
     let [IrStmt::Expr(IrExpr::Call { func, args })] = inner.as_slice() else { return false; };
     if !matches!(func.as_str(), "exec" | "builtin") { return false; }
     let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return false; };
@@ -2488,6 +2496,224 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
     );
     *st = IrStmt::RawText(code);
     true
+}
+
+
+/// `echo [-e] LIT | grep FLAGS PAT [> LITOUT]` → native Perl: split the
+/// literal echo content into lines, filter by the grep flags (-C/-A/-B
+/// context, -w whole-word, -i case-insensitive, -m max), write to LITOUT
+/// or print. Refuses -o/-v/-l/-c/-q/--color (complex output), dynamic
+/// echo content, or patterns with unquoted regex metachars beyond the
+/// flags handled. Mirrors GNU grep context-group semantics (dedupe
+/// overlapping context, preserve order).
+fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
+    // Redirect form: inner=[echo|grep pipeline], redirects=[fd1 w LITOUT]
+    let (pipeline, out): (&IrExpr, Option<String>) = match st {
+        IrStmt::Redirect { inner, redirects } => {
+            let [r] = redirects.as_slice() else { return false; };
+            if r.fd.unwrap_or(1) != 1 { return false; }
+            if !matches!(r.mode.as_str(), "w" | "wc") { return false; }
+            let out = match &r.target {
+                IrExpr::Str(s, _) => crate::ir::safe_perl_q_string(s),
+                IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
+                _ => return false,
+            };
+            let [IrStmt::Expr(e)] = inner.as_slice() else { return false; };
+            (e, Some(out))
+        }
+        IrStmt::Expr(e) => (e, None),
+        _ => return false,
+    };
+    let IrExpr::Call { func, args } = pipeline else { return false; };
+    if func != "pipeline" { return false; }
+    let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
+    if stages.len() != 2 { return false; }
+    let mut out = out; // outer redirect out (may be overridden by stage redirect below)
+    // stage 0: echo [-e] LIT (literal)
+    let IrExpr::Arrow(s0) = &stages[0] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: _, args: a0 })] = s0.as_slice() else { return false; };
+    let [IrExpr::Str(cmd0, _), IrExpr::Array(w0)] = a0.as_slice() else { return false; };
+    if cmd0 != "echo" { return false; }
+    let mut content: Option<String> = None;
+    let mut it = w0.iter();
+    while let Some(w) = it.next() {
+        if let IrExpr::Str(sv, _) = w {
+            if sv == "-e" || sv == "-E" { continue; }
+            if sv.starts_with('-') { return false; } // other echo options
+            if content.is_some() { return false; }   // only ONE literal payload
+            let decoded = if let Some(d) = decode_echo_escapes(sv) { d } else { sv.clone() };
+            content = Some(decoded);
+        } else {
+            // the payload may be an all-literal Interpolate (the double-
+            // quoted `echo -e "line1\nline2"` form)
+            if content.is_some() { return false; }
+            match w {
+                IrExpr::Interpolate(parts)
+                    if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+                {
+                    let text: String = parts.iter().filter_map(|p| match p {
+                        InterpPart::Lit(s) => Some(s.as_str()),
+                        _ => None,
+                    }).collect();
+                    let decoded = if let Some(d) = decode_echo_escapes(&text) { d } else { text };
+                    content = Some(decoded);
+                }
+                _ => return false,
+            }
+        }
+    }
+    let Some(content) = content else { return false; };
+    // stage 1: grep FLAGS PAT (literal pattern), possibly wrapped in a
+    // `redirect` Call (`grep … > OUT` — args[0] is the grep Arrow, the
+    // redirect spec carries OUT).
+    let (out, grep_args): (Option<String>, Option<&Vec<IrExpr>>) = match &stages[1] {
+        IrExpr::Arrow(s1) => {
+            let [IrStmt::Expr(e)] = s1.as_slice() else { return false };
+            if let IrExpr::Call { func, args } = e {
+                if func == "redirect" {
+                    // args[0] = Arrow([Expr(exec grep …)]), args[1..] = specs
+                    let Some(IrExpr::Arrow(inner)) = args.first() else { return false };
+                    let [IrStmt::Expr(IrExpr::Call { func: f, args: ga })] = inner.as_slice() else { return false };
+                    if !matches!(f.as_str(), "exec" | "builtin") { return false; }
+                    let [IrExpr::Str(cmd, _), ..] = ga.as_slice() else { return false; };
+                    if cmd != "grep" { return false; }
+                    let mut o = None;
+                    for spec in args.iter().skip(1) {
+                        // the spec arrives as Array([Object([fd, mode, target])])
+                        let obj = match spec {
+                            IrExpr::Object(fields) => Some(fields),
+                            IrExpr::Array(elems) => match elems.first() {
+                                Some(IrExpr::Object(fields)) => Some(fields),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(fields) = obj {
+                            let mut mode = "";
+                            let mut target: Option<&IrExpr> = None;
+                            for (k, v) in fields {
+                                if k == "mode" { if let IrExpr::Str(m, _) = v { mode = m; } }
+                                if k == "target" { target = Some(v); }
+                            }
+                            if mode == "w" || mode == "wc" {
+                                if let Some(t) = target {
+                                    o = Some(match t {
+                                        IrExpr::Str(ts, _) => crate::ir::safe_perl_q_string(ts),
+                                        IrExpr::Var(n, _) | IrExpr::Ident(n) => crate::ir::safe_perl_q_string(n),
+                                        _ => return false,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    (o, Some(ga))
+                } else {
+                    (None, None)
+                }
+            } else { (None, None) }
+        }
+        _ => (None, None),
+    };
+    let Some(a1) = grep_args else { return false; };
+    let [IrExpr::Str(cmd1, _), IrExpr::Array(w1)] = a1.as_slice() else { return false; };
+    if cmd1 != "grep" { return false; }
+    let mut before = 0i64;
+    let mut after = 0i64;
+    let mut word = false;
+    let mut ci = false;
+    let mut maxm: Option<i64> = None;
+    let mut pat: Option<String> = None;
+    let mut it1 = w1.iter();
+    while let Some(w) = it1.next() {
+        // the pattern may be an all-literal Interpolate (`grep "TARGET"`)
+        let pat_text: Option<String> = match w {
+            IrExpr::Str(sv, _) => Some(sv.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                Some(parts.iter().filter_map(|p| match p {
+                    InterpPart::Lit(s) => Some(s.as_str()),
+                    _ => None,
+                }).collect())
+            }
+            _ => None,
+        };
+        let Some(sv) = pat_text else { return false; };
+        if sv.starts_with('-') && sv.len() > 1 {
+            let mut i = 1;
+            let chars: Vec<char> = sv.chars().collect();
+            while i < chars.len() {
+                match chars[i] {
+                    'A' | 'B' | 'C' => {
+                        let n: i64 = if i + 1 < chars.len() {
+                            let d: String = chars[i+1..].iter().collect();
+                            let Ok(v) = d.parse() else { return false; };
+                            i = chars.len();
+                            v
+                        } else {
+                            i += 1;
+                            let Some(nw) = it1.next() else { return false; };
+                            let IrExpr::Str(ns, _) = nw else { return false; };
+                            let Ok(v) = ns.parse() else { return false; };
+                            v
+                        };
+                        match chars[i-1] { 'A' => after = n, 'B' => before = n, _ => { before = n; after = n; } }
+                        i += 1;
+                        continue;
+                    }
+                    'w' => word = true,
+                    'i' => ci = true,
+                    'm' => {
+                        i += 1;
+                        let Some(nw) = it1.next() else { return false; };
+                        let IrExpr::Str(ns, _) = nw else { return false; };
+                        let Ok(v) = ns.parse() else { return false; };
+                        maxm = Some(v);
+                        continue;
+                    }
+                    _ => { return false; } // -o/-v/-l/-c/-q/--color etc
+                }
+                i += 1;
+            }
+        } else {
+            if pat.is_some() { return false; }
+            pat = Some(sv.clone());
+        }
+    }
+    let Some(pat) = pat else { return false; };
+    // literal-safe regex: quotemeta the pattern (bash grep treats it as a
+    // literal substring unless -w adds word boundaries)
+    let qpat = regex_escape_literal(&pat);
+    let anchored = if word { format!("\\b{qpat}\\b") } else { qpat };
+    let ci_flag = if ci { "i" } else { "" };
+    let content_q = crate::ir::safe_perl_q_string(&content);
+    let max_frag = match maxm {
+        Some(n) => format!(" last if @__mi >= {n};"),
+        None => String::new(),
+    };
+    let mut code = format!(
+        "do {{ my @__gl = split(/\\n/, {content_q}, -1); pop @__gl if @__gl && $__gl[-1] eq q{{}}; my @__mi; for my $__i (0..$#__gl) {{ if ($__gl[$__i] =~ /{anchored}/{ci_flag}) {{ push @__mi, $__i;{max_frag} }} }} my @__out; my %__se; for my $__i (@__mi) {{ my $__lo = $__i - {before}; $__lo = 0 if $__lo < 0; my $__hi = $__i + {after}; $__hi = $#__gl if $__hi > $#__gl; for my $__j ($__lo..$__hi) {{ push @__out, $__gl[$__j] unless $__se{{$__j}}++; }} }} "
+    );
+    match out {
+        Some(oq) => code.push_str(&format!(
+            "open(my $__ofh, '>', {oq}) or die \"grep: {oq}: $ERRNO\"; if (@__out) {{ print $__ofh join(\"\\n\", @__out), \"\\n\"; }} close $__ofh; $main_exit_code = $CHILD_ERROR = 0;"
+        )),
+        None => code.push_str(
+            "if (@__out) { print join(\"\\n\", @__out), \"\\n\"; } $main_exit_code = $CHILD_ERROR = 0;"
+        ),
+    }
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// Escape a literal grep pattern for use inside a Perl regex (quotemeta).
+fn regex_escape_literal(s: &str) -> String {
+    s.chars().map(|c| match c {
+        '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' => {
+            format!("\\{c}")
+        }
+        _ => c.to_string(),
+    }).collect()
 }
 
 // ── Family 2: empty-input herestrings → provable-status exec ──────────
