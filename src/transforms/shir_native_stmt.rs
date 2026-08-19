@@ -225,6 +225,7 @@ fn transform_stmt(
             }
             x |= empty_herestring_to_status(st);
             x |= file_redirect_block(st);
+            x |= native_sort_file_stmt(st);
             x |= native_cat_heredoc_writefile(st);
             x |= native_grep_herestring(st);
             x |= native_grep_o_herestring(st);
@@ -2438,6 +2439,54 @@ fn file_redirect_block(st: &mut IrStmt) -> bool {
         func: func.clone(),
         args: args.clone(),
     })]);
+    true
+}
+
+
+/// `sort FILE [> LITOUT]` with a literal file and simple flags (-n/-r) →
+/// native Perl (read the file, sort the lines, write the output). Refuses
+/// complex keys (-k/-t/-c/…), dynamic files/outs, and stdin input — those
+/// stay a shell-out. Mirrors the renderer's `printf|sort` native pattern.
+fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Redirect { inner, redirects } = st else { return false; };
+    let [r] = redirects.as_slice() else { return false; };
+    if r.fd.unwrap_or(1) != 1 { return false; }
+    if !matches!(r.mode.as_str(), "w" | "wc") { return false; }
+    // only a literal Str output path is safe: a Var/Ident target
+    // (process-substitution temps like `__ps_tmp0`) is not declared as a
+    // perl scalar by the renderer, so emitting `$name` would be an
+    // undeclared-symbol error — refuse those (stay a shell-out).
+    let IrExpr::Str(out, _) = &r.target else { return false; };
+    let out = crate::ir::safe_perl_q_string(out);
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = inner.as_slice() else { return false; };
+    if !matches!(func.as_str(), "exec" | "builtin") { return false; }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return false; };
+    if cmd != "sort" { return false; }
+    let mut numeric = false;
+    let mut reverse = false;
+    let mut file: Option<&IrExpr> = None;
+    for w in words {
+        match w {
+            IrExpr::Str(sv, _) if sv.starts_with('-') && sv.len() > 1 => {
+                for ch in sv[1..].chars() {
+                    match ch { 'n' => numeric = true, 'r' => reverse = true, _ => return false }
+                }
+            }
+            _ => {
+                if file.is_some() { return false; }
+                file = Some(w);
+            }
+        }
+    }
+    let Some(file) = file else { return false; };
+    let IrExpr::Str(fname, _) = file else { return false; };
+    let fq = crate::ir::safe_perl_q_string(fname);
+    let cmp = if numeric { "{ $a <=> $b }" } else { "{ $a cmp $b }" };
+    let reverse = if reverse { " @__sl = reverse @__sl;" } else { "" };
+    let code = format!(
+        "do {{ my @__sl = do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__fh, '<', {fq}) or die \"sort: {fq}: $ERRNO\"; my $__c = <$__fh>; close $__fh; split(/\\n/, $__c) }}; pop @__sl if @__sl && $__sl[-1] eq q{{}}; @__sl = sort {cmp} @__sl;{reverse} open(my $__ofh, '>', {out}) or die \"sort: {out}: $ERRNO\"; if (@__sl) {{ print $__ofh join(\"\\n\", @__sl), \"\\n\"; }} close $__ofh; }}; $main_exit_code = $CHILD_ERROR = 0;"
+    );
+    *st = IrStmt::RawText(code);
     true
 }
 
