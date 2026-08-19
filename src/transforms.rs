@@ -71,6 +71,12 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // `Block([…, exec true])`), so it stays disabled by default until
         // that is fixed. Re-enable per-run with
         // DEBASHC_TRANSFORMS=shir-native-stmt.
+        // shir-native-stmt is PERL-RENDERER-ONLY (applied in
+        // ir.rs shir_to_perl): its rewrites (echo>file → Block-wrapped
+        // exec, status_exec markers, test&&echo||echo → If) regress the
+        // estree backend's native folding (writeFile for echo>file,
+        // native echo, dead-flags liveness). Re-enable per-run with
+        // DEBASHC_TRANSFORMS=shir-native-stmt for bisecting.
         // ("shir-native-stmt", shir_native_stmt::transform),
         // ── OFFERED (core-requests/transforms/offered/) — staged for the per-backend bisect —
         ("arith-identity", arith_identity::transform),

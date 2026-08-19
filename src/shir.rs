@@ -16284,6 +16284,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             return Some(Stmt::ExpressionStatement { expression: dead });
                         }
                     }
+                    // status_exec marker (shir-native-stmt's
+                    // `exec("true"/"false", [])`): a PURE lastExit writer.
+                    // When the write is dead (never read) the marker has no
+                    // observable effect — drop the whole statement instead of
+                    // emitting a full `sh2.exec` call with an unread write.
+                    if let [IrExpr::Str(n, _), IrExpr::Array(items)] = args.as_slice() {
+                        if matches!(n.as_str(), "true" | "false") && items.is_empty() {
+                            return None;
+                        }
+                    }
                 }
             }
             // Per-function `local` native lift: a statement-position
@@ -33517,6 +33527,52 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         // ESTree-reachable positions (bash conditions go through the
         // `test` text channel; `$((…))` goes through `Arith`), but the
         // contract round-trips them (shir_json.rs / shir_json_in.rs) and
+        // The general arithmetic / string / bitwise BinOp (the operator
+        // table mirrors js_backend.rs): Add/Concat → `+`, Sub → `-`,
+        // Mul → `*`, Div → `/`, Mod → `%`, Pow → `**`, BitAnd → `&`,
+        // BitOr → `|`, BitXor → `^`, ShiftL → `<<`, ShiftR → `>>`. The
+        // shir-native-stmt transform emits Concat for literal echo args
+        // (`echo a b` → `"a" + " " + "b"`); the C frontend emits the
+        // arithmetic/bitwise forms. Parens are the caller's concern.
+        IrExpr::BinOp {
+            op:
+                op @ (BinOpKind::Add
+                | BinOpKind::Sub
+                | BinOpKind::Mul
+                | BinOpKind::Div
+                | BinOpKind::Mod
+                | BinOpKind::Pow
+                | BinOpKind::Concat
+                | BinOpKind::BitAnd
+                | BinOpKind::BitOr
+                | BinOpKind::BitXor
+                | BinOpKind::ShiftL
+                | BinOpKind::ShiftR),
+            lhs,
+            rhs,
+        } => {
+            let l = expr_to_estree(lhs);
+            let r = expr_to_estree(rhs);
+            let js_op = match op {
+                BinOpKind::Add | BinOpKind::Concat => "+",
+                BinOpKind::Sub => "-",
+                BinOpKind::Mul => "*",
+                BinOpKind::Div => "/",
+                BinOpKind::Mod => "%",
+                BinOpKind::Pow => "**",
+                BinOpKind::BitAnd => "&",
+                BinOpKind::BitOr => "|",
+                BinOpKind::BitXor => "^",
+                BinOpKind::ShiftL => "<<",
+                BinOpKind::ShiftR => ">>",
+                _ => unreachable!("arith/string/bitwise arm: non-op {op:?}"),
+            };
+            Expr::BinaryExpression {
+                operator: js_op.to_string(),
+                left: Box::new(l),
+                right: Box::new(r),
+            }
+        }
         // the Perl backend already renders them — the operator table
         // mirrors js_backend.rs (Eq→`==`, Ne→`!=`, Lt→`<`, Gt→`>`,
         // Le→`<=`, Ge→`>=`; parens are the caller's concern).

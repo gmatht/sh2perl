@@ -253,6 +253,8 @@ pub enum StrStyle {
     /// interpolate variable references.  Newlines and control characters
     /// are still escaped so the Perl source is readable.
     Heredoc,
+    /// Raw Perl code - emitted as-is without quoting. Use sparingly.
+    Raw,
 }
 
 // ── Interpolation parts ──────────────────────────────────────────────
@@ -891,6 +893,16 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     // strip; double-strip is a no-op).
     let mut stripped = prog.clone();
     crate::shir_passes::strip_cfor(&mut stripped);
+    // shir-native-stmt (perl-only shell-out elimination): NOT in the
+    // shared transforms::all() — its rewrites (echo>file → Block-wrapped
+    // exec, status_exec markers, test&&echo||echo → If) are perl-oriented
+    // and regress the estree backend's native folding (writeFile for
+    // echo>file, native echo, dead-flags liveness). Applied here so
+    // fail-shir benefits without estree regressions.
+    crate::transforms::shir_native_stmt::transform(&mut stripped.stmts);
+    for sub in stripped.subs.iter_mut() {
+        crate::transforms::shir_native_stmt::transform(&mut sub.body);
+    }
     // builtin-op native arm (shir-builtin-op-20260816): the A1 carries
     // `builtin(cmd, args)` ops (the exec-to-builtin transform). The perl
     // renderer ACCEPTS the op — emit_stmt's builtin arms (statement,
@@ -5624,6 +5636,7 @@ fn render_str_literal(s: &str, style: &StrStyle) -> String {
             out.push('`');
             out
         }
+        StrStyle::Raw => s.to_string(),
     }
 }
 
@@ -5985,6 +5998,7 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 escaped.push('"');
                 escaped
             }
+            StrStyle::Raw => s.clone(),
         },
 
         IrExpr::Var(name, sigil) => match sigil.unwrap_or(Sigil::Scalar) {
