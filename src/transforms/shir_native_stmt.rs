@@ -3629,6 +3629,7 @@ fn native_echo_filter_stmt(st: &mut IrStmt) -> bool {
         return false;
     }
     let mut content: Option<String> = None;
+    let mut content_var: Option<String> = None;
     let mut escapes = false;
     for w in w0 {
         match w {
@@ -3656,17 +3657,35 @@ fn native_echo_filter_stmt(st: &mut IrStmt) -> bool {
                     .collect();
                 content = Some(t);
             }
+            IrExpr::Call { func: vf, args: vargs }
+                if vf == "getVar" && content.is_none() && content_var.is_none() =>
+            {
+                let Some(IrExpr::Str(vname, _)) = vargs.first() else {
+                    return false;
+                };
+                content_var = Some(vname.clone());
+            }
             _ => return false,
         }
     }
-    let Some(content) = content else { return false; };
+    let content = match (&content, &content_var) {
+        (Some(c), _) => c.clone(),
+        (None, Some(v)) => v.clone(),
+        _ => return false,
+    };
     let content = if escapes {
         let Some(d) = decode_echo_escapes(&content) else { return false; };
         d
     } else {
         content
     };
-    let cq = crate::ir::safe_perl_q_string(&content);
+    let (cq, cexpr) = match &content_var {
+        Some(v) => (format!("${v}"), format!("${v}")),
+        None => (
+            crate::ir::safe_perl_q_string(&content),
+            crate::ir::safe_perl_q_string(&content),
+        ),
+    };
     // stage 1: the consumer
     let IrExpr::Arrow(s1) = &stages[1] else { return false; };
     let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
@@ -3696,6 +3715,70 @@ fn native_echo_filter_stmt(st: &mut IrStmt) -> bool {
         }
     };
     let mut code = match cmd1.as_str() {
+        "cut" => {
+            // cut -d D -f F1[,F2...][-R] — select fields of each line
+            let mut delim: Option<String> = None;
+            let mut fields: Vec<usize> = Vec::new();
+            let mut i = 0;
+            while i < w1.len() {
+                let Some(t) = word_text(&w1[i]) else { return false; };
+                match t.as_str() {
+                    "-d" => {
+                        i += 1;
+                        if i >= w1.len() {
+                            return false;
+                        }
+                        let Some(d) = word_text(&w1[i]) else { return false; };
+                        delim = Some(d);
+                    }
+                    "-f" => {
+                        i += 1;
+                        if i >= w1.len() {
+                            return false;
+                        }
+                        let Some(fl) = word_text(&w1[i]) else { return false; };
+                        for part in fl.split(',') {
+                            if let Some((lo, hi)) = part.split_once('-') {
+                                let Ok(lo) = lo.parse::<usize>() else { return false; };
+                                let Ok(hi) = hi.parse::<usize>() else { return false; };
+                                if lo == 0 || hi < lo {
+                                    return false;
+                                }
+                                for f in lo..=hi {
+                                    fields.push(f - 1);
+                                }
+                            } else {
+                                let Ok(f) = part.parse::<usize>() else { return false; };
+                                if f == 0 {
+                                    return false;
+                                }
+                                fields.push(f - 1);
+                            }
+                        }
+                    }
+                    _ => return false,
+                }
+                i += 1;
+            }
+            let Some(delim) = delim else { return false; };
+            if delim.len() != 1 {
+                return false;
+            }
+            if fields.is_empty() || fields.len() > 6 {
+                return false;
+            }
+            let dq = crate::ir::safe_perl_q_string(&delim);
+            let pick = if fields.len() == 1 {
+                format!("$__f[{}]", fields[0])
+            } else {
+                format!("@__f[{}]", fields.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
+            };
+            format!(
+                r#"do {{ my @__l = split(/
+/, {cq}, -1); pop @__l if @__l && $__l[-1] eq q{{}}; for my $__l (@__l) {{ my @__f = split({dq}, $__l); print STDOUT join({dq}, {pick}), "
+"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+            )
+        }
         "head" => {
             // head [-n] N — print the first N lines of the content
             let mut n: usize = 10;
