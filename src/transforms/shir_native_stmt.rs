@@ -170,7 +170,8 @@ fn transform_stmt(
                     | native_grep_file_pipeline(st)
                     | native_echo_filter_stmt(st)
                     | native_echo_xargs_stmt(st)
-                    | native_echo_tr_sort_stmt(st);
+                    | native_echo_tr_sort_stmt(st)
+                    | native_literal_subshell_wc_stmt(st);
             }
             x |= native_echo_grep_stmt(st);
             x |= normalize_literal_exec_words(st);
@@ -186,6 +187,7 @@ fn transform_stmt(
             x |= native_echo_grep_test_chain(st);
             x |= native_echo_xargs_stmt(st);
             x |= native_echo_tr_sort_stmt(st);
+            x |= native_literal_subshell_wc_stmt(st);
             x |= native_ls_stmt(st);
             x |= native_trap_stmt(st);
             x |= native_head_tail_stmt(st);
@@ -4380,6 +4382,237 @@ fn native_echo_tr_sort_stmt(st: &mut IrStmt) -> bool {
     }
     code.push_str(
         r#" if (@__l) { print STDOUT join("\n", @__l), "\n"; } }; $main_exit_code = $CHILD_ERROR = 0;"#,
+    );
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `( subshell ) | wc -l` where the subshell is a tree of literal echoes,
+/// nested subshells, and literal grep/sed pipelines (perl-only): fold the
+/// whole tree at transform time to the line count.
+fn native_literal_subshell_wc_stmt(st: &mut IrStmt) -> bool {
+    fn literal_word(w: &IrExpr) -> Option<String> {
+        match w {
+            IrExpr::Str(sv, _) => Some(sv.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                Some(
+                    parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            InterpPart::Lit(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+    fn eval_pipeline(stages: &[IrExpr]) -> Option<String> {
+        let mut text = eval_stage(stages.first()?)?;
+        for stage in &stages[1..] {
+            let IrExpr::Arrow(body) = stage else { return None; };
+            let [IrStmt::Expr(IrExpr::Call { func, args })] = body.as_slice() else {
+                return None;
+            };
+            if !matches!(func.as_str(), "builtin" | "exec") {
+                return None;
+            }
+            let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+                return None;
+            };
+            match cmd.as_str() {
+                "grep" => {
+                    let mut pat: Option<String> = None;
+                    for w in words {
+                        let Some(t) = literal_word(w) else { return None; };
+                        if t.starts_with('-') {
+                            return None;
+                        }
+                        if pat.is_some() {
+                            return None;
+                        }
+                        pat = Some(t);
+                    }
+                    let pat = pat?;
+                    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+                    if lines.last().map(|s| s.is_empty()).unwrap_or(false) {
+                        lines.pop();
+                    }
+                    lines.retain(|l| l.contains(&pat));
+                    text = lines.join("\n");
+                    if !lines.is_empty() {
+                        text.push('\n');
+                    }
+                }
+                "sed" => {
+                    let Some(sc) = words.first().and_then(literal_word) else {
+                        return None;
+                    };
+                    let sc = sc.trim();
+                    if !sc.starts_with('s') || sc.len() < 4 {
+                        return None;
+                    }
+                    let delim = sc.as_bytes()[1] as char;
+                    let rest = &sc[2..];
+                    let mut parts = rest.split(delim as char);
+                    let (Some(pat), Some(repl)) = (parts.next(), parts.next()) else {
+                        return None;
+                    };
+                    let flags = parts.next().unwrap_or("");
+                    let mut global = false;
+                    for ch in flags.chars() {
+                        match ch {
+                            'g' => global = true,
+                            _ => return None,
+                        }
+                    }
+                    if repl.contains('&') || repl.contains('\\') {
+                        return None;
+                    }
+                    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+                    if lines.last().map(|s| s.is_empty()).unwrap_or(false) {
+                        lines.pop();
+                    }
+                    for l in lines.iter_mut() {
+                        let pat = pat.clone();
+                        if global {
+                            *l = l.replace(&pat, repl);
+                        } else {
+                            if let Some(idx) = l.find(&pat) {
+                                l.replace_range(idx..idx + pat.len(), repl);
+                            }
+                        }
+                    }
+                    text = lines.join("\n");
+                    if !lines.is_empty() {
+                        text.push('\n');
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(text)
+    }
+    fn eval_stage(stage: &IrExpr) -> Option<String> {
+        let IrExpr::Arrow(body) = stage else { return None; };
+        let [st] = body.as_slice() else { return None; };
+        match st {
+            IrStmt::Subshell(inner) => eval_subshell(inner),
+            IrStmt::Expr(IrExpr::Call { func, args }) => {
+                if func == "pipeline" {
+                    let [IrExpr::Array(stages)] = args.as_slice() else { return None; };
+                    eval_pipeline(stages)
+                } else if matches!(func.as_str(), "builtin" | "exec") {
+                    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+                        return None;
+                    };
+                    if cmd != "echo" {
+                        return None;
+                    }
+                    let mut content: Option<String> = None;
+                    for w in words {
+                        match w {
+                            IrExpr::Str(sv, _) if sv == "-e" || sv == "-E" || sv == "-n" => {
+                                return None;
+                            }
+                            _ => {
+                                if content.is_some() {
+                                    return None;
+                                }
+                                content = literal_word(w);
+                            }
+                        }
+                    }
+                    let mut c = content?;
+                    c.push('\n');
+                    Some(c)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+    fn eval_subshell(stmts: &[IrStmt]) -> Option<String> {
+        let mut out = String::new();
+        for st in stmts {
+            match st {
+                IrStmt::Subshell(inner) => out.push_str(&eval_subshell(inner)?),
+                IrStmt::Expr(IrExpr::Call { func, args }) => {
+                    if func == "pipeline" {
+                        let [IrExpr::Array(stages)] = args.as_slice() else { return None; };
+                        out.push_str(&eval_pipeline(stages)?);
+                    } else if matches!(func.as_str(), "builtin" | "exec") {
+                        let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice()
+                            else { return None; };
+                        if cmd != "echo" {
+                            return None;
+                        }
+                        let mut content: Option<String> = None;
+                        for w in words {
+                            match w {
+                                IrExpr::Str(sv, _)
+                                    if sv == "-e" || sv == "-E" || sv == "-n" =>
+                                {
+                                    return None;
+                                }
+                                _ => {
+                                    if content.is_some() {
+                                        return None;
+                                    }
+                                    content = literal_word(w);
+                                }
+                            }
+                        }
+                        let mut c = content?;
+                        c.push('\n');
+                        out.push_str(&c);
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+    // the stmt: Expr(Call pipeline [subshell-stage, wc -l])
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
+    if func != "pipeline" {
+        return false;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
+    if stages.len() != 2 {
+        return false;
+    }
+    let Some(text) = eval_stage(&stages[0]) else { return false; };
+    // stage 1: wc -l
+    let IrExpr::Arrow(s1) = &stages[1] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+        return false;
+    };
+    if !matches!(f1.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd1, _), IrExpr::Array(w1)] = a1.as_slice() else { return false; };
+    if cmd1 != "wc" || w1.len() != 1 {
+        return false;
+    }
+    let Some(flag) = w1.first().and_then(literal_word) else { return false; };
+    if flag != "-l" {
+        return false;
+    }
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    let count = lines.len();
+    let code = format!(
+        "print {cq}, \"\\n\"; $main_exit_code = $CHILD_ERROR = 0;",
+        cq = crate::ir::safe_perl_q_string(&count.to_string())
     );
     *st = IrStmt::RawText(code);
     true
