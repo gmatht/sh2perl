@@ -195,6 +195,7 @@ fn transform_stmt(
             x |= native_echo_or_chain(st);
             x |= native_if_test_cond(st);
             x |= native_test_exit_stmt(st);
+            x |= native_cat_var_or_stmt(st);
             x |= native_echo_grep_test_chain(st);
             x |= native_echo_xargs_stmt(st);
             x |= native_echo_tr_sort_stmt(st);
@@ -259,6 +260,8 @@ fn transform_stmt(
             x |= file_redirect_block(st);
             x |= native_sort_file_stmt(st);
             x |= native_echo_write_file_stmt(st);
+            x |= native_subshell_redirect_stmt(st);
+            x |= native_cat_var_or_stmt(st);
             x |= native_diff_files_stmt(st);
             x |= native_grep_file_pipeline(st);
             x |= native_echo_grep_stmt(st);
@@ -294,7 +297,22 @@ fn transform_expr(
     files: &mut std::collections::HashMap<String, String>,
 ) -> bool {
     match e {
-        IrExpr::Arrow(stmts) => transform_with_printf(stmts, true, files),
+        IrExpr::Arrow(stmts) => {
+            transform_with_printf(stmts, true, files)
+        }
+        // capture bodies are real statements (the renderer captures their
+        // stdout) — transform them like any other stmt list
+        IrExpr::Capture { expr, native } => {
+            let x = transform_expr(expr, files);
+            // a transformed body (RawText) can no longer be rebuilt as
+            // shell text — the renderer must render it natively.
+            if let IrExpr::Arrow(stmts) = expr.as_ref() {
+                if stmts.iter().any(|s| matches!(s, IrStmt::RawText(_))) {
+                    *native = true;
+                }
+            }
+            x
+        }
         IrExpr::Call { func, args } => {
             // `command -v CMD > /dev/null` in condition position → a
             // constant boolean (the redirect does not change the status).
@@ -455,6 +473,8 @@ fn test_and_to_if(st: &mut IrStmt) -> bool {
 }
 
 fn test_chain_to_if(st: &mut IrStmt) -> bool {
+    if let IrStmt::Expr(e) = st {
+    }
     let IrStmt::Expr(IrExpr::BinOp {
         op: BinOpKind::Or,
         lhs,
@@ -5391,6 +5411,189 @@ fn native_cat_heredoc_wc_stmt(st: &mut IrStmt) -> bool {
     let code = format!(
         "print {cq}, \"\\n\"; $main_exit_code = $CHILD_ERROR = 0;",
         cq = crate::ir::safe_perl_q_string(&count.to_string())
+    );
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `( printf 'LIT' ) <<DOC 2>&1 > "$f"` (perl-only): a subshell whose
+/// only statement is a literal printf/echo, with an fd1 write redirect
+/// (the target may be a Var/Interpolate-getVar like `$tmpf`). The heredoc
+/// stdin and fd2 are ignored.
+fn native_subshell_redirect_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Redirect { inner, redirects } = st else { return false; };
+    let [IrStmt::Subshell(sub)] = inner.as_slice() else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = sub.as_slice() else { return false; };
+    if !matches!(func.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else { return false; };
+    if cmd != "printf" && cmd != "echo" {
+        return false;
+    }
+    // one literal word
+    let word_text = |w: &IrExpr| -> Option<String> {
+        match w {
+            IrExpr::Str(sv, _) => Some(sv.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                Some(
+                    parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            InterpPart::Lit(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    };
+    let mut content: Option<String> = None;
+    for w in words {
+        let Some(t) = word_text(w) else { return false; };
+        if t.starts_with('-') {
+            return false;
+        }
+        if content.is_some() {
+            return false;
+        }
+        content = Some(t);
+    }
+    let Some(mut content) = content else { return false; };
+    if cmd == "echo" {
+        content.push('\n');
+    }
+    // the fd1 w target
+    let mut target: Option<String> = None;
+    for r in redirects {
+        if r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "wc") {
+            target = match &r.target {
+                IrExpr::Str(s, _) => Some(crate::ir::safe_perl_q_string(s)),
+                IrExpr::Var(n, _) | IrExpr::Ident(n) => Some(format!("${n}")),
+                IrExpr::Interpolate(parts) => {
+                    let mut name: Option<String> = None;
+                    for p in parts {
+                        if let InterpPart::Expr(e) = p {
+                            if let IrExpr::Call { func: vf, args: vargs } = e.as_ref() {
+                                if vf == "getVar" {
+                                    if let Some(IrExpr::Str(n, _)) = vargs.first() {
+                                        name = Some(format!("${n}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    name
+                }
+                IrExpr::Call { func: vf, args: vargs } if vf == "getVar" => {
+                    if let Some(IrExpr::Str(n, _)) = vargs.first() {
+                        Some(format!("${n}"))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+        }
+    }
+    let Some(target) = target else { return false; };
+    let cq = crate::ir::safe_perl_q_string(&content);
+    let code = format!(
+        r#"do {{ open(my $__ofh, '>', {target}) or die "write: {target}: $ERRNO"; print $__ofh {cq}; close $__ofh; }}; $main_exit_code = $CHILD_ERROR = 0;"#
+    );
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `cat "$VAR" 2>/dev/null || echo 'LIT'` (perl-only): native read of a
+/// variable path with the fallback echo when the file is missing. The
+/// current shell-out passes `"$VAR"` literally to bash (un-interpolated),
+/// so this is both a byte reduction and a correctness fix.
+fn native_cat_var_or_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::BinOp {
+        op: BinOpKind::Or,
+        lhs,
+        rhs,
+    }) = st
+    else {
+        return false;
+    };
+    // lhs: redirect(Arrow([Expr(cat "$VAR")]), [fd2 -> /dev/null])
+    let IrExpr::Call { func, args } = lhs.as_ref() else { return false; };
+    if func != "redirect" {
+        return false;
+    }
+    let Some(IrExpr::Arrow(inner)) = args.first() else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: cf, args: cargs })] = inner.as_slice() else {
+        return false;
+    };
+    if !matches!(cf.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = cargs.as_slice() else { return false; };
+    if cmd != "cat" {
+        return false;
+    }
+    let mut path: Option<String> = None;
+    for w in words {
+        match w {
+            IrExpr::Call { func: vf, args: vargs } if vf == "getVar" => {
+                if path.is_some() {
+                    return false;
+                }
+                if let Some(IrExpr::Str(n, _)) = vargs.first() {
+                    path = Some(format!("${n}"));
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    let Some(path) = path else { return false; };
+    // rhs: echo 'LIT'
+    let IrExpr::Call { func, args } = rhs.as_ref() else { return false; };
+    if !matches!(func.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(ecmd, _), IrExpr::Array(ewords)] = args.as_slice() else { return false; };
+    if ecmd != "echo" {
+        return false;
+    }
+    let mut fallback: Option<String> = None;
+    for w in ewords {
+        match w {
+            IrExpr::Str(sv, _) => {
+                if fallback.is_some() {
+                    return false;
+                }
+                fallback = Some(sv.clone());
+            }
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                if fallback.is_some() {
+                    return false;
+                }
+                let t: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(x) => Some(x.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                fallback = Some(t);
+            }
+            _ => return false,
+        }
+    }
+    let Some(fallback) = fallback else { return false; };
+    let fq = crate::ir::safe_perl_q_string(&fallback);
+    let code = format!(
+        r#"do {{ if (open(my $__fh, '<', {path})) {{ local $/; my $__c = <$__fh>; close $__fh; print STDOUT $__c; }} else {{ print STDOUT {fq}, "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
     );
     *st = IrStmt::RawText(code);
     true
