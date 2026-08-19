@@ -18617,6 +18617,34 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 },
             }
         }
+        IrStmt::Output { value, newline, target } => {
+            // Native `process.stdout.write(value)` for simple stdout
+            // output (herestrings, bare print). Falls back to the runtime
+            // `sh2.output(value)` when a redirect target is set.
+            let val = expr_to_estree(value);
+            if target.is_some() {
+                Stmt::ExpressionStatement {
+                    expression: sh2_call("output", vec![val]),
+                }
+            } else {
+                let write_val = if *newline {
+                    Expr::BinaryExpression {
+                        operator: "+".to_string(),
+                        left: Box::new(val),
+                        right: Box::new(Expr::Literal {
+                            value: serde_json::Value::String("\n".to_string()),
+                            raw: None,
+                            regex: None,
+                        }),
+                    }
+                } else {
+                    val
+                };
+                Stmt::ExpressionStatement {
+                    expression: printf_write_expr(write_val),
+                }
+            }
+        }
         other => unreachable!("Perl-only IR statement reached the ESTree renderer: {other:?}"),
     })
 }
