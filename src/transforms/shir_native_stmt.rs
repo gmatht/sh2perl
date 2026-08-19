@@ -170,6 +170,7 @@ fn transform_stmt(
                     | native_grep_file_pipeline(st)
                     | native_echo_filter_stmt(st);
             }
+            x |= native_echo_grep_stmt(st);
             x |= normalize_literal_exec_words(st);
             x |= native_declare_typeset_stmt(st);
             x |= native_echo_stmt(st);
@@ -2526,7 +2527,55 @@ fn native_sort_file_stmt(st: &mut IrStmt) -> bool {
 /// overlapping context, preserve order).
 fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
     // Redirect form: inner=[echo|grep pipeline], redirects=[fd1 w LITOUT]
-    let (pipeline, out): (&IrExpr, Option<String>) = match st {
+    // the `pipeline || echo X` chain: keep the else-echo for the no-match case
+    let mut else_echo: Option<String> = None;
+    let (pipeline, out): (IrExpr, Option<String>) = match st {
+        IrStmt::Expr(IrExpr::BinOp {
+            op: BinOpKind::Or,
+            lhs,
+            rhs,
+        }) => {
+            let IrExpr::Call { func, args } = rhs.as_ref() else { return false; };
+            if !matches!(func.as_str(), "builtin" | "exec") {
+                return false;
+            }
+            let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+                return false;
+            };
+            if cmd != "echo" {
+                return false;
+            }
+            // one literal word
+            let mut content: Option<String> = None;
+            for w in words {
+                match w {
+                    IrExpr::Str(sv, _) => {
+                        if content.is_some() {
+                            return false;
+                        }
+                        content = Some(sv.clone());
+                    }
+                    IrExpr::Interpolate(parts)
+                        if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+                    {
+                        if content.is_some() {
+                            return false;
+                        }
+                        let t: String = parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                InterpPart::Lit(x) => Some(x.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        content = Some(t);
+                    }
+                    _ => return false,
+                }
+            }
+            else_echo = content;
+            ((**lhs).clone(), None)
+        }
         IrStmt::Redirect { inner, redirects } => {
             let [r] = redirects.as_slice() else { return false; };
             if r.fd.unwrap_or(1) != 1 { return false; }
@@ -2537,12 +2586,12 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
                 _ => return false,
             };
             let [IrStmt::Expr(e)] = inner.as_slice() else { return false; };
-            (e, Some(out))
+            (e.clone(), Some(out))
         }
-        IrStmt::Expr(e) => (e, None),
+        IrStmt::Expr(e) => (e.clone(), None),
         _ => return false,
     };
-    let IrExpr::Call { func, args } = pipeline else { return false; };
+    let IrExpr::Call { func, args } = &pipeline else { return false; };
     if func != "pipeline" { return false; }
     let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
     if stages.len() != 2 { return false; }
@@ -2588,7 +2637,12 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
         IrExpr::Arrow(s1) => {
             let [IrStmt::Expr(e)] = s1.as_slice() else { return false };
             if let IrExpr::Call { func, args } = e {
-                if func == "redirect" {
+                if matches!(func.as_str(), "builtin" | "exec") {
+                    // a plain grep stage (no redirect): `echo X | grep ...`
+                    let [IrExpr::Str(cmd, _), ..] = args.as_slice() else { return false; };
+                    if cmd != "grep" { return false; }
+                    (None, Some(args))
+                } else if func == "redirect" {
                     // args[0] = Arrow([Expr(exec grep …)]), args[1..] = specs
                     let Some(IrExpr::Arrow(inner)) = args.first() else { return false };
                     let [IrStmt::Expr(IrExpr::Call { func: f, args: ga })] = inner.as_slice() else { return false };
@@ -2640,6 +2694,7 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
     let mut word = false;
     let mut ci = false;
     let mut maxm: Option<i64> = None;
+    let mut color = false;
     let mut pat: Option<String> = None;
     let mut it1 = w1.iter();
     while let Some(w) = it1.next() {
@@ -2657,6 +2712,10 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
             _ => None,
         };
         let Some(sv) = pat_text else { return false; };
+        if sv == "--color=always" {
+            color = true;
+            continue;
+        }
         if sv.starts_with('-') && sv.len() > 1 {
             let mut i = 1;
             let chars: Vec<char> = sv.chars().collect();
@@ -2699,12 +2758,28 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
         }
     }
     let Some(pat) = pat else { return false; };
+    let content_q = crate::ir::safe_perl_q_string(&content);
+    if color {
+        // grep --color=always PAT: colorize each match (GNU grep's
+        // SGR + erase-line sequences), exit 0 on match / 1 without;
+        // the || echo fallback prints on no-match.
+        let qpat = regex_escape_literal(&pat);
+        let mut c = format!(
+            r#"do {{ my $__o = {content_q}; if ($__o =~ /{qpat}/) {{ $__o =~ s/({qpat})/\e[01;31m\e[K$1\e[m\e[K/g; print STDOUT $__o, "\n"; $main_exit_code = $CHILD_ERROR = 0; }} else {{"#
+        );
+        if let Some(ec) = &else_echo {
+            let eq = crate::ir::safe_perl_q_string(ec);
+            c.push_str(&format!(" print STDOUT {eq}, \"\\n\"; "));
+        }
+        c.push_str(" $main_exit_code = $CHILD_ERROR = 1; } };");
+        *st = IrStmt::RawText(c);
+        return true;
+    }
     // literal-safe regex: quotemeta the pattern (bash grep treats it as a
     // literal substring unless -w adds word boundaries)
     let qpat = regex_escape_literal(&pat);
     let anchored = if word { format!("\\b{qpat}\\b") } else { qpat };
     let ci_flag = if ci { "i" } else { "" };
-    let content_q = crate::ir::safe_perl_q_string(&content);
     let max_frag = match maxm {
         Some(n) => format!(" last if @__mi >= {n};"),
         None => String::new(),
@@ -2716,9 +2791,18 @@ fn native_echo_grep_stmt(st: &mut IrStmt) -> bool {
         Some(oq) => code.push_str(&format!(
             "open(my $__ofh, '>', {oq}) or die \"grep: {oq}: $ERRNO\"; if (@__out) {{ print $__ofh join(\"\\n\", @__out), \"\\n\"; }} close $__ofh; $main_exit_code = $CHILD_ERROR = 0;"
         )),
-        None => code.push_str(
-            "if (@__out) { print join(\"\\n\", @__out), \"\\n\"; } $main_exit_code = $CHILD_ERROR = 0;"
-        ),
+        None => {
+            let tail = match &else_echo {
+                Some(ec) => {
+                    let eq = crate::ir::safe_perl_q_string(ec);
+                    format!(
+                        "if (@__out) {{ print join(\"\\n\", @__out), \"\\n\"; $main_exit_code = $CHILD_ERROR = 0; }} else {{ print STDOUT {eq}, \"\\n\"; $main_exit_code = $CHILD_ERROR = 1; }}"
+                    )
+                }
+                None => "if (@__out) { print join(\"\\n\", @__out), \"\\n\"; } $main_exit_code = $CHILD_ERROR = 0;".to_string(),
+            };
+            code.push_str(&tail);
+        }
     }
     *st = IrStmt::RawText(code);
     true
