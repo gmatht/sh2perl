@@ -913,6 +913,11 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
 
     // Run optimization passes before emitting.
     let stmts = optimize_stmts(&prog.stmts);
+    if std::env::var("DLS2").is_ok() {
+        for st in stmts.iter() {
+            eprintln!("DLS2: stmt {:?} raw={}", std::mem::discriminant(st), matches!(st, IrStmt::RawText(_)));
+        }
+    }
     let modern_ir = prog.imports.is_empty();
 
     // Function calls: exec(foo, …) where foo is a defined shell function
@@ -4653,7 +4658,15 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
         ok(out);
         return;
     }
-    let all_literal = args.iter().all(|a| matches!(a, IrExpr::Str(_, _)));
+    let all_literal = args.iter().all(|a| {
+        matches!(a, IrExpr::Str(_, _))
+            || matches!(
+                a,
+                IrExpr::Interpolate(parts)
+                    if parts.iter().all(|p| matches!(p, InterpPart::Lit(_)))
+            )
+    }); args={:?}", all_literal, args.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>());
+    }
     if all_literal {
         let joined: String = args
             .iter()
