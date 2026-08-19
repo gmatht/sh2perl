@@ -4665,8 +4665,7 @@ fn emit_echo(out: &mut String, words: &[&IrExpr], indent: usize) {
                 IrExpr::Interpolate(parts)
                     if parts.iter().all(|p| matches!(p, InterpPart::Lit(_)))
             )
-    }); args={:?}", all_literal, args.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>());
-    }
+    });
     if all_literal {
         let joined: String = args
             .iter()
