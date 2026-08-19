@@ -179,6 +179,7 @@ fn transform_stmt(
             x |= native_grep_devnull_or(st);
             x |= native_test_chain(st);
             x |= native_echo_or_chain(st);
+            x |= native_ls_stmt(st);
             x |= native_head_tail_stmt(st);
             x |= native_sort_stmt(st);
             x |= native_perl_e_stmt(st);
@@ -2213,7 +2214,7 @@ fn native_echo_stmt(st: &mut IrStmt) -> bool {
         }
         option_words
             .into_iter()
-            .map(|word| IrExpr::Str(word, StrStyle::Raw))
+            .map(|word| IrExpr::Str(word, StrStyle::DoubleQuoted))
             .collect()
     } else {
         // A direct getVar call is the quoted `$x` shape. The unquoted form
@@ -2224,7 +2225,7 @@ fn native_echo_stmt(st: &mut IrStmt) -> bool {
         words.to_vec()
     };
 
-    let mut value = IrExpr::Str(String::new(), StrStyle::Raw);
+    let mut value = IrExpr::Str(String::new(), StrStyle::DoubleQuoted);
     for (idx, word) in word_exprs.into_iter().enumerate() {
         if idx == 0 {
             value = word;
@@ -2805,7 +2806,7 @@ fn native_echo_write_file_stmt(st: &mut IrStmt) -> bool {
         content
     };
     let cq = crate::ir::safe_perl_q_string(&decoded);
-    let nl = if newline { ", \"\\n\"" } else { "" };
+        let nl = if newline { ", \"\\n\"" } else { "" };
     let code = format!(
         "open(my $__ofh, '>', {out}) or die \"echo: {out}: $ERRNO\"; print $__ofh {cq}{nl}; close $__ofh; $main_exit_code = $CHILD_ERROR = 0;"
     );
@@ -3200,6 +3201,21 @@ fn native_echo_or_chain(st: &mut IrStmt) -> bool {
     if !matches!(op, BinOpKind::Or | BinOpKind::And) {
         return false;
     }
+    // the LHS must be a (compound) TEST condition — `[[ cond ]]`, `test`,
+    // or `[[ a ]] && [[ b ]]` — never an arbitrary command (a `ls ... ||
+    // echo` chain is native_ls_stmt's job, and rendering a redirect/exec
+    // call into a boolean cond is broken).
+    fn is_test_cond(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, .. } => matches!(func.as_str(), "test" | "[" | "[["),
+            IrExpr::BinOp { lhs, rhs, .. } => is_test_cond(lhs) && is_test_cond(rhs),
+            IrExpr::Bool(_) => true,
+            _ => false,
+        }
+    }
+    if !is_test_cond(lhs) {
+        return false;
+    }
     let IrExpr::Call { func, args } = rhs.as_ref() else { return false; };
     if !matches!(func.as_str(), "exec" | "builtin") {
         return false;
@@ -3273,6 +3289,175 @@ fn native_echo_or_chain(st: &mut IrStmt) -> bool {
         elsifs: vec![],
         else_: vec![],
     };
+    true
+}
+
+/// `ls PATH... [2>/dev/null]` with literal paths and no flags (perl-only):
+/// print each existing path; a directory path prints its sorted contents
+/// (header + blank line when there are multiple args, matching bash ls on
+/// a pipe). fd2 -> /dev/null redirects are ignored. Refuses -l/-a/-t/-r
+/// and dynamic paths.
+fn native_ls_stmt(st: &mut IrStmt) -> bool {
+    // Extract the ls call (words + fd2 specs) from a stmt form or an
+    // `ls ... || echo` BinOp lhs.
+    fn ls_words(e: &IrExpr) -> Option<(Vec<&IrExpr>, bool)> {
+        // returns (words, is_redirect_form)
+        let IrExpr::Call { func, args } = e else { return None; };
+        if matches!(func.as_str(), "builtin" | "exec") {
+            let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+                return None;
+            };
+            if cmd != "ls" {
+                return None;
+            }
+            return Some((words.iter().collect(), false));
+        }
+        if func == "redirect" {
+            let Some(IrExpr::Arrow(inner)) = args.first() else { return None; };
+            let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = inner.as_slice() else {
+                return None;
+            };
+            if !matches!(f2.as_str(), "builtin" | "exec") {
+                return None;
+            }
+            let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = a2.as_slice() else {
+                return None;
+            };
+            if cmd != "ls" {
+                return None;
+            }
+            // only fd2 specs tolerated (stderr sink)
+            for spec in args.iter().skip(1) {
+                let obj = match spec {
+                    IrExpr::Object(fields) => Some(fields),
+                    IrExpr::Array(elems) => match elems.first() {
+                        Some(IrExpr::Object(fields)) => Some(fields),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(fields) = obj else { return None; };
+                let mut fd = 1;
+                for (k, v) in fields {
+                    if k == "fd" {
+                        if let IrExpr::Int(n) = v {
+                            fd = *n as i32;
+                        }
+                    }
+                }
+                if fd != 2 {
+                    return None;
+                }
+            }
+            return Some((words.iter().collect(), true));
+        }
+        None
+    }
+    // the else-echo (optional `|| echo LIT`)
+    fn echo_words(e: &IrExpr) -> Option<(String, bool)> {
+        let IrExpr::Call { func, args } = e else { return None; };
+        if !matches!(func.as_str(), "builtin" | "exec") {
+            return None;
+        }
+        let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+            return None;
+        };
+        if cmd != "echo" {
+            return None;
+        }
+        let mut content: Option<String> = None;
+        let mut newline = true;
+        for w in words {
+            match w {
+                IrExpr::Str(sv, _) if sv == "-n" => newline = false,
+                IrExpr::Str(sv, _) if sv == "-e" || sv == "-E" => return None,
+                IrExpr::Str(sv, _) => {
+                    if content.is_some() {
+                        return None;
+                    }
+                    content = Some(sv.clone());
+                }
+                IrExpr::Interpolate(parts)
+                    if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+                {
+                    if content.is_some() {
+                        return None;
+                    }
+                    let t: String = parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            InterpPart::Lit(x) => Some(x.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    content = Some(t);
+                }
+                _ => return None,
+            }
+        }
+        Some((content?, newline))
+    }
+    let (words, else_echo): (Vec<&IrExpr>, Option<(String, bool)>) = match st {
+        IrStmt::Expr(IrExpr::BinOp { op: BinOpKind::Or, lhs, rhs }) => {
+            let Some((w, _)) = ls_words(lhs) else { return false; };
+            let Some(ec) = echo_words(rhs) else { return false; };
+            (w, Some(ec))
+        }
+        _ => return false,
+    };
+    let mut paths: Vec<String> = Vec::new();
+    for w in words {
+        match w {
+            IrExpr::Str(sv, _) if sv == "-1" => continue,
+            IrExpr::Str(sv, _) if sv.starts_with('-') => return false,
+            IrExpr::Str(sv, _) => paths.push(sv.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                let t: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(x) => Some(x.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                paths.push(t);
+            }
+            _ => return false,
+        }
+    }
+    if paths.is_empty() || paths.len() > 8 {
+        return false;
+    }
+    let list: Vec<String> = paths
+        .iter()
+        .map(|p| crate::ir::safe_perl_q_string(p))
+        .collect();
+    let multi = if paths.len() > 1 { "1" } else { "0" };
+    // unique temp name per site so multiple ls transforms in one program
+    // don't redeclare (perl "masks earlier declaration" warnings)
+    static LS_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let idx = LS_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let rc = format!("__lsrc{idx}");
+    let bad = format!("__lsbad{idx}");
+    let lp = format!("__lp{idx}");
+    let p = format!("__p{idx}");
+    let dh = format!("__dh{idx}");
+    let d = format!("__d{idx}");
+    let mut code = format!(
+        r#"my ${rc} = 0; do {{ my ${bad} = 0; my @{lp} = ({}); my $__multi = {multi}; for my ${p} (@{lp}) {{ if (!-e ${p}) {{ ${bad} = 1; next; }} if (-d ${p}) {{ if ($__multi) {{ print STDOUT "${p}:\n"; }} opendir(my ${dh}, ${p}) or next; my @{d} = sort grep {{ $_ ne '.' && $_ ne '..' }} readdir(${dh}); closedir ${dh}; if (@{d}) {{ print STDOUT join("\n", @{d}), "\n"; }} }} else {{ print STDOUT ${p}, "\n"; }} }} ${rc} = ${bad} ? 2 : 0; }}"#,
+        list.join(", ")
+    );
+    if let Some((content, newline)) = else_echo {
+        let cq = crate::ir::safe_perl_q_string(&content);
+        let nl = if newline { ", \"\\n\"" } else { "" };
+        code.push_str(&format!(
+            "; if (${rc}) {{ print STDOUT {cq}{nl}; }} $main_exit_code = $CHILD_ERROR = ${rc};"
+        ));
+    } else {
+        code.push_str("$main_exit_code = $CHILD_ERROR = 0;");
+    }
+    *st = IrStmt::RawText(code);
     true
 }
 
