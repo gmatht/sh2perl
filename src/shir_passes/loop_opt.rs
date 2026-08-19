@@ -460,6 +460,18 @@ fn collect_expr_reads(e: &IrExpr, fns: &HashMap<String, FnInfo>, out: &mut HashS
                 if let Some(IrExpr::Str(n, _)) = args.get(1) {
                     out.insert(n.clone());
                 }
+                // param's OTHER args carry unexpanded $vars too: the
+                // slice start of `${s:$i:1}` arrives as Str("$i") (not a
+                // Var node), so the invariance analysis saw dt_ch as
+                // loop-invariant and hoisted the slice out of draw_text's
+                // loop — every HUD char drew the first one. Decode every
+                // Str arg like the array ops arm does (the NAME arg
+                // decodes to nothing — no $).
+                for a in args {
+                    if let IrExpr::Str(s, _) = a {
+                        bare_dollar_names(s, out);
+                    }
+                }
             } else if func == "test" || func == "arith" {
                 for a in args {
                     if let IrExpr::Str(s, _) = a {
