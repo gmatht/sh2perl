@@ -178,7 +178,8 @@ fn transform_stmt(
                     | native_echo_filter_stmt(st)
                     | native_echo_xargs_stmt(st)
                     | native_echo_tr_sort_stmt(st)
-                    | native_literal_subshell_wc_stmt(st);
+                    | native_literal_subshell_wc_stmt(st)
+                    | native_find_stmt(st);
             }
             x |= native_echo_grep_stmt(st);
             x |= normalize_literal_exec_words(st);
@@ -197,6 +198,7 @@ fn transform_stmt(
             x |= native_echo_xargs_stmt(st);
             x |= native_echo_tr_sort_stmt(st);
             x |= native_literal_subshell_wc_stmt(st);
+            x |= native_find_stmt(st);
             x |= native_ls_stmt(st);
             x |= native_rm_rf_stmt(st);
             x |= native_trap_stmt(st);
@@ -5151,6 +5153,147 @@ fn native_while_multi_cond(st: &mut IrStmt) -> bool {
         }
         _ => return false,
     }
+    true
+}
+
+/// `find DIR -name PAT | head -N` (perl-only): recursive readdir walk
+/// (depth-first in readdir order, like find), match the basename against
+/// the literal pattern (suffix/glob), print matching paths, then head.
+fn native_find_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::Call { func, args }) = st else { return false; };
+    if func != "pipeline" {
+        return false;
+    }
+    let [IrExpr::Array(stages)] = args.as_slice() else { return false; };
+    if stages.len() < 1 || stages.len() > 2 {
+        return false;
+    }
+    // stage 0: find DIR -name PAT
+    let IrExpr::Arrow(s0) = &stages[0] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: f0, args: a0 })] = s0.as_slice() else {
+        return false;
+    };
+    if !matches!(f0.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(cmd0, _), IrExpr::Array(w0)] = a0.as_slice() else { return false; };
+    if cmd0 != "find" {
+        return false;
+    }
+    let mut dir: Option<String> = None;
+    let mut pat: Option<String> = None;
+    let mut i = 0;
+    while i < w0.len() {
+        let Some(t) = (match &w0[i] {
+            IrExpr::Str(sv, _) => Some(sv.clone()),
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                Some(
+                    parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            InterpPart::Lit(x) => Some(x.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }) else {
+            return false;
+        };
+        if t == "-name" {
+            i += 1;
+            if i >= w0.len() {
+                return false;
+            }
+            let Some(p) = (match &w0[i] {
+                IrExpr::Str(sv, _) => Some(sv.clone()),
+                IrExpr::Interpolate(parts)
+                    if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+                {
+                    Some(
+                        parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                InterpPart::Lit(x) => Some(x.as_str()),
+                                _ => None,
+                            })
+                            .collect(),
+                    )
+                }
+                _ => None,
+            }) else {
+                return false;
+            };
+            pat = Some(p);
+        } else if t.starts_with('-') {
+            return false;
+        } else if dir.is_none() {
+            dir = Some(t);
+        } else {
+            return false;
+        }
+        i += 1;
+    }
+    let Some(dir) = dir else { return false; };
+    let Some(pat) = pat else { return false; };
+    // the pattern: a literal suffix glob ("*.sh") or plain text
+    let suffix: Option<String> = if pat.len() >= 2 && pat.starts_with('*') {
+        Some(pat[1..].to_string())
+    } else {
+        None
+    };
+    if suffix.is_none() && (pat.contains('*') || pat.contains('?') || pat.contains('[')) {
+        return false;
+    }
+    let dq = crate::ir::safe_perl_q_string(&dir);
+    // optional head -N
+    let mut head_n: Option<usize> = None;
+    if stages.len() == 2 {
+        let IrExpr::Arrow(s1) = &stages[1] else { return false; };
+        let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+            return false;
+        };
+        if !matches!(f1.as_str(), "builtin" | "exec") {
+            return false;
+        }
+        let [IrExpr::Str(cmd1, _), IrExpr::Array(w1)] = a1.as_slice() else { return false; };
+        if cmd1 != "head" || w1.len() != 1 {
+            return false;
+        }
+        let Some(t) = (match &w1[0] {
+            IrExpr::Str(sv, _) => Some(sv.clone()),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let Some(n) = t.strip_prefix('-') else { return false; };
+        let Ok(v) = n.parse() else { return false; };
+        head_n = Some(v);
+    }
+    let matcher = match &suffix {
+        Some(sf) => format!(
+            "if (-d $__p) {{ $__walk->($__p); }} elsif (substr($__e, -{}) eq {}) {{ push @__out, $__p; }}",
+            sf.len(),
+            crate::ir::safe_perl_q_string(sf)
+        ),
+        None => {
+            let pq = crate::ir::safe_perl_q_string(&pat);
+            format!(
+                "if (-d $__p) {{ $__walk->($__p); }} elsif ($__e eq {pq}) {{ push @__out, $__p; }}"
+            )
+        }
+    };
+    let head = match head_n {
+        Some(n) => format!(" splice(@__out, {n}) if @__out > {n};"),
+        None => String::new(),
+    };
+    let code = format!(
+        r#"do {{ my @__out; my $__walk; $__walk = sub {{ my ($__d) = @_; opendir(my $__h, $__d) or return; my @__e = readdir($__h); closedir $__h; for my $__e (@__e) {{ next if $__e eq '.' || $__e eq '..'; my $__p = "$__d/$__e"; {matcher} }} }}; $__walk->({dq});{head} if (@__out) {{ print STDOUT join("\n", @__out), "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+    );
+    *st = IrStmt::RawText(code);
     true
 }
 
