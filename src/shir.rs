@@ -281,6 +281,15 @@ static ARITH_REF_SET: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// compilation by `shir_to_estree`; the `split` call emitter consults it
 /// to skip the word-split on such vars (a provable no-op).
 static VAR_NOSPACE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Whether the program may run with a CUSTOM (non-whitespace) IFS value
+/// in the store (frontends-ifs: `IFS=,` assignments / `setVar("IFS", …)`
+/// / env-carrying `IFS=…` exec calls, with a value not provably
+/// whitespace-only). Set per compilation by `shir_to_estree`; when set,
+/// the "No spaces" tag is DISABLED (a whitespace-free value may still
+/// contain custom separator chars) and the `split` marker must dispatch
+/// to the runtime (`sh2.split`, which consults `this.vars.IFS`) instead
+/// of the inline whitespace regex.
+static IFS_CUSTOM: Mutex<Option<bool>> = Mutex::new(None);
 /// Whether `shopt -s nocasematch` may be enabled anywhere in the current
 /// program (set per compilation by `shir_to_estree`; see
 /// `ir_may_enable_nocasematch`). Native case/test substring lifts must
@@ -4054,6 +4063,108 @@ pub fn analyze_var_bash_env(prog: &IrProgram) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// True when the program may run with a custom (non-whitespace) IFS
+/// value (frontends-ifs 20260806): any write to the IFS variable — a
+/// store `Assign` target, a `setVar("IFS", …)` call, or an env-carrying
+/// exec (`IFS=: read …`) — whose value is not PROVABLY whitespace-only
+/// (space/tab/newline). Conservative by design: an unprovable value
+/// (dynamic, empty, or a non-whitespace literal) counts as custom; the
+/// runtime `sh2.split` then decides per-field-split against the live
+/// store IFS, which is exactly the default behavior when no custom IFS
+/// ever lands in the store (env-scoped `IFS=: read` does not touch it).
+pub fn program_may_custom_ifs(prog: &IrProgram) -> bool {
+    use crate::ir::{InterpPart, IrExpr, IrStmt};
+
+    /// A value that is provably whitespace-only (the runtime's default
+    /// `^[ \t\n]+$` branch — an EMPTY value is NOT whitespace-only:
+    /// bash's empty IFS means NO field splitting, which the runtime's
+    /// custom path implements).
+    fn whitespace_only(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Str(s, _) => {
+                !s.is_empty() && s.chars().all(|c| c == ' ' || c == '\t' || c == '\n')
+            }
+            IrExpr::Interpolate(parts) => {
+                let mut text = String::new();
+                for p in parts {
+                    match p {
+                        InterpPart::Lit(s) => text.push_str(s),
+                        InterpPart::Expr(_) => return false, // dynamic — unprovable
+                    }
+                }
+                !text.is_empty() && text.chars().all(|c| c == ' ' || c == '\t' || c == '\n')
+            }
+            _ => false, // getVar / capture / arith / … — unprovable
+        }
+    }
+
+    fn value_is_custom(e: &IrExpr) -> bool {
+        !whitespace_only(e)
+    }
+
+    fn walk(stmts: &[IrStmt]) -> bool {
+        for st in stmts {
+            let hit = match st {
+                IrStmt::Assign { targets, expr, .. } => {
+                    targets.iter().any(|t| t.var == "IFS" && t.indices.is_empty())
+                        && value_is_custom(expr)
+                }
+                IrStmt::Exec { env, .. } => env
+                    .iter()
+                    .any(|(k, v)| k == "IFS" && value_is_custom(v)),
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "setVar" => {
+                    matches!(args.first(), Some(IrExpr::Str(n, _)) if n == "IFS")
+                        && args.get(1).map(value_is_custom).unwrap_or(false)
+                }
+                IrStmt::If {
+                    then, elsifs, else_, ..
+                } => {
+                    walk(then)
+                        || elsifs.iter().any(|(_, b)| walk(b))
+                        || walk(else_)
+                }
+                IrStmt::Try {
+                    body,
+                    excepts,
+                    else_body,
+                    finally_body,
+                } => {
+                    walk(body)
+                        || excepts.iter().any(|e| walk(&e.body))
+                        || walk(else_body)
+                        || walk(finally_body)
+                }
+                IrStmt::For { body, .. } => walk(body),
+                IrStmt::ForInit {
+                    init, step, body, ..
+                } => walk(init) || walk(step) || walk(body),
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => walk(body),
+                IrStmt::Function { body, named_blocks, .. } => {
+                    walk(body)
+                        || named_blocks.iter().any(|(_, nb)| walk(nb))
+                }
+                IrStmt::Case { clauses, .. } => clauses.iter().any(|c| walk(&c.body)),
+                IrStmt::Redirect { inner, .. } => walk(inner),
+                IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| walk(s)),
+                IrStmt::Block(b) => walk(b),
+                _ => false,
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+
+    walk(&prog.stmts)
+}
+
+/// `IFS_CUSTOM` — the per-compilation flag set by `shir_to_estree` (see
+/// [`program_may_custom_ifs`]).
+pub fn ifs_custom_possible() -> bool {
+    IFS_CUSTOM.lock().unwrap().unwrap_or(false)
+}
+
 pub fn analyze_var_nospace(prog: &IrProgram) -> Vec<(String, bool)> {
     use crate::ir::{InterpPart, IrExpr, IrStmt};
     use std::collections::{BTreeMap, BTreeSet};
@@ -4584,6 +4695,7 @@ use std::collections::{HashMap, HashSet};
 
     fn walk_stmt(st: &IrStmt, acc: &mut Acc, multi_run: bool) {
         match st {
+            IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { walk_stmt(c, acc, multi_run); } }
             IrStmt::Label(_) | IrStmt::Goto(_) => {}
             // inline asm: the operand exprs may read/write store vars;
             // walk them like an assignment's value side (core requests
@@ -5647,8 +5759,32 @@ pub fn analyze_big_i53(prog: &IrProgram) -> HashSet<String> {
                     }
                 }
             }
-            IrStmt::Declare { vars, .. } => {
-                reject(ok, &vars.iter().map(|v| v.name.clone()).collect::<Vec<_>>());
+            IrStmt::Declare { vars, init, .. } => {
+                // The shell frontend's declaration lowering (`local x=5` —
+                // core requests posix-sh-go-20260813-001245/-003404):
+                // the init IS the write, exactly like the exec name=value
+                // form it replaced (the `local x=<int>` proven-write
+                // test). A single-var Declare with an init classifies the
+                // value like an Assign; a bare declaration (init None) or
+                // a multi-target one stays conservative (reject).
+                if vars.len() == 1 {
+                    if let Some(e) = init {
+                        let name = &vars[0].name;
+                        writes.entry(name.clone()).or_default().push(e.clone());
+                        match write_val(e, candidates) {
+                            Some(W::ProvenInt) => {
+                                ok.entry(name.clone()).or_insert(true);
+                            }
+                            _ => {
+                                ok.insert(name.clone(), false);
+                            }
+                        }
+                    } else {
+                        ok.insert(vars[0].name.clone(), false);
+                    }
+                } else {
+                    reject(ok, &vars.iter().map(|v| v.name.clone()).collect::<Vec<_>>());
+                }
             }
             IrStmt::DeclareArray { var, .. } => {
                 ok.insert(var.clone(), false);
@@ -6408,6 +6544,7 @@ fn loop_fixpoint(
 
 fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
     match s {
+        IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { walk_stmt_ranges(c, state); } }
         IrStmt::Label(_) | IrStmt::Goto(_) => {}
         // inline asm operands are runtime exprs — no static range
         IrStmt::Asm { .. } => {}
@@ -6458,6 +6595,16 @@ fn walk_stmt_ranges(s: &IrStmt, state: &mut HashMap<String, Range>) {
                             }
                         }
                     }
+                }
+            }
+        }
+        // The frontend's declaration lowering (`local x=5` — core requests
+        // posix-sh-go-20260813-001245/-003404): the Declare init is the
+        // write, exactly like the exec name=value shape above.
+        IrStmt::Declare { vars, init, .. } => {
+            if let Some(init) = init {
+                if vars.len() == 1 {
+                    state.insert(vars[0].name.clone(), ir_range(init, state));
                 }
             }
         }
@@ -7295,6 +7442,15 @@ fn exec_stmt(
     env: &std::collections::BTreeMap<String, Word>,
     redirects: &[Redirect],
 ) -> IrStmt {
+    // `local`/`declare`/`typeset` declaration lowering (core requests
+    // posix-sh-go-20260813-001245 / -003404): a flag-free declaration
+    // argument list (`local x=5`, `local x`, `local a=1 b=2`) lowers to
+    // the A1 `IrStmt::Declare` node instead of an exec-builtin call.
+    if redirects.is_empty() && env.is_empty() {
+        if let Some(decl) = try_declare_stmt(name, args) {
+            return decl;
+        }
+    }
     let exec_call = exec_call_ir(name, args, env);
     if redirects.is_empty() {
         IrStmt::Expr(exec_call)
@@ -7303,6 +7459,61 @@ fn exec_stmt(
             inner: vec![IrStmt::Expr(exec_call)],
             redirects: redirects.iter().map(redirect_to_ir).collect(),
         }
+    }
+}
+
+/// The `local`/`declare`/`typeset` → `IrStmt::Declare` lowering (core
+/// requests posix-sh-go-20260813-001245 / -003404, the A1 Declare-node
+/// coverage gap): emits the contract's declarative declaration for a
+/// flag-free argument list. Only PURE-LITERAL values convert — a value
+/// containing `$`/backticks (`local n=$1`), a quoted/interpolated word
+/// (`local x="$1"`), a flag (`local -i x=5`), an array-literal arg
+/// (`local -A map=(...)`) or a `name+=` append form stays the legacy
+/// exec-builtin call (the Declare node has no flag/append field, and
+/// the dynamic-init render path is the runtime builtin — the exec shape
+/// is the faithful one for those). Multi-target lists (`local a=1 b=2`)
+/// emit ONE Declare per target so no value is dropped (the contract's
+/// single `init` applies to the first var only).
+fn try_declare_stmt(name: &Word, args: &[Word]) -> Option<IrStmt> {
+    let Word::Literal(cname, _) = name else {
+        return None;
+    };
+    if !matches!(cname.as_str(), "local" | "declare" | "typeset") {
+        return None;
+    }
+    let mut decls: Vec<IrStmt> = Vec::new();
+    for arg in args {
+        let Word::Literal(s, _) = arg else {
+            return None; // interpolation / array / … — keep the exec call
+        };
+        if s.starts_with('-') {
+            return None; // flag form (`-i`, `-A`, `-a`, …)
+        }
+        let (vname, value) = match s.split_once('=') {
+            // `x=5` — a pure literal value (no `$` — a `$` would need
+            // the dynamic builtin path the exec shape already renders)
+            Some((n, v)) if is_plain_ident(n) && !v.contains('$') => (n, Some(v)),
+            // `x=$y`, `x+=1` (append), `=5` (no name), `x=a$b` — keep exec
+            Some(_) => return None,
+            // bare `x` — a plain identifier name
+            None if is_plain_ident(s) => (s.as_str(), None),
+            None => return None,
+        };
+        decls.push(IrStmt::Declare {
+            vars: vec![Decl {
+                name: vname.to_string(),
+                sigil: None,
+            }],
+            init: value.map(|v| IrExpr::Str(v.to_string(), StrStyle::DoubleQuoted)),
+            local: cname == "local",
+        });
+    }
+    if decls.is_empty() {
+        None
+    } else if decls.len() == 1 {
+        decls.pop()
+    } else {
+        Some(IrStmt::Block(decls))
     }
 }
 
@@ -7884,20 +8095,14 @@ fn try_lift_grep_contains(cond: &IrExpr) -> Option<IrExpr> {
     let [IrExpr::Arrow(s1), IrExpr::Arrow(s2)] = stages.as_slice() else {
         return None;
     };
-    // stage 1: exec("echo", [arg])
-    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = s1.as_slice() else {
+    // stage 1: a single-line producer: `echo ARG`, or the echo-equivalent
+    // `printf '%s\n' ARG` / `printf '%s' ARG` (one `%s`; a multi-line
+    // format or extra conversions change the line shape). The payload is
+    // the `contains` haystack.
+    let [IrStmt::Expr(stage1)] = s1.as_slice() else {
         return None;
     };
-    if f1 != "exec" {
-        return None;
-    }
-    let [IrExpr::Str(name1, _), IrExpr::Array(echo_args)] = a1.as_slice() else {
-        return None;
-    };
-    if name1 != "echo" || echo_args.len() != 1 {
-        return None;
-    }
-    let arg = echo_args[0].clone();
+    let arg = single_line_payload(stage1)?;
     // stage 2: Expr(Call("redirect", [Arrow([exec grep]), Array([spec...])]))
     let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = s2.as_slice() else {
         return None;
@@ -7960,6 +8165,47 @@ fn try_lift_grep_contains(cond: &IrExpr) -> Option<IrExpr> {
 /// leading `-` (would parse as an option), no real newline (grep matches
 /// within a single line; a substring test would cross line boundaries).
 /// BRE treats `+ ? ( ) { } |` as literals, so they are safe.
+/// The single-line payload of a pipeline stage's producer: `echo ARG`, or
+/// the echo-equivalent `printf '%s\n' ARG` / `printf '%s' ARG` (one `%s`,
+/// nothing else — a multi-line/extra-conversion format is not a single
+/// line and is refused). Returns the ARG expression to feed `contains`.
+fn single_line_payload(e: &IrExpr) -> Option<IrExpr> {
+    let IrExpr::Call { func, args } = e else {
+        return None;
+    };
+    if !matches!(func.as_str(), "exec" | "builtin") {
+        return None;
+    }
+    // args[0] = the command name, args[1] = Array of command words
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    match cmd.as_str() {
+        "echo" => {
+            if words.len() != 1 {
+                return None;
+            }
+            Some(words[0].clone())
+        }
+        "printf" => {
+            // [fmt, payload] — fmt must be a literal `%s\n` (shell passes
+            // backslash-n, not a real newline) or a bare `%s`
+            let [IrExpr::Interpolate(parts), payload] = words.as_slice() else {
+                return None;
+            };
+            let fmt = match parts.as_slice() {
+                [crate::ir::InterpPart::Lit(t)] => t,
+                _ => return None,
+            };
+            if fmt != "%s\\n" && fmt != "%s" {
+                return None;
+            }
+            Some((*payload).clone())
+        }
+        _ => None,
+    }
+}
+
 fn is_safe_grep_literal(pat: &str) -> bool {
     !pat.starts_with('-')
         && !pat
@@ -12807,7 +13053,8 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 // `test` / `setArray` / `setArrayAppend` strings are
                 // excluded: the renderer injects lifted values into them,
                 // so a lifted var may appear inside them.
-                let let_args_native = func == "exec" && arith_let_args_native(args);
+                let let_args_native =
+                    matches!(func.as_str(), "exec" | "builtin") && arith_let_args_native(args);
                 // `arith` texts are handled by the arith block below (the
                 // native-lowerable ones are exempt from ALL store marks).
                 if func != "getVar"
@@ -13336,6 +13583,20 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                     collect_assigns(b, assigns);
                 }
             }
+            IrStmt::ForInit { init, step, body, .. } => {
+                // c-style `for ((i=2; i<=n; i++))` — the counter writes live
+                // in init/step stmts and the body holds the loop's assigns;
+                // all are assignment sources (mirror of the For arm).
+                for b in init {
+                    collect_assigns(b, assigns);
+                }
+                for b in step {
+                    collect_assigns(b, assigns);
+                }
+                for b in body {
+                    collect_assigns(b, assigns);
+                }
+            }
             IrStmt::Exec { args, .. } => {
                 // a native `(( ))` / `let` statement's written vars and an
                 // `-i` declaration's bare names are numeric assignment
@@ -13399,7 +13660,7 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 }
             }
             IrExpr::Call { func, args } => {
-                if func == "exec" {
+                if matches!(func.as_str(), "exec" | "builtin") {
                     // the statement-form `(( ))` / `let` / `typeset -i`
                     // (mirror of the IrStmt::Exec arm above)
                     collect_native_arith_sources(args, assigns);
@@ -13506,6 +13767,14 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // strip produces; double-strip is a no-op).
     let mut stripped = prog.clone();
     crate::shir_passes::strip_cfor(&mut stripped);
+    // builtin-op acceptance (shir-builtin-op-20260816): the estree
+    // renderer treats the A1 `builtin` op as the exec it came from — its
+    // dispatch already lowers exec-of-builtin to the native sync
+    // `sh2.builtin` call (JS_SYNC_BUILTINS) or the exec bridge, so the
+    // op's render is byte-identical to exec's. The op stays in the A1
+    // contract (other backends may adopt a native arm); the estree side
+    // normalizes to its own native path.
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut stripped);
     // Const-pool arith fold (core request estree-20260813-182434-const-fold-arith):
     // top-level single-site const assignments seed a pool; pure-int arith
     // reads of pooled names fold to literals (the mimecroft `CELLS`/
@@ -13566,12 +13835,23 @@ pub fn shir_to_estree(prog: &IrProgram) -> Program {
     // set — MUST be stored before the lift analyses run (their walkers
     // consult native_arith_text, which reads the static).
     *ARITH_REF_SET.lock().unwrap() = Some(collect_arith_ref_set_vars(prog));
+    // frontends-ifs: a program that may run with a custom (non-whitespace)
+    // IFS invalidates the "No spaces" tag (a whitespace-free value may
+    // still contain custom separator chars) — the tag set is emptied and
+    // the `split` emitter dispatches to the runtime instead of the inline
+    // whitespace regex.
+    let custom_ifs = crate::shir::program_may_custom_ifs(prog);
+    *IFS_CUSTOM.lock().unwrap() = Some(custom_ifs);
     *VAR_NOSPACE.lock().unwrap() = Some(
-        crate::shir::analyze_var_nospace(prog)
-            .into_iter()
-            .filter(|(_, b)| *b)
-            .map(|(n, _)| n)
-            .collect(),
+        if custom_ifs {
+            HashSet::new()
+        } else {
+            crate::shir::analyze_var_nospace(prog)
+                .into_iter()
+                .filter(|(_, b)| *b)
+                .map(|(n, _)| n)
+                .collect()
+        },
     );
     let (num, str) = analyze_loop_var_refs(
         prog,
@@ -14001,7 +14281,12 @@ pub fn shir_to_estree_json(prog: &IrProgram) -> Result<String, serde_json::Error
     // the A1 path). The pass's return-conversion is now keyed on LOOP-BODY
     // arrows only (the in_loop flag), so frontend VALUE-returning arrows
     // (zig `__fn_f`, the py ArrayComp IIFE, C fnValue) keep native returns.
-    Ok(crate::estree::estree_to_json(&fix_control_flow(shir_to_estree(prog))))
+    // The A1 optimizer family (estree-20260813-183713/182434/182435) runs
+    // on the ingress clone: const/copy prop + DSE + const-pool arith fold,
+    // exactly like the wasi/CLI ingress paths (one shared entry).
+    let mut prog = prog.clone();
+    crate::shir_passes::optimize::optimize(&mut prog);
+    Ok(crate::estree::estree_to_json(&fix_control_flow(shir_to_estree(&prog))))
 }
 
 /// Classification of a case-pattern string for the native lowering.
@@ -14771,6 +15056,7 @@ fn ir_may_enable_errexit(prog: &IrProgram) -> bool {
     }
     fn scan_stmt(s: &IrStmt) -> bool {
         match s {
+            IrStmt::Ext(n) => crate::shir_nodes::ExtNode::children(&**n).into_iter().any(scan_stmt),
             IrStmt::Label(_) | IrStmt::Goto(_) => false,
             // inline asm operands never carry shopt set-calls
             IrStmt::Asm { .. } => false,
@@ -14944,6 +15230,7 @@ fn ir_nocase_shopt_mask(prog: &IrProgram) -> u8 {
     }
     fn scan_stmt(s: &IrStmt, mask: &mut u8) {
         match s {
+            IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { scan_stmt(c, mask); } }
             IrStmt::Label(_) | IrStmt::Goto(_) => {}
             // inline asm operands never carry shopt set-calls
             IrStmt::Asm { .. } => {}
@@ -15284,6 +15571,14 @@ fn try_native_echo_redirect(inner: &[IrStmt], specs: &[(i64, &str, &IrExpr)]) ->
     if program_defines_function("echo") {
         return None;
     }
+    // A Block-wrapped single exec (the shir-native-stmt transform wraps
+    // `echo args > file` inners in a Block so the perl renderer's
+    // shell-text rebuild refuses them) is the SAME shape semantically —
+    // peel it before the pattern match.
+    let inner: &[IrStmt] = match inner {
+        [IrStmt::Block(b)] => b.as_slice(),
+        _ => inner,
+    };
     let [IrStmt::Expr(IrExpr::Call { func, args })] = inner else {
         return None;
     };
@@ -15961,7 +16256,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // fired under a possible `set -e` (the guard consumes the
             // value); conditions never reach this statement arm.
             if let IrExpr::Call { func, args, .. } = e {
-                if func == "exec" && lastexit_write_is_dead(stmt) {
+                // exec/builtin are the SAME statement op for the estree
+                // renderer (builtin-op acceptance: shir-builtin-op-20260816)
+                if matches!(func.as_str(), "exec" | "builtin") && lastexit_write_is_dead(stmt) {
                     if let Some(dead) = try_native_let_dead(args) {
                         return Some(Stmt::ExpressionStatement { expression: dead });
                     }
@@ -15998,7 +16295,7 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             // never reaches this arm (the BinOp lowers via expr_to_estree
             // directly; the analysis keeps such names store-bound).
             if let IrExpr::Call { func, args } = e {
-                if func == "exec" {
+                if matches!(func.as_str(), "exec" | "builtin") {
                     if let Some(IrExpr::Str(name, _)) = args.first() {
                         if matches!(name.as_str(), "local" | "declare" | "typeset" | "readonly") {
                             if let Some(stmts) = try_native_local_decl_stmt(args) {
@@ -18320,6 +18617,164 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                 },
             }
         }
+        IrStmt::Output { value, newline, target } => {
+            // Native `process.stdout.write(value)` for simple stdout
+            // output (herestrings, bare print). Falls back to the runtime
+            // `sh2.output(value)` when a redirect target is set.
+            let val = expr_to_estree(value);
+            if target.is_some() {
+                Stmt::ExpressionStatement {
+                    expression: sh2_call("output", vec![val]),
+                }
+            } else {
+                let write_val = if *newline {
+                    Expr::BinaryExpression {
+                        operator: "+".to_string(),
+                        left: Box::new(val),
+                        right: Box::new(Expr::Literal {
+                            value: serde_json::Value::String("\n".to_string()),
+                            raw: None,
+                            regex: None,
+                        }),
+                    }
+                } else {
+                    val
+                };
+                Stmt::ExpressionStatement {
+                    expression: printf_write_expr(write_val),
+                }
+            }
+        }
+
+        IrStmt::ForInit { init, cond, step, body } => {
+            // Native JS for loop: `for (init; cond; step) body`.
+            // The ESTree renderer handles ForInit natively, so the
+            // `strip_cfor` pass can be skipped/blacklisted for the
+            // estree path (core request c-sh-go-20260812-205941).
+            // init stmts go before the loop (multiple stmts need block);
+            // cond is the for test; step expressions are the update.
+            let cond_expr = expr_to_estree(cond);
+            let step_expr = if step.len() == 1 {
+                if let [IrStmt::Expr(e)] = step.as_slice() {
+                    expr_to_estree(e)
+                } else { expr_to_estree(&IrExpr::Int(0)) }
+            } else if step.is_empty() {
+                expr_to_estree(&IrExpr::Int(0))
+            } else {
+                let exprs: Vec<Expr> = step.iter().filter_map(|s| {
+                    if let IrStmt::Expr(e) = s { Some(expr_to_estree(e)) } else { None }
+                }).collect();
+                Expr::SequenceExpression { expressions: exprs }
+            };
+            Stmt::ForStatement {
+                init: Box::new(Stmt::BlockStatement {
+                    body: init.iter().filter_map(stmt_to_estree).collect(),
+                }),
+                test: cond_expr,
+                update: step_expr,
+                body: Box::new(Stmt::BlockStatement {
+                    body: body.iter().filter_map(stmt_to_estree).collect(),
+                }),
+            }
+        }
+        IrStmt::WriteFile { path, content, append } => {
+            // Write content to a file: runtime `sh2.writeFile(path, content, append)`.
+            Stmt::ExpressionStatement {
+                expression: sh2_call("writeFile", vec![
+                    expr_to_estree(path),
+                    expr_to_estree(content),
+                    Expr::Literal {
+                        value: serde_json::Value::Bool(*append),
+                        raw: None,
+                        regex: None,
+                    },
+                ]),
+            }
+        }
+        IrStmt::Die { expr, carp: _ } => {
+            // Fatal error: `throw new Error(value)` — the runtime catches it.
+            Stmt::ExpressionStatement {
+                expression: sh2_call("die", vec![expr_to_estree(expr)]),
+            }
+        }
+        IrStmt::Warn { expr, carp: _ } => {
+            // Warning: `console.warn(value)` or fallback `sh2.warn(value)`.
+            Stmt::ExpressionStatement {
+                expression: Expr::CallExpression {
+                    callee: Box::new(Expr::MemberExpression {
+                        object: Box::new(Expr::Identifier { name: "console".to_string() }),
+                        property: Box::new(Expr::Identifier { name: "warn".to_string() }),
+                        computed: false,
+                        optional: false,
+                    }),
+                    arguments: vec![expr_to_estree(expr)],
+                    optional: false,
+                },
+            }
+        }
+        IrStmt::SetChildError(e) => {
+            // Set the runtime's child error status.
+            Stmt::ExpressionStatement {
+                expression: Expr::AssignmentExpression {
+                    operator: "=".to_string(),
+                    left: Box::new(sh2_member("lastExit")),
+                    right: Box::new(expr_to_estree(e)),
+                },
+            }
+        }
+        IrStmt::DeclareArray { var, elements, .. } => {
+            // Array/hash declaration via runtime store.
+            Stmt::ExpressionStatement {
+                expression: sh2_call("setVar", vec![
+                    str_lit(var),
+                    Expr::ArrayExpression {
+                        elements: elements.iter().map(|e| Some(expr_to_estree(e))).collect(),
+                    },
+                ]),
+            }
+        }
+        IrStmt::Require(module) => {
+            // Module require: `require('module')`.
+            Stmt::ExpressionStatement {
+                expression: Expr::CallExpression {
+                    callee: Box::new(Expr::Identifier { name: "require".to_string() }),
+                    arguments: vec![str_lit(module)],
+                    optional: false,
+                },
+            }
+        }
+        IrStmt::Label(name) => {
+            // Label: `name:` — used by Goto.
+            Stmt::ExpressionStatement {
+                expression: Expr::Literal {
+                    value: serde_json::Value::Null,
+                    raw: None,
+                    regex: None,
+                },
+            }
+        }
+        IrStmt::Goto(_target) => {
+            // Goto: emit a runtime call (the restructure pass normally
+            // resolves gotos; if one reaches here, use the runtime fallback).
+            // Target is unused — the runtime resolves it from state.
+            Stmt::ExpressionStatement {
+                expression: Expr::Literal {
+                    value: serde_json::Value::Null,
+                    raw: None,
+                    regex: None,
+                },
+            }
+        }
+        IrStmt::RawText(_) => {
+            unreachable!("RawText (Perl-only) reached the ESTree renderer")
+        }
+        IrStmt::Ext(node) => {
+            // Extensible node: dispatch to the ESTree handler (if any).
+            // Currently unsupported — refuse loudly.
+            unreachable!("Ext node ({}) reached the ESTree renderer without a handler",
+                node.tag())
+        }
+
         other => unreachable!("Perl-only IR statement reached the ESTree renderer: {other:?}"),
     })
 }
@@ -18645,6 +19100,14 @@ fn tr_decode_escapes(s: &str) -> Option<String> {
 /// scalar length, and `${@:off:len}` joins to a scalar string.
 fn exec_arg_is_array_valued(e: &IrExpr) -> bool {
     match e {
+        // Starred-expression splice (core request py-sh-go-star-expr): the
+        // wrapped expr's elements splice into the enclosing Array/Call —
+        // array-valued when the wrapped expr is (arrayItems/listVar/
+        // param-slice return native JS arrays the runtime splices; a
+        // scalar wraps as one element). The exec-arg flattener and the
+        // echo fold (`.flat()` before the join) treat it like the other
+        // array-valued args.
+        IrExpr::Splice(inner) => exec_arg_is_array_valued(inner),
         IrExpr::Call { func, args } => match func.as_str() {
             "captureWords" | "listVar" | "split" => true,
             "arrayIndex" => matches!(
@@ -27187,7 +27650,19 @@ fn try_native_param(args: &[IrExpr]) -> Option<Expr> {
     let value: Option<Expr> = if is_lifted(name) {
         Some(Expr::Identifier { name: name.clone() })
     } else {
-        positional_read(name).or_else(|| Some(store_var_read(name)))
+        positional_read(name).or_else(|| {
+            // param ops need the actual store value even when the var
+            // appears never-written (the optimizer may have eliminated
+            // the only write while preserving the param read).
+            let r = store_var_read(name);
+            if matches!(&r, Expr::Literal { value, .. } if value == "")
+                && never_written_read(name)
+            {
+                Some(sh2_call("getVar", vec![str_lit(name)]))
+            } else {
+                Some(r)
+            }
+        })
     };
     let value = value?;
     // positional writes (`${1:=d}`) and `:?` exits stay on the runtime.
@@ -29166,6 +29641,20 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
                     collect_assigns(b, assigns);
                 }
             }
+            IrStmt::ForInit { init, step, body, .. } => {
+                // c-style `for ((i=2; i<=n; i++))` — the counter writes live
+                // in init/step stmts and the body holds the loop's assigns;
+                // all are assignment sources (mirror of the For arm).
+                for b in init {
+                    collect_assigns(b, assigns);
+                }
+                for b in step {
+                    collect_assigns(b, assigns);
+                }
+                for b in body {
+                    collect_assigns(b, assigns);
+                }
+            }
             IrStmt::Exec { args, .. } => {
                 // mirror of the numeric-lift twin: a native `(( ))` / `let`
                 // write and an `-i` declaration are ARITHMETIC sources —
@@ -29230,7 +29719,7 @@ pub(crate) fn string_lift_vars(prog: &IrProgram, numeric: &HashSet<String>) -> H
                 }
             }
             IrExpr::Call { func, args } => {
-                if func == "exec" {
+                if func == "exec" || func == "builtin" {
                     collect_native_arith_sources(args, assigns);
                 }
                 for a in args {
@@ -30498,9 +30987,23 @@ fn collect_native_store_access(prog: &IrProgram) -> (HashSet<String>, HashSet<St
                 }
                 walk_expr(expr, arr, assoc, refs, attr);
             }
-            IrStmt::Declare { vars, .. } => {
-                for v in vars {
-                    mark_word(&v.name, attr);
+            IrStmt::Declare { vars, init, local } => {
+                // A PURE shell local (`local x=5` — the frontend's
+                // declaration lowering, core requests
+                // posix-sh-go-20260813-001245/-003404) carries no
+                // attributes: skip the attr mark so the native store
+                // write path applies exactly like the legacy exec-call
+                // form (mirror of lift_stmt_is_pure_decl's pure-value
+                // skip). Other Declare forms (typed frontend decls,
+                // dynamic inits, bare declarations) keep the
+                // conservative attr block.
+                let pure_local = *local
+                    && vars.len() == 1
+                    && init.as_ref().and_then(literal_decl_value).is_some();
+                if !pure_local {
+                    for v in vars {
+                        mark_word(&v.name, attr);
+                    }
                 }
             }
             IrStmt::DeclareArray { var, .. } => mark_word(var, arr),
@@ -31422,15 +31925,22 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // no dispatch. `String(v)` guards lifted numeric bindings.
             if func == "split" {
                 if let [v] = args.as_slice() {
+                    // Custom IFS (frontends-ifs): with a non-whitespace IFS
+                    // possible, neither the "No spaces" elision (the value
+                    // may contain separator chars) nor the inline
+                    // whitespace regex (it must split on the IFS chars) is
+                    // sound — dispatch to the runtime `sh2.split`, which
+                    // consults `this.vars.IFS` per split.
+                    let custom_ifs = ifs_custom_possible();
                     // the "No spaces" tag: when the value is provably free
                     // of IFS whitespace (a tagged var, a numeric value, a
                     // spaceless literal), the word-split is a no-op —
                     // emit the value directly (no split/filter/join).
-                    if expr_known_nospace(v) {
+                    if !custom_ifs && expr_known_nospace(v) {
                         return expr_to_estree(v);
                     }
                     let ve = expr_to_estree(v);
-                    if expr_has_await(&ve) {
+                    if expr_has_await(&ve) || custom_ifs {
                         return sh2_call("split", vec![ve]);
                     }
                     return Expr::CallExpression {
@@ -35186,6 +35696,121 @@ mod range_analysis_tests {
         let cmds = crate::Parser::new(src).parse().expect("parse");
         let prog = ast_to_ir(&cmds);
         analyze_var_ranges(&prog)
+    }
+
+    /// The grep-contains lift treats `printf '%s\n' ARG | grep PAT >/dev/null`
+    /// as echo-equivalent (single line), so it lowers to native `contains`
+    /// (index) with no bash -c — printf must match echo.
+    #[test]
+    fn printf_grep_test_lifts_to_contains() {
+        let src = r#"x="hello world"
+if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("index($x, 'world') >= 0"),
+            "printf|grep must lift to native contains: {perl}"
+        );
+        assert!(
+            !perl.contains("system('bash'"),
+            "printf|grep must not shell out: {perl}"
+        );
+    }
+
+    /// `cmp -s F1 F2` (silent byte compare) lowers to a native read-both +
+    /// eq check (exit status only; cmp's "differ" message needs -s-less
+    /// output we won't reproduce, so only -s lifts).
+    #[test]
+    fn cmp_s_lowers_native_compare() {
+        let src = "if cmp -s /tmp/a /tmp/b; then echo eq; fi\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("open(my $__h, '<', '/tmp/a')")
+                && perl.contains("eq (sub"),
+            "cmp -s should lower to a native byte compare: {perl}"
+        );
+        assert!(
+            !perl.contains("system('bash'"),
+            "cmp -s must not shell out: {perl}"
+        );
+    }
+
+    /// `cat <<'EOF' … EOF` (the print-heredoc idiom) lowers to a native
+    /// `print` with no bash -c.
+    #[test]
+    fn cat_heredoc_lowers_native() {
+        let src = "cat <<EOF\nalpha\nbeta\nEOF\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("print(") && !perl.contains("system('bash'"),
+            "cat <<EOF should be a native print, not a shell-out: {perl}"
+        );
+    }
+
+    /// `unset VAR` lowers to a native type-agnostic undef (no bash -c).
+    #[test]
+    fn unset_lowers_native_undef() {
+        let src = "unset maybe\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("no strict 'refs'") && !perl.contains("system('bash'"),
+            "unset should be a native undef, not a shell-out: {perl}"
+        );
+    }
+
+    /// Bare `cmp F1 F2` (literal paths) lowers to a native differ-message
+    /// compare (no bash -c).
+    #[test]
+    fn cmp_bare_lowers_native_differ() {
+        let src = "cmp /tmp/a /tmp/b\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("differ: byte")
+                && perl.contains("%s %s differ")
+                && !perl.contains("system('bash'"),
+            "bare cmp should lower to a native differ compare: {perl}"
+        );
+    }
+
+    /// `ls <literal args> 2>/dev/null || echo FALLBACK` lowers to a native
+    /// file/dir listing with a missing-operand fallback (no bash -c).
+    #[test]
+    fn ls_or_echo_lowers_native() {
+        let src = "ls a.txt b.txt 2>/dev/null || echo \"No test files found\"\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            perl.contains("readdir") && !perl.contains("system('bash'"),
+            "ls || echo should be a native listing, not a shell-out: {perl}"
+        );
+    }
+
+    /// `printf LITERAL | sort` lowers natively (no bash -c): the content is
+    /// a known literal, so sort is a pure in-Perl text op.
+    #[test]
+    fn printf_sort_lowers_native() {
+        let src = "printf \"c\\na\\nb\\n\" | sort\n";
+        let cmds = crate::Parser::new(src).parse().expect("parse");
+        let prog = ast_to_ir(&cmds);
+        let perl = crate::ir::shir_to_perl(&prog);
+        assert!(
+            !perl.contains("system('bash'"),
+            "printf|sort must not shell out: {perl}"
+        );
+        assert!(
+            perl.contains("sort") && perl.contains("@__pl"),
+            "printf|sort should emit a native sort: {perl}"
+        );
     }
 
     /// The Try node lowers to a JS try/catch/finally (core request

@@ -176,6 +176,8 @@ fn walk_stmt(
     let p = *pos;
     match st {
         IrStmt::Label(_) | IrStmt::Goto(_) => {}
+
+        IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { walk_stmt(c, pos, first, last, escapes, in_closure, copied); } }
         IrStmt::Assign { targets, expr, asm, .. } => {
             for t in targets {
                 if t.indices.is_empty() {
@@ -676,7 +678,8 @@ fn mark_stmt_vars_escape(
 ) {
     match st {
         IrStmt::Label(_) | IrStmt::Goto(_) => {}
-        IrStmt::Assign { targets, expr, asm, .. } => {
+
+        IrStmt::Ext(n) => { for c in crate::shir_nodes::ExtNode::children(&**n) { mark_stmt_vars_escape(c, first, escapes); } }        IrStmt::Assign { targets, expr, asm, .. } => {
             for t in targets {
                 first.entry(t.var.clone()).or_insert(0);
                 escapes.insert(t.var.clone());

@@ -961,11 +961,10 @@ exit $main_exit_code;
                 Ok(p) => p,
                 Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
             };
-            // C-family `for (init; cond; step)` A1: lower the rich
-            // ForInit to init + while (core request
-            // c-sh-go-20260812-205941 — the ESTree renderer panics on an
-            // UNSTRIPPED ForInit).
-            debashl::shir_passes::strip_cfor(&mut prog);
+            // ForInit (c-style `for`) is handled natively by the
+            // ESTree renderer (native JS `for` loop), so strip_cfor
+            // is not needed here (core request
+            // c-sh-go-20260812-205941).
             debashl::shir_passes::restructure_goto_only(&mut prog);
             // process substitution: materialize frontend-emitted
             // process-in/out into temp-file form (core request
@@ -1058,6 +1057,52 @@ exit $main_exit_code;
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
             print!("{}", match debashl::sh_backend::shir_to_sh(&prog) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
+            });
+        }
+        "--shir-in-go" | "--shir-in-c" | "--shir-in-python" | "--shir-in-java" | "--shir-in-rust" | "--shir-in-zig" | "--shir-in-js" | "--shir-in-glsl" => {
+            // core dispatcher parity (marketplace triage gate): the
+            // co-owned mirror renderers render through the same A1-ingress
+            // (strip_cfor + RestructureGoto + process-subst + optimize),
+            // so the CORE can gate a triage pair against MAIN without
+            // needing a per-backend worktree build. Each co-owned backend
+            // worktree may keep an identical arm in its own cli.
+            if args.len() < 3 { println!("Error: {} requires input", args[1]); return; }
+            let input = &args[2];
+            let content = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e); std::process::exit(1);
+                }
+                Ok(s)
+            } else {
+                fs::read_to_string(input)
+            };
+            let content = match content {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+            };
+            debashl::shir_passes::strip_cfor(&mut prog);
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
+            debashl::shir_passes::optimize::optimize(&mut prog);
+            let out = match args[1].as_str() {
+                "--shir-in-c" => Ok(debashl::c_backend::shir_to_c(&prog)),
+                "--shir-in-go" => Ok(debashl::go_backend::shir_to_go(&prog)),
+                "--shir-in-python" => Ok(debashl::python_backend::shir_to_python(&prog)),
+                "--shir-in-java" => debashl::java_backend::shir_to_java(&prog),
+                "--shir-in-rust" => Ok(debashl::rust_backend::shir_to_rust(&prog)),
+                "--shir-in-zig" => Ok(debashl::zig_backend::shir_to_zig(&prog)),
+                "--shir-in-js" => Ok(debashl::js_backend::shir_to_js(&prog)),
+                "--shir-in-glsl" => Ok(debashl::glsl_backend::shir_to_glsl(&prog)),
+                _ => unreachable!(),
+            };
+            print!("{}", match out {
                 Ok(s) => s,
                 Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
             });

@@ -46,7 +46,9 @@
 pub mod analysis;
 pub mod context;
 pub mod lifetime;
+pub mod loop_opt; // LICM-lite (estree-20260813-182436/201235): hoist loop-invariant runs into loop prologues
 pub mod metric;
+pub mod optimize; // const_prop + dead_store_elim (the A1 optimizer family)
 pub mod pattern;
 pub mod restructure;
 pub mod strip;
