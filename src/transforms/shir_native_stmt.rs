@@ -197,6 +197,7 @@ fn transform_stmt(
             x |= native_if_test_cond(st);
             x |= native_test_exit_stmt(st);
             x |= native_cat_var_or_stmt(st);
+            x |= native_env_grep_or_stmt(st);
             x |= native_echo_grep_test_chain(st);
             x |= native_echo_xargs_stmt(st);
             x |= native_echo_tr_sort_stmt(st);
@@ -5669,6 +5670,103 @@ fn native_comm_stmt(st: &mut IrStmt) -> bool {
     };
     let code = format!(
         r#"do {{ my @__a = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__f, '<', {f1}) or die "comm: {f1}: $ERRNO"; my $__c = <$__f>; close $__f; $__c }}, -1); pop @__a if @__a && $__a[-1] eq q{{}}; my @__b = split(/\n/, do {{ local $INPUT_RECORD_SEPARATOR = undef; open(my $__g, '<', {f2}) or die "comm: {f2}: $ERRNO"; my $__c = <$__g>; close $__g; $__c }}, -1); pop @__b if @__b && $__b[-1] eq q{{}}; my ($__i, $__j) = (0, 0); my @__out; while ($__i < @__a && $__j < @__b) {{ my $__c = $__a[$__i] cmp $__b[$__j]; if ($__c == 0) {{ push @__out, $__a[$__i]; $__i++; $__j++; }} elsif ($__c < 0) {{ $__i++; }} else {{ $__j++; }} }} if (@__out) {{ print STDOUT join("\n", @__out), "\n"; }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
+    );
+    *st = IrStmt::RawText(code);
+    true
+}
+
+/// `env | grep '^PAT' || echo LIT` (perl-only): scan %ENV, print the
+/// matching NAME=value lines, else the fallback echo.
+fn native_env_grep_or_stmt(st: &mut IrStmt) -> bool {
+    let IrStmt::Expr(IrExpr::BinOp {
+        op: BinOpKind::Or,
+        lhs,
+        rhs,
+    }) = st
+    else {
+        return false;
+    };
+    let IrExpr::Call { func: pf, args: pargs } = lhs.as_ref() else { return false; };
+    if pf != "pipeline" {
+        return false;
+    }
+    let [IrExpr::Array(stages)] = pargs.as_slice() else { return false; };
+    if stages.len() != 2 {
+        return false;
+    }
+    // stage 0: env (no args)
+    let IrExpr::Arrow(s0) = &stages[0] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: _, args: a0 })] = s0.as_slice() else {
+        return false;
+    };
+    let [IrExpr::Str(cmd0, _), IrExpr::Array(w0)] = a0.as_slice() else { return false; };
+    if cmd0 != "env" || !w0.is_empty() {
+        return false;
+    }
+    // stage 1: grep PAT
+    let IrExpr::Arrow(s1) = &stages[1] else { return false; };
+    let [IrStmt::Expr(IrExpr::Call { func: _, args: a1 })] = s1.as_slice() else {
+        return false;
+    };
+    let [IrExpr::Str(cmd1, _), IrExpr::Array(w1)] = a1.as_slice() else { return false; };
+    if cmd1 != "grep" || w1.len() != 1 {
+        return false;
+    }
+    let pat = match &w1[0] {
+        IrExpr::Str(sv, _) => sv.clone(),
+        IrExpr::Interpolate(parts)
+            if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+        {
+            parts
+                .iter()
+                .filter_map(|p| match p {
+                    InterpPart::Lit(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+        _ => return false,
+    };
+    // rhs: echo LIT
+    let IrExpr::Call { func, args } = rhs.as_ref() else { return false; };
+    if !matches!(func.as_str(), "builtin" | "exec") {
+        return false;
+    }
+    let [IrExpr::Str(ecmd, _), IrExpr::Array(ewords)] = args.as_slice() else { return false; };
+    if ecmd != "echo" {
+        return false;
+    }
+    let mut fallback: Option<String> = None;
+    for w in ewords {
+        match w {
+            IrExpr::Str(sv, _) => {
+                if fallback.is_some() {
+                    return false;
+                }
+                fallback = Some(sv.clone());
+            }
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                if fallback.is_some() {
+                    return false;
+                }
+                let t: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(x) => Some(x.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                fallback = Some(t);
+            }
+            _ => return false,
+        }
+    }
+    let Some(fallback) = fallback else { return false; };
+    let fq = crate::ir::safe_perl_q_string(&fallback);
+    let code = format!(
+        r#"do {{ my @__m = grep {{ /{pat}/ }} map {{ "$_=$ENV{{$_}}" }} sort keys %ENV; if (@__m) {{ print STDOUT join("\n", @__m), "\n"; $main_exit_code = $CHILD_ERROR = 0; }} else {{ print STDOUT {fq}, "\n"; $main_exit_code = $CHILD_ERROR = 1; }} }};"#
     );
     *st = IrStmt::RawText(code);
     true
