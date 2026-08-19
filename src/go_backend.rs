@@ -1834,6 +1834,7 @@ impl Render {
     fn cmd_text_stmt(&mut self, s: &IrStmt) -> Option<String> {
         match s {
             IrStmt::Expr(e) => self.cmd_text_expr(e),
+            IrStmt::Ext(_) => None,
             // try/except has no shell text — a bash -c fallback cannot
             // express it
             IrStmt::Try { .. } => None,
@@ -2470,6 +2471,7 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => self.stmt_expr(e),
+            IrStmt::Ext(_) => panic!("go backend: Ext node unsupported"),
             IrStmt::Assign { targets, expr, .. } => self.stmt_assign(targets, expr),
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
@@ -5119,6 +5121,14 @@ fn redirect_stmt_text(r: &crate::ir::IrRedirect) -> Option<String> {
     let fd = r.fd.unwrap_or(0).to_string();
     let t = match &r.target {
         IrExpr::Str(s, _) => s.clone(),
+        // a variable redirect target (`echo hi > "$f"` — bat-sh-go
+        // t36_redirect_var): render `$name` — redirRun's bash child sees
+        // the var's value through env_lit (every written var ships as
+        // `name=<value>` env).
+        IrExpr::Call { func, args } if func == "getVar" => match args.first() {
+            Some(IrExpr::Str(n, _)) => format!("${{{n}}}"),
+            _ => return None,
+        },
         _ => return None,
     };
     match r.mode.as_str() {

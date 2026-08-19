@@ -3278,6 +3278,7 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => self.expr_stmt(e),
+            IrStmt::Ext(_) => panic!("glsl backend: Ext node unsupported"),
             IrStmt::Assign { targets, expr, asm, .. } => {
                 // Declarator-position asm label (core request
                 // c-sh-go-toplevelasmargument-20260814-042952) — no GLSL
@@ -4604,6 +4605,7 @@ fn walk_stmts(stmts: &[IrStmt], vars: &mut std::collections::HashMap<String, Opt
 
 fn walk_stmt(s: &IrStmt, vars: &mut std::collections::HashMap<String, Option<Range>>) -> bool {
     match s {
+        IrStmt::Ext(n) => crate::shir_nodes::ExtNode::children(&**n).into_iter().any(|c| walk_stmt(c, vars)),
         IrStmt::Assign { targets, expr, .. } => {
             let r = expr_range(expr, vars);
             if r.is_none() {

@@ -168,6 +168,7 @@ pub fn stmts_read(name: &str, stmts: &[IrStmt]) -> bool {
 
 pub fn stmt_reads(name: &str, st: &IrStmt) -> bool {
     match st {
+        IrStmt::Ext(n) => crate::shir_nodes::ExtNode::children(&**n).into_iter().any(|c| stmt_reads(name, c)),
         IrStmt::Expr(e) => expr_reads(name, e),
         IrStmt::Assign { targets, expr, .. } => {
             expr_reads(name, expr)
@@ -222,7 +223,14 @@ pub fn stmt_reads(name: &str, st: &IrStmt) -> bool {
                 || clauses.iter().any(|c| stmts_read(name, &c.body))
         }
         IrStmt::Pipeline { stages, .. } => stages.iter().any(|s| stmts_read(name, s)),
-        IrStmt::Redirect { inner, .. } => stmts_read(name, inner),
+        IrStmt::Redirect { inner, redirects } => {
+            // redirect TARGETS are reads too (`echo hi > "$f"` — the
+            // getVar target must keep the store alive; missing it made
+            // dead_store_elim drop the write and the read fold to "" —
+            // the bat-sh-go t36_redirect_var cluster)
+            stmts_read(name, inner)
+                || redirects.iter().any(|r| expr_reads(name, &r.target))
+        }
         IrStmt::Exec { cmd, args, .. } => {
             expr_reads(name, cmd)
                 || args.iter().any(|a| expr_reads(name, a))
@@ -1308,7 +1316,22 @@ fn drop_dead_store(st: &IrStmt, reads: &HashSet<String>, guarded: &HashSet<Strin
     match st {
         IrStmt::Assign { targets, expr, .. } => {
             let all_dead = targets.iter().all(|t| {
-                t.indices.is_empty() && !reads.contains(&t.var) && !guarded.contains(&t.var)
+                if !t.indices.is_empty() {
+                    return false;
+                }
+                if reads.contains(&t.var) || guarded.contains(&t.var) {
+                    return false;
+                }
+                // baked-subscript write (`aa[one]=1`): the read signal
+                // registers the BASE name (`aa` from arrayIndex("aa",
+                // "one")) — keep the write when the base is read.
+                if let Some(pos) = t.var.find('[') {
+                    let base = &t.var[..pos];
+                    if reads.contains(base) || guarded.contains(base) {
+                        return false;
+                    }
+                }
+                true
             });
             if targets.is_empty() || !all_dead {
                 return false;
@@ -1474,9 +1497,14 @@ fn collect_stmt_read_names(st: &IrStmt, out: &mut Vec<String>) {
                 }
             }
         }
-        IrStmt::Redirect { inner, .. } => {
+        IrStmt::Redirect { inner, redirects } => {
             for s in inner {
                 collect_stmt_read_names(s, out);
+            }
+            // redirect TARGETS are reads (getVar target — `echo hi > "$f"`;
+            // missing them dropped the store and the target folded to "")
+            for r in redirects {
+                collect_expr_read_names(&r.target, out);
             }
         }
         IrStmt::Exec { cmd, args, .. } => {
@@ -1496,7 +1524,10 @@ fn collect_stmt_read_names(st: &IrStmt, out: &mut Vec<String>) {
             }
         }
         IrStmt::Output { value, .. } => collect_expr_read_names(value, out),
-        IrStmt::WriteFile { content, .. } => collect_expr_read_names(content, out),
+        IrStmt::WriteFile { path, content, .. } => {
+            collect_expr_read_names(path, out);
+            collect_expr_read_names(content, out);
+        }
         IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) | IrStmt::SetChildError(e)
         | IrStmt::Die { expr: e, .. } | IrStmt::Warn { expr: e, .. } => {
             collect_expr_read_names(e, out)
@@ -1584,6 +1615,13 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                 // the NAME arg (args[1]) is a READ (go-sh-20260816-164300)
                 if let Some(IrExpr::Str(n, _)) = args.get(1) {
                     out.push(n.clone());
+                    // baked-subscript read (`aa[$k]` / `aa[one]`): the
+                    // base name is the array — register it so a
+                    // baked-subscript WRITE (`aa[two]=2`) is not
+                    // dead-eliminated when the array is read dynamically.
+                    if let Some(pos) = n.find('[') {
+                        out.push(n[..pos].to_string());
+                    }
                 }
             } else if matches!(
                 func.as_str(),
@@ -1591,6 +1629,9 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
             ) {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     out.push(n.clone());
+                    if let Some(pos) = n.find('[') {
+                        out.push(n[..pos].to_string());
+                    }
                 }
             } else if func == "arrayIndex" {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
@@ -1785,6 +1826,37 @@ mod tests {
         ]);
         let mut prog = prog;
         assert!(!dead_store_elim(&mut prog));
+        assert_eq!(prog.stmts.len(), 2);
+    }
+
+    #[test]
+    fn dce_keeps_redirect_target_read_store() {
+        // f=out.txt; echo hi > "$f" — the redirect TARGET getVar(f) is a
+        // READ: dropping the store folds the target to "" and the write
+        // lands in a file named '' (bat-sh-go t36_redirect_var cluster).
+        let prog = prog_of(vec![
+            assign("f", IrExpr::Str("out.txt".to_string(), StrStyle::DoubleQuoted)),
+            IrStmt::Redirect {
+                inner: vec![IrStmt::Expr(IrExpr::Call {
+                    func: "exec".to_string(),
+                    args: vec![
+                        IrExpr::Str("echo".to_string(), StrStyle::DoubleQuoted),
+                        IrExpr::Array(vec![IrExpr::Str("hi".to_string(), StrStyle::DoubleQuoted)]),
+                    ],
+                })],
+                redirects: vec![crate::ir::IrRedirect {
+                    fd: Some(1),
+                    mode: "w".to_string(),
+                    target: IrExpr::Call {
+                        func: "getVar".to_string(),
+                        args: vec![IrExpr::Str("f".to_string(), StrStyle::DoubleQuoted)],
+                    },
+                    interpolate: true,
+                }],
+            },
+        ]);
+        let mut prog = prog;
+        assert!(!dead_store_elim(&mut prog), "redirect-target getVar read must keep the f store");
         assert_eq!(prog.stmts.len(), 2);
     }
 
