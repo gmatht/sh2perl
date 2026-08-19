@@ -31,6 +31,7 @@ pub mod shir_pipeline_native;
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
 pub mod shir_native_stmt; // worker-submitted: redirect/herestring/test-chain shapes → native stmt forms
+<<<<<<< Updated upstream
 // OFFERED transforms (core-requests/transforms/offered/) — staged for per-backend bisect
 pub mod const_capture_fold;
 pub mod const_condition_elim;
@@ -44,6 +45,9 @@ pub mod test_simplification;
 pub mod unreachable_after_exit;
 pub mod counted_while_forinit;
 pub mod merge_init_assignments;
+=======
+pub mod shir_cat_heredoc; // TEST
+>>>>>>> Stashed changes
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
@@ -61,6 +65,7 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // native-stmt normalisation (fail-shir: perl shell-out elimination):
         // `echo args > file` → Block-wrapped exec (native select redirect),
         // empty herestrings → status exec, `test && echo || echo` → If.
+<<<<<<< Updated upstream
         //
         // GATED OFF BY DEFAULT: this prior-session rewrite regresses the
         // estree gate — its `status_exec(true)` markers break the estree
@@ -99,6 +104,10 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("unreachable-after-exit", unreachable_after_exit::transform),
         ("counted-while-forinit", counted_while_forinit::transform),
         ("merge-init-assignments", merge_init_assignments::transform),
+=======
+        ("shir-native-stmt", shir_native_stmt::transform),
+        ("shir-cat-heredoc", shir_cat_heredoc::transform), // TEST
+>>>>>>> Stashed changes
         // NOTE: exec-to-builtin (shir-builtin-op-20260816) is NOT in the
         // ast_to_ir channel — the rewrite happens at the A1 EXPORT
         // (shir_json::shir_to_shir_json) so the analyses and every
