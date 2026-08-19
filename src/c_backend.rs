@@ -626,6 +626,22 @@ impl Render {
             self.emit("  }");
             self.emit("  d[n] = 0; return d;");
             self.emit("}");
+            self.emit("/* ${@:off:len} — positional-param slice (off is 1-based; off 0 includes $0) */");
+            self.emit("static char *_sh_argv_slice(char *d, size_t cap, long long off, long long len) {");
+            self.emit("  long long total = (long long)_sh_argc;");
+            self.emit("  long long b = (off <= 0) ? 0 : off;");
+            self.emit("  if (b > total) b = total;");
+            self.emit("  long long nav = total - b;");
+            self.emit("  long long e = b + ((len < 0) ? nav + len : len);");
+            self.emit("  if (e > total) e = total; if (e < b) e = b;");
+            self.emit("  size_t dn = 0; long long i;");
+            self.emit("  for (i = b; i < e; i++) {");
+            self.emit("    if (i > b && dn + 1 < cap) d[dn++] = ' ';");
+            self.emit("    const char *s = _sh_argv[i] ? _sh_argv[i] : \"\";");
+            self.emit("    while (*s && dn + 1 < cap) d[dn++] = *s++;");
+            self.emit("  }");
+            self.emit("  d[dn] = 0; return d;");
+            self.emit("}");
             self.emit("/* wrap the built command as `bash -c '<cmd>'` (single-quote escaped) */");
             self.emit("static void _sh_wrap_cmd(const char *cmd) {");
             self.emit("  size_t n = strlen(cmd), need = n * 2 + 16;");
@@ -688,7 +704,7 @@ impl Render {
             self.emit("  while (*p) { while (*p == ' ') p++; if (!*p) break; n++; while (*p && *p != ' ') p++; }");
             self.emit("  long long b = off < 0 ? (long long)n + off : off;");
             self.emit("  if (b < 0) b = 0; if (b > (long long)n) b = (long long)n;");
-            self.emit("  long long e = (len < 0) ? (long long)n : b + len;");
+            self.emit("  long long e = b + ((len < 0) ? (long long)n + len : len);");
             self.emit("  if (e > (long long)n) e = (long long)n; if (e < b) e = b;");
             self.emit("  size_t dn = 0, i = 0; p = s;");
             self.emit("  while (*p && i < (size_t)e) {");
@@ -710,7 +726,7 @@ impl Render {
             self.emit("  size_t n = strlen(s);");
             self.emit("  long long b = off < 0 ? (long long)n + off : off;");
             self.emit("  if (b < 0) b = 0; if (b > (long long)n) b = (long long)n;");
-            self.emit("  long long e = (len < 0) ? (long long)n : b + len;");
+            self.emit("  long long e = b + ((len < 0) ? (long long)n + len : len);");
             self.emit("  if (e > (long long)n) e = (long long)n; if (e < b) e = b;");
             self.emit("  size_t out = (size_t)(e - b);");
             self.emit("  if (out >= cap) out = cap - 1;");
@@ -1928,7 +1944,29 @@ impl Render {
                     self.temp_seq += 1;
                     let cap = self.capture_call(args);
                     self.emit(&format!("char *{t} = {cap};"));
-                    word(self, t);
+                    if func == "captureWords" {
+                        // UNQUOTED command substitution: the captured
+                        // output is field-split by the child shell (echo
+                        // `ls | grep …` → newline-separated list joined
+                        // by IFS spaces), mirroring the `split` arm below.
+                        // Export the raw capture and append the BARE ref so
+                        // the child re-splits it — a quoted `_sh_word` would
+                        // keep the embedded newlines (bash single-token).
+                        match buf {
+                            CmdBuf::Shared => {
+                                self.emit(&format!("_sh_export(\"_SHSPLIT\", {t});"));
+                                self.emit("_sh_addraw(\"$_SHSPLIT\");");
+                            }
+                            CmdBuf::Private(id) => {
+                                self.emit(&format!("_sh_export(\"_SHSPLIT\", {t});"));
+                                self.emit(&format!(
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" $_SHSPLIT\");"
+                                ));
+                            }
+                        }
+                    } else {
+                        word(self, t);
+                    }
                 }
                 _ => {
                     let v = self.value_c(e);
@@ -2586,6 +2624,20 @@ impl Render {
                         }
                     }
                 }
+                IrStmt::Pipeline { stages, capture, .. } => {
+                    // `cmd1 | cmd2 | …` as a capture body: emit each stage
+                    // (a list of stmts) joined by `|`. A captured pipeline
+                    // is `$(…)`-substituted by the caller; the stages
+                    // themselves reconstruct to shell text like the other
+                    // stmt arms.
+                    let _ = capture;
+                    for (i, stage) in stages.iter().enumerate() {
+                        if i > 0 {
+                            self.sh_raw(buf, "|");
+                        }
+                        self.sh_stage(buf, stage);
+                    }
+                }
                 _ => {
                     self.mark_todo(&format!("capture body stmt {:?}", s));
                 }
@@ -3105,12 +3157,55 @@ impl Render {
                 }
                 "(_sh_rc = 0, 1)".into()
             }
-            "set" | "shift" => {
-                // set -euo pipefail etc. → no-op (errexit is not
-                // implemented; the corpus scripts succeed under it);
-                // `set -- args` / shift mutate positionals (not tracked)
+            "set" => {
+                // `set -- args...` — set the positional params ($1..).
+                // Other set flags (-euo pipefail...) are no-ops (errexit
+                // is not implemented; the corpus succeeds under it). The
+                // values are computed BEFORE the swap (they may read the
+                // old $N — `set -- "$1" ...`).
+                if let Some(IrExpr::Str(s, _)) = words.first() {
+                    if s.trim() == "--" {
+                        self.need_sh = true;
+                        let n = words.len() - 1;
+                        let av = format!("_sh_av{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!("char *{av}[{}];", n + 1));
+                        self.emit(&format!(
+                            "{av}[0] = (_sh_argc > 0 && _sh_argv[0]) ? _sh_argv[0] : \"\";"
+                        ));
+                        let sk = format!("_sk{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!("int {sk} = 1;"));
+                        for w in words.iter().skip(1) {
+                            // a `${@:off}` slice beyond the positional
+                            // count expands to ZERO words (the bash quirk
+                            // parse-at-slice-param pins) — guard the append
+                            let guard = self.param_slice_zero_word_guard(w);
+                            let v = self.value_c(w);
+                            match guard {
+                                Some(g) => self.emit(&format!(
+                                    "if ({g}) {{ {av}[{sk}++] = strdup({v}); }}"
+                                )),
+                                None => self.emit(&format!("{av}[{sk}++] = strdup({v});")),
+                            }
+                        }
+                        self.emit(&format!("_sh_argv = {av}; _sh_argc = {sk};"));
+                        return "(_sh_rc = 0, 1)".into();
+                    }
+                }
                 self.need_sh = true;
                 "(_sh_rc = 0, 1)".into()
+            }
+            "shift" => {
+                // `shift [n]` — drop the first n positionals ($0 stays)
+                self.need_sh = true;
+                let n = match words.first() {
+                    Some(w) => self.value_num(w),
+                    None => "1".into(),
+                };
+                format!(
+                    "{{ long long _sn = {n}; if (_sn < 0) _sn = 0; if (_sn > (long long)(_sh_argc - 1)) _sn = _sh_argc - 1; for (long long _si = 1; _si + _sn < _sh_argc; _si++) _sh_argv[_si] = _sh_argv[_si + _sn]; _sh_argc -= (int)_sn; _sh_rc = 0; (_sh_rc == 0); }}"
+                )
             }
             "sleep" => {
                 let v = match words.first() {
@@ -4021,6 +4116,34 @@ impl Render {
         }
     }
 
+    /// bash `${@:off}` — a slice beyond the positional count expands to
+    /// ZERO words (the word vanishes from `set -- ... "${@:3}"`). Returns
+    /// a runtime guard that is true iff the slice contributes a word.
+    fn param_slice_zero_word_guard(&mut self, w: &IrExpr) -> Option<String> {
+        if let IrExpr::Call { func, args } = w {
+            if func == "param" {
+                if let (Some(IrExpr::Str(op, _)), Some(IrExpr::Str(nm, _))) =
+                    (args.first(), args.get(1))
+                {
+                    if op == "slice" && (nm == "@" || nm == "*") {
+                        let off = match args.get(2) {
+                            Some(IrExpr::Str(s, _)) if s == "@" || s == "*" => args
+                                .get(3)
+                                .map(|x| self.value_num(x))
+                                .unwrap_or_else(|| "0".into()),
+                            Some(x) => self.value_num(x),
+                            None => "0".into(),
+                        };
+                        // the first selected index is off<=0 ? 0 : off —
+                        // the slice has words iff it is < _sh_argc
+                        return Some(format!("(({off} <= 0) ? 0 : ({off})) < _sh_argc"));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     // ── parameter expansion ──────────────────────────────────────────
 
     fn param_call(&mut self, args: &[IrExpr]) -> String {
@@ -4053,8 +4176,14 @@ impl Render {
             if idx_is_at || name_has_at || args.len() >= 4 {
                 self.cur_param_args = args.to_vec();
                 let mut is_array = true;
+                let mut is_positional = name == "@" || name == "*";
                 let joined = if let Some(keys) = name.strip_prefix('!') {
                     self.array_keys_join(keys)
+                } else if name == "@" || name == "*" {
+                    // `${@:off:len}` — the positional params (the
+                    // helper slices _sh_argv directly)
+                    is_positional = true;
+                    "\"\"".to_string()
                 } else if name_has_at {
                     self.array_join_all(&name[..name.len() - 3])
                 } else if self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
@@ -4062,6 +4191,7 @@ impl Render {
                 } else {
                     // a scalar string slice `${x:off:len}` — CHAR-based
                     is_array = false;
+                    is_positional = false;
                     let v = if self.is_num(&name) {
                         self.num_temp(&self.c_ident(&name))
                     } else {
@@ -4074,14 +4204,26 @@ impl Render {
                 let off_idx = if idx_is_at { 3 } else { 2 };
                 let len_idx = off_idx + 1;
                 let off = self.args_value_num(off_idx);
+                // `_sh_substr`/`_sh_arr_slice` count negative lengths
+                // from the END (bash `${x::-2}` = n-2 chars), so the
+                // no-length sentinel must be a huge POSITIVE value that
+                // clamps to n (a -1 sentinel would chop the last char
+                // under the end-counting rule)
                 let len = match args.get(len_idx) {
-                    None => "-1".to_string(),
-                    Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
+                    None => "(long long)1LL<<60".to_string(),
+                    Some(IrExpr::Str(s, _)) if s.is_empty() => "(long long)1LL<<60".to_string(),
                     Some(_) => self.args_value_num(len_idx),
                 };
                 self.need_sh = true;
                 let t = self.str_temp(65536);
-                if is_array {
+                if is_positional {
+                    // `${@:off:len}` — bash's offset is 1-based (0
+                    // includes $0); the helper slices _sh_argv directly
+                    // (the space-joined form would lose empty elements)
+                    self.emit(&format!(
+                        "_sh_argv_slice({t}, sizeof {t}, {off}, {len});"
+                    ));
+                } else if is_array {
                     self.emit(&format!(
                         "_sh_arr_slice({t}, sizeof {t}, {joined}, {off}, {len});"
                     ));
@@ -4202,7 +4344,10 @@ impl Render {
             }
             "slice" => {
                 let off = args.get(2).map(|x| self.value_num(x)).unwrap_or_else(|| "0".into());
-                let len = args.get(3).map(|x| self.value_num(x)).unwrap_or_else(|| "-1".into());
+                // no length arg = to the end — a huge positive sentinel
+                // (see the 4-arg slice arm: negative lens are real
+                // end-counts in the runtime)
+                let len = args.get(3).map(|x| self.value_num(x)).unwrap_or_else(|| "(long long)1LL<<60".into());
                 self.need_sh = true;
                 let t = self.str_temp(4096);
                 self.emit(&format!(
@@ -4296,7 +4441,11 @@ impl Render {
                 "slice" => {
                     // `${arr[@]:off:len}` — slice of the joined elements
                     let off = self.args_value_num(2);
-                    let len = self.args_value_num(3);
+                    let len = match self.cur_param_args.get(3) {
+                        None => "(long long)1LL<<60".to_string(),
+                        Some(IrExpr::Str(s, _)) if s.is_empty() => "(long long)1LL<<60".to_string(),
+                        Some(_) => self.args_value_num(3),
+                    };
                     let joined = self.array_join_all(var);
                     let t = self.str_temp(65536);
                     self.emit(&format!(
@@ -5527,6 +5676,36 @@ impl Render {
                 // the var's only write).
                 if self.const_lifted.contains(&t.var) {
                     return;
+                }
+                // bash `((expr))` arith STATEMENT (the core spells the
+                // side-effect forms as Assign with an Arith expr whose
+                // ROOT Assign/IncDec writes the target): the truthiness
+                // of the arith VALUE is the status — `((i++))` with i=0
+                // exits 1, `((++i))` with the result nonzero exits 0 —
+                // and the target is the side-effect var, NOT a stored
+                // assignment (`i = i++` is a C read-modify-write no-op).
+                if let IrExpr::Arith(a) = expr {
+                    if matches!(
+                        a.as_ref(),
+                        ArithAst::Assign { .. } | ArithAst::IncDec { .. }
+                    ) {
+                        let c = self.arith(a);
+                        self.need_sh = true;
+                        let is_self = matches!(a.as_ref(), ArithAst::IncDec { var, .. } if var == &t.var)
+                            || matches!(a.as_ref(), ArithAst::Assign { var, .. } if var == &t.var);
+                        if is_self {
+                            // the expr carries the side effect (i++ /
+                            // x = y + 1) — emit it once, read the value
+                            // for the status
+                            self.emit(&format!("_sh_rc = !(({c}) != 0);"));
+                        } else {
+                            // `((j = i++))` — the target receives the
+                            // value AND the status reflects it
+                            let name = self.c_ident(&t.var);
+                            self.emit(&format!("_sh_rc = !(({name} = ({c})) != 0);"));
+                        }
+                        return;
+                    }
                 }
                 let name = self.c_ident(&t.var);
                 if let Some(b) = self.buf_bound(&t.var) {
