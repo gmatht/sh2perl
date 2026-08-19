@@ -102,7 +102,17 @@ fn transform_stmt(
             elsifs,
             else_,
         } => {
-            let mut x = transform_expr(cond, files);
+            let mut x = native_if_test_cond(st);
+            let IrStmt::If {
+                cond,
+                then,
+                elsifs,
+                else_,
+            } = st
+            else {
+                return x;
+            };
+            x |= transform_expr(cond, files);
             x |= transform_with_printf(then, lower_printf, files);
             for (ec, eb) in elsifs.iter_mut() {
                 x |= transform_expr(ec, files);
@@ -117,11 +127,6 @@ fn transform_stmt(
             x
         }
         IrStmt::While { cond, body, .. } => {
-            let mut x = transform_with_printf(body, lower_printf, files);
-            x |= transform_expr(cond, files);
-            x
-        }
-        IrStmt::DoWhile { body, cond, .. } => {
             let mut x = transform_with_printf(body, lower_printf, files);
             x |= transform_expr(cond, files);
             x
@@ -184,6 +189,7 @@ fn transform_stmt(
             x |= native_grep_devnull_or(st);
             x |= native_test_chain(st);
             x |= native_echo_or_chain(st);
+            x |= native_if_test_cond(st);
             x |= native_echo_grep_test_chain(st);
             x |= native_echo_xargs_stmt(st);
             x |= native_echo_tr_sort_stmt(st);
@@ -886,8 +892,11 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
     }).collect();
     if parts.is_empty() { return IrExpr::Bool(false); }
     let text = parts.join(" ");
-    let tokens: Vec<&str> = text.split_whitespace().collect();
-    
+    let mut tokens: Vec<&str> = text.split_whitespace().collect();
+    // the `[[ ... ]]` form appends a trailing `[[` marker word
+    if tokens.last() == Some(&"[[") {
+        tokens.pop();
+    }
     // Build an IrExpr for the condition
     if tokens.len() == 3 {
         let (left, op, right) = (tokens[0], tokens[1], tokens[2]);
@@ -921,6 +930,7 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
             "-d" => IrExpr::Str(format!("-d \"{}\"", arg), StrStyle::Raw),
             "-e" => IrExpr::Str(format!("-e \"{}\"", arg), StrStyle::Raw),
             "-s" => IrExpr::Str(format!("-s \"{}\"", arg), StrStyle::Raw),
+            "-S" => IrExpr::Str(format!("-S \"{}\"", arg), StrStyle::Raw),
             "-z" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", arg), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", arg), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             _ => IrExpr::Str(format!("do {{ my $t = \"{text}\"; $t =~ /-\\w+/ ? 1 : 0 }}"), StrStyle::Raw),
@@ -3378,10 +3388,112 @@ fn emit_file_op(ops: &mut Vec<String>, ws: &[String]) -> bool {
 /// is a literal echo, evaluate the condition and print natively. The
 /// LHS may be a compound test expression (rendered via ir_expr_to_perl
 /// as a boolean perl expression). The echo branch always exits 0.
+/// A literal `echo WORD` as an Output stmt (single literal word).
+fn literal_echo_output(e: &IrExpr) -> Option<IrStmt> {
+    let IrExpr::Call { func, args } = e else { return None; };
+    if !matches!(func.as_str(), "builtin" | "exec") {
+        return None;
+    }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(words)] = args.as_slice() else {
+        return None;
+    };
+    if cmd != "echo" {
+        return None;
+    }
+    let mut content: Option<String> = None;
+    for w in words {
+        match w {
+            IrExpr::Str(sv, _) if sv == "-e" || sv == "-E" || sv == "-n" => return None,
+            IrExpr::Str(sv, _) => {
+                if content.is_some() {
+                    return None;
+                }
+                content = Some(sv.clone());
+            }
+            IrExpr::Interpolate(parts)
+                if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+            {
+                if content.is_some() {
+                    return None;
+                }
+                let t: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        InterpPart::Lit(x) => Some(x.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                content = Some(t);
+            }
+            _ => return None,
+        }
+    }
+    Some(IrStmt::Output {
+        value: IrExpr::Str(content?, StrStyle::DoubleQuoted),
+        newline: true,
+        target: None,
+    })
+}
+
 fn native_echo_or_chain(st: &mut IrStmt) -> bool {
     let IrStmt::Expr(IrExpr::BinOp { op, lhs, rhs }) = st else { return false; };
     if !matches!(op, BinOpKind::Or | BinOpKind::And) {
         return false;
+    }
+    // `test COND && echo A || echo B`: a test-then-else chain
+    if *op == BinOpKind::Or {
+
+        if let IrExpr::BinOp {
+            op: BinOpKind::And,
+            lhs: and_lhs,
+            rhs: and_rhs,
+        } = lhs.as_ref()
+        {
+            let IrExpr::Call { func, args } = and_lhs.as_ref() else { return false; };
+            // the test may arrive as exec("test", [...]) or Call(test, ...)
+            let test_ok = if matches!(func.as_str(), "test" | "[" | "[[" ) {
+                true
+            } else if matches!(func.as_str(), "exec" | "builtin") {
+                matches!(
+                    args.as_slice(),
+                    [IrExpr::Str(c, _), ..] if c == "test" || c == "["
+                )
+            } else {
+                false
+            };
+            if test_ok
+                && matches!(and_rhs.as_ref(), IrExpr::Call { func, .. }
+                    if matches!(func.as_str(), "builtin" | "exec"))
+            {
+                // cond = the test; then = echo A; else = echo B
+                let Some(cond_words) = (|| -> Option<Vec<&IrExpr>> {
+                    let IrExpr::Call { args, .. } = and_lhs.as_ref() else {
+                        return None;
+                    };
+                    let [IrExpr::Str(_, _), IrExpr::Array(words)] = args.as_slice() else {
+                        return None;
+                    };
+                    Some(words.iter().collect())
+                })()
+                else {
+                    return false;
+                };
+                let cond = render_test_words(&cond_words);
+                let (Some(ta), Some(fb)) = (
+                    literal_echo_output(and_rhs.as_ref()),
+                    literal_echo_output(rhs.as_ref()),
+                ) else {
+                    return false;
+                };
+                *st = IrStmt::If {
+                    cond,
+                    then: vec![ta],
+                    elsifs: vec![],
+                    else_: vec![fb],
+                };
+                return true;
+            }
+        }
     }
     // the LHS must be a (compound) TEST condition — `[[ cond ]]`, `test`,
     // or `[[ a ]] && [[ b ]]` — never an arbitrary command (a `ls ... ||
@@ -4805,6 +4917,25 @@ fn native_rm_rf_stmt(st: &mut IrStmt) -> bool {
         r#"do {{ my $__rm; $__rm = sub {{ my ($__d) = @_; if (-d $__d) {{ opendir(my $__h, $__d) or return; for my $__e (readdir($__h)) {{ next if $__e eq '.' || $__e eq '..'; my $__p = "$__d/$__e"; if (-d $__p) {{ $__rm->($__p); }} else {{ unlink $__p; }} }} closedir $__h; rmdir $__d; }} else {{ unlink $__d; }} }}; if (-e {pq}) {{ $__rm->({pq}); }} }}; $main_exit_code = $CHILD_ERROR = 0;"#
     );
     *st = IrStmt::RawText(code);
+    true
+}
+
+/// `If { cond: test(...), .. }` (perl-only): render the test condition
+/// natively (the renderer shells out unsupported flags like -S).
+fn native_if_test_cond(st: &mut IrStmt) -> bool {
+    let IrStmt::If { cond, .. } = st else { return false; };
+    let IrExpr::Call { func, args } = cond else { return false; };
+    if !matches!(func.as_str(), "test" | "[" | "[[" ) {
+        return false;
+    }
+    // the test args may be [Str("cmd"), Array(words)] or just the cond
+    // words ([Str(" -S /dev/null")]).
+    let cond_words: Vec<&IrExpr> = match args.as_slice() {
+        [IrExpr::Str(_, _), IrExpr::Array(words)] => words.iter().collect(),
+        _ => args.iter().collect(),
+    };
+    let new_cond = render_test_words(&cond_words);
+    *cond = new_cond;
     true
 }
 
