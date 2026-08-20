@@ -94,12 +94,9 @@ impl PartialEq for Box<dyn ExtExpr> {
 /// Registry constructor for expression nodes: (JSON) → boxed node.
 pub(crate) type ExprNodeCtor = fn(&serde_json::Value) -> Result<Box<dyn ExtExpr>, String>;
 
-// The generated stmt + expr node structs + registries.
-// Scratch: hand-written gen_stmt.rs / gen_expr.rs (replaced by build.rs → OUT_DIR later).
-pub(crate) mod gen_stmt;
-pub(crate) mod gen_expr;
-pub use gen_stmt::*;
-pub use gen_expr::*;
+// The generated stmt + expr node structs + registries (build.rs → OUT_DIR).
+include!(concat!(env!("OUT_DIR"), "/shir_nodes_gen.rs"));
+include!(concat!(env!("OUT_DIR"), "/shir_expr_nodes_gen.rs"));
 
 /// Union lookup: find the constructor for a statement node tag.
 pub(crate) fn node_ctor(tag: &str) -> Option<NodeCtor> {
