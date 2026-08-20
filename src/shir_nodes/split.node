@@ -1,0 +1,9 @@
+# shir_nodes/split.node — primitive: split a string into an array by a delimiter.
+# Every language has split(). Composition base for wc -l / wc -w / cut / head / tail.
+
+node Split
+tag "Split"
+kind expr
+field text: expr
+field delim: string
+field is_regex: bool

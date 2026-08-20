@@ -31545,16 +31545,12 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             argument: Box::new(expr_to_estree(e)),
         },
         IrExpr::Ext(n) => {
-            let ctx = crate::render_ext_expr::ExprRenderCtx {
-                backend: crate::render_ext_expr::Backend::Estree,
-                indent: 0,
-            };
-            if let Some(code) = crate::render_ext_expr::render(n.as_ref(), &ctx) {
-                // Parse the rendered code as ESTree
-                Expr::Identifier { name: code }
-            } else {
-                unreachable!("Ext nodes should be lowered before ESTree rendering")
+            // Native ESTree rendering (real JS: .split/.includes/.length/...).
+            if let Some(native) = ext_to_native_estree(n.as_ref()) {
+                return native;
             }
+            // No native form — fall back to a sh2.* runtime call (never panic).
+            crate::estree::sh2_call(&snake_tag(n.tag()), vec![])
         }
         // A numeric-range iterable (`seq_range_for`'s bare `Range`
         // For.iter shape): the ESTree surface has no range literal, so
@@ -33703,6 +33699,138 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         other => unreachable!("Perl-only IR expression reached the ESTree renderer: {other:?}"),
     }
 }
+/// Render an ExtExpr node to NATIVE ESTree (no sh2.* fallback) — real
+/// JS: `.split()`, `.includes()`, `.length`, `.trim()`, etc.
+fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
+    let children: Vec<&IrExpr> = n.children();
+    match n.tag() {
+        "StrLen" => {
+            let text = children.get(0)?;
+            Some(Expr::MemberExpression {
+                object: Box::new(expr_to_estree(text)),
+                property: Box::new(Expr::Identifier { name: "length".to_string() }),
+                computed: false,
+                optional: false,
+            })
+        }
+        "CaseTransform" => {
+            let text = children.get(0)?;
+            let upper = n.as_any().downcast_ref::<crate::shir_nodes::CaseTransform>()?.upper;
+            Some(crate::estree::method_call(expr_to_estree(text),
+                if upper { "toUpperCase" } else { "toLowerCase" }, vec![]))
+        }
+        "StringContains" => {
+            let text = children.get(0)?;
+            let pat = children.get(1)?;
+            Some(crate::estree::method_call(expr_to_estree(text), "includes", vec![expr_to_estree(pat)]))
+        }
+        "StringAffix" => {
+            let text = children.get(0)?;
+            let pat = children.get(1)?;
+            let prefix = n.as_any().downcast_ref::<crate::shir_nodes::StringAffix>()?.prefix;
+            Some(crate::estree::method_call(expr_to_estree(text),
+                if prefix { "startsWith" } else { "endsWith" }, vec![expr_to_estree(pat)]))
+        }
+        "StringTrim" => {
+            let text = children.get(0)?;
+            Some(crate::estree::method_call(expr_to_estree(text), "trim", vec![]))
+        }
+        "RepeatStr" => {
+            let text = children.get(0)?;
+            let count = children.get(1)?;
+            Some(crate::estree::method_call(expr_to_estree(text), "repeat", vec![expr_to_estree(count)]))
+        }
+        "SubStrExtract" => {
+            let text = children.get(0)?;
+            let offset = children.get(1)?;
+            let len = children.get(2).copied().unwrap_or_else(|| &IrExpr::Int(-1));
+            Some(crate::estree::method_call(expr_to_estree(text), "substring",
+                vec![expr_to_estree(offset), expr_to_estree(len)]))
+        }
+        "Split" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::Split>()?;
+            let delim = if node.is_regex {
+                crate::estree::regex_lit(&node.delim)
+            } else {
+                crate::estree::str_lit(&node.delim)
+            };
+            Some(crate::estree::method_call(expr_to_estree(text), "split", vec![delim]))
+        }
+        "RegCount" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::RegCount>()?;
+            // (text.match(/pat/g) || []).length
+            let matched = crate::estree::method_call(expr_to_estree(text), "match",
+                vec![crate::estree::regex_lit(&node.pattern)]);
+            let arr = Expr::LogicalExpression {
+                operator: "||".to_string(),
+                left: Box::new(matched),
+                right: Box::new(Expr::ArrayExpression { elements: vec![] }),
+            };
+            Some(Expr::MemberExpression {
+                object: Box::new(arr),
+                property: Box::new(Expr::Identifier { name: "length".to_string() }),
+                computed: false, optional: false,
+            })
+        }
+        "ArrayLen" => {
+            let array = children.get(0)?;
+            Some(Expr::MemberExpression {
+                object: Box::new(expr_to_estree(array)),
+                property: Box::new(Expr::Identifier { name: "length".to_string() }),
+                computed: false, optional: false,
+            })
+        }
+        "FieldExtract" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()?;
+            let idx = node.fields.first().and_then(|f| match f {
+                crate::ir::FieldRange::Single(i) => Some((i - 1) as i64),
+                _ => None,
+            })?;
+            let split = crate::estree::method_call(expr_to_estree(text), "split", vec![crate::estree::str_lit(&node.delimiter)]);
+            Some(Expr::MemberExpression {
+                object: Box::new(split),
+                property: Box::new(crate::estree::Expr::Literal { value: serde_json::json!(idx), raw: None, regex: None }),
+                computed: true,
+                optional: false,
+            })
+        }
+        "TakeLines" => {
+            let text = children.get(0)?;
+            let count = children.get(1)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::TakeLines>()?;
+            let lines = crate::estree::method_call(expr_to_estree(text), "split", vec![crate::estree::str_lit("\n")]);
+            let sliced = if node.from_end {
+                crate::estree::method_call(lines, "slice", vec![Expr::UnaryExpression {
+                    operator: "-".to_string(), prefix: true,
+                    argument: Box::new(expr_to_estree(count)),
+                }])
+            } else {
+                crate::estree::method_call(lines, "slice", vec![crate::estree::int_lit_expr(0), expr_to_estree(count)])
+            };
+            Some(crate::estree::method_call(sliced, "join", vec![crate::estree::str_lit("\n")]))
+        }
+        _ => None,
+    }
+}
+
+/// snake_case of an Ext tag ("CaseTransform" → "case_transform") — used for
+/// the sh2.* fallback callee name.
+fn snake_tag(tag: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in tag.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 { out.push('_'); }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 
 fn interpolate_to_estree(parts: &[InterpPart]) -> Expr {
     let mut quasis = Vec::new();

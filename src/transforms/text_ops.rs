@@ -456,16 +456,61 @@ fn try_lower_head_tail(text: IrExpr, args: &[IrExpr], from_end: bool) -> Option<
 // ── wc ───────────────────────────────────────────────────────────────
 
 fn try_lower_wc(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
-    let mode = args.iter().filter_map(|a| {
-        if let IrExpr::Str(s, _) = a { Some(s.as_str()) } else { None }
-    }).find(|s| s.starts_with('-'))
-        .and_then(|s| s.chars().nth(1))
-        .unwrap_or('l'); // default: lines
+    // Lower `wc` to a PRIMITIVE count node so each renderer implements it
+    // once, trivially — no per-mode branching in the renderers:
+    //   wc -c / wc -m  → StrLen (text.length)
+    //   wc -l          → LineCount (split('\n').length)
+    //   wc -w          → WordCount (split(/\s+/).length)
+    let flags: Vec<&str> = args.iter().filter_map(|a| {
+        match a {
+            IrExpr::Str(s, _) => Some(s.as_str()),
+            IrExpr::Interpolate(parts) if parts.len() == 1 => {
+                if let InterpPart::Lit(s) = &parts[0] { Some(s.as_str()) } else { None }
+            }
+            _ => None,
+        }
+    }).filter(|s| s.starts_with('-')).collect();
 
-    Some(IrExpr::Ext(Box::new(WordCount {
-        text: text,
-        mode: mode.to_string(),
-    })))
+    let mut lower_c = false;
+    let mut lower_l = false;
+    let mut lower_w = false;
+    for f in &flags {
+        for c in f.chars().skip(1) {
+            match c {
+                'c' | 'm' => lower_c = true,
+                'l' => lower_l = true,
+                'w' => lower_w = true,
+                _ => {}
+            }
+        }
+    }
+    // Multiple modes (e.g. `wc -lc`) output multiple counts — too complex
+    // for a single primitive; don't lower.
+    let set_count = [lower_c, lower_l, lower_w].iter().filter(|b| **b).count();
+    if set_count != 1 {
+        return None;
+    }
+    if lower_c {
+        // wc -c → StrLen (text.length)
+        Some(IrExpr::Ext(Box::new(StrLen { text })))
+    } else {
+        // wc -l / wc -w → ArrayLen(Split(text, delim)) — a COMPOSITION of
+        // primitives. Backends implement Split + ArrayLen once; no bespoke
+        // LineCount/WordCount nodes.
+        if lower_l {
+            // wc -l is a NEWLINE COUNT (each line ends in \n) — NOT
+            // split('\n').length (off by one on trailing newline).
+            Some(IrExpr::Ext(Box::new(RegCount {
+                text,
+                pattern: "\\n".to_string(),
+            })))
+        } else {
+            // wc -w → ArrayLen(Split(text, /\s+/))
+            Some(IrExpr::Ext(Box::new(ArrayLen {
+                array: IrExpr::Ext(Box::new(Split { text, delim: "\\s+".to_string(), is_regex: true })),
+            })))
+        }
+    }
 }
 
 // ── sed ──────────────────────────────────────────────────────────────
