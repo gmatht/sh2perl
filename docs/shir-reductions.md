@@ -117,3 +117,37 @@ against bash; the backend implements the leaves.
 The planner keeps these as candidate (op, source) paths; a backend reaches
 the ones it can express from its `nodes.txt` manifest, recursively, and
 falls back to `sh2.*` / the original command otherwise.
+
+## Implementation status (as-built)
+
+These reductions are implemented in `text_ops` and verified **byte-exact vs
+bash** at statement level:
+
+| Idiom | Node | Status |
+|-------|------|--------|
+| `${#v}` | StrLen (param `len` / getVar `#v`) | ✅ |
+| `${v^^}`/`${v,,}` | CaseTransform | ✅ |
+| `${v:N:M}` | SubStrExtract | ✅ |
+| `${v##*/}`/`${v%/*}`, `basename`/`dirname` | PathName | ✅ (statement level) |
+| `cut -d, -fN` | FieldExtract | ✅ |
+| `tr 'A-Z' 'a-z'` | CaseTransform | ✅ |
+| `tr 'a' 'b'` | CharTranslate | ✅ |
+| `sed 's///'` | RegSub | ✅ |
+| `grep -q P` | StringContains | ✅ |
+| `wc -c` | StrLen | ✅ |
+| `wc -l` | RegCount(text+\"\\n\") | ✅ |
+| `wc -w` | ArrayLen(Split(/\s+/)) | ✅ |
+| `head`/`tail -n` | TakeLines | ✅ |
+| `xargs` | StringTrim | ✅ |
+| `yes X | head -n K` | RepeatStr("X\\n", K) | ✅ |
+
+**Scope boundary:** reductions fire at **statement level only** (`emit=true`).
+Inside a `$(...)` capture the body must remain the original COMMAND (to
+produce stdout the capture collects) — reducing it to a bare value breaks
+the capture. So capture-internal constructs fall back to `sh2.*` / the
+original command (correct, just not reduced). This is the documented
+"anything the core cannot reduce falls back" rule.
+
+**Not yet reduced (fall back to original):** `sort`/`uniq`, `seq | head`,
+`awk`, `[[ $x == P* ]]` (test-string parsing), multi-stage pipelines with a
+dynamic (file/grep) source.
