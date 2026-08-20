@@ -2258,6 +2258,15 @@ impl Render {
                 }
                 Some(out)
             }
+            IrExpr::Call { func, args } if func == "subshell" || func == "block" => {
+                // `( body )` / `{ body }` groups in an `and`/`or`/capture
+                // operand — reconstruct as a subshell group.
+                let Some(IrExpr::Arrow(body)) = args.first() else {
+                    return None;
+                };
+                let text = self.cmd_text_stmts(body)?;
+                Some(format!("( {text} )"))
+            }
             IrExpr::Call { func, args } if func == "assign" => {
                 let name = match args.first() {
                     Some(IrExpr::Str(n, _)) => n.clone(),
