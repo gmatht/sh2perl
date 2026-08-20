@@ -274,3 +274,96 @@ fn plan(cmd: &str, cap: &Capabilities) -> Option<IrExpr> {
 
 This is the shape `text_ops` grows into: a backend-manifest-driven planner
 instead of a single hard-coded lowering.
+
+## Transforms are typed; reduction is a directed graph
+
+Each operation is a **precise node type** (a typed primitive with a defined
+input/output), and a "transform" is a typed **reduction edge**:
+*op A can be implemented exactly in terms of op B*. The edges are DIRECTED
+because reduction is not symmetric.
+
+The running example: **`count_char` vs `regex`.**
+
+```
+count_char(c)  →  regex-match of the escaped char      # ALWAYS possible
+regex(re)      →  count_char(c)                          # only for single-char regexes
+```
+
+- `count_char → regex` is a universal edge (a char is just a regex literal).
+- `regex → count_char` is NOT always possible (a general regex like `\s+` or
+  `a.*b` has no single-char equivalent).
+
+So the reduction relation is a **directed graph**: nodes = operation types,
+edges = "implements-in-terms-of". The planner solves a **reachability /
+shortest-path** problem: does a path from the needed operation to a backend's
+declared operation exist?
+
+### The graph
+
+```text
+                   ┌─ split ──┐
+wc -l ──► newline_count ─┘         └─ array_len
+                   └─ regex_count ─┘   (if regex supported)
+wc -w ──► word_count ──► split(/\s+/) ─► array_len
+              │
+              └─ regex_count            (if no split-regex)
+wc -c ──► str_len
+```
+
+Each edge is annotated with the reduction it performs. The graph is the
+single source of truth for "what reduces to what" — correctness of every
+path is verified once.
+
+### The solver = BFS / shortest-path
+
+Given the needed op and the backend manifest (declared ops), the core does a
+BFS over the reduction graph from the needed op toward the manifest:
+
+```rust
+// Reverse edges: op --implements--> target
+fn reduce(op, cap) -> Option<Plan> {
+    // BFS: can `op` reach any op in cap.nodes?
+    // edges: for each reduction op → T, if T is composable, recurse;
+    //        if T is in cap.nodes, we've reached a supported leaf.
+}
+```
+
+The planner:
+
+1. Starts from the operation a command needs (e.g. `newline_count`).
+2. Walks reduction edges; if it reaches a node the backend declares, that's
+   the plan (the path is the composition).
+3. Picks the **shortest** path (fewest edges / cheapest), honoring the
+   backend's declared preferences.
+4. If no path to a declared node exists, fall back to `sh2.*` (if declared)
+   or keep the original command.
+
+### The "double reduction"
+
+A backend that declares `regex_count` but not `count_char`:
+```
+count_char('\n') ──(count_char→regex)──► regex_count(/\n/)   ← in manifest
+```
+The solver finds the two-edge path. A backend that declares ONLY
+`count_char` (e.g. C, no regex):
+```
+regex_count(/\n/) ──(single-char regex→count_char)──► count_char('\n')  ← in manifest
+```
+The regex here happens to be single-char, so it reduces. But `word_count`
+needs `\s+`, which does NOT reduce to `count_char` — so C can't express
+`wc -w` via a plain count; it needs `split`+`array_len` or a `sh2.*` fallback.
+
+### Why this is the right model
+
+1. **Precise types catch bad edges.** A transform only fires when the types
+   match; `regex → count_char` is allowed only for the single-char subset.
+2. **Correctness is local and verified once.** Each edge is a small, provably
+   exact rewrite; a path is correct iff every edge is.
+3. **Backends declare leaves only.** The graph expands everything else; a
+   backend with `count_char` alone still supports `wc -l` (via the graph),
+   and never sees a regex it can't express.
+4. **Weights/preferences** can steer (prefer `count_char` over `regex`), but
+   reachability decides feasibility.
+
+This is the planner `text_ops` grows into: a typed reduction graph, solved
+per-backend by BFS, bounded by the backend's `nodes.txt` manifest.
