@@ -767,6 +767,12 @@ impl Render {
                             if func == "pipeline" {
                                 return self.call("pipeline", args);
                             }
+                            // `$(cmd < file)` — a redirect body -> bash -c
+                            if func == "redirect" {
+                                if let Some(c) = self.capture_redirect(args) {
+                                    return c;
+                                }
+                            }
                         }
                     }
                 }
@@ -1318,6 +1324,104 @@ impl Render {
             }
             _ => self.sh2_stub(func, args, func),
         }
+    }
+
+    /// Shell-quote a literal for a bash -c reconstruction.
+    fn sh_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+    /// Render an exec arg to shell text (literal/int/\$var), for bash -c.
+    fn sh_arg(&self, e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Str(s, _) => Some(Self::sh_quote(s)),
+            IrExpr::Int(i) => Some(i.to_string()),
+            IrExpr::Call { func, args } if func == "getVar" => {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    Some(format!("${n}"))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+    /// Render a single-exec/pipeline Arrow body to shell text (for the
+    /// bash -c capture fallback). None for anything else.
+    fn body_shell_text(&self, body: &[IrStmt]) -> Option<String> {
+        let [IrStmt::Expr(e)] = body else {
+            return None;
+        };
+        match e {
+            IrExpr::Call { func, args } if func == "exec" => {
+                let mut parts = Vec::new();
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    parts.push(Self::sh_quote(cmd));
+                }
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for it in items {
+                        parts.push(self.sh_arg(it)?);
+                    }
+                }
+                Some(parts.join(" "))
+            }
+            _ => None,
+        }
+    }
+    /// Render a {fd, mode, target} redirect object to shell text.
+    fn redirect_shell_text(&self, r: &IrExpr) -> Option<String> {
+        let IrExpr::Object(props) = r else {
+            return None;
+        };
+        let mut mode = "w".to_string();
+        let mut target = None;
+        for (k, v) in props {
+            match k.as_str() {
+                "mode" => {
+                    if let IrExpr::Str(s, _) = v {
+                        mode = s.clone();
+                    }
+                }
+                "target" => {
+                    if let IrExpr::Str(s, _) = v {
+                        target = Some(Self::sh_quote(s));
+                    } else if let IrExpr::Call { func, args } = v {
+                        if func == "getVar" {
+                            if let Some(IrExpr::Str(n, _)) = args.first() {
+                                target = Some(format!("\"${n}\"" ));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let t = target?;
+        Some(match mode.as_str() {
+            "w" => format!(">{t}"),
+            "a" => format!(">>{t}"),
+            "r" => format!("<{t}"),
+            "herestring" => format!("<<<{t}"),
+            _ => return None,
+        })
+    }
+    /// `$(cmd < file)` — bash -c capture fallback for a redirect body.
+    fn capture_redirect(&mut self, args: &[IrExpr]) -> Option<String> {
+        let (Some(IrExpr::Arrow(body)), Some(IrExpr::Array(redirs))) =
+            (args.first(), args.get(1))
+        else {
+            return None;
+        };
+        let inner = self.body_shell_text(body)?;
+        let mut text = format!("( {inner} )");
+        for r in redirs {
+            text.push(' ');
+            text.push_str(&self.redirect_shell_text(r)?);
+        }
+        self.need_subprocess = true;
+        Some(format!(
+            "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
+            Self::py_str(&text)
+        ))
     }
 
     /// `exec printf FMT ARGS...` → native `sys.stdout.write`, mirroring
