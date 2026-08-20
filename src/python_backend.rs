@@ -1010,6 +1010,16 @@ impl Render {
                         self.need_sys = true;
                         return format!("sys.exit({code})");
                     }
+                    if cmd == "cd" {
+                        // `cd [dir]` — os.chdir (bash cd; PWD updated)
+                        let dir = match args.get(1) {
+                            Some(IrExpr::Array(items)) if !items.is_empty() => {
+                                self.expr(&items[0])
+                            }
+                            _ => "os.path.expanduser(\"~\")".to_string(),
+                        };
+                        return format!("os.chdir({dir})");
+                    }
                     if cmd == "let" {
                         if let Some(IrExpr::Array(items)) = args.get(1) {
                             if let Some(IrExpr::Str(text, _)) = items.first() {
