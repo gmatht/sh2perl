@@ -33,13 +33,59 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 
 fn lower_stmt(stmt: &mut IrStmt) {
     match stmt {
-        // shIR pipeline: IrExpr::Call { func: "pipeline", args: [Array(stages)] }
+        // ShIR pipeline: IrExpr::Call { func: "pipeline", args: [Array(stages)] }
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
             if let [IrExpr::Array(stages)] = args.as_slice() {
                 if stages.len() == 2 {
                     if let Some(replacement) = try_lower_pipeline(stages) {
                         *stmt = IrStmt::Expr(replacement);
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+        }
+        // Here-string/here-doc: `cmd <<< "text"` — the text is the fd-0
+        // redirect target, the command is the inner stage.
+        IrStmt::Redirect { inner, redirects } => {
+            // Find a here-string / heredoc on fd 0 → the input text
+            if let Some(text_ir) = redirects.iter().find_map(|r| {
+                if r.fd == Some(0) && (r.mode == "herestring" || r.mode == "heredoc") {
+                    Some(r.target.clone())
+                } else { None }
+            }) {
+                // Try to lower the inner command against the here-text
+                if let [IrStmt::Expr(IrExpr::Call { func, args })] = inner.as_slice() {
+                    if func == "exec" || func == "builtin" {
+                        if let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice() {
+                            if let Some(replacement) = try_lower_command(text_ir, name, cmd_args) {
+                                *stmt = IrStmt::Expr(replacement);
+                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            // Recurse into the inner body
+            for s in inner.iter_mut() {
+                lower_stmt(s);
+            }
+        }
+        // Plain builtin command: basename X / dirname X (no pipeline)
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
+            // Recurse into args first (to reach nested $(...) / param calls)
+            for a in args.iter_mut() { lower_expr(a); }
+            if let [IrExpr::Str(cmd, _), IrExpr::Array(cmd_args)] = args.as_slice() {
+                if (cmd == "basename" || cmd == "dirname") && !cmd_args.is_empty() {
+                    let which = if cmd == "dirname" { "dirname" } else { "basename" };
+                    if let Some(text) = arg_to_expr(&cmd_args[0]) {
+                        *stmt = IrStmt::Expr(IrExpr::Ext(Box::new(PathName {
+                            text,
+                            which: which.to_string(),
+                        })));
+                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return;
                     }
                 }
             }
@@ -47,6 +93,34 @@ fn lower_stmt(stmt: &mut IrStmt) {
         IrStmt::Expr(expr) => {
             lower_expr(expr);
         }
+        // Recurse into nested statement bodies (if/while/for/function/...)
+        IrStmt::If { then, elsifs, else_, .. } => {
+            for s in then.iter_mut() { lower_stmt(s); }
+            for (_, b) in elsifs.iter_mut() { for s in b.iter_mut() { lower_stmt(s); } }
+            for s in else_.iter_mut() { lower_stmt(s); }
+        }
+        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+            for s in body.iter_mut() { lower_stmt(s); }
+        }
+        IrStmt::For { body, .. } => { for s in body.iter_mut() { lower_stmt(s); } }
+        IrStmt::ForInit { init, body, .. } => {
+            for s in init.iter_mut() { lower_stmt(s); }
+            for s in body.iter_mut() { lower_stmt(s); }
+        }
+        IrStmt::Function { body, .. } => { for s in body.iter_mut() { lower_stmt(s); } }
+        IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+            for s in body.iter_mut() { lower_stmt(s); }
+        }
+        IrStmt::Case { discriminant, clauses } => {
+            lower_expr(discriminant);
+            for c in clauses.iter_mut() { for s in c.body.iter_mut() { lower_stmt(s); } }
+        }
+        IrStmt::Assign { expr, .. } => lower_expr(expr),
+        IrStmt::Declare { init, .. } => { if let Some(e) = init { lower_expr(e); } }
+        IrStmt::WriteFile { path, content, .. } => {
+            lower_expr(path); lower_expr(content);
+        }
+        IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => lower_expr(e),
         _ => {}
     }
 }
@@ -58,8 +132,55 @@ fn lower_expr(expr: &mut IrExpr) {
             if let Some(replacement) = try_lower_param_len(args) {
                 *expr = replacement;
                 LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            // ${p##*/} → PathName(basename), ${p%/*} → PathName(dirname)
+            if let Some(replacement) = try_lower_param_path(args) {
+                *expr = replacement;
+                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            for a in args.iter_mut() { lower_expr(a); }
+        }
+        // Recurse into nested pipelines (command substitution: capture wraps Arrow)
+        IrExpr::Call { func, args } if func == "pipeline" => {
+            let mut had = false;
+            for a in args.iter_mut() { lower_expr(a); }
+        }
+        IrExpr::Arrow(body) => {
+            for s in body.iter_mut() { lower_stmt(s); }
+        }
+        IrExpr::Capture { expr: inner, .. } => lower_expr(inner),
+        IrExpr::Array(items) => { for i in items.iter_mut() { lower_expr(i); } }
+        IrExpr::Interpolate(parts) => {
+            for p in parts.iter_mut() {
+                if let InterpPart::Expr(e) = p { lower_expr(e); }
             }
         }
+        IrExpr::Index { key, .. } => lower_expr(key),
+        IrExpr::BinOp { lhs, rhs, .. } => { lower_expr(lhs); lower_expr(rhs); }
+        IrExpr::Ternary { cond, then, else_, .. } => { lower_expr(cond); lower_expr(then); lower_expr(else_); }
+        // Nested builtin/exec command in expression position: basename/dirname
+        // inside $(...) — e.g. `dirname "$(pwd)"`.
+        IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+            // Recursively lower nested expressions in args first
+            for a in args.iter_mut() { lower_expr(a); }
+            // Then check if this is a reducible single command (basename/dirname)
+            if let [IrExpr::Str(cmd, _), IrExpr::Array(cmd_args)] = args.as_slice() {
+                if (cmd == "basename" || cmd == "dirname") && !cmd_args.is_empty() {
+                    let which = if cmd == "dirname" { "dirname" } else { "basename" };
+                    if let Some(text) = arg_to_expr(&cmd_args[0]) {
+                        *expr = IrExpr::Ext(Box::new(PathName {
+                            text,
+                            which: which.to_string(),
+                        }));
+                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+        }
+        IrExpr::Call { args, .. } => { for a in args.iter_mut() { lower_expr(a); } }
         _ => {}
     }
 }
@@ -101,23 +222,20 @@ fn try_lower_pipeline(stages: &[IrExpr]) -> Option<IrExpr> {
         }
     };
 
+    lower_text_cmd(text_expr, cmd_name, cmd_args)
+}
+
+/// Dispatch a single command against input text (used by both the pipeline
+/// stage-2 and the here-string inner command).
+fn lower_text_cmd(text: IrExpr, cmd_name: &str, cmd_args: &[IrExpr]) -> Option<IrExpr> {
     match cmd_name {
-        "cut" => {
-            let result = try_lower_cut(text_expr, cmd_args);
-            result
-        }
-        "tr" => {
-            let result = try_lower_tr(text_expr, cmd_args);
-            result
-        }
-        "head" => try_lower_head_tail(text_expr, cmd_args, false),
-        "tail" => try_lower_head_tail(text_expr, cmd_args, true),
-        "wc" => try_lower_wc(text_expr, cmd_args),
-        "sed" => {
-            let result = try_lower_sed(text_expr, cmd_args);
-            result
-        }
-        "xargs" => try_lower_xargs(text_expr),
+        "cut" => try_lower_cut(text, cmd_args),
+        "tr" => try_lower_tr(text, cmd_args),
+        "head" => try_lower_head_tail(text, cmd_args, false),
+        "tail" => try_lower_head_tail(text, cmd_args, true),
+        "wc" => try_lower_wc(text, cmd_args),
+        "sed" => try_lower_sed(text, cmd_args),
+        "xargs" => try_lower_xargs(text),
         _ => None,
     }
 }
@@ -434,5 +552,65 @@ mod tests {
             FieldRange::Range { start: 1, end: 3 },
             FieldRange::Single(5),
         ]);
+    }
+}
+
+/// Lower a single command `cmd_name(args)` against input text `text`.
+/// Used by the here-string/here-doc Redirect path.
+fn try_lower_command(text: IrExpr, cmd_name: &str, cmd_args: &[IrExpr]) -> Option<IrExpr> {
+    // Handle basename/dirname as top-level commands too
+    match cmd_name {
+        "basename" => Some(IrExpr::Ext(Box::new(PathName {
+            text: text.clone(),
+            which: "basename".to_string(),
+        }))),
+        "dirname" => Some(IrExpr::Ext(Box::new(PathName {
+            text: text.clone(),
+            which: "dirname".to_string(),
+        }))),
+        _ => lower_text_cmd(text, cmd_name, cmd_args),
+    }
+}
+
+/// `${p##*/}` → PathName(basename), `${p%/*}` → PathName(dirname)
+///
+/// The `param` call carries the operator name and the variable.
+fn try_lower_param_path(args: &[IrExpr]) -> Option<IrExpr> {
+    // Shape: param(op, name) — the shIR already lowers ${p##*/} → param("basename", p)
+    // and ${p%/*} → param("dirname", p).
+    if args.len() >= 2 {
+        if let IrExpr::Str(op, _) = &args[0] {
+            let var = args[1].clone();
+            match op.as_str() {
+                "basename" => {
+                    return Some(IrExpr::Ext(Box::new(PathName {
+                        text: var,
+                        which: "basename".to_string(),
+                    })));
+                }
+                "dirname" => {
+                    return Some(IrExpr::Ext(Box::new(PathName {
+                        text: var,
+                        which: "dirname".to_string(),
+                    })));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn arg_to_expr(arg: &IrExpr) -> Option<IrExpr> {
+    match arg {
+        IrExpr::Str(s, _) => Some(IrExpr::Str(s.clone(), StrStyle::DoubleQuoted)),
+        IrExpr::Interpolate(parts) if parts.len() == 1 => {
+            match &parts[0] {
+                InterpPart::Lit(s) => Some(IrExpr::Str(s.clone(), StrStyle::DoubleQuoted)),
+                _ => Some(arg.clone()),
+            }
+        }
+        IrExpr::Var(..) | IrExpr::Capture { .. } | IrExpr::Call { .. } => Some(arg.clone()),
+        _ => None,
     }
 }
