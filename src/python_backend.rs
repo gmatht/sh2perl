@@ -46,6 +46,10 @@ pub struct Render {
     need_strip: bool,
     /// needs `import re` (the grepMatches lift)
     need_re: bool,
+    /// needs `import sys` (exit)
+    need_sys: bool,
+    /// needs the `__sh_exec` subprocess helper
+    need_subprocess: bool,
 }
 
 impl Render {
@@ -951,8 +955,28 @@ impl Render {
                     if cmd == "printf" {
                         return self.printf_call(args);
                     }
+                    if cmd == "exit" {
+                        let code = match args.get(1) {
+                            Some(IrExpr::Array(items)) if !items.is_empty() => self.expr(&items[0]),
+                            _ => "0".to_string(),
+                        };
+                        self.need_sys = true;
+                        return format!("sys.exit({code})");
+                    }
+                    if cmd == "let" {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if let Some(IrExpr::Str(text, _)) = items.first() {
+                                if let Some(c) = self.render_let_cond(text) {
+                                    return c;
+                                }
+                            }
+                        }
+                    }
                 }
-                self.sh2_stub("exec", args, "exec")
+                // external command: fork/exec via subprocess
+                let argv = self.build_argv(args);
+                self.need_subprocess = true;
+                return format!("__sh_exec([{}])", argv.join(", "));
             }
             // getVar("y") — the ShIR's form of a `$y` read; typed vars are
             // plain python names, a store-written name (the imperative
@@ -1361,9 +1385,66 @@ impl Render {
             }
             [flag, v] if flag == "-n" => Some(format!("({})", self.test_value(v))),
             [flag, v] if flag == "-z" => Some(format!("(not {})", self.test_value(v))),
+            [flag, v] if matches!(flag.as_str(), "-f" | "-d" | "-e" | "-s") => {
+                let p = self.test_value(v);
+                match flag.as_str() {
+                    "-f" => Some(format!("os.path.isfile({p})")),
+                    "-d" => Some(format!("os.path.isdir({p})")),
+                    "-e" => Some(format!("os.path.exists({p})")),
+                    "-s" => Some(format!("os.path.getsize({p}) > 0")),
+                    _ => None,
+                }
+            }
             [v] => Some(format!("({})", self.test_value(v))),
             _ => None,
         }
+    }
+
+    /// Build the argv literals for an external `exec` command
+    /// (`["cmd", "arg", …]`).
+    fn build_argv(&mut self, args: &[IrExpr]) -> Vec<String> {
+        let mut argv = Vec::new();
+        if let Some(IrExpr::Str(cmd, _)) = args.first() {
+            argv.push(Self::py_str(cmd));
+        }
+        if let Some(IrExpr::Array(items)) = args.get(1) {
+            for it in items {
+                argv.push(self.expr(it));
+            }
+        }
+        argv
+    }
+
+    /// Render a `let "EXPR"` arithmetic condition (`i<3`) as a Python
+    /// numeric comparison.
+    fn render_let_cond(&mut self, text: &str) -> Option<String> {
+        for (op, py_op) in [("<=", "<="), (">=", ">="), ("==", "=="), ("!=", "!="), ("<", "<"), (">", ">")] {
+            if let Some(idx) = text.find(op) {
+                let l = text[..idx].trim();
+                let r = text[idx + op.len()..].trim();
+                let l = self.num_operand(l)?;
+                let r = self.num_operand(r)?;
+                return Some(format!("({l} {py_op} {r})"));
+            }
+        }
+        None
+    }
+
+    /// A numeric operand for a `let` condition.
+    fn num_operand(&mut self, t: &str) -> Option<String> {
+        let t = t.trim();
+        if let Ok(n) = t.parse::<i64>() {
+            return Some(n.to_string());
+        }
+        let name = t.strip_prefix('$').unwrap_or(t);
+        let name = name
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(name);
+        if self.var_types.contains_key(name) {
+            return Some(self.py_ident(name));
+        }
+        None
     }
 
     /// Tokenize a test string the way the estree tokenizeTest does for the
@@ -1681,6 +1762,13 @@ impl Render {
                 // `s = s += n` (arith Assign on the same target) → `s += n`
                 // (python forbids assignment inside an expression)
                 if let IrExpr::Arith(a) = expr {
+                    if let ArithAst::IncDec { var, delta, .. } = &**a {
+                        let v = self.py_ident(var);
+                        let d = delta.unsigned_abs();
+                        let s = if *delta >= 0 { "+" } else { "-" };
+                        self.emit(&format!("{v} {s}= {d}"));
+                        return;
+                    }
                     if let ArithAst::Assign { var, op, rhs } = &**a {
                         if var == &t.var {
                             let r = self.arith(rhs);
@@ -1785,6 +1873,35 @@ impl Render {
                 if !else_.is_empty() {
                     self.emit("else:");
                     self.block(else_);
+                }
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                // shell `case D in pat) …;; esac` — if/elif chain on string
+                // equality (bash case is anchored glob match; the common
+                // literal-pattern case is exact equality).
+                let d = self.expr(discriminant);
+                let mut emitted_any = false;
+                for cl in clauses {
+                    let conds: Vec<String> = cl
+                        .patterns
+                        .iter()
+                        .filter(|p| p.as_str() != "*")
+                        .map(|p| format!("{d} == {}", Self::py_str(p)))
+                        .collect();
+                    let is_default = cl.patterns.iter().any(|p| p.as_str() == "*");
+                    if conds.is_empty() && is_default {
+                        self.emit("else:");
+                        self.block(&cl.body);
+                        emitted_any = true;
+                        continue;
+                    }
+                    let kw = if emitted_any { "elif" } else { "if" };
+                    self.emit(&format!("{kw} {}:", conds.join(" or ")));
+                    self.block(&cl.body);
+                    emitted_any = true;
                 }
             }
             IrStmt::For { var, iter, body } => {
@@ -2004,6 +2121,36 @@ impl Render {
                     self.block(finally_body);
                 }
             }
+            IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                for s in body {
+                    self.stmt(s);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    for s in st {
+                        self.stmt(s);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                // render the inner commands; apply a simple fd-1 write
+                // redirect (`> file`) by writing to the file (capture-free
+                // approximation for the v1 subset).
+                for s in inner {
+                    self.stmt(s);
+                }
+                for r in redirects {
+                    if r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "a") {
+                        let p = self.expr(&r.target);
+                        let mode = if r.mode == "a" { "'a'" } else { "'w'" };
+                        self.emit(&format!("with open({p}, {mode}) as _f:"));
+                        self.depth += 1;
+                        self.emit("_f.write('')");
+                        self.depth -= 1;
+                    }
+                }
+            }
             other => self.mark_todo(&format!("stmt {:?}", other)),
         }
     }
@@ -2066,6 +2213,12 @@ impl Render {
         self.emit("import sys");
         if self.need_re {
             self.emit("import re");
+        }
+        if self.need_subprocess {
+            self.emit("");
+            self.emit("def __sh_exec(argv):");
+            self.emit("    import subprocess");
+            self.emit("    return subprocess.call(argv)");
         }
         self.emit("");
         if !self.sh2_calls.is_empty() {

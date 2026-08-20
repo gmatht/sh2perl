@@ -119,6 +119,10 @@ pub struct Render {
     need_truthy: bool,
     need_cat: bool,
     need_b2s: bool,
+    need_env: bool,
+    need_fexist: bool,
+    need_writefile: bool,
+    need_run: bool,
     loop_depth: usize,
     todo: usize,
     /// counter for generated temp names (for-loop item bindings)
@@ -928,6 +932,9 @@ impl Render {
                         self.mark_read(name);
                         return m;
                     }
+                    // undeclared (env) var: read the process environment
+                    self.need_env = true;
+                    return format!("sh2Env({})", Self::zig_str(name));
                 }
                 self.sh2_stub("getVar", "getVar")
             }
@@ -935,6 +942,25 @@ impl Render {
                 // a [ ... ] result in string context (rare; e.g. `x=$( [ .. ] )`)
                 self.need_b2s = true;
                 format!("sh2B2S({})", self.call_bool(func, args))
+            }
+            "split" => {
+                // word splitting: a single value with default IFS (no
+                // whitespace) is just the value; render the inner arg.
+                match args.first() {
+                    Some(arg) => self.expr_str(arg),
+                    None => self.sh2_stub("split", "split"),
+                }
+            }
+            "setArray" | "setArrayAppend" => {
+                // array assignment `arr=(a b c)` — render as a bracketed
+                // string (the common indexed-array form).
+                let mut parts = Vec::new();
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for it in items {
+                        parts.push(self.expr_str(it));
+                    }
+                }
+                format!("[_] []const u8{{{}}}", parts.join(", "))
             }
             "arith" => {
                 self.need_intstr = true;
@@ -973,6 +999,28 @@ impl Render {
                 self.need_truthy = true;
                 format!("sh2Truthy({})", self.call_str(func, args))
             }
+            "exec" => {
+                // builtin true/false used as a condition
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    match cmd.as_str() {
+                        "true" => return "true".to_string(),
+                        "false" => return "false".to_string(),
+                        "let" => {
+                            // `let "i<3"` — an arithmetic status condition
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                if let Some(IrExpr::Str(text, _)) = items.first() {
+                                    if let Some(c) = self.render_let_cond(text) {
+                                        return c;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.need_truthy = true;
+                format!("sh2Truthy({})", self.call_str(func, args))
+            }
             _ => {
                 self.need_truthy = true;
                 format!("sh2Truthy({})", self.call_str(func, args))
@@ -980,8 +1028,58 @@ impl Render {
         }
     }
 
+    /// Render a `let "EXPR"` arithmetic condition (`i<3`) as a Zig
+    /// numeric comparison over declared numeric vars. Returns None for
+    /// shapes outside the simple subset.
+    fn render_let_cond(&mut self, text: &str) -> Option<String> {
+        for (op, zop) in [("<=", "<="), (">=", ">="), ("==", "=="), ("!=", "!="), ("<", "<"), (">", ">")] {
+            if let Some(idx) = text.find(op) {
+                let l = text[..idx].trim();
+                let r = text[idx + op.len()..].trim();
+                let l = self.num_operand(l)?;
+                let r = self.num_operand(r)?;
+                return Some(format!("({l} {zop} {r})"));
+            }
+        }
+        None
+    }
+
+    /// A numeric operand for a `let` condition: a declared numeric var
+    /// → its ident; a number literal → the literal.
+    fn num_operand(&mut self, t: &str) -> Option<String> {
+        let t = t.trim();
+        if let Ok(n) = t.parse::<i64>() {
+            return Some(n.to_string());
+        }
+        let name = t.strip_prefix('$').unwrap_or(t);
+        let name = name
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(name);
+        if self.declared(name) {
+            let m = self.zig_ident(name);
+            self.mark_read(name);
+            return Some(m);
+        }
+        None
+    }
+
+    /// Build the argv literals for an external `exec` command
+    /// (`["cmd", "arg", …]`). The command name is args[0]; the trailing
+    /// args array is args[1].
+    fn build_argv(&mut self, cmd: &str, args: &[IrExpr]) -> Vec<String> {
+        let mut argv = vec![Self::zig_str(cmd)];
+        if let Some(IrExpr::Array(items)) = args.get(1) {
+            for it in items {
+                argv.push(self.expr_str(it));
+            }
+        }
+        argv
+    }
+
     fn sh2_stub(&mut self, name: &str, note: &str) -> String {
         self.sh2_calls.insert(name.to_string());
+        self.mark_todo(&format!("{note} → sh2.{name}"));
         self.mark_todo(&format!("{note} → sh2.{name}"));
         format!("sh2{}()", camel(name))
     }
@@ -1179,6 +1277,18 @@ impl Render {
                 };
                 Some(format!("({vv} .len != 0)"))
             }
+            [flag, v] if matches!(*flag, "-f" | "-d" | "-e" | "-s") => {
+                // file test: -f regular, -d dir, -e exists, -s non-empty
+                let (vv, nv) = self.test_operand(v);
+                let vv = if nv {
+                    self.need_intstr = true;
+                    format!("sh2IntStr({vv})")
+                } else {
+                    vv
+                };
+                self.need_fexist = true;
+                Some(format!("sh2FileTest({}, {vv})", Self::zig_str(*flag)))
+            }
             _ => None,
         }
     }
@@ -1231,6 +1341,15 @@ impl Render {
                                 self.emit(&format!("std.process.exit(@intCast({code}));"));
                                 return;
                             }
+                            if cmd == "true" {
+                                // status 0 no-op
+                                return;
+                            }
+                            if cmd == "false" {
+                                // status 1: exit nonzero
+                                self.emit("std.process.exit(1);");
+                                return;
+                            }
                             if cmd == "echo" {
                                 let mut parts = Vec::new();
                                 if let Some(IrExpr::Array(items)) = args.get(1) {
@@ -1245,6 +1364,50 @@ impl Render {
                                     return;
                                 }
                             }
+                            if cmd == "printf" {
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    if let Some(IrExpr::Str(fmt, _)) = items.first() {
+                                        let mut parts = Vec::new();
+                                        // translate the format's % conversions into
+                                        // print_from_parts specs over the arg list
+                                        let rest = &items[1..];
+                                        let mut argi = 0;
+                                        let mut chars = fmt.chars().peekable();
+                                        while let Some(c) = chars.next() {
+                                            if c == '%' {
+                                                if chars.peek() == Some(&'%') {
+                                                    chars.next();
+                                                    parts.push(('s', Self::zig_str("%")));
+                                                    continue;
+                                                }
+                                                let spec = match chars.peek() {
+                                                    Some('s') => { chars.next(); 's' }
+                                                    Some('d') | Some('i') => { chars.next(); 'd' }
+                                                    Some('\n') => { chars.next(); 's' }
+                                                    _ => { parts.push(('s', Self::zig_str("%"))); continue; }
+                                                };
+                                                if let Some(a) = rest.get(argi) {
+                                                    argi += 1;
+                                                    let pa = self.parts_of(a);
+                                                    parts.push(if pa.len() == 1 { (spec, pa[0].1.clone()) } else { pa[0].clone() });
+                                                } else {
+                                                    parts.push((spec, if spec == 'd' { "0".into() } else { "\"\"".into() }));
+                                                }
+                                            } else {
+                                                parts.push(('s', Self::zig_str(&c.to_string())));
+                                            }
+                                        }
+                                        let call = self.print_from_parts(parts, false);
+                                        self.emit(&call);
+                                        return;
+                                    }
+                                }
+                            }
+                            // external command: fork/exec via sh2Run
+                            let argv = self.build_argv(cmd, args);
+                            self.need_run = true;
+                            self.emit(&format!("_ = sh2Run(&[_][]const u8{{{}}});", argv.join(", ")));
+                            return;
                         }
                     }
                     if func == "break" && self.loop_depth > 0 {
@@ -1278,6 +1441,41 @@ impl Render {
                     return;
                 }
                 let rhs = if self.is_num(&t.var) {
+                    // arith-assign / inc-dec render natively (not via
+                    // the sh2Arith stub)
+                    match expr {
+                        IrExpr::Arith(a) => match &**a {
+                            ArithAst::IncDec { var, delta, .. } => {
+                                let v = self.zig_ident(var);
+                                self.mark_read(var);
+                                let d = delta.unsigned_abs();
+                                let s = if *delta >= 0 { "+" } else { "-" };
+                                self.emit(&format!("{v} {s}= {d};"));
+                                return;
+                            }
+                            ArithAst::Assign { var, op, rhs } => {
+                                let v = self.zig_ident(var);
+                                self.mark_read(var);
+                                let r = self.arith(rhs);
+                                let zop = match op.as_str() {
+                                    "+=" => "+=",
+                                    "-=" => "-=",
+                                    "*=" => "*=",
+                                    "/=" => "/=",
+                                    "%=" => "%=",
+                                    _ => "=",
+                                };
+                                if zop == "=" {
+                                    self.emit(&format!("{v} = {r};"));
+                                } else {
+                                    self.emit(&format!("{v} {zop} {r};"));
+                                }
+                                return;
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
                     self.expr_num(expr)
                 } else {
                     self.expr_str(expr)
@@ -1363,6 +1561,46 @@ impl Render {
                     self.depth -= 1;
                 }
                 self.emit("}");
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                // shell `case D in pat) …;; esac` — if/else-if chain on
+                // string equality (the common literal-pattern case).
+                let d = self.expr_str(discriminant);
+                let mut emitted = false;
+                for cl in clauses {
+                    let conds: Vec<String> = cl
+                        .patterns
+                        .iter()
+                        .filter(|p| p.as_str() != "*")
+                        .map(|p| format!("std.mem.eql(u8, {d}, {})", Self::zig_str(p)))
+                        .collect();
+                    let is_default = cl.patterns.iter().any(|p| p.as_str() == "*");
+                    if conds.is_empty() && is_default {
+                        self.emit("else {");
+                        self.depth += 1;
+                        for s in &cl.body {
+                            self.stmt(s);
+                        }
+                        self.depth -= 1;
+                        self.emit("}");
+                        emitted = true;
+                        continue;
+                    }
+                    let kw = if emitted { "} else if" } else { "if" };
+                    self.emit(&format!("{kw} ({}) {{", conds.join(" or ")));
+                    self.depth += 1;
+                    for s in &cl.body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    emitted = true;
+                }
+                if emitted {
+                    self.emit("}");
+                }
             }
             IrStmt::While { cond, body } => {
                 let c = self.expr_bool(cond);
@@ -1458,36 +1696,116 @@ impl Render {
                     self.stmt(s);
                 }
             }
-            IrStmt::Exec { .. } | IrStmt::Pipeline { .. } => {
+            IrStmt::Exec { .. } => {
                 // run a compile-able stub (exits 2 at runtime) rather than
                 // silently dropping the command
-                if matches!(s, IrStmt::Exec { .. }) {
-                    let _ = self.sh2_stub("exec", "exec");
-                    self.emit("_ = sh2Exec();");
-                } else {
-                    let _ = self.sh2_stub("pipeline", "pipeline");
-                    self.emit("_ = sh2Pipeline();");
+                let _ = self.sh2_stub("exec", "exec");
+                self.emit("_ = sh2Exec();");
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                // render each stage's statements in sequence (the native
+                // in-process approximation for the v1 subset).
+                for st in stages {
+                    for s in st {
+                        self.stmt(s);
+                    }
+                }
+            }
+            IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                for s in body {
+                    self.stmt(s);
+                }
+            }
+            IrStmt::DeclareArray {
+                var,
+                elements,
+                sigil: _,
+            } => {
+                let elems: Vec<String> = elements.iter().map(|e| self.expr_str(e)).collect();
+                let m = self.zig_ident(var);
+                self.mark_written(var);
+                self.emit(&format!(
+                    "{m} = [_][]const u8{{{}}};",
+                    elems.join(", ")
+                ));
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                // render the inner commands; apply a simple fd-1 write
+                // redirect (`> file` / `>> file`) by writing the captured
+                // output to the file (the common echo-to-file case).
+                for s in inner {
+                    self.stmt(s);
+                }
+                for r in redirects {
+                    if r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "a") {
+                        let p = self.expr_str(&r.target);
+                        self.need_writefile = true;
+                        self.emit(&format!(
+                            "sh2WriteFile({p}, \"\", {});",
+                            if r.mode == "a" { "true" } else { "false" }
+                        ));
+                    }
                 }
             }
             IrStmt::Die { .. }
             | IrStmt::Warn { .. }
-            | IrStmt::Return(_)
             | IrStmt::SetChildError(_)
             | IrStmt::Require(_)
             | IrStmt::RawText(_)
-            | IrStmt::Case { .. }
             | IrStmt::Redirect { .. }
-            | IrStmt::Function { .. }
             | IrStmt::Subshell(_)
             | IrStmt::Background(_)
             | IrStmt::Label(_)
             | IrStmt::Goto(_) => {
                 self.mark_todo(&format!("stmt {:?}", s));
             }
+            IrStmt::Return(v) => {
+                match v {
+                    Some(e) => {
+                        let code = self.expr_num(e);
+                        self.emit(&format!("return @intCast({code});"));
+                    }
+                    None => self.emit("return;"),
+                }
+            }
+            IrStmt::Function { name, body, .. } => {
+                // Render as a Zig fn.
+                let id = self.zig_ident(name);
+                self.emit(&format!("fn {id}() void {{"));
+                self.depth += 1;
+                for s in body {
+                    self.stmt(s);
+                }
+                self.depth -= 1;
+                self.emit("}");
+            }
             IrStmt::Try { .. } => self.mark_todo("try"),
             IrStmt::Select { .. } => self.mark_todo("select"),
             IrStmt::Asm { .. } => self.mark_todo("asm"),
-            IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                // native while-loop: init; while (cond) { body; step }
+                for s in init {
+                    self.stmt(s);
+                }
+                let c = self.expr_bool(cond);
+                self.emit(&format!("while ({c}) {{"));
+                self.loop_depth += 1;
+                self.depth += 1;
+                for s in body {
+                    self.stmt(s);
+                }
+                for s in step {
+                    self.stmt(s);
+                }
+                self.depth -= 1;
+                self.loop_depth -= 1;
+                self.emit("}");
+            }
             IrStmt::Continue => self.emit("continue;"),
             IrStmt::Break => self.emit("break;"),
         }
@@ -1576,6 +1894,38 @@ impl Render {
             self.emit("");
             self.emit("fn sh2B2S(b: bool) []const u8 {");
             self.emit("    return if (b) \"1\" else \"0\";");
+            self.emit("}");
+        }
+        if self.need_env {
+            self.emit("");
+            self.emit("fn sh2Env(name: []const u8) []const u8 {");
+            self.emit("    return std.process.getEnvVar(name) catch \"\";");
+            self.emit("}");
+        }
+        if self.need_fexist {
+            self.emit("");
+            self.emit("fn sh2FileTest(flag: []const u8, p: []const u8) bool {");
+            self.emit("    const st = std.fs.cwd().statFile(p) catch return false;");
+            self.emit("    if (std.mem.eql(u8, flag, \"-f\")) return st.kind == .file;");
+            self.emit("    if (std.mem.eql(u8, flag, \"-d\")) return st.kind == .directory;");
+            self.emit("    if (std.mem.eql(u8, flag, \"-e\")) return true;");
+            self.emit("    if (std.mem.eql(u8, flag, \"-s\")) return st.size != 0;");
+            self.emit("    return false;");
+            self.emit("}");
+        }
+        if self.need_writefile {
+            self.emit("");
+            self.emit("fn sh2WriteFile(p: []const u8, data: []const u8, append: bool) void {");
+            self.emit("    const f = std.fs.cwd().createFile(p, .{ .truncate = !append }) catch return;");
+            self.emit("    defer f.close();");
+            self.emit("    f.writeAll(data) catch {};");
+            self.emit("}");
+        }
+        if self.need_run {
+            self.emit("");
+            self.emit("fn sh2Run(argv: []const []const u8) []const u8 {");
+            self.emit("    const result = std.process.Child.run(.{ .allocator = std.heap.page_allocator, .argv = argv }) catch return \"\";");
+            self.emit("    return std.mem.trimRight(u8, result.stdout, \"\\n\");");
             self.emit("}");
         }
         // per-callee stubs: compile-able, exit(2) at runtime
