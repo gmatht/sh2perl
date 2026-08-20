@@ -564,6 +564,17 @@ impl Render {
                 }
                 self.sh2_stub("test")
             }
+            IrExpr::Call { func, args } if func == "contains" => {
+                // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+                // strings.Contains. The strings import is auto-derived from
+                // the generated text.
+                if args.len() >= 2 {
+                    let needle = self.expr_str(&args[0]);
+                    let pattern = self.expr_str(&args[1]);
+                    return format!("strings.Contains({needle}, {pattern})");
+                }
+                self.sh2_stub("contains")
+            }
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     return self.getvar_bool(name);

@@ -926,6 +926,16 @@ impl Render {
 
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+            // python `PAT in STR`.
+            "contains" => {
+                if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
+                    let needle = self.expr(needle);
+                    let pattern = self.expr(pattern);
+                    return format!("{pattern} in {needle}");
+                }
+                self.sh2_stub("contains", args, "contains")
+            }
             // exec("echo", [args...]) → native print (python's print IS echo
             // semantics: space-separated args + trailing newline);
             // exec("printf", [fmt, args...]) → native sys.stdout.write
