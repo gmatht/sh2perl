@@ -150,6 +150,13 @@ fn lower_expr(expr: &mut IrExpr) {
                 LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            // ${var,,} → Case(lower), ${var^^} → Case(upper),
+            // ${var:2:3} → SubStr(var, 2, 3)
+            if let Some(replacement) = try_lower_param_op(args) {
+                *expr = replacement;
+                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             for a in args.iter_mut() { lower_expr(a); }
         }
         // Recurse into nested pipelines (command substitution: capture wraps Arrow)
@@ -666,6 +673,30 @@ fn arg_to_expr(arg: &IrExpr) -> Option<IrExpr> {
             }
         }
         IrExpr::Var(..) | IrExpr::Capture { .. } | IrExpr::Call { .. } => Some(arg.clone()),
+        _ => None,
+    }
+}
+
+/// Reduce `param` expansion ops to primitives:
+///   ${var^^} → Case(var, upper), ${var,,} → Case(var, lower)
+///   ${var^} / ${var,} → CaseFirst (first char only)
+///   ${var:2:3} → SubStr(var, 2, 3)
+fn try_lower_param_op(args: &[IrExpr]) -> Option<IrExpr> {
+    if args.len() < 2 { return None; }
+    let op = match &args[0] { IrExpr::Str(s, _) => s.as_str(), _ => return None };
+    let var = args[1].clone();
+    match op {
+        ",," => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: false }))),
+        "^^" => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: true }))),
+        "slice" if args.len() >= 4 => {
+            let off = match &args[2] { IrExpr::Str(s, _) => s.parse::<i64>().ok()?, _ => return None };
+            let len = match &args[3] { IrExpr::Str(s, _) => s.parse::<i64>().ok()?, _ => return None };
+            Some(IrExpr::Ext(Box::new(SubStrExtract {
+                text: var,
+                offset: IrExpr::Int(off),
+                length: Some(Box::new(IrExpr::Int(len))),
+            })))
+        }
         _ => None,
     }
 }
