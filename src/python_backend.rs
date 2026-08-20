@@ -1443,21 +1443,71 @@ impl Render {
     /// s/d/i/u, `%%` literal, text backslash-unescape, args cycle across
     /// passes, spec-less formats repeat once per arg. Flags/width/prec or
     /// array args → stub (the core keeps the runtime dispatch there too).
+    /// bash -c fork/exec fallback for printf formats/args the native python
+    /// printf can't handle (flags/width/prec, array args, f-string fmt).
+    fn printf_fallback(&mut self, args: &[IrExpr]) -> String {
+        if let Some(IrExpr::Array(items)) = args.get(1) {
+            let fmt = match &items[0] {
+                IrExpr::Str(s, _) => Some(s.clone()),
+                IrExpr::Interpolate(parts) => {
+                    let mut t = String::new();
+                    let mut ok = true;
+                    for p in parts {
+                        match p {
+                            crate::ir::InterpPart::Lit(s) => t.push_str(s),
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(fmt) = fmt {
+                let mut parts = vec![Self::sh_quote(&fmt)];
+                let mut ok = true;
+                for a in &items[1..] {
+                    match self.sh_arg(a) {
+                        Some(t) => parts.push(t),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    self.need_subprocess = true;
+                    return format!(
+                        "subprocess.call([\"bash\", \"-c\", {}])",
+                        Self::py_str(&format!("printf {}", parts.join(" ")))
+                    );
+                }
+            }
+        }
+        self.sh2_stub("printf", args, "printf")
+    }
+
     fn printf_call(&mut self, args: &[IrExpr]) -> String {
         let Some(IrExpr::Array(items)) = args.get(1) else {
-            return self.sh2_stub("exec", args, "exec");
+            return self.printf_fallback(args);
         };
         let Some(IrExpr::Str(fmt, _)) = items.first() else {
-            return self.sh2_stub("exec", args, "exec");
+            return self.printf_fallback(args);
         };
         let parsed = match Self::printf_parse(fmt) {
             Some(p) => p,
-            None => return self.sh2_stub("exec", args, "exec"),
+            None => return self.printf_fallback(args),
         };
         let (els, n_specs) = parsed;
         let fmt_args: Vec<&IrExpr> = items[1..].iter().collect();
         if fmt_args.iter().any(|a| matches!(a, IrExpr::Array(_))) {
-            return self.sh2_stub("exec", args, "exec");
+            return self.printf_fallback(args);
         }
         let arg_exprs: Vec<String> = fmt_args.iter().map(|a| self.expr(a)).collect();
         // a spec with flags/width/prec must keep the runtime builtin
@@ -1468,7 +1518,7 @@ impl Render {
             None => false,
         });
         if complex {
-            return self.sh2_stub("exec", args, "exec");
+            return self.printf_fallback(args);
         }
         let passes = if n_specs == 0 {
             arg_exprs.len().max(1)
