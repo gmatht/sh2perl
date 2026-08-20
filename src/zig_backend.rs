@@ -543,6 +543,7 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "\"\"".into()
             }
+            IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "\"\"".into()
@@ -712,6 +713,7 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "false".into()
             }
+            IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "false".into()

@@ -1,0 +1,10 @@
+# shir_nodes/str_len.node — expression-level semantic IR node.
+# String length (lowered from `${#var}`).
+#
+# Backends: Perl length(), JS .length, C strlen(), Rust .len()
+# Fallback: sh2.strLen(text)
+
+node StrLen
+tag "StrLen"
+kind expr
+field text: expr

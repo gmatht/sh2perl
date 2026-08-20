@@ -429,6 +429,20 @@ pub enum IrExpr {
     /// JS SpreadElement (`[...x]` / `f(...x)`); the runtime store's array
     /// values are native JS arrays, so the spread is the exact splice.
     Splice(Box<IrExpr>),
+    /// A transform-declared expression node (shir_nodes): the extensible
+    /// slot for semantic IR nodes (FieldExtract, CharTranslate, RegSub,
+    /// etc.). Renderers that don't know the node fall back to the sh2.*
+    /// call; traversers reach children via ExtExpr::children_mut.
+    Ext(Box<dyn crate::shir_nodes::ExtExpr>),
+}
+
+// ── Supporting types ─────────────────────────────────────────────────
+
+/// A 1-indexed field position or range (for FieldExtract, CharExtract).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum FieldRange {
+    Single(u32),
+    Range { start: u32, end: u32 },
 }
 
 // ── Assignment target ────────────────────────────────────────────────
@@ -5826,6 +5840,16 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
             // ESTree-path-only splice marker — refuse loudly (see ArrayComp).
             "die \"debashc: shIR construct not yet supported by the Perl backend (Splice)\";".to_string()
         }
+        IrExpr::Ext(n) => {
+            // Transform-declared expression node — drop-in handler dispatch.
+            let ctx = crate::render_ext_expr::ExprRenderCtx { indent: 0 };
+            if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
+                code
+            } else {
+                // No handler — fall back to sh2.* call (the runtime handles it).
+                format!("sh2.{}(...)", n.tag())
+            }
+        }
         IrExpr::Array(elements) => {
             // General expression position: parenthesized list (for-iter,
             // list contexts). Exec-word position uses render_word instead.
@@ -6666,6 +6690,8 @@ fn expr_refers_to_main_exit(expr: &IrExpr) -> bool {
         }
         IrExpr::Lambda { body, .. } => body.iter().any(stmt_refers_to_main_exit),
         IrExpr::Splice(e) => expr_refers_to_main_exit(e),
+        IrExpr::Ext(n) => n.children().iter().any(|c| expr_refers_to_main_exit(c)),
+        IrExpr::Ext(n) => n.children().iter().any(|c| expr_refers_to_main_exit(c)),
         IrExpr::Array(elems) => elems.iter().any(expr_refers_to_main_exit),
         IrExpr::Arith(_) => false,
         IrExpr::Bool(_) => false,
@@ -6900,6 +6926,8 @@ fn collect_vars_in_expr(expr: &IrExpr, vars: &mut std::collections::HashSet<Stri
             }
         }
         IrExpr::Splice(e) => collect_vars_in_expr(e, vars),
+        IrExpr::Ext(n) => { for c in n.children() { collect_vars_in_expr(c, vars); } }
+        IrExpr::Ext(n) => { for c in n.children() { collect_vars_in_expr(c, vars); } }
         IrExpr::Arrow(body) => {
             for stmt in body {
                 collect_vars_in_stmt(stmt, vars);

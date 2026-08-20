@@ -1,0 +1,11 @@
+# shir_nodes/repeat_str.node — expression-level semantic IR node.
+# Repeat a string N times (lowered from `printf '%100s' '' | tr ' ' C`).
+#
+# Backends: Perl "C" x N, JS .repeat(), C memset, Rust repeat()
+# Fallback: sh2.repeatStr(text, count)
+
+node RepeatStr
+tag "RepeatStr"
+kind expr
+field text: expr
+field count: expr

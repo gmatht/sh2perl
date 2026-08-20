@@ -24,7 +24,7 @@ pub mod enc;
 /// A transform-declared node. The `tag` is the JSON discriminator
 /// (`{"type": <tag>, …}`); `children_mut` lets pre-existing walkers descend
 /// into a node they don't understand (structural traversal, §1 of the doc).
-pub trait ExtNode: std::fmt::Debug {
+pub trait ExtNode: std::fmt::Debug + Send + Sync {
     fn tag(&self) -> &'static str;
     fn to_json(&self) -> serde_json::Value;
     fn children_mut(&mut self) -> Vec<&mut IrStmt>;
@@ -58,12 +58,60 @@ impl PartialEq for Box<dyn ExtNode> {
 /// Registry constructor: (JSON) → boxed node.
 pub(crate) type NodeCtor = fn(&serde_json::Value) -> Result<Box<dyn ExtNode>, String>;
 
-// The generated structs + `all_nodes()` registry (build.rs → OUT_DIR).
-include!(concat!(env!("OUT_DIR"), "/shir_nodes_gen.rs"));
+// ── ExtExpr (expression-level extensible nodes) ──────────────────────
 
-/// Union lookup: find the constructor for a node tag.
+/// A transform-declared expression node. Mirrors `ExtNode` but for `IrExpr`
+/// — the extensible slot for expression-level semantic nodes (FieldExtract,
+/// CharTranslate, RegSub, etc.). Renderers that don't know the node fall
+/// back to the `sh2.*` call; traversers reach children via
+/// `ExtExpr::children_mut`.
+pub trait ExtExpr: std::fmt::Debug + Send + Sync {
+    fn tag(&self) -> &'static str;
+    fn to_json(&self) -> serde_json::Value;
+    /// Mutable child expressions (for tree-walking passes).
+    fn children_mut(&mut self) -> Vec<&mut crate::ir::IrExpr>;
+    /// Immutable child expressions (for analysis passes).
+    fn children(&self) -> Vec<&crate::ir::IrExpr>;
+    /// Clone-erasure so `Box<dyn ExtExpr>` can be `Clone`.
+    fn clone_box(&self) -> Box<dyn ExtExpr>;
+    /// Type-erased downcast (per-backend renderers downcast by tag).
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+// Same derive story as ExtNode: the `IrExpr` enum derives Debug/Clone/
+// PartialEq, so `Box<dyn ExtExpr>` needs those impls.
+impl Clone for Box<dyn ExtExpr> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+impl PartialEq for Box<dyn ExtExpr> {
+    fn eq(&self, other: &Self) -> bool {
+        self.tag() == other.tag() && self.to_json() == other.to_json()
+    }
+}
+
+/// Registry constructor for expression nodes: (JSON) → boxed node.
+pub(crate) type ExprNodeCtor = fn(&serde_json::Value) -> Result<Box<dyn ExtExpr>, String>;
+
+// The generated stmt + expr node structs + registries.
+// Scratch: hand-written gen_stmt.rs / gen_expr.rs (replaced by build.rs → OUT_DIR later).
+pub(crate) mod gen_stmt;
+pub(crate) mod gen_expr;
+pub use gen_stmt::*;
+pub use gen_expr::*;
+
+/// Union lookup: find the constructor for a statement node tag.
 pub(crate) fn node_ctor(tag: &str) -> Option<NodeCtor> {
     all_nodes()
+        .into_iter()
+        .find(|(t, _)| *t == tag)
+        .map(|(_, ctor)| ctor)
+}
+
+/// Union lookup: find the constructor for an expression node tag.
+pub(crate) fn expr_node_ctor(tag: &str) -> Option<ExprNodeCtor> {
+    all_expr_nodes()
         .into_iter()
         .find(|(t, _)| *t == tag)
         .map(|(_, ctor)| ctor)

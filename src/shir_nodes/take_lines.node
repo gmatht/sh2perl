@@ -1,0 +1,13 @@
+# shir_nodes/take_lines.node — expression-level semantic IR node.
+# Take first/last N lines or bytes (lowered from `head`/`tail`).
+#
+# Backends: Perl lines().take(), JS split().slice(), C fgets, Rust lines()
+# Fallback: sh2.takeLines(text, count, from_end, bytes)
+
+node TakeLines
+tag "TakeLines"
+kind expr
+field text: expr
+field count: expr
+field from_end: bool
+field bytes: bool

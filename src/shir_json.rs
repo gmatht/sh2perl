@@ -472,6 +472,7 @@ fn expr_json(e: &IrExpr) -> Value {
         // `[*a]` / `f(*a)` — the wrapped expr's elements splice into the
         // enclosing Array/Call (the estree renderer emits a JS spread).
         IrExpr::Splice(e) => json!({ "type": "Splice", "expr": expr_json(e) }),
+        IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
         IrExpr::Object(props) => json!({
             "type": "Object",
             "properties": props.iter().map(|(k, v)| json!({"key": k, "value": expr_json(v)})).collect::<Vec<_>>(),

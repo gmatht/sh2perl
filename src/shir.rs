@@ -4644,6 +4644,7 @@ use std::collections::{HashMap, HashSet};
                 walk_expr(lhs, acc, multi_run);
                 walk_expr(rhs, acc, multi_run);
             }
+            IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
             IrExpr::Index { key, .. } | IrExpr::Capture { expr: key, .. } => {
                 walk_expr(key, acc, multi_run);
             }
@@ -31539,6 +31540,7 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         IrExpr::Splice(e) => Expr::SpreadElement {
             argument: Box::new(expr_to_estree(e)),
         },
+        IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
         // A numeric-range iterable (`seq_range_for`'s bare `Range`
         // For.iter shape): the ESTree surface has no range literal, so
         // render the materialized string list. The native ForStatement

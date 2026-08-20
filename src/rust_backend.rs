@@ -1110,6 +1110,7 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "String::new()".to_string()
             }
+            IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
         }
     }
 
