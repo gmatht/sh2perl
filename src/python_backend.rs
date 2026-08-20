@@ -1073,6 +1073,28 @@ impl Render {
                             return format!("str(len({}))", self.py_ident(name));
                         }
                     }
+                    // `${x:-default}` — the value if non-empty else the default
+                    if op == ":-" || op == ":=" {
+                        if let (Some(IrExpr::Str(name, _)), Some(def)) =
+                            (args.get(1), args.get(2))
+                        {
+                            let v = self.call("getVar", &[IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted)]);
+                            let d = self.expr(def);
+                            if op == ":-" {
+                                return format!("({v} if {v} != \"\" else {d})");
+                            }
+                            return format!("({v} if {v} != \"\" else ({d}))");
+                        }
+                    }
+                    // `${s:off:len}` — substring slice
+                    if op == "slice" {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            let v = self.call("getVar", &[IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted)]);
+                            let o = self.expr_as_num(&args[2]);
+                            let l = self.expr_as_num(&args[3]);
+                            return format!("{v}[{o}:{o}+{l}]");
+                        }
+                    }
                 }
                 self.sh2_stub("param", args, "param")
             }
