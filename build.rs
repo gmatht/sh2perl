@@ -60,12 +60,21 @@ fn main() {
     fs::write(format!("{out}/pipeline_native_gen.rs"), gen).unwrap();
 
     // ── Part 2: transform-declared IR nodes ────────────────────────────
-    // DISABLED for scratch: using hand-written gen_stmt.rs / gen_expr.rs
-    // let nodes_dir = Path::new("src/shir_nodes");
-    // println!("cargo:rerun-if-changed={}", nodes_dir.display());
-    // let nodes = parse_nodes(nodes_dir);
-    // let node_gen = gen_nodes(&nodes);
-    // fs::write(format!("{out}/shir_nodes_gen.rs"), node_gen).unwrap();
+    let nodes_dir = Path::new("src/shir_nodes");
+    println!("cargo:rerun-if-changed={}", nodes_dir.display());
+    let all_nodes = parse_nodes(nodes_dir);
+
+    // Split into stmt (ExtNode) and expr (ExtExpr) nodes
+    let stmt_nodes: Vec<&NodeDecl> = all_nodes.iter().filter(|n| !n.is_expr).collect();
+    let expr_nodes: Vec<&NodeDecl> = all_nodes.iter().filter(|n| n.is_expr).collect();
+
+    // Stmt nodes → ExtNode structs + all_nodes() registry
+    let node_gen = gen_stmt_nodes(&stmt_nodes);
+    fs::write(format!("{out}/shir_nodes_gen.rs"), node_gen).unwrap();
+
+    // Expr nodes → ExtExpr structs + all_expr_nodes() registry
+    let expr_gen = gen_expr_nodes(&expr_nodes);
+    fs::write(format!("{out}/shir_expr_nodes_gen.rs"), expr_gen).unwrap();
 
     // ── Part 3: per-backend Ext-node render handlers (perl proof) ──────
     // DISABLED for scratch: using hand-written gen_stmt.rs / gen_expr.rs
@@ -142,6 +151,7 @@ fn snake(name: &str) -> String {
 struct NodeDecl {
     name: String,
     tag: String,
+    is_expr: bool, // kind: expr → ExtExpr; kind: stmt (default) → ExtNode
     fields: Vec<(String, String)>, // (field name, field type)
 }
 
@@ -166,6 +176,7 @@ fn parse_nodes(dir: &Path) -> Vec<NodeDecl> {
 fn parse_one_node(text: &str) -> Option<NodeDecl> {
     let mut name = None;
     let mut tag = None;
+    let mut is_expr = false;
     let mut fields = Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -176,6 +187,8 @@ fn parse_one_node(text: &str) -> Option<NodeDecl> {
             name = Some(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("tag ") {
             tag = Some(rest.trim_matches('"').to_string());
+        } else if let Some(rest) = line.strip_prefix("kind ") {
+            is_expr = rest.trim() == "expr";
         } else if let Some(rest) = line.strip_prefix("field ") {
             if let Some((fname, ftype)) = rest.split_once(':') {
                 fields.push((fname.trim().to_string(), ftype.trim().to_string()));
@@ -185,51 +198,91 @@ fn parse_one_node(text: &str) -> Option<NodeDecl> {
     Some(NodeDecl {
         name: name?,
         tag: tag.unwrap_or_default(),
+        is_expr,
         fields,
     })
 }
 
-/// The Rust type for a field's JSON value in `to_json`/`from_json`.
-fn gen_node(n: &NodeDecl) -> String {
+// ── Field type helpers ───────────────────────────────────────────────
+
+fn rust_ty(ftype: &str) -> &'static str {
+    match ftype {
+        "string" => "String",
+        "int" => "i64",
+        "bool" => "bool",
+        "expr" => "crate::ir::IrExpr",
+        "stmts" => "Vec<crate::ir::IrStmt>",
+        "optional_string" => "Option<String>",
+        "optional_expr" => "Option<Box<crate::ir::IrExpr>>",
+        "vec_field_range" => "Vec<crate::ir::FieldRange>",
+        other => panic!("unknown shir_nodes field type {other}"),
+    }
+}
+
+fn gen_json_build(fname: &str, ftype: &str) -> String {
+    let raw = match ftype {
+        "string" | "optional_string" | "vec_field_range" => {
+            format!("            \"{fname}\": self.{fname}.clone(),\n")
+        }
+        "int" => format!("            \"{fname}\": self.{fname},\n"),
+        "bool" => format!("            \"{fname}\": self.{fname},\n"),
+        "expr" => format!(
+            "            \"{fname}\": crate::shir_nodes::enc::expr_to_json(&self.{fname}),\n"
+        ),
+        "optional_expr" => format!(
+            "            \"{fname}\": self.{fname}.as_ref().map(|e| crate::shir_nodes::enc::expr_to_json(e)),\n"
+        ),
+        "stmts" => format!(
+            "            \"{fname}\": crate::shir_nodes::enc::stmts_to_json(&self.{fname}),\n"
+        ),
+        _ => String::new(),
+    };
+    // vec_field_range uses serde_json::to_value which handles the derive
+    if ftype == "vec_field_range" {
+        raw.replace(
+            &format!("self.{fname}.clone()"),
+            &format!("serde_json::to_value(&self.{fname}).unwrap()"),
+        )
+    } else {
+        raw
+    }
+}
+
+fn gen_json_read(fname: &str, ftype: &str, struct_name: &str) -> String {
+    match ftype {
+        "string" => format!(
+            "v[\"{fname}\"].as_str().ok_or(\"{struct_name}.{fname}\")?.to_string()"
+        ),
+        "int" => format!("v[\"{fname}\"].as_i64().ok_or(\"{struct_name}.{fname}\")?"),
+        "bool" => format!("v[\"{fname}\"].as_bool().ok_or(\"{struct_name}.{fname}\")?"),
+        "optional_string" => format!("v[\"{fname}\"].as_str().map(|s| s.to_string())"),
+        "expr" => format!("crate::shir_nodes::enc::json_to_expr(&v[\"{fname}\"])?"),
+        "optional_expr" => format!(
+            "if v[\"{fname}\"].is_null() {{ None }} else {{ Some(Box::new(crate::shir_nodes::enc::json_to_expr(&v[\"{fname}\"])?)) }}"
+        ),
+        "stmts" => format!("crate::shir_nodes::enc::json_to_stmts(&v[\"{fname}\"])?"),
+        "vec_field_range" => format!(
+            "serde_json::from_value(v[\"{fname}\"].clone()).map_err(|e| format!(\"{struct_name}.{fname}: {{e}}\"))?"
+        ),
+        _ => String::new(),
+    }
+}
+
+// ── Statement node generation (ExtNode) ─────────────────────────────
+
+fn gen_stmt_node(n: &NodeDecl) -> String {
     let mut fields = String::new();
     let mut json_build = String::new();
-    let mut json_read = String::new();
+    let mut json_read_lines = Vec::new();
     let mut children = String::new();
     let mut children_ref = String::new();
+
     for (fname, ftype) in &n.fields {
-        let rust_ty = match ftype.as_str() {
-            "string" => "String",
-            "int" => "i64",
-            "bool" => "bool",
-            "expr" => "crate::ir::IrExpr",
-            "stmts" => "Vec<crate::ir::IrStmt>",
-            other => panic!("unknown shir_nodes field type {other}"),
-        };
-        fields.push_str(&format!("    pub {fname}: {rust_ty},\n"));
-        json_build.push_str(&match ftype.as_str() {
-            "string" => format!("            \"{fname}\": self.{fname}.clone(),\n"),
-            "int" => format!("            \"{fname}\": self.{fname},\n"),
-            "bool" => format!("            \"{fname}\": self.{fname},\n"),
-            "expr" => format!(
-                "            \"{fname}\": crate::shir_nodes::enc::expr_to_json(&self.{fname}),\n"
-            ),
-            "stmts" => format!(
-                "            \"{fname}\": crate::shir_nodes::enc::stmts_to_json(&self.{fname}),\n"
-            ),
-            _ => String::new(),
-        });
-        json_read.push_str(&format!(
-            "            {fname}: {},\n",
-            match ftype.as_str() {
-                "string" => {
-                    format!("v[\"{fname}\"].as_str().ok_or(\"{}.{fname}\")?.to_string()", n.name)
-                }
-                "int" => format!("v[\"{fname}\"].as_i64().ok_or(\"{}.{fname}\")?", n.name),
-                "bool" => format!("v[\"{fname}\"].as_bool().ok_or(\"{}.{fname}\")?", n.name),
-                "expr" => format!("crate::shir_nodes::enc::json_to_expr(&v[\"{fname}\"])?"),
-                "stmts" => format!("crate::shir_nodes::enc::json_to_stmts(&v[\"{fname}\"])?"),
-                _ => String::new(),
-            }
+        let ty = rust_ty(ftype);
+        fields.push_str(&format!("    pub {fname}: {ty},\n"));
+        json_build.push_str(&gen_json_build(fname, ftype));
+        json_read_lines.push(format!(
+            "            {fname}: {}", gen_json_read(fname, ftype, &n.name)
         ));
         if ftype == "stmts" {
             children.push_str(&format!("        out.extend(self.{fname}.iter_mut());\n"));
@@ -237,16 +290,19 @@ fn gen_node(n: &NodeDecl) -> String {
         }
     }
 
+    let json_read = json_read_lines.join(",\n");
+
     format!(
-        r#"// @generated by build.rs from a shir_nodes/*.node declaration — do not edit.
+        r#"// @generated by build.rs from a shir_nodes/*.node — do not edit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct {name} {{
 {fields}}}
 
 impl {name} {{
-    fn from_json(v: &serde_json::Value) -> Result<Self, String> {{
+    pub(crate) fn from_json(v: &serde_json::Value) -> Result<Self, String> {{
         Ok({name} {{
-{json_read}        }})
+{json_read}
+        }})
     }}
 }}
 
@@ -268,9 +324,7 @@ impl crate::shir_nodes::ExtNode for {name} {{
     fn clone_box(&self) -> Box<dyn crate::shir_nodes::ExtNode> {{
         Box::new(self.clone())
     }}
-    fn as_any(&self) -> &dyn std::any::Any {{
-        self
-    }}
+    fn as_any(&self) -> &dyn std::any::Any {{ self }}
 }}
 
 "#,
@@ -284,22 +338,118 @@ impl crate::shir_nodes::ExtNode for {name} {{
     )
 }
 
-fn gen_nodes(nodes: &[NodeDecl]) -> String {
+fn gen_stmt_nodes(nodes: &[&NodeDecl]) -> String {
     let mut out = String::new();
     for n in nodes {
-        out.push_str(&gen_node(n));
+        out.push_str(&gen_stmt_node(n));
     }
     let mut registry = String::new();
     for n in nodes {
         registry.push_str(&format!(
             "        (\"{tag}\", |v| Ok(Box::new({name}::from_json(v)?))),\n",
-            tag = n.tag,
-            name = n.name
+            tag = n.tag, name = n.name
         ));
     }
     out.push_str(&format!(
-        "// @generated by build.rs — the union of transform-declared nodes.\n\
+        "// @generated by build.rs — the union of transform-declared stmt nodes.\n\
          pub(crate) fn all_nodes() -> Vec<(&'static str, crate::shir_nodes::NodeCtor)> {{\n\
+         vec![\n{registry}    ]\n}}\n"
+    ));
+    out
+}
+
+// ── Expression node generation (ExtExpr) ────────────────────────────
+
+fn gen_expr_node(n: &NodeDecl) -> String {
+    let mut fields = String::new();
+    let mut json_build = String::new();
+    let mut json_read_lines = Vec::new();
+    let mut child_exprs = String::new();
+    let mut child_exprs_ref = String::new();
+
+    for (fname, ftype) in &n.fields {
+        let ty = rust_ty(ftype);
+        fields.push_str(&format!("    pub {fname}: {ty},\n"));
+        json_build.push_str(&gen_json_build(fname, ftype));
+        json_read_lines.push(format!(
+            "            {fname}: {}", gen_json_read(fname, ftype, &n.name)
+        ));
+        if ftype == "expr" {
+            child_exprs.push_str(&format!("        out.push(&mut self.{fname});\n"));
+            child_exprs_ref.push_str(&format!("        out.push(&self.{fname});\n"));
+        } else if ftype == "optional_expr" {
+            child_exprs.push_str(&format!(
+                "        if let Some(ref mut e) = self.{fname} {{ out.push(e); }}\n"
+            ));
+            child_exprs_ref.push_str(&format!(
+                "        if let Some(ref e) = self.{fname} {{ out.push(e); }}\n"
+            ));
+        }
+    }
+
+    let json_read = json_read_lines.join(",\n");
+
+    format!(
+        r#"// @generated by build.rs from a shir_nodes/*.node — do not edit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct {name} {{
+{fields}}}
+
+impl {name} {{
+    pub(crate) fn from_json(v: &serde_json::Value) -> Result<Self, String> {{
+        Ok({name} {{
+{json_read}
+        }})
+    }}
+}}
+
+impl crate::shir_nodes::ExtExpr for {name} {{
+    fn tag(&self) -> &'static str {{ "{tag}" }}
+    fn to_json(&self) -> serde_json::Value {{
+        serde_json::json!({{
+            "type": "{tag}",
+{json_build}        }})
+    }}
+    fn children_mut(&mut self) -> Vec<&mut crate::ir::IrExpr> {{
+        let mut out = Vec::new();
+{child_exprs}        out
+    }}
+    fn children(&self) -> Vec<&crate::ir::IrExpr> {{
+        let mut out = Vec::new();
+{child_exprs_ref}        out
+    }}
+    fn clone_box(&self) -> Box<dyn crate::shir_nodes::ExtExpr> {{
+        Box::new(self.clone())
+    }}
+    fn as_any(&self) -> &dyn std::any::Any {{ self }}
+}}
+
+"#,
+        name = n.name,
+        tag = n.tag,
+        fields = fields,
+        json_read = json_read,
+        json_build = json_build,
+        child_exprs = child_exprs,
+        child_exprs_ref = child_exprs_ref,
+    )
+}
+
+fn gen_expr_nodes(nodes: &[&NodeDecl]) -> String {
+    let mut out = String::new();
+    for n in nodes {
+        out.push_str(&gen_expr_node(n));
+    }
+    let mut registry = String::new();
+    for n in nodes {
+        registry.push_str(&format!(
+            "        (\"{tag}\", |v| Ok(Box::new({name}::from_json(v)?))),\n",
+            tag = n.tag, name = n.name
+        ));
+    }
+    out.push_str(&format!(
+        "// @generated by build.rs — the union of transform-declared expr nodes.\n\
+         pub(crate) fn all_expr_nodes() -> Vec<(&'static str, crate::shir_nodes::ExprNodeCtor)> {{\n\
          vec![\n{registry}    ]\n}}\n"
     ));
     out

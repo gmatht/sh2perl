@@ -9,5 +9,6 @@ tag "FieldExtract"
 kind expr
 field text: expr
 field delimiter: string
+field fields: vec_field_range
 field suppress_no_delim: bool
 field output_delimiter: optional_string
