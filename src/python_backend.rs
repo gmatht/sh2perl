@@ -1090,6 +1090,28 @@ impl Render {
                         }
                     }
                     // `${x:-default}` — the value if non-empty else the default
+                    // case conversion: ${x^^} / ${x,,} / ${x^} / ${x,}
+                    if op == "^^" || op == ",," || op == "^" || op == "," {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.to_string(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            match op.as_str() {
+                                "^^" => return format!("{v}.upper()"),
+                                ",," => return format!("{v}.lower()"),
+                                "^" => return format!(
+                                    "({v}[:1].upper() + {v}[1:] if {v} else \"\")"
+                                ),
+                                _ => return format!(
+                                    "({v}[:1].lower() + {v}[1:] if {v} else \"\")"
+                                ),
+                            }
+                        }
+                    }
                     if op == ":-" || op == ":=" {
                         if let (Some(IrExpr::Str(name, _)), Some(def)) =
                             (args.get(1), args.get(2))
