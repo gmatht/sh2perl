@@ -1163,6 +1163,31 @@ fn word_to_java(e: &IrExpr) -> Result<String, String> {
                 None => Err("split with no arg (v1)".into()),
             }
         }
+        IrExpr::Capture { expr, .. } => {
+            // `$(cmd args)` in a word — run and capture stdout
+            if let IrExpr::Arrow(body) = expr.as_ref() {
+                if let [IrStmt::Expr(e)] = body.as_slice() {
+                    if let IrExpr::Call { func: f, args } = e {
+                        if f == "exec" {
+                            let mut argv = Vec::new();
+                            if let Some(IrExpr::Str(c, _)) = args.first() {
+                                argv.push(java_str_lit(c));
+                            }
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                for it in items {
+                                    argv.push(word_to_java(it)?);
+                                }
+                            }
+                            return Ok(format!(
+                                "new String(new ProcessBuilder({}).start().getInputStream().readAllBytes()).trim()",
+                                argv.join(", ")
+                            ));
+                        }
+                    }
+                }
+            }
+            Err("capture not in the v1 Java subset".into())
+        }
         IrExpr::Array(items) => {
             let parts: Result<Vec<String>, String> =
                 items.iter().map(word_to_java).collect();
