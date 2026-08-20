@@ -1,0 +1,9 @@
+# shir_nodes/reg_count.node — primitive: count matches of a regex in a string.
+# wc -l lowers to RegCount(text, /\n/) (a newline count, NOT split+len).
+# Every regex-capable language has this.
+
+node RegCount
+tag "RegCount"
+kind expr
+field text: expr
+field pattern: string

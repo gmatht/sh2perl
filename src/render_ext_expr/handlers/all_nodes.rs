@@ -12,6 +12,15 @@ use crate::shir_nodes::*;
 use crate::shir_nodes::ExtExpr;
 use crate::render_ext_expr::{ExprRenderCtx, Backend};
 
+/// Render a child expression per-backend (all backends, not just Perl).
+fn render_text(ctx: &ExprRenderCtx, expr: &crate::ir::IrExpr) -> Option<String> {
+    match ctx.backend {
+        Backend::Perl => Some(crate::ir::ir_expr_to_perl(expr)),
+        _ => None, // placeholder until per-backend expr renderers exist
+    }
+}
+
+
 // Helper: render a child expression for the current backend
 fn render_child(expr: &crate::ir::IrExpr, ctx: &ExprRenderCtx) -> Option<String> {
     match ctx.backend {
@@ -110,35 +119,6 @@ pub fn take_lines(node: &TakeLines, ctx: &ExprRenderCtx) -> Option<String> {
 }
 
 // ── WordCount ────────────────────────────────────────────────────────
-
-pub fn word_count(node: &WordCount, ctx: &ExprRenderCtx) -> Option<String> {
-    match ctx.backend {
-        Backend::Perl => {
-            let text = crate::ir::ir_expr_to_perl(&node.text);
-            match node.mode.as_str() {
-                "l" => Some(format!("scalar(split(/\\n/, {}, -1))", text)),
-                "w" => Some(format!("scalar(split(/\\s+/, {}))", text)),
-                "c" => Some(format!("length({})", text)),
-                "m" => Some(format!("length({})", text)), // approximation
-                _ => None,
-            }
-        }
-        Backend::Estree => {
-            let text = render_child(&node.text, ctx)?;
-            match node.mode.as_str() {
-                "l" => Some(format!("{}.split('\\n').length", text)),
-                "w" => Some(format!("{}.split(/\\s+/).length", text)),
-                "c" | "m" => Some(format!("{}.length", text)),
-                _ => None,
-            }
-        }
-        Backend::Go => Some(format!("/* TODO: WordCount Go */")),
-        Backend::Rust => Some(format!("/* TODO: WordCount Rust */")),
-        Backend::C => None,
-        Backend::Zig => Some(format!("/* TODO: WordCount Zig */")),
-        _ => None,
-    }
-}
 
 // ── SubStrExtract ────────────────────────────────────────────────────
 
@@ -390,6 +370,64 @@ pub fn path_name(node: &PathName, ctx: &ExprRenderCtx) -> Option<String> {
                 Some(format!("do {{ my $p = {}; $p =~ s|/[^/]*$||; $p eq \"\" ? \"/\" : $p }}", text))
             }
         }
+        _ => None,
+    }
+}
+
+// ── Split ────────────────────────────────────────────────────────────
+
+pub fn split(node: &Split, ctx: &ExprRenderCtx) -> Option<String> {
+    let text = render_text(ctx, &node.text)?;
+    match ctx.backend {
+        Backend::Perl => {
+            if node.is_regex {
+                Some(format!("split(/{}/, {}, -1)", node.delim, text))
+            } else {
+                let d = node.delim.replace('\'', "''");
+                Some(format!("split('{}', {}, -1)", d, text))
+            }
+        }
+        Backend::Estree => {
+            if node.is_regex {
+                Some(format!("{}.split(/{}/)", text, node.delim))
+            } else {
+                Some(format!("{}.split('{}')", text, node.delim.replace('\'', "\\'")))
+            }
+        }
+        Backend::Go => Some(format!("strings.Split({}, \"{}\" /* TODO */)", text, node.delim)),
+        Backend::Rust => Some(format!("{}.split('{}')", text, node.delim)),
+        Backend::C => None,
+        Backend::Zig => Some(format!("std.mem.splitScalar(u8, {}, '{}')", text, node.delim)),
+        _ => None,
+    }
+}
+
+// ── ArrayLen ─────────────────────────────────────────────────────────
+
+pub fn array_len(node: &ArrayLen, ctx: &ExprRenderCtx) -> Option<String> {
+    let arr = render_text(ctx, &node.array)?;
+    match ctx.backend {
+        Backend::Perl => Some(format!("scalar({})", arr)),
+        Backend::Estree => Some(format!("{}.length", arr)),
+        Backend::Go => Some(format!("len({})", arr)),
+        Backend::Rust => Some(format!("{}.len()", arr)),
+        Backend::C => None,
+        Backend::Zig => Some(format!("{}.len", arr)),
+        _ => None,
+    }
+}
+
+// ── RegCount ─────────────────────────────────────────────────────────
+
+pub fn reg_count(node: &RegCount, ctx: &ExprRenderCtx) -> Option<String> {
+    let text = render_text(ctx, &node.text)?;
+    match ctx.backend {
+        Backend::Perl => Some(format!("() = ({} =~ /{}/g)", text, node.pattern)),
+        Backend::Estree => Some(format!("({}.match(/{}/g) || []).length", text, node.pattern)),
+        Backend::Go => Some(format!("len(regexp.MustCompile(\"{}\").FindAllStringIndex({}, -1))", node.pattern, text)),
+        Backend::Rust => Some(format!("{}.match(/{}/g) /* TODO */", text, node.pattern)),
+        Backend::C => None,
+        Backend::Zig => Some(format!("/* TODO: RegCount Zig */")),
         _ => None,
     }
 }
