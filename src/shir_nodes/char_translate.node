@@ -1,0 +1,14 @@
+# shir_nodes/char_translate.node — expression-level semantic IR node.
+# Translate/delete/squeeze characters (lowered from `tr SET1 SET2`).
+#
+# Backends: Perl tr///, JS regex/lookup, C ctype, Rust chars().map()
+# Fallback: sh2.translate(text, from, to, delete, squeeze)
+
+node CharTranslate
+tag "CharTranslate"
+kind expr
+field text: expr
+field from: string
+field to: string
+field delete: bool
+field squeeze: bool

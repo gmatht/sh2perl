@@ -785,6 +785,7 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "nil".into()
             }
+            IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr_any(i)).collect();
                 format!("[]any{{{}}}", elems.join(", "))

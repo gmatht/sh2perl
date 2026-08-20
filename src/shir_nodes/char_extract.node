@@ -1,0 +1,11 @@
+# shir_nodes/char_extract.node — expression-level semantic IR node.
+# Extract characters/bytes by position (lowered from `cut -cN` / `cut -bN`).
+#
+# Backends: Perl substr(), JS slice(), C pointer arithmetic, Rust chars().skip()
+# Fallback: sh2.charExtract(text, positions, byte_mode)
+
+node CharExtract
+tag "CharExtract"
+kind expr
+field text: expr
+field byte_mode: bool
