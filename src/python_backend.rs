@@ -750,7 +750,24 @@ impl Render {
                 format!("({} or {})", self.expr(expr), self.expr(default))
             }
             IrExpr::Interpolate(parts) => self.interp(parts),
-            IrExpr::Capture { .. } => self.sh2_stub("capture", &[], "capture"),
+            IrExpr::Capture { expr, .. } => {
+                // `$(cmd args)` with a single exec body -> native capture
+                if let IrExpr::Arrow(body) = expr.as_ref() {
+                    if let [IrStmt::Expr(e)] = body.as_slice() {
+                        if let IrExpr::Call { func, args } = e {
+                            if func == "exec" {
+                                let argv = self.build_argv(args);
+                                self.need_subprocess = true;
+                                return format!(
+                                    "subprocess.check_output([{}]).decode()",
+                                    argv.join(", ")
+                                );
+                            }
+                        }
+                    }
+                }
+                self.sh2_stub("capture", &[], "capture")
+            },
             IrExpr::Regex { .. } => self.sh2_stub("regex", &[], "regex"),
             IrExpr::Range { start, end } => format!("range({}, {})", start, end + 1),
             IrExpr::RawExpr(s) => {
