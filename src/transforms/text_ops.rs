@@ -190,6 +190,16 @@ fn lower_expr(expr: &mut IrExpr) {
         IrExpr::Index { key, .. } => lower_expr(key),
         IrExpr::BinOp { lhs, rhs, .. } => { lower_expr(lhs); lower_expr(rhs); }
         IrExpr::Ternary { cond, then, else_, .. } => { lower_expr(cond); lower_expr(then); lower_expr(else_); }
+        // `${#s}` outside a string lowers to getVar("##s") — the raw length
+        // marker. Reduce to StrLen(read(s)).
+        IrExpr::Call { func, args } if func == "getVar" => {
+            if let Some(replacement) = try_lower_getvar_len(args) {
+                *expr = replacement;
+                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            for a in args.iter_mut() { lower_expr(a); }
+        }
         // Nested builtin/exec command in expression position: basename/dirname
         // inside $(...) — e.g. `dirname "$(pwd)"`.
         IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
@@ -599,7 +609,7 @@ fn try_lower_param_len(args: &[IrExpr]) -> Option<IrExpr> {
     // param("length", var_name) → StrLen(read(var))
     if args.len() >= 2 {
         if let IrExpr::Str(op, _) = &args[0] {
-            if op == "length" {
+            if op == "length" || op == "len" {
                 let var = param_var_read(&args[1])?;
                 return Some(IrExpr::Ext(Box::new(StrLen { text: var })));
             }
@@ -818,4 +828,29 @@ fn try_lower_grep(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
         })));
     }
     None
+}
+
+/// `${#name}` raw form: getVar("##name") → StrLen(read(name)).
+/// The "##" prefix marks a length read in the shIR.
+fn try_lower_getvar_len(args: &[IrExpr]) -> Option<IrExpr> {
+    match args {
+        [IrExpr::Str(name, _)] => {
+            if name.starts_with('#') && name.len() > 1 {
+                let var_name = &name[1..];
+                let var = param_var_read(&IrExpr::Str(var_name.to_string(), StrStyle::DoubleQuoted))?;
+                return Some(IrExpr::Ext(Box::new(StrLen { text: var })));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Read a variable by name: param("", name) — the shIR's plain-read form.
+fn param_var(name: &IrExpr) -> Option<IrExpr> {
+    match name {
+        IrExpr::Str(s, _) => Some(IrExpr::Call { func: "param".to_string(),
+            args: vec![IrExpr::Str(String::new(), StrStyle::DoubleQuoted), IrExpr::Str(s.clone(), StrStyle::DoubleQuoted)] }),
+        _ => None,
+    }
 }
