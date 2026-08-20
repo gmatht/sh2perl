@@ -1476,21 +1476,29 @@ impl Render {
     fn body_shell_text(&self, body: &[IrStmt]) -> Option<String> {
         let mut parts = Vec::new();
         for st in body {
-            let IrStmt::Expr(e) = st else {
-                return None;
-            };
-            match e {
-                IrExpr::Call { func, args } if func == "exec" => {
-                    let mut one = Vec::new();
-                    if let Some(IrExpr::Str(cmd, _)) = args.first() {
-                        one.push(Self::sh_quote(cmd));
-                    }
-                    if let Some(IrExpr::Array(items)) = args.get(1) {
-                        for it in items {
-                            one.push(self.sh_arg(it)?);
+            match st {
+                IrStmt::Expr(e) => {
+                    if let IrExpr::Call { func, args } = e {
+                        if func == "exec" {
+                            let mut one = Vec::new();
+                            if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                                one.push(Self::sh_quote(cmd));
+                            }
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                for it in items {
+                                    one.push(self.sh_arg(it)?);
+                                }
+                            }
+                            parts.push(one.join(" "));
+                            continue;
                         }
                     }
-                    parts.push(one.join(" "));
+                    return None;
+                }
+                IrStmt::Assign { targets, expr, .. } => {
+                    let var = targets.first()?.var.clone();
+                    let val = self.sh_arg(expr)?;
+                    parts.push(format!("{var}={val}"));
                 }
                 _ => return None,
             }
