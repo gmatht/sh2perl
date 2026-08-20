@@ -71,10 +71,12 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool) {
                 if let [IrStmt::Expr(IrExpr::Call { func, args })] = inner.as_slice() {
                     if func == "exec" || func == "builtin" {
                         if let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice() {
-                            if let Some(replacement) = try_lower_command(text_ir, name, cmd_args) {
-                                *stmt = IrStmt::Expr(replacement);
-                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
-                                return;
+                            if emit {
+                                if let Some(replacement) = try_lower_command(text_ir, name, cmd_args) {
+                                    *stmt = IrStmt::Output { value: replacement, newline: true, target: None };
+                                    LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -364,8 +366,16 @@ fn extract_text_from_stage(stmts: &[IrStmt]) -> Option<IrExpr> {
             }
             None
         }
-        // Simple expression
-        [IrStmt::Expr(e)] => Some(e.clone()),
+        // A literal-only expression (a string or all-literal interpolation),
+        // NOT an arbitrary command — `paste | head` must not reduce as if
+        // paste produced a literal string.
+        [IrStmt::Expr(e)] => match e {
+            IrExpr::Str(..) => Some(e.clone()),
+            IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => {
+                Some(e.clone())
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -471,6 +481,20 @@ fn try_lower_tr(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
 
     if from.is_empty() {
         return None;
+    }
+
+    // POSIX character classes: tr '[:upper:]' '[:lower:]' is a CASE
+    // transform, NOT a literal char map ("[:upper:]" is a class, not chars).
+    // Other classes ([:digit:], [:space:], ...) can't be a literal CharTranslate
+    // — leave them to the runtime.
+    if from.contains("[:") || to.contains("[:") {
+        if !delete && !squeeze && from == "[:upper:]" && to == "[:lower:]" {
+            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: false })));
+        }
+        if !delete && !squeeze && from == "[:lower:]" && to == "[:upper:]" {
+            return Some(IrExpr::Ext(Box::new(CaseTransform { text, upper: true })));
+        }
+        return None; // other class translations → runtime
     }
 
     // Special case: tr 'a-z' 'A-Z' (case transform)
@@ -726,16 +750,6 @@ mod tests {
         assert!(!n.upper, ",, should be lower");
     }
 
-    #[test]
-    fn param_slice() {
-        let args = vec![st("slice"), st("var"), st("2"), st("3")];
-        let r = try_lower_param_op(&args).expect("slice lowers");
-        let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
-        let n = n.as_any().downcast_ref::<SubStrExtract>().unwrap();
-        assert_eq!(n.offset, IrExpr::Int(2));
-        assert_eq!(**n.length.as_ref().unwrap(), IrExpr::Int(3));
-    }
-
     // ── wc reductions ────────────────────────────────────────────────
 
     fn arg(text: IrExpr) -> IrExpr {
@@ -879,15 +893,11 @@ fn try_lower_param_op(args: &[IrExpr]) -> Option<IrExpr> {
     match op {
         ",," => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: false }))),
         "^^" => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: true }))),
-        "slice" if args.len() >= 4 => {
-            let off = match &args[2] { IrExpr::Str(s, _) => s.parse::<i64>().ok()?, _ => return None };
-            let len = match &args[3] { IrExpr::Str(s, _) => s.parse::<i64>().ok()?, _ => return None };
-            Some(IrExpr::Ext(Box::new(SubStrExtract {
-                text: var,
-                offset: IrExpr::Int(off),
-                length: Some(Box::new(IrExpr::Int(len))),
-            })))
-        }
+        // "slice" is NOT reduced: ${s:N:M} (scalar) and ${arr[@]:N:M} (array)
+        // produce IDENTICAL param("slice", name, off, len) — they can't be
+        // told apart from the args, and reducing an array slice to a string
+        // SubStrExtract is WRONG. The runtime handles both correctly, so
+        // leave param("slice") untouched.
         _ => None,
     }
 }
