@@ -1168,6 +1168,31 @@ fn word_to_java(e: &IrExpr) -> Result<String, String> {
                 items.iter().map(word_to_java).collect();
             Ok(format!("(\"\" + {})", parts?.join(" + \" \" + ")))
         }
+        IrExpr::Interpolate(parts) => {
+            // `"hello"` / `"hi $name"` — concatenate lit + expr parts
+            let mut out = String::from("\"\" + ");
+            let mut lit = String::new();
+            for p in parts {
+                match p {
+                    crate::ir::InterpPart::Lit(s) => lit.push_str(s),
+                    crate::ir::InterpPart::Expr(x) => {
+                        if !lit.is_empty() {
+                            out.push_str(&java_str_lit(&lit));
+                            out.push_str(" + ");
+                            lit.clear();
+                        }
+                        out.push_str(&word_to_java(x)?);
+                        out.push_str(" + ");
+                    }
+                }
+            }
+            if !lit.is_empty() || out == "\"\" + " {
+                out.push_str(&java_str_lit(&lit));
+            } else {
+                out.truncate(out.len() - 3);
+            }
+            Ok(out)
+        }
         other => Err(format!("word not in the v1 Java subset: {other:?}")),
     }
 }
