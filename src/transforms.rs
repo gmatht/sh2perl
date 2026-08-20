@@ -31,6 +31,14 @@ pub mod shir_pipeline_native;
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
 pub mod shir_native_stmt; // worker-submitted: redirect/herestring/test-chain shapes → native stmt forms
+// New transforms merged from the workspace (core-requests/transforms/done).
+pub mod background_decide; // `&` background → THREAD/FORK class (analysis; feeds renderer hooks)
+pub mod bc_float_clean; // strip redundant `+ 0.0` before `echo … | bc` (native float emulation)
+pub mod direct_calls; // `v=$(sq 3)` of a defined pure-output fn → in-process Capture{Call}
+pub mod escape_classes; // per-var STORE requirement census (feeds escape/hoist analyses)
+pub mod for_recovery; // counter-while → native For recovery
+pub mod function_purity; // function-level side-effect classes by call-graph fixpoint
+pub mod i32_provable; // PROVABLY-32-bit arith annotations
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
@@ -53,6 +61,18 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // (shir_json::shir_to_shir_json) so the analyses and every
         // exec-keyed renderer arm stay untouched; the exported contract
         // carries the op and the renderers erase/accept at entry.
+        //
+        // New transforms merged from the workspace (core-requests/transforms/done).
+        // Analyses (escape-classes, function-purity, background-decide, i32-provable)
+        // compute statics the renderer hooks read; direct-calls / for-recovery /
+        // bc-float-clean make structural rewrites.
+        ("background-decide", background_decide::transform),
+        ("bc-float-clean", bc_float_clean::transform),
+        ("direct-calls", direct_calls::transform),
+        ("escape-classes", escape_classes::transform),
+        ("for-recovery", for_recovery::transform),
+        ("function-purity", function_purity::transform),
+        ("i32-provable", i32_provable::transform),
     ]
 }
 
