@@ -252,6 +252,13 @@ fn try_lower_pipeline(stages: &[IrExpr]) -> Option<IrExpr> {
         _ => return None,
     };
 
+    // `yes X | head -n K` → RepeatStr(X+"\n", K) — a clean repeat idiom.
+    if cmd_name == "head" {
+        if let Some(replacement) = try_lower_yes_head(stage1_body, cmd_args) {
+            return Some(replacement);
+        }
+    }
+
     // stage1 produces text (echo, capture, etc.)
     let text_expr = match extract_text_from_stage(stage1_body) {
         Some(e) => {
@@ -263,6 +270,49 @@ fn try_lower_pipeline(stages: &[IrExpr]) -> Option<IrExpr> {
     };
 
     lower_text_cmd(text_expr, cmd_name, cmd_args)
+}
+
+/// `yes "X" | head -n K` → RepeatStr("X\n", K). `yes` repeats "X\n";
+/// head -n K keeps K lines.
+fn try_lower_yes_head(stage1: &[IrStmt], head_args: &[IrExpr]) -> Option<IrExpr> {
+    // stage1: exec/builtin yes X
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stage1 else { return None };
+    if !(func == "exec" || func == "builtin") { return None; }
+    let [IrExpr::Str(cmd, _), IrExpr::Array(yes_args)] = args.as_slice() else { return None };
+    if cmd != "yes" { return None; }
+    let text = match yes_args.first() {
+        Some(IrExpr::Str(s, _)) => s.clone(),
+        Some(IrExpr::Interpolate(p)) if p.len() == 1 => {
+            if let InterpPart::Lit(s) = &p[0] { s.clone() } else { return None }
+        }
+        _ => return None,
+    };
+    // head -n K → K
+    let k = head_count(head_args)?;
+    Some(IrExpr::Ext(Box::new(RepeatStr {
+        text: IrExpr::Str(format!("{}\n", text), StrStyle::DoubleQuoted),
+        count: IrExpr::Int(k),
+    })))
+}
+
+/// Extract the -n K count from `head -n K` / `head -K`.
+fn head_count(head_args: &[IrExpr]) -> Option<i64> {
+    let strs: Vec<&str> = head_args.iter().filter_map(|a| match a {
+        IrExpr::Str(s, _) => Some(s.as_str()),
+        _ => None,
+    }).collect();
+    let mut i = 0;
+    while i < strs.len() {
+        if strs[i] == "-n" || strs[i] == "-c" {
+            if let Some(c) = strs.get(i + 1) { return c.parse::<i64>().ok(); }
+        } else if let Some(rest) = strs[i].strip_prefix('-') {
+            if rest.len() >= 1 && !rest.chars().all(|c| !c.is_ascii_digit()) {
+                if let Ok(n) = rest.parse::<i64>() { return Some(n); }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Dispatch a single command against input text (used by both the pipeline
