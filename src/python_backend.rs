@@ -763,6 +763,10 @@ impl Render {
                                     argv.join(", ")
                                 );
                             }
+                            // `$(cmd1 | cmd2)` — a pipeline body
+                            if func == "pipeline" {
+                                return self.call("pipeline", args);
+                            }
                         }
                     }
                 }
@@ -1275,6 +1279,35 @@ impl Render {
                 }
                 let rc = format!("\"\\n\".join(re.findall({}, {text}))", Self::py_str(&body));
                 rc
+            }
+            "pipeline" => {
+                // `cmd1 | cmd2` — bash -c fork/exec fallback (a pipeline is
+                // a shell primitive; subprocess pipes would need stage wiring).
+                if let Some(IrExpr::Array(stages)) = args.first() {
+                    let mut parts = Vec::new();
+                    for stage in stages {
+                        if let IrExpr::Arrow(body) = stage {
+                            if let [IrStmt::Expr(e)] = body.as_slice() {
+                                if let IrExpr::Call { func, args } = e {
+                                    if func == "exec" {
+                                        let argv = self.build_argv(args);
+                                        parts.push(argv.join(" "));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        return self.sh2_stub("pipeline", args, "pipeline");
+                    }
+                    if !parts.is_empty() {
+                        self.need_subprocess = true;
+                        return format!(
+                            "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
+                            Self::py_str(&parts.join(" | "))
+                        );
+                    }
+                }
+                self.sh2_stub("pipeline", args, "pipeline")
             }
             _ => self.sh2_stub(func, args, func),
         }
