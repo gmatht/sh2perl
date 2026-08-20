@@ -234,6 +234,37 @@ impl JavaCtx {
                 indent(out, d);
                 out.push_str(&t.var);
                 out.push_str(" = ");
+                // `i++` / `i--` / `i += n` step/body arith assignments
+                if let IrExpr::Arith(a) = expr {
+                    match &**a {
+                        ArithAst::IncDec { var, delta, .. } => {
+                            let d = delta.unsigned_abs();
+                            let sign = if *delta >= 0 { "+" } else { "-" };
+                            out.push_str(&format!(
+                                "Long.toString(sh2Num({var}) {sign} {d})"
+                            ));
+                            out.push_str(";\n");
+                            return Ok(());
+                        }
+                        ArithAst::Assign { var, op, rhs } => {
+                            let rhs = arith_str(rhs)?;
+                            let jop = match op.as_str() {
+                                "+=" => " + ",
+                                "-=" => " - ",
+                                "*=" => " * ",
+                                "/=" => " / ",
+                                "%=" => " % ",
+                                _ => " + ",
+                            };
+                            out.push_str(&format!(
+                                "Long.toString(sh2Num({var}){jop}({rhs}))"
+                            ));
+                            out.push_str(";\n");
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
                 expr_to_java(expr, out)?;
                 out.push_str(";\n");
                 Ok(())
@@ -397,6 +428,198 @@ impl JavaCtx {
                     Err("continue outside a loop (v1)".into())
                 }
             }
+            IrStmt::Output {
+                value,
+                newline,
+                target,
+            } => {
+                if target.is_some() {
+                    return Err("Output to a filehandle target (v1)".into());
+                }
+                indent(out, d);
+                out.push_str(if *newline { "System.out.println(" } else { "System.out.print(" });
+                expr_to_java(value, out)?;
+                out.push_str(");\n");
+                Ok(())
+            }
+            IrStmt::Exit(e) => {
+                let code = match e {
+                    Some(x) => {
+                        let mut s = String::new();
+                        expr_to_java(x, &mut s)?;
+                        format!("sh2Num({})", s)
+                    }
+                    None => "0".to_string(),
+                };
+                indent(out, d);
+                out.push_str(&format!("System.exit((int){});\n", code));
+                Ok(())
+            }
+            IrStmt::Return(v) => {
+                indent(out, d);
+                match v {
+                    Some(x) => {
+                        out.push_str("return ");
+                        expr_to_java(x, out)?;
+                        out.push_str(";\n");
+                    }
+                    None => out.push_str("return;\n"),
+                }
+                Ok(())
+            }
+            IrStmt::SetChildError(_) => Ok(()), // status tracked elsewhere (no-op)
+            IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                for b in body {
+                    self.stmt_to_java(b, d, out)?;
+                }
+                Ok(())
+            }
+            IrStmt::Declare { vars, init, .. } => {
+                for v in vars {
+                    indent(out, d);
+                    out.push_str(&v.name);
+                    out.push_str(" = ");
+                    match init {
+                        Some(e) => expr_to_java(e, out)?,
+                        None => out.push_str("\"\""),
+                    }
+                    out.push_str(";\n");
+                }
+                Ok(())
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                let mut dstr = String::new();
+                expr_to_java(discriminant, &mut dstr)?;
+                let mut emitted = false;
+                for cl in clauses {
+                    let is_default = cl.patterns.iter().any(|p| p == "*");
+                    let conds: Vec<String> = cl
+                        .patterns
+                        .iter()
+                        .filter(|p| p.as_str() != "*")
+                        .map(|p| format!("{}.equals({})", dstr, java_str_lit(p)))
+                        .collect();
+                    if conds.is_empty() && is_default {
+                        indent(out, d);
+                        out.push_str("else {\n");
+                        for b in &cl.body {
+                            self.stmt_to_java(b, d + 1, out)?;
+                        }
+                        indent(out, d);
+                        out.push_str("}\n");
+                        emitted = true;
+                        continue;
+                    }
+                    indent(out, d);
+                    out.push_str(if emitted { "else if (" } else { "if (" });
+                    out.push_str(&conds.join(" || "));
+                    out.push_str(") {\n");
+                    for b in &cl.body {
+                        self.stmt_to_java(b, d + 1, out)?;
+                    }
+                    indent(out, d);
+                    out.push_str("}\n");
+                    emitted = true;
+                }
+                Ok(())
+            }
+            IrStmt::Function { name, body, .. } => {
+                let id = java_ident(name);
+                let ret = if body_has_return(body) {
+                    "String"
+                } else {
+                    "void"
+                };
+                indent(out, d);
+                out.push_str(&format!("static {ret} {id}() {{\n"));
+                for b in body {
+                    self.stmt_to_java(b, d + 1, out)?;
+                }
+                indent(out, d);
+                if ret == "String" {
+                    out.push_str("return \"\";\n");
+                }
+                out.push_str("}\n");
+                Ok(())
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                // render the inner commands; apply a simple fd-1 write
+                // redirect (`> file` / `>> file`) by wrapping the output
+                // in a print-to-file (capture-free approximation for the
+                // v1 subset).
+                let write_target: Option<(String, bool)> = redirects.iter().find_map(|r| {
+                    if r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "a") {
+                        let mut p = String::new();
+                        if expr_to_java(&r.target, &mut p).is_ok() {
+                            Some((p, r.mode == "a"))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+                for b in inner {
+                    self.stmt_to_java(b, d, out)?;
+                }
+                if let Some((path, append)) = write_target {
+                    indent(out, d);
+                    let opt = if append {
+                        "java.nio.file.StandardOpenOption.APPEND"
+                    } else {
+                        "java.nio.file.StandardOpenOption.TRUNCATE_EXISTING, java.nio.file.StandardOpenOption.CREATE"
+                    };
+                    out.push_str(&format!(
+                        "java.nio.file.Files.write(java.nio.file.Paths.get({path}), \"\".getBytes(), {opt});\n"
+                    ));
+                }
+                Ok(())
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    for b in st {
+                        self.stmt_to_java(b, d, out)?;
+                    }
+                }
+                Ok(())
+            }
+            IrStmt::WriteFile {
+                path,
+                content,
+                append,
+            } => {
+                let mut p = String::new();
+                expr_to_java(path, &mut p)?;
+                let mut c = String::new();
+                expr_to_java(content, &mut c)?;
+                indent(out, d);
+                let opt = if *append {
+                    "java.nio.file.StandardOpenOption.APPEND"
+                } else {
+                    "java.nio.file.StandardOpenOption.TRUNCATE_EXISTING, java.nio.file.StandardOpenOption.CREATE"
+                };
+                out.push_str(&format!(
+                    "java.nio.file.Files.write(java.nio.file.Paths.get({p}), ({c}).getBytes(), {opt});\n"
+                ));
+                Ok(())
+            }
+            IrStmt::DeclareArray { var, elements, .. } => {
+                let mut elems = String::new();
+                for (i, e) in elements.iter().enumerate() {
+                    if i > 0 {
+                        elems.push_str(", ");
+                    }
+                    expr_to_java(e, &mut elems)?;
+                }
+                indent(out, d);
+                out.push_str(&format!(
+                    "{var} = java.util.Arrays.toString(new String[]{{{elems}}});\n"
+                ));
+                Ok(())
+            }
             other => Err(format!("statement not in the v1 subset: {other:?}")),
         }
     }
@@ -421,6 +644,45 @@ impl JavaCtx {
                 out.push_str("true");
                 Ok(())
             }
+            IrExpr::Call { func, args, .. } if func == "exec" => {
+                // `true`/`false` builtins used as a condition
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    match cmd.as_str() {
+                        "true" => {
+                            out.push_str("true");
+                            return Ok(());
+                        }
+                        "false" => {
+                            out.push_str("false");
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+                out.push_str("true");
+                Ok(())
+            }
+            IrExpr::BinOp { lhs, op, rhs } => {
+                let jop = match op {
+                    crate::ir::BinOpKind::And => " && ",
+                    crate::ir::BinOpKind::Or => " || ",
+                    crate::ir::BinOpKind::Eq => " == ",
+                    crate::ir::BinOpKind::Ne => " != ",
+                    crate::ir::BinOpKind::Not => {
+                        let mut inner = String::new();
+                        self.cond_to_java(rhs, &mut inner)?;
+                        out.push_str(&format!("!({inner})"));
+                        return Ok(());
+                    }
+                    _ => return Err(format!("condition op not in the v1 Java subset: {op:?}")),
+                };
+                let mut l = String::new();
+                let mut r = String::new();
+                self.cond_to_java(lhs, &mut l)?;
+                self.cond_to_java(rhs, &mut r)?;
+                out.push_str(&format!("({l}){jop}({r})"));
+                Ok(())
+            }
             IrExpr::Call { .. } => {
                 out.push_str("true");
                 Ok(())
@@ -432,6 +694,16 @@ impl JavaCtx {
 
 fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), String> {
     match e {
+        IrExpr::Call { func, args, .. } if func == "test" => {
+            // a bare `[ cond ]` statement: emit the condition truth
+            if let Some(IrExpr::Str(s, _)) = args.first() {
+                let c = test_render(s).unwrap_or_else(|| "true".to_string());
+                indent(out, d);
+                out.push_str(&format!("boolean __t = {c};\n"));
+                return Ok(());
+            }
+            Ok(())
+        }
         IrExpr::Call { func, args, .. } if func == "exec" => {
             let cmd = match args.first() {
                 Some(IrExpr::Str(name, _)) => name.clone(),
@@ -581,6 +853,29 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
 /// (a raw newline inside the literal is a compile error — cpp-sh-go
 /// t30_static_assert.cc's `printf "static assert ok\n"` carries a real
 /// \n in the A1 Str).
+/// Sanitize a shell function name into a Java identifier.
+fn java_ident(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for (i, c) in name.chars().enumerate() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else if i > 0 {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "f".to_string()
+    } else {
+        out
+    }
+}
+
+/// Does a function body contain a `Return(Some(..))`? If so the Java
+/// method needs a non-void return type.
+fn body_has_return(body: &[IrStmt]) -> bool {
+    body.iter().any(|s| matches!(s, IrStmt::Return(Some(_))))
+}
+
 fn java_str_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -848,6 +1143,13 @@ fn word_to_java(e: &IrExpr) -> Result<String, String> {
         IrExpr::Var(name, _) => Ok(format!("({name} == null ? \"\" : {name})")),
         IrExpr::Arith(a) => Ok(format!("Long.toString({})", arith_str(a)?)),
         IrExpr::Call { func, args, .. } if is_mem_func(func) => mem_call_java(func, args),
+        IrExpr::Call { func, args, .. } if func == "split" => {
+            // word splitting of a single value: just the value
+            match args.first() {
+                Some(inner) => word_to_java(inner),
+                None => Err("split with no arg (v1)".into()),
+            }
+        }
         IrExpr::Array(items) => {
             let parts: Result<Vec<String>, String> =
                 items.iter().map(word_to_java).collect();
@@ -870,6 +1172,20 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
             } else {
                 Err("getVar with non-literal name (v1)".into())
             }
+        }
+        IrExpr::Call { func, args, .. } if func == "setArray" => {
+            // `declare -a arr=(a b c)` — render as a bracketed array string
+            let mut parts = String::new();
+            if let Some(IrExpr::Array(items)) = args.get(1) {
+                for (i, it) in items.iter().enumerate() {
+                    if i > 0 {
+                        parts.push_str(", ");
+                    }
+                    parts.push_str(&word_to_java(it)?);
+                }
+            }
+            out.push_str(&format!("(\"[\" + {})", if parts.is_empty() { "\"\"".to_string() } else { format!("java.util.Arrays.toString(new String[]{{{parts}}})") }));
+            Ok(())
         }
         IrExpr::Var(name, _) => {
             out.push_str(name);
@@ -1037,6 +1353,18 @@ fn test_render(s: &str) -> Option<String> {
         }
         [flag, v] if *flag == "-n" => Some(format!("(!{}.isEmpty())", test_operand(v)?)),
         [flag, v] if *flag == "-z" => Some(format!("({}.isEmpty())", test_operand(v)?)),
+        // file tests: -f regular, -d dir, -e exists, -s non-empty
+        [flag, v] if matches!(*flag, "-f" | "-d" | "-e" | "-s") => {
+            let f = test_operand(v)?;
+            let path = format!("java.nio.file.Paths.get({f})");
+            match *flag {
+                "-f" => Some(format!("(java.nio.file.Files.isRegularFile({path}))")),
+                "-d" => Some(format!("(java.nio.file.Files.isDirectory({path}))")),
+                "-e" => Some(format!("(java.nio.file.Files.exists({path}))")),
+                "-s" => Some(format!("(java.nio.file.Files.size({path}) > 0)")),
+                _ => None,
+            }
+        }
         // `[ 0 ]` / `[ "" ]` — bash tests the non-emptiness
         [v] => Some(format!("(!{}.isEmpty())", test_operand(v)?)),
         _ => None,

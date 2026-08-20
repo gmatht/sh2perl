@@ -57,3 +57,7 @@ strip = true     # Strip symbols
 
 [profile.release.package."*"]
 opt-level = "z"
+
+[[bin]]
+name = "render_all_nodes"
+path = "src/bin/render_all_nodes.rs"

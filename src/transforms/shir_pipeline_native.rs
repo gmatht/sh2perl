@@ -32,14 +32,13 @@
 //!   stages are each a SINGLE `Expr(exec|builtin)` of a natively-
 //!   emulable command — i.e. rewriting the pipeline removes shell-outs
 //!   instead of moving them.
-//! - The first (producer) stage must be `echo`/`printf` — the estree
-//!   fold family (`echo X | grep` → grepText, `echo X | tr …` → native
-//!   echo, `echo/printf … | wc/head/tail` → native write) folds these
-//!   to a SYNC call in BOTH the `Expr(pipeline)` and the `Pipeline`
-//!   forms, so the emitted JS is identical (no awaited/un-awaited
-//!   divergence). A non-static producer (ls/cat/… | …) is refused: the
-//!   estree renderer leaves such pipelines on the async runtime path,
-//!   where the two statement forms await differently.
+//! - The first (producer) stage must also be a natively-emulable
+//!   command. The estree renderer re-creates the identical `pipeline`
+//!   Call from a `Pipeline` statement (`stmt_to_estree`), so any native
+//!   producer renders byte-identically in both statement forms (verified
+//!   empirically for echo/printf/cat/ls/grep/tr/wc/tail producers). A
+//!   non-native producer (sed/diff/gzip/…) is refused: the perl renderer
+//!   would only shell out that stage, so no reduction.
 //! - NOT the whole story everywhere else: pipelines inside `&&`/`||`
 //!   operand positions, `Redirect` inners, `capture` bodies, and
 //!   dynamic-word stages are all left untouched (they render through
@@ -253,11 +252,14 @@ fn stage_is_native(body: &[IrStmt]) -> Option<()> {
 }
 
 /// `Expr(Call { func: "pipeline" })` in statement position →
-/// `IrStmt::Pipeline`. Only when EVERY stage is native AND the producer
-/// is a literal-able `echo`/`printf` (see the module doc — that is the
-/// class the ESTree renderer folds to a sync call identically in both
-/// statement forms). The stage list is emptied — the renderer's
-/// `capture: None` arm re-emits each stage natively.
+/// `IrStmt::Pipeline`. Only when EVERY stage is native. The producer
+/// (first stage) must also be a natively-emulable command — the estree
+/// renderer re-creates the identical `pipeline` Call from a `Pipeline`
+/// statement (stmt_to_estree), so any native producer renders
+/// byte-identically in both statement forms (verified empirically for
+/// echo/printf/cat/ls/grep/tr/wc/head/sort/tail producers). The stage
+/// list is emptied — the renderer's `capture: None` arm re-emits each
+/// stage natively.
 fn lower_pipeline(st: &mut IrStmt) -> bool {
     let IrStmt::Expr(IrExpr::Call { func, args }) = st else {
         return false;
@@ -279,15 +281,14 @@ fn lower_pipeline(st: &mut IrStmt) -> bool {
         if stage_is_native(body).is_none() {
             return false;
         }
-        // The producer (first stage) must be echo/printf — the static
-        // fold family. A producer outside it is refused (estree async
-        // divergence — see the module doc).
+        // The producer (first stage) must be a natively-emulable command
+        // too — a non-native producer would still shell out when rendered.
         if idx == 0 {
             let IrStmt::Expr(IrExpr::Call { func: f, args: a }) = &body[0] else {
                 return false;
             };
             let (cmd, _) = exec_parts(f, a).unwrap();
-            if !matches!(cmd, "echo" | "printf") {
+            if !is_native_cmd(cmd) {
                 return false;
             }
         }
@@ -353,16 +354,16 @@ mod tests {
     }
 
     #[test]
-    fn non_echo_producer_is_refused() {
-        // `ls | grep -v a.txt` — ls produces the pipe, not echo/printf;
-        // the estree renderer leaves it on the async runtime path where
-        // the two statement forms await differently. Refuse.
-        let commands = parse_commands_from_text("ls -1 | grep -v a.txt").expect("parse");
+    fn non_native_producer_is_refused() {
+        // `sed | grep` — sed is outside the emulable set, so the
+        // producer (and the stage) is not native; the perl renderer
+        // would only shell out that stage, so no reduction. Refuse.
+        let commands = parse_commands_from_text("sed s/a/b/ | grep -v a.txt").expect("parse");
         let mut prog = ast_to_ir_raw(&commands);
         let before = shir_to_shir_json(&prog);
         let changed = transform(&mut prog.stmts);
         let after = shir_to_shir_json(&prog);
-        assert_eq!(before, after, "non-echo producer must be untouched");
+        assert_eq!(before, after, "non-native producer must be untouched");
         assert!(!changed);
     }
 

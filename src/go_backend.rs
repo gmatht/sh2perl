@@ -1396,6 +1396,39 @@ impl Render {
                 self.mark_arr(&name);
                 format!("s2s(arrLen({m}))")
             }
+            "split" => {
+                // bash word-splitting on whitespace (the default IFS):
+                // collapse runs, drop empty fields. strings.Fields is the
+                // exact native match, joined back with single spaces.
+                if let Some(a) = args.first() {
+                    let v = self.expr_str(a);
+                    return format!("strings.Join(strings.Fields({v}), \" \")");
+                }
+                "\"\"".to_string()
+            }
+            "and" | "or" => {
+                // `A && B` / `A || B` — bash -c fork/exec fallback
+                // (short-circuit semantics are a shell primitive)
+                let mut texts = Vec::new();
+                let mut ok = true;
+                for a in args {
+                    if let Some(t) = self.cmd_text_expr(a) {
+                        texts.push(t);
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok && !texts.is_empty() {
+                    let env = self.env_lit();
+                    let sep = if func == "and" { " && " } else { " || " };
+                    return format!(
+                        "redirRun({}, {env})",
+                        Self::go_str(&texts.join(sep))
+                    );
+                }
+                self.sh2_stub(func)
+            }
             "arith" => {
                 if let Some(IrExpr::Str(s, _)) = args.first() {
                     if let Some((_, v)) = self.arith_str(s) {
@@ -2829,7 +2862,31 @@ impl Render {
                     ));
                     self.need_st = true;
                 } else {
-                    self.mark_todo("Pipeline");
+                    // bash -c fork/exec fallback (last-resort tier): a stage
+                    // that isn't a single external exec (variable cmd,
+                    // builtin, redirect) — reconstruct the whole pipeline
+                    // as shell text and run it.
+                    let mut parts = Vec::new();
+                    let mut ok2 = true;
+                    for st in stages {
+                        if let Some(t) = self.cmd_text_stmts(st) {
+                            parts.push(t);
+                        } else {
+                            ok2 = false;
+                            break;
+                        }
+                    }
+                    if ok2 {
+                        let text = parts.join(" | ");
+                        let env = self.env_lit();
+                        self.emit(&format!(
+                            "st = redirRun({}, {env});",
+                            Self::go_str(&text)
+                        ));
+                        self.need_st = true;
+                    } else {
+                        self.mark_todo("Pipeline");
+                    }
                 }
             }
             IrStmt::Background(_) => {
