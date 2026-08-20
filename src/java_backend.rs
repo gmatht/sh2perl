@@ -1237,6 +1237,32 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
             out.push_str(&mem_call_java(func, args)?);
             Ok(())
         }
+        IrExpr::Capture { expr, .. } => {
+            // `$(cmd args)` — run and capture stdout via ProcessBuilder
+            if let IrExpr::Arrow(body) = expr.as_ref() {
+                if let [IrStmt::Expr(e)] = body.as_slice() {
+                    if let IrExpr::Call { func: f, args } = e {
+                        if f == "exec" {
+                            let mut argv = Vec::new();
+                            if let Some(IrExpr::Str(c, _)) = args.first() {
+                                argv.push(java_str_lit(c));
+                            }
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                for it in items {
+                                    argv.push(word_to_java(it)?);
+                                }
+                            }
+                            out.push_str(&format!(
+                                "new String(new ProcessBuilder({}).start().getInputStream().readAllBytes()).trim()",
+                                argv.join(", ")
+                            ));
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err("capture not in the v1 Java subset".into())
+        }
         other => Err(format!("expr not in the v1 Java subset: {other:?}")),
     }
 }
