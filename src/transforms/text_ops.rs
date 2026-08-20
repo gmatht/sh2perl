@@ -33,7 +33,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     }
     let before = LIFT_COUNT.load(Ordering::Relaxed);
     for stmt in stmts.iter_mut() {
-        lower_stmt(stmt);
+        lower_stmt(stmt, true);
     }
     let after = LIFT_COUNT.load(Ordering::Relaxed);
     if after > before {
@@ -41,20 +41,19 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     after > before
 }
 
-fn lower_stmt(stmt: &mut IrStmt) {
+fn lower_stmt(stmt: &mut IrStmt, emit: bool) {
     match stmt {
         // ShIR pipeline: IrExpr::Call { func: "pipeline", args: [Array(stages)] }
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
             if let [IrExpr::Array(stages)] = args.as_slice() {
                 if stages.len() == 2 {
-                    if let Some(replacement) = try_lower_pipeline(stages) {
-                        // A STATEMENT-level `echo X | cut` PRINTS the result.
-                        // Preserve the output side-effect: wrap the value in
-                        // an Output (process.stdout.write + newline), not a
-                        // bare expression (which would compute but not print).
-                        *stmt = IrStmt::Output { value: replacement, newline: true, target: None };
-                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
-                        return;
+                    if emit {
+                        if let Some((replacement, already_nl)) = try_lower_pipeline(stages) {
+                            // A statement-level pipeline PRINTS its result.
+                            *stmt = IrStmt::Output { value: replacement, newline: !already_nl, target: None };
+                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
                     }
                 }
             }
@@ -83,7 +82,7 @@ fn lower_stmt(stmt: &mut IrStmt) {
             }
             // Recurse into the inner body
             for s in inner.iter_mut() {
-                lower_stmt(s);
+                lower_stmt(s, emit);
             }
         }
         // Plain builtin command: basename X / dirname X (no pipeline)
@@ -91,13 +90,14 @@ fn lower_stmt(stmt: &mut IrStmt) {
             // Recurse into args first (to reach nested $(...) / param calls)
             for a in args.iter_mut() { lower_expr(a); }
             if let [IrExpr::Str(cmd, _), IrExpr::Array(cmd_args)] = args.as_slice() {
-                if (cmd == "basename" || cmd == "dirname") && !cmd_args.is_empty() {
+                if emit && (cmd == "basename" || cmd == "dirname") && !cmd_args.is_empty() {
                     let which = if cmd == "dirname" { "dirname" } else { "basename" };
                     if let Some(text) = arg_to_expr(&cmd_args[0]) {
-                        *stmt = IrStmt::Expr(IrExpr::Ext(Box::new(PathName {
-                            text,
-                            which: which.to_string(),
-                        })));
+                        *stmt = IrStmt::Output {
+                            value: IrExpr::Ext(Box::new(PathName { text, which: which.to_string() })),
+                            newline: true,
+                            target: None,
+                        };
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -109,25 +109,25 @@ fn lower_stmt(stmt: &mut IrStmt) {
         }
         // Recurse into nested statement bodies (if/while/for/function/...)
         IrStmt::If { then, elsifs, else_, .. } => {
-            for s in then.iter_mut() { lower_stmt(s); }
-            for (_, b) in elsifs.iter_mut() { for s in b.iter_mut() { lower_stmt(s); } }
-            for s in else_.iter_mut() { lower_stmt(s); }
+            for s in then.iter_mut() { lower_stmt(s, emit); }
+            for (_, b) in elsifs.iter_mut() { for s in b.iter_mut() { lower_stmt(s, emit); } }
+            for s in else_.iter_mut() { lower_stmt(s, emit); }
         }
         IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
-            for s in body.iter_mut() { lower_stmt(s); }
+            for s in body.iter_mut() { lower_stmt(s, emit); }
         }
-        IrStmt::For { body, .. } => { for s in body.iter_mut() { lower_stmt(s); } }
+        IrStmt::For { body, .. } => { for s in body.iter_mut() { lower_stmt(s, emit); } }
         IrStmt::ForInit { init, body, .. } => {
-            for s in init.iter_mut() { lower_stmt(s); }
-            for s in body.iter_mut() { lower_stmt(s); }
+            for s in init.iter_mut() { lower_stmt(s, emit); }
+            for s in body.iter_mut() { lower_stmt(s, emit); }
         }
-        IrStmt::Function { body, .. } => { for s in body.iter_mut() { lower_stmt(s); } }
+        IrStmt::Function { body, .. } => { for s in body.iter_mut() { lower_stmt(s, emit); } }
         IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
-            for s in body.iter_mut() { lower_stmt(s); }
+            for s in body.iter_mut() { lower_stmt(s, emit); }
         }
         IrStmt::Case { discriminant, clauses } => {
             lower_expr(discriminant);
-            for c in clauses.iter_mut() { for s in c.body.iter_mut() { lower_stmt(s); } }
+            for c in clauses.iter_mut() { for s in c.body.iter_mut() { lower_stmt(s, emit); } }
         }
         IrStmt::Assign { expr, .. } => lower_expr(expr),
         IrStmt::Declare { init, .. } => { if let Some(e) = init { lower_expr(e); } }
@@ -168,7 +168,7 @@ fn lower_expr(expr: &mut IrExpr) {
         IrExpr::Call { func, args } if func == "pipeline" => {
             if let [IrExpr::Array(stages)] = args.as_slice() {
                 if stages.len() == 2 {
-                    if let Some(replacement) = try_lower_pipeline(stages) {
+                    if let Some((replacement, _)) = try_lower_pipeline(stages) {
                         *expr = replacement;
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                         return;
@@ -178,7 +178,7 @@ fn lower_expr(expr: &mut IrExpr) {
             for a in args.iter_mut() { lower_expr(a); }
         }
         IrExpr::Arrow(body) => {
-            for s in body.iter_mut() { lower_stmt(s); }
+            for s in body.iter_mut() { lower_stmt(s, false); }
         }
         IrExpr::Capture { expr: inner, .. } => lower_expr(inner),
         IrExpr::Array(items) => { for i in items.iter_mut() { lower_expr(i); } }
@@ -229,7 +229,7 @@ fn lower_expr(expr: &mut IrExpr) {
 
 /// Try to lower a two-stage pipeline `stage1 | stage2` to a semantic node.
 /// Stages are IrExpr::Arrow(body) from the `Call { func: "pipeline", args: [Array(stages)] }` form.
-fn try_lower_pipeline(stages: &[IrExpr]) -> Option<IrExpr> {
+fn try_lower_pipeline(stages: &[IrExpr]) -> Option<(IrExpr, bool)> {
     // Each stage is an Arrow function: Arrow([Stmt])
     let stage1_body = match &stages[0] {
         IrExpr::Arrow(body) => body.as_slice(),
@@ -255,7 +255,7 @@ fn try_lower_pipeline(stages: &[IrExpr]) -> Option<IrExpr> {
     // `yes X | head -n K` → RepeatStr(X+"\n", K) — a clean repeat idiom.
     if cmd_name == "head" {
         if let Some(replacement) = try_lower_yes_head(stage1_body, cmd_args) {
-            return Some(replacement);
+            return Some((replacement, true)); // RepeatStr already ends in \n
         }
     }
 
@@ -269,7 +269,7 @@ fn try_lower_pipeline(stages: &[IrExpr]) -> Option<IrExpr> {
         }
     };
 
-    lower_text_cmd(text_expr, cmd_name, cmd_args)
+    lower_text_cmd(text_expr, cmd_name, cmd_args).map(|e| (e, false))
 }
 
 /// `yes "X" | head -n K` → RepeatStr("X\n", K). `yes` repeats "X\n";
@@ -354,6 +354,9 @@ fn extract_text_from_stage(stmts: &[IrStmt]) -> Option<IrExpr> {
                         }
                     }).collect();
                     if let Some(strs) = all_strs {
+                        // The echo ARGS joined (echo's trailing newline is
+                        // added by the statement Output wrapper, and by the
+                        // wc -l newline-count case below).
                         let joined = strs.join(" ");
                         return Some(IrExpr::Str(joined, StrStyle::DoubleQuoted));
                     }
@@ -581,6 +584,9 @@ fn try_lower_wc(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
         if lower_l {
             // wc -l is a NEWLINE COUNT (each line ends in \n) — NOT
             // split('\n').length (off by one on trailing newline).
+            // echo / here-string sources end with a trailing newline, so the
+            // input is text + "\n"; the count includes that trailing newline.
+            let text = append_trailing_newline(text);
             Some(IrExpr::Ext(Box::new(RegCount {
                 text,
                 pattern: "\\n".to_string(),
@@ -902,5 +908,14 @@ fn param_var(name: &IrExpr) -> Option<IrExpr> {
         IrExpr::Str(s, _) => Some(IrExpr::Call { func: "param".to_string(),
             args: vec![IrExpr::Str(String::new(), StrStyle::DoubleQuoted), IrExpr::Str(s.clone(), StrStyle::DoubleQuoted)] }),
         _ => None,
+    }
+}
+
+/// Append a trailing "\n" to a literal text (echo / here-string sources
+/// produce a trailing newline that newline-count reductions must see).
+fn append_trailing_newline(text: IrExpr) -> IrExpr {
+    match text {
+        IrExpr::Str(s, style) => IrExpr::Str(format!("{}\n", s), style),
+        _ => IrExpr::Interpolate(vec![InterpPart::Expr(Box::new(text)), InterpPart::Lit("\n".to_string())]),
     }
 }

@@ -33744,8 +33744,14 @@ fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
             let text = children.get(0)?;
             let offset = children.get(1)?;
             let len = children.get(2).copied().unwrap_or_else(|| &IrExpr::Int(-1));
+            // substring(start, start+length) — JS end is EXCLUSIVE, not a length.
+            let end = Expr::BinaryExpression {
+                operator: "+".to_string(),
+                left: Box::new(expr_to_estree(offset)),
+                right: Box::new(expr_to_estree(len)),
+            };
             Some(crate::estree::method_call(expr_to_estree(text), "substring",
-                vec![expr_to_estree(offset), expr_to_estree(len)]))
+                vec![expr_to_estree(offset), end]))
         }
         "RegSub" => {
             let text = children.get(0)?;
@@ -33844,8 +33850,10 @@ fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
                 let c = crate::estree::ident("c");
                 let i = crate::estree::ident("i");
                 let idx = crate::estree::method_call(crate::estree::str_lit(&node.from), "indexOf", vec![c.clone()]);
+                // to[from.indexOf(c)] — index into `to` by c's position in `from`,
+                // NOT by the map index (a repeated char would index past `to`).
                 let repl = Expr::MemberExpression {
-                    object: Box::new(crate::estree::str_lit(&node.to)), property: Box::new(i.clone()), computed: true, optional: false,
+                    object: Box::new(crate::estree::str_lit(&node.to)), property: Box::new(idx.clone()), computed: true, optional: false,
                 };
                 let cond = Expr::ConditionalExpression {
                     test: Box::new(Expr::BinaryExpression { operator: ">=".to_string(),
@@ -33854,7 +33862,7 @@ fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
                     alternate: Box::new(c.clone()),
                 };
                 let mapf = Expr::ArrowFunctionExpression {
-                    params: vec![c.clone(), i], body: ArrowBody::Expr(Box::new(cond)), expression: true, r#async: false,
+                    params: vec![c.clone()], body: ArrowBody::Expr(Box::new(cond)), expression: true, r#async: false,
                 };
                 let mapped = crate::estree::method_call(
                     crate::estree::method_call(t, "split", vec![crate::estree::str_lit("")]),
