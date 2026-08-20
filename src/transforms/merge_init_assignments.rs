@@ -236,5 +236,6 @@ fn recurse_expr(e: &mut IrExpr) -> bool {
         }
         IrExpr::Splice(x) => recurse_expr(x),
         _ => false,
+        IrExpr::Ext(_) => false,
     }
 }

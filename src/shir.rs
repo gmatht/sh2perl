@@ -4644,6 +4644,11 @@ use std::collections::{HashMap, HashSet};
                 walk_expr(lhs, acc, multi_run);
                 walk_expr(rhs, acc, multi_run);
             }
+            IrExpr::Ext(n) => {
+                for c in n.children() {
+                    walk_expr(c, acc, multi_run);
+                }
+            }
             IrExpr::Index { key, .. } | IrExpr::Capture { expr: key, .. } => {
                 walk_expr(key, acc, multi_run);
             }
@@ -31539,6 +31544,18 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         IrExpr::Splice(e) => Expr::SpreadElement {
             argument: Box::new(expr_to_estree(e)),
         },
+        IrExpr::Ext(n) => {
+            let ctx = crate::render_ext_expr::ExprRenderCtx {
+                backend: crate::render_ext_expr::Backend::Estree,
+                indent: 0,
+            };
+            if let Some(code) = crate::render_ext_expr::render(n.as_ref(), &ctx) {
+                // Parse the rendered code as ESTree
+                Expr::Identifier { name: code }
+            } else {
+                unreachable!("Ext nodes should be lowered before ESTree rendering")
+            }
+        }
         // A numeric-range iterable (`seq_range_for`'s bare `Range`
         // For.iter shape): the ESTree surface has no range literal, so
         // render the materialized string list. The native ForStatement

@@ -1,0 +1,11 @@
+# shir_nodes/word_count.node — expression-level semantic IR node.
+# Count lines/words/bytes/chars (lowered from `wc`).
+#
+# Backends: Perl scalar(split), JS split().length, Rust lines().count()
+# Fallback: sh2.wc(text, mode)
+
+node WordCount
+tag "WordCount"
+kind expr
+field text: expr
+field mode: string

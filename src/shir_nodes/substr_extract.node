@@ -1,0 +1,12 @@
+# shir_nodes/substr_extract.node — expression-level semantic IR node.
+# Extract a substring (lowered from `expr substr`, `${var:N:M}`).
+#
+# Backends: Perl substr(), JS slice(), C strncpy, Rust &s[n..n+m]
+# Fallback: sh2.subStr(text, offset, length)
+
+node SubStrExtract
+tag "SubStrExtract"
+kind expr
+field text: expr
+field offset: expr
+field length: optional_expr

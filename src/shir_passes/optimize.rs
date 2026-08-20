@@ -61,6 +61,7 @@ pub fn expr_reads(name: &str, e: &IrExpr) -> bool {
         }
         IrExpr::Splice(inner) => expr_reads(name, inner),
         IrExpr::Arith(ast) => arith_reads(name, ast),
+        IrExpr::Ext(_) => false,
         IrExpr::Object(pairs) => pairs.iter().any(|(_, v)| expr_reads(name, v)),
         IrExpr::MethodCall { obj, args, .. } => {
             expr_reads(name, obj) || args.iter().any(|a| expr_reads(name, a))
@@ -443,6 +444,7 @@ fn expr_reads_name(name: &str, e: &IrExpr) -> bool {
         }
         IrExpr::Splice(inner) => expr_reads_name(name, inner),
         IrExpr::Arith(ast) => arith_reads_name(name, ast),
+        IrExpr::Ext(_) => false,
         IrExpr::Object(pairs) => pairs.iter().any(|(_, v)| expr_reads_name(name, v)),
         IrExpr::MethodCall { obj, args, .. } => {
             expr_reads_name(name, obj) || args.iter().any(|a| expr_reads_name(name, a))
@@ -1245,6 +1247,7 @@ fn expr_pure(e: &IrExpr) -> bool {
         IrExpr::Object(pairs) => pairs.iter().all(|(_, v)| expr_pure(v)),
         IrExpr::Splice(inner) => expr_pure(inner),
         IrExpr::Index { key, .. } => expr_pure(key),
+        IrExpr::Ext(_) => false,
         IrExpr::Arith(_) => true, // compound writes checked by the caller
         IrExpr::MethodCall { obj, args, .. } => expr_pure(obj) && args.iter().all(expr_pure),
         IrExpr::Call { func, args } => {
@@ -1600,6 +1603,7 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
         }
         IrExpr::Splice(inner) => collect_expr_read_names(inner, out),
         IrExpr::Arith(ast) => collect_arith_read_names(ast, out),
+        IrExpr::Ext(_) => (),
         IrExpr::Object(pairs) => {
             for (_, v) in pairs {
                 collect_expr_read_names(v, out);

@@ -1,0 +1,11 @@
+# shir_nodes/case_transform.node — expression-level semantic IR node.
+# Lowercase/uppercase transform (lowered from `tr`, `${var,,}`, `${var^^}`).
+#
+# Backends: Perl lc/uc, JS toLowerCase/toUpperCase, C tolower/toupper, Rust to_lowercase
+# Fallback: sh2.caseTransform(text, upper)
+
+node CaseTransform
+tag "CaseTransform"
+kind expr
+field text: expr
+field upper: bool

@@ -1,0 +1,14 @@
+# shir_nodes/field_extract.node — expression-level semantic IR node.
+# Extract fields from delimited text (lowered from `cut -dD -fF`).
+#
+# Backends: Perl split(), JS split(), C strtok, Rust split().nth()
+# Fallback: sh2.fieldExtract(text, delimiter, fields, suppress, output_delim)
+
+node FieldExtract
+tag "FieldExtract"
+kind expr
+field text: expr
+field delimiter: string
+field fields: vec_field_range
+field suppress_no_delim: bool
+field output_delimiter: optional_string
