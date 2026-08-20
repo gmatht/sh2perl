@@ -994,6 +994,17 @@ impl Render {
                 self.sh2_calls.insert("test".into());
                 "sh2Test()".to_string()
             }
+            "contains" => {
+                // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+                // std.mem.indexOf (the backend's native substring primitive).
+                if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
+                    let n = self.expr_str(needle);
+                    let p = self.expr_str(pattern);
+                    return format!("std.mem.indexOf(u8, {n}, {p}) != null");
+                }
+                self.sh2_calls.insert("contains".into());
+                "sh2Contains()".to_string()
+            }
             "arith" => "(sh2Arith() != 0)".to_string(),
             "getVar" => {
                 self.need_truthy = true;

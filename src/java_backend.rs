@@ -644,6 +644,19 @@ impl JavaCtx {
                 out.push_str("true");
                 Ok(())
             }
+            IrExpr::Call { func, args, .. } if func == "contains" => {
+                // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+                // String.contains (java fields are Strings).
+                if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
+                    let mut n = String::new();
+                    expr_to_java(needle, &mut n)?;
+                    let mut p = String::new();
+                    expr_to_java(pattern, &mut p)?;
+                    out.push_str(&format!("({n}).contains({p})"));
+                    return Ok(());
+                }
+                Ok(())
+            }
             IrExpr::Call { func, args, .. } if func == "exec" => {
                 // `true`/`false` builtins used as a condition
                 if let Some(IrExpr::Str(cmd, _)) = args.first() {
