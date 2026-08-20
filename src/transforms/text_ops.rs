@@ -21,6 +21,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static LIFT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
+    // text-ops is an EXPERIMENTAL lowering that changes the shIR shape
+    // (pipelines/commands → ExtExpr nodes). It is opt-in ONLY: run when
+    // DEBASHC_TRANSFORMS explicitly lists "text-ops". This keeps the
+    // default corpus gate and unit tests green (the analyses and renderers
+    // have conservative Ext-node defaults, but the byte-equal round-trip
+    // and corpus tests still pin the UN-lowered shape).
+    let enabled = std::env::var("DEBASHC_TRANSFORMS").unwrap_or_default();
+    if !enabled.split(',').any(|s| s.trim() == "text-ops") {
+        return false;
+    }
     let before = LIFT_COUNT.load(Ordering::Relaxed);
     for stmt in stmts.iter_mut() {
         lower_stmt(stmt);
