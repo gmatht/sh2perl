@@ -2090,6 +2090,39 @@ impl Render {
         Some(t.to_string())
     }
 
+    /// Rebuild an `ArithAst` as shell arithmetic TEXT (`$((…))` operand),
+    /// so the `and`/`or`/capture bash -c fallback can reconstruct
+    /// arithmetic-containing operands. Conservative: refuses (None) the
+    /// assignment/incdec/cast shapes rather than guess.
+    fn cmd_text_arith(&self, a: &crate::ir::ArithAst) -> Option<String> {
+        match a {
+            crate::ir::ArithAst::Num(n) => Some(n.to_string()),
+            crate::ir::ArithAst::Var(name) | crate::ir::ArithAst::Ident(name) => {
+                Some(format!("${name}"))
+            }
+            crate::ir::ArithAst::Index { var, key } => Some(format!(
+                "{var}[{}]",
+                self.cmd_text_arith(key)?
+            )),
+            crate::ir::ArithAst::Bin { op, lhs, rhs } => Some(format!(
+                "({} {} {})",
+                self.cmd_text_arith(lhs)?,
+                op,
+                self.cmd_text_arith(rhs)?
+            )),
+            crate::ir::ArithAst::Un { op, arg } => {
+                Some(format!("({op}{})", self.cmd_text_arith(arg)?))
+            }
+            crate::ir::ArithAst::Cond { test, then, else_ } => Some(format!(
+                "({} ? {} : {})",
+                self.cmd_text_arith(test)?,
+                self.cmd_text_arith(then)?,
+                self.cmd_text_arith(else_)?
+            )),
+            _ => None,
+        }
+    }
+
     fn cmd_text_expr(&mut self, e: &IrExpr) -> Option<String> {
         match e {
             IrExpr::Str(s, _) => Some(s.clone()),
@@ -2113,7 +2146,9 @@ impl Render {
             }
             IrExpr::Var(name, _) => Some(format!("${name}")),
             IrExpr::Ident(name) => Some(format!("${name}")),
-            IrExpr::Arith(_) => None,
+            IrExpr::Arith(a) => self
+                .cmd_text_arith(a)
+                .map(|t| format!("$(({t}))")),
             IrExpr::BinOp { lhs, op, rhs } => {
                 let l = self.cmd_text_expr(lhs)?;
                 let r = self.cmd_text_expr(rhs)?;
