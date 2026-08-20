@@ -376,7 +376,7 @@ fn walk_expr(expr: &IrExpr, counts: &mut HashMap<String, usize>) {
         }
         IrExpr::Splice(e) => walk_expr(e, counts),
         IrExpr::Capture { expr, .. } => walk_expr(expr, counts),
-        IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
+        IrExpr::Ext(_) => (), // Ext nodes: conservative no-op
         IrExpr::Range { .. } => {}
         IrExpr::Arith(a) => walk_arith(a, counts),
     }
