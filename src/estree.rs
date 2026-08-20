@@ -7218,7 +7218,8 @@ mod tests {
 
     #[test]
     fn function_lowers_to_define() {
-        let json = to_json("greet() { echo hi; }");
+        let json = to_json("greet() { echo hi; }
+greet");
         // the native define lowering: a direct `sh2.functions.set(name, fn)`
         // state write + `true`, no dispatch
         assert!(json.contains("\"name\":\"functions\""));
