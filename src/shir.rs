@@ -31831,6 +31831,36 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // SH2_ASSUME_NO_ENV contract — see [`never_written_read`])
             if func == "getVar" {
                 if let [IrExpr::Str(name, _)] = args.as_slice() {
+                    // `${#s}` — length of a LIFTED / native-store string.
+                    // The runtime getVar("#s") reads the STORE, which is
+                    // empty for a lifted var (the 010_substring_loop
+                    // regression: `len=${#s}` came back 0 and the while
+                    // loop never ran — empty output). Emit the native
+                    // binding's `.length` instead.
+                    if let Some(base) = name.strip_prefix('#') {
+                        let len_expr = |obj: Expr| Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "String".to_string(),
+                            }),
+                            arguments: vec![Expr::MemberExpression {
+                                object: Box::new(obj),
+                                property: Box::new(Expr::Identifier {
+                                    name: "length".to_string(),
+                                }),
+                                computed: false,
+                                optional: false,
+                            }],
+                            optional: false,
+                        };
+                        if is_lifted(base) {
+                            return len_expr(Expr::Identifier {
+                                name: base.to_string(),
+                            });
+                        }
+                        if native_store_read_ok(base) {
+                            return len_expr(native_store_read(base));
+                        }
+                    }
                     // `--true64` slot var: the slot IS the home (echo /
                     // printf / interpolation observation points read the
                     // native int64 element — BigInt stringifies exactly)

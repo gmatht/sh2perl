@@ -9128,7 +9128,7 @@ mod tests {
     fn int_render(name: &str, lo: i64, hi: i64, w: Width) -> Render {
         let mut r = Render::default();
         r.var_types.insert(name.to_string(), IrType::Int);
-        r.var_ranges.insert(name.to_string(), (lo, hi));
+        r.var_ranges.insert(name.to_string(), (lo as i128, hi as i128));
         r.var_widths.insert(name.to_string(), w);
         r
     }
