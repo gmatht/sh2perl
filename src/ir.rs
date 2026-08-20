@@ -5842,7 +5842,10 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
         }
         IrExpr::Ext(n) => {
             // Transform-declared expression node — drop-in handler dispatch.
-            let ctx = crate::render_ext_expr::ExprRenderCtx { indent: 0 };
+            let ctx = crate::render_ext_expr::ExprRenderCtx {
+                backend: crate::render_ext_expr::Backend::Perl,
+                indent: 0,
+            };
             if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
                 code
             } else {

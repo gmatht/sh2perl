@@ -10,8 +10,24 @@
 
 use crate::shir_nodes::ExtExpr;
 
+/// Which backend is requesting rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backend {
+    Perl,
+    Estree,
+    Go,
+    Rust,
+    C,
+    Zig,
+    Sh,
+    Glsl,
+    Python,
+    Java,
+}
+
 /// Render context for expression handlers.
 pub(crate) struct ExprRenderCtx {
+    pub backend: Backend,
     pub indent: usize,
 }
 
@@ -21,7 +37,7 @@ pub(crate) mod handlers;
 // The generated tag → handler dispatch (build.rs scans handlers/).
 include!(concat!(env!("OUT_DIR"), "/render_ext_expr_gen.rs"));
 
-/// Render an ExtExpr node. Returns Some(perl_code) if a handler exists,
+/// Render an ExtExpr node. Returns Some(code) if a handler exists,
 /// None otherwise (caller falls back to sh2.* call).
 pub(crate) fn render(n: &dyn ExtExpr, ctx: &ExprRenderCtx) -> Option<String> {
     render_ext_expr_dispatch(n, ctx)

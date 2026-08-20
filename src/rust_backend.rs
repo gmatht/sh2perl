@@ -1110,7 +1110,17 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "String::new()".to_string()
             }
-            IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
+            IrExpr::Ext(n) => {
+                let ctx = crate::render_ext_expr::ExprRenderCtx {
+                    backend: crate::render_ext_expr::Backend::Rust,
+                    indent: 0,
+                };
+                if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
+                    code
+                } else {
+                    format!("sh2.{}(...)", n.tag())
+                }
+            }
         }
     }
 
