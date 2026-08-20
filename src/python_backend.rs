@@ -996,6 +996,22 @@ impl Render {
             // python binding; anything else → runtime stub
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
+                    // bash special/positional vars — native reads.
+                    match name.as_str() {
+                        "?" => {
+                            self.need_rc = true;
+                            return "str(__sh_rc)".into();
+                        }
+                        "#" => return "str(len(sys.argv) - 1)".into(),
+                        "@" | "*" => return "\" \".join(sys.argv[1:])".into(),
+                        n if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+                            let i: i64 = n.parse().unwrap_or(1);
+                            return format!(
+                                "(sys.argv[{i}] if len(sys.argv) > {i} else \"\")"
+                            );
+                        }
+                        _ => {}
+                    }
                     if self.var_types.contains_key(name) {
                         return self.py_ident(name);
                     }
