@@ -1,0 +1,12 @@
+# shir_nodes/path_name.node — expression-level semantic IR node.
+# Extract basename or dirname of a path (lowered from `basename`, `dirname`,
+# `${p##*/}`, `${p%/*}`).
+#
+# Backends: Perl File::Basename, JS path.basename/dirname, C strrchr, Rust Path::file_name
+# Fallback: sh2.pathName(text, which)
+
+node PathName
+tag "PathName"
+kind expr
+field text: expr
+field which: string

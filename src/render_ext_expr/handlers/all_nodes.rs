@@ -376,3 +376,20 @@ pub fn case_transform(node: &CaseTransform, ctx: &ExprRenderCtx) -> Option<Strin
         _ => None,
     }
 }
+
+// ── PathName ─────────────────────────────────────────────────────────
+
+pub fn path_name(node: &PathName, ctx: &ExprRenderCtx) -> Option<String> {
+    let which = if node.which == "dirname" { "dirname" } else { "basename" };
+    match ctx.backend {
+        Backend::Perl => {
+            let text = crate::ir::ir_expr_to_perl(&node.text);
+            if which == "basename" {
+                Some(format!("do {{ my $p = {}; $p =~ s|.*/||; $p }}", text))
+            } else {
+                Some(format!("do {{ my $p = {}; $p =~ s|/[^/]*$||; $p eq \"\" ? \"/\" : $p }}", text))
+            }
+        }
+        _ => None,
+    }
+}
