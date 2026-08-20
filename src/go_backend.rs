@@ -1640,6 +1640,19 @@ impl Render {
                 "target" => {
                     if let IrExpr::Str(s, _) = v {
                         target = Some(s.clone());
+                    } else if let IrExpr::Call { func, args } = v {
+                        // `> "$f"` — a variable redirect target: render
+                        // `$name` so the bash -c child (redirRun) resolves it
+                        // via env_lit (mirrors redirect_stmt_text).
+                        if func == "getVar" {
+                            if let Some(IrExpr::Str(n, _)) = args.first() {
+                                target = Some(format!("${{{n}}}"));
+                            } else {
+                                return None;
+                            }
+                        } else {
+                            return None;
+                        }
                     } else {
                         return None;
                     }
