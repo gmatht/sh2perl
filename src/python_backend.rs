@@ -1124,13 +1124,39 @@ impl Render {
                             return format!("({v} if {v} != \"\" else ({d}))");
                         }
                     }
-                    // `${s:off:len}` — substring slice
+                    // \${s:off:len}` — substring slice
                     if op == "slice" {
                         if let Some(IrExpr::Str(name, _)) = args.get(1) {
                             let v = self.call("getVar", &[IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted)]);
                             let o = self.expr_as_num(&args[2]);
                             let l = self.expr_as_num(&args[3]);
                             return format!("{v}[{o}:{o}+{l}]");
+                        }
+                    }
+                    // \${x#pat} / \${x##pat} / \${x%pat} / \${x%%pat} —
+                    // strip prefix/suffix, literal pattern only (no glob).
+                    if op == "#" || op == "##" || op == "%" || op == "%%" {
+                        if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Str(pat, _))) =
+                            (args.get(1), args.get(2))
+                        {
+                            if !pat.contains('*') && !pat.contains('?') && !pat.contains('[') {
+                                let v = self.call(
+                                    "getVar",
+                                    &[IrExpr::Str(
+                                        name.to_string(),
+                                        crate::ir::StrStyle::DoubleQuoted,
+                                    )],
+                                );
+                                let p = Self::py_str(pat);
+                                return match op.as_str() {
+                                    "#" | "##" => format!(
+                                        "({v}[len({p}):] if {v}.startswith({p}) else {v})"
+                                    ),
+                                    _ => format!(
+                                        "({v}[:len({v})-len({p})] if {v}.endswith({p}) else {v})"
+                                    ),
+                                };
+                            }
                         }
                     }
                 }
