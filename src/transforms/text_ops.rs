@@ -625,6 +625,81 @@ mod tests {
             FieldRange::Single(5),
         ]);
     }
+
+    // ── param op reductions ──────────────────────────────────────────
+    fn st(s: &str) -> IrExpr { IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted) }
+
+    #[test]
+    fn param_case_upper() {
+        let args = vec![st("^^"), st("var")];
+        let r = try_lower_param_op(&args).expect("^^ lowers");
+        let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
+        let n = n.as_any().downcast_ref::<CaseTransform>().unwrap();
+        assert!(n.upper, "^^ should be upper");
+    }
+
+    #[test]
+    fn param_case_lower() {
+        let args = vec![st(",,"), st("var")];
+        let r = try_lower_param_op(&args).expect(",, lowers");
+        let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
+        let n = n.as_any().downcast_ref::<CaseTransform>().unwrap();
+        assert!(!n.upper, ",, should be lower");
+    }
+
+    #[test]
+    fn param_slice() {
+        let args = vec![st("slice"), st("var"), st("2"), st("3")];
+        let r = try_lower_param_op(&args).expect("slice lowers");
+        let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
+        let n = n.as_any().downcast_ref::<SubStrExtract>().unwrap();
+        assert_eq!(n.offset, IrExpr::Int(2));
+        assert_eq!(**n.length.as_ref().unwrap(), IrExpr::Int(3));
+    }
+
+    // ── wc reductions ────────────────────────────────────────────────
+
+    fn arg(text: IrExpr) -> IrExpr {
+        let t = IrExpr::Str("hello".to_string(), StrStyle::DoubleQuoted);
+        let _ = text;
+        t
+    }
+
+    #[test]
+    fn wc_c_is_strlen() {
+        let r = try_lower_wc(st("hello"), &[st("-c")]).unwrap();
+        let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
+        assert!(n.as_any().downcast_ref::<StrLen>().is_some(), "wc -c → StrLen");
+    }
+
+    #[test]
+    fn wc_l_is_regcount() {
+        let r = try_lower_wc(st("hello"), &[st("-l")]).unwrap();
+        let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
+        assert!(n.as_any().downcast_ref::<RegCount>().is_some(), "wc -l → RegCount");
+    }
+
+    #[test]
+    fn wc_w_is_split_plus_arraylen() {
+        let r = try_lower_wc(st("hello"), &[st("-w")]).unwrap();
+        let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
+        assert!(n.as_any().downcast_ref::<ArrayLen>().is_some(), "wc -w → ArrayLen(Split)");
+    }
+
+    // ── grep reduction ──────────────────────────────────────────────
+
+    #[test]
+    fn grep_q_is_stringcontains() {
+        let r = try_lower_grep(st("hello world"), &[st("-q"), st("wor")]).unwrap();
+        let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
+        assert!(n.as_any().downcast_ref::<StringContains>().is_some());
+    }
+
+    #[test]
+    fn grep_plain_not_reduced() {
+        // grep without -q isn't a substring test → no reduction
+        assert!(try_lower_grep(st("hello world"), &[st("wor")]).is_none());
+    }
 }
 
 /// Lower a single command `cmd_name(args)` against input text `text`.

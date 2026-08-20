@@ -33821,6 +33821,61 @@ fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
             };
             Some(crate::estree::method_call(sliced, "join", vec![crate::estree::str_lit("\n")]))
         }
+        "CharTranslate" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::CharTranslate>()?;
+            let t = expr_to_estree(text);
+            if node.delete {
+                // text.split('').filter(c => !from.includes(c)).join('')
+                let c = crate::estree::ident("c");
+                let filt = crate::estree::method_call(
+                    crate::estree::method_call(t.clone(), "split", vec![crate::estree::str_lit("")]),
+                    "filter",
+                    vec![Expr::ArrowFunctionExpression {
+                        params: vec![c.clone()], body: ArrowBody::Expr(Box::new(
+                            Expr::UnaryExpression { operator: "!".to_string(), prefix: true,
+                                argument: Box::new(crate::estree::method_call(crate::estree::str_lit(&node.from), "includes", vec![c])) }
+                        )), expression: true, r#async: false,
+                    }],
+                );
+                Some(crate::estree::method_call(filt, "join", vec![crate::estree::str_lit("")]))
+            } else {
+                // text.split('').map(c => from.includes(c) ? to[from.indexOf(c)] : c).join('')
+                let c = crate::estree::ident("c");
+                let i = crate::estree::ident("i");
+                let idx = crate::estree::method_call(crate::estree::str_lit(&node.from), "indexOf", vec![c.clone()]);
+                let repl = Expr::MemberExpression {
+                    object: Box::new(crate::estree::str_lit(&node.to)), property: Box::new(i.clone()), computed: true, optional: false,
+                };
+                let cond = Expr::ConditionalExpression {
+                    test: Box::new(Expr::BinaryExpression { operator: ">=".to_string(),
+                        left: Box::new(idx.clone()), right: Box::new(crate::estree::int_lit_expr(0)) }),
+                    consequent: Box::new(repl),
+                    alternate: Box::new(c.clone()),
+                };
+                let mapf = Expr::ArrowFunctionExpression {
+                    params: vec![c.clone(), i], body: ArrowBody::Expr(Box::new(cond)), expression: true, r#async: false,
+                };
+                let mapped = crate::estree::method_call(
+                    crate::estree::method_call(t, "split", vec![crate::estree::str_lit("")]),
+                    "map", vec![mapf]);
+                Some(crate::estree::method_call(mapped, "join", vec![crate::estree::str_lit("")]))
+            }
+        }
+        "PathName" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::PathName>()?;
+            let split = crate::estree::method_call(expr_to_estree(text), "split", vec![crate::estree::str_lit("/")]);
+            if node.which == "dirname" {
+                // split('/').slice(0, -1).join('/')
+                Some(crate::estree::method_call(
+                    crate::estree::method_call(split, "slice", vec![crate::estree::int_lit_expr(0), crate::estree::int_lit_expr(-1)]),
+                    "join", vec![crate::estree::str_lit("/")]))
+            } else {
+                // split('/').pop()
+                Some(crate::estree::method_call(split, "pop", vec![]))
+            }
+        }
         _ => None,
     }
 }
