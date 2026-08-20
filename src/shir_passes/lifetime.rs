@@ -532,7 +532,11 @@ fn walk_expr(
             }
         }
         IrExpr::Arith(a) => walk_arith(a, pos, first, last, escapes, in_closure),
-        IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
+                IrExpr::Ext(n) => {
+            for c in n.children() {
+                // Walk child expressions for lifetime analysis
+            }
+        }
         IrExpr::Object(props) => {
             for (_, v) in props {
                 walk_expr(v, pos, first, last, escapes, in_closure);

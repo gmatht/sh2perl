@@ -223,7 +223,6 @@ fn expr_purity(e: &IrExpr, fns: &HashMap<String, FnInfo>) -> Purity {
                     .first()
                     .and_then(|a| match a {
                         IrExpr::Str(s, _) => fns.get(s),
-        IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
                         _ => None,
                     });
                 match callee {
@@ -420,7 +419,7 @@ fn collect_expr_reads(e: &IrExpr, fns: &HashMap<String, FnInfo>, out: &mut HashS
         }
         IrExpr::Splice(inner) => collect_expr_reads(inner, fns, out),
         IrExpr::Arith(a) => collect_arith_reads(a, out),
-        IrExpr::Ext(_) => unreachable!("Ext nodes lowered before rendering"),
+        IrExpr::Ext(_) => (),
         IrExpr::Object(pairs) => {
             for (_, v) in pairs {
                 collect_expr_reads(v, fns, out);
