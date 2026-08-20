@@ -1206,6 +1206,29 @@ impl Render {
                             }
                         }
                     }
+                    // ${x/pat/repl} / ${x//pat/repl} — substitute (literal pattern).
+                    if op == "/" || op == "//" {
+                        if let (
+                            Some(IrExpr::Str(name, _)),
+                            Some(IrExpr::Str(pat, _)),
+                            Some(IrExpr::Str(repl, _)),
+                        ) = (args.get(1), args.get(2), args.get(3))
+                        {
+                            if !pat.contains('*') && !pat.contains('?') && !pat.contains('[') {
+                                let v = self.call(
+                                    "getVar",
+                                    &[IrExpr::Str(
+                                        name.to_string(),
+                                        crate::ir::StrStyle::DoubleQuoted,
+                                    )],
+                                );
+                                let p = Self::py_str(pat);
+                                let r = Self::py_str(repl);
+                                let cnt = if op == "/" { "1" } else { "-1" };
+                                return format!("{v}.replace({p}, {r}, {cnt})");
+                            }
+                        }
+                    }
                 }
                 self.sh2_stub("param", args, "param")
             }
