@@ -3670,9 +3670,17 @@ impl Render {
                 // eval 'code' — run the code in a bash -c child (native
                 // evaluation is impossible; the child inherits the written
                 // vars via env_lit).
-                if let Some(IrExpr::Str(code, _)) = argv.first() {
+                if let Some(code) = argv.first() {
+                    let text = if let IrExpr::Str(c, _) = code {
+                        c.clone()
+                    } else if let Some(t) = self.cmd_text_expr(code) {
+                        t
+                    } else {
+                        self.mark_todo("builtin eval");
+                        return true;
+                    };
                     let env = self.env_lit();
-                    self.emit(&format!("st = redirRun({}, {env});", Self::go_str(code)));
+                    self.emit(&format!("st = redirRun({}, {env});", Self::go_str(&text)));
                     self.need_st = true;
                     true
                 } else {
