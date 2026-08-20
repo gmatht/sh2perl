@@ -1056,6 +1056,16 @@ impl Render {
             }
             // param(op, name, ..) — the C frontend's strlen lowering is the
             // `${#name}` len op on a native var: `param("len", "s")`.
+            "brace" => {
+                // `{x,y}{1..2}` / `a{1..3}b` — brace expansion. The groups
+                // are literals (ranges/lists), so expand them statically at
+                // render time and emit the space-joined words as a python
+                // string. Refuses any non-literal group.
+                if let Some(w) = py_brace_words(args) {
+                    return Self::py_str(&w);
+                }
+                self.sh2_stub("brace", args, "brace")
+            }
             "param" => {
                 if let Some(IrExpr::Str(op, _)) = args.first() {
                     if op == "len" {
@@ -2538,4 +2548,98 @@ fn collect_vars_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
         ArithAst::Assign { rhs, .. } => collect_vars_arith(rhs, out),
         _ => {}
     }
+}
+
+/// `{x,y}{1..2}` / `a{1..3}b` — compute the space-joined brace-expansion
+/// words. Returns None for any non-literal part (the renderer refuses).
+fn py_brace_words(args: &[IrExpr]) -> Option<String> {
+    let pre = match args.first()? {
+        IrExpr::Str(s, _) => s.clone(),
+        _ => return None,
+    };
+    let groups: Vec<Vec<String>> = match args.get(1)? {
+        IrExpr::Json(serde_json::Value::Array(items)) => {
+            let mut g = Vec::new();
+            for item in items {
+                let arr = item.as_array()?;
+                let comma = arr.len() > 1;
+                let mut one = Vec::new();
+                for e in arr {
+                    if let Some(s) = e.as_str() {
+                        one.push(s.to_string());
+                    } else if let Some(range) = e.get("range").and_then(|r| r.as_array()) {
+                        let start = range.first()?.as_str().unwrap_or("");
+                        let end = range.get(1)?.as_str().unwrap_or("");
+                        if comma {
+                            // a comma list keeps range-looking items literal
+                            one.push(format!("{start}..{end}"));
+                        } else {
+                            let step: i64 = range
+                                .get(2)?
+                                .as_str()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(1);
+                            let (Ok(a), Ok(b)) =
+                                (start.parse::<i64>(), end.parse::<i64>())
+                            else {
+                                return None;
+                            };
+                            let pad = if start.len() > 1 && start.starts_with('0') {
+                                Some(start.len())
+                            } else {
+                                None
+                            };
+                            let fmt = |n: i64| {
+                                let s = n.to_string();
+                                match pad {
+                                    Some(w) if s.len() < w => {
+                                        format!("{}{}", "0".repeat(w - s.len()), s)
+                                    }
+                                    _ => s,
+                                }
+                            };
+                            if step >= 0 {
+                                let mut n = a;
+                                while n <= b {
+                                    one.push(fmt(n));
+                                    n += step;
+                                    if step == 0 {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                let mut n = a;
+                                while n >= b {
+                                    one.push(fmt(n));
+                                    n += step;
+                                }
+                            }
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+                g.push(one);
+            }
+            g
+        }
+        _ => return None,
+    };
+    let suf = match args.get(3)? {
+        IrExpr::Str(s, _) => s.clone(),
+        _ => return None,
+    };
+    // cartesian product of the groups; prefix + concat + suffix per combo
+    let mut combos: Vec<String> = vec![String::new()];
+    for group in &groups {
+        let mut next = Vec::new();
+        for combo in &combos {
+            for item in group {
+                next.push(format!("{combo}{item}"));
+            }
+        }
+        combos = next;
+    }
+    let words: Vec<String> = combos.iter().map(|c| format!("{pre}{c}{suf}")).collect();
+    Some(words.join(" "))
 }
