@@ -70,6 +70,37 @@ impl Render {
             "def sh2_setVar(name, value):\n    __sh_store[name] = \"\" if value is None else str(value)\n",
         ),
         (
+            "strip",
+            concat!(
+                "def sh2_strip(v, pat, which):\n",
+                "    import fnmatch\n",
+                "    if which == 'p':\n",
+                "        m = 0\n",
+                "        for i in range(1, len(v)+1):\n",
+                "            if fnmatch.fnmatch(v[:i], pat):\n",
+                "                m = i; break\n",
+                "        return v[m:]\n",
+                "    if which == 'P':\n",
+                "        m = 0\n",
+                "        for i in range(1, len(v)+1):\n",
+                "            if fnmatch.fnmatch(v[:i], pat):\n",
+                "                m = i\n",
+                "        return v[m:]\n",
+                "    if which == 's':\n",
+                "        n = len(v)\n",
+                "        for i in range(len(v)-1, -1, -1):\n",
+                "            if fnmatch.fnmatch(v[i:], pat):\n",
+                "                n = i\n",
+                "        return v[:n]\n",
+                "    # 'S' longest suffix\n",
+                "    n = len(v)\n",
+                "    for i in range(len(v)-1, -1, -1):\n",
+                "        if fnmatch.fnmatch(v[i:], pat):\n",
+                "            n = i; break\n",
+                "    return v[:n]\n",
+            ),
+        ),
+        (
             "memAlloc",
             concat!(
                 "def sh2_memAlloc(size):\n",
@@ -1225,14 +1256,14 @@ impl Render {
                         if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Str(pat, _))) =
                             (args.get(1), args.get(2))
                         {
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.to_string(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
                             if !pat.contains('*') && !pat.contains('?') && !pat.contains('[') {
-                                let v = self.call(
-                                    "getVar",
-                                    &[IrExpr::Str(
-                                        name.to_string(),
-                                        crate::ir::StrStyle::DoubleQuoted,
-                                    )],
-                                );
                                 let p = Self::py_str(pat);
                                 return match op.as_str() {
                                     "#" | "##" => format!(
@@ -1243,6 +1274,19 @@ impl Render {
                                     ),
                                 };
                             }
+                            // glob pattern — runtime sh2_strip
+                            let which = match op.as_str() {
+                                "#" => "p",
+                                "##" => "P",
+                                "%" => "s",
+                                _ => "S",
+                            };
+                            self.sh2_calls.insert("strip".into());
+                            return format!(
+                                "sh2_strip({v}, {}, {})",
+                                Self::py_str(pat),
+                                Self::py_str(which)
+                            );
                         }
                     }
                     // ${x/pat/repl} / ${x//pat/repl} — substitute (literal pattern).
