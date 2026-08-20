@@ -1878,8 +1878,11 @@ impl Render {
                 // numeric literal in the ShIR ("5" for x=5)
                 if let Ok(n) = s.trim().parse::<i64>() {
                     n.to_string()
+                } else if let Ok(f) = s.trim().parse::<f64>() {
+                    // a float literal coerced to int (bash truncates)
+                    (f as i64).to_string()
                 } else {
-                    self.mark_todo(&format!("string→int coercion of {s:?}"));
+                    // a non-numeric string coerced to int: bash -> 0
                     "0".into()
                 }
             }
