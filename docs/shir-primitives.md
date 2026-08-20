@@ -367,3 +367,39 @@ needs `\s+`, which does NOT reduce to `count_char` — so C can't express
 
 This is the planner `text_ops` grows into: a typed reduction graph, solved
 per-backend by BFS, bounded by the backend's `nodes.txt` manifest.
+
+## The same command has several reductions — keyed by data source
+
+`wc -l` does NOT always reduce to the same graph path. The planner must
+consider **where the input comes from**:
+
+```
+wc -l foo        # a FILE
+... | wc -l      # a PIPELINE / stream
+wc -l <<< "a\nb" # a literal STRING (here-string)
+```
+
+| Input source | Natural reduction | Why |
+|--------------|-------------------|-----|
+| literal string | `RegCount(str, /\n/)` | the text is already in memory; a single count |
+| file / pipeline | `while (readline()) i++` | stream — never hold the whole input, count lines as they arrive |
+
+So the reduction graph's nodes are **source-aware**: "count a *string*" and
+"count a *stream*" are different node types with different edges. A file
+`wc -l` may not reduce to a string `RegCount` at all (that would require
+materializing the file), but to a streaming line loop instead.
+
+```
+wc -l [stream] ──► readLoop { i++ per readline }   # C, Go bufio.Scanner, Perl <$fh>
+wc -l [string] ──► RegCount(str, /\n/)             # JS, Perl, Rust
+```
+
+The planner keys the candidate table on (command, source):
+- `wc -l` on a here-string → string reduction (RegCount)
+- `wc -l` on a file or the last pipeline stage → streaming loop (readLoop)
+
+**Consequence for the graph model:** an edge isn't just `op → op'`; it's
+`(op, source) → (op', source')` where the source is part of the node's type.
+The planner starts from the command's actual source and follows edges that
+respect it — it won't force a string-count reduction onto a file it would
+have to slurp, and it won't force a stream into a literal-string shape.
