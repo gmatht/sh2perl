@@ -27,6 +27,18 @@ use std::collections::HashSet;
 
 /// Apply the transform. Returns whether anything changed.
 pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
+    // `KEEP_VARIABLES` (env) — debug/introspection escape hatch: when set,
+    // keep every defined function (and so every shell variable it could
+    // reference), even the never-called ones. Mirrors the `SH2_ASSUME_*`
+    // env-flag convention; used e.g. when a program introspects its own
+    // definitions (`declare -f`/`typeset -f`/`type name`).
+    if std::env::var("KEEP_VARIABLES")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
     // Pass 1: collect every defined function name.
     let mut defined: HashSet<String> = HashSet::new();
     collect_function_names(stmts, &mut defined);
