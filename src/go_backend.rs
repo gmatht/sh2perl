@@ -2229,6 +2229,24 @@ impl Render {
                     _ => Some(format!("${name}")),
                 }
             }
+            IrExpr::Call { func, args } if func == "redirect" => {
+                // `redirect` Call: args[0] = Arrow(body), args[1] = Array of
+                // {fd, mode, target} — reconstruct as `( body ) redir`s so an
+                // `and`/`or`/capture operand containing a redirect resolves.
+                let (Some(IrExpr::Arrow(body)), Some(IrExpr::Array(redirs))) =
+                    (args.first(), args.get(1))
+                else {
+                    return None;
+                };
+                let text = self.cmd_text_stmts(body)?;
+                let mut out = format!("( {text} )");
+                for r in redirs {
+                    let rt = self.redirect_text(r)?;
+                    out.push(' ');
+                    out.push_str(&rt);
+                }
+                Some(out)
+            }
             IrExpr::Call { func, args } if func == "assign" => {
                 let name = match args.first() {
                     Some(IrExpr::Str(n, _)) => n.clone(),
