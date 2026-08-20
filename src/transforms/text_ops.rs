@@ -159,9 +159,18 @@ fn lower_expr(expr: &mut IrExpr) {
             }
             for a in args.iter_mut() { lower_expr(a); }
         }
-        // Recurse into nested pipelines (command substitution: capture wraps Arrow)
+        // Nested pipeline in expression position (&& chains, command
+        // substitution, ternary): `echo X | cmd` inside `... && ...`.
         IrExpr::Call { func, args } if func == "pipeline" => {
-            let mut had = false;
+            if let [IrExpr::Array(stages)] = args.as_slice() {
+                if stages.len() == 2 {
+                    if let Some(replacement) = try_lower_pipeline(stages) {
+                        *expr = replacement;
+                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
             for a in args.iter_mut() { lower_expr(a); }
         }
         IrExpr::Arrow(body) => {
@@ -252,6 +261,7 @@ fn lower_text_cmd(text: IrExpr, cmd_name: &str, cmd_args: &[IrExpr]) -> Option<I
         "tail" => try_lower_head_tail(text, cmd_args, true),
         "wc" => try_lower_wc(text, cmd_args),
         "sed" => try_lower_sed(text, cmd_args),
+        "grep" => try_lower_grep(text, cmd_args),
         "xargs" => try_lower_xargs(text),
         _ => None,
     }
@@ -699,4 +709,25 @@ fn try_lower_param_op(args: &[IrExpr]) -> Option<IrExpr> {
         }
         _ => None,
     }
+}
+
+/// `echo X | grep -q P` → StringContains(X, P) — the substring test.
+fn try_lower_grep(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
+    // Only the grep -q P (quiet substring test) shape.
+    let strs: Vec<&str> = args.iter().filter_map(|a| match a {
+        IrExpr::Str(s, _) => Some(s.as_str()),
+        IrExpr::Interpolate(p) if p.len() == 1 => {
+            if let InterpPart::Lit(s) = &p[0] { Some(s.as_str()) } else { None }
+        }
+        _ => None,
+    }).collect();
+    // args like ["-q", "wor"] → quiet + literal pattern
+    if strs.len() == 2 && strs[0] == "-q" {
+        let pattern = IrExpr::Str(strs[1].to_string(), StrStyle::DoubleQuoted);
+        return Some(IrExpr::Ext(Box::new(StringContains {
+            text: text.clone(),
+            pattern,
+        })));
+    }
+    None
 }

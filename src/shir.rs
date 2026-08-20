@@ -33747,6 +33747,15 @@ fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
             Some(crate::estree::method_call(expr_to_estree(text), "substring",
                 vec![expr_to_estree(offset), expr_to_estree(len)]))
         }
+        "RegSub" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::RegSub>()?;
+            // text.replace(/pat/g, repl) or text.replace(/pat/, repl)
+            let re = crate::estree::regex_lit_flags(&node.pattern,
+                if node.global { "g" } else { "" });
+            Some(crate::estree::method_call(expr_to_estree(text), "replace",
+                vec![re, crate::estree::str_lit(&node.replacement)]))
+        }
         "Split" => {
             let text = children.get(0)?;
             let node = n.as_any().downcast_ref::<crate::shir_nodes::Split>()?;
