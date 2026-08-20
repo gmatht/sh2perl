@@ -561,6 +561,12 @@ impl Render {
                     if let Some(c) = self.test_render(s) {
                         return c;
                     }
+                    // bash -c fallback for a test go can't parse natively
+                    let env = self.env_lit();
+                    return format!(
+                        "(redirRun({}, {env}) == 0)",
+                        Self::go_str(&format!("[ {s} ]"))
+                    );
                 }
                 self.sh2_stub("test")
             }
@@ -1338,6 +1344,11 @@ impl Render {
                     if let Some(c) = self.test_render(s) {
                         return c;
                     }
+                    let env = self.env_lit();
+                    return format!(
+                        "(redirRun({}, {env}) == 0)",
+                        Self::go_str(&format!("[ {s} ]"))
+                    );
                 }
                 self.sh2_stub("test")
             }
