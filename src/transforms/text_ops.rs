@@ -779,6 +779,33 @@ mod tests {
         // grep without -q isn't a substring test → no reduction
         assert!(try_lower_grep(st("hello world"), &[st("wor")]).is_none());
     }
+
+    #[test]
+    fn getvar_hash_is_strlen() {
+        // ${#s} raw form: getVar("#s") → StrLen
+        let r = try_lower_getvar_len(&[st("#s")]).unwrap();
+        let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
+        assert!(n.as_any().downcast_ref::<StrLen>().is_some(), "#s → StrLen");
+    }
+
+    #[test]
+    fn getvar_plain_not_reduced() {
+        // a normal var read getVar("s") is NOT a length → no reduction
+        assert!(try_lower_getvar_len(&[st("s")]).is_none());
+    }
+
+    #[test]
+    fn yes_head_is_repeat() {
+        // yes "X" | head -n 3 → RepeatStr("X\n", 3)
+        let yes = [IrStmt::Expr(IrExpr::Call { func: "exec".to_string(), args: vec![
+            st("yes"), IrExpr::Array(vec![st("Hi")]),
+        ]})];
+        let r = try_lower_yes_head(&yes, &[st("-n"), st("3")]).unwrap();
+        let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
+        let rep = n.as_any().downcast_ref::<RepeatStr>().unwrap();
+        assert_eq!(rep.count, IrExpr::Int(3));
+        assert!(matches!(&rep.text, IrExpr::Str(s, _) if s == "Hi\n"));
+    }
 }
 
 /// Lower a single command `cmd_name(args)` against input text `text`.
