@@ -1232,6 +1232,13 @@ impl Render {
                     if let Some(c) = self.test_render(s) {
                         return c;
                     }
+                    // bash -c fallback for a test shape test_render can't
+                    // parse natively: run `[ <test> ]` (fork/exec).
+                    self.need_subprocess = true;
+                    return format!(
+                        "(subprocess.check_output([\"bash\", \"-c\", {}]) == 0)",
+                        Self::py_str(&format!("[ {s} ]"))
+                    );
                 }
                 self.sh2_stub("test", args, "test")
             }
