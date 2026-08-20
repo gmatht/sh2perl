@@ -48,7 +48,11 @@ fn lower_stmt(stmt: &mut IrStmt) {
             if let [IrExpr::Array(stages)] = args.as_slice() {
                 if stages.len() == 2 {
                     if let Some(replacement) = try_lower_pipeline(stages) {
-                        *stmt = IrStmt::Expr(replacement);
+                        // A STATEMENT-level `echo X | cut` PRINTS the result.
+                        // Preserve the output side-effect: wrap the value in
+                        // an Output (process.stdout.write + newline), not a
+                        // bare expression (which would compute but not print).
+                        *stmt = IrStmt::Output { value: replacement, newline: true, target: None };
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -580,15 +584,24 @@ fn try_lower_xargs(text: IrExpr) -> Option<IrExpr> {
 
 // ── ${#var} → StrLen ────────────────────────────────────────────────
 
+/// Convert a `param` op's var-name arg (a Str of the variable NAME) into a
+/// real variable READ (`getVar("name")`), not the literal name string.
+/// `${#var}` must read the variable's value, not count the chars of "var".
+fn param_var_read(name: &IrExpr) -> Option<IrExpr> {
+    match name {
+        IrExpr::Str(s, _) => Some(IrExpr::Call { func: "param".to_string(),
+            args: vec![IrExpr::Str(String::new(), StrStyle::DoubleQuoted), IrExpr::Str(s.clone(), StrStyle::DoubleQuoted)] }),
+        _ => None,
+    }
+}
+
 fn try_lower_param_len(args: &[IrExpr]) -> Option<IrExpr> {
-    // param("length", var_name) or similar
+    // param("length", var_name) → StrLen(read(var))
     if args.len() >= 2 {
         if let IrExpr::Str(op, _) = &args[0] {
             if op == "length" {
-                let var = args[1].clone();
-                return Some(IrExpr::Ext(Box::new(StrLen {
-                    text: var,
-                })));
+                let var = param_var_read(&args[1])?;
+                return Some(IrExpr::Ext(Box::new(StrLen { text: var })));
             }
         }
     }
@@ -727,7 +740,7 @@ fn try_lower_param_path(args: &[IrExpr]) -> Option<IrExpr> {
     // and ${p%/*} → param("dirname", p).
     if args.len() >= 2 {
         if let IrExpr::Str(op, _) = &args[0] {
-            let var = args[1].clone();
+            let var = param_var_read(&args[1])?;
             match op.as_str() {
                 "basename" => {
                     return Some(IrExpr::Ext(Box::new(PathName {
@@ -769,7 +782,7 @@ fn arg_to_expr(arg: &IrExpr) -> Option<IrExpr> {
 fn try_lower_param_op(args: &[IrExpr]) -> Option<IrExpr> {
     if args.len() < 2 { return None; }
     let op = match &args[0] { IrExpr::Str(s, _) => s.as_str(), _ => return None };
-    let var = args[1].clone();
+    let var = param_var_read(&args[1])?;
     match op {
         ",," => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: false }))),
         "^^" => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: true }))),
