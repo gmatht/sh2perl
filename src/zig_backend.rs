@@ -543,6 +543,17 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "\"\"".into()
             }
+            IrExpr::Ext(n) => {
+                let ctx = crate::render_ext_expr::ExprRenderCtx {
+                    backend: crate::render_ext_expr::Backend::Zig,
+                    indent: 0,
+                };
+                if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
+                    code
+                } else {
+                    format!("sh2.{}(...)", n.tag())
+                }
+            }
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "\"\"".into()
@@ -711,6 +722,17 @@ impl Render {
             IrExpr::Splice(_) => {
                 self.mark_todo("Splice expr");
                 "false".into()
+            }
+            IrExpr::Ext(n) => {
+                let ctx = crate::render_ext_expr::ExprRenderCtx {
+                    backend: crate::render_ext_expr::Backend::Zig,
+                    indent: 0,
+                };
+                if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
+                    code
+                } else {
+                    format!("sh2.{}(...)", n.tag())
+                }
             }
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");

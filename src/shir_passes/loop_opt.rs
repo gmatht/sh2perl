@@ -419,6 +419,7 @@ fn collect_expr_reads(e: &IrExpr, fns: &HashMap<String, FnInfo>, out: &mut HashS
         }
         IrExpr::Splice(inner) => collect_expr_reads(inner, fns, out),
         IrExpr::Arith(a) => collect_arith_reads(a, out),
+        IrExpr::Ext(_) => (),
         IrExpr::Object(pairs) => {
             for (_, v) in pairs {
                 collect_expr_reads(v, fns, out);

@@ -9,6 +9,7 @@ pub mod ir;
 pub mod pipeline_native;
 pub mod shir;
 pub mod render_ext;
+pub mod render_ext_expr;
 pub mod shir_nodes;
 pub mod shir_json;
 pub mod transforms;

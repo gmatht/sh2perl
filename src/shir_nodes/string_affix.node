@@ -1,0 +1,12 @@
+# shir_nodes/string_affix.node — expression-level semantic IR node.
+# Prefix/suffix test (lowered from `[[ $x == P* ]]`, `case P*)`).
+#
+# Backends: Perl index()==0, JS startsWith/endsWith, C strncmp, Rust starts_with
+# Fallback: sh2.stringAffix(text, pattern, prefix)
+
+node StringAffix
+tag "StringAffix"
+kind expr
+field text: expr
+field pattern: expr
+field prefix: bool

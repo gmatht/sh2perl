@@ -785,6 +785,17 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "nil".into()
             }
+            IrExpr::Ext(n) => {
+                let ctx = crate::render_ext_expr::ExprRenderCtx {
+                    backend: crate::render_ext_expr::Backend::Go,
+                    indent: 0,
+                };
+                if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
+                    code
+                } else {
+                    format!("sh2.{}(...)", n.tag())
+                }
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr_any(i)).collect();
                 format!("[]any{{{}}}", elems.join(", "))

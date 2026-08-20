@@ -29,6 +29,7 @@ pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native num
 /// into the crate. Each entry is (name, transform_fn).
 pub mod shir_pipeline_native;
 pub mod dead_fn_elim; // generic: remove never-referenced shell functions
+pub mod text_ops; // common shell commands → semantic IR nodes (cut/tr/sed/head/tail/wc)
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
 pub mod shir_native_stmt; // worker-submitted: redirect/herestring/test-chain shapes → native stmt forms
@@ -75,6 +76,7 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         ("for-recovery", for_recovery::transform),
         ("function-purity", function_purity::transform),
         ("i32-provable", i32_provable::transform),
+        ("text-ops", text_ops::transform),
     ]
 }
 

@@ -124,6 +124,7 @@ fn has_dynamic_write(stmts: &[IrStmt]) -> bool {
             IrExpr::ArrayComp { iter, elem, cond, .. } => walk_expr(iter) || walk_expr(elem) || cond.as_ref().map(|c| walk_expr(c)).unwrap_or(false),
             IrExpr::Splice(inner) => walk_expr(inner),
             IrExpr::Arith(ast) => walk_arith(ast),
+            IrExpr::Ext(_) => false,
             _ => false,
         }
     }
@@ -307,6 +308,7 @@ fn count_writes(stmts: &[IrStmt]) -> std::collections::HashMap<String, usize> {
             IrExpr::ArrayComp { iter, elem, cond, .. } => { walk_expr(iter, counts); walk_expr(elem, counts); if let Some(c) = cond { walk_expr(c, counts); } }
             IrExpr::Splice(inner) => walk_expr(inner, counts),
             IrExpr::Arith(ast) => walk_arith(ast, counts),
+            IrExpr::Ext(_) => false,
             _ => {}
         }
     }
@@ -643,6 +645,7 @@ fn expr_pure(e: &IrExpr) -> bool {
         | IrExpr::ArrayComp { .. }
         | IrExpr::Lambda { .. }
         | IrExpr::Ident(_) => false,
+        IrExpr::Ext(_) => false,
     }
 }
 
