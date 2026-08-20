@@ -1180,6 +1180,20 @@ impl Render {
                             return format!("{v}[{o}:{o}+{l}]");
                         }
                     }
+                    // \${x##*/} / basename / dirname — native os.path
+                    if op == "basename" || op == "dirname" {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.to_string(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            let f = if op == "basename" { "basename" } else { "dirname" };
+                            return format!("os.path.{f}({v})");
+                        }
+                    }
                     // \${x#pat} / \${x##pat} / \${x%pat} / \${x%%pat} —
                     // strip prefix/suffix, literal pattern only (no glob).
                     if op == "#" || op == "##" || op == "%" || op == "%%" {
