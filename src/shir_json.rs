@@ -545,6 +545,7 @@ fn style_json(s: &StrStyle) -> &'static str {
         StrStyle::DoubleQuoted => "DoubleQuoted",
         StrStyle::Command => "Command",
         StrStyle::Heredoc => "Heredoc",
+        StrStyle::Raw => "Raw",
     }
 }
 
