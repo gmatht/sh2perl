@@ -1020,6 +1020,31 @@ impl Render {
                         };
                         return format!("os.chdir({dir})");
                     }
+                    if cmd == "read" {
+                        // `read var` — read a line into the store (sh2_setVar
+                        // triggers the store runtime).
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if let Some(IrExpr::Str(v, _)) = items.first() {
+                                self.sh2_calls.insert("setVar".into());
+                                return format!(
+                                    "sh2_setVar({}, sys.stdin.readline().rstrip(\"\\n\"))",
+                                    Self::py_str(v)
+                                );
+                            }
+                        }
+                    }
+                    if cmd == "unset" {
+                        // `unset var` — remove from the store
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if let Some(IrExpr::Str(v, _)) = items.first() {
+                                self.sh2_calls.insert("setVar".into());
+                                return format!(
+                                    "__sh_store.pop({}, None)",
+                                    Self::py_str(v)
+                                );
+                            }
+                        }
+                    }
                     if cmd == "let" {
                         if let Some(IrExpr::Array(items)) = args.get(1) {
                             if let Some(IrExpr::Str(text, _)) = items.first() {
