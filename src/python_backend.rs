@@ -784,7 +784,17 @@ impl Render {
                 self.mark_todo(&format!("RawExpr {s:?}"));
                 "None".into()
             }
-            IrExpr::Arrow(_) => self.sh2_stub("arrow", &[], "arrow"),
+            IrExpr::Arrow(body) => {
+                // a command body as a value — bash -c capture fallback
+                if let Some(text) = self.body_shell_text(body) {
+                    self.need_subprocess = true;
+                    return format!(
+                        "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
+                        Self::py_str(&text)
+                    );
+                }
+                self.sh2_stub("arrow", &[], "arrow")
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|e| self.expr(e)).collect();
                 format!("[{}]", elems.join(", "))
@@ -1348,24 +1358,28 @@ impl Render {
     /// Render a single-exec/pipeline Arrow body to shell text (for the
     /// bash -c capture fallback). None for anything else.
     fn body_shell_text(&self, body: &[IrStmt]) -> Option<String> {
-        let [IrStmt::Expr(e)] = body else {
-            return None;
-        };
-        match e {
-            IrExpr::Call { func, args } if func == "exec" => {
-                let mut parts = Vec::new();
-                if let Some(IrExpr::Str(cmd, _)) = args.first() {
-                    parts.push(Self::sh_quote(cmd));
-                }
-                if let Some(IrExpr::Array(items)) = args.get(1) {
-                    for it in items {
-                        parts.push(self.sh_arg(it)?);
+        let mut parts = Vec::new();
+        for st in body {
+            let IrStmt::Expr(e) = st else {
+                return None;
+            };
+            match e {
+                IrExpr::Call { func, args } if func == "exec" => {
+                    let mut one = Vec::new();
+                    if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                        one.push(Self::sh_quote(cmd));
                     }
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        for it in items {
+                            one.push(self.sh_arg(it)?);
+                        }
+                    }
+                    parts.push(one.join(" "));
                 }
-                Some(parts.join(" "))
+                _ => return None,
             }
-            _ => None,
         }
+        Some(parts.join("; "))
     }
     /// Render a {fd, mode, target} redirect object to shell text.
     fn redirect_shell_text(&self, r: &IrExpr) -> Option<String> {
