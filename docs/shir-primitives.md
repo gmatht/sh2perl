@@ -403,3 +403,88 @@ The planner keys the candidate table on (command, source):
 The planner starts from the command's actual source and follows edges that
 respect it — it won't force a string-count reduction onto a file it would
 have to slurp, and it won't force a stream into a literal-string shape.
+
+## Streaming & capture-aware reduction design (phase 2)
+
+Two coverage gaps remain deliberately unreduced in phase 1: idioms INSIDE
+`$(…)` captures, and pipelines whose source reads a FILE. Both get a design
+here before implementation. Driving rules: (a) never slurp a whole file
+where bash streams, (b) avoid fork/exec when the target language has a
+native construct, (c) preserve observable semantics exactly — stdout value
+AND `$?`.
+
+### 1. Capture-internal reduction (`x=$(echo X | cut …)`)
+
+Today: `Assign { expr: Capture { expr: Arrow([Expr(pipeline)]) } }` — the
+capture runs the pipeline, collects stdout, strips trailing newlines.
+Reductions were skipped because a bare VALUE produces no stdout for the
+capture to collect.
+
+Design: reduce the ASSIGN'S EXPRESSION, not the capture body.
+
+```
+x=$(echo X | <reducible>)     ⇒     x = <composed Ext value>
+SetChildError(0)                     # preserve $? (allowlist ⇒ status 0)
+```
+
+Semantics table (why each is exact):
+
+| Stage kind | bash value after strip | composition result |
+|---|---|---|
+| cut/tr/sed/head/tail/xargs over echo text | transform(strip(text)) | same — these operate per-line and their output strip removes what echo added |
+| wc -c | len(text)+1 (echo newline) | StrLen(text+"\\n") — append_trailing_newline |
+| wc -l | newlines(text)+1 | RegCount(text+"\\n") |
+| wc -w | words(text) | ArrayLen(Split(text,/\\s+/)) |
+
+Exit-status preservation: the allowlist (cut/tr/head/tail/wc/xargs, sed with
+static s///) provably exits 0 on static input, so the reduction emits
+`SetChildError(0)` after the assignment. `grep` is EXCLUDED from captures —
+`x=$(echo abc | grep -q xyz)` is a STATUS idiom (empty value, $? = 1), not a
+value idiom; reducing it would be wrong. `captureWords` (unquoted $( )) is
+excluded — word-splitting happens outside the value.
+
+### 2. Dynamic-source pipelines: the ForEachLine stream primitive
+
+`grep x /etc/passwd | cut -d: -f1` must become a lazy per-line loop, not
+slurp-and-transform. New statement primitive:
+
+```
+node ForEachLine
+tag "ForEachLine"
+kind stmt              # statement-level ExtNode
+field source: expr     # file path expression
+field var: string      # loop variable holding the CURRENT LINE (no \n)
+field body: stmts      # uses the existing VALUE primitives per line
+```
+
+Backend renderings (all O(1) memory, all native — no fork/exec):
+
+| Backend | rendering |
+|---|---|
+| JS | `for await (const l of sh2.lines(<path>)) { … }` — NEW sh2.lines(path) runtime member backed by readline+createReadStream |
+| Perl | `open my $fh, '<', …; while (my $l = <$fh>) { chomp $l; … }` |
+| C | `FILE* f…; while (getline(&buf,&n,f) != -1) { … }` |
+| Go | `bufio.NewScanner(os.Open(path))` loop |
+| Zig | reader loop |
+
+Compositions over ForEachLine (source command folds into the body):
+
+| Pipeline | Reduction |
+|---|---|
+| `cut -dD -fN F` | ForEachLine(F, Output(FieldExtract(l,D,N))) |
+| `grep P F \| cut -dD -fN` | ForEachLine(F, if Contains(l,P) then Output(FieldExtract)) |
+| `grep P F \| wc -l` | `n=0; ForEachLine(F, if Contains(l,P) then n+=1)` → value n |
+| `wc -l < F` | `n=0; ForEachLine(F, n+=1)` |
+| `sed s/// F` | ForEachLine(F, Output(RegSub(l,…))) |
+| `tr X Y < F` | ForEachLine(F, Output(CharTranslate(l,…))) |
+
+`head -K F` MAY stream with an early-exit counter (later iteration);
+`tail` cannot stream without buffering — falls back. `sort` needs full
+input inherently — always falls back (bash sorts in memory too).
+
+### 3. No-slurp verification method
+
+For each handled idiom, generate js/pl/C output and assert the file is
+consumed via the line-iteration construct (readline/getline/scanner) and
+that NO readFileSync/readFile/whole-buffer call appears for it. This check
+joins the byte-exact targeted tests.
