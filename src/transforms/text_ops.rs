@@ -55,6 +55,11 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                     // Statement-level Block replacement (counter loop).
                     if emit {
                         if let [IrExpr::Arrow(b1), IrExpr::Arrow(b2)] = stages.as_slice() {
+                            if let Some(repl) = try_lower_grep_cut(b1, b2) {
+                                *stmt = repl;
+                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
                             if let Some(repl) = try_lower_grep_wc(b1, b2) {
                                 *stmt = repl;
                                 LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -100,6 +105,34 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
             // `wc -l < F` → STREAMING count: O(1) memory line loop, never
             // a whole-file read (docs shir-primitives.md §ForEachLine).
             if emit {
+                // `tr SET1 SET2 < F` → ForEachLine(Output(tr(l)))
+                let tr_inner = match inner.as_slice() {
+                    [IrStmt::Expr(IrExpr::Call { func, args })]
+                        if (func == "exec" || func == "builtin")
+                            && matches!(args.as_slice(),
+                                [IrExpr::Str(n, _), IrExpr::Array(_)] if n == "tr") =>
+                    {
+                        match args.as_slice() {
+                            [IrExpr::Str(_, _), IrExpr::Array(a)] => Some(a.as_slice()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let red_path = redirects.iter().find_map(|r| {
+                    if r.fd == Some(0) && r.mode == "r" { Some(r.target.clone()) } else { None }
+                });
+                if let (Some(targs), Some(path)) = (tr_inner, red_path) {
+                    if let Some(val) = try_lower_tr(loop_var_read("__l"), targs) {
+                        *stmt = IrStmt::Ext(Box::new(ForEachLine {
+                            source: path,
+                            var: "__l".to_string(),
+                            body: vec![IrStmt::Output { value: val, newline: true, target: None }],
+                        }));
+                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
                 let is_wc_l = matches!(inner.as_slice(),
                     [IrStmt::Expr(IrExpr::Call { func, args })]
                         if (func == "exec" || func == "builtin")
@@ -166,6 +199,39 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         }
                     }
                 }
+                // `sed s/// F` (single FILE source) → STREAMING per-line RegSub.
+                if emit && cmd == "sed" {
+                    let mut flags: Vec<IrExpr> = Vec::new();
+                    let mut files: Vec<IrExpr> = Vec::new();
+                    let mut script: Option<IrExpr> = None;
+                    let mut i = 0;
+                    while i < cmd_args.len() {
+                        match &cmd_args[i] {
+                            IrExpr::Str(s, _) if matches!(s.as_str(), "-i" | "-n" | "-E") => {
+                                flags.push(cmd_args[i].clone()); // unsupported modifiers → won't reduce below
+                            }
+                            IrExpr::Str(s, _) if s.starts_with('-') => { flags.push(cmd_args[i].clone()); }
+                            other => {
+                                if script.is_none() { script = Some(other.clone()); }
+                                else { files.push(other.clone()); }
+                            }
+                        }
+                        i += 1;
+                    }
+                    if flags.is_empty() && files.len() == 1 {
+                        if let Some(val) = try_lower_sed(loop_var_read("__l"), &flags.iter().chain(script.iter()).cloned().collect::<Vec<_>>()) {
+                            *stmt = IrStmt::Ext(Box::new(ForEachLine {
+                                source: files.remove(0),
+                                var: "__l".to_string(),
+                                body: vec![IrStmt::Output { value: val, newline: true, target: None }],
+                            }));
+                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+                // `tr X Y < F` → STREAMING per-line CharTranslate/Case.
+                // (handled in the Redirect arm below via try_lower_tr_fd)
                 if emit && cmd == "printf" {
                     if let Some(val) = try_lower_printf_repeat(cmd_args) {
                         // printf emits NO trailing newline.
@@ -1346,4 +1412,51 @@ fn try_lower_grep_wc(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
     let pat = IrExpr::Str(strs[0].to_string(), StrStyle::DoubleQuoted);
     let path = IrExpr::Str(strs[1].to_string(), StrStyle::DoubleQuoted);
     Some(streaming_line_count(path, Some(pat)))
+}
+
+/// `grep P F | cut -dD -fN` → ForEachLine(F, if Contains(l,P) then
+/// Output(FieldExtract(l,D,N))). Static args only.
+fn try_lower_grep_cut(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
+    // stage1: grep P F (no flags, two literals)
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = stage1 else { return None };
+    if !(f1 == "exec" || f1 == "builtin") { return None; }
+    let [IrExpr::Str(n1, _), IrExpr::Array(ga)] = a1.as_slice() else { return None };
+    if n1 != "grep" || ga.len() != 2 { return None; }
+    let mut gs: Vec<&str> = Vec::new();
+    for x in ga.iter() {
+        match x {
+            IrExpr::Str(s, _) => gs.push(s.as_str()),
+            IrExpr::Interpolate(p) if p.len() == 1 => {
+                match &p[0] { InterpPart::Lit(s) => gs.push(s.as_str()), _ => return None }
+            }
+            _ => return None,
+        }
+    }
+    if gs.len() != 2 || gs[1].starts_with('-') { return None; }
+    let pat = IrExpr::Str(gs[0].to_string(), StrStyle::DoubleQuoted);
+    let path = IrExpr::Str(gs[1].to_string(), StrStyle::DoubleQuoted);
+
+    // stage2: cut with flag-only args
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = stage2 else { return None };
+    if !(f2 == "exec" || f2 == "builtin") { return None; }
+    let [IrExpr::Str(n2, _), IrExpr::Array(ca)] = a2.as_slice() else { return None };
+    if n2 != "cut" { return None; }
+    let flags: Vec<IrExpr> = ca.iter().filter(|x| matches!(x, IrExpr::Str(s, _) if s.starts_with('-'))).cloned().collect();
+    if flags.len() != ca.len() { return None; } // positional file in pipe stage = wrong shape
+
+    let field = try_lower_cut(loop_var_read("__l"), &flags)?;
+    let cond = IrExpr::Ext(Box::new(StringContains {
+        text: loop_var_read("__l"),
+        pattern: pat,
+    }));
+    Some(IrStmt::Ext(Box::new(ForEachLine {
+        source: path,
+        var: "__l".to_string(),
+        body: vec![IrStmt::If {
+            cond,
+            then: vec![IrStmt::Output { value: field, newline: true, target: None }],
+            elsifs: vec![],
+            else_: vec![],
+        }],
+    })))
 }
