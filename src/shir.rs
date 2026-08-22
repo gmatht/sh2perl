@@ -13272,6 +13272,14 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 }
             }
             IrExpr::Capture { expr, .. } => walk_expr(expr, excluded, string_ctx, in_copy),
+            IrExpr::Ext(n) => {
+                // transform-declared nodes: descend into child expressions
+                // (a read hidden inside an Ext node must keep its var
+                // store-bound — see the lift_walk_expr Ext arm).
+                for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                    walk_expr(c, excluded, string_ctx, in_copy);
+                }
+            }
             IrExpr::Array(elems) => {
                 for el in elems {
                     walk_expr(el, excluded, string_ctx, in_copy);
@@ -28658,6 +28666,11 @@ fn lift_mark_all_idents_args(e: &IrExpr, out: &mut HashSet<String>) {
                 lift_mark_all_idents_args(v, out);
             }
         }
+        IrExpr::Ext(n) => {
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                lift_mark_all_idents_args(c, out);
+            }
+        }
         _ => {}
     }
 }
@@ -28674,6 +28687,11 @@ fn lift_mark_str_args(e: &IrExpr, string_ctx: &mut HashSet<String>) {
                 lift_mark_str_args(v, string_ctx);
             }
         }
+        IrExpr::Ext(n) => {
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                lift_mark_str_args(c, string_ctx);
+            }
+        }
         _ => {}
     }
 }
@@ -28682,6 +28700,11 @@ fn lift_mark_write_builtin_vars(e: &IrExpr, excluded: &mut HashSet<String>) {
         IrExpr::Array(elems) => {
             for el in elems {
                 lift_mark_write_builtin_vars(el, excluded);
+            }
+        }
+        IrExpr::Ext(n) => {
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                lift_mark_write_builtin_vars(c, excluded);
             }
         }
         IrExpr::Str(sv, _) => {
@@ -28941,6 +28964,16 @@ fn lift_walk_expr(
             }
         }
         IrExpr::Capture { expr, .. } => lift_walk_expr(expr, excluded, string_ctx, in_copy),
+        IrExpr::Ext(n) => {
+            // transform-declared nodes: descend into their child
+            // expressions so reads hidden inside an Ext node keep the
+            // host var OUT of the native-lift candidate set (a lifted
+            // var has no store entry — a getVar inside an opaque node
+            // would read "" and silently corrupt the program).
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                lift_walk_expr(c, excluded, string_ctx, in_copy);
+            }
+        }
         IrExpr::Array(elems) => {
             for el in elems {
                 lift_walk_expr(el, excluded, string_ctx, in_copy);
@@ -29322,6 +29355,9 @@ fn lift_expr_mentions(e: &IrExpr, name: &str) -> bool {
             lift_expr_mentions(expr, name) || lift_expr_mentions(default, name)
         }
         IrExpr::Capture { expr, .. } => lift_expr_mentions(expr, name),
+        IrExpr::Ext(n) => crate::shir_nodes::ExtExpr::children(&**n)
+            .into_iter()
+            .any(|c| lift_expr_mentions(c, name)),
         _ => false,
     }
 }

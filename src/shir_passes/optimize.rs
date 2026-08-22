@@ -1557,6 +1557,14 @@ fn collect_stmt_read_names(st: &IrStmt, out: &mut Vec<String>) {
 fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
     match e {
         IrExpr::Var(n, _) | IrExpr::Ident(n) => out.push(n.clone()),
+        IrExpr::Ext(n) => {
+            // transform-declared nodes: reads hidden inside an Ext node
+            // keep the host var alive (a zero-read store drop would
+            // delete a write the ext node's operand still reads).
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                collect_expr_read_names(c, out);
+            }
+        }
         IrExpr::Index { var, key } => {
             out.push(var.clone());
             collect_expr_read_names(key, out);

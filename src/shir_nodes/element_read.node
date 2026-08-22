@@ -1,0 +1,15 @@
+# shir_nodes/element_read.node — ElementRead: index into an anonymous
+# composite VALUE (`m["key"]` on a map literal, arr[i] on a literal,
+# Java/Zig element reads on non-named collections).
+#
+# GENERIC. coll is any expression evaluating to a composite value; key
+# stringifies like the host object model. Named-variable indexing keeps
+# the existing A1 shapes (assocGet / arrayIndex / ${a[i]}) — THIS node
+# covers only the expression-position form frontends previously had no
+# shape for.
+
+node ElementRead
+tag "ElementRead"
+kind expr
+field coll: expr
+field key: expr
