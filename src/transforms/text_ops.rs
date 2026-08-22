@@ -31,9 +31,13 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     if !enabled.split(',').any(|s| s.trim() == "text-ops") {
         return false;
     }
+    // Census of array variables — scalar `${v:N:M}` slices reduce to
+    // SubStrExtract; array slices must NOT (they are index subsets).
+    let mut arrays: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_array_names(stmts, &mut arrays);
     let before = LIFT_COUNT.load(Ordering::Relaxed);
     for stmt in stmts.iter_mut() {
-        lower_stmt(stmt, true);
+        lower_stmt(stmt, true, &arrays);
     }
     let after = LIFT_COUNT.load(Ordering::Relaxed);
     if after > before {
@@ -41,7 +45,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     after > before
 }
 
-fn lower_stmt(stmt: &mut IrStmt, emit: bool) {
+fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<String>) {
     match stmt {
         // ShIR pipeline: IrExpr::Call { func: "pipeline", args: [Array(stages)] }
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
@@ -84,13 +88,13 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool) {
             }
             // Recurse into the inner body
             for s in inner.iter_mut() {
-                lower_stmt(s, emit);
+                lower_stmt(s, emit, arrays);
             }
         }
         // Plain builtin command: basename X / dirname X (no pipeline)
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
             // Recurse into args first (to reach nested $(...) / param calls)
-            for a in args.iter_mut() { lower_expr(a); }
+            for a in args.iter_mut() { lower_expr(a, arrays); }
             if let [IrExpr::Str(cmd, _), IrExpr::Array(cmd_args)] = args.as_slice() {
                 if emit && (cmd == "basename" || cmd == "dirname") && !cmd_args.is_empty() {
                     let which = if cmd == "dirname" { "dirname" } else { "basename" };
@@ -107,41 +111,41 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool) {
             }
         }
         IrStmt::Expr(expr) => {
-            lower_expr(expr);
+            lower_expr(expr, arrays);
         }
         // Recurse into nested statement bodies (if/while/for/function/...)
         IrStmt::If { then, elsifs, else_, .. } => {
-            for s in then.iter_mut() { lower_stmt(s, emit); }
-            for (_, b) in elsifs.iter_mut() { for s in b.iter_mut() { lower_stmt(s, emit); } }
-            for s in else_.iter_mut() { lower_stmt(s, emit); }
+            for s in then.iter_mut() { lower_stmt(s, emit, arrays); }
+            for (_, b) in elsifs.iter_mut() { for s in b.iter_mut() { lower_stmt(s, emit, arrays); } }
+            for s in else_.iter_mut() { lower_stmt(s, emit, arrays); }
         }
         IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
-            for s in body.iter_mut() { lower_stmt(s, emit); }
+            for s in body.iter_mut() { lower_stmt(s, emit, arrays); }
         }
-        IrStmt::For { body, .. } => { for s in body.iter_mut() { lower_stmt(s, emit); } }
+        IrStmt::For { body, .. } => { for s in body.iter_mut() { lower_stmt(s, emit, arrays); } }
         IrStmt::ForInit { init, body, .. } => {
-            for s in init.iter_mut() { lower_stmt(s, emit); }
-            for s in body.iter_mut() { lower_stmt(s, emit); }
+            for s in init.iter_mut() { lower_stmt(s, emit, arrays); }
+            for s in body.iter_mut() { lower_stmt(s, emit, arrays); }
         }
-        IrStmt::Function { body, .. } => { for s in body.iter_mut() { lower_stmt(s, emit); } }
+        IrStmt::Function { body, .. } => { for s in body.iter_mut() { lower_stmt(s, emit, arrays); } }
         IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
-            for s in body.iter_mut() { lower_stmt(s, emit); }
+            for s in body.iter_mut() { lower_stmt(s, emit, arrays); }
         }
         IrStmt::Case { discriminant, clauses } => {
-            lower_expr(discriminant);
-            for c in clauses.iter_mut() { for s in c.body.iter_mut() { lower_stmt(s, emit); } }
+            lower_expr(discriminant, arrays);
+            for c in clauses.iter_mut() { for s in c.body.iter_mut() { lower_stmt(s, emit, arrays); } }
         }
-        IrStmt::Assign { expr, .. } => lower_expr(expr),
-        IrStmt::Declare { init, .. } => { if let Some(e) = init { lower_expr(e); } }
+        IrStmt::Assign { expr, .. } => lower_expr(expr, arrays),
+        IrStmt::Declare { init, .. } => { if let Some(e) = init { lower_expr(e, arrays); } }
         IrStmt::WriteFile { path, content, .. } => {
-            lower_expr(path); lower_expr(content);
+            lower_expr(path, arrays); lower_expr(content, arrays);
         }
-        IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => lower_expr(e),
+        IrStmt::Return(Some(e)) | IrStmt::Exit(Some(e)) => lower_expr(e, arrays),
         _ => {}
     }
 }
 
-fn lower_expr(expr: &mut IrExpr) {
+fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
     match expr {
         // ${#var} → StrLen
         IrExpr::Call { func, args } if func == "param" => {
@@ -158,12 +162,12 @@ fn lower_expr(expr: &mut IrExpr) {
             }
             // ${var,,} → Case(lower), ${var^^} → Case(upper),
             // ${var:2:3} → SubStr(var, 2, 3)
-            if let Some(replacement) = try_lower_param_op(args) {
+            if let Some(replacement) = try_lower_param_op(args, arrays) {
                 *expr = replacement;
                 LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            for a in args.iter_mut() { lower_expr(a); }
+            for a in args.iter_mut() { lower_expr(a, arrays); }
         }
         // Nested pipeline in expression position (&& chains, command
         // substitution, ternary): `echo X | cmd` inside `... && ...`.
@@ -177,21 +181,21 @@ fn lower_expr(expr: &mut IrExpr) {
                     }
                 }
             }
-            for a in args.iter_mut() { lower_expr(a); }
+            for a in args.iter_mut() { lower_expr(a, arrays); }
         }
         IrExpr::Arrow(body) => {
-            for s in body.iter_mut() { lower_stmt(s, false); }
+            for s in body.iter_mut() { lower_stmt(s, false, arrays); }
         }
-        IrExpr::Capture { expr: inner, .. } => lower_expr(inner),
-        IrExpr::Array(items) => { for i in items.iter_mut() { lower_expr(i); } }
+        IrExpr::Capture { expr: inner, .. } => lower_expr(inner, arrays),
+        IrExpr::Array(items) => { for i in items.iter_mut() { lower_expr(i, arrays); } }
         IrExpr::Interpolate(parts) => {
             for p in parts.iter_mut() {
-                if let InterpPart::Expr(e) = p { lower_expr(e); }
+                if let InterpPart::Expr(e) = p { lower_expr(e, arrays); }
             }
         }
-        IrExpr::Index { key, .. } => lower_expr(key),
-        IrExpr::BinOp { lhs, rhs, .. } => { lower_expr(lhs); lower_expr(rhs); }
-        IrExpr::Ternary { cond, then, else_, .. } => { lower_expr(cond); lower_expr(then); lower_expr(else_); }
+        IrExpr::Index { key, .. } => lower_expr(key, arrays),
+        IrExpr::BinOp { lhs, rhs, .. } => { lower_expr(lhs, arrays); lower_expr(rhs, arrays); }
+        IrExpr::Ternary { cond, then, else_, .. } => { lower_expr(cond, arrays); lower_expr(then, arrays); lower_expr(else_, arrays); }
         // `${#s}` outside a string lowers to getVar("##s") — the raw length
         // marker. Reduce to StrLen(read(s)).
         IrExpr::Call { func, args } if func == "getVar" => {
@@ -200,13 +204,13 @@ fn lower_expr(expr: &mut IrExpr) {
                 LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            for a in args.iter_mut() { lower_expr(a); }
+            for a in args.iter_mut() { lower_expr(a, arrays); }
         }
         // Nested builtin/exec command in expression position: basename/dirname
         // inside $(...) — e.g. `dirname "$(pwd)"`.
         IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
             // Recursively lower nested expressions in args first
-            for a in args.iter_mut() { lower_expr(a); }
+            for a in args.iter_mut() { lower_expr(a, arrays); }
             // Then check if this is a reducible single command (basename/dirname)
             if let [IrExpr::Str(cmd, _), IrExpr::Array(cmd_args)] = args.as_slice() {
                 if (cmd == "basename" || cmd == "dirname") && !cmd_args.is_empty() {
@@ -222,7 +226,7 @@ fn lower_expr(expr: &mut IrExpr) {
                 }
             }
         }
-        IrExpr::Call { args, .. } => { for a in args.iter_mut() { lower_expr(a); } }
+        IrExpr::Call { args, .. } => { for a in args.iter_mut() { lower_expr(a, arrays); } }
         _ => {}
     }
 }
@@ -735,7 +739,7 @@ mod tests {
     #[test]
     fn param_case_upper() {
         let args = vec![st("^^"), st("var")];
-        let r = try_lower_param_op(&args).expect("^^ lowers");
+        let r = try_lower_param_op(&args, &std::collections::HashSet::new()).expect("^^ lowers");
         let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
         let n = n.as_any().downcast_ref::<CaseTransform>().unwrap();
         assert!(n.upper, "^^ should be upper");
@@ -744,7 +748,7 @@ mod tests {
     #[test]
     fn param_case_lower() {
         let args = vec![st(",,"), st("var")];
-        let r = try_lower_param_op(&args).expect(",, lowers");
+        let r = try_lower_param_op(&args, &std::collections::HashSet::new()).expect(",, lowers");
         let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
         let n = n.as_any().downcast_ref::<CaseTransform>().unwrap();
         assert!(!n.upper, ",, should be lower");
@@ -886,18 +890,31 @@ fn arg_to_expr(arg: &IrExpr) -> Option<IrExpr> {
 ///   ${var^^} → Case(var, upper), ${var,,} → Case(var, lower)
 ///   ${var^} / ${var,} → CaseFirst (first char only)
 ///   ${var:2:3} → SubStr(var, 2, 3)
-fn try_lower_param_op(args: &[IrExpr]) -> Option<IrExpr> {
+fn try_lower_param_op(args: &[IrExpr], arrays: &std::collections::HashSet<String>) -> Option<IrExpr> {
     if args.len() < 2 { return None; }
     let op = match &args[0] { IrExpr::Str(s, _) => s.as_str(), _ => return None };
     let var = param_var_read(&args[1])?;
     match op {
         ",," => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: false }))),
         "^^" => Some(IrExpr::Ext(Box::new(CaseTransform { text: var, upper: true }))),
-        // "slice" is NOT reduced: ${s:N:M} (scalar) and ${arr[@]:N:M} (array)
-        // produce IDENTICAL param("slice", name, off, len) — they can't be
-        // told apart from the args, and reducing an array slice to a string
-        // SubStrExtract is WRONG. The runtime handles both correctly, so
-        // leave param("slice") untouched.
+        "slice" if args.len() >= 4 => {
+            // ${v:N:M} on a SCALAR is SubStr; on an ARRAY it's an index
+            // subset. The two produce identical param calls, so consult the
+            // array-variable census: only reduce when v was never declared/
+            // written as an array anywhere in the program.
+            let raw_name = match &args[1] { IrExpr::Str(s, _) => s.as_str(), _ => return None };
+            // "p", "p[@]", "p[*]", "p[i]" all refer to array p — compare on
+            // the BASE name against the census.
+            let base = raw_name.split('[').next().unwrap_or(raw_name);
+            if arrays.contains(base) { return None; }
+            let off = match &args[2] { IrExpr::Str(s, _) => s.parse::<i64>().ok()?, _ => return None };
+            let len = match &args[3] { IrExpr::Str(s, _) => s.parse::<i64>().ok()?, _ => return None };
+            Some(IrExpr::Ext(Box::new(SubStrExtract {
+                text: var,
+                offset: IrExpr::Int(off),
+                length: Some(Box::new(IrExpr::Int(len))),
+            })))
+        }
         _ => None,
     }
 }
@@ -954,5 +971,81 @@ fn append_trailing_newline(text: IrExpr) -> IrExpr {
     match text {
         IrExpr::Str(s, style) => IrExpr::Str(format!("{}\n", s), style),
         _ => IrExpr::Interpolate(vec![InterpPart::Expr(Box::new(text)), InterpPart::Lit("\n".to_string())]),
+    }
+}
+
+// ── Array-variable census (for safe scalar-slice reduction) ─────────
+
+/// Collect variables that are ARRAYS anywhere in the program: declared via
+/// DeclareArray / setArray / setArrayAppend, written with an index
+/// (`a[i]=…`), or filled by readarray/mapfile. `${v:N:M}` on such a var is
+/// an ARRAY slice (index subset), which must NOT reduce to SubStrExtract.
+fn collect_array_names(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::DeclareArray { var, .. } => { out.insert(var.clone()); }
+            IrStmt::Assign { targets, expr, .. } => {
+                // Array markers: indexed target (`a[i]=…`), array-literal
+                // RHS (`p=(1 2 3)`), or a setArray/setArrayAppend call as the
+                // assigned value — any of these make the var an ARRAY.
+                let arr_rhs = match expr {
+                    IrExpr::Array(..) => true,
+                    IrExpr::Call { func, .. } => matches!(func.as_str(), "setArray" | "setArrayAppend"),
+                    _ => false,
+                };
+                for t in targets {
+                    if !t.indices.is_empty() || arr_rhs {
+                        out.insert(t.var.clone());
+                    }
+                }
+            }
+            IrStmt::Expr(IrExpr::Call { func, args }) => {
+                if matches!(func.as_str(), "setArray" | "setArrayAppend"
+                    | "readarray" | "mapfile") {
+                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                        out.insert(n.trim_start_matches('-').to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        // recurse into nested bodies
+        let mut sub: Vec<&Vec<IrStmt>> = Vec::new();
+        match s {
+            IrStmt::If { then, elsifs, else_, .. } => {
+                sub.push(then);
+                for (_, b) in elsifs.iter() { sub.push(b); }
+                sub.push(else_);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. } | IrStmt::Function { body, .. }
+            | IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body)
+            | IrStmt::Try { body, .. } => sub.push(body),
+            IrStmt::Redirect { inner, .. } => sub.push(inner),
+            IrStmt::ForInit { init, body, .. } => { sub.push(init); sub.push(body); }
+            IrStmt::Case { clauses, .. } => {
+                for cl in clauses.iter() { sub.push(&cl.body); }
+            }
+            _ => {}
+        }
+        for b in sub { collect_array_names(b, out); }
+    }
+}
+
+
+#[cfg(test)]
+mod census_tests {
+    use super::*;
+    fn st(s: &str) -> IrExpr { IrExpr::Str(s.to_string(), StrStyle::DoubleQuoted) }
+    #[test]
+    fn collector_finds_setarray() {
+        // p=(1 2 3) lowers to exec/builtin("setArray", ["p", [...]])
+        let stmt = IrStmt::Expr(IrExpr::Call {
+            func: "setArray".to_string(),
+            args: vec![st("p"), IrExpr::Array(vec![st("1"), st("2")])],
+        });
+        let mut out = std::collections::HashSet::new();
+        collect_array_names(&[stmt], &mut out);
+        assert!(out.contains("p"), "collector found: {:?}", out);
     }
 }
