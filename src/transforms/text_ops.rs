@@ -96,6 +96,14 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
             // Recurse into args first (to reach nested $(...) / param calls)
             for a in args.iter_mut() { lower_expr(a, arrays); }
             if let [IrExpr::Str(cmd, _), IrExpr::Array(cmd_args)] = args.as_slice() {
+                if emit && cmd == "printf" {
+                    if let Some(val) = try_lower_printf_repeat(cmd_args) {
+                        // printf emits NO trailing newline.
+                        *stmt = IrStmt::Output { value: val, newline: false, target: None };
+                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
                 if emit && (cmd == "basename" || cmd == "dirname") && !cmd_args.is_empty() {
                     let which = if cmd == "dirname" { "dirname" } else { "basename" };
                     if let Some(text) = arg_to_expr(&cmd_args[0]) {
@@ -1048,4 +1056,52 @@ mod census_tests {
         collect_array_names(&[stmt], &mut out);
         assert!(out.contains("p"), "collector found: {:?}", out);
     }
+}
+
+/// `printf 'X%.0s' ARGS...` → RepeatStr("X", N) — the classic repeat idiom.
+/// The format must be exactly `<unit>%.0s` with no other conversions; N is
+/// the static arg count, where a brace(...) expansion contributes its range
+/// size (`{1..200}` → 200). Anything non-static → no reduction.
+fn try_lower_printf_repeat(args: &[IrExpr]) -> Option<IrExpr> {
+    let fmt = match args.first()? {
+        IrExpr::Str(s, _) => s.as_str(),
+        IrExpr::Interpolate(parts) if parts.len() == 1 => match &parts[0] {
+            InterpPart::Lit(s) => s.as_str(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let suffix = "%.0s";
+    if !fmt.ends_with(suffix) { return None; }
+    let unit = &fmt[..fmt.len() - suffix.len()];
+    if unit.contains('%') { return None; } // other conversions — bail
+
+    let mut total: i64 = 0;
+    for a in &args[1..] {
+        match a {
+            IrExpr::Str(..) => total += 1,
+            IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => total += 1,
+            IrExpr::Call { func, args: ba } if func == "brace" => {
+                // brace(prefix, Json(groups), Json(middles?), suffix)
+                let groups = ba.get(1)?;
+                let gv = match groups { IrExpr::Json(v) => v, _ => return None };
+                let outer = gv.as_array()?;
+                if outer.len() != 1 { return None; }
+                let group = outer[0].as_array()?;
+                if group.len() != 1 { return None; }
+                let spec = group[0].get("range")?.as_array()?;
+                if spec.len() < 2 { return None; }
+                let s: i64 = spec[0].as_str()?.parse().ok()?;
+                let e: i64 = spec[1].as_str()?.parse().ok()?;
+                if !spec.get(2)?.is_null() { return None; } // step unsupported
+                if e >= s { total += e - s + 1; }
+            }
+            _ => return None,
+        }
+    }
+    if total < 1 { return None; }
+    Some(IrExpr::Ext(Box::new(RepeatStr {
+        text: IrExpr::Str(unit.to_string(), StrStyle::DoubleQuoted),
+        count: IrExpr::Int(total),
+    })))
 }

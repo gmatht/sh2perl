@@ -140,6 +140,7 @@ bash** at statement level:
 | `head`/`tail -n` | TakeLines | ✅ |
 | `xargs` | StringTrim | ✅ |
 | `yes X | head -n K` | RepeatStr("X\\n", K) | ✅ |
+| `printf 'X%.0s' ARGS…` | RepeatStr("X", static-count incl. brace ranges) | ✅ |
 
 **Scope boundary:** reductions fire at **statement level only** (`emit=true`).
 Inside a `$(...)` capture the body must remain the original COMMAND (to
