@@ -1,0 +1,18 @@
+# shir_nodes/spread.node — Spread: expand a list into individual
+# arguments/elements (`f(args...)` variadic spread, JS `...arr`,
+# Zig/Java varargs pass-through).
+#
+# GENERIC. VALID ONLY where the host surface allows a spread: direct
+# call arguments and collection-literal elements (ESTree restricts
+# SpreadElement the same way). A frontend emitting it elsewhere gets a
+# generator error — Refuse > guess at the emit layer.
+#
+# Relation to the existing Python-flavored `Splice` node: same runtime
+# effect; Splice predates this node (Python slice-splice idiom) and
+# stays for its transform consumers. New frontends should prefer this
+# neutral name.
+
+node Spread
+tag "Spread"
+kind expr
+field expr: expr

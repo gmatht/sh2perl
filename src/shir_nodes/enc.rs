@@ -64,6 +64,10 @@ pub fn json_to_expr(v: &Value) -> Result<IrExpr, String> {
             v["name"].as_str().ok_or("Var.name")?.to_string(),
             None,
         )),
+        // A1 contract flavor (frontend ingress): child expressions inside
+        // an Ext node arrive in the standard A1 shape ("type" discriminator),
+        // so delegate to the full A1 expr parser instead of failing.
+        _ if v.get("type").is_some() => crate::shir_json_in::expr_from_a1(v, "ext-child"),
         _ => Err(format!("unknown expr encoding: {v}")),
     }
 }

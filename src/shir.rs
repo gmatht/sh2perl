@@ -31501,7 +31501,15 @@ fn expr_known_nospace(e: &IrExpr) -> bool {
     }
 }
 
+/// Public wrapper for the drop-in handler modules (render_ext_estree/*):
+/// they lower child IrExprs through the SAME ESTree renderer the core
+/// uses, so native node handlers compose with every core expression form.
+pub(crate) fn expr_to_estree_pub(e: &IrExpr) -> Expr {
+    expr_to_estree(e)
+}
+
 fn expr_to_estree(e: &IrExpr) -> Expr {
+
     match e {
         IrExpr::Int(i) => Expr::Literal {
             value: serde_json::Value::from(*i),
@@ -31545,6 +31553,12 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             argument: Box::new(expr_to_estree(e)),
         },
         IrExpr::Ext(n) => {
+            // Drop-in ESTree handler registry first (build.rs-scanned
+            // src/render_ext_estree/handlers/ — new nodes render natively
+            // with zero core edits), then the hand-written table.
+            if let Some(native) = crate::render_ext_estree::render(n.as_ref()) {
+                return native;
+            }
             // Native ESTree rendering (real JS: .split/.includes/.length/...).
             if let Some(native) = ext_to_native_estree(n.as_ref()) {
                 return native;
