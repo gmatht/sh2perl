@@ -143,7 +143,18 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
             lower_expr(discriminant, arrays);
             for c in clauses.iter_mut() { for s in c.body.iter_mut() { lower_stmt(s, emit, arrays); } }
         }
-        IrStmt::Assign { expr, .. } => lower_expr(expr, arrays),
+        IrStmt::Assign { .. } if emit => {
+            // CAPTURE-INTERNAL REDUCTION: x=$(echo X | cut …) — reduce the
+            // ASSIGN'S EXPRESSION to the composed primitive value (docs
+            // shir-primitives.md §"Capture-internal reduction"), preserving
+            // $? via SetChildError(0) for the provably-successful allowlist.
+            if let Some(repl) = try_reduce_capture_assign(&*stmt, arrays) {
+                *stmt = repl;
+                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if let IrStmt::Assign { expr, .. } = stmt { lower_expr(expr, arrays); }
+        }
         IrStmt::Declare { init, .. } => { if let Some(e) = init { lower_expr(e, arrays); } }
         IrStmt::WriteFile { path, content, .. } => {
             lower_expr(path, arrays); lower_expr(content, arrays);
@@ -340,7 +351,7 @@ fn lower_text_cmd(text: IrExpr, cmd_name: &str, cmd_args: &[IrExpr]) -> Option<I
         "wc" => try_lower_wc(text, cmd_args),
         "sed" => try_lower_sed(text, cmd_args),
         "grep" => try_lower_grep(text, cmd_args),
-        "xargs" => try_lower_xargs(text),
+        "xargs" => try_lower_xargs(text, cmd_args),
         _ => None,
     }
 }
@@ -368,6 +379,12 @@ fn extract_text_from_stage(stmts: &[IrStmt]) -> Option<IrExpr> {
                         }
                     }).collect();
                     if let Some(strs) = all_strs {
+                        // Backslash escapes (printf '\n', echo -e) are NOT
+                        // interpreted by this literal extraction — bail so
+                        // such sources keep the original (correct) command.
+                        if strs.iter().any(|s| s.contains('\\')) {
+                            return None;
+                        }
                         // The echo ARGS joined (echo's trailing newline is
                         // added by the statement Output wrapper, and by the
                         // wc -l newline-count case below).
@@ -676,7 +693,10 @@ fn try_lower_sed(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
 
 // ── xargs (trim) ─────────────────────────────────────────────────────
 
-fn try_lower_xargs(text: IrExpr) -> Option<IrExpr> {
+fn try_lower_xargs(text: IrExpr, cmd_args: &[IrExpr]) -> Option<IrExpr> {
+    // ONLY bare `| xargs` trims. `xargs -n1 echo "Number:"` EXECUTES a
+    // command per word — reducing that to Trim is wrong.
+    if !cmd_args.is_empty() { return None; }
     Some(IrExpr::Ext(Box::new(StringTrim {
         text: text,
         leading: true,
@@ -1104,4 +1124,66 @@ fn try_lower_printf_repeat(args: &[IrExpr]) -> Option<IrExpr> {
         text: IrExpr::Str(unit.to_string(), StrStyle::DoubleQuoted),
         count: IrExpr::Int(total),
     })))
+}
+
+/// Reduce `x=$(echo X | <reducible>)`: the Assign's Capture-wrapped pipeline
+/// becomes the composed Ext VALUE. Allowlist only (cut/tr/head/tail/wc/xargs/
+/// simple sed) — these exit 0 on static input, so `SetChildError(0)` preserves
+/// $?. grep is excluded (status idiom). Counts append the echo trailing \n.
+fn try_reduce_capture_assign(stmt: &IrStmt, arrays: &std::collections::HashSet<String>) -> Option<IrStmt> {
+    // Peek (immutable), build replacement from cloned pieces.
+    let (targets, asm, stages) = match stmt {
+        IrStmt::Assign { targets, asm, expr, .. } => {
+            let inner = match expr {
+                IrExpr::Capture { expr: ci, native: false } => ci.as_ref(),
+                _ => return None,
+            };
+            let stages = match inner {
+                IrExpr::Arrow(body) => match body.as_slice() {
+                    [IrStmt::Expr(pe)] => match pe {
+                        IrExpr::Call { func, args } if func == "pipeline" => {
+                            match args.as_slice() {
+                                [IrExpr::Array(st)] if st.len() == 2 => st.as_slice(),
+                                _ => return None,
+                            }
+                        }
+                        _ => return None,
+                    },
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            (targets.clone(), asm.clone(), stages.to_vec())
+        }
+        _ => return None,
+    };
+
+    let stage_bodies: Vec<&[IrStmt]> = stages.iter().map(|s| match s {
+        IrExpr::Arrow(b) => b.as_slice(), _ => unreachable!("checked above"),
+    }).collect();
+    if stage_bodies.len() != 2 { return None; }
+
+    // Source must be a clean literal echo/printf (no flags/backslash escapes).
+    let text = extract_text_from_stage(stage_bodies[0])?;
+
+    // Last stage must be in the status-0 allowlist.
+    let (cmd_name, cmd_args) = match stage_bodies[1] {
+        [IrStmt::Expr(IrExpr::Call { func, args })] if func == "exec" || func == "builtin" => {
+            match args.as_slice() {
+                [IrExpr::Str(n, _), IrExpr::Array(a)] => (n.as_str(), a.as_slice()),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    const STATUS0: [&str; 7] = ["cut", "tr", "head", "tail", "wc", "xargs", "sed"];
+    if !STATUS0.contains(&cmd_name) { return None; }
+
+    let value = lower_text_cmd(text, cmd_name, cmd_args)?;
+
+    // Preserve $?: the allowlisted pipeline exits 0.
+    Some(IrStmt::Block(vec![
+        IrStmt::Assign { targets, expr: value, asm },
+        IrStmt::SetChildError(IrExpr::Int(0)),
+    ]))
 }
