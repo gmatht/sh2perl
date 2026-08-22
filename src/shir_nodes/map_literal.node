@@ -1,0 +1,18 @@
+# shir_nodes/map_literal.node — MapLiteral: a whole dict VALUE in
+# expression position (`map[K]V{...}` composite literal, JS object
+# literal, Zig/Java map constructors).
+#
+# GENERIC. keys[i] / values[i] are parallel lists (equal length);
+# non-string keys stringify exactly like the host object model does.
+# A named map built statement-by-statement (assocSet on a variable)
+# stays the existing A1 shape — THIS node is only for the anonymous
+# expression-position form that previously had no drop-in shape.
+#
+# Requires build.rs DSL field type `exprs` (Vec<IrExpr>) added for
+# list-bearing nodes.
+
+node MapLiteral
+tag "MapLiteral"
+kind expr
+field keys: exprs
+field values: exprs

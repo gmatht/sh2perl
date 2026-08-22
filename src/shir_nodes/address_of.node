@@ -1,0 +1,16 @@
+# shir_nodes/address_of.node — AddressOf: reference-taking (`&x`).
+#
+# GENERIC (Go &x, Zig &x, C-like frontends). The IR passes VALUES; what
+# "taking an address" means is backend-defined:
+#   - backends with real references render a genuine reference
+#     (Perl: \(...) / \(...) — aliasing preserved);
+#   - value-only backends (JS/ESTree) use SNAPSHOT semantics: the
+#     current value passes through. Writes through such a reference are
+#     NOT representable there — a frontend must refuse them at its own
+#     gate (Refuse > guess), not mis-lower.
+# Deref is the matching read side; keep the pair's contract in sync.
+
+node AddressOf
+tag "AddressOf"
+kind expr
+field operand: expr

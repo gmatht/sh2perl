@@ -859,10 +859,22 @@ fn redirect_from(v: &Value, where_: &str) -> Result<IrRedirect, String> {
 
 // ── Expressions ──────────────────────────────────────────────────────
 
+/// A1 expr parsing entry for the shir_nodes encoder (enc.rs delegates
+/// here for `"type"`-discriminated child expressions inside Ext nodes).
+pub(crate) fn expr_from_a1(v: &Value, where_: &str) -> Result<IrExpr, String> {
+    expr_from(v, where_)
+}
+
 fn expr_from(v: &Value, where_: &str) -> Result<IrExpr, String> {
     let o = require_obj(v, where_)?;
     let t = req_str(o, "type", where_)?;
     if !KNOWN_EXPR.contains(&t) {
+        // a transform-declared expr node (shir_nodes): the generated union
+        // is the parser for its own tag, so an Ext expr node round-trips
+        // through the A1 (mirrors the stmt_from Ext fallback above).
+        if let Some(ctor) = crate::shir_nodes::expr_node_ctor(&t) {
+            return Ok(IrExpr::Ext(ctor(v)?));
+        }
         return Err(format!("{where_}.type: unknown expr type {t:?}"));
     }
     Ok(match t {
