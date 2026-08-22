@@ -8221,6 +8221,7 @@ fn is_safe_grep_literal(pat: &str) -> bool {
 fn command_to_ir(cmd: &Command) -> IrExpr {
     match cmd {
         Command::TestExpression(t) => {
+            eprintln!("DBG command_to_ir TestExpression expr={:?}", t.expression);
             if t.modifiers.double {
                 call("test", vec![st(&t.expression), st("[[")])
             } else {
@@ -16602,6 +16603,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     IrExpr::Call { func, args } if func == "line" => {
                         expr_to_estree(expr)
                     }
+                    // `n = n + 1` — lifted numeric self-add (ForEachLine
+                    // streaming counter): native binding arithmetic.
+                    IrExpr::BinOp { lhs, op: BinOpKind::Add, rhs } => Expr::BinaryExpression {
+                        operator: "+".to_string(),
+                        left: Box::new(expr_to_estree(lhs)),
+                        right: Box::new(expr_to_estree(rhs)),
+                    },
                     _ => unreachable!("lifted var assigned an unanalysed source"),
                 };
                 return Some(Stmt::ExpressionStatement {
@@ -18784,10 +18792,47 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             unreachable!("RawText (Perl-only) reached the ESTree renderer")
         }
         IrStmt::Ext(node) => {
-            // Extensible node: dispatch to the ESTree handler (if any).
-            // Currently unsupported — refuse loudly.
-            unreachable!("Ext node ({}) reached the ESTree renderer without a handler",
-                node.tag())
+            // Statement-level Ext nodes with ESTree renderings. ForEachLine
+            // lowers to the runtime's STREAMING line iterator:
+            //   sh2.eachLine(<source>, (<var>) => { <body> })
+            // (readline over createReadStream inside the runtime — O(1)
+            // memory, never a whole-file read).
+            return match node.tag() {
+                "ForEachLine" => {
+                    let fl = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>()
+                        .expect("tag/type agree");
+                    let var = crate::estree::ident(&fl.var);
+                    // Bind the JS param into the runtime store: composed
+                    // bodies read the line via getVar (the param('',name)
+                    // read form), so the value must BE in the store.
+                    let bind = Stmt::ExpressionStatement {
+                        expression: crate::estree::sh2_call("setVar", vec![
+                            crate::estree::str_lit(&fl.var), var.clone(),
+                        ]),
+                    };
+                    let mut body_stmts: Vec<Stmt> = vec![bind];
+                    body_stmts.extend(fl.body.iter().filter_map(stmt_to_estree));
+                    let cb = Expr::ArrowFunctionExpression {
+                        params: vec![var],
+                        body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
+                            body: body_stmts,
+                        })),
+                        expression: false,
+                        r#async: false,
+                    };
+                    // AWAITED: bash pipelines are synchronous; without the
+                    // await, later statements (e.g. printing the counter)
+                    // run before any line arrives.
+                    Some(Stmt::ExpressionStatement {
+                        expression: Expr::AwaitExpression {
+                            argument: Box::new(crate::estree::sh2_call("eachLine",
+                                vec![expr_to_estree(&fl.source), cb])),
+                        },
+                    })
+                }
+                other => unreachable!(
+                    "Ext statement node ({other}) reached the ESTree renderer without a handler"),
+            };
         }
 
         other => unreachable!("Perl-only IR statement reached the ESTree renderer: {other:?}"),

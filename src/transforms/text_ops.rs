@@ -51,6 +51,17 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
             if let [IrExpr::Array(stages)] = args.as_slice() {
                 if stages.len() == 2 {
+                    // `grep P F | wc -l` → STREAMING filtered line count.
+                    // Statement-level Block replacement (counter loop).
+                    if emit {
+                        if let [IrExpr::Arrow(b1), IrExpr::Arrow(b2)] = stages.as_slice() {
+                            if let Some(repl) = try_lower_grep_wc(b1, b2) {
+                                *stmt = repl;
+                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }
                     if emit {
                         if let Some((replacement, already_nl)) = try_lower_pipeline(stages) {
                             // A statement-level pipeline PRINTS its result.
@@ -86,6 +97,27 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                     }
                 }
             }
+            // `wc -l < F` → STREAMING count: O(1) memory line loop, never
+            // a whole-file read (docs shir-primitives.md §ForEachLine).
+            if emit {
+                let is_wc_l = matches!(inner.as_slice(),
+                    [IrStmt::Expr(IrExpr::Call { func, args })]
+                        if (func == "exec" || func == "builtin")
+                            && matches!(args.as_slice(),
+                                [IrExpr::Str(n, _), IrExpr::Array(a)]
+                                    if n == "wc" && a.len() == 1
+                                        && matches!(&a[0], IrExpr::Str(f, _) if f == "-l")));
+                let path = redirects.iter().find_map(|r| {
+                    if r.fd == Some(0) && r.mode == "r" { Some(r.target.clone()) } else { None }
+                });
+                if is_wc_l {
+                    if let Some(path) = path {
+                        *stmt = streaming_line_count(path, None);
+                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
             // Recurse into the inner body
             for s in inner.iter_mut() {
                 lower_stmt(s, emit, arrays);
@@ -96,6 +128,44 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
             // Recurse into args first (to reach nested $(...) / param calls)
             for a in args.iter_mut() { lower_expr(a, arrays); }
             if let [IrExpr::Str(cmd, _), IrExpr::Array(cmd_args)] = args.as_slice() {
+                // `cut -dD -fN F` (single FILE source) → STREAMING per-line
+                // FieldExtract — never slurped.
+                if emit && cmd == "cut" {
+                    // Pairwise parse: -d/-f/-o consume the NEXT arg when
+                    // detached (`-d :`). Everything else non-flag is a file.
+                    let mut flags: Vec<IrExpr> = Vec::new();
+                    let mut files: Vec<IrExpr> = Vec::new();
+                    let mut i = 0;
+                    while i < cmd_args.len() {
+                        match &cmd_args[i] {
+                            IrExpr::Str(s, _) if matches!(s.as_str(), "-d" | "-f" | "-o" | "--output-delimiter") => {
+                                flags.push(cmd_args[i].clone());
+                                i += 1;
+                                if i < cmd_args.len() { flags.push(cmd_args[i].clone()); }
+                            }
+                            IrExpr::Str(s, _) if s.starts_with('-') => flags.push(cmd_args[i].clone()),
+                            other => files.push(other.clone()),
+                        }
+                        i += 1;
+                    }
+                    if files.len() == 1 {
+                        if let Some(field_val) =
+                            try_lower_cut(loop_var_read("__l"), &flags)
+                        {
+                            *stmt = IrStmt::Ext(Box::new(ForEachLine {
+                                source: files.remove(0),
+                                var: "__l".to_string(),
+                                body: vec![IrStmt::Output {
+                                    value: field_val,
+                                    newline: true,
+                                    target: None,
+                                }],
+                            }));
+                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
                 if emit && cmd == "printf" {
                     if let Some(val) = try_lower_printf_repeat(cmd_args) {
                         // printf emits NO trailing newline.
@@ -1186,4 +1256,94 @@ fn try_reduce_capture_assign(stmt: &IrStmt, arrays: &std::collections::HashSet<S
         IrStmt::Assign { targets, expr: value, asm },
         IrStmt::SetChildError(IrExpr::Int(0)),
     ]))
+}
+
+/// Read the ForEachLine loop variable inside composed Ext children.
+/// MUST be the param('',name) form: bare Var renders empty in that
+/// position (same lesson as the ${v^^} capture fix).
+fn loop_var_read(lv: &str) -> IrExpr {
+    IrExpr::Call {
+        func: "param".to_string(),
+        args: vec![
+            IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+            IrExpr::Str(lv.to_string(), StrStyle::DoubleQuoted),
+        ],
+    }
+}
+
+/// Build a STREAMING line counter: `n=0; ForEachLine(src, guard? n+=1)` —
+/// value = n. guard=None counts every line (`wc -l < F`); Some(pattern)
+/// counts lines containing it (`grep P F | wc -l`). O(1) memory.
+fn streaming_line_count(source: IrExpr, guard: Option<IrExpr>) -> IrStmt {
+    let k = LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let cnt = format!("__lc{}", k);
+    let lv = format!("__l{}", k);
+    let mut body: Vec<IrStmt> = Vec::new();
+    let incr = IrStmt::Assign {
+        targets: vec![AssignTarget { var: cnt.clone(), sigil: None, indices: vec![] }],
+        expr: IrExpr::BinOp {
+            lhs: Box::new(IrExpr::Var(cnt.clone(), None)),
+            op: BinOpKind::Add,
+            rhs: Box::new(IrExpr::Int(1)),
+        },
+        asm: None,
+    };
+    match guard {
+        Some(pat) => {
+            let cond = IrExpr::Ext(Box::new(StringContains {
+                text: loop_var_read(&lv),
+                pattern: pat,
+            }));
+            body.push(IrStmt::If { cond, then: vec![incr], elsifs: vec![], else_: vec![] });
+        }
+        None => body.push(incr),
+    }
+    IrStmt::Block(vec![
+        IrStmt::Assign {
+            targets: vec![AssignTarget { var: cnt.clone(), sigil: None, indices: vec![] }],
+            expr: IrExpr::Int(0),
+            asm: None,
+        },
+        IrStmt::Ext(Box::new(ForEachLine { source, var: lv, body })),
+        IrStmt::Output {
+            value: IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![IrExpr::Str(cnt, StrStyle::DoubleQuoted)],
+            },
+            newline: true,
+            target: None,
+        },
+    ])
+}
+
+/// `grep P F | wc -l` → streaming filtered count. Static args only:
+/// grep takes exactly [P, F] (no flags), both literals, F a path.
+fn try_lower_grep_wc(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
+    // wc must be exactly -l
+    let wc_args_ok = matches!(stage2,
+        [IrStmt::Expr(IrExpr::Call { func, args })]
+            if (func == "exec" || func == "builtin")
+                && matches!(args.as_slice(),
+                    [IrExpr::Str(n, _), IrExpr::Array(wa)] if n == "wc" && wa.len() == 1
+                        && matches!(&wa[0], IrExpr::Str(f, _) if f.as_str() == "-l")));
+    if !wc_args_ok { return None; }
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stage1 else { return None };
+    if !(func == "exec" || func == "builtin") { return None; }
+    let [IrExpr::Str(n, _), IrExpr::Array(a)] = args.as_slice() else { return None };
+    if n != "grep" || a.len() != 2 { return None; }
+    // no flags: both args literal strings, second is a path
+    let mut strs: Vec<&str> = Vec::new();
+    for x in a.iter() {
+        match x {
+            IrExpr::Str(s, _) => strs.push(s.as_str()),
+            IrExpr::Interpolate(p) if p.len() == 1 => {
+                match &p[0] { InterpPart::Lit(s) => strs.push(s.as_str()), _ => return None }
+            }
+            _ => return None,
+        }
+    }
+    if strs.len() != 2 || strs[1].starts_with('-') { return None; }
+    let pat = IrExpr::Str(strs[0].to_string(), StrStyle::DoubleQuoted);
+    let path = IrExpr::Str(strs[1].to_string(), StrStyle::DoubleQuoted);
+    Some(streaming_line_count(path, Some(pat)))
 }
