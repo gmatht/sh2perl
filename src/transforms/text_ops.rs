@@ -51,6 +51,16 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
             if let [IrExpr::Array(stages)] = args.as_slice() {
                 if stages.len() == 2 {
+                    // `cat F | <reducible>` — cat contributes a FILE source;
+                    // rewrite stage1 body to the file-arg command shape so
+                    // the file-source reductions below apply uniformly.
+                    if let [IrExpr::Arrow(b1), IrExpr::Arrow(b2)] = stages.as_slice() {
+                        if let Some(repl) = try_lower_cat_pipe(b1, b2) {
+                            *stmt = repl;
+                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
                     // `grep P F | wc -l` → STREAMING filtered line count.
                     // Statement-level Block replacement (counter loop).
                     if emit {
@@ -1459,4 +1469,54 @@ fn try_lower_grep_cut(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
             else_: vec![],
         }],
     })))
+}
+
+/// `cat F | wc -l` / `cat F | cut flags` → ForEachLine forms. cat's file
+/// becomes the ForEachLine source; stage2 must be flag-only static.
+fn try_lower_cat_pipe(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = stage1 else { return None };
+    if !(f1 == "exec" || f1 == "builtin") { return None; }
+    let [IrExpr::Str(n1, _), IrExpr::Array(a1a)] = a1.as_slice() else { return None };
+    if n1 != "cat" || a1a.len() != 1 { return None; }
+    let path = match &a1a[0] {
+        IrExpr::Str(s, _) if !s.starts_with('-') =>
+            IrExpr::Str(s.clone(), StrStyle::DoubleQuoted),
+        _ => return None,
+    };
+
+    // stage2: wc -l → counter
+    if let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = stage2 {
+        if f2 == "exec" || f2 == "builtin" {
+            if let [IrExpr::Str(n2, _), IrExpr::Array(wa)] = a2.as_slice() {
+                if n2 == "wc" && wa.len() == 1
+                    && matches!(&wa[0], IrExpr::Str(f, _) if f.as_str() == "-l") {
+                    return Some(streaming_line_count(path, None));
+                }
+            }
+        }
+    }
+
+    // stage2: cut flags → per-line FieldExtract output
+    if let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = stage2 {
+        if f2 == "exec" || f2 == "builtin" {
+            if let [IrExpr::Str(n2, _), IrExpr::Array(ca)] = a2.as_slice() {
+                if n2 == "cut" {
+                    let flags: Vec<IrExpr> = ca.iter().filter(|x| matches!(x,
+                        IrExpr::Str(s, _) if s.starts_with('-'))).cloned().collect();
+                    if flags.len() == ca.len() {
+                        if let Some(field) = try_lower_cut(loop_var_read("__l"), &flags) {
+                            return Some(IrStmt::Ext(Box::new(ForEachLine {
+                                source: path,
+                                var: "__l".to_string(),
+                                body: vec![IrStmt::Output {
+                                    value: field, newline: true, target: None,
+                                }],
+                            })));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
