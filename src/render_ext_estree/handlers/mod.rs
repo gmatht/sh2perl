@@ -4,6 +4,7 @@
     pub(crate) mod spread;
     pub(crate) mod type_assert;
     pub(crate) mod map_literal;
+    pub(crate) mod clone_deep;
     pub(crate) mod element_read;
     pub(crate) mod field_read;
 
