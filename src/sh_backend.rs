@@ -2103,6 +2103,13 @@ fn cmd_to_sh(e: &IrExpr) -> Result<String, String> {
         // increment statements): the arithmetic command, whose exit
         // status is the value != 0 (bash `(( ))` semantics)
         IrExpr::Arith(a) => Ok(format!("(( {} ))", arith_to_sh(a))),
+        // a bare variable in command position: the goto restructure's
+        // flag guards (`if (flag) break`) — truthiness of the store
+        // value ([ -n ]), matching the runtime's nonempty-true semantics
+        IrExpr::Var(name, _) => {
+            let v = var_ref_to_sh(name, false);
+            Ok(format!("[ -n \"{v}\" ]"))
+        }
         other => Err(format!("command expression not renderable: {other:?}")),
     }
 }
@@ -3379,6 +3386,19 @@ fn word_to_sh(e: &IrExpr) -> Result<String, String> {
             arrow_to_sh(std::slice::from_ref(expr.as_ref()))?
         )),
         IrExpr::Json(v) => Ok(json_str(v)),
+        IrExpr::Ternary { cond, then, else_ } => {
+            // POSIX has no inline conditional: command-substitute an
+            // if/else. The cond is a test/arith call (the ternary_desugar
+            // shape) — cmd_to_sh renders it as a command; each branch is
+            // echoed verbatim. The substitution strips trailing newlines,
+            // so printf '%s\n' is safe.
+            let c = cmd_to_sh(cond)?;
+            let t = word_to_sh(then)?;
+            let e = word_to_sh(else_)?;
+            Ok(format!(
+                "\"$( {{ {c} && printf '%s\\n' {t}; }} || printf '%s\\n' {e} )\""
+            ))
+        }
         other => Err(format!("word not renderable: {other:?}")),
     }
 }
@@ -3551,6 +3571,21 @@ fn call_word_to_sh(func: &str, args: &[IrExpr]) -> Result<String, String> {
             let op = raw_arg(args, 1)?;
             let value = word_to_sh(arg(args, 2)?)?;
             Ok(format!("{name}{op}{value}"))
+        }
+        "line" => {
+            // multi-return line read (`line(cap, N)` = the outparam
+            // transform's String(v).split('\n')[N]): POSIX per-line
+            // extraction via sed — a missing line yields ""
+            let v = word_to_sh(arg(args, 0)?)?;
+            let n = match arg(args, 1)? {
+                IrExpr::Str(i, _) => i.parse::<usize>().unwrap_or(0),
+                other => return Err(format!("line: index not renderable: {other:?}")),
+            };
+            // sed lines are 1-BASED; the JS split index is 0-based
+            Ok(format!(
+                "\"$(printf '%s' {v} | sed -n '{}p')\"",
+                n + 1
+            ))
         }
         other => Err(format!("word call not renderable: {other:?}")),
     }

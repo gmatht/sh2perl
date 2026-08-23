@@ -50,6 +50,7 @@ pub struct Render {
     need_sys: bool,
     /// needs the `__sh_exec` subprocess helper
     need_subprocess: bool,
+    need_capture_out: bool,
 }
 
 impl Render {
@@ -807,6 +808,40 @@ impl Render {
                         }
                     }
                 }
+                // The C frontend's outparam channel: capture(Arrow[
+                // fnCall(..)]) — the callee echoes its out-params, the
+                // caller captures STDOUT.
+                if let IrExpr::Arrow(body) = expr.as_ref() {
+                    let mut call: Option<(String, Vec<String>)> = None;
+                    for st in body.iter() {
+                        if let IrStmt::Expr(IrExpr::Call { func, args })
+                        = st {
+                            if func == "fnCall" || func == "$fn_call" {
+                                let name = args.first().and_then(|a| match a {
+                                    IrExpr::Str(n, _) => Some(n.clone()),
+                                    _ => None,
+                                });
+                                let call_args = args.get(1).and_then(|a| match a {
+                                    IrExpr::Array(elems) => Some(
+                                        elems.iter().map(|e| self.expr(e)).collect::<Vec<_>>(),
+                                    ),
+                                    _ => None,
+                                });
+                                if let (Some(name), Some(call_args)) = (name, call_args) {
+                                    call = Some((name, call_args));
+                                }
+                            }
+                        }
+                    }
+                    if let Some((name, call_args)) = call {
+                        self.need_capture_out = true;
+                        return format!(
+                            "__sh_capture_out({}, {})",
+                            self.py_ident(&name),
+                            call_args.join(", ")
+                        );
+                    }
+                }
                 self.sh2_stub("capture", &[], "capture")
             },
             IrExpr::Regex { .. } => self.sh2_stub("regex", &[], "regex"),
@@ -879,11 +914,27 @@ impl Render {
                 let r = self.arith(rhs);
                 if *op == "**" {
                     format!("pow({l},{r})")
+                } else if op == "&&" {
+                    // Python has no &&/|| — the C frontend's boolean ops
+                    // inside arith ASTs (bool ok && !no). Numeric result:
+                    // printf %d needs an int, not True/False.
+                    format!("(1 if ({l} and {r}) else 0)")
+                } else if op == "||" {
+                    format!("(1 if ({l} or {r}) else 0)")
+                } else if op == "/" {
+                    // bash `/` truncates toward zero
+                    format!("int({l} / {r})")
                 } else {
                     format!("({l} {op} {r})")
                 }
             }
-            ArithAst::Un { op, arg } => format!("({op}{})", self.arith(arg)),
+            ArithAst::Un { op, arg } => {
+                if op == "!" {
+                    format!("(1 if not {} else 0)", self.arith(arg))
+                } else {
+                    format!("({op}{})", self.arith(arg))
+                }
+            }
             ArithAst::Cond { test, then, else_ } => format!(
                 "({} if {} else {})",
                 self.arith(then),
@@ -994,6 +1045,42 @@ impl Render {
 
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            "capture" => {
+                // The C frontend's outparam channel: capture(Arrow[
+                // fnCall(..)]) — the callee echoes its out-params, the
+                // caller captures STDOUT.
+                if let Some(IrExpr::Arrow(body)) = args.first() {
+                    let mut call: Option<(String, Vec<String>)> = None;
+                    for st in body.iter() {
+                        if let IrStmt::Expr(IrExpr::Call { func: f, args: fargs }) = st {
+                            if f == "fnCall" || f == "$fn_call" {
+                                let name = fargs.first().and_then(|a| match a {
+                                    IrExpr::Str(n, _) => Some(n.clone()),
+                                    _ => None,
+                                });
+                                let call_args = fargs.get(1).and_then(|a| match a {
+                                    IrExpr::Array(elems) => Some(
+                                        elems.iter().map(|e| self.expr(e)).collect::<Vec<_>>(),
+                                    ),
+                                    _ => None,
+                                });
+                                if let (Some(name), Some(cargs)) = (name, call_args) {
+                                    call = Some((name, cargs));
+                                }
+                            }
+                        }
+                    }
+                    if let Some((name, call_args)) = call {
+                        self.need_capture_out = true;
+                        return format!(
+                            "__sh_capture_out({}, {})",
+                            self.py_ident(&name),
+                            call_args.join(", ")
+                        );
+                    }
+                }
+                self.sh2_stub("capture", args, "capture")
+            }
             // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
             // python `PAT in STR`.
             "contains" => {
@@ -1324,6 +1411,31 @@ impl Render {
                             return format!("int({})", self.py_ident(name));
                         }
                     }
+                    // a general arith STRING (`($x % 2)` — the C frontend's
+                    // testArith/ternary-cond shape): normalize $refs to
+                    // bare idents, parse, render via the Arith AST walker
+                    let norm: String = s
+                        .chars()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            if c == '$'
+                                && i + 1 < s.len()
+                                && (s[i + 1..].starts_with('{')
+                                    || s[i + 1..]
+                                        .chars()
+                                        .next()
+                                        .map_or(false, |n| n.is_ascii_alphabetic() || n == '_'))
+                            {
+                                ' '
+                            } else {
+                                c
+                            }
+                        })
+                        .collect();
+                    let norm = norm.replace('{', " ").replace('}', " ");
+                    if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
+                        return self.arith(&ast);
+                    }
                 }
                 self.sh2_stub("arith", args, "arith")
             }
@@ -1359,6 +1471,16 @@ impl Render {
             }
             // test("...") — mini evaluator for the common numeric/string
             // patterns; anything else → runtime stub.
+            "line" => {
+                // multi-return line read (`line(cap, N)` = the C frontend's
+                // outparam channel): String(v).split('\n')[N] with "" default
+                if let (Some(v), Some(IrExpr::Str(i, _))) = (args.first(), args.get(1)) {
+                    let ve = self.expr(v);
+                    let n: usize = i.parse().unwrap_or(0);
+                    return format!("(__sh_lines({})[{n}] if {} else '')", ve, ve.clone());
+                }
+                self.sh2_stub("line", args, "line")
+            }
             "test" => {
                 if let Some(IrExpr::Str(s, _)) = args.first() {
                     if let Some(c) = self.test_render(s) {
@@ -2259,6 +2381,18 @@ impl Render {
                 } else {
                     self.expr(expr)
                 };
+                // a STORE-resident target: the native binding is not the
+                // var's home — the store read (sh2_getVar) must observe
+                // the write (the C frontend's outparam channel assigns
+                // out-targets from line() captures here)
+                if !self.is_num(&t.var) && self.store_written.contains(&t.var) {
+                    self.sh2_calls.insert("setVar".into());
+                    self.emit(&format!(
+                        "sh2_setVar({}, {rhs})",
+                        Self::py_str(&t.var)
+                    ));
+                    return;
+                }
                 self.emit(&format!("{name} = {rhs}"));
             }
             IrStmt::Declare { vars, init, .. } => {
@@ -2677,6 +2811,27 @@ impl Render {
             self.emit("def __sh_exec(argv):");
             self.emit("    import subprocess");
             self.emit("    return subprocess.call(argv)");
+        }
+        if self.need_capture_out || self.sh2_calls.contains(&"line".to_string()) {
+            self.emit("def __sh_lines(v):");
+            self.emit("    return str(v).split('\\n')");
+            // the C frontend's outparam channel: the callee echoes its
+            // out-param values; the caller captures STDOUT into a buffer.
+            // Callee bodies read their POSITIONAL params via getVar("1")
+            // (the bash $1 convention → sys.argv), so the shim sets argv
+            // to the stringified call arguments for the duration.
+            self.emit("");
+            self.emit("def __sh_capture_out(__fn, *__args):");
+            self.emit("    import io");
+            self.emit("    import contextlib");
+            self.emit("    import sys as __sys");
+            self.emit("    __buf = io.StringIO()");
+            self.emit("    __old_argv = __sys.argv");
+            self.emit("    __sys.argv = [__fn.__name__] + [str(a) for a in __args]");
+            self.emit("    with contextlib.redirect_stdout(__buf):");
+            self.emit("        __fn()");
+            self.emit("    __sys.argv = __old_argv");
+            self.emit("    return __buf.getvalue()");
         }
         self.emit("");
         if !self.sh2_calls.is_empty() {

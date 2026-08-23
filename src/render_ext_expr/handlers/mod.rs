@@ -11,9 +11,11 @@
     pub(crate) mod char_translate;
     pub(crate) mod reg_count;
     pub(crate) mod string_contains;
+    pub(crate) mod clone_deep;
     pub(crate) mod take_lines;
     pub(crate) mod reg_sub;
     pub(crate) mod string_affix;
     pub(crate) mod char_extract;
+    pub(crate) mod field_read;
     pub(crate) mod split;
 
