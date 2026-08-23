@@ -170,6 +170,9 @@ pub struct Render {
     /// (`char _sN[cap]; snprintf(_sN, ...)` before the enclosing stmt)
     temp_seq: usize,
     todo: usize,
+    /// a heredoc terminator was just emitted — the next raw token must
+    /// start on a fresh line (the terminator must be alone on its line)
+    heredoc_nl: bool,
     /// untyped var names (A2 verdict missing) — the native `char*` store.
     /// getVar/param reads of these render `(name ? name : "")`; Assign
     /// targets render `name = value;` (pointer semantics).
@@ -2187,6 +2190,17 @@ impl Render {
 
     /// Append raw separator text to a command buffer (buf-parameterized).
     fn sh_raw(&mut self, buf: CmdBuf, s: &str) {
+        // a heredoc terminator must be alone on its line — any raw token
+        // that follows (`)`, `|`, `;`) starts on a fresh line
+        if self.heredoc_nl {
+            match buf {
+                CmdBuf::Shared => self.emit("_sh_add(\"\\n\");"),
+                CmdBuf::Private(id) => self.emit(&format!(
+                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"\\n\");"
+                )),
+            }
+            self.heredoc_nl = false;
+        }
         match buf {
             CmdBuf::Shared => self.emit(&format!("_sh_addraw({});", Self::cstr(s))),
             CmdBuf::Private(id) => self.emit(&format!(
@@ -2964,7 +2978,16 @@ impl Render {
                 r.emit(&format!("_sh_badd(&_c{id}_cmd, &_c{id}_cap, {v});"))
             }
         };
-        for rd in redirects {
+        // heredoc/herestring bodies are multi-line: their terminator line
+        // must be ALONE on its line, so file redirects (`> f`) render
+        // BEFORE them — `cat <<EOF > f` would otherwise put `> f` after
+        // the terminator and bash never sees the end of the body
+        // (heredoc-with-redirect-same-line)
+        let (heres, others): (Vec<&crate::ir::IrRedirect>, Vec<&crate::ir::IrRedirect>) =
+            redirects.iter().partition(|rd| {
+                matches!(rd.mode.as_str(), "heredoc" | "heredoc-tabs" | "herestring")
+            });
+        for rd in others.into_iter().chain(heres) {
             let mode = rd.mode.as_str();
             let fd = rd.fd.unwrap_or(1);
             let fd_pre = if fd == 1 { String::new() } else { format!("{fd}") };
@@ -2996,8 +3019,26 @@ impl Render {
                     self.sh_word(buf, &rd.target);
                 }
                 "heredoc" | "heredoc-tabs" => {
-                    // target = the body content (already interpolated by
-                    // the core); a quoted delimiter keeps it literal.
+                    // target = the body content. An UNQUOTED-delimiter
+                    // heredoc (interpolate = true) must expand $vars and
+                    // $(cmd) — export the vars the body mentions and let
+                    // the child bash interpolate (the quoted form keeps
+                    // everything literal: 079_heredoc_interpolation).
+                    if rd.interpolate && !matches!(&rd.target, IrExpr::Str(s, _) if !s.contains('$'))
+                    {
+                        if let IrExpr::Str(text, _) = &rd.target {
+                            self.sh_export_vars(text);
+                        }
+                        raw(self, "<<_SH2EOF_\n");
+                        let v = self.value_c(&rd.target);
+                        addv(self, &v);
+                        self.emit(&format!(
+                            "{{ size_t _hl = strlen({v}); if (_hl == 0 || {v}[_hl - 1] != '\\n') _sh_add(\"\\n\"); }}"
+                        ));
+                        add(self, "_SH2EOF_");
+                        self.heredoc_nl = true;
+                        continue;
+                    }
                     // `<<-` strips leading tabs from content + delimiter
                     // (the tab-stripped content arrives pre-stripped from
                     // the core; the delimiter line uses the same form)
@@ -3008,6 +3049,7 @@ impl Render {
                         "{{ size_t _hl = strlen({v}); if (_hl == 0 || {v}[_hl - 1] != '\\n') _sh_add(\"\\n\"); }}"
                     ));
                     add(self, "_SH2EOF_");
+                    self.heredoc_nl = true;
                 }
                 "herestring" => {
                     raw(self, "<<<");
