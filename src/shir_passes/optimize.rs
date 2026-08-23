@@ -1569,8 +1569,24 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
             out.push(var.clone());
             collect_expr_read_names(key, out);
         }
-        IrExpr::Int(_) | IrExpr::Str(_, _) | IrExpr::Bool(_) | IrExpr::Json(_)
+        IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_)
         | IrExpr::RawExpr(_) | IrExpr::Regex { .. } | IrExpr::Range { .. } => {}
+        IrExpr::Str(s, _) => {
+            // `$name` / `${name}` tokens inside ANY string operand:
+            // several lowerings evaluate string operands at runtime with
+            // expansion semantics (test/testArith/fparith/ternary conds
+            // from the C frontend, the sh2.test fallback, ...), and the
+            // native-first arms read those operands' `$name`s at EMISSION
+            // time (try_native_test -> store_var_read -> never-written
+            // fold). A store whose only "read" lives inside such a string
+            // must survive DCE, or the cond evaluates the never-written
+            // "" fold instead of the variable (c-sh-go t65_ternary /
+            // t64_bitwise_cond / t23_float regressions). Conservative:
+            // over-marking only shrinks the elimination set.
+            for nm in bare_dollar_names(s) {
+                out.push(nm);
+            }
+        }
         IrExpr::BinOp { lhs, rhs, .. } => {
             collect_expr_read_names(lhs, out);
             collect_expr_read_names(rhs, out);
@@ -1651,6 +1667,15 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                     out.push(n.clone());
                 }
             } else if func == "test" || func == "let" {
+                // `ternary` (the C frontend's `cond ? a : b`): args[0] is
+                // the cond TEST-STRING — try_native_test lowers it by
+                // scanning `$name` operands natively, so a store write a
+                // DCE would drop (no AST read) changes the answer from
+                // the var's value to the never-written fold ""
+                // (c-sh-go t65_ternary regression: every cond evaluated
+                // false). The branch args are already-lowered values —
+                // scanning them is harmless over-marking. Same shape as
+                // test/let: string mentions are runtime reads.
                 for a in args {
                     if let IrExpr::Str(s, _) = a {
                         for nm in bare_dollar_names(s) {

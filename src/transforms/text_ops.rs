@@ -70,6 +70,11 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                                 LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                                 return;
                             }
+                            if let Some(repl) = try_lower_grep_count(b1, b2) {
+                                *stmt = repl;
+                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
                             if let Some(repl) = try_lower_grep_wc(b1, b2) {
                                 *stmt = repl;
                                 LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -137,6 +142,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         *stmt = IrStmt::Ext(Box::new(ForEachLine {
                             source: path,
                             var: "__l".to_string(),
+                            limit: None,
                             body: vec![IrStmt::Output { value: val, newline: true, target: None }],
                         }));
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -198,6 +204,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                             *stmt = IrStmt::Ext(Box::new(ForEachLine {
                                 source: files.remove(0),
                                 var: "__l".to_string(),
+                                limit: None,
                                 body: vec![IrStmt::Output {
                                     value: field_val,
                                     newline: true,
@@ -233,6 +240,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                             *stmt = IrStmt::Ext(Box::new(ForEachLine {
                                 source: files.remove(0),
                                 var: "__l".to_string(),
+                                limit: None,
                                 body: vec![IrStmt::Output { value: val, newline: true, target: None }],
                             }));
                             LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -242,6 +250,76 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                 }
                 // `tr X Y < F` → STREAMING per-line CharTranslate/Case.
                 // (handled in the Redirect arm below via try_lower_tr_fd)
+                // `grep -c P F` (single FILE source) → STREAMING count.
+                if emit && cmd == "grep" && cmd_args.len() == 3 {
+                    let is_c = matches!(&cmd_args[0], IrExpr::Str(s, _) if s.as_str() == "-c");
+                    if is_c {
+                        let mut strs: Vec<&str> = Vec::new();
+                        let mut ok = true;
+                        for x in &cmd_args[1..] {
+                            match x {
+                                IrExpr::Str(s, _) => strs.push(s.as_str()),
+                                IrExpr::Interpolate(p) if p.len() == 1 => {
+                                    match &p[0] {
+                                        InterpPart::Lit(s) => strs.push(s.as_str()),
+                                        _ => { ok = false; }
+                                    }
+                                }
+                                _ => { ok = false; }
+                            }
+                        }
+                        if ok && strs.len() == 2 && !strs[1].starts_with('-') {
+                            let pat = IrExpr::Str(strs[0].to_string(), StrStyle::DoubleQuoted);
+                            let path = IrExpr::Str(strs[1].to_string(), StrStyle::DoubleQuoted);
+                            *stmt = streaming_line_count(path, Some(pat));
+                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                }
+                // `head -n K F` (single FILE source) → STREAMING head with
+                // early exit — O(K) memory, reader closed after K lines.
+                // (tail CANNOT stream — falls back.)
+                if emit && cmd == "head" {
+                    let mut files: Vec<IrExpr> = Vec::new();
+                    let mut k: Option<i64> = None;
+                    let mut bad = false;
+                    let mut i = 0;
+                    while i < cmd_args.len() {
+                        match &cmd_args[i] {
+                            IrExpr::Str(s, _) if s == "-n" => {
+                                match cmd_args.get(i + 1) {
+                                    Some(IrExpr::Str(v, _)) => { k = v.parse().ok(); i += 1; }
+                                    _ => { bad = true; }
+                                }
+                            }
+                            IrExpr::Str(s, _) if s == "-c" => { bad = true; } // byte-head: skip v1
+                            IrExpr::Str(s, _) if s.len() > 1 && s.starts_with("-n") => {
+                                k = s[2..].parse().ok();
+                            }
+                            IrExpr::Str(s, _) if s.starts_with('-') && s != "--" => {
+                                if let Ok(n) = s[1..].parse::<i64>() { k = Some(n); }
+                                else { bad = true; }
+                            }
+                            other => files.push(other.clone()),
+                        }
+                        i += 1;
+                    }
+                    if !bad && k.filter(|n| *n > 0).is_some() && files.len() == 1 {
+                        *stmt = IrStmt::Ext(Box::new(ForEachLine {
+                            source: files.remove(0),
+                            var: "__l".to_string(),
+                            limit: Some(Box::new(IrExpr::Int(k.unwrap()))),
+                            body: vec![IrStmt::Output {
+                                value: loop_var_read("__l"),
+                                newline: true,
+                                target: None,
+                            }],
+                        }));
+                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
                 if emit && cmd == "printf" {
                     if let Some(val) = try_lower_printf_repeat(cmd_args) {
                         // printf emits NO trailing newline.
@@ -1055,7 +1133,12 @@ fn arg_to_expr(arg: &IrExpr) -> Option<IrExpr> {
                 _ => Some(arg.clone()),
             }
         }
-        IrExpr::Var(..) | IrExpr::Capture { .. } | IrExpr::Call { .. } => Some(arg.clone()),
+        // A variable read reduces fine; a CAPTURE or command CALL does NOT —
+        // embedding one inside an Ext node makes the A1 exporter punt
+        // ("Other") and ingress refuse. Those sources keep the original
+        // command (correct fallback).
+        IrExpr::Var(..) => Some(arg.clone()),
+        IrExpr::Call { func, .. } if func == "getVar" || func == "param" => Some(arg.clone()),
         _ => None,
     }
 }
@@ -1380,7 +1463,7 @@ fn streaming_line_count(source: IrExpr, guard: Option<IrExpr>) -> IrStmt {
             expr: IrExpr::Int(0),
             asm: None,
         },
-        IrStmt::Ext(Box::new(ForEachLine { source, var: lv, body })),
+        IrStmt::Ext(Box::new(ForEachLine { source, var: lv, limit: None, body })),
         IrStmt::Output {
             value: IrExpr::Call {
                 func: "getVar".to_string(),
@@ -1462,6 +1545,7 @@ fn try_lower_grep_cut(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
     Some(IrStmt::Ext(Box::new(ForEachLine {
         source: path,
         var: "__l".to_string(),
+        limit: None,
         body: vec![IrStmt::If {
             cond,
             then: vec![IrStmt::Output { value: field, newline: true, target: None }],
@@ -1508,6 +1592,7 @@ fn try_lower_cat_pipe(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
                             return Some(IrStmt::Ext(Box::new(ForEachLine {
                                 source: path,
                                 var: "__l".to_string(),
+                                limit: None,
                                 body: vec![IrStmt::Output {
                                     value: field, newline: true, target: None,
                                 }],
@@ -1519,4 +1604,42 @@ fn try_lower_cat_pipe(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
         }
     }
     None
+}
+
+/// `grep -c P F` → STREAMING guarded count (grep prints the count itself).
+fn try_lower_grep_count(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
+    // stage2 must be a bare `grep` passthrough? No — stage2 is `wc -l`;
+    // grep -c prints its own count, so the PIPELINE is grep -c P F | wc -l?
+    // No: `grep -c P F` alone prints the count. Handle the PIPELINE form
+    // `… | wc -l` where stage1 is grep -c: bash would print count AND wc
+    // counts lines of it — rare; skip. Instead: bare `grep -c P F` is a
+    // single command (handled in the plain-command arm via
+    // streaming_line_count). This fn handles `grep -c P F` as stage1 of a
+    // 2-stage pipeline whose stage2 is `cat`/nothing — not a corpus shape;
+    // kept for symmetry: only accept stage2 == cat passthrough.
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = stage2 else { return None };
+    if !(f2 == "exec" || f2 == "builtin") { return None; }
+    let [IrExpr::Str(n2, _), IrExpr::Array(ca)] = a2.as_slice() else { return None };
+    if !(n2 == "cat" && ca.is_empty()) { return None; }
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = stage1 else { return None };
+    if !(f1 == "exec" || f1 == "builtin") { return None; }
+    let [IrExpr::Str(n1, _), IrExpr::Array(ga)] = a1.as_slice() else { return None };
+    if n1 != "grep" || ga.len() != 3 { return None; }
+    // shape: [-c, P, F]
+    let is_c = matches!(&ga[0], IrExpr::Str(s, _) if s.as_str() == "-c");
+    if !is_c { return None; }
+    let pat = match &ga[1] {
+        IrExpr::Str(s, _) => IrExpr::Str(s.clone(), StrStyle::DoubleQuoted),
+        IrExpr::Interpolate(p) if p.len() == 1 => match &p[0] {
+            InterpPart::Lit(s) => IrExpr::Str(s.clone(), StrStyle::DoubleQuoted),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let path = match &ga[2] {
+        IrExpr::Str(s, _) if !s.starts_with('-') =>
+            IrExpr::Str(s.clone(), StrStyle::DoubleQuoted),
+        _ => return None,
+    };
+    Some(streaming_line_count(path, Some(pat)))
 }

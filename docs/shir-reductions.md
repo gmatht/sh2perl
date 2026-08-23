@@ -140,6 +140,8 @@ bash** at statement level:
 | `head`/`tail -n` | TakeLines | ✅ |
 | `xargs` | StringTrim | ✅ |
 | `yes X | head -n K` | RepeatStr("X\\n", K) | ✅ |
+| `head -n K F` | ForEachLine(F, Output(l), limit=K) — early-exit streaming head | ✅ |
+| `grep -c P F` | ForEachLine(F, guarded n+=1) → count | ✅ |
 | `printf 'X%.0s' ARGS…` | RepeatStr("X", static-count incl. brace ranges) | ✅ |
 
 **Scope boundary:** reductions fire at **statement level only** (`emit=true`).
@@ -149,6 +151,6 @@ the capture. So capture-internal constructs fall back to `sh2.*` / the
 original command (correct, just not reduced). This is the documented
 "anything the core cannot reduce falls back" rule.
 
-**Not yet reduced (fall back to original):** `sort`/`uniq`, `seq | head`,
+**Not yet reduced (fall back to original):** `tail F` (cannot stream), `sort`/`uniq`, `seq | head`,
 `awk`, `[[ $x == P* ]]` (test-string parsing), multi-stage pipelines with a
 dynamic (file/grep) source.

@@ -21,10 +21,27 @@ pub(crate) fn render(ctx: &mut RenderCtx, n: &ForEachLine) -> bool {
         path
     ));
     for _ in 0..indent { ctx.out.push_str("    "); }
-    ctx.out.push_str(&format!("while (my ${} = <$_fl_fh{k}>) {{\n", n.var));
+    match &n.limit {
+        None => ctx.out.push_str(&format!("while (my ${} = <$_fl_fh{k}>) {{\n", n.var)),
+        Some(lim) => {
+            // streaming head: counter + last after K lines (O(K) memory)
+            let lim_p = ir_expr_to_perl(lim);
+            ctx.out.push_str(&format!("my $__fl_n{k} = 0;\n"));
+            for _ in 0..indent { ctx.out.push_str("    "); }
+            let hdr = format!(
+                "while ($__fl_n{k} < ({lim_p}) && defined(my ${} = <$_fl_fh{k}>)) {{\n",
+                n.var
+            );
+            ctx.out.push_str(&hdr);
+        }
+    }
     for _ in 0..indent + 1 { ctx.out.push_str("    "); }
     // bash/cut/grep see lines WITHOUT the trailing newline — chomp it.
     ctx.out.push_str(&format!("chomp ${};\n", n.var));
+    if n.limit.is_some() {
+        for _ in 0..indent + 1 { ctx.out.push_str("    "); }
+        ctx.out.push_str(&format!("$__fl_n{k}++;\n"));
+    }
     for b in &n.body {
         emit_stmt(ctx.out, b, indent + 1);
     }

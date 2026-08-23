@@ -115,6 +115,11 @@ fn restructure_children(s: &mut IrStmt, n: &mut usize) {
         IrStmt::While { body, .. }
         | IrStmt::DoWhile { body, .. }
         | IrStmt::For { body, .. }
+        // C-style for (frontend-emitted A1): gotos inside its body
+        // target labels OUTSIDE the loop — same nesting rules (the
+        // c-sh-go corpus's nested-goto pins regressed when the shell
+        // lowering adopted the rich A1 ForInit node)
+        | IrStmt::ForInit { body, .. }
         | IrStmt::Block(body)
         | IrStmt::Subshell(body)
         | IrStmt::Background(body)
@@ -362,7 +367,10 @@ fn descend_from(
             }
             push_and_walk(else_, idx, Branch::Else, lc, labels, path, loop_steps, out);
         }
-        IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::For { body, .. } => {
+        IrStmt::While { body, .. }
+        | IrStmt::DoWhile { body, .. }
+        | IrStmt::For { body, .. }
+        | IrStmt::ForInit { body, .. } => {
             push_and_walk(
                 body,
                 idx,
@@ -508,7 +516,10 @@ fn is_loop_stmt_at(stmts: &Vec<IrStmt>, path: &[(usize, Branch)], step: usize) -
         if k == step {
             return matches!(
                 s,
-                IrStmt::While { .. } | IrStmt::For { .. } | IrStmt::DoWhile { .. }
+                IrStmt::While { .. }
+                    | IrStmt::For { .. }
+                    | IrStmt::DoWhile { .. }
+                    | IrStmt::ForInit { .. }
             );
         }
         list = match s {
@@ -516,6 +527,7 @@ fn is_loop_stmt_at(stmts: &Vec<IrStmt>, path: &[(usize, Branch)], step: usize) -
             IrStmt::While { body, .. }
             | IrStmt::DoWhile { body, .. }
             | IrStmt::For { body, .. }
+            | IrStmt::ForInit { body, .. }
             | IrStmt::Block(body)
             | IrStmt::Subshell(body)
             | IrStmt::Background(body)
@@ -613,6 +625,7 @@ fn body_list_mut(s: &mut IrStmt) -> &mut Vec<IrStmt> {
         IrStmt::While { body, .. }
         | IrStmt::DoWhile { body, .. }
         | IrStmt::For { body, .. }
+        | IrStmt::ForInit { body, .. }
         | IrStmt::Block(body)
         | IrStmt::Subshell(body)
         | IrStmt::Background(body)
