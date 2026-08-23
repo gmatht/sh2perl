@@ -1765,7 +1765,28 @@ impl Render {
             IrExpr::Int(i) => i.to_string(),
             IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
                 Ok(n) => n.to_string(),
-                Err(_) => format!("(int)atoll({})", Self::cstr(s)),
+                Err(_) => {
+                    // `$i` / `${i}` slice-index text: resolve the live
+                    // value (a literal atoll("$i") is always 0)
+                    let t = s.trim();
+                    let name = t.strip_prefix('$').map(|r| r.trim_matches('{').trim_matches('}'));
+                    if let Some(name) = name {
+                        if is_ident(name)
+                            || name.chars().all(|c| c.is_ascii_digit())
+                            || name == "?"
+                        {
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.to_string(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            return format!("(int)atoll({v})");
+                        }
+                    }
+                    format!("(int)atoll({})", Self::cstr(s))
+                }
             },
             IrExpr::Var(name, _) | IrExpr::Ident(name) if self.is_num(name) => self.c_ident(name),
             IrExpr::Call { func, args } if func == "getVar" => {
@@ -4920,6 +4941,30 @@ impl Render {
                         "(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")"
                     );
                 }
+                if let Some(rest) = name.strip_prefix('#') {
+                    // ${#var} — the core spells the LENGTH expansion
+                    // getVar("#var") (010_substring_loop len=${#s})
+                    if rest.is_empty() || rest == "@" || rest == "*" {
+                        return self.num_temp("((_sh_argc > 0) ? (_sh_argc - 1) : 0)");
+                    }
+                    let v = if self.is_num(rest) {
+                        self.num_temp(&self.c_ident(rest))
+                    } else if self.store.contains(rest) || self.var_types.contains_key(rest) {
+                        self.store_read(rest)
+                    } else {
+                        self.need_sh = true;
+                        format!(
+                            "(getenv({}) ? getenv({}) : \"\")",
+                            Self::cstr(rest),
+                            Self::cstr(rest)
+                        )
+                    };
+                    let t = self.str_temp(32);
+                    self.emit(&format!(
+                        "snprintf({t}, sizeof {t}, \"%lld\", (long long)strlen({v}));"
+                    ));
+                    return t;
+                }
                 if self.arrays.contains(&name) {
                     let id = self.c_ident(&name);
                     format!("(({id}_len > 0 && {id}[0]) ? {id}[0] : \"\")")
@@ -7715,6 +7760,9 @@ fn collect_capture_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     }
                 }
                 let is_cap = match expr {
+                    // backtick/\$( ) captures deserialize as the Capture
+                    // NODE (not a Call) — equally unbounded
+                    IrExpr::Capture { .. } => true,
                     IrExpr::Call { func, args } => {
                         (func == "capture" || func == "captureWords")
                             || (func == "arith" && {
