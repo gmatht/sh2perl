@@ -173,6 +173,11 @@ pub struct Render {
     /// a heredoc terminator was just emitted — the next raw token must
     /// start on a fresh line (the terminator must be alone on its line)
     heredoc_nl: bool,
+    /// vars assigned as SHELL TEXT in the current command buffer — the
+    /// child bash owns their value for this site; re-exporting the stale
+    /// C var inside the same buffer would clobber it (091_while_pipe_var:
+    /// count=$((count+1)) then echo "$count" exported 0 every iteration)
+    shell_assigned: BTreeSet<String>,
     /// untyped var names (A2 verdict missing) — the native `char*` store.
     /// getVar/param reads of these render `(name ? name : "")`; Assign
     /// targets render `name = value;` (pointer semantics).
@@ -291,6 +296,11 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
 
 impl Render {
     fn emit(&mut self, s: &str) {
+        if s == "_sh_reset();" {
+            // a new command buffer starts — shell-text assignments from
+            // the previous one no longer own their vars
+            self.shell_assigned.clear();
+        }
         if s.is_empty() {
             self.out.push(String::new());
         } else {
@@ -1755,7 +1765,28 @@ impl Render {
             IrExpr::Int(i) => i.to_string(),
             IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
                 Ok(n) => n.to_string(),
-                Err(_) => format!("(int)atoll({})", Self::cstr(s)),
+                Err(_) => {
+                    // `$i` / `${i}` slice-index text: resolve the live
+                    // value (a literal atoll("$i") is always 0)
+                    let t = s.trim();
+                    let name = t.strip_prefix('$').map(|r| r.trim_matches('{').trim_matches('}'));
+                    if let Some(name) = name {
+                        if is_ident(name)
+                            || name.chars().all(|c| c.is_ascii_digit())
+                            || name == "?"
+                        {
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.to_string(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            return format!("(int)atoll({v})");
+                        }
+                    }
+                    format!("(int)atoll({})", Self::cstr(s))
+                }
             },
             IrExpr::Var(name, _) | IrExpr::Ident(name) if self.is_num(name) => self.c_ident(name),
             IrExpr::Call { func, args } if func == "getVar" => {
@@ -2118,7 +2149,9 @@ impl Render {
                                 } else {
                                     self.store_read(&n)
                                 };
-                                self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
+                                if !self.shell_assigned.contains(&n) {
+                                    self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
+                                }
                                 let ref_text = if n == "?" { v.clone() } else { format!("${n}") };
                                 if first_seg {
                                     match buf {
@@ -2243,15 +2276,35 @@ impl Render {
             first_stmt = false;
             match s {
                 IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
-                    // env prefix: `IFS=: cmd ...` (the Object arg)
+                    // `while IFS= read -r line` — the core splits the
+                    // env-prefix assignment into words (cmd=NAME,
+                    // args[0]="=", args[1]=value?): glue NAME=value and
+                    // treat the REST as the command (a space-separated
+                    // `IFS = read` is not an assignment in bash:
+                    // 071_while_ifs_read)
+                    // env prefix: `IFS=: cmd ...` (the Object arg).
+                    // NAME=VALUE must be GLUED — a spaced `IFS = read`
+                    // is not an assignment in bash (071_while_ifs_read)
                     for a in args {
                         if let IrExpr::Object(fields) = a {
                             for (k, v) in fields {
-                                let key = k.clone();
-                                let val = v.clone();
-                                self.sh_raw(buf, &key);
-                                self.sh_raw(buf, "=");
-                                self.sh_word(buf, &val);
+                                match v {
+                                    IrExpr::Str(s, _) => {
+                                        self.sh_add(buf, &format!(" {k}={s}"));
+                                    }
+                                    other => {
+                                        // dynamic value: export it under a
+                                        // temp name, the child expands it
+                                        let vt = self.value_c(other);
+                                        let en = format!("__SH2_EP{}", self.temp_seq);
+                                        self.temp_seq += 1;
+                                        self.emit(&format!(
+                                            "_sh_export({}, {vt});",
+                                            Self::cstr(&en)
+                                        ));
+                                        self.sh_add(buf, &format!(" {k}=${en}"));
+                                    }
+                                }
                             }
                         }
                     }
@@ -2310,16 +2363,20 @@ impl Render {
                                     continue;
                                 }
                             }
-                            self.emit(&format!(
-                                "_sh_addraw({});",
-                                Self::cstr(&format!("{}=", t.var))
-                            ));
+                            self.shell_assigned.insert(t.var.clone());
+                            // NAME=VALUE must be ONE word — `count= $(…)`
+                            // makes bash treat the assignment as an env
+                            // PREFIX for the next command (empty count)
+                            self.sh_raw(buf, &format!("{}=", t.var));
                             match expr {
                                 IrExpr::Arith(a) => {
                                     self.emit(&format!(
-                                        "_sh_addraw({});",
+                                        "_sh_add({});",
                                         Self::cstr(&format!("$(({}))", arith_shell(a)))
                                     ));
+                                }
+                                IrExpr::Str(s, _) => {
+                                    self.sh_add(buf, &Self::cstr(s));
                                 }
                                 _ => {
                                     self.sh_word(buf, expr);
@@ -2909,6 +2966,11 @@ impl Render {
     /// `_sh_export("name", value)` for a program var (numeric vars via
     /// their string form).
     fn export_one(&mut self, name: &str) {
+        if self.shell_assigned.contains(name) {
+            // the current command text already assigns this var — the
+            // child's own value is authoritative
+            return;
+        }
         if self.var_types.contains_key(name) || self.store.contains(name) {
             if self.is_num(name) {
                 let t = self.num_temp(&self.c_ident(name));
@@ -4878,6 +4940,30 @@ impl Render {
                     return format!(
                         "(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")"
                     );
+                }
+                if let Some(rest) = name.strip_prefix('#') {
+                    // ${#var} — the core spells the LENGTH expansion
+                    // getVar("#var") (010_substring_loop len=${#s})
+                    if rest.is_empty() || rest == "@" || rest == "*" {
+                        return self.num_temp("((_sh_argc > 0) ? (_sh_argc - 1) : 0)");
+                    }
+                    let v = if self.is_num(rest) {
+                        self.num_temp(&self.c_ident(rest))
+                    } else if self.store.contains(rest) || self.var_types.contains_key(rest) {
+                        self.store_read(rest)
+                    } else {
+                        self.need_sh = true;
+                        format!(
+                            "(getenv({}) ? getenv({}) : \"\")",
+                            Self::cstr(rest),
+                            Self::cstr(rest)
+                        )
+                    };
+                    let t = self.str_temp(32);
+                    self.emit(&format!(
+                        "snprintf({t}, sizeof {t}, \"%lld\", (long long)strlen({v}));"
+                    ));
+                    return t;
                 }
                 if self.arrays.contains(&name) {
                     let id = self.c_ident(&name);
@@ -7674,6 +7760,9 @@ fn collect_capture_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     }
                 }
                 let is_cap = match expr {
+                    // backtick/\$( ) captures deserialize as the Capture
+                    // NODE (not a Call) — equally unbounded
+                    IrExpr::Capture { .. } => true,
                     IrExpr::Call { func, args } => {
                         (func == "capture" || func == "captureWords")
                             || (func == "arith" && {
