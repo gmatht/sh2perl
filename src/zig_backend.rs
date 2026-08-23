@@ -1137,7 +1137,7 @@ impl Render {
             fmt.push('\n');
         }
         format!(
-            "try stdout.print({}, .{{{}}});",
+            "try stdout.print({}, .{{{}}});\n    try stdout.flush();",
             Self::zig_str(&fmt),
             args.join(", ")
         )
@@ -2015,8 +2015,26 @@ impl Render {
         }
         if self.need_stdout {
             self.emit("");
+            // zig 0.16 removed std.io.getStdOut: stdout writing needs the
+            // process Init's Io. Rewrite the already-emitted main signature
+            // and set up a buffered File.Writer as `stdout` — generated
+            // statements (`try stdout.print(...)`) are unchanged, each one
+            // is followed by an explicit flush (early returns / exit() must
+            // not lose buffered output).
+            for line in self.out.iter_mut() {
+                if line == "pub fn main() !void {" {
+                    *line = "pub fn main(init: std.process.Init) !void {".to_string();
+                    break;
+                }
+            }
             self.out
-                .push("    const stdout = std.io.getStdOut().writer();".to_string());
+                .push("    var stdout_buffer: [4096]u8 = undefined;".to_string());
+            self.out.push(
+                "    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);"
+                    .to_string(),
+            );
+            self.out
+                .push("    const stdout = &stdout_file_writer.interface;".to_string());
         }
         if !body_stmts.is_empty() || !decls.is_empty() {
             self.emit("");
@@ -2249,7 +2267,10 @@ mod tests {
             out.contains("try stdout.print(\"{s}{d}\\n\", .{\"x is \", x});"),
             "{out}"
         );
-        assert!(out.contains("pub fn main() !void {"), "{out}");
+        assert!(
+            out.contains("pub fn main(init: std.process.Init) !void {"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -2288,6 +2309,9 @@ mod tests {
     fn for_loop_renders() {
         let out = render("for i in 1 2 3; do\necho \"$i\"\ndone\n");
         // the parser may not produce Range; just require it renders
-        assert!(out.contains("pub fn main() !void {"), "{out}");
+        assert!(
+            out.contains("pub fn main(init: std.process.Init) !void {"),
+            "{out}"
+        );
     }
 }

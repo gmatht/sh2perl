@@ -2658,6 +2658,38 @@ fn glob_to_regex_greedy(pat: &str, greedy: bool) -> String {
 
 /// Render `ArithAst` as a Perl numeric expression (bash integer semantics;
 /// int() wrapping happens at the IrExpr::Arith arm).
+/// Render an arith STRING (`$(($x % 2))` text — the C frontend's
+/// arith/testArith lowering) as a Perl expression. `$name`/`${name}`
+/// normalize to bare idents (what parse_arith accepts), then the AST
+/// renders via [`arith_ast_to_perl`]. None when the string doesn't parse
+/// (caller falls back).
+fn arith_str_to_perl(s: &str) -> Option<String> {
+    let mut t = String::new();
+    let ch: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < ch.len() {
+        if ch[i] == '$' && i + 1 < ch.len() {
+            if ch[i + 1] == '{' {
+                let mut j = i + 2;
+                while j < ch.len() && ch[j] != '}' {
+                    t.push(ch[j]);
+                    j += 1;
+                }
+                if j < ch.len() {
+                    i = j + 1;
+                    continue;
+                }
+            } else if ch[i + 1].is_ascii_alphabetic() || ch[i + 1] == '_' {
+                i += 1; // drop the '$' — the ident itself parses as Ident
+                continue;
+            }
+        }
+        t.push(ch[i]);
+        i += 1;
+    }
+    crate::shir::parse_arith(&t).map(|ast| arith_ast_to_perl(&ast))
+}
+
 fn arith_ast_to_perl(ast: &ArithAst) -> String {
     match ast {
         ArithAst::Num(n) => n.to_string(),
@@ -2743,8 +2775,15 @@ fn render_word(e: &IrExpr) -> String {
             "param" => render_param(args),
             "arith" => args
                 .first()
-                .map(|a| format!("int({})", render_word(a)))
-                .unwrap_or_else(|| "0".to_string()),
+                .and_then(|a| match a {
+                    IrExpr::Str(s, _) => arith_str_to_perl(s),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    args.first()
+                        .map(|a| format!("int({})", render_word(a)))
+                        .unwrap_or_else(|| "0".to_string())
+                }),
             "brace" => render_brace_word(args),
             "capture" | "captureWords" => {
                 // Command substitution in unquoted word position: capture
@@ -6102,8 +6141,19 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                 "param" => render_param(args),
                 "arith" => args
                     .first()
-                    .map(|a| format!("int({})", render_word(a)))
-                    .unwrap_or_else(|| "0".to_string()),
+                    .and_then(|a| match a {
+                        // an arith STRING (`$(($x % 2))` text, the C
+                        // frontend's arith/testArith lowering): parse and
+                        // render natively — a quoted `int("...")` would
+                        // numify the LITERAL string, not the expression
+                        IrExpr::Str(s, _) => arith_str_to_perl(s),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        args.first()
+                            .map(|a| format!("int({})", render_word(a)))
+                            .unwrap_or_else(|| "0".to_string())
+                    }),
                 "brace" => render_brace_word(args),
                 "capture" | "captureWords" => {
                     // Expression/interpolated context (e.g. inside a
