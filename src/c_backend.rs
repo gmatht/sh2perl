@@ -1911,9 +1911,9 @@ impl Render {
                                 "_sh_export(\"_SHARGV\", (({n} < _sh_argc && _sh_argv[{n}]) ? _sh_argv[{n}] : \"\"));"
                             ));
                             match buf {
-                                CmdBuf::Shared => self.emit("_sh_add(\"$_SHARGV\");"),
+                                CmdBuf::Shared => self.emit("_sh_addraw(\"$_SHARGV\");"),
                                 CmdBuf::Private(id) => self.emit(&format!(
-                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"$_SHARGV\");"
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" $_SHARGV\");"
                                 )),
                             }
                         }
@@ -2128,7 +2128,7 @@ impl Render {
                                         )),
                                         CmdBuf::Private(id) => self.emit(&format!(
                                             "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
-                                            Self::cstr(&format!("\"{ref_text}\""))
+                                            Self::cstr(&format!(" \"{ref_text}\""))
                                         )),
                                     }
                                 } else {
