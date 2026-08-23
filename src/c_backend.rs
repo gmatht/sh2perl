@@ -1155,7 +1155,14 @@ impl Render {
                     // `!` is UNARY — the ShIR duplicates the operand
                     // (until loops: BinOp{Not, test, test}), so render
                     // the negation of the lhs and ignore the rhs copy.
-                    crate::ir::BinOpKind::Not => return format!("(!({l}))"),
+                    // The negated STATUS writes back to _sh_rc — bash
+                    // `! cmd` sets $? to the flipped status (`exit: $?`
+                    // after `! grep …` saw the RAW status otherwise).
+                    crate::ir::BinOpKind::Not => {
+                        // the operand is bash TRUTHINESS (1 = succeeded);
+                        // the flipped STATUS is 1/0 accordingly
+                        return format!("(!(_sh_rc = ({l}) ? 1 : 0))")
+                    }
                     crate::ir::BinOpKind::Pow => {
                         return format!("pow({l},{r})");
                     }
@@ -1999,7 +2006,35 @@ impl Render {
                             let t = self.num_temp("_sh_rc");
                             word(self, t);
                         }
-                        Some("@") | Some("*") => {
+                        Some("@") => {
+                            // `"$@"` expands to SEPARATELY QUOTED words —
+                            // joining into one word made the child run
+                            // 'id -u' (with the space) as a command name.
+                            // Emit a C loop appending 'arg' per argv slot.
+                            let quoted = "'\\\"'\\\"'"; // '"'"' escaping
+                            let body = format!(
+                                "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; {a1} for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) {a2} else {a3} }} {a4} }} }}",
+                                a1 = Self::cstr(" '"),
+                                a2 = Self::cstr(quoted),
+                                a3 = "{ _sh_addc(*_qp); }",
+                                a4 = Self::cstr("'"),
+                            );
+                            match buf {
+                                CmdBuf::Shared => self.emit(&body),
+                                CmdBuf::Private(id) => {
+                                    let b = body.replace("_sh_add(", &format!("_sh_badd(&_c{id}_cmd, &_c{id}_cap, "));
+                                    // _sh_badd takes (b, cap, s) — rebuild instead
+                                    let _ = b;
+                                    self.emit(&format!(
+                                        "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; _sh_badd(&_c{id}_cmd, &_c{id}_cap, {q1}); for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) _sh_badd(&_c{id}_cmd, &_c{id}_cap, {q2}); else _sh_baddc(&_c{id}_cmd, &_c{id}_cap, *_qp); }} _sh_badd(&_c{id}_cmd, &_c{id}_cap, {q3}); }} }}",
+                                        q1 = Self::cstr(" '"),
+                                        q2 = Self::cstr(quoted),
+                                        q3 = Self::cstr("'"),
+                                    ));
+                                }
+                            }
+                        }
+                        Some("*") => {
                             let t = self.str_temp(4096);
                             self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
                             word(self, t);
@@ -2067,6 +2102,29 @@ impl Render {
                                 "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" $_SHSPLIT\");"
                             ));
                         }
+                    }
+                }
+                "listVar" if matches!(Self::str_arg(args, 0).as_deref(), Some("@")) => {
+                    // `"$@"` as the COMMAND word: expand to SEPARATELY
+                    // quoted words (a joined single word made the child run
+                    // 'id -u' as one command name). The value_c listVar
+                    // fallback joins into one space-separated string.
+                    let addq = Self::cstr(" '");
+                    let escq = Self::cstr("'\"'\"'");
+                    let endq = Self::cstr("'");
+                    match buf {
+                        CmdBuf::Shared => self.emit(&format!(
+                            "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; _sh_add({addq}); for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) _sh_add({escq}); else _sh_addc(*_qp); }} _sh_add({endq}); }} }}",
+                            addq = addq,
+                            escq = escq,
+                            endq = endq,
+                        )),
+                        CmdBuf::Private(id) => self.emit(&format!(
+                            "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; _sh_badd(&_c{id}_cmd, &_c{id}_cap, {addq}); for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) _sh_badd(&_c{id}_cmd, &_c{id}_cap, {escq}); else _sh_baddc(&_c{id}_cmd, &_c{id}_cap, *_qp); }} _sh_badd(&_c{id}_cmd, &_c{id}_cap, {endq}); }} }}",
+                            addq = addq,
+                            escq = escq,
+                            endq = endq,
+                        )),
                     }
                 }
                 "brace" => {
@@ -2227,15 +2285,36 @@ impl Render {
                                         let t = self.num_temp("_sh_rc");
                                         (t.clone(), t)
                                     }
+                                    "@" if first_seg => {
+                                        // standalone `"$@"` expands to
+                                        // SEPARATELY QUOTED words — a single
+                                        // joined word made the child run
+                                        // 'id -u' as one command name. The C
+                                        // loop appends 'arg' per argv slot.
+                                        let q2 = Self::cstr("'\"'\"'");
+                                        match buf {
+                                            CmdBuf::Shared => self.emit(&format!(
+                                                "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; {a1} for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) {a2} else {{ _sh_addc(*_qp); }} }} {a3} }} }}",
+                                                a1 = Self::cstr(" '"),
+                                                a2 = q2,
+                                                a3 = Self::cstr("'"),
+                                            )),
+                                            CmdBuf::Private(id) => self.emit(&format!(
+                                                "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; _sh_badd(&_c{id}_cmd, &_c{id}_cap, {a1}); for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) _sh_badd(&_c{id}_cmd, &_c{id}_cap, {a2}); else _sh_baddc(&_c{id}_cmd, &_c{id}_cap, *_qp); }} _sh_badd(&_c{id}_cmd, &_c{id}_cap, {a3}); }} }}",
+                                                a1 = Self::cstr(" '"),
+                                                a2 = q2,
+                                                a3 = Self::cstr("'"),
+                                            )),
+                                        }
+                                        first_seg = false;
+                                        continue;
+                                    }
                                     "@" | "*" => {
+                                        // mid-word `$@`: join to one word
                                         let t = self.str_temp(4096);
                                         self.emit(&format!(
                                             "_sh_argv_join({t}, sizeof {t});"
                                         ));
-                                        // export the join; the child sees a
-                                        // single quoted word (bash would
-                                        // split `$@` — acceptable for the
-                                        // text-site form where argv is flat)
                                         self.emit(&format!(
                                             "_sh_export(\"_SHARGSJ\", {t});"
                                         ));
