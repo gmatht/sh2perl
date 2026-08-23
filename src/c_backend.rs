@@ -196,6 +196,21 @@ pub struct Render {
     need_pow: bool,
     /// counter for _sh_site_N() / _cap_N() helper ids
     site_seq: usize,
+    /// vars ASSIGNED anywhere in the shell-text stage currently being
+    /// rendered (Assign targets, read targets) — the child bash owns
+    /// these during the stage, so getVar refs must NOT re-export the C
+    /// value (that would clobber the child's own mutation: a
+    /// `count=$((count+1))` loop would echo a stale count)
+    stage_assigned: BTreeSet<String>,
+    /// vars already exported in the CURRENT site — the first textual
+    /// reference exports the entry value (all export C-code runs before
+    /// the single system() call), later references must leave the
+    /// child-owned variable alone
+    site_exported: BTreeSet<String>,
+    /// set before a sh_word call that must GLUE to text already in the
+    /// buffer (`NAME=` + value = one word) — consumed by the next
+    /// word-append
+    glue_next_word: bool,
     /// emitted shell-out site helper bodies (`static int _sh_site_N(void) {...}`)
     site_bodies: Vec<String>,
     /// emitted capture helper bodies (`static char *_cap_N(void) {...}`)
@@ -1851,6 +1866,7 @@ impl Render {
 
     fn shell_site(&mut self, body: impl FnOnce(&mut Render), invert: bool) -> String {
         self.need_sh = true;
+        self.site_exported.clear();
         let id = self.site_seq;
         self.site_seq += 1;
         let saved = std::mem::take(&mut self.out);
@@ -1893,6 +1909,7 @@ impl Render {
     /// Returns the call expression `_cap_N()` (a char*).
     fn cap_site(&mut self, body: impl FnOnce(&mut Render, usize)) -> String {
         self.need_sh = true;
+        self.site_exported.clear();
         let id = self.site_seq;
         self.site_seq += 1;
         let saved = std::mem::take(&mut self.out);
@@ -1924,9 +1941,26 @@ impl Render {
     /// word evaluate into a temp (their sites have private buffers, so
     /// the build never interleaves).
     fn sh_word(&mut self, buf: CmdBuf, e: &IrExpr) {
-        let word = |r: &mut Render, v: String| match buf {
-            CmdBuf::Shared => r.emit(&format!("_sh_word({v});")),
-            CmdBuf::Private(id) => r.emit(&format!("_sh_bword(&_c{id}_cmd, &_c{id}_cap, {v});")),
+        let word = |r: &mut Render, v: String| {
+            // glue mode: append WITHOUT the word-separating space
+            // (`NAME=` + value = ONE shell word)
+            let glue = std::mem::take(&mut r.glue_next_word);
+            match buf {
+                CmdBuf::Shared => {
+                    if glue {
+                        r.emit(&format!("_sh_add({v});"))
+                    } else {
+                        r.emit(&format!("_sh_word({v});"))
+                    }
+                }
+                CmdBuf::Private(id) => {
+                    if glue {
+                        r.emit(&format!("_sh_badd(&_c{id}_cmd, &_c{id}_cap, {v});"))
+                    } else {
+                        r.emit(&format!("_sh_bword(&_c{id}_cmd, &_c{id}_cap, {v});"))
+                    }
+                }
+            }
         };
         // a glob-marked literal (`\x01SH2GLOB\x01*.txt`) is an UNQUOTED
         // glob pattern: emit it RAW (stripped) so the child bash
@@ -1988,7 +2022,17 @@ impl Render {
                             } else {
                                 self.store_read(n)
                             };
-                            self.emit(&format!("_sh_export({}, {v});", Self::cstr(n)));
+                            // the first textual reference in a site exports
+                            // the ENTRY value; later references must not
+                            // clobber a variable the CHILD assigns (a
+                            // `count=$((count+1))` loop would echo a stale
+                            // count). Vars assigned by THIS stage are
+                            // child-owned from the start.
+                            let owned = self.stage_assigned.contains(n);
+                            if !owned || self.site_exported.insert(n.to_string()) {
+                                self.emit(&format!("_sh_export({}, {v});", Self::cstr(n)));
+                            }
+
                             // a BARE getVar word is the QUOTED form (the
                             // core spells unquoted refs `split(getVar)` —
                             // the split arm above emits them raw); quote it
@@ -2226,10 +2270,16 @@ impl Render {
                                         } else {
                                             self.store_read(&n)
                                         };
-                                        self.emit(&format!(
-                                            "_sh_export({}, {v});",
-                                            Self::cstr(&n)
-                                        ));
+                                        // child-owned vars: first reference
+                                        // only (see stage_assigned)
+                                        if !self.stage_assigned.contains(&n)
+                                            || self.site_exported.insert(n.clone())
+                                        {
+                                            self.emit(&format!(
+                                                "_sh_export({}, {v});",
+                                                Self::cstr(&n)
+                                            ));
+                                        }
                                         (v.clone(), format!("${n}"))
                                     }
                                 };
@@ -2340,7 +2390,67 @@ impl Render {
 
     /// Reconstruct the command text of one Arrow body (an exec call, a
     /// test, a redirect, a nested pipeline). Emits word appends.
+    /// Collect the variable names ASSIGNED in a stage's statements
+    /// (Assign targets, `read` targets, nested bodies). See the
+    /// `stage_assigned` field doc for why this matters.
+    fn collect_assigned(stmts: &[IrStmt], set: &mut BTreeSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, .. } => {
+                    for t in targets {
+                        set.insert(t.var.clone());
+                    }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args })
+                    if func == "exec" || func == "builtin" =>
+                {
+                    // `read [-r] name...` — the words after the flags are
+                    // assignment targets (the child writes them)
+                    let is_read = matches!(Self::str_arg(args, 0).as_deref(), Some("read"));
+                    if is_read {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            for w in items {
+                                if let IrExpr::Str(n, _) = w {
+                                    if !n.starts_with('-') && is_ident(n) {
+                                        set.insert(n.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "whileLoop" => {
+                    for a in args {
+                        if let IrExpr::Arrow(sts) = a {
+                            Self::collect_assigned(sts, set);
+                        }
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => Self::collect_assigned(inner, set),
+                IrStmt::Block(b) | IrStmt::Background(b) => Self::collect_assigned(b, set),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        Self::collect_assigned(st, set);
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    Self::collect_assigned(then, set);
+                    for (_, b) in elsifs {
+                        Self::collect_assigned(b, set);
+                    }
+                    Self::collect_assigned(else_, set);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn sh_stage(&mut self, buf: CmdBuf, stmts: &[IrStmt]) {
+        // track what THIS stage assigns (child-owned vars — see the
+        // field docs); nested sh_stage calls scope their own set
+        let saved_assigned = std::mem::take(&mut self.stage_assigned);
+        Self::collect_assigned(stmts, &mut self.stage_assigned);
+        self.stage_assigned.extend(saved_assigned.iter().cloned());
         let mut first_stmt = true;
         for s in stmts {
             if !first_stmt {
@@ -2349,15 +2459,66 @@ impl Render {
             first_stmt = false;
             match s {
                 IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
-                    // env prefix: `IFS=: cmd ...` (the Object arg)
+                    // env prefix: `IFS=: cmd ...` (the Object arg).
+                    // `KEY=value` is ONE shell word — the key and '='
+                    // must GLUE to the value (`IFS = '' read` makes 'IFS'
+                    // a COMMAND). The value renders unquoted-assignment
+                    // + single-quoted text; non-literals export via a
+                    // temp ref.
                     for a in args {
                         if let IrExpr::Object(fields) = a {
                             for (k, v) in fields {
-                                let key = k.clone();
-                                let val = v.clone();
-                                self.sh_raw(buf, &key);
-                                self.sh_raw(buf, "=");
-                                self.sh_word(buf, &val);
+                                match (&v, buf) {
+                                    (IrExpr::Str(s, _), b) => {
+                                        let sq = format!(
+                                            "'{}'",
+                                            s.replace('\'', "'\"'\"'")
+                                        );
+                                        match b {
+                                            CmdBuf::Shared => {
+                                                self.emit(&format!(
+                                                    "_sh_addraw({});",
+                                                    Self::cstr(&format!("{k}="))
+                                                ));
+                                                self.emit(&format!(
+                                                    "_sh_add({});",
+                                                    Self::cstr(&sq)
+                                                ));
+                                            }
+                                            CmdBuf::Private(id) => {
+                                                self.emit(&format!(
+                                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                                    Self::cstr(&format!(" {k}="))
+                                                ));
+                                                self.emit(&format!(
+                                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                                    Self::cstr(&sq)
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    (_, b) => {
+                                        let vc = self.value_c(&v);
+                                        match b {
+                                            CmdBuf::Shared => {
+                                                self.emit(&format!(
+                                                    "_sh_addraw({});",
+                                                    Self::cstr(&format!("{k}="))
+                                                ));
+                                                self.emit(&format!("_sh_add({vc});"));
+                                            }
+                                            CmdBuf::Private(id) => {
+                                                self.emit(&format!(
+                                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                                    Self::cstr(&format!(" {k}="))
+                                                ));
+                                                self.emit(&format!(
+                                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {vc});"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2422,12 +2583,17 @@ impl Render {
                             ));
                             match expr {
                                 IrExpr::Arith(a) => {
-                                    self.emit(&format!(
-                                        "_sh_addraw({});",
-                                        Self::cstr(&format!("$(({}))", arith_shell(a)))
-                                    ));
+                                    // GLUE: `count=$((count+1))` is one
+                                    // word — a space after '=' makes bash
+                                    // run a command named 'count='
+                                    self.sh_add(
+                                        buf,
+                                        &format!("$(({}))", arith_shell(a)),
+                                    );
                                 }
                                 _ => {
+                                    // glue the value to NAME= (no space)
+                                    self.glue_next_word = true;
                                     self.sh_word(buf, expr);
                                 }
                             }
@@ -2788,6 +2954,7 @@ impl Render {
                 }
             }
         }
+        self.stage_assigned = saved_assigned;
     }
 
     /// Reconstruct the shell text of a for-iterable (`in <iter>`).
@@ -2922,7 +3089,13 @@ impl Render {
                     } else {
                         self.store_read(&n)
                     };
-                    self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
+                    // child-owned vars: export only the FIRST reference's
+                    // entry value (see stage_assigned / site_exported)
+                    if !self.stage_assigned.contains(&n)
+                        || self.site_exported.insert(n.clone())
+                    {
+                        self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
+                    }
                     self.sh_add(buf, &format!("${n}"));
                 }
             }
