@@ -1790,15 +1790,34 @@ pub(crate) fn emit_stmt(out: &mut String, stmt: &IrStmt, indent: usize) {
                     "exec" => {
                         emit_exec_call(out, e, indent);
                     }
+                    "setVar" => {
+                        // Statement-position store write (frontend-emitted
+                        // A1 — the C frontend's Assign lowers to setVar in
+                        // some shapes): a plain scalar assignment
+                        if let (Some(name), Some(value)) =
+                            (args.first().and_then(call_arg_str), args.get(1))
+                        {
+                            let t = var_read(&name);
+                            let v = ir_expr_to_perl(value);
+                            emit_indent(out, indent);
+                            out.push_str(&format!("{t} = {v};\n"));
+                        } else {
+                            emit_indent(out, indent);
+                            out.push_str("die \"debashc: setVar args not renderable (Perl backend)\\n\";\n");
+                        }
+                    }
                     "builtin" => {
                         // The shared `builtin` op (builtins.json namespace):
                         // emit_exec_call renders the native-command set and
                         // shells out the still-unsupported remainder.
                         emit_exec_call(out, e, indent);
                     }
-                    "$fn_call" => {
+                    "$fn_call" | "fnCall" => {
                         // Call to a shell function defined in this program
                         // (rewritten by shir_to_perl): a Perl sub call.
+                        // `fnCall` arrives verbatim in frontend-emitted A1
+                        // nested inside capture arrows (the C frontend's
+                        // outparam channel), where the rewrite never ran.
                         let name = args.first().and_then(call_arg_str).unwrap_or_default();
                         let words = exec_word_args(args);
                         let rest: Vec<String> = words.iter().map(|w| render_word_list(w)).collect();
@@ -5733,6 +5752,25 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     if let Some(cmd) = stmts_to_shell_cmd(stmts) {
                         return cmd_str_to_open_perl(&cmd);
                     }
+                    // A PERL-SIDE capture: the C frontend's outparam
+                    // channel (setVar(cap, capture(Arrow[fnCall(..)]))) —
+                    // the callee ECHOES its out-param values and the
+                    // caller captures them. Redirect STDOUT into a string
+                    // buffer around the body statements.
+                    let has_calls = stmts.iter().any(|s| {
+                        matches!(s,
+                            IrStmt::Expr(IrExpr::Call { func, .. })
+                                if func == "$fn_call" || func == "exec" || func == "builtin")
+                    });
+                    if has_calls {
+                        let mut body = String::new();
+                        for st in stmts.iter() {
+                            emit_stmt(&mut body, st, 1);
+                        }
+                        return format!(
+                            "do {{ my $__cap = ''; open my $__fh, '>', \\$__cap or die; my $__old = select($__fh); {body}close $__fh; select($__old); $__cap }}"
+                        );
+                    }
                     // A non-rebuildable closure: its Perl rendering is
                     // not shell — refuse loudly rather than emit the
                     // broken `sub {}` text into bash -c.
@@ -6160,9 +6198,30 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     // double-quoted word): the raw chomped value, NOT a
                     // split (split in scalar context yields a field count).
                     let cap = args.first().and_then(arrow_to_cmd);
-                    match cap {
-                        Some(cmd) => cmd_str_to_open_perl(&cmd),
-                        None => "''".to_string(),
+                    if let Some(cmd) = cap {
+                        cmd_str_to_open_perl(&cmd)
+                    } else if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                        // A PERL-SIDE capture: the C frontend's outparam
+                        // channel — the callee ECHOES its out-param values,
+                        // the caller captures STDOUT into a buffer.
+                        let has_calls = stmts.iter().any(|s| {
+                            matches!(s,
+                                IrStmt::Expr(IrExpr::Call { func, .. })
+                                    if func == "$fn_call" || func == "fnCall" || func == "exec" || func == "builtin")
+                        });
+                        if has_calls {
+                            let mut body = String::new();
+                            for st in stmts.iter() {
+                                emit_stmt(&mut body, st, 1);
+                            }
+                            format!(
+                                "do {{ my $__cap = ''; open my $__fh, '>', \\$__cap or die; my $__old = select($__fh); {body}close $__fh; select($__old); $__cap }}"
+                            )
+                        } else {
+                            "''".to_string()
+                        }
+                    } else {
+                        "''".to_string()
                     }
                 }
                 "listVar" | "getArray" | "arrayItems" => args
@@ -6223,6 +6282,19 @@ pub(crate) fn ir_expr_to_perl(expr: &IrExpr) -> String {
                     format!("({})", items.join(", "))
                 }
                 "test" => render_test_call(args),
+                "line" => {
+                    // multi-return line read (`line(cap, N)` = the C
+                    // frontend's outparam channel): String(v).split('\n')[N]
+                    // → a Perl split with a default of ""
+                    if let (Some(v), Some(IrExpr::Str(i, _))) = (args.first(), args.get(1)) {
+                        let ve = ir_expr_to_perl(v);
+                        let n = i.parse::<usize>().unwrap_or(0);
+                        format!("((split(/\\n/, {ve}))[{n}] // '')")
+                    } else {
+                        eprintln!("debashc: line args unsupported");
+                        "''".to_string()
+                    }
+                }
                 // `regexMatch(Regex(pattern, flags), value)` — the fish
                 // `string match -rq` cond lift (triage-perl
                 // t81_regex_match): Perl's native regex is the exact ERE
