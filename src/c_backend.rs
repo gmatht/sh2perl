@@ -3489,6 +3489,12 @@ impl Render {
     /// Append a pipeline call's stage text (`a | b | c`).
     fn sh_pipeline_text(&mut self, buf: CmdBuf, args: &[IrExpr]) {
         let mut first = true;
+        // heredoc bodies attached to pipeline stages: bash reads the
+        // body from the lines FOLLOWING the whole pipeline line, while
+        // the `<<DELIM` marker stays attached to its own stage. Emit
+        // markers inline, defer every body to after the line.
+        let mut deferred: Vec<String> = Vec::new();
+        let mut first = true;
         if let Some(IrExpr::Array(items)) = args.first() {
             for it in items {
                 if let IrExpr::Arrow(stmts) = it {
@@ -3496,9 +3502,112 @@ impl Render {
                         self.sh_raw(buf, "|");
                     }
                     first = false;
-                    self.sh_stage(buf, stmts);
+                    let mut spec_redirect = |specs: &[IrExpr],
+                                             inner: &Vec<IrStmt>,
+                                             deferred: &mut Vec<String>,
+                                             buf: CmdBuf,
+                                             r: &mut Render|
+                     -> Vec<IrStmt> {
+                        let mut kept: Vec<IrExpr> = Vec::new();
+                        let mut all_heredoc = true;
+                        for sp in specs {
+                            if let IrExpr::Object(fields) = sp {
+                                let mut mode = String::new();
+                                let mut target =
+                                    IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted);
+                                let mut interpolate = true;
+                                for (k, v) in fields {
+                                    match k.as_str() {
+                                        "mode" => {
+                                            mode =
+                                                Self::str_arg(&[v.clone()], 0).unwrap_or_default();
+                                        }
+                                        "target" => target = v.clone(),
+                                        "interpolate" => {
+                                            if let IrExpr::Bool(b) = v {
+                                                interpolate = *b;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if matches!(mode.as_str(), "heredoc" | "heredoc-tabs") {
+                                    // inline marker, deferred body
+                                    r.sh_raw(buf, "<<'_SH2EOF_'");
+                                    let v = if interpolate {
+                                        r.heredoc_body_c(&target)
+                                    } else {
+                                        r.value_c(&target)
+                                    };
+                                    deferred.push(v);
+                                    continue;
+                                }
+                                all_heredoc = false;
+                            }
+                            kept.push(sp.clone());
+                        }
+                        if all_heredoc && !specs.is_empty() && kept.is_empty() {
+                            inner.clone()
+                        } else if kept.len() != specs.len() {
+                            vec![IrStmt::Expr(IrExpr::Call {
+                                func: "redirect".to_string(),
+                                args: vec![IrExpr::Arrow(inner.clone()), IrExpr::Array(kept)],
+                            })]
+                        } else {
+                            vec![IrStmt::Expr(IrExpr::Call {
+                                func: "redirect".to_string(),
+                                args: vec![
+                                    IrExpr::Arrow(inner.clone()),
+                                    IrExpr::Array(specs.to_vec()),
+                                ],
+                            })]
+                        }
+                    };
+                    let cleaned: Vec<IrStmt> = stmts
+                        .iter()
+                        .flat_map(|s| match s {
+                            IrStmt::Redirect { inner, redirects } => {
+                                let specs: Vec<IrExpr> = redirects
+                                    .iter()
+                                    .map(|rd| {
+                                        IrExpr::Object(vec![
+                                            (
+                                                "fd".to_string(),
+                                                IrExpr::Int(rd.fd.unwrap_or(0) as i64),
+                                            ),
+                                            ("mode".to_string(), IrExpr::Str(rd.mode.clone(), crate::ir::StrStyle::DoubleQuoted)),
+                                            ("target".to_string(), rd.target.clone()),
+                                            ("interpolate".to_string(), IrExpr::Bool(rd.interpolate)),
+                                        ])
+                                    })
+                                    .collect();
+                                spec_redirect(&specs, inner, &mut deferred, buf, self)
+                            }
+                            IrStmt::Expr(IrExpr::Call { func, args })
+                                if func == "redirect" =>
+                            {
+                                match (args.first(), args.get(1)) {
+                                    (Some(IrExpr::Arrow(inner)), Some(IrExpr::Array(specs))) => {
+                                        spec_redirect(specs, inner, &mut deferred, buf, self)
+                                    }
+                                    _ => vec![s.clone()],
+                                }
+                            }
+                            other => vec![other.clone()],
+                        })
+                        .collect();
+                    self.sh_stage(buf, &cleaned);
                 }
             }
+        }
+        // bodies follow the whole pipeline line, one block per marker
+        for v in &deferred {
+            self.emit("_sh_add(\"\\n\");");
+            self.emit(&format!("_sh_add({v});"));
+            self.emit(&format!(
+                "{{ size_t _hl = strlen({v}); if (_hl == 0 || {v}[_hl - 1] != '\\n') _sh_add(\"\\n\"); }}"
+            ));
+            self.emit(&format!("_sh_add({});", Self::cstr("_SH2EOF_\\n")));
         }
     }
 
@@ -9876,7 +9985,20 @@ fn brace_expand(args: &[IrExpr]) -> Vec<String> {
         for g in gs {
             let mut items = Vec::new();
             if let Some(es) = g.as_array() {
+                // A MULTI-entry group is a COMMA LIST: elements that look
+                // like ranges are LITERAL text (bash expands a range only
+                // as a standalone {a..b}; `{1..3,7..9}` yields `1..3
+                // 7..9`, not `1 2 3 7 8 9`)
+                let multi = es.len() > 1;
                 for e in es {
+                    if multi {
+                        if let Some(r) = e.get("range").and_then(|r| r.as_array()) {
+                            let a = r.first().and_then(|x| x.as_str()).unwrap_or("");
+                            let b = r.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                            items.push(format!("{a}..{b}"));
+                            continue;
+                        }
+                    }
                     items.extend(brace_group_items(e));
                 }
             }
@@ -9886,18 +10008,43 @@ fn brace_expand(args: &[IrExpr]) -> Vec<String> {
     if groups.is_empty() {
         return vec![format!("{prefix}{suffix}")];
     }
+    // middles (args[2]): the literal separators BETWEEN consecutive
+    // groups (`x_{a..b}_{1..2}_{p,q}` → middles ["_", "_"]) — ignoring
+    // them glued multi-group words together
+    let mids: Vec<String> = args
+        .get(2)
+        .and_then(|a| match a {
+            IrExpr::Json(v) => Some(
+                v.as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
     let mut out: Vec<String> = vec![String::new()];
+    let mut rendered = 0usize;
     for g in &groups {
         if g.is_empty() {
             continue;
         }
+        let mid: &str = if rendered == 0 {
+            ""
+        } else {
+            mids.get(rendered - 1).map(|s| s.as_str()).unwrap_or("")
+        };
         let mut next = Vec::new();
         for o in &out {
             for item in g {
-                next.push(format!("{o}{item}"));
+                next.push(format!("{o}{mid}{item}"));
             }
         }
         out = next;
+        rendered += 1;
     }
     out.iter().map(|s| format!("{prefix}{s}{suffix}")).collect()
 }
