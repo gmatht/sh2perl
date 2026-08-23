@@ -500,6 +500,7 @@ impl Render {
             self.emit("/* shell-out runtime: build a command line, run it via bash -c */");
             self.emit("static int _sh_rc = 0;");
             self.emit("static int _sh_argc = 0; static char **_sh_argv = 0;");
+            self.emit("static char _sh_opts[] = \"hB\"; /* $- — option flags */");
             self.emit("static char *_sh_cmd = 0; static size_t _sh_cap = 0;");
             self.emit("static char *_sh_wb = 0; static size_t _sh_wcap = 0;");
             self.emit("static char *_sh_wrap = 0; static size_t _sh_wrapcap = 0;");
@@ -1320,15 +1321,30 @@ impl Render {
                 self.literal_init(&rhs)
             };
             if let Some(init) = init {
-                self.const_lifted.insert(v.to_string());
-                if self.is_num(v) {
-                    self.emit(&format!("const {} {name} = {init};", self.width_of_var(v).c_type()));
-                } else if let Some(b) = self.buf_bound(v) {
-                    self.emit(&format!("const char {name}[{}] = {init};", b + 1));
+                // type guard: a numeric literal cannot initialize a char
+                // buffer/pointer (invalid C — 078_arithmetic_double_paren
+                // `const char i[21] = 2;`); only lift when the declared
+                // form matches the initializer kind
+                let numeric_init = matches!(rhs, IrExpr::Int(_))
+                    || matches!(&rhs, IrExpr::Str(s, _) if s.trim().parse::<i128>().is_ok());
+                let ok = if self.is_num(v) {
+                    numeric_init || matches!(&rhs, IrExpr::Str(s, _) if s.trim().parse::<i128>().is_ok())
+                } else if self.buf_bound(v).is_some() {
+                    !numeric_init && matches!(rhs, IrExpr::Str(_, _) | IrExpr::Interpolate(_))
                 } else {
-                    self.emit(&format!("const char* {name} = {init};"));
+                    matches!(rhs, IrExpr::Str(_, _) | IrExpr::Interpolate(_))
+                };
+                if ok {
+                    self.const_lifted.insert(v.to_string());
+                    if self.is_num(v) {
+                        self.emit(&format!("const {} {name} = {init};", self.width_of_var(v).c_type()));
+                    } else if let Some(b) = self.buf_bound(v) {
+                        self.emit(&format!("const char {name}[{}] = {init};", b + 1));
+                    } else {
+                        self.emit(&format!("const char* {name} = {init};"));
+                    }
+                    return;
                 }
-                return;
             }
         }
         if self.is_num(v) {
@@ -1693,12 +1709,21 @@ impl Render {
                 },
                 "join" => self.join_value(args),
                 "arith" => {
-                    // VALUE context `x=$(( dyn ))`: capture the arith
-                    // RESULT (the call() dispatch's first `arith` arm is
-                    // the truthiness site — wrong for a value). The
-                    // child command must ECHO the expansion (`$(( ))`
-                    // alone is not a command).
+                    // VALUE context `x=$(( dyn ))`: NATIVE evaluation
+                    // first (parse_arith → the typed arith renderer —
+                    // no fork/exec emulation); the child-bash capture
+                    // (`echo "$(( ))"`) is the fallback for texts the
+                    // parser cannot handle.
                     if let Some(s) = Self::str_arg(args, 0) {
+                        let pre = Self::arith_subst_specials(&s);
+                        if let Some(ast) = crate::shir::parse_arith(&pre) {
+                            let v = if Self::arith_has_side_effects(&ast) {
+                                self.arith_sequenced(&ast)
+                            } else {
+                                self.arith(&ast)
+                            };
+                            return self.num_temp(&v);
+                        }
                         let s = s.clone();
                         self.cap_site(|r, id| {
                             r.sh_export_vars(&s);
@@ -3486,6 +3511,235 @@ impl Render {
 
     /// `(( expr ))` as a site: export the vars, run `(( expr ))` via
     /// bash -c; return the INVERTED rc (bash rc==0 ⟺ value nonzero).
+    /// A raw `(( ... ))` text — try NATIVE evaluation first (parse_arith
+    /// → the typed C arith renderer: no fork/exec emulation); fall back
+    /// to the child-bash site only for texts the parser cannot handle.
+    /// Positional/special params are substituted textually first (bash
+    /// expands them before the arithmetic parses).
+    fn arith_text(&mut self, s: &str) -> String {
+        let pre = Self::arith_subst_specials(s);
+        if let Some(ast) = crate::shir::parse_arith(&pre) {
+            if Self::arith_has_side_effects(&ast) {
+                return self.arith_sequenced(&ast);
+            }
+            return self.arith(&ast);
+        }
+        self.arith_string_site(s)
+    }
+
+    /// `$N` / `${N}` (positionals), `$#`, `$?` → their numeric C reads.
+    /// bash expands these BEFORE the arith parser sees the text.
+    fn arith_subst_specials(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '$' && i + 1 < chars.len() {
+                let rest: String = chars[i + 1..].iter().collect();
+                if let Some(inner) = rest.strip_prefix('{') {
+                    if let Some(end) = inner.find('}') {
+                        let name = &inner[..end];
+                        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                            out.push_str(&Self::positional_read(name));
+                            i += 3 + end;
+                            continue;
+                        }
+                    }
+                } else if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                    let mut j = i + 1;
+                    while j < chars.len() && chars[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    let n: String = chars[i + 1..j].iter().collect();
+                    out.push_str(&Self::positional_read(&n));
+                    i = j;
+                    continue;
+                } else if rest.starts_with('#') {
+                    out.push_str("((_sh_argc > 0) ? (_sh_argc - 1) : 0)");
+                    i += 2;
+                    continue;
+                } else if rest.starts_with('?') {
+                    out.push_str("((long long)_sh_rc)");
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
+    }
+
+    fn positional_read(n: &str) -> String {
+        format!(
+            "(atoll((( {n} < _sh_argc && _sh_argv[{n}]) ? _sh_argv[{n}] : \"\")))"
+        )
+    }
+
+    /// Conservative native-renderability test for the Redirect fast path:
+    /// scalar assigns / arith / tests (and And/Or chains over them) —
+    /// anything else may need a shell site.
+    fn stmt_natively_renderable(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Expr(e) => Self::expr_natively_renderable(e),
+            IrStmt::Assign { targets, expr, .. } => {
+                targets.iter().all(|t| t.indices.is_empty())
+                    && Self::expr_natively_renderable(expr)
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                redirects.iter().all(|rd| matches!(rd.fd, Some(f) if f >= 2))
+                    && inner.iter().all(Self::stmt_natively_renderable)
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_natively_renderable(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Int(_) | IrExpr::Str(_, _) => true,
+            IrExpr::Call { func, args } => {
+                matches!(func.as_str(), "test" | "arith" | "getVar" | "setVar" | "assign")
+                    && args.iter().all(|a| match a {
+                        IrExpr::Str(s, _) => !s.contains("$(") && !s.contains("`"),
+                        other => Self::expr_natively_renderable(other),
+                    })
+            }
+            IrExpr::BinOp { lhs, op, rhs } => {
+                matches!(
+                    op,
+                    crate::ir::BinOpKind::And
+                        | crate::ir::BinOpKind::Or
+                        | crate::ir::BinOpKind::Not
+                ) && Self::expr_natively_renderable(lhs)
+                    && Self::expr_natively_renderable(rhs)
+            }
+            IrExpr::Arith(a) => !Self::arith_has_side_effects(a),
+            _ => false,
+        }
+    }
+
+    fn arith_has_side_effects(a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Assign { .. } | ArithAst::IncDec { .. } => true,
+            ArithAst::Bin { lhs, rhs, .. } => {
+                Self::arith_has_side_effects(lhs) || Self::arith_has_side_effects(rhs)
+            }
+            ArithAst::Un { arg, .. } => Self::arith_has_side_effects(arg),
+            ArithAst::Cond { test, then, else_ } => {
+                Self::arith_has_side_effects(test)
+                    || Self::arith_has_side_effects(then)
+                    || Self::arith_has_side_effects(else_)
+            }
+            ArithAst::Index { key, .. } => Self::arith_has_side_effects(key),
+            _ => false,
+        }
+    }
+
+    /// Side-effecting arith (`j = i++ + ++i`) rendered SEQUENCED: every
+    /// mutation becomes an ordered statement writing a numbered temp; the
+    /// final expression reads only temps. A flat nested expression would
+    /// let hoisted temps reorder bash's left-to-right mutations.
+    fn arith_sequenced(&mut self, a: &ArithAst) -> String {
+        let mut out: Vec<String> = Vec::new();
+        let e = self.arith_seq_walk(a, &mut out);
+        for l in out {
+            self.emit(&l);
+        }
+        e
+    }
+
+    fn fresh_ll(&mut self) -> String {
+        let t = format!("_sq{}", self.temp_seq);
+        self.temp_seq += 1;
+        t
+    }
+
+    /// A var write of a numeric VALUE as its shell string form — pushed
+    /// into the ordered statement list (NOT emitted directly: helpers
+    /// like num_temp would break the sequence order).
+    fn seq_write_str_var(&mut self, var: &str, val: &str, out: &mut Vec<String>) {
+        let id = self.c_ident(var);
+        let t = self.temp_seq;
+        self.temp_seq += 1;
+        if let Some(b) = self.buf_bound(var) {
+            out.push(format!(
+                "{{ char _wb{t}[32]; snprintf(_wb{t}, sizeof _wb{t}, \"%lld\", (long long)({val})); strncpy({id}, _wb{t}, {b} + 1); {id}[{b}] = '\\0'; }}"
+            ));
+        } else {
+            out.push(format!(
+                "{{ static char _wb{t}[32]; snprintf(_wb{t}, sizeof _wb{t}, \"%lld\", (long long)({val})); {id} = _wb{t}; }}"
+            ));
+        }
+    }
+
+    fn arith_seq_walk(&mut self, a: &ArithAst, out: &mut Vec<String>) -> String {
+        match a {
+            ArithAst::IncDec { var, delta, prefix } => {
+                let id = self.c_ident(var);
+                let d = if *delta >= 0 { "1" } else { "-1" };
+                let t = self.fresh_ll();
+                if self.is_num(var) {
+                    if *prefix {
+                        out.push(format!("long long {t} = ({id} += {d});"));
+                    } else {
+                        out.push(format!("long long {t} = {id};"));
+                        out.push(format!("{id} += {d};"));
+                    }
+                } else {
+                    let store = self.store_read(var);
+                    if *prefix {
+                        out.push(format!("long long {t} = atoll({store}) + {d};"));
+                        let tv = t.clone();
+                        self.seq_write_str_var(var, &tv, out);
+                    } else {
+                        out.push(format!("long long {t} = atoll({store});"));
+                        let w = format!("({t} + {d})");
+                        self.seq_write_str_var(var, &w, out);
+                    }
+                }
+                t
+            }
+            ArithAst::Assign { var, op, rhs } => {
+                let r = self.arith_seq_walk(rhs, out);
+                let id = self.c_ident(var);
+                let t = self.fresh_ll();
+                if op == "=" {
+                    if self.is_num(var) {
+                        out.push(format!("long long {t} = ({id} = ({r}));"));
+                    } else {
+                        out.push(format!("long long {t} = ({r});"));
+                        let tv = t.clone();
+                        self.seq_write_str_var(var, &tv, out);
+                    }
+                } else if self.is_num(var) {
+                    out.push(format!("long long {t} = ({id} {op} ({r}));"));
+                } else {
+                    let base = op.trim_end_matches('=');
+                    let store = self.store_read(var);
+                    out.push(format!(
+                        "long long {t} = (atoll({store}) {base} ({r}));"
+                    ));
+                    let tv = t.clone();
+                    self.seq_write_str_var(var, &tv, out);
+                }
+                t
+            }
+            ArithAst::Bin { op, lhs, rhs } => {
+                let l = self.arith_seq_walk(lhs, out);
+                let r = self.arith_seq_walk(rhs, out);
+                if op == "**" {
+                    self.need_pow = true;
+                    format!("_sh_pow({l},{r})")
+                } else if op == "/" || op == "%" {
+                    format!("({r} == 0 ? 0 : ({l} {op} {r}))")
+                } else {
+                    format!("({l} {op} {r})")
+                }
+            }
+            other => self.arith(other),
+        }
+    }
+
     fn arith_string_site(&mut self, s: &str) -> String {
         let s = s.to_string();
         self.shell_site(
@@ -3933,10 +4187,43 @@ impl Render {
             "\\>" => format!("(strcmp({l}, {r}) > 0)"),
             "\\<" => format!("(strcmp({l}, {r}) < 0)"),
             "=" | "==" | "!=" => {
-                let has_glob = raw_l.contains('*')
-                    || raw_l.contains('?')
-                    || raw_r.contains('*')
-                    || raw_r.contains('?');
+                // glob metachars in the PATTERN text — but `$?`/`${…}`/
+                // `$var` expansions must not count (their `?`/`*` are
+                // parameter syntax), and a QUOTED pattern is literal
+                let mask_params = |s: &str| -> String {
+                    let d = s.trim_matches(|c| c == '"' || c == '\'');
+                    let chars: Vec<char> = d.chars().collect();
+                    let mut out = String::new();
+                    let mut i = 0;
+                    while i < chars.len() {
+                        if chars[i] == '$' {
+                            i += 1;
+                            if i < chars.len() && chars[i] == '{' {
+                                let mut depth = 1;
+                                i += 1;
+                                while i < chars.len() && depth > 0 {
+                                    if chars[i] == '{' {
+                                        depth += 1;
+                                    } else if chars[i] == '}' {
+                                        depth -= 1;
+                                    }
+                                    i += 1;
+                                }
+                            } else {
+                                i += 1;
+                            }
+                        } else {
+                            out.push(chars[i]);
+                            i += 1;
+                        }
+                    }
+                    out
+                };
+                let r_quoted = raw_r.starts_with('"') || raw_r.starts_with('\'');
+                let masked_r = mask_params(raw_r);
+                let has_glob = !r_quoted && (masked_r.contains('*') || masked_r.contains('?'))
+                    || mask_params(raw_l).contains('*')
+                    || mask_params(raw_l).contains('?');
                 if has_glob {
                     // `[[ x == pattern ]]` — glob match (fnmatch);
                     // extglobs (`!(a)`, `@(a|b)`, `+(a)`, ...) use
@@ -3944,7 +4231,7 @@ impl Render {
                     // old negated-fnmatch approximation was wrong)
                     self.need_fnmatch = true;
                     let neg = op == "!=";
-                    let pat = if neg { raw_r.clone() } else { raw_r.clone() };
+                    let pat = raw_r.trim_matches(|c| c == '"' || c == '\'').to_string();
                     let ext = pat.contains("!(")
                         || pat.contains("@(")
                         || pat.contains("+(")
@@ -4115,6 +4402,30 @@ impl Render {
                     Self::cstr(rest)
                 ));
                 return t;
+            }
+            // special params ($?, $#, $$, $!, $-, $0, $1.., $@) — the
+            // getVar mapping (a `?` here previously rendered as "")
+            let is_special = stripped == "?"
+                || stripped == "$"
+                || stripped == "#"
+                || stripped == "!"
+                || stripped == "-"
+                || stripped == "@"
+                || stripped == "*"
+                || (!stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit()));
+            if is_special {
+                let v = self.call(
+                    "getVar",
+                    &[IrExpr::Str(stripped.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+                );
+                // numeric-valued specials (?, #, $, !) render as ints —
+                // a test operand needs a char*
+                if matches!(&stripped[..], "?" | "#" | "$" | "!") {
+                    let t = self.str_temp(32);
+                    self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", (long long)({v}));"));
+                    return t;
+                }
+                return v;
             }
             "\"\"".into()
         } else if raw.starts_with('$') && raw.len() > 1 {
@@ -4500,6 +4811,19 @@ impl Render {
                     self.need_sh = true;
                     return "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into();
                 }
+                if name == "0" {
+                    // $0 — the program name (argv[0]; bash carries the
+                    // script path there, the transpiled binary its own)
+                    self.need_sh = true;
+                    return "((_sh_argc > 0 && _sh_argv[0]) ? _sh_argv[0] : \"\")".into();
+                }
+                if name == "-" {
+                    // $- — current option flags. The native runtime keeps
+                    // them in a mutable string seeded with the interactive-
+                    // off defaults; `set ±x/v/e` update it when rendered.
+                    self.need_sh = true;
+                    return "_sh_opts".into();
+                }
                 if name == "@" || name == "*" {
                     self.need_sh = true;
                     let t = self.str_temp(4096);
@@ -4566,7 +4890,7 @@ impl Render {
                 }
             }
             "arith" => match Self::str_arg(args, 0) {
-                Some(s) => self.arith_string_site(&s),
+                Some(s) => self.arith_text(&s),
                 None => "0".into(),
             },
             "test" => match Self::str_arg(args, 0) {
@@ -4813,6 +5137,30 @@ impl Render {
     /// A redirect call (expr position): reconstruct `cmd <redirs>` and
     /// run it.
     fn redirect_expr(&mut self, args: &[IrExpr]) -> String {
+        // NATIVE fast path: stderr-only redirects over natively
+        // renderable statements (n=$(($1+0)) 2>/dev/null) — the assign
+        // must land in the parent, a child-bash site would lose it
+        if let (Some(IrExpr::Arrow(stmts)), Some(IrExpr::Array(specs))) = (args.first(), args.get(1))
+        {
+            // stderr-only: every spec's fd >= 2 (stdout redirects change
+            // what the diff sees — never skip those)
+            let stderr_only = specs.iter().all(|sp| match sp {
+                IrExpr::Object(fields) => fields.iter().all(|(k, v)| match k.as_str() {
+                    "fd" => matches!(v, IrExpr::Int(n) if *n >= 2),
+                    "mode" | "target" => true,
+                    _ => false,
+                }),
+                _ => false,
+            });
+            if stderr_only && stmts.iter().all(Self::stmt_natively_renderable) {
+                for s in stmts {
+                    self.stmt(s);
+                }
+                // bash: the command's rc — keep the site-call convention
+                // (truthiness) so And/Or chains around this expr still work
+                return "(_sh_rc == 0)".into();
+            }
+        }
         let args = args.to_vec();
         self.shell_site(
             |r| {
@@ -5676,7 +6024,7 @@ impl Render {
                     // `break || X` — break ALWAYS succeeds, X never runs
                     // (`continue || X` likewise) — the C break/continue
                     // cannot be an expression, so peel the BinOp
-                    IrExpr::BinOp { lhs, op, .. }
+                    IrExpr::BinOp { lhs, op, rhs, .. }
                         if matches!(op, crate::ir::BinOpKind::Or | crate::ir::BinOpKind::And) =>
                     {
                         if let IrExpr::Call { func, .. } = lhs.as_ref() {
@@ -5689,6 +6037,56 @@ impl Render {
                                 return;
                             }
                         }
+                        // statement-level `A && B` / `A || B` where A is a
+                        // command/test: bash publishes A's verdict in $?
+                        // (the chain's rc is B's rc when B runs, else A's
+                        // failure) — the flat `(l && r);` form leaked a
+                        // stale $? (eq-string-num-var status-zero2)
+                        let chain_lhs = matches!(
+                            lhs.as_ref(),
+                            IrExpr::Call { func, .. }
+                                if func == "exec"
+                                    || func == "builtin"
+                                    || func == "pipeline"
+                                    || func == "test"
+                        ) || matches!(lhs.as_ref(),
+                            IrExpr::BinOp { op: crate::ir::BinOpKind::Not, .. });
+                        if chain_lhs {
+                            let l = self.expr(lhs.as_ref());
+                            let t = self.temp_seq;
+                            self.temp_seq += 1;
+                            self.emit(&format!("{{ int _t{t} = ({l});"));
+                            self.emit(&format!("  _sh_rc = _t{t} ? 0 : 1;"));
+                            if *op == crate::ir::BinOpKind::And {
+                                self.emit(&format!("  if (_t{t}) {{"));
+                            } else {
+                                self.emit(&format!("  if (!_t{t}) {{"));
+                            }
+                            self.depth += 1;
+                            // the rhs may itself be a chain — recurse as a
+                            // statement so nested verdicts publish too
+                            let rhs_stmt = IrStmt::Expr((**rhs).clone());
+                            self.stmt(&rhs_stmt);
+                            self.depth -= 1;
+                            self.emit("  }");
+                            self.emit("}");
+                            return;
+                        }
+                    }
+                    // `! cmd` / `! pipeline` — bash stores the NEGATED rc
+                    // in $?: the statement must ASSIGN back, not discard
+                    IrExpr::BinOp { lhs, op: crate::ir::BinOpKind::Not, .. }
+                        if matches!(
+                            lhs.as_ref(),
+                            IrExpr::Call { func, .. }
+                                if func == "exec" || func == "builtin" || func == "pipeline"
+                        ) =>
+                    {
+                        // the site renders as bash-truthiness (true iff
+                        // rc==0); `! cmd` stores the inverted verdict
+                        let v = self.expr(lhs.as_ref());
+                        self.emit(&format!("_sh_rc = ({v}) ? 1 : 0;"));
+                        return;
                     }
                     IrExpr::Call { func, args } if func == "break" => {
                         self.emit("break;");
@@ -5829,7 +6227,9 @@ impl Render {
                         a.as_ref(),
                         ArithAst::Assign { .. } | ArithAst::IncDec { .. }
                     ) {
-                        let c = self.arith(a);
+                        // a nested mutation (j = i++ + ++i) must not be
+                        // reordered by hoisted temps — sequence it
+                        let c = self.arith_sequenced(a);
                         self.need_sh = true;
                         let is_self = matches!(a.as_ref(), ArithAst::IncDec { var, .. } if var == &t.var)
                             || matches!(a.as_ref(), ArithAst::Assign { var, .. } if var == &t.var);
@@ -6369,6 +6769,22 @@ impl Render {
                 // calls arrive as exec("<name>") and render `name();`.
             }
             IrStmt::Redirect { inner, redirects } => {
+                // NATIVE fast path: a redirect that only touches fd≥2
+                // (`cmd 2>/dev/null`) silences stderr — stdout parity is
+                // unaffected, so when the inner statement is natively
+                // renderable (a scalar assign / test / arith chain), skip
+                // the child-bash site entirely (the assign's variable
+                // write must land in the PARENT process — a site would
+                // lose it: dollar-positional-arithmetic n=$(($1+0)) 2>/dev/null)
+                let stderr_only = redirects.iter().all(|rd| {
+                    matches!(rd.fd, Some(f) if f >= 2)
+                });
+                if stderr_only && inner.iter().all(Self::stmt_natively_renderable) {
+                    for s in inner {
+                        self.stmt(s);
+                    }
+                    return;
+                }
                 // `cmd > file 2>&1` — reconstruct the full shell text and
                 // run it (bash applies the redirections exactly)
                 let inner = inner.clone();
@@ -6948,7 +7364,12 @@ impl Render {
         if !fn_out.is_empty() {
             self.emit("");
         }
-        self.emit("int main(void) {");
+        self.emit("int main(int _mac, char **_mav) {");
+        if self.need_sh {
+            // real argv for $0 / positional params (function-call
+            // emulation saves/restores _sh_argv around its own sites)
+            self.emit("  _sh_argv = _mav; _sh_argc = _mac;");
+        }
         // Only REAL shell-out sites (bash -c subprocesses) need the
         // preamble: their children share fd 1 — unbuffered stdout keeps
         // the interleave order — and write to our stderr — silenced to
@@ -7316,6 +7737,14 @@ fn collect_capture_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 fn const_assign_rhs(stmts: &[IrStmt], const_vars: &HashMap<String, VarKind>) -> HashMap<String, IrExpr> {
     let mut out = HashMap::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    // raw arith texts (`(( j = i++ + ++i ))` arrives as Call{func:"arith",
+    // args:["i++ + ++i"]}) hide writes from the typed walk — any name
+    // mentioned in one is conservatively poisoned (soundness > lift rate)
+    let mut arith_names: BTreeSet<String> = BTreeSet::new();
+    for s in stmts {
+        collect_arith_text_names(s, &mut arith_names);
+    }
+    let mut poisoned: BTreeSet<String> = arith_names;
     for s in stmts {
         if let IrStmt::Assign { targets, expr, .. } = s {
             for t in targets {
@@ -7323,8 +7752,14 @@ fn const_assign_rhs(stmts: &[IrStmt], const_vars: &HashMap<String, VarKind>) -> 
                     && const_vars.get(&t.var) == Some(&VarKind::Const)
                     && !out.contains_key(&t.var)
                     && !seen.contains(&t.var)
+                    && !poisoned.contains(&t.var)
                 {
                     out.insert(t.var.clone(), expr.clone());
+                } else if out.contains_key(&t.var) {
+                    // a SECOND write — the first assignment is not the
+                    // final value; the lift is unsound
+                    out.remove(&t.var);
+                    poisoned.insert(t.var.clone());
                 }
             }
         }
@@ -7336,7 +7771,90 @@ fn const_assign_rhs(stmts: &[IrStmt], const_vars: &HashMap<String, VarKind>) -> 
             seen.insert(r);
         }
     }
+    out.retain(|k, _| !poisoned.contains(k));
     out
+}
+
+/// Identifiers mentioned inside raw `arith` call texts — a conservative
+/// write/mutation set for the const-lift (`i++` never parses as Arith).
+fn collect_arith_text_names(s: &IrStmt, out: &mut BTreeSet<String>) {
+    fn walk(e: &IrExpr, out: &mut BTreeSet<String>) {
+        match e {
+            IrExpr::Call { func, args } if func == "arith" || func == "cstyleFor" => {
+                for a in args {
+                    if let IrExpr::Str(txt, _) = a {
+                        for tok in txt.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                            if !tok.is_empty()
+                                && tok.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                            {
+                                out.insert(tok.to_string());
+                            }
+                        }
+                    } else {
+                        walk(a, out);
+                    }
+                }
+            }
+            IrExpr::Call { func, args } if func == "test" => {
+                for a in args {
+                    if let IrExpr::Str(txt, _) = a {
+                        // `${…}`/`$var` mentions inside test text
+                        for tok in txt.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                            if !tok.is_empty()
+                                && tok.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                            {
+                                out.insert(tok.to_string());
+                            }
+                        }
+                    } else {
+                        walk(a, out);
+                    }
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk(expr, out),
+            IrExpr::Arrow(body) => {
+                for st in body {
+                    collect_arith_text_names(st, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_e(e: &IrExpr, out: &mut BTreeSet<String>) {
+        walk(e, out);
+        match e {
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_e(lhs, out);
+                walk_e(rhs, out);
+            }
+            IrExpr::Interpolate(_) => {}
+            _ => {}
+        }
+    }
+    match s {
+        IrStmt::Expr(e) | IrStmt::Assign { expr: e, .. } => walk_e(e, out),
+        IrStmt::If { cond, then, elsifs, else_, .. } => {
+            walk_e(cond, out);
+            for st in then {
+                collect_arith_text_names(st, out);
+            }
+            for st in else_ {
+                collect_arith_text_names(st, out);
+            }
+            for (_, body) in elsifs {
+                for st in body {
+                    collect_arith_text_names(st, out);
+                }
+            }
+        }
+        IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+            walk_e(cond, out);
+            for st in body {
+                collect_arith_text_names(st, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Names READ by a statement (getVar/param/word mentions) — a const lift
