@@ -1687,6 +1687,17 @@ impl Render {
                     let Some(name) = Self::str_arg(args, 0) else {
                         return "0".into();
                     };
+                    // `${#s}` arrives as getVar("#s") — string length
+                    if let Some(base) = name.strip_prefix('#') {
+                        if !base.is_empty() && is_ident(base) {
+                            let v = if self.is_num(base) {
+                                self.num_temp(&self.c_ident(base))
+                            } else {
+                                self.store_read(base)
+                            };
+                            return self.num_temp(&format!("(long long)strlen({v})"));
+                        }
+                    }
                     if name == "?" {
                         return self.num_temp("_sh_rc");
                     }
@@ -2002,6 +2013,16 @@ impl Render {
                 "getVar" => {
                     let name = Self::str_arg(args, 0);
                     match name.as_deref() {
+                        Some(n) if n.starts_with('#') && is_ident(&n[1..]) => {
+                            // `${#s}` → getVar("#s")
+                            let v = if self.is_num(&n[1..]) {
+                                self.num_temp(&self.c_ident(&n[1..]))
+                            } else {
+                                self.store_read(&n[1..])
+                            };
+                            let t = self.num_temp(&format!("(long long)strlen({v})"));
+                            word(self, t);
+                        }
                         Some("?") => {
                             let t = self.num_temp("_sh_rc");
                             word(self, t);
@@ -2281,6 +2302,19 @@ impl Render {
                                 // store_read("@") and exported an empty
                                 // value, so the child saw `hello ' '`)
                                 let (v, ref_text): (String, String) = match n.as_str() {
+                                    p if p.starts_with('#')
+                                        && is_ident(&p[1..]) =>
+                                    {
+                                        // `${#s}` → getVar("#s")
+                                        let v = if self.is_num(&p[1..]) {
+                                            self.num_temp(&self.c_ident(&p[1..]))
+                                        } else {
+                                            self.store_read(&p[1..])
+                                        };
+                                        let t =
+                                            self.num_temp(&format!("(long long)strlen({v})"));
+                                        (t.clone(), format!("${{#{}}}", &p[1..]))
+                                    }
                                     "?" => {
                                         let t = self.num_temp("_sh_rc");
                                         (t.clone(), t)
@@ -4037,6 +4071,12 @@ impl Render {
     /// default) renders as its value.
     fn default_word(&mut self, x: &IrExpr) -> String {
         if let IrExpr::Str(s, _) = x {
+            // a default carrying `$var`/`${...}` EXPANDS at runtime
+            // (${MOUNTPOINT:-${NAME}} → the NAME value) — render it like
+            // an unquoted heredoc body instead of the literal text
+            if s.contains('$') {
+                return self.heredoc_body_c(x);
+            }
             let t = s.trim();
             let chars: Vec<char> = t.chars().collect();
             if chars.len() >= 2
@@ -4050,6 +4090,22 @@ impl Render {
         } else {
             self.value_c(x)
         }
+    }
+
+
+    /// A numeric operand that may be RAW TEXT carrying `$var` refs
+    /// (`${s:$i:1}` arrives with the offset as Str("$i")) — expand the
+    /// text like an unquoted heredoc body, then atoll() it.
+    fn value_num_dollar(&mut self, x: &IrExpr) -> String {
+        if let IrExpr::Str(s, _) = x {
+            if s.contains('$') {
+                let v = self.heredoc_body_c(x);
+                // RAW numeric expr — num_temp would stringify it back
+                // into a char* buffer
+                return format!("(long long)atoll({v})");
+            }
+        }
+        self.value_num(x)
     }
 
     /// A shell-out exec site (statement or expr position).
@@ -4968,11 +5024,17 @@ impl Render {
                 t
             }
             "slice" => {
-                let off = args.get(2).map(|x| self.value_num(x)).unwrap_or_else(|| "0".into());
+                let off = args
+                    .get(2)
+                    .map(|x| self.value_num_dollar(x))
+                    .unwrap_or_else(|| "0".into());
                 // no length arg = to the end — a huge positive sentinel
                 // (see the 4-arg slice arm: negative lens are real
                 // end-counts in the runtime)
-                let len = args.get(3).map(|x| self.value_num(x)).unwrap_or_else(|| "(long long)1LL<<60".into());
+                let len = args
+                    .get(3)
+                    .map(|x| self.value_num_dollar(x))
+                    .unwrap_or_else(|| "(long long)1LL<<60".into());
                 self.need_sh = true;
                 let t = self.str_temp(4096);
                 self.emit(&format!(
@@ -5110,6 +5172,19 @@ impl Render {
                 if name == "$" {
                     // `$$` — the shell PID
                     return "getpid()".into();
+                }
+                // `${#s}` arrives as getVar("#s") — string length as a
+                // STRING temp (shell values are strings; strdup'ing a raw
+                // long long would segfault)
+                if let Some(base) = name.strip_prefix('#') {
+                    if !base.is_empty() && is_ident(base) {
+                        let v = if self.is_num(base) {
+                            self.num_temp(&self.c_ident(base))
+                        } else {
+                            self.store_read(base)
+                        };
+                        return self.num_temp(&format!("(long long)strlen({v})"));
+                    }
                 }
                 if name == "#" {
                     self.need_sh = true;
@@ -5485,7 +5560,7 @@ impl Render {
             Some(e) => e.clone(),
             None => return "0".into(),
         };
-        self.value_num(&e)
+        self.value_num_dollar(&e)
     }
 
     // ── arrays ───────────────────────────────────────────────────────
