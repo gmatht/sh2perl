@@ -65,6 +65,17 @@ pub fn shir_to_shir_json(prog: &IrProgram) -> String {
     // so every backend consuming the A1 contract knows the body always
     // runs (the estree backend uses it to skip its ran/last tracking).
     crate::shir::set_provably_running_loops(&prog.stmts);
+    // shir-builtin-op-20260816: the A1 CONTRACT carries the native
+    // `builtin` op — every exec of a builtins.json command is rewritten
+    // AT EXPORT (after the analyses above, which stay exec-shaped), so
+    // the shared A1 check ("no exec of a builtins.json command in the
+    // A1") holds and the backends see the native verdict. The renderers
+    // erase/accept at their entries (self-fallback); the internal IR and
+    // the analyses are untouched.
+    crate::transforms::builtin::transform(&mut prog.stmts);
+    for sub in prog.subs.iter_mut() {
+        crate::transforms::builtin::transform(&mut sub.body);
+    }
     program_json(&prog, CONTRACT_VERSION).to_string()
 }
 
@@ -74,7 +85,15 @@ pub fn shir_to_shir_json(prog: &IrProgram) -> String {
 /// serialization (purity is a per-node property, not a post-attach).
 /// Use to pin `F(S)_raw == C(S)_raw` and `O(F(S)) == C(S)`.
 pub fn shir_to_shir_json_raw(prog: &IrProgram) -> String {
-    program_json(prog, CONTRACT_VERSION).to_string()
+    let mut prog = prog.clone();
+    // shir-builtin-op-20260816: the raw export carries the same native
+    // `builtin` op (the frontend/optimizer boundary contract — the
+    // shared check gates the raw A1).
+    crate::transforms::builtin::transform(&mut prog.stmts);
+    for sub in prog.subs.iter_mut() {
+        crate::transforms::builtin::transform(&mut sub.body);
+    }
+    program_json(&prog, CONTRACT_VERSION).to_string()
 }
 
 /// Current contract version (plan §2.1). Bump on any breaking shape change.
@@ -113,6 +132,7 @@ fn sub_json(s: &IrSub) -> Value {
 
 fn stmt_json(s: &IrStmt) -> Value {
     match s {
+        IrStmt::Ext(n) => n.to_json(),
         IrStmt::Output {
             value,
             newline,
@@ -452,6 +472,7 @@ fn expr_json(e: &IrExpr) -> Value {
         // `[*a]` / `f(*a)` — the wrapped expr's elements splice into the
         // enclosing Array/Call (the estree renderer emits a JS spread).
         IrExpr::Splice(e) => json!({ "type": "Splice", "expr": expr_json(e) }),
+        IrExpr::Ext(n) => n.to_json(),
         IrExpr::Object(props) => json!({
             "type": "Object",
             "properties": props.iter().map(|(k, v)| json!({"key": k, "value": expr_json(v)})).collect::<Vec<_>>(),
@@ -525,6 +546,7 @@ fn style_json(s: &StrStyle) -> &'static str {
         StrStyle::DoubleQuoted => "DoubleQuoted",
         StrStyle::Command => "Command",
         StrStyle::Heredoc => "Heredoc",
+        StrStyle::Raw => "Raw",
     }
 }
 
@@ -568,6 +590,11 @@ fn call_purity(func: &str, args: &[IrExpr]) -> &'static str {
         | "setArray" | "setArrayAppend" | "arrayItems" | "arrayKeys" | "arrayLen"
         | "arrayIndex" | "fnCall" | "fnValue" | "define" | "forLoop" | "whileLoop" | "block" | "shopt"
         | "builtin" | "bcSqrt" | "ternary" | "arrayStore" | "memAdvance" | "memTest" | "line"
+        // associative-array helpers (core request py-sh-go-20260806-144303-b):
+        // assocSet/assocGet/assocNames/assocValues — runtime store ops on
+        // the assoc Map, CPU-only, no process spawn (mirror setArray/
+        // arrayItems).
+        | "assocSet" | "assocSet2" | "assocGet" | "assocNames" | "assocValues"
         // channel/select vocabulary (core requests go-sh-commclause /
         // go-sh-recvstmt): FIFO channels + blocking recv/send + the
         // round-robin select poll — all implementable in the runtime

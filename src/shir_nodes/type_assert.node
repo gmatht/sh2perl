@@ -1,0 +1,19 @@
+# shir_nodes/type_assert.node — TypeAssert: a dynamic type assertion.
+#
+# GENERIC (any frontend with runtime type checks: Go `x.(T)` and its
+# comma-ok form, Zig @as-style checked casts, Java `instanceof`-narrowed
+# reads). The IR is dynamically typed, so the assertion is a CHECKED
+# PASSTHROUGH: the value flows through unchanged; `kind` names the
+# expected dynamic kind so backends that CAN check may validate.
+#
+# kind vocabulary = the sh2.typeOf strings already pinned by the type-
+# switch lowering: "string" | "int" | "float" | "bool" | "array".
+# The comma-ok boolean is NOT part of this node: a frontend emits the
+# comparison `typeof(x) == kind` itself (same vocabulary), keeping the
+# node single-responsibility.
+
+node TypeAssert
+tag "TypeAssert"
+kind expr
+field expr: expr
+field kind: string

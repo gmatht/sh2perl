@@ -91,6 +91,259 @@ pub struct Render {
     in_fn: bool,              // rendering inside a Function body
     todo: usize,
     opts: ShGlslOptions,
+    // the input bridges
+    // texture-fetch load sinking: groups whose fetch + per-channel seeds
+    // move into the single block that dominates every read of their
+    // bridge vars (computed in shir_to_glsl_opts before the body
+    // renders) — the untouched path costs zero fetches.
+    lazy_tex_sinks: Vec<LazyTexSink>,
+    // true when the PROGRAM reads the uv_x/uv_y bridges directly (the
+    // texture samples wrap via fract(vUv) and don't need the texel-grid
+    // seeds; only a genuine uv read does)
+    reads_uv: bool,
+}
+
+// ── texture-fetch load sinking ──────────────────────────────────
+// A texture bridge group (tex → uTex, crack → uCrack) is fetched at
+// main() start whenever ANY of its channel vars is referenced. When
+// every reference of the group's channels lives inside ONE block (an
+// if/else arm or a bare block), the fetch + per-channel extraction is
+// instead emitted at the top of that block, so the other path costs
+// zero fetches. MIMEcroft's crack overlay reads cr_r/g/b/a only inside
+// `if damage > 0` — undamaged fragments never sample uCrack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TexGroup { Tex, Crack }
+
+#[derive(Clone, Copy)]
+struct LazyTexSink {
+    group: TexGroup,
+    block: *const [IrStmt],
+}
+
+fn tex_group_channels(g: TexGroup) -> &'static [&'static str] {
+    match g {
+        TexGroup::Tex => &["tex_r", "tex_g", "tex_b"],
+        TexGroup::Crack => &["cr_r", "cr_g", "cr_b", "cr_a"],
+    }
+}
+
+fn record_tex_channel(n: &str, blk: *const [IrStmt], out: &mut Vec<(TexGroup, *const [IrStmt])>) {
+    if n == "tex_r" || n == "tex_g" || n == "tex_b" {
+        out.push((TexGroup::Tex, blk));
+    } else if n == "cr_r" || n == "cr_g" || n == "cr_b" || n == "cr_a" {
+        out.push((TexGroup::Crack, blk));
+    }
+}
+
+// Record every tex/crack channel READ with the innermost block that
+// contains it. A block is a Vec<IrStmt> slice; the top-level statement
+// list is the root — never a sink target. Missing a nested body only
+// attributes its reads to the enclosing block, which still dominates
+// them, so the fetch is never placed somewhere that fails to dominate
+// a read (the walk below covers every block-carrying variant the
+// backend renders).
+fn collect_tex_reads(
+    stmts: &[IrStmt],
+    blk: *const [IrStmt],
+    out: &mut Vec<(TexGroup, *const [IrStmt])>,
+) {
+    for s in stmts {
+        tex_reads_in_stmt(s, blk, out);
+        match s {
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_tex_reads(then, then.as_slice() as *const [IrStmt], out);
+                for (_, b) in elsifs {
+                    collect_tex_reads(b, b.as_slice() as *const [IrStmt], out);
+                }
+                collect_tex_reads(else_, else_.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::Block(body) | IrStmt::Subshell(body) | IrStmt::Background(body) => {
+                collect_tex_reads(body, body.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                collect_tex_reads(body, body.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::For { body, .. } => {
+                collect_tex_reads(body, body.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::ForInit { body, .. } => {
+                collect_tex_reads(body, body.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_tex_reads(&c.body, c.body.as_slice() as *const [IrStmt], out);
+                }
+            }
+            IrStmt::Function { body, .. } => {
+                collect_tex_reads(body, body.as_slice() as *const [IrStmt], out);
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    collect_tex_reads(st, st.as_slice() as *const [IrStmt], out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// Walk a statement's SCALAR expressions (conds, values, outputs) at the
+// current block. Block-carrying fields are walked separately by
+// collect_tex_reads with their own block pointer — double-walking them
+// here would misattribute the reads to the enclosing block.
+fn tex_reads_in_stmt(s: &IrStmt, blk: *const [IrStmt], out: &mut Vec<(TexGroup, *const [IrStmt])>) {
+    match s {
+        IrStmt::Output { value, .. } => tex_reads_in_expr(value, blk, out),
+        IrStmt::WriteFile { path, content, .. } => {
+            tex_reads_in_expr(path, blk, out);
+            tex_reads_in_expr(content, blk, out);
+        }
+        IrStmt::Assign { expr, .. } => tex_reads_in_expr(expr, blk, out),
+        IrStmt::Declare { init, .. } => {
+            if let Some(i) = init {
+                tex_reads_in_expr(i, blk, out);
+            }
+        }
+        IrStmt::DeclareArray { elements, .. } => {
+            for e in elements {
+                tex_reads_in_expr(e, blk, out);
+            }
+        }
+        IrStmt::If { cond, .. } => tex_reads_in_expr(cond, blk, out),
+        IrStmt::While { cond, .. } | IrStmt::DoWhile { cond, .. } => tex_reads_in_expr(cond, blk, out),
+        IrStmt::ForInit { cond, .. } => tex_reads_in_expr(cond, blk, out),
+        IrStmt::For { iter, .. } => tex_reads_in_expr(iter, blk, out),
+        IrStmt::Die { expr, .. } | IrStmt::Warn { expr, .. } => tex_reads_in_expr(expr, blk, out),
+        IrStmt::Exec { cmd, args, redirects, env, .. } => {
+            tex_reads_in_expr(cmd, blk, out);
+            for a in args {
+                tex_reads_in_expr(a, blk, out);
+            }
+            for r in redirects {
+                tex_reads_in_expr(r, blk, out);
+            }
+            for (_, v) in env {
+                tex_reads_in_expr(v, blk, out);
+            }
+        }
+        IrStmt::Case { discriminant, .. } => tex_reads_in_expr(discriminant, blk, out),
+        IrStmt::Redirect { redirects, .. } => {
+            for r in redirects {
+                tex_reads_in_expr(&r.target, blk, out);
+            }
+        }
+        IrStmt::Return(Some(e)) => tex_reads_in_expr(e, blk, out),
+        IrStmt::Exit(Some(e)) => tex_reads_in_expr(e, blk, out),
+        IrStmt::SetChildError(e) => tex_reads_in_expr(e, blk, out),
+        IrStmt::Expr(e) => tex_reads_in_expr(e, blk, out),
+        _ => {}
+    }
+}
+
+fn tex_reads_in_expr(e: &IrExpr, blk: *const [IrStmt], out: &mut Vec<(TexGroup, *const [IrStmt])>) {
+    match e {
+        IrExpr::Var(n, _) => record_tex_channel(n, blk, out),
+        IrExpr::Call { func, args } => {
+            if func == "getVar" {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    record_tex_channel(n, blk, out);
+                }
+            }
+            for a in args {
+                tex_reads_in_expr(a, blk, out);
+            }
+        }
+        IrExpr::Index { key, .. } => tex_reads_in_expr(key, blk, out),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            tex_reads_in_expr(lhs, blk, out);
+            tex_reads_in_expr(rhs, blk, out);
+        }
+        IrExpr::MethodCall { obj, args, .. } => {
+            tex_reads_in_expr(obj, blk, out);
+            for a in args {
+                tex_reads_in_expr(a, blk, out);
+            }
+        }
+        IrExpr::Ternary { cond, then, else_ } => {
+            tex_reads_in_expr(cond, blk, out);
+            tex_reads_in_expr(then, blk, out);
+            tex_reads_in_expr(else_, blk, out);
+        }
+        IrExpr::DefinedOr { expr, default } => {
+            tex_reads_in_expr(expr, blk, out);
+            tex_reads_in_expr(default, blk, out);
+        }
+        IrExpr::Capture { expr, .. } => tex_reads_in_expr(expr, blk, out),
+        IrExpr::Arrow(body) => collect_tex_reads(body, body.as_slice() as *const [IrStmt], out),
+        IrExpr::Array(items) => {
+            for i in items {
+                tex_reads_in_expr(i, blk, out);
+            }
+        }
+        IrExpr::ArrayComp { iter, elem, cond, .. } => {
+            tex_reads_in_expr(iter, blk, out);
+            tex_reads_in_expr(elem, blk, out);
+            if let Some(c) = cond {
+                tex_reads_in_expr(c, blk, out);
+            }
+        }
+        IrExpr::Arith(a) => tex_reads_in_arith(a, blk, out),
+        _ => {}
+    }
+}
+
+fn tex_reads_in_arith(
+    a: &ArithAst,
+    blk: *const [IrStmt],
+    out: &mut Vec<(TexGroup, *const [IrStmt])>,
+) {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => record_tex_channel(n, blk, out),
+        ArithAst::Index { var, key } => {
+            record_tex_channel(var, blk, out);
+            tex_reads_in_arith(key, blk, out);
+        }
+        ArithAst::Bin { lhs, rhs, .. } => {
+            tex_reads_in_arith(lhs, blk, out);
+            tex_reads_in_arith(rhs, blk, out);
+        }
+        ArithAst::Un { arg, .. } => tex_reads_in_arith(arg, blk, out),
+        ArithAst::Cond { test, then, else_ } => {
+            tex_reads_in_arith(test, blk, out);
+            tex_reads_in_arith(then, blk, out);
+            tex_reads_in_arith(else_, blk, out);
+        }
+        ArithAst::Assign { rhs, .. } => tex_reads_in_arith(rhs, blk, out),
+        ArithAst::IncDec { var, .. } => record_tex_channel(var, blk, out),
+        ArithAst::Cast { arg, .. } => tex_reads_in_arith(arg, blk, out),
+        ArithAst::Num(_) | ArithAst::Sizeof(_) => {}
+    }
+}
+
+// The groups whose reads all live in one non-top-level block → sink the
+// fetch there. Top-level-only reads (e.g. tex_r used unconditionally)
+// keep the current main()-start seeding.
+fn compute_lazy_tex_sinks(prog: &IrProgram) -> Vec<LazyTexSink> {
+    let top = prog.stmts.as_slice() as *const [IrStmt];
+    let mut reads: Vec<(TexGroup, *const [IrStmt])> = Vec::new();
+    collect_tex_reads(&prog.stmts, top, &mut reads);
+    let mut out = Vec::new();
+    for g in [TexGroup::Crack, TexGroup::Tex] {
+        let mut blocks: Vec<*const [IrStmt]> = Vec::new();
+        let mut any = false;
+        for (rg, b) in &reads {
+            if *rg == g {
+                any = true;
+                if !blocks.iter().any(|x| std::ptr::eq(*x, *b)) {
+                    blocks.push(*b);
+                }
+            }
+        }
+        if any && blocks.len() == 1 && !std::ptr::eq(blocks[0], top) {
+            out.push(LazyTexSink { group: g, block: blocks[0] });
+        }
+    }
+    out
 }
 
 /// Renderer options — the default (ES 3.00 stdout-computation) is the
@@ -152,6 +405,9 @@ pub fn shir_to_glsl(prog: &IrProgram) -> String {
 /// Render with options (see [`ShGlslOptions`]).
 pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
     let mut prog = prog.clone();
+    // builtin-op fallback arm (shir-builtin-op-20260816): the glsl
+    // backend has NOT accepted the `builtin` op — render as exec.
+    crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
     // A2: the raw ShIR carries no type verdicts; run the analysis so
     // int vars become native GLSL ints (like the C backend does).
     prog.var_types = crate::shir::analyze_var_types(&prog);
@@ -168,6 +424,11 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
             r.collect_stmt(s);
         }
     }
+    // texture-fetch load sinking: a group whose channel reads all live
+    // in one branch/block is fetched there, not at main() start (only
+    // the top-level program — function bodies render in their own
+    // scope, where the main() uv/damage seeds are not visible).
+    r.lazy_tex_sinks = compute_lazy_tex_sinks(&prog);
     // Input bridges are seeded/declared ONLY when the program references
     // them (see the color_out seeding below) — pass 1 collected every
     // reference into r.vars (direct Var reads, $(( )) arith, test
@@ -293,8 +554,8 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
         // the varyings — always written at the end of main() (the
         // fragment shader declares the ones it consumes; a vertex-only
         // varying is legal ES 1.00 and links fine).
-        r.emit("varying vec4 vColor;");
-        r.emit("varying vec2 vUv;");
+        r.emit("varying highp vec4 vColor;");
+        r.emit("varying highp vec2 vUv;");
     } else if !r.opts.color_out {
         if r.opts.es100 {
             // ES 1.00 has no `out` — outColor is a local, written to
@@ -317,10 +578,17 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
         let tex = r.uses_any(&["tex_r", "tex_g", "tex_b"]);
         let crack = r.uses_any(&["cr_r", "cr_g", "cr_b", "cr_a"]);
         if vcolor {
-            r.emit(if r.opts.es100 { "varying vec4 vColor;" } else { "in vec4 vColor;" });
+            r.emit(if r.opts.es100 { "varying highp vec4 vColor;" } else { "in highp vec4 vColor;" });
         }
         if uv {
-            r.emit(if r.opts.es100 { "varying vec2 vUv;" } else { "in vec2 vUv;" });
+            // vUv carries WORLD coordinates for the camera-following
+            // background planes (usc_x > 1100 → the vertex shader
+            // outputs p.xz, up to ±35 world units) — a mediump read
+            // (fp16 on Vulkan/Metal ANGLE backends) loses the
+            // fractional part and jitters the texel-grid selection by
+            // ±1 texel, so the floor texture flaked. highp read, like
+            // the hand-written fallback (fs_fb) always had.
+            r.emit(if r.opts.es100 { "varying highp vec2 vUv;" } else { "in highp vec2 vUv;" });
         }
         if tex {
             r.emit("uniform sampler2D uTex;");
@@ -365,13 +633,13 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
             r.emit("g_frag_y = int(gl_FragCoord.y);");
         }
         if r.vars.contains("vcolor_r") {
-            r.emit("g_vcolor_r = int(vColor.r * 255.0);");
+            r.emit("g_vcolor_r = int(vColor.r * 127.0);");
         }
         if r.vars.contains("vcolor_g") {
-            r.emit("g_vcolor_g = int(vColor.g * 255.0);");
+            r.emit("g_vcolor_g = int(vColor.g * 127.0);");
         }
         if r.vars.contains("vcolor_b") {
-            r.emit("g_vcolor_b = int(vColor.b * 255.0);");
+            r.emit("g_vcolor_b = int(vColor.b * 127.0);");
         }
         if opts.tex_size > 0 {
             let uv_needed = r.uses_any(&[
@@ -379,58 +647,33 @@ pub fn shir_to_glsl_opts(prog: &IrProgram, opts: &ShGlslOptions) -> String {
                 "cr_r", "cr_g", "cr_b", "cr_a",
             ]);
             if uv_needed {
-                let f = |v: u32| format!("{v}.0");
-                let sz = f(opts.tex_size);
                 // uv_x/uv_y: the texel index (0..tex_size) from the
-                // varying — a prerequisite for every texture sample
-                r.emit(&format!("g_uv_x = int(vUv.x * {sz});"));
-                r.emit(&format!("g_uv_y = int(vUv.y * {sz});"));
-                // tex_r/g/b: the texel's colour (center-sampled), 0..255
-                let uv = format!(
-                    "(vec2(float(g_uv_x), float(g_uv_y)) + vec2(0.5)) / {sz}"
-                );
+                // varying — a program that READS the uv bridges directly
+                // needs these seeds; the texture samples themselves use
+                // fract(vUv) (precision-safe wrapping) and don't.
+                if r.reads_uv {
+                    let f = |v: u32| format!("{v}.0");
+                    let sz = f(opts.tex_size);
+                    r.emit(&format!("g_uv_x = int(vUv.x * {sz});"));
+                    r.emit(&format!("g_uv_y = int(vUv.y * {sz});"));
+                }
                 // Sample each texture ONCE into a vec4 local, then
                 // swizzle — the three tex (resp. four crack) seeds use
                 // the same coordinates, and drivers may not CSE
                 // identical texture2D calls, so this is 2 fetches per
-                // fragment instead of 7.
-                if r.vars.contains("tex_r")
-                    || r.vars.contains("tex_g")
-                    || r.vars.contains("tex_b")
-                {
-                    r.emit(&format!("vec4 _tex = texture2D(uTex, {uv});"));
-                    if r.vars.contains("tex_r") {
-                        r.emit("g_tex_r = int(_tex.r * 255.0);");
-                    }
-                    if r.vars.contains("tex_g") {
-                        r.emit("g_tex_g = int(_tex.g * 255.0);");
-                    }
-                    if r.vars.contains("tex_b") {
-                        r.emit("g_tex_b = int(_tex.b * 255.0);");
-                    }
+                // fragment instead of 7. A group whose channel reads
+                // all live in one block (compute_lazy_tex_sinks) is
+                // fetched at the top of that block instead — the
+                // untouched path costs zero fetches.
+                if !r.is_tex_sunk(TexGroup::Tex) {
+                    r.emit_tex_seeds(TexGroup::Tex);
                 }
                 // the crack overlay: uDamage (0..3) + the crack texel
                 if r.vars.contains("damage") {
                     r.emit("g_damage = uDamage;");
                 }
-                if r.vars.contains("cr_r")
-                    || r.vars.contains("cr_g")
-                    || r.vars.contains("cr_b")
-                    || r.vars.contains("cr_a")
-                {
-                    r.emit(&format!("vec4 _crack = texture2D(uCrack, {uv});"));
-                    if r.vars.contains("cr_r") {
-                        r.emit("g_cr_r = int(_crack.r * 255.0);");
-                    }
-                    if r.vars.contains("cr_g") {
-                        r.emit("g_cr_g = int(_crack.g * 255.0);");
-                    }
-                    if r.vars.contains("cr_b") {
-                        r.emit("g_cr_b = int(_crack.b * 255.0);");
-                    }
-                    if r.vars.contains("cr_a") {
-                        r.emit("g_cr_a = int(_crack.a * 255.0);");
-                    }
+                if !r.is_tex_sunk(TexGroup::Crack) {
+                    r.emit_tex_seeds(TexGroup::Crack);
                 }
             }
         }
@@ -729,6 +972,8 @@ impl Default for Render {
             used_ipow: false,
             used_isqrt: false,
             putb_pos: 0,
+            lazy_tex_sinks: Vec::new(),
+            reads_uv: false,
             fns: BTreeSet::new(),
             fn_bodies: BTreeMap::new(),
             fn_order: Vec::new(),
@@ -1023,6 +1268,85 @@ impl Render {
         }
     }
 
+    // ── texture-fetch load sinking (the LazyTexSink hooks) ────────
+    fn is_tex_sunk(&self, g: TexGroup) -> bool {
+        self.lazy_tex_sinks.iter().any(|s| s.group == g)
+    }
+
+    // Emit the ONE fetch + per-channel seeds for a texture group. The
+    // per-channel seeds are use-gated (only referenced channels emit);
+    // at a sink site every referenced channel is read inside the block.
+    fn emit_tex_seeds(&mut self, g: TexGroup) {
+        if self.opts.tex_size == 0 {
+            return;
+        }
+        // Sample through `fract(vUv)` — the wrap happens here, in [0,1)
+        // space, so the texture2D coordinate stays small and is EXACT at
+        // any precision. The old `(g_uv_x + 0.5) / sz` form built a
+        // coordinate up to ±35 for the camera-following background planes
+        // (vUv = world xz) — a MEDIUMP float (fp16 on Vulkan/Metal
+        // ANGLE) quantized its fractional part to ±1 texel, so the floor
+        // texture's selection jittered ("sometimes shows"). fract() keeps
+        // the wrap value tiny (fp16-exact), and REPEAT wrap mode is no
+        // longer required for the sampling either.
+        let uv = "fract(vUv)".to_string();
+        match g {
+            TexGroup::Tex => {
+                if self.vars.contains("tex_r")
+                    || self.vars.contains("tex_g")
+                    || self.vars.contains("tex_b")
+                {
+                    self.emit(&format!("vec4 _tex = texture2D(uTex, {uv});"));
+                    if self.vars.contains("tex_r") {
+                        self.emit("g_tex_r = int(_tex.r * 255.0);");
+                    }
+                    if self.vars.contains("tex_g") {
+                        self.emit("g_tex_g = int(_tex.g * 255.0);");
+                    }
+                    if self.vars.contains("tex_b") {
+                        self.emit("g_tex_b = int(_tex.b * 255.0);");
+                    }
+                }
+            }
+            TexGroup::Crack => {
+                if self.vars.contains("cr_r")
+                    || self.vars.contains("cr_g")
+                    || self.vars.contains("cr_b")
+                    || self.vars.contains("cr_a")
+                {
+                    self.emit(&format!("vec4 _crack = texture2D(uCrack, {uv});"));
+                    if self.vars.contains("cr_r") {
+                        self.emit("g_cr_r = int(_crack.r * 127.0);");
+                    }
+                    if self.vars.contains("cr_g") {
+                        self.emit("g_cr_g = int(_crack.g * 127.0);");
+                    }
+                    if self.vars.contains("cr_b") {
+                        self.emit("g_cr_b = int(_crack.b * 127.0);");
+                    }
+                    if self.vars.contains("cr_a") {
+                        self.emit("g_cr_a = int(_crack.a * 127.0);");
+                    }
+                }
+            }
+        }
+    }
+
+    // When a block is a recorded sink site, emit the group's fetch +
+    // seeds as its first statements (the block dominates every read).
+    fn emit_lazy_tex_seeds(&mut self, blk: &[IrStmt]) {
+        let blk = blk as *const [IrStmt];
+        let groups: Vec<TexGroup> = self
+            .lazy_tex_sinks
+            .iter()
+            .filter(|s| std::ptr::eq(s.block, blk))
+            .map(|s| s.group)
+            .collect();
+        for g in groups {
+            self.emit_tex_seeds(g);
+        }
+    }
+
     fn render_fn(&mut self, name: &str, body: &[IrStmt]) {
         self.emit(&format!("void {}() {{", self.ident(name)));
         self.depth += 1;
@@ -1263,6 +1587,9 @@ impl Render {
                 self.strlit(s);
             }
             IrExpr::Var(n, _) => {
+                if n == "uv_x" || n == "uv_y" {
+                    self.reads_uv = true;
+                }
                 self.vars.insert(n.clone());
             }
             IrExpr::Index { var, key } => {
@@ -1579,8 +1906,13 @@ impl Render {
             }
             IrExpr::DefinedOr { expr, .. } => self.expr_num(expr),
             IrExpr::Capture { expr, .. } => {
-                if let Some(s) = self.bc_capture(expr) {
-                    return format!("s2i({s})");
+                // the first-class Capture node (core request
+                // zsh-sh-go-20260814-230503) — unwrap the Arrow like the
+                // Call-capture arm below before the bc fold.
+                if let Some(pipe) = self.capture_pipeline(std::slice::from_ref(expr.as_ref())) {
+                    if let Some(s) = self.bc_capture(pipe) {
+                        return format!("s2i({s})");
+                    }
                 }
                 self.todo += 1;
                 "/* TODO(cmdsub num) */ 0".to_string()
@@ -1783,8 +2115,13 @@ impl Render {
             }
             IrExpr::DefinedOr { expr, .. } => self.expr_str(expr),
             IrExpr::Capture { expr, .. } => {
-                if let Some(s) = self.bc_capture(expr) {
-                    return s;
+                // the first-class Capture node (core request
+                // zsh-sh-go-20260814-230503) — unwrap the Arrow like the
+                // Call-capture arm below before the bc fold.
+                if let Some(pipe) = self.capture_pipeline(std::slice::from_ref(expr.as_ref())) {
+                    if let Some(s) = self.bc_capture(pipe) {
+                        return s;
+                    }
                 }
                 self.todo += 1;
                 "/* TODO(command substitution) */ ivec2(0, 0)".to_string()
@@ -2541,7 +2878,16 @@ impl Render {
     fn bc_float_expr(&mut self, pipe: &IrExpr) -> Option<String> {
         // unwrap the cmdsub wrapper: `$(…)` arrives as Capture/capture
         let pipe = match pipe {
-            IrExpr::Capture { expr, .. } => expr,
+            IrExpr::Capture { expr, .. } => {
+                // the first-class Capture node (core request
+                // zsh-sh-go-20260814-230503) — unwrap the Arrow like the
+                // Call-capture arm below (capture_pipeline does the
+                // Arrow → pipeline unwrap).
+                let Some(p) = self.capture_pipeline(std::slice::from_ref(expr.as_ref())) else {
+                    return None;
+                };
+                p
+            }
             IrExpr::Call { func, args } if func == "capture" || func == "captureWords" => {
                 self.capture_pipeline(args)?
             }
@@ -2607,7 +2953,15 @@ impl Render {
     /// (it only pattern-matches and clones — safe during collect).
     fn is_float_bc_capture(&mut self, pipe: &IrExpr) -> bool {
         let pipe = match pipe {
-            IrExpr::Capture { expr, .. } => expr,
+            IrExpr::Capture { expr, .. } => {
+                // the first-class Capture node (core request
+                // zsh-sh-go-20260814-230503) — unwrap the Arrow like the
+                // Call-capture arm below.
+                let Some(p) = self.capture_pipeline(std::slice::from_ref(expr.as_ref())) else {
+                    return false;
+                };
+                p
+            }
             IrExpr::Call { func, args }
                 if func == "capture" || func == "captureWords" =>
             {
@@ -2924,6 +3278,7 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => self.expr_stmt(e),
+            IrStmt::Ext(_) => panic!("glsl backend: Ext node unsupported"),
             IrStmt::Assign { targets, expr, asm, .. } => {
                 // Declarator-position asm label (core request
                 // c-sh-go-toplevelasmargument-20260814-042952) — no GLSL
@@ -3064,6 +3419,7 @@ impl Render {
                 let c = self.expr_bool(cond);
                 self.emit(&format!("if ({c}) {{"));
                 self.depth += 1;
+                self.emit_lazy_tex_seeds(then.as_slice());
                 for s in then {
                     self.stmt(s);
                 }
@@ -3072,6 +3428,7 @@ impl Render {
                     let c = self.expr_bool(e);
                     self.emit(&format!("}} else if ({c}) {{"));
                     self.depth += 1;
+                    self.emit_lazy_tex_seeds(b.as_slice());
                     for s in b {
                         self.stmt(s);
                     }
@@ -3080,6 +3437,7 @@ impl Render {
                 if !else_.is_empty() {
                     self.emit("} else {");
                     self.depth += 1;
+                    self.emit_lazy_tex_seeds(else_.as_slice());
                     for s in else_ {
                         self.stmt(s);
                     }
@@ -3140,6 +3498,7 @@ impl Render {
             IrStmt::Block(body) => {
                 self.emit("{");
                 self.depth += 1;
+                self.emit_lazy_tex_seeds(body.as_slice());
                 for s in body {
                     self.stmt(s);
                 }
@@ -3923,7 +4282,21 @@ impl Range {
         if bound > MEDIUMP_I16 {
             return None;
         }
-        Some(Range { lo: -bound, hi: bound })
+        // Sign-aware: a non-negative (resp. non-positive) dividend with a
+        // positive divisor truncates to a non-negative (resp. non-positive)
+        // quotient — keeping the sign instead of widening to ±bound is what
+        // lets the 0..127 tint's [0,32385]/128 stay [0,254] (not [-254,254]);
+        // a signed dividend still widens to ±bound. This is what keeps the
+        // damage blend's `r - (r-cr_r)*mix/256` (with r-cr_r ≥ -127) inside
+        // mediump int — the widened negative would otherwise overflow the
+        // CRT term that follows.
+        if a.lo >= 0 {
+            Some(Range { lo: 0, hi: bound })
+        } else if a.hi <= 0 {
+            Some(Range { lo: -bound, hi: 0 })
+        } else {
+            Some(Range { lo: -bound, hi: bound })
+        }
     }
 
     /// The `%` emulation `a - b*(a/b)` — THREE intermediates must fit:
@@ -3963,19 +4336,19 @@ fn fits_mediump_int(prog: &IrProgram, opts: &ShGlslOptions) -> bool {
     if opts.color_out {
         seed(&mut vars, "frag_x", opts.max_view as i64);
         seed(&mut vars, "frag_y", opts.max_view as i64);
-        seed(&mut vars, "vcolor_r", 255);
-        seed(&mut vars, "vcolor_g", 255);
-        seed(&mut vars, "vcolor_b", 255);
+        seed(&mut vars, "vcolor_r", 127);
+        seed(&mut vars, "vcolor_g", 127);
+        seed(&mut vars, "vcolor_b", 127);
         if opts.tex_size > 0 {
             seed(&mut vars, "uv_x", opts.tex_size as i64);
             seed(&mut vars, "uv_y", opts.tex_size as i64);
             seed(&mut vars, "tex_r", 255);
             seed(&mut vars, "tex_g", 255);
             seed(&mut vars, "tex_b", 255);
-            seed(&mut vars, "cr_r", 255);
-            seed(&mut vars, "cr_g", 255);
-            seed(&mut vars, "cr_b", 255);
-            seed(&mut vars, "cr_a", 255);
+            seed(&mut vars, "cr_r", 127);
+            seed(&mut vars, "cr_g", 127);
+            seed(&mut vars, "cr_b", 127);
+            seed(&mut vars, "cr_a", 127);
             seed(&mut vars, "damage", 3);
         }
     }
@@ -4232,6 +4605,7 @@ fn walk_stmts(stmts: &[IrStmt], vars: &mut std::collections::HashMap<String, Opt
 
 fn walk_stmt(s: &IrStmt, vars: &mut std::collections::HashMap<String, Option<Range>>) -> bool {
     match s {
+        IrStmt::Ext(n) => crate::shir_nodes::ExtNode::children(&**n).into_iter().any(|c| walk_stmt(c, vars)),
         IrStmt::Assign { targets, expr, .. } => {
             let r = expr_range(expr, vars);
             if r.is_none() {
@@ -4533,14 +4907,23 @@ mod tests {
 
     #[test]
     fn mediump_refused_on_overflow() {
-        // r*tex_r with both 0..255 → 65025 > 32767 → must stay highp int
-        let prog = MEDIUMP_OK_PROG.replace(
-            "\"rhs\":{\"type\":\"Num\",\"value\":90}",
-            "\"rhs\":{\"type\":\"Var\",\"name\":\"tex_r\"}",
-        );
+        // r*tex_r with both 0..255 → 65025 > 32767 → must stay highp int.
+        // r is sourced from tex_r (not vcolor_r): the vcolor bridge seed
+        // dropped to 0..127 (f71d804 colour-scale bridges), so a vcolor-
+        // rooted r can no longer reach the overflow (127*255 = 32385 ≤
+        // 32767) — tex_r stays 0..255, keeping the test's premise.
+        let prog = MEDIUMP_OK_PROG
+            .replace(
+                "\"ast\":{\"type\":\"Var\",\"name\":\"vcolor_r\"}",
+                "\"ast\":{\"type\":\"Var\",\"name\":\"tex_r\"}",
+            )
+            .replace(
+                "\"rhs\":{\"type\":\"Num\",\"value\":90}",
+                "\"rhs\":{\"type\":\"Var\",\"name\":\"tex_r\"}",
+            );
         let shader = render_opts(
             &prog,
-            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 800 },
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 32, max_view: 800 },
         );
         assert!(shader.contains("precision highp int;"), "overflow must refuse mediump int");
         assert!(shader.contains("precision mediump float;"), "float side stays provable");
@@ -4590,7 +4973,7 @@ mod tests {
             r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
               {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
-            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 0 },
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 32, max_view: 0 },
         );
         assert!(!shader.contains("OUT_CAP"), "OUT_CAP in render fragment");
         assert!(!shader.contains("out_len"), "out_len in render fragment");
@@ -4626,7 +5009,7 @@ mod tests {
               {"type":"Assign","targets":[{"var":"fx","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Var","name":"frag_x"}}},
               {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
-            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 0 },
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 32, max_view: 0 },
         );
         assert!(shader.contains("g_frag_x = int(gl_FragCoord.x);"), "frag_x seed missing");
         assert!(!shader.contains("vColor"), "vColor declared unused");
@@ -4641,19 +5024,25 @@ mod tests {
     #[test]
     fn bridges_tex_group_dependency() {
         // referencing tex_r must pull in vUv + the uv seeds (the sample
-        // coordinate reads them) but NOT the crack/damage machinery.
+        // coordinate reads them) but NOT the crack/damage machinery. The
+        // uv seed is gated on a DIRECT uv_x/uv_y read (b5ae282: the
+        // texture sample itself uses fract(vUv), only programs that read
+        // the uv bridges need the seed), so the program reads uv_x too.
         let shader = render_opts(
             r#"{"type":"Program","contract_version":1,"imports":[],"requires":[],"stmt_lines":[],"stmts":[
               {"type":"Assign","targets":[{"var":"t","indices":[],"sigil":null}],"expr":{"type":"Arith","ast":{"type":"Var","name":"tex_r"}}},
+              {"type":"Assign","targets":[{"var":"u","indices":[],"sigil":null}],"expr":{"type":"Var","name":"uv_x","sigil":null}},
               {"type":"Expr","expr":{"type":"Call","func":"putb","purity":"Emulable","args":[{"type":"Str","value":"255","style":"DoubleQuoted"}]}}
             ],"subs":[],"var_types":[],"var_lengths":[],"var_const":[],"var_lifetimes":[],"var_nospace":[]}"#,
-            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 16, max_view: 0 },
+            ShGlslOptions { es100: true, color_out: true, vert_out: false, tex_size: 32, max_view: 0 },
         );
-        assert!(shader.contains("varying vec2 vUv;"), "vUv missing for tex bridge");
+        assert!(shader.contains("varying highp vec2 vUv;"), "vUv missing for tex bridge");
         assert!(shader.contains("uniform sampler2D uTex;"), "uTex missing for tex bridge");
         assert!(shader.contains("int g_uv_x;"), "uv_x not declared (the tex seeds write it)");
         assert!(shader.contains("int g_uv_y;"), "uv_y not declared (the tex seeds write it)");
-        assert!(shader.contains("g_uv_x = int(vUv.x * 16.0);"), "uv seed missing");
+        // the grid is tex_size (the test opts use 32 — ac19fa4 moved the
+        // MIME name textures to 32×32; the assert tracks the option).
+        assert!(shader.contains("g_uv_x = int(vUv.x * 32.0);"), "uv seed missing");
         assert!(shader.contains("vec4 _tex = texture2D(uTex"), "uTex sample missing");
         assert!(shader.contains("g_tex_r = int(_tex.r * 255.0);"), "tex_r seed missing");
         assert!(!shader.contains("g_tex_g"), "tex_g seeded unused");
@@ -4693,7 +5082,7 @@ vp_w=$w
 vc_r=$((ash_r * ublk_r / 1000))
 vu_u=$auv_u
 "#,
-            ShGlslOptions { es100: true, color_out: false, vert_out: true, tex_size: 16, max_view: 0 },
+            ShGlslOptions { es100: true, color_out: false, vert_out: true, tex_size: 32, max_view: 0 },
         );
         // header: attributes/uniforms/varyings
         assert!(shader.contains("attribute vec3 aPosition;"), "aPosition missing");
@@ -4703,8 +5092,8 @@ vu_u=$auv_u
         assert!(shader.contains("uniform vec3 uObjPos;"), "uObjPos missing");
         assert!(shader.contains("uniform vec3 uScale;"), "uScale missing");
         assert!(shader.contains("uniform vec3 uBlockColor;"), "uBlockColor missing");
-        assert!(shader.contains("varying vec4 vColor;"), "vColor missing");
-        assert!(shader.contains("varying vec2 vUv;"), "vUv missing");
+        assert!(shader.contains("varying highp vec4 vColor;"), "vColor missing");
+        assert!(shader.contains("varying highp vec2 vUv;"), "vUv missing");
         // seeds ×1000
         assert!(shader.contains("g_ap_x = int(aPosition.x * 1000.0);"), "ap_x seed");
         assert!(shader.contains("g_auv_u = int(aUv.x * 1000.0);"), "auv_u seed");

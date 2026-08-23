@@ -1,0 +1,7 @@
+# shir_nodes/array_len.node — primitive: length of an array.
+# Every language: .length / .len() / count(). Composes with Split: wc -l = ArrayLen(Split(t,"\n")).
+
+node ArrayLen
+tag "ArrayLen"
+kind expr
+field array: expr

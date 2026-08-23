@@ -1,0 +1,11 @@
+# shir_nodes/string_contains.node — expression-level semantic IR node.
+# Substring test (lowered from `grep -q`, `case *P*)`).
+#
+# Backends: Perl index()!=-1, JS .includes(), C strstr(), Rust .contains()
+# Fallback: sh2.contains(text, pattern)
+
+node StringContains
+tag "StringContains"
+kind expr
+field text: expr
+field pattern: expr

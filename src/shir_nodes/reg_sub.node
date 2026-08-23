@@ -1,0 +1,14 @@
+# shir_nodes/reg_sub.node — expression-level semantic IR node.
+# Regex substitution (lowered from `sed 's/pattern/repl/'`).
+#
+# Backends: Perl s///, JS replace(), C regex, Rust regex::replace
+# Fallback: sh2.regSub(text, pattern, replacement, global)
+
+node RegSub
+tag "RegSub"
+kind expr
+field text: expr
+field pattern: string
+field replacement: string
+field global: bool
+field line_mode: bool

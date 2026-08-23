@@ -18,18 +18,36 @@ use crate::ir::IrStmt;
 pub type TransformFn = fn(&mut Vec<IrStmt>) -> bool;
 
 pub mod arith_forms;
+pub mod arith_identity; // OFFER (core-requests/transforms/offered/arith-identity)
+pub mod builtin;
+pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod grep_o; // `grep -o PAT` → the generic grepMatches(text, pattern, flags) op
 pub mod process_subst;
 pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
 /// Registered transforms. The estree worker APPENDS entries here (and a
 /// `pub mod <name>;` above) when a worker-submitted transform is accepted
 /// into the crate. Each entry is (name, transform_fn).
+pub mod shir_pipeline_native;
+pub mod dead_fn_elim; // generic: remove never-referenced shell functions
+pub mod text_ops; // common shell commands → semantic IR nodes (cut/tr/sed/head/tail/wc)
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
+pub mod shir_native_stmt; // worker-submitted: redirect/herestring/test-chain shapes → native stmt forms
+// New transforms merged from the workspace (core-requests/transforms/done).
+pub mod background_decide; // `&` background → THREAD/FORK class (analysis; feeds renderer hooks)
+pub mod bc_float_clean; // strip redundant `+ 0.0` before `echo … | bc` (native float emulation)
+pub mod direct_calls; // `v=$(sq 3)` of a defined pure-output fn → in-process Capture{Call}
+pub mod escape_classes; // per-var STORE requirement census (feeds escape/hoist analyses)
+pub mod for_recovery; // counter-while → native For recovery
+pub mod function_purity; // function-level side-effect classes by call-graph fixpoint
+pub mod i32_provable; // PROVABLY-32-bit arith annotations
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
+        ("shir-pipeline-native", shir_pipeline_native::transform),
+        ("dead-fn-elim", dead_fn_elim::transform),
         // (name, <name>::transform) — estree worker adds entries here
+        ("inline-pure-fns", inline_pure_fns::inline_pure_fns),
         ("sync-ok-loops", sync_ok_loops::transform),
         ("seq-range-for", seq_range_for::transform),
         ("grep-o", grep_o::transform),
@@ -38,6 +56,27 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // the --shir export and the A1 ingress (frontend-emitted JSON).
         ("process-subst", process_subst::transform),
         ("arith-forms", arith_forms::transform),
+        // native-stmt normalisation (fail-shir: perl shell-out elimination):
+        // `echo args > file` → Block-wrapped exec (native select redirect),
+        // empty herestrings → status exec, `test && echo || echo` → If.
+        // NOTE: exec-to-builtin (shir-builtin-op-20260816) is NOT in the
+        // ast_to_ir channel — the rewrite happens at the A1 EXPORT
+        // (shir_json::shir_to_shir_json) so the analyses and every
+        // exec-keyed renderer arm stay untouched; the exported contract
+        // carries the op and the renderers erase/accept at entry.
+        //
+        // New transforms merged from the workspace (core-requests/transforms/done).
+        // Analyses (escape-classes, function-purity, background-decide, i32-provable)
+        // compute statics the renderer hooks read; direct-calls / for-recovery /
+        // bc-float-clean make structural rewrites.
+        ("background-decide", background_decide::transform),
+        ("bc-float-clean", bc_float_clean::transform),
+        ("direct-calls", direct_calls::transform),
+        ("escape-classes", escape_classes::transform),
+        ("for-recovery", for_recovery::transform),
+        ("function-purity", function_purity::transform),
+        ("i32-provable", i32_provable::transform),
+        ("text-ops", text_ops::transform),
     ]
 }
 
