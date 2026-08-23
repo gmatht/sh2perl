@@ -28742,6 +28742,17 @@ fn lift_walk_expr(
             // excluded: the renderer injects lifted values into them,
             // so a lifted var may appear inside them.
             let let_args_native = func == "exec" && arith_let_args_native(args);
+            // pointer indirection (&x / *x): the named slot MUST stay
+            // store-bound — derefGet/derefSet resolve through getVar/
+            // setVar at runtime, which read the STORE (a lifted native
+            // binding would desync the alias)
+            if matches!(func.as_str(), "addrVar" | "derefGet" | "derefSet") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if lift_is_ident(n) && !n.starts_with('#') {
+                        excluded.insert(n.clone());
+                    }
+                }
+            }
             // `arith` texts are handled by the arith block below (the
             // native-lowerable ones are exempt from ALL store marks).
             if func != "getVar"
@@ -29318,6 +29329,10 @@ fn lift_expr_mentions(e: &IrExpr, name: &str) -> bool {
                     | "arraySlice"
                     | "setArray"
                     | "setArrayAppend"
+                    | "addrVar"
+                    | "derefGet"
+                    | "derefSet"
+                    | "appendTo"
             ) {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     if n == name {

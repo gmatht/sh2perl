@@ -7509,10 +7509,13 @@ greet");
         // per level, `_g`-scratched) with the literal echo default. No
         // param call, no spawn.
         let json = to_json("echo \"${var:-${default:-${fallback:-$(echo \"computed\")}}}\"");
-        // the never-written `var` level folds to the lift-known constant
-        // "" (its store read); the live levels read via the native
-        // store read (env-fallback property reads — no getVar dispatch)
-        assert!(!json.contains("\"name\":\"getVar\""));
+        // the never-written `var` level reads through the runtime getVar
+        // dispatch ONCE (the `_g`-scratched primary — the DCE-safety
+        // fallback: the optimizer may have eliminated the only write while
+        // preserving the param read, so a folded "" primary would be
+        // unsound); the nested default levels read via the native store
+        // read (env-fallback property reads — no getVar dispatch)
+        assert_eq!(json.matches("\"name\":\"getVar\"").count(), 1);
         assert!(json.contains("computed"));
         assert!(!json.contains("\"name\":\"param\""));
         assert!(!json.contains("unsupported"));
@@ -7525,9 +7528,10 @@ greet");
         assert!(!json2.contains("\"name\":\"param\""));
         // a ${NAME} plain-ref default lowers to the native store read too
         let json3 = to_json("echo ${MOUNTPOINT:-${NAME}}");
-        // the never-written MOUNTPOINT level folds to the constant ""
-        // (its store read); the live NAME level reads natively
-        assert!(!json3.contains("\"name\":\"getVar\""));
+        // the never-written MOUNTPOINT level reads through the same
+        // DCE-safety getVar fallback (once); the live NAME level reads
+        // natively
+        assert_eq!(json3.matches("\"name\":\"getVar\"").count(), 1);
         assert!(!json3.contains("\"name\":\"param\""));
     }
 
