@@ -671,6 +671,46 @@ impl Render {
             self.emit("  _sh_rc = (rc == -1) ? 127 : (WIFEXITED(rc) ? WEXITSTATUS(rc) : 1);");
             self.emit("  while (n > 0 && (buf[n - 1] == '\\n' || buf[n - 1] == '\\r')) buf[--n] = 0;");
             self.emit("}");
+            self.emit("/* eval / . : import a NUL-separated env dump back into this process */");
+            self.emit("static void _sh_import_env(const char *path) {");
+            self.emit("  FILE *p = fopen(path, \"rb\");");
+            self.emit("  if (!p) return;");
+            self.emit("  fseek(p, 0, SEEK_END); long sz = ftell(p); fseek(p, 0, SEEK_SET);");
+            self.emit("  if (sz <= 0) { fclose(p); return; }");
+            self.emit("  char *data = (char*)malloc((size_t)sz + 1);");
+            self.emit("  size_t rd = fread(data, 1, (size_t)sz, p); data[rd] = 0; fclose(p);");
+            self.emit("  char *q = data; char *end = data + rd;");
+            self.emit("  while (q < end) {");
+            self.emit("    size_t len = strnlen(q, (size_t)(end - q));");
+            self.emit("    char *eq = (char*)memchr(q, '=', len);");
+            self.emit("    if (eq && eq > q) {");
+            self.emit("      size_t nl = (size_t)(eq - q);");
+            self.emit("      int ok = isalpha((unsigned char)q[0]) || q[0] == '_';");
+            self.emit("      for (size_t k = 1; ok && k < nl; k++) ok = isalnum((unsigned char)q[k]) || q[k] == '_';");
+            self.emit("      if (ok) { char c = *eq; *eq = 0; setenv(q, eq + 1, 1); *eq = c; }");
+            self.emit("    }");
+            self.emit("    q += len + 1;");
+            self.emit("  }");
+            self.emit("  free(data);");
+            self.emit("}");
+            self.emit("/* eval / . : run the built command, then snapshot the child's");
+            self.emit("   post-command environment and import it so assignments persist */");
+            self.emit("static int _sh_state_run(void) {");
+            self.emit("  const char *suffix = \" ; __shst_rc=$? ; env -0 > \\\"${_SH2ENVF}\\\" ; exit $__shst_rc\";");
+            self.emit("  const char *pre = \"set -a ; \";");
+            self.emit("  size_t l = _sh_cmd ? strlen(_sh_cmd) : 0, n = strlen(suffix), p0 = strlen(pre);");
+            self.emit("  _sh_grow(&_sh_cmd, &_sh_cap, l + n + p0 + 1);");
+            self.emit("  if (!_sh_cmd) return 127;");
+            self.emit("  memmove(_sh_cmd + p0, _sh_cmd, l + 1);");
+            self.emit("  memcpy(_sh_cmd, pre, p0);");
+            self.emit("  strcat(_sh_cmd, suffix);");
+            self.emit("  _sh_wrap_cmd(_sh_cmd);");
+            self.emit("  int rc = system(_sh_wrap);");
+            self.emit("  rc = (rc == -1) ? 127 : (WIFEXITED(rc) ? WEXITSTATUS(rc) : 1);");
+            self.emit("  const char *f = getenv(\"_SH2ENVF\");");
+            self.emit("  if (f && *f) _sh_import_env(f);");
+            self.emit("  return rc;");
+            self.emit("}");
             self.emit("/* split a captured string on IFS whitespace into words */");
             self.emit("static size_t _sh_split(char *buf, char **words, size_t max) {");
             self.emit("  size_t n = 0; char *p = buf;");
@@ -1757,6 +1797,58 @@ impl Render {
     /// Register a command-run site; `body` renders the helper body (the
     /// command-text build). Returns the call expression `_sh_site_N()`.
     /// `invert` makes the helper return `!rc` (the `(( ))` truth value).
+    /// `.`/`source FILE` / `eval TEXT` — statement position. The text is
+    /// arbitrary dynamic shell code with no native lowering (the one
+    /// documented fork/exec case), but bash semantics require its
+    /// ASSIGNMENTS to persist in this process: run it via `_sh_state_run`,
+    /// which appends an `env -0` snapshot to the child command and imports
+    /// every identifier assignment back via setenv — later reads go
+    /// through getenv, children inherit through _sh_export/getenv.
+    fn source_eval_site(&mut self, kind: &str, args: &[IrExpr]) -> String {
+        self.need_sh = true;
+        let words = match args.get(1) {
+            Some(IrExpr::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        };
+        let kind_str = IrExpr::Str(kind.to_string(), crate::ir::StrStyle::DoubleQuoted);
+        let id = self.site_seq;
+        self.site_seq += 1;
+        let saved = std::mem::take(&mut self.out);
+        let saved_depth = self.depth;
+        self.depth = 0;
+        // unique-per-process snapshot path for the child's env dump
+        self.emit(&format!(
+            "{{ static char _envf{id}[64]; snprintf(_envf{id}, sizeof _envf{id}, \"/tmp/.shstate.%ld\", (long)getpid()); _sh_export(\"_SH2ENVF\", _envf{id}); }}"
+        ));
+        self.emit("_sh_reset();");
+        self.sh_word(CmdBuf::Shared, &kind_str);
+        for w in &words {
+            self.sh_word(CmdBuf::Shared, w);
+        }
+        let body_out = std::mem::replace(&mut self.out, saved);
+        self.depth = saved_depth;
+        let mut s = format!("static int _sh_site_{id}(void) {{\n");
+        for line in body_out {
+            s.push_str(&line);
+            s.push('\n');
+        }
+        s.push_str("  return !_sh_state_run();\n}");
+        self.site_bodies.push(s);
+        self.site_ids.push(id);
+        format!("_sh_site_{id}()")
+    }
+
+    /// The exec/builtin args of a state-mutating builtin (`[cmd, words]`
+    /// where cmd is `.` / `source` / `eval`).
+    fn state_builtin_args(args: &[IrExpr]) -> Option<(&str, &[IrExpr])> {
+        match args.first() {
+            Some(IrExpr::Str(c, _)) if matches!(c.as_str(), "." | "source" | "eval") => {
+                Some((c.as_str(), args))
+            }
+            _ => None,
+        }
+    }
+
     fn shell_site(&mut self, body: impl FnOnce(&mut Render), invert: bool) -> String {
         self.need_sh = true;
         let id = self.site_seq;
@@ -2082,16 +2174,65 @@ impl Render {
                             }
                             IrExpr::Call { func, args } if func == "getVar" => {
                                 let n = Self::str_arg(args, 0).unwrap_or_default();
-                                let v = if n == "?" {
-                                    self.num_temp("_sh_rc")
-                                } else if self.is_num(&n) {
-                                    let t = self.num_temp(&self.c_ident(&n));
-                                    t
-                                } else {
-                                    self.store_read(&n)
+                                // special vars first — they are NOT store
+                                // names (`hello $@` went through
+                                // store_read("@") and exported an empty
+                                // value, so the child saw `hello ' '`)
+                                let (v, ref_text): (String, String) = match n.as_str() {
+                                    "?" => {
+                                        let t = self.num_temp("_sh_rc");
+                                        (t.clone(), t)
+                                    }
+                                    "@" | "*" => {
+                                        let t = self.str_temp(4096);
+                                        self.emit(&format!(
+                                            "_sh_argv_join({t}, sizeof {t});"
+                                        ));
+                                        // export the join; the child sees a
+                                        // single quoted word (bash would
+                                        // split `$@` — acceptable for the
+                                        // text-site form where argv is flat)
+                                        self.emit(&format!(
+                                            "_sh_export(\"_SHARGSJ\", {t});"
+                                        ));
+                                        let r = "${_SHARGSJ}".to_string();
+                                        (t.clone(), r)
+                                    }
+                                    "$" => {
+                                        let t = self.num_temp("getpid()");
+                                        (t.clone(), t)
+                                    }
+                                    "#" => {
+                                        let t = self.num_temp(
+                                            "((_sh_argc > 0) ? (_sh_argc - 1) : 0)",
+                                        );
+                                        (t.clone(), t)
+                                    }
+                                    d
+                                        if !d.is_empty()
+                                            && d.chars().all(|c| c.is_ascii_digit()) =>
+                                    {
+                                        // positional — resolved through the
+                                        // child's env via _SHARGV (the same
+                                        // trick sh_word's digit arm uses)
+                                        self.emit(&format!(
+                                            "_sh_export(\"_SHARGV\", (({d} < _sh_argc && _sh_argv[{d}]) ? _sh_argv[{d}] : \"\"));"
+                                        ));
+                                        (String::new(), "$_SHARGV".to_string())
+                                    }
+                                    _ => {
+                                        let v = if self.is_num(&n) {
+                                            self.num_temp(&self.c_ident(&n))
+                                        } else {
+                                            self.store_read(&n)
+                                        };
+                                        self.emit(&format!(
+                                            "_sh_export({}, {v});",
+                                            Self::cstr(&n)
+                                        ));
+                                        (v.clone(), format!("${n}"))
+                                    }
                                 };
-                                self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
-                                let ref_text = if n == "?" { v.clone() } else { format!("${n}") };
                                 if first_seg {
                                     // NEW word: keep the separating space
                                     // (`-- "$d/f1"` is TWO args — gluing
@@ -2977,7 +3118,9 @@ impl Render {
                 }
                 HdSeg::Arith(a) => {
                     fmt.push_str("%lld");
-                    cargs.push(self.arith(a));
+                    // the arith() expression may be plain-int C — the
+                    // varargs promotion needs an explicit long long
+                    cargs.push(format!("(long long)({})", self.arith(a)));
                 }
                 HdSeg::Cmd(cmd) => {
                     fmt.push_str("%s");
@@ -5759,6 +5902,21 @@ impl Render {
         match s {
             IrStmt::Expr(e) => {
                 match e {
+                    // eval / . / source: state-mutating dynamic shell text
+                    // (see source_eval_site) — intercept BEFORE the generic
+                    // shell-text site
+                    IrExpr::Call { func, args }
+                        if (func == "exec" || func == "builtin")
+                            && Self::state_builtin_args(args).is_some() =>
+                    {
+                        let (_, a) = Self::state_builtin_args(args).unwrap();
+                        let site = self.source_eval_site(
+                            Self::str_arg(a, 0).unwrap_or_default().as_str(),
+                            a,
+                        );
+                        self.emit(&format!("{site};"));
+                        return;
+                    }
                     // `break || X` — break ALWAYS succeeds, X never runs
                     // (`continue || X` likewise) — the C break/continue
                     // cannot be an expression, so peel the BinOp
@@ -6631,6 +6789,16 @@ impl Render {
             IrStmt::Exec { cmd, args, capture, redirects, .. } => {
                 let mut call_args = vec![cmd.clone()];
                 call_args.push(IrExpr::Array(args.clone()));
+                // eval / . / source (no capture/redirects): state site
+                if capture.is_none()
+                    && redirects.is_empty()
+                    && Self::state_builtin_args(&call_args).is_some()
+                {
+                    let (k, a) = Self::state_builtin_args(&call_args).unwrap();
+                    let site = self.source_eval_site(k, a);
+                    self.emit(&format!("{site};"));
+                    return;
+                }
                 if let Some(var) = capture {
                     self.store.insert(var.clone());
                     let id = self.c_ident(var);
