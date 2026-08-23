@@ -18828,13 +18828,18 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         expression: false,
                         r#async: false,
                     };
+                    // limit? → third arg: the runtime closes the reader
+                    // after that many lines (streaming head, O(K) memory).
+                    let mut call_args = vec![expr_to_estree(&fl.source), cb];
+                    if let Some(lim) = &fl.limit {
+                        call_args.push(expr_to_estree(lim));
+                    }
                     // AWAITED: bash pipelines are synchronous; without the
                     // await, later statements (e.g. printing the counter)
                     // run before any line arrives.
                     Some(Stmt::ExpressionStatement {
                         expression: Expr::AwaitExpression {
-                            argument: Box::new(crate::estree::sh2_call("eachLine",
-                                vec![expr_to_estree(&fl.source), cb])),
+                            argument: Box::new(crate::estree::sh2_call("eachLine", call_args)),
                         },
                     })
                 }

@@ -1,15 +1,18 @@
 # shir_nodes/foreach_line.node — STREAMING line iteration over a file.
 #
 # The dynamic-source primitive: reduces `cmd file` / `grep P F | cmd`
-# pipelines to a lazy per-line loop — O(1) memory, never slurps the file
-# where bash itself streams. Body statements use the existing VALUE
-# primitives (FieldExtract/Contains/RegSub/…) per line.
+# pipelines to a lazy per-line loop — O(1) memory (O(limit) for early-exit
+# heads), never slurps the file where bash itself streams. Body statements
+# use the existing VALUE primitives (FieldExtract/Contains/RegSub/…) per
+# line. limit=None reads to EOF; Some(expr) stops after that many lines
+# (`head -n K F`) — backends close the reader early.
 #
-# Backends: Perl while(<$fh>), JS sh2.eachLine (readline), C getline,
-# Go bufio.Scanner, Zig reader loop.
+# Backends: Perl while(<$fh>)+last, JS sh2.eachLine(path,cb,limit),
+# C getline, Go bufio.Scanner, Zig reader loop.
 
 node ForEachLine
 tag "ForEachLine"
 field source: expr
 field var: string
 field body: stmts
+field limit: optional_expr
