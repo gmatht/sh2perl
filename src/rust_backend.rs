@@ -519,6 +519,13 @@ impl Render {
     /// A shell variable read as a String-typed expression. Handles the
     /// declared vars, positional params, special vars and env vars.
     fn getvar_str(&mut self, name: &str) -> String {
+        // `${#var}` arrives as getVar("#var") (the parser keeps the `#`
+        // in the braced-name token) — render as a character count.
+        if name.len() > 1 && name.starts_with('#') {
+            self.add_helper("len");
+            let inner = self.getvar_str(&name[1..]);
+            return format!("__sh_len(&{inner}).to_string()");
+        }
         if let Some(l) = self.captured.get(name) {
             return if self.is_num(name) {
                 format!("{l}.to_string()")
@@ -589,6 +596,12 @@ impl Render {
 
     /// A shell variable read as an i64-typed expression.
     fn getvar_num(&mut self, name: &str) -> String {
+        // `${#var}` in numeric context (see getvar_str)
+        if name.len() > 1 && name.starts_with('#') {
+            self.add_helper("len");
+            let inner = self.getvar_str(&name[1..]);
+            return format!("__sh_len(&{inner})");
+        }
         if let Some(l) = self.captured.get(name) {
             return if self.is_num(name) {
                 l.clone()
