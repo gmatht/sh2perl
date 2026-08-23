@@ -2093,14 +2093,18 @@ impl Render {
                                 self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
                                 let ref_text = if n == "?" { v.clone() } else { format!("${n}") };
                                 if first_seg {
+                                    // NEW word: keep the separating space
+                                    // (`-- "$d/f1"` is TWO args — gluing
+                                    // the ref to the literal before it
+                                    // concatenates them into ONE)
                                     match buf {
                                         CmdBuf::Shared => self.emit(&format!(
                                             "_sh_addraw({});",
-                                            Self::cstr(&format!("\"{ref_text}\""))
+                                            Self::cstr(&format!(" \"{ref_text}\""))
                                         )),
                                         CmdBuf::Private(id) => self.emit(&format!(
                                             "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
-                                            Self::cstr(&format!("\"{ref_text}\""))
+                                            Self::cstr(&format!(" \"{ref_text}\""))
                                         )),
                                     }
                                 } else {
