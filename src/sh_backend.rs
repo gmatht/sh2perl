@@ -2235,6 +2235,14 @@ fn needs_grep_p(stmts: &[IrStmt]) -> bool {
                         return true;
                     }
                 }
+                // a pipeline's stages are per-stage stmt lists — descend so
+                // `echo x | grep -oP …` (stage 2) is visible to the
+                // polyfill-prologue decision (pipeline_grep_p_emits_polyfill)
+                IrStmt::Pipeline { stages, .. } => {
+                    if stages.iter().any(|s| walk(s)) {
+                        return true;
+                    }
+                }
                 _ => {}
             }
         }

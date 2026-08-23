@@ -301,6 +301,57 @@ pub fn string_trim(node: &StringTrim, ctx: &ExprRenderCtx) -> Option<String> {
     }
 }
 
+// ── AffixStrip ──────────────────────────────────────────────────────
+
+pub fn affix_strip(node: &AffixStrip, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        Backend::Perl => {
+            // ONE occurrence: test then strip, mirroring Go's
+            // TrimPrefix/TrimSuffix (absent affix → text unchanged)
+            let text = crate::ir::ir_expr_to_perl(&node.text);
+            let pat = crate::ir::ir_expr_to_perl(&node.pattern);
+            if node.prefix {
+                Some(format!("(index({}, {}) == 0 ? substr({}, length({})) : {})",
+                    text, pat, text, pat, text))
+            } else {
+                Some(format!("(substr({}, -length({})) eq {} ? substr({}, 0, length({}) - length({})) : {})",
+                    text, pat, pat, text, text, pat, text))
+            }
+        }
+        Backend::Estree => {
+            let text = render_child(&node.text, ctx)?;
+            let pat = render_child(&node.pattern, ctx)?;
+            if node.prefix {
+                Some(format!("({}.startsWith({}) ? {}.slice({}.length) : {})",
+                    text, pat, text, pat, text))
+            } else {
+                Some(format!("({}.endsWith({}) ? {}.slice(0, {}.length - {}.length) : {})",
+                    text, pat, text, text, pat, text))
+            }
+        }
+        Backend::Go => {
+            let text = render_child(&node.text, ctx)?;
+            let pat = render_child(&node.pattern, ctx)?;
+            if node.prefix {
+                Some(format!("strings.TrimPrefix({}, {})", text, pat))
+            } else {
+                Some(format!("strings.TrimSuffix({}, {})", text, pat))
+            }
+        }
+        Backend::Rust => {
+            let text = render_child(&node.text, ctx)?;
+            let pat = render_child(&node.pattern, ctx)?;
+            if node.prefix {
+                Some(format!("{}.strip_prefix({}).unwrap_or({})", text, pat, text))
+            } else {
+                Some(format!("{}.strip_suffix({}).unwrap_or({})", text, pat, text))
+            }
+        }
+        Backend::Zig => None,
+        _ => None,
+    }
+}
+
 // ── RepeatStr ────────────────────────────────────────────────────────
 
 pub fn repeat_str(node: &RepeatStr, ctx: &ExprRenderCtx) -> Option<String> {

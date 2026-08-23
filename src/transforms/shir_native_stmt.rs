@@ -968,6 +968,15 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
             "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             "=" | "==" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(left.to_string(), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(right.to_string(), StrStyle::Raw)) },
             "!=" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(left.to_string(), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(right.to_string(), StrStyle::Raw)) },
+            "=~" => {
+                // `[[ $s =~ re ]]` — regex match (triage-perl t68_case_glob,
+                // regex_test_op_renders_match). The rhs is a bare ERE
+                // pattern; single-quoted so delimiter/interpolation chars
+                // stay literal (Perl's dialect ≈ ERE for the corpus).
+                let l = left.trim().trim_matches('"');
+                let r = right.trim().trim_matches('"').replace('\'', "\\'");
+                IrExpr::Str(format!("({} =~ '{}')", l, r), StrStyle::Raw)
+            }
             "-ef" => {
                 // Compare device and inode: (stat(f))[0] eq (stat(g))[0] && (stat(f))[1] eq (stat(g))[1]
                 let stat_left = IrExpr::Str(format!("(stat(\"{}\"))[0]", left), StrStyle::Raw);
