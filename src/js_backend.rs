@@ -357,11 +357,22 @@ impl Render {
                 let r = self.arith(rhs);
                 if *op == "**" {
                     format!("Math.pow({l},{r})")
+                } else if *op == "&&" || *op == "||" {
+                    // JS && / || return an OPERAND (true is a boolean —
+                    // parseInt(true) is NaN); the arith contract needs a
+                    // NUMBER (printf %d of `ok && !no` printed 0)
+                    format!("((({l} {op} {r})) ? 1 : 0)")
                 } else {
                     format!("({l} {op} {r})")
                 }
             }
-            ArithAst::Un { op, arg } => format!("({op}{})", self.arith(arg)),
+            ArithAst::Un { op, arg } => {
+                if op == "!" {
+                    format!("((!({})) ? 1 : 0)", self.arith(arg))
+                } else {
+                    format!("({op}{})", self.arith(arg))
+                }
+            }
             ArithAst::Cond { test, then, else_ } => format!(
                 "({} ? {} : {})",
                 self.arith(test),
@@ -678,33 +689,31 @@ impl Render {
     /// index/cond); a plain `$name` (or `$a op $b`) folds to the native
     /// bindings. Anything else → None (runtime stub).
     fn arith_str(&mut self, s: &str) -> Option<String> {
-        let toks: Vec<&str> = s.split_whitespace().collect();
-        match toks.as_slice() {
-            [t] => {
-                let rest = t.strip_prefix('$')?;
-                if is_plain_name(rest) {
-                    Some(self.js_ident(rest))
+        // General arith STRING (`($x % 2)` — the C frontend's
+        // testArith/ternary-cond shape): normalize $refs to bare idents,
+        // parse, render via the Arith AST walker (its Var arm keeps the
+        // Number()||0 coercion for string-homed vars).
+        let norm: String = s
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if c == '$'
+                    && i + 1 < s.len()
+                    && (s[i + 1..].starts_with('{')
+                        || s[i + 1..]
+                            .chars()
+                            .next()
+                            .map_or(false, |n| n.is_ascii_alphabetic() || n == '_'))
+                {
+                    ' '
                 } else {
-                    None
+                    c
                 }
-            }
-            [l, op, r] if matches!(*op, "+" | "-" | "*" | "/" | "%") => {
-                let l = l.strip_prefix('$').filter(|x| is_plain_name(x))?;
-                let rr = if let Some(n) = r.strip_prefix('$') {
-                    if is_plain_name(n) {
-                        self.js_ident(n)
-                    } else {
-                        return None;
-                    }
-                } else if let Ok(n) = r.parse::<i64>() {
-                    n.to_string()
-                } else {
-                    return None;
-                };
-                Some(format!("({} {} {})", self.js_ident(l), op, rr))
-            }
-            _ => None,
-        }
+            })
+            .collect();
+        let norm = norm.replace('{', " ").replace('}', " ");
+        let ast = crate::shir::parse_arith(norm.trim())?;
+        Some(self.arith(&ast))
     }
 
     /// The native read of a `param` target: the binding for a
