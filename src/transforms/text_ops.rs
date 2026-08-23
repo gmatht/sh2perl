@@ -1133,7 +1133,12 @@ fn arg_to_expr(arg: &IrExpr) -> Option<IrExpr> {
                 _ => Some(arg.clone()),
             }
         }
-        IrExpr::Var(..) | IrExpr::Capture { .. } | IrExpr::Call { .. } => Some(arg.clone()),
+        // A variable read reduces fine; a CAPTURE or command CALL does NOT —
+        // embedding one inside an Ext node makes the A1 exporter punt
+        // ("Other") and ingress refuse. Those sources keep the original
+        // command (correct fallback).
+        IrExpr::Var(..) => Some(arg.clone()),
+        IrExpr::Call { func, .. } if func == "getVar" || func == "param" => Some(arg.clone()),
         _ => None,
     }
 }
