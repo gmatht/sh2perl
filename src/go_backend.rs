@@ -785,16 +785,40 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "nil".into()
             }
-            IrExpr::Ext(n) => {
-                let ctx = crate::render_ext_expr::ExprRenderCtx {
-                    backend: crate::render_ext_expr::Backend::Go,
-                    indent: 0,
-                };
-                if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
-                    code
-                } else {
-                    format!("sh2.{}(...)", n.tag())
+            IrExpr::Ext(n) => match n.tag() {
+                "StringContains" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StringContains>()
+                        .expect("tag/type agree");
+                    format!("strings.Contains({}, {})",
+                        self.expr_any(&x.text), self.expr_any(&x.pattern))
                 }
+                "FieldExtract" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()
+                        .expect("tag/type agree");
+                    // single-field fast path; ranges/multi-field fall back
+                    if x.fields.len() == 1 {
+                        if let crate::ir::FieldRange::Single(i) = x.fields[0] {
+                            return format!(
+                                "func() string {{\n_p := strings.Split({}, {})\nif {}-1 < len(_p) {{\nreturn _p[{}]\n}}\nreturn \"\"\n}}()",
+                                self.expr_any(&x.text),
+                                go_str_lit(&x.delimiter), i, i - 1);
+                        }
+                    }
+                    "nil".into()
+                }
+                "StrLen" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StrLen>()
+                        .expect("tag/type agree");
+                    format!("len({})", self.expr_any(&x.text))
+                }
+                "CaseTransform" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::CaseTransform>()
+                        .expect("tag/type agree");
+                    format!("strings.{}({})",
+                        if x.upper { "ToUpper" } else { "ToLower" },
+                        self.expr_any(&x.text))
+                }
+                _ => format!("sh2.{}(...)", n.tag()),
             }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr_any(i)).collect();
@@ -2612,7 +2636,44 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => self.stmt_expr(e),
-            IrStmt::Ext(_) => panic!("go backend: Ext node unsupported"),
+            IrStmt::Ext(node) => {
+                // STREAMING line iteration — O(1) memory, never slurps.
+                // Body statements render through the Go backend's own
+                // emitters (recursion goes back through this match).
+                if node.tag() == "ForEachLine" {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static FL_N: AtomicUsize = AtomicUsize::new(0);
+                    let k = FL_N.fetch_add(1, Ordering::Relaxed);
+                    let fl = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>()
+                        .expect("tag/type agree");
+                    // The loop var is a STRING: register the verdict before
+                    // anything renders, so reads use native string ops and
+                    // the hoisted decl is `var __l string` not `any`.
+                    self.var_types.insert(fl.var.clone(), IrType::Str);
+                    let src = self.expr_any(&fl.source);
+                    self.emit(&format!("_ff{k}, _err{k} := os.Open({src})", src = src));
+                    self.emit(&format!("if _err{k} != nil {{ st = 1 }} else {{"));
+                    self.depth += 1;
+                    self.emit(&format!("_sc{k} := bufio.NewScanner(_ff{k})"));
+                    self.emit(&format!("for _sc{k}.Scan() {{"));
+                    self.depth += 1;
+                    self.emit(&format!("{} = _sc{k}.Text()", fl.var));
+                    self.mark_written(&fl.var);
+                    // Go errors on unused locals — silence when the body
+                    // doesn't read the line (pure counters).
+                    self.emit(&format!("_ = {}", fl.var));
+                    for b in &fl.body {
+                        self.stmt(b);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                    self.depth -= 1;
+                    self.emit("}");
+                    self.need_st = true;
+                } else {
+                    panic!("go backend: Ext node {} unsupported", node.tag());
+                }
+            }
             IrStmt::Assign { targets, expr, .. } => self.stmt_assign(targets, expr),
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
@@ -4289,6 +4350,7 @@ impl Render {
             }
             IrExpr::BinOp { .. } => vec![Part::Arg(self.expr_any(e))],
             IrExpr::Call { .. } => vec![Part::Arg(self.expr_any(e))],
+            IrExpr::Ext(n) => vec![Part::Arg(self.expr_any(e))],
             other => {
                 self.mark_todo(&format!("echo arg {:?}", other));
                 vec![Part::Arg("0".into())]
@@ -4445,6 +4507,13 @@ impl Render {
     /// The per-program declaration lines (vars, st, vars map, fArgs).
     fn decl_lines(&mut self) -> Vec<String> {
         let mut out = Vec::new();
+        // ForEachLine loop vars are STRING-typed by construction (scanner
+        // .Text() assigned in the streaming loop) — register before typing.
+        for v in &self.written {
+            if v.starts_with("__l") && !self.var_types.contains_key(v) {
+                self.var_types.insert(v.clone(), IrType::Str);
+            }
+        }
         let written: Vec<String> = self.written.iter().cloned().collect();
         for v in &written {
             let m = self.go_ident(v);
@@ -6567,4 +6636,8 @@ mod pipe_tests {
             }
         }
     }
+}
+
+fn go_str_lit(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }

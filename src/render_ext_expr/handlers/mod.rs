@@ -14,5 +14,6 @@
     pub(crate) mod reg_sub;
     pub(crate) mod string_affix;
     pub(crate) mod char_extract;
+    pub(crate) mod field_read;
     pub(crate) mod split;
 

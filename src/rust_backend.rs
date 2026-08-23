@@ -892,6 +892,16 @@ impl Render {
                 }
                 _ => format!("({} != 0)", self.expr_num(e)),
             },
+            IrExpr::Ext(n) => match n.tag() {
+                "StringContains" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StringContains>()
+                        .expect("tag/type agree");
+                    format!(
+                        "(if {}.contains({}.as_str()) {{ true }} else {{ false }})",
+                        self.expr_str(&x.text), self.expr_str(&x.pattern))
+                }
+                other => format!("({} != 0)", self.expr_num(e)),
+            },
             IrExpr::Arith(a) => format!("({} != 0)", self.arith(a)),
             IrExpr::Call { func, args } if func == "test" => self.test_call_bool(args),
             IrExpr::Call { func, args } if func == "grepMatches" => {
@@ -1110,16 +1120,40 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "String::new()".to_string()
             }
-            IrExpr::Ext(n) => {
-                let ctx = crate::render_ext_expr::ExprRenderCtx {
-                    backend: crate::render_ext_expr::Backend::Rust,
-                    indent: 0,
-                };
-                if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
-                    code
-                } else {
-                    format!("sh2.{}(...)", n.tag())
+            IrExpr::Ext(n) => match n.tag() {
+                "StringContains" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StringContains>()
+                        .expect("tag/type agree");
+                    format!(
+                        "(if {}.contains({}.as_str()) {{ 1i64 }} else {{ 0i64 }})",
+                        self.expr_str(&x.text), self.expr_str(&x.pattern))
                 }
+                "StrLen" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StrLen>()
+                        .expect("tag/type agree");
+                    format!("({}.len() as i64)", self.expr_str(&x.text))
+                }
+                "CaseTransform" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::CaseTransform>()
+                        .expect("tag/type agree");
+                    format!("{}.{}()",
+                        self.expr_str(&x.text),
+                        if x.upper { "to_uppercase" } else { "to_lowercase" })
+                }
+                "FieldExtract" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()
+                        .expect("tag/type agree");
+                    if x.fields.len() == 1 {
+                        if let crate::ir::FieldRange::Single(i) = x.fields[0] {
+                            return format!(
+                                "{{ let __s: String = {}; let __p: Vec<&str> = __s.split({}).collect(); if {}-1 < __p.len() {{ __p[{}].to_string() }} else {{ String::new() }} }}",
+                                self.expr_str(&x.text),
+                                Self::rust_str(&x.delimiter), i, i - 1);
+                        }
+                    }
+                    "String::new()".into()
+                }
+                _ => "String::new()".into(),
             }
         }
     }
@@ -2479,6 +2513,19 @@ impl Render {
             IrExpr::Index { var, key } => {
                 let k = self.expr_num(key);
                 format!("vec![{}]", self.array_elem(var, &k))
+            }
+            IrExpr::Ext(n) if n.tag() == "FieldExtract" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()
+                    .expect("tag/type agree");
+                if x.fields.len() == 1 {
+                    if let crate::ir::FieldRange::Single(i) = x.fields[0] {
+                        let t = self.expr_str(&x.text);
+                        let d = Self::rust_str_expr(&x.delimiter);
+                        return format!("vec![{{ let __s: String = {t}; let __p: Vec<&str> = __s.split({d}.as_str()).collect(); if {}-1 < __p.len() {{ __p[{}].to_string() }} else {{ String::new() }} }}]", i, i - 1);
+                    }
+                }
+                self.mark_todo("word FieldExtract (complex fields)");
+                "vec![String::new()]".to_string()
             }
             other => {
                 self.mark_todo(&format!("word {:?}", other));
@@ -5098,6 +5145,42 @@ impl Render {
                     "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
                 ));
             }
+            IrStmt::Ext(node) if node.tag() == "ForEachLine" => {
+                // STREAMING line iteration — O(1) memory (O(limit) for
+                // early-exit heads), never slurps. The loop var is bound
+                // into its thread_local String static; body statements
+                // render through the backend's own emitters.
+                let fl = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>()
+                    .expect("tag/type agree");
+                self.var_types.insert(fl.var.clone(), IrType::Str);
+                self.mark_written(&fl.var);
+                let m = self.rust_ident(&fl.var);
+                let src = self.expr_str(&fl.source);
+                let iter = match &fl.limit {
+                    Some(lim) => {
+                        let lim_r = self.expr_num(lim);
+                        format!("std::io::BufReader::new(__sh_f).lines().take(({}) as usize)", lim_r)
+                    }
+                    None => "std::io::BufReader::new(__sh_f).lines()".to_string(),
+                };
+                self.emit(&format!("match std::fs::File::open({}) {{", src));
+                self.depth += 1;
+                self.emit("Ok(__sh_f) => {");
+                self.depth += 1;
+                self.emit(&format!("for {} in {}.flatten() {{", fl.var, iter));
+                self.depth += 1;
+                self.emit(&format!("{}.with(|v| *v.borrow_mut() = {}.clone());", m, fl.var));
+                for b in &fl.body {
+                    self.stmt(b);
+                }
+                self.depth -= 1;
+                self.emit("}");
+                self.depth -= 1;
+                self.emit("}");
+                self.emit("Err(_) => { __SH_RC.store(1, Ordering::SeqCst); }");
+                self.depth -= 1;
+                self.emit("}");
+            }
             IrStmt::Die { .. } | IrStmt::Warn { .. } | IrStmt::SetChildError(_)
             | IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Goto(_)
             | IrStmt::Label(_) | IrStmt::Ext(_) => {
@@ -5230,7 +5313,12 @@ impl Render {
         // The thread_local var declarations are MODULE-level statics (the
         // function bodies reference them) — emitted before main. Render
         // pass may have discovered MORE arrays (eval-word param texts) —
-        // fold them in before declaring.
+        // fold them in before declaring. Same for vars discovered during
+        // rendering (ForEachLine loop vars — their writes happen inside the
+        // streaming node's hand-emitted scanner loop).
+        for v in &self.written {
+            written.insert(v.clone());
+        }
         for a in &self.arrays {
             written.insert(a.clone());
         }
@@ -5277,6 +5365,7 @@ impl Render {
         self.emit("#![allow(non_upper_case_globals)]");
         self.emit("use std::sync::atomic::Ordering;");
         self.emit("use std::io::Read;");
+        self.emit("use std::io::BufRead;");
         self.emit("use std::io::Write;");
         self.emit("");
         self.emit("static __SH_RC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
