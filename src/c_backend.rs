@@ -4096,12 +4096,37 @@ impl Render {
     /// runs the command substitutions itself.
     fn test_shell_site(&mut self, s: &str) -> String {
         let s = s.to_string();
+        // extglob patterns (@(…) etc.) need the shopt enabled in the child
         let flat = !s.contains(' ');
+        let ext = ["@(", "+(", "!(",
+                   "?("].iter().any(|e| s.contains(e));
         self.shell_site(
             |r| {
                 r.sh_export_vars(&s);
                 r.emit("_sh_reset();");
-                if flat {
+                if ext {
+                    r.emit(&format!(
+                        "_sh_addraw({});",
+                        Self::cstr("shopt -s extglob >/dev/null 2>&1;")
+                    ));
+                }
+                if ext {
+                    // bash needs SPACES around the operator before an
+                    // extglob pattern (`"$x"=@(…)` is a syntax error)
+                    let mut sp = ["@(", "+(", "!(",
+                                  "?("]
+                        .iter()
+                        .fold(s.clone(), |acc, e| acc.replace(e, &format!(" {e}")));
+                    // the operator needs its spaces too ("$x"= @(...) is
+                    // still a syntax error → "$x" = @(...)
+                    if !sp.contains("==") && !sp.contains("!=") {
+                        sp = sp.replacen('=', " = ", 1);
+                    }
+                    r.emit(&format!(
+                        "_sh_addraw({});",
+                        Self::cstr(&format!("[[ {sp} ]]"))
+                    ));
+                } else if flat {
                     r.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[[ {s} ]]"))));
                 } else {
                     r.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[ {s} ]"))));
@@ -5161,7 +5186,12 @@ impl Render {
             },
             "test" => match Self::str_arg(args, 0) {
                 Some(s) => {
-                    if s.contains("$(") {
+                    // \$( ) command substitution or EXTGLOB patterns
+                    // (@(…) +(…) !(…) ?(…)) have no native lowering —
+                    // the child bash evaluates them (extglob enabled)
+                    if s.contains("$(")
+                        || ["@(", "+(", "!(", "?("].iter().any(|e| s.contains(e))
+                    {
                         return self.test_shell_site(&s);
                     }
                     self.test_render(&s)
@@ -7081,11 +7111,16 @@ impl Render {
                 self.need_fnmatch = true;
                 let mut first = true;
                 for cl in clauses {
-                    for pat in &cl.patterns {
+                    for pat_raw in &cl.patterns {
+                        // patterns arrive as RAW TEXT including any
+                        // quoting (`"add"`) — bash strips the QUOTES before
+                        // matching, so fnmatch never saw a match
+                        let stripped = strip_glob(pat_raw);
+                        let pat = unquote_case_pattern(stripped);
                         let kw = if first { "if" } else { "else if" };
                         first = false;
                         let flags = if self.nocasematch { " | FNM_CASEFOLD" } else { "" };
-                        let pat_c = Self::cstr(strip_glob(pat));
+                        let pat_c = Self::cstr(pat);
                         self.emit(&format!(
                             "{kw} (fnmatch({pat_c}, {d}, 0{flags}) == 0) {{"
                         ));
@@ -9123,6 +9158,19 @@ fn collect_vars_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
 /// renderer strips it before emitting the pattern anywhere.
 fn strip_glob(s: &str) -> &str {
     s.strip_prefix("\u{1}SH2GLOB\u{1}").unwrap_or(s)
+}
+
+/// A case pattern arrives as RAW TEXT including any quoting (`"add"`,
+/// `'start'`) — bash strips the QUOTES before matching.
+fn unquote_case_pattern(p: &str) -> &str {
+    let t = p.trim();
+    let mut ch = t.chars();
+    if let (Some(f), Some(l)) = (ch.next(), t.chars().last()) {
+        if ch.count() >= 1 && ((f == '"' && l == '"') || (f == '\'' && l == '\'')) {
+            return &t[1..t.len() - 1];
+        }
+    }
+    p
 }
 
 fn is_ident(s: &str) -> bool {
