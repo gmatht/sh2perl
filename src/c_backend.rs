@@ -2916,6 +2916,84 @@ impl Render {
         }
     }
 
+    /// `$( raw shell text )` inside an interpolated heredoc: run it in a
+    /// child bash (the referenced variables are exported first) and
+    /// capture stdout. This is the one genuinely unavoidable shell-out —
+    /// arbitrary command substitution text has no native C lowering.
+    fn capture_text_c(&mut self, cmd: &str) -> String {
+        let cmd = cmd.to_string();
+        self.cap_site(|r, id| {
+            r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
+            r.sh_export_vars(&cmd);
+            r.emit(&format!(
+                "_sh_capture(buf, sizeof buf, {});",
+                Self::cstr(&cmd)
+            ));
+            r.emit("return buf;");
+        })
+    }
+
+    /// An unquoted heredoc body's C value expression. The core delivers
+    /// the RAW text (`IrRedirect.target` is a plain `Str`,
+    /// `interpolate: true`) — expand it at render time via
+    /// [`split_heredoc_body`]: literals + getVar/param/native-arith
+    /// segments snprintf into a temp; `$(...)`/backtick segments run in
+    /// child bash ([`Render::capture_text_c`]). Unmodeled bodies stay
+    /// literal (the previous behavior).
+    fn heredoc_body_c(&mut self, target: &IrExpr) -> String {
+        let IrExpr::Str(s, _) = target else {
+            return self.value_c(target);
+        };
+        let Some(segs) = split_heredoc_body(s) else {
+            return Self::cstr(s);
+        };
+        if segs.len() == 1 {
+            if let HdSeg::Lit(l) = &segs[0] {
+                return Self::cstr(l);
+            }
+        }
+        let mut fmt = String::new();
+        let mut cargs: Vec<String> = Vec::new();
+        for seg in &segs {
+            match seg {
+                HdSeg::Lit(t) => fmt.push_str(&t.replace('%', "%%")),
+                HdSeg::Var(name) => {
+                    fmt.push_str("%s");
+                    cargs.push(self.value_c(&IrExpr::Call {
+                        func: "getVar".to_string(),
+                        args: vec![IrExpr::Str(
+                            name.clone(),
+                            crate::ir::StrStyle::DoubleQuoted,
+                        )],
+                    }));
+                }
+                HdSeg::Param(args) => {
+                    fmt.push_str("%s");
+                    cargs.push(self.param_call(args));
+                }
+                HdSeg::Arith(a) => {
+                    fmt.push_str("%lld");
+                    cargs.push(self.arith(a));
+                }
+                HdSeg::Cmd(cmd) => {
+                    fmt.push_str("%s");
+                    cargs.push(self.capture_text_c(cmd));
+                }
+            }
+        }
+        let t = self.str_temp(4096);
+        let args = if cargs.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", cargs.join(", "))
+        };
+        self.emit(&format!(
+            "snprintf({t}, sizeof {t}, {}{args});",
+            Self::cstr(&fmt)
+        ));
+        t
+    }
+
     /// Append the redirect text (`> f`, `>> f`, `< f`, heredoc, ...).
     fn sh_redirect_text(&mut self, buf: CmdBuf, redirects: &[crate::ir::IrRedirect]) {
         let raw = |r: &mut Render, s: &str| match buf {
@@ -2971,13 +3049,17 @@ impl Render {
                     self.sh_word(buf, &rd.target);
                 }
                 "heredoc" | "heredoc-tabs" => {
-                    // target = the body content (already interpolated by
-                    // the core); a quoted delimiter keeps it literal.
-                    // `<<-` strips leading tabs from content + delimiter
-                    // (the tab-stripped content arrives pre-stripped from
-                    // the core; the delimiter line uses the same form)
+                    // target = the body content; a quoted delimiter keeps
+                    // it literal. An UNQUOTED delimiter (`interpolate`)
+                    // expands `$var`/`${...}`/`$((...))`/`$(...)` — split
+                    // the raw body and render each segment (see
+                    // [`Render::heredoc_body_c`]).
                     raw(self, "<<'_SH2EOF_'\n");
-                    let v = self.value_c(&rd.target);
+                    let v = if rd.interpolate {
+                        self.heredoc_body_c(&rd.target)
+                    } else {
+                        self.value_c(&rd.target)
+                    };
                     addv(self, &v);
                     self.emit(&format!(
                         "{{ size_t _hl = strlen({v}); if (_hl == 0 || {v}[_hl - 1] != '\\n') _sh_add(\"\\n\"); }}"
@@ -8981,6 +9063,284 @@ fn flatten_parts(parts: &[InterpPart]) -> Vec<InterpPart> {
         }
     }
     out
+}
+
+// ── unquoted-heredoc body interpolation ──────────────────────────────
+
+/// One segment of an unquoted heredoc body (the core delivers the RAW
+/// text — `IrRedirect.target` is a plain `Str` with `interpolate: true`;
+/// the C backend must expand it itself, there is no Perl-style string
+/// interpolation to lean on):
+/// - `Lit` — literal text (backslash escapes already resolved)
+/// - `Var` — `$name` / `$1` / `$?` / ... → a getVar value
+/// - `Param` — `${name:-op...}` → a param call (args prebuilt)
+/// - `Arith` — `$((expr))` → native arithmetic (parsed AST)
+/// - `Cmd` — `$(text)` / `` `text` `` → child-bash capture (raw inner
+///   text; the renderer wraps it in an `_sh_capture` site)
+#[derive(Debug, Clone)]
+enum HdSeg {
+    Lit(String),
+    Var(String),
+    Param(Vec<IrExpr>),
+    Arith(ArithAst),
+    Cmd(String),
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// `${...}` body → the param/getVar call args mirroring the core's
+/// spellings (`param("len","x")`, `param(":-", name, default)`,
+/// `param("slice", name, off[, len])`, `getVar(name)`). None = a shape
+/// the mapper doesn't model — the caller falls back to literal text.
+fn dollar_brace_args(body: &str) -> Option<Vec<IrExpr>> {
+    let s = |t: &str| IrExpr::Str(t.to_string(), crate::ir::StrStyle::DoubleQuoted);
+    // `${#x}` / `${#arr[@]}` — length
+    if let Some(rest) = body.strip_prefix('#') {
+        let base = rest.trim_end_matches("[@]").trim_end_matches("[*]");
+        if is_ident(base) || base == "@" || base == "*" {
+            return Some(vec![s("len"), s(base)]);
+        }
+        return None;
+    }
+    if body.starts_with('!') {
+        return None; // ${!x} indirect — not modeled
+    }
+    // leading name
+    let ch: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < ch.len() && is_name_char(ch[i]) {
+        i += 1;
+    }
+    if i == 0 {
+        // bare special forms: ${@} ${*} ${#} ${$} ${?} ${N}
+        if matches!(ch.first(), Some('@' | '*' | '#' | '$' | '?'))
+            || ch.first().is_some_and(|c| c.is_ascii_digit())
+        {
+            if ch.len() == 1 {
+                return Some(vec![s(&ch[0].to_string())]);
+            }
+        }
+        return None;
+    }
+    let name: String = ch[..i].iter().collect();
+    let rest: String = ch[i..].iter().collect();
+    if rest.is_empty() {
+        return Some(vec![s(&name)]); // getVar shape
+    }
+    // array-element marker: `arr[@]` inside ops stays unmodeled
+    let (op, arg): (String, String) = if let Some(r) = rest.strip_prefix(":-") {
+        (":-".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix(":=") {
+        (":=".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix(":?") {
+        (":?".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix(":+") {
+        (":+".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix(":") {
+        // ${x:off} / ${x:off:len} — slice; args must be plain integers
+        let mut it = r.splitn(2, ':');
+        let off = it.next().unwrap_or("").trim();
+        let len = it.next();
+        if !off.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let mut a = vec![s("slice"), s(&name), s(off)];
+        if let Some(l) = len {
+            let l = l.trim();
+            let neg = l.starts_with('-');
+            let dt = l.trim_start_matches('-');
+            if !dt.chars().all(|c| c.is_ascii_digit()) || dt.is_empty() {
+                return None;
+            }
+            let lenv = if neg { format!("-{dt}") } else { l.to_string() };
+            a.push(s(&lenv));
+        }
+        return Some(a);
+    } else if let Some(r) = rest.strip_prefix("##") {
+        ("##".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix("%%") {
+        ("%%".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix("//") {
+        ("//".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix('#') {
+        ("#".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix('%') {
+        ("%".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix('/') {
+        ("/".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix('-') {
+        ("-".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix('+') {
+        ("+".into(), r.to_string())
+    } else {
+        return None;
+    };
+    // nested expansions in the operand stay unmodeled (the renderer's
+    // default_word handles quoted literals only)
+    if arg.contains('$') || arg.contains('`') {
+        return None;
+    }
+    Some(vec![s(&op), s(&name), s(&arg)])
+}
+
+/// Split an unquoted heredoc body into segments. Returns None when the
+/// body contains an expansion the splitter doesn't model — the caller
+/// keeps the raw text (today's behavior).
+fn split_heredoc_body(text: &str) -> Option<Vec<HdSeg>> {
+    let ch: Vec<char> = text.chars().collect();
+    let mut segs: Vec<HdSeg> = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0usize;
+    while i < ch.len() {
+        // backslash escapes (unquoted heredoc): \ $ ` " \ and line-join
+        if ch[i] == '\\' && i + 1 < ch.len() && matches!(ch[i + 1], '$' | '`' | '"' | '\\' | '\n') {
+            if ch[i + 1] != '\n' {
+                lit.push(ch[i + 1]);
+            }
+            i += 2;
+            continue;
+        }
+        if ch[i] == '$' && i + 1 < ch.len() {
+            let nxt = ch[i + 1];
+            // special single-char vars and positionals
+            if matches!(nxt, '?' | '#' | '@' | '*' | '$' | '!') || nxt.is_ascii_digit() {
+                if !lit.is_empty() {
+                    segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                }
+                segs.push(HdSeg::Var(nxt.to_string()));
+                i += 2;
+                continue;
+            }
+            if nxt == '{' {
+                // find the matching close brace
+                let mut depth = 1usize;
+                let mut j = i + 2;
+                while j < ch.len() {
+                    if ch[j] == '{' {
+                        depth += 1;
+                    } else if ch[j] == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    let body: String = ch[i + 2..j].iter().collect();
+                    if let Some(args) = dollar_brace_args(&body) {
+                        if !lit.is_empty() {
+                            segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                        }
+                        if args.len() == 1 {
+                            // getVar shape
+                            if let IrExpr::Str(n, _) = &args[0] {
+                                segs.push(HdSeg::Var(n.clone()));
+                                i = j + 1;
+                                continue;
+                            }
+                        }
+                        segs.push(HdSeg::Param(args));
+                        i = j + 1;
+                        continue;
+                    }
+                    return None; // unmodeled ${...} — fall back wholesale
+                }
+                return None; // unterminated
+            }
+            if nxt == '(' {
+                // `$(( arith ))`
+                if i + 2 < ch.len() && ch[i + 2] == '(' {
+                    let mut depth = 0i32;
+                    let mut j = i + 3;
+                    while j < ch.len() {
+                        if ch[j] == '(' {
+                            depth += 1;
+                        } else if ch[j] == ')' {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        j += 1;
+                    }
+                    // expect `))`
+                    if j + 1 < ch.len() && ch[j] == ')' && ch[j + 1] == ')' {
+                        let body: String = ch[i + 3..j].iter().collect();
+                        if let Some(a) = crate::shir::parse_arith(&body) {
+                            if !lit.is_empty() {
+                                segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                            }
+                            segs.push(HdSeg::Arith(a));
+                            i = j + 2;
+                            continue;
+                        }
+                        return None;
+                    }
+                    return None;
+                }
+                // `$( cmd )`
+                let mut depth = 1usize;
+                let mut j = i + 2;
+                while j < ch.len() {
+                    if ch[j] == '(' {
+                        depth += 1;
+                    } else if ch[j] == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    let body: String = ch[i + 2..j].iter().collect();
+                    if !lit.is_empty() {
+                        segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                    }
+                    segs.push(HdSeg::Cmd(body));
+                    i = j + 1;
+                    continue;
+                }
+                return None;
+            }
+            // `$name`
+            if is_name_char(nxt) {
+                let mut j = i + 1;
+                while j < ch.len() && is_name_char(ch[j]) {
+                    j += 1;
+                }
+                let name: String = ch[i + 1..j].iter().collect();
+                if !lit.is_empty() {
+                    segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                }
+                segs.push(HdSeg::Var(name));
+                i = j;
+                continue;
+            }
+        }
+        if ch[i] == '`' {
+            // `cmd` — find the closing backtick (no nesting model)
+            if let Some(rel) = ch[i + 1..].iter().position(|&c| c == '`') {
+                let body: String = ch[i + 1..i + 1 + rel].iter().collect();
+                if !lit.is_empty() {
+                    segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                }
+                segs.push(HdSeg::Cmd(body));
+                i = i + rel + 2;
+                continue;
+            }
+            return None;
+        }
+        lit.push(ch[i]);
+        i += 1;
+    }
+    if !lit.is_empty() {
+        segs.push(HdSeg::Lit(lit));
+    }
+    Some(segs)
 }
 
 /// The Json brace-parts argument (`brace("pre", [[...]], [...], "suf")`).
