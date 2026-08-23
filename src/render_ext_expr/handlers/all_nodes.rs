@@ -50,8 +50,24 @@ pub fn char_translate(node: &CharTranslate, ctx: &ExprRenderCtx) -> Option<Strin
             if node.delete {
                 Some(format!("{}.split('').filter(c => !\"{}\".includes(c)).join('')", text, node.from))
             } else if node.squeeze {
-                Some(format!("(() => {{ let r = {}; for(let i=0;i<\"{}\".length;i++) r = r.replaceAll(new RegExp(\"{}\".charAt(i)+\"+\"+\"{}\".charAt(i), 'g'), \"{}\".charAt(i)); return r; }})()",
-                    text, node.from, node.from, node.to, node.to))
+                // translate (SET1→SET2) then collapse runs of each OUTPUT
+                // char to ONE copy — bash `tr -s` squeezes to a single char,
+                // it never deletes ("  spaced  " -> " spaced "). With an
+                // empty SET2 (`tr -s SET`) the SET chars are their own
+                // output set.
+                let mapped = if node.to.is_empty() {
+                    text.clone()
+                } else {
+                    format!("{}.split('').map(c => {{ const i = \"{}\".indexOf(c); return i >= 0 ? \"{}\"[i] : c; }}).join('')",
+                        text, node.from, node.to)
+                };
+                let sq = if node.to.is_empty() { &node.from } else { &node.to };
+                let mut out = mapped;
+                for ch in sq.chars() {
+                    let esc = if "+*?()[]{}|^$\\/".contains(ch) { format!("\\{}", ch) } else { ch.to_string() };
+                    out = format!("{}.replace(/{}+/g, '{}')", out, esc, ch);
+                }
+                Some(out)
             } else {
                 Some(format!("{}.split('').map(c => {{ const i = \"{}\".indexOf(c); return i >= 0 ? \"{}\"[i] : c; }}).join('')",
                     text, node.from, node.to))
@@ -95,6 +111,14 @@ pub fn take_lines(node: &TakeLines, ctx: &ExprRenderCtx) -> Option<String> {
         Backend::Perl => {
             let text = crate::ir::ir_expr_to_perl(&node.text);
             let count = crate::ir::ir_expr_to_perl(&node.count);
+            if node.bytes {
+                // head/tail -c counts BYTES: a substr of the text, not a
+                // line split.
+                if node.from_end {
+                    return Some(format!("do {{ my $t = {}; my $n = {}; substr($t, -$n) }}", text, count));
+                }
+                return Some(format!("do {{ my $t = {}; my $n = {}; substr($t, 0, $n) }}", text, count));
+            }
             if node.from_end {
                 Some(format!("do {{ my @l = split(/\\n/, {}, -1); join(\"\\n\", @l[-{}..-1] // @l) }}", text, count))
             } else {
@@ -104,6 +128,13 @@ pub fn take_lines(node: &TakeLines, ctx: &ExprRenderCtx) -> Option<String> {
         Backend::Estree => {
             let text = render_child(&node.text, ctx)?;
             let count = render_child(&node.count, ctx)?;
+            if node.bytes {
+                // head/tail -c: byte take = substring of the in-memory text
+                if node.from_end {
+                    return Some(format!("{}.slice(-{})", text, count));
+                }
+                return Some(format!("{}.slice(0,{})", text, count));
+            }
             if node.from_end {
                 Some(format!("{}.split('\\n').slice(-{}).join('\\n')", text, count))
             } else {

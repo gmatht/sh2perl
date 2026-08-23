@@ -16,6 +16,22 @@ for f in "${files[@]}"; do
   d="$(dirname "$f")"; b="$(basename "$f")"
   case "$be" in
     python) timeout 20 python3 "$TMP/prog" > "$TMP/got.txt" 2>/dev/null ;;
+    zig)
+      ZIG=/usr/local/zig-x86_64-linux-0.17.0-dev.1818+7051f8e73/zig
+      mkdir -p "$TMP/zo"
+      if timeout 90 "$ZIG" build-exe "$TMP/prog" -femit-bin="$TMP/zo/zigprog" 2>/dev/null; then
+        timeout 20 "$TMP/zo/zigprog" > "$TMP/got.txt" 2>/dev/null
+      else
+        skip=$((skip+1)); continue
+      fi ;;
+    java)
+      # the generated class is public Sh2Program -> file must match
+      cp "$TMP/prog" "$TMP/Sh2Program.java"
+      if timeout 60 javac -d "$TMP" "$TMP/Sh2Program.java" 2>/dev/null; then
+        timeout 20 java -cp "$TMP" Sh2Program > "$TMP/got.txt" 2>/dev/null
+      else
+        skip=$((skip+1)); continue
+      fi ;;
     *) skip=$((skip+1)); continue ;;
   esac
   ( cd "$d" && timeout 20 bash "$b" ) > "$TMP/want.txt" 2>/dev/null

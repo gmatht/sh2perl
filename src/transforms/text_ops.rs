@@ -31,6 +31,14 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     if !enabled.split(',').any(|s| s.trim() == "text-ops") {
         return false;
     }
+    // text-ops is often exercised ALONE (DEBASHC_TRANSFORMS=text-ops) — the
+    // worker's A/B gate. But arithmetic statements (`let "v = e"`, `((v=e))`)
+    // are lowered by arith-forms, which the opt-in gate then EXCLUDES: a
+    // script byte-exact at baseline would regress purely because another
+    // transform went missing. Compose arith-forms FIRST (the same relative
+    // order the registry runs it when both are listed) so text-ops-only
+    // keeps baseline-exact arithmetic semantics.
+    crate::transforms::arith_forms::transform(stmts);
     // Census of array variables — scalar `${v:N:M}` slices reduce to
     // SubStrExtract; array slices must NOT (they are index subsets).
     let mut arrays: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -85,7 +93,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                     if emit {
                         if let Some((replacement, already_nl)) = try_lower_pipeline(stages) {
                             // A statement-level pipeline PRINTS its result.
-                            *stmt = IrStmt::Output { value: replacement, newline: !already_nl, target: None };
+                            *stmt = with_status_zero(IrStmt::Output { value: replacement, newline: !already_nl, target: None });
                             LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
@@ -108,7 +116,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         if let [IrExpr::Str(name, _), IrExpr::Array(cmd_args)] = args.as_slice() {
                             if emit {
                                 if let Some(replacement) = try_lower_command(text_ir, name, cmd_args) {
-                                    *stmt = IrStmt::Output { value: replacement, newline: true, target: None };
+                                    *stmt = with_status_zero(IrStmt::Output { value: replacement, newline: true, target: None });
                                     LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                                     return;
                                 }
@@ -139,12 +147,12 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                 });
                 if let (Some(targs), Some(path)) = (tr_inner, red_path) {
                     if let Some(val) = try_lower_tr(loop_var_read("__l"), targs) {
-                        *stmt = IrStmt::Ext(Box::new(ForEachLine {
+                        *stmt = with_status_zero(IrStmt::Ext(Box::new(ForEachLine {
                             source: path,
                             var: "__l".to_string(),
                             limit: None,
                             body: vec![IrStmt::Output { value: val, newline: true, target: None }],
-                        }));
+                        })));
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -201,7 +209,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         if let Some(field_val) =
                             try_lower_cut(loop_var_read("__l"), &flags)
                         {
-                            *stmt = IrStmt::Ext(Box::new(ForEachLine {
+                            *stmt = with_status_zero(IrStmt::Ext(Box::new(ForEachLine {
                                 source: files.remove(0),
                                 var: "__l".to_string(),
                                 limit: None,
@@ -210,7 +218,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                                     newline: true,
                                     target: None,
                                 }],
-                            }));
+                            })));
                             LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
@@ -237,12 +245,12 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                     }
                     if flags.is_empty() && files.len() == 1 {
                         if let Some(val) = try_lower_sed(loop_var_read("__l"), &flags.iter().chain(script.iter()).cloned().collect::<Vec<_>>()) {
-                            *stmt = IrStmt::Ext(Box::new(ForEachLine {
+                            *stmt = with_status_zero(IrStmt::Ext(Box::new(ForEachLine {
                                 source: files.remove(0),
                                 var: "__l".to_string(),
                                 limit: None,
                                 body: vec![IrStmt::Output { value: val, newline: true, target: None }],
-                            }));
+                            })));
                             LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
@@ -306,7 +314,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         i += 1;
                     }
                     if !bad && k.filter(|n| *n > 0).is_some() && files.len() == 1 {
-                        *stmt = IrStmt::Ext(Box::new(ForEachLine {
+                        *stmt = with_status_zero(IrStmt::Ext(Box::new(ForEachLine {
                             source: files.remove(0),
                             var: "__l".to_string(),
                             limit: Some(Box::new(IrExpr::Int(k.unwrap()))),
@@ -315,7 +323,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                                 newline: true,
                                 target: None,
                             }],
-                        }));
+                        })));
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -323,7 +331,7 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                 if emit && cmd == "printf" {
                     if let Some(val) = try_lower_printf_repeat(cmd_args) {
                         // printf emits NO trailing newline.
-                        *stmt = IrStmt::Output { value: val, newline: false, target: None };
+                        *stmt = with_status_zero(IrStmt::Output { value: val, newline: false, target: None });
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -331,11 +339,11 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                 if emit && (cmd == "basename" || cmd == "dirname") && !cmd_args.is_empty() {
                     let which = if cmd == "dirname" { "dirname" } else { "basename" };
                     if let Some(text) = arg_to_expr(&cmd_args[0]) {
-                        *stmt = IrStmt::Output {
+                        *stmt = with_status_zero(IrStmt::Output {
                             value: IrExpr::Ext(Box::new(PathName { text, which: which.to_string() })),
                             newline: true,
                             target: None,
-                        };
+                        });
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -412,11 +420,21 @@ fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
             }
             for a in args.iter_mut() { lower_expr(a, arrays); }
         }
-        // Nested pipeline in expression position (&& chains, command
-        // substitution, ternary): `echo X | cmd` inside `... && ...`.
+        // Nested pipeline in expression position (&& chains, if-conds,
+        // command substitution): `echo X | cmd` inside `... && ...`.
         IrExpr::Call { func, args } if func == "pipeline" => {
             if let [IrExpr::Array(stages)] = args.as_slice() {
                 if stages.len() == 2 {
+                    // CONDITION-context grep: `echo X | grep -q P` reduces to
+                    // StringContains here (status semantics preserved by the
+                    // enclosing If/&& lowering). Statement level skips it.
+                    if let [b1, b2] = stages.as_slice() {
+                        if let Some(replacement) = try_lower_grep_cond(b1, b2) {
+                            *expr = replacement;
+                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
                     if let Some((replacement, _)) = try_lower_pipeline(stages) {
                         *expr = replacement;
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -508,17 +526,82 @@ fn try_lower_pipeline(stages: &[IrExpr]) -> Option<(IrExpr, bool)> {
         }
     }
 
-    // stage1 produces text (echo, capture, etc.)
-    let text_expr = match extract_text_from_stage(stage1_body) {
-        Some(e) => {
-            e
-        }
-        None => {
+    // stage1 produces text (echo, capture, etc.) — plus whether bash's
+    // stage-1 output ENDS with a newline (echo appends one; printf only
+    // when its last literal does). The distinction decides whether the
+    // statement-level Output wrapper may re-append the stripped newline.
+    let (text_expr, implicit_nl) = extract_stage_text(stage1_body)?;
+
+    // Byte-takes slice the RAW text INCLUDING its trailing-newline state,
+    // so the reduced value ends "with or without \n" exactly as bash's
+    // bytes do. Reducible only when text AND count are static — then the
+    // slice folds and `already_nl` is computed exactly; otherwise fall
+    // back (an eager wrong-newline render is worse than the runtime).
+    if cmd_name == "head" || cmd_name == "tail" {
+        if let Some(k) = head_byte_count(cmd_args) {
+            if let (IrExpr::Str(ts, _), Some(k)) = (&text_expr, Some(k)) {
+                let mut raw = ts.clone();
+                if implicit_nl {
+                    raw.push('\n');
+                }
+                let n = raw.len() as i64;
+                let (start, end) = if cmd_name == "head" {
+                    (0, k.min(n))
+                } else {
+                    (n.saturating_sub(k).max(0), n)
+                };
+                if start >= 0 && end <= raw.len() as i64 && start <= end {
+                    // floor the start / ceiling the end to UTF-8 boundaries
+                    let b = raw.as_bytes();
+                    let mut s = start.max(0) as usize;
+                    while s > 0 && (b[s] & 0xC0) == 0x80 { s -= 1; }
+                    let mut e2 = (end as usize).min(raw.len());
+                    while e2 < raw.len() && (b[e2] & 0xC0) == 0x80 { e2 += 1; }
+                    let sliced = raw[s..e2].to_string();
+                    // The fold produces the EXACT output bytes — never let
+                    // the Output wrapper re-append a newline (whether or
+                    // not the slice happens to end in one).
+                    return Some((IrExpr::Str(sliced, StrStyle::DoubleQuoted), true));
+                }
+            }
             return None;
         }
-    };
+    }
 
-    lower_text_cmd(text_expr, cmd_name, cmd_args).map(|e| (e, false))
+    let replacement = lower_text_cmd(text_expr, cmd_name, cmd_args)?;
+    // Line-oriented transforms pass the (stripped) terminal newline
+    // through, so the Output wrapper re-appends it ONLY for an echo-like
+    // source. wc PRINTS its own terminating newline after the number —
+    // always append. A printf source without a trailing newline stays
+    // without one.
+    let already_nl = if cmd_name == "wc" { false } else { !implicit_nl };
+    Some((replacement, already_nl))
+}
+
+/// The `-c N` byte-count form of head/tail (plain positive N; GNU's signed
+/// `head -c -N` / `tail -c +K` forms are NOT covered → None → fallback).
+fn head_byte_count(args: &[IrExpr]) -> Option<i64> {
+    let strs: Vec<&str> = args.iter().filter_map(|a| match a {
+        IrExpr::Str(s, _) => Some(s.as_str()),
+        _ => None,
+    }).collect();
+    let mut i = 0;
+    let mut found: Option<i64> = None;
+    while i < strs.len() {
+        if strs[i] == "-c" {
+            match strs.get(i + 1).and_then(|c| c.parse::<i64>().ok()) {
+                Some(k) if k > 0 => { found = Some(k); i += 2; continue; }
+                _ => return None,
+            }
+        } else if let Some(rest) = strs[i].strip_prefix("-c") {
+            match rest.parse::<i64>() {
+                Ok(k) if k > 0 => found = Some(k),
+                _ => return None,
+            }
+        }
+        i += 1;
+    }
+    found
 }
 
 /// `yes "X" | head -n K` → RepeatStr("X\n", K). `yes` repeats "X\n";
@@ -574,16 +657,22 @@ fn lower_text_cmd(text: IrExpr, cmd_name: &str, cmd_args: &[IrExpr]) -> Option<I
         "tail" => try_lower_head_tail(text, cmd_args, true),
         "wc" => try_lower_wc(text, cmd_args),
         "sed" => try_lower_sed(text, cmd_args),
-        "grep" => try_lower_grep(text, cmd_args),
+        // NOTE: grep deliberately absent — `grep -q` is a STATUS idiom
+        // (no stdout); reducing it to StringContains is only valid in
+        // CONDITION contexts (handled separately in lower_expr).
         "xargs" => try_lower_xargs(text, cmd_args),
         _ => None,
     }
 }
 
-/// Extract the text expression from a pipeline stage body (echo, capture, etc.)
-fn extract_text_from_stage(stmts: &[IrStmt]) -> Option<IrExpr> {
+/// Extract the text expression from a pipeline stage body, plus whether
+/// bash's stage-1 output ends with a terminal newline:
+///   echo ARGS  → true  (echo appends \n; the extraction drops it)
+///   printf L…  → last literal ends with \n ?
+///   a bare literal → same test on its text
+fn extract_stage_text(stmts: &[IrStmt]) -> Option<(IrExpr, bool)> {
     match stmts {
-        // echo ARGS → join args as string
+        // echo/printf with string/literal args → concatenate
         [IrStmt::Expr(IrExpr::Call { func, args })]
             if func == "exec" || func == "builtin" =>
         {
@@ -613,7 +702,34 @@ fn extract_text_from_stage(stmts: &[IrStmt]) -> Option<IrExpr> {
                         // added by the statement Output wrapper, and by the
                         // wc -l newline-count case below).
                         let joined = strs.join(" ");
-                        return Some(IrExpr::Str(joined, StrStyle::DoubleQuoted));
+                        let nl = if name == "echo" { true } else { joined.ends_with('\n') };
+                        return Some((IrExpr::Str(joined, StrStyle::DoubleQuoted), nl));
+                    }
+                    // VARIABLE-bearing source: a single interpolated arg
+                    // (`echo "$s"`) is the variable's value verbatim — the
+                    // interpolation IS the text, no interpretation needed.
+                    // This is the corpus's dominant pipeline source shape
+                    // (`echo "$s" | cut …`); refusing it would leave every
+                    // real-world idiom at the sh2.* runtime fallback.
+                    // A bare `$s` lowers to Call(getVar) rather than a
+                    // one-part interpolation — same value, same treatment.
+                    // ECHO ONLY: echo's terminal \n is unconditional, so the
+                    // Output wrapper reproduces it exactly. A dynamic printf
+                    // format may or may not end in \n — unknowable here, so
+                    // printf keeps its literal-only path.
+                    if name == "echo" && echo_args.len() == 1 {
+                        let var_text: Option<IrExpr> = match &echo_args[0] {
+                            IrExpr::Interpolate(parts) => Some(IrExpr::Interpolate(parts.clone())),
+                            IrExpr::Call { func, args }
+                                if func == "getVar" && args.len() == 1 =>
+                            {
+                                Some(echo_args[0].clone())
+                            }
+                            _ => None,
+                        };
+                        if let Some(text) = var_text {
+                            return Some((text, true));
+                        }
                     }
                 }
             }
@@ -623,14 +739,23 @@ fn extract_text_from_stage(stmts: &[IrStmt]) -> Option<IrExpr> {
         // NOT an arbitrary command — `paste | head` must not reduce as if
         // paste produced a literal string.
         [IrStmt::Expr(e)] => match e {
-            IrExpr::Str(..) => Some(e.clone()),
+            IrExpr::Str(s, _) => Some((e.clone(), s.ends_with('\n'))),
             IrExpr::Interpolate(parts) if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) => {
-                Some(e.clone())
+                let txt: String = parts.iter().filter_map(|p| match p {
+                    InterpPart::Lit(s) => Some(s.as_str()),
+                    _ => None,
+                }).collect();
+                Some((e.clone(), txt.ends_with('\n')))
             }
             _ => None,
         },
         _ => None,
     }
+}
+
+/// Extract the text expression from a pipeline stage body (echo, capture, etc.)
+fn extract_text_from_stage(stmts: &[IrStmt]) -> Option<IrExpr> {
+    extract_stage_text(stmts).map(|(e, _)| e)
 }
 
 // ── cut ──────────────────────────────────────────────────────────────
@@ -733,6 +858,15 @@ fn try_lower_tr(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
     }
 
     if from.is_empty() {
+        return None;
+    }
+    // Squeeze needs a well-defined output set: `tr -sd` (delete+squeeze of
+    // DIFFERENT sets) and range/class squeeze sets aren't expressible as a
+    // literal per-char run collapse — leave those to the runtime.
+    if delete && squeeze {
+        return None;
+    }
+    if squeeze && (from.contains('-') || to.contains('-')) {
         return None;
     }
 
@@ -1166,6 +1300,10 @@ fn try_lower_param_op(args: &[IrExpr], arrays: &std::collections::HashSet<String
             if arrays.contains(base) { return None; }
             let off = match &args[2] { IrExpr::Str(s, _) => s.parse::<i64>().ok()?, _ => return None };
             let len = match &args[3] { IrExpr::Str(s, _) => s.parse::<i64>().ok()?, _ => return None };
+            // Negative offset (counting from end) or negative length (up-to-M
+            // from end) are bash-only semantics SubStrExtract can't express —
+            // leave them to the runtime.
+            if off < 0 || len < 0 { return None; }
             Some(IrExpr::Ext(Box::new(SubStrExtract {
                 text: var,
                 offset: IrExpr::Int(off),
@@ -1417,17 +1555,12 @@ fn try_reduce_capture_assign(stmt: &IrStmt, arrays: &std::collections::HashSet<S
     ]))
 }
 
-/// Read the ForEachLine loop variable inside composed Ext children.
-/// MUST be the param('',name) form: bare Var renders empty in that
-/// position (same lesson as the ${v^^} capture fix).
+/// Read the ForEachLine loop variable inside composed Ext children:
+/// a plain Var — compiled backends render it natively, and the ESTree
+/// ForEachLine arm registers the name in LIFTED_STRING so it renders as
+/// the bare callback identifier there too.
 fn loop_var_read(lv: &str) -> IrExpr {
-    IrExpr::Call {
-        func: "param".to_string(),
-        args: vec![
-            IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
-            IrExpr::Str(lv.to_string(), StrStyle::DoubleQuoted),
-        ],
-    }
+    IrExpr::Var(lv.to_string(), None)
 }
 
 /// Build a STREAMING line counter: `n=0; ForEachLine(src, guard? n+=1)` —
@@ -1642,4 +1775,25 @@ fn try_lower_grep_count(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> 
         _ => return None,
     };
     Some(streaming_line_count(path, Some(pat)))
+}
+
+/// `echo X | grep -q P` in EXPRESSION/CONDITION position → StringContains.
+/// Only fires here (conditions), never at statement level where the status
+/// semantics would be lost.
+fn try_lower_grep_cond(stage1: &IrExpr, stage2: &IrExpr) -> Option<IrExpr> {
+    let b1 = match stage1 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
+    let b2 = match stage2 { IrExpr::Arrow(b) => b.as_slice(), _ => return None };
+    let text = extract_text_from_stage(b1)?;
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = b2 else { return None };
+    if !(func == "exec" || func == "builtin") { return None; }
+    let [IrExpr::Str(n, _), IrExpr::Array(ga)] = args.as_slice() else { return None };
+    if n != "grep" { return None; }
+    try_lower_grep(text, ga)
+}
+
+/// A statement-level reduction replaces a COMMAND with a pure value — the
+/// original command would have set $? = 0 (allowlisted, static-good input).
+/// Wrap so the observable status is preserved: Block([stmt, SetChildError(0)]).
+fn with_status_zero(s: IrStmt) -> IrStmt {
+    IrStmt::Block(vec![s, IrStmt::SetChildError(IrExpr::Int(0))])
 }

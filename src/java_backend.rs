@@ -745,10 +745,30 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
                     let Some(IrExpr::Array(items)) = args.get(1) else {
                         return Err("printf without an args array (v1)".into());
                     };
-                    let Some(IrExpr::Str(fmt, _)) = items.first() else {
-                        return Err("printf with a non-literal format (v1)".into());
+                    let fmt = match items.first() {
+                        Some(IrExpr::Str(s, _)) => s.clone(),
+                        Some(IrExpr::Interpolate(parts)) => {
+                            // an f-string format whose parts are all literal
+                            let mut t = String::new();
+                            let mut ok = true;
+                            for p in parts {
+                                match p {
+                                    crate::ir::InterpPart::Lit(s) => t.push_str(s),
+                                    _ => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if ok {
+                                t
+                            } else {
+                                return Err("printf with a non-literal format (v1)".into());
+                            }
+                        }
+                        _ => return Err("printf with a non-literal format (v1)".into()),
                     };
-                    let parsed = printf_parse(fmt);
+                    let parsed = printf_parse(&fmt);
                     let Some((els, n_specs)) = parsed else {
                         // complex spec — the v1 raw join
                         indent(out, d);
@@ -768,7 +788,7 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
                     let mut pieces: Vec<String> = Vec::new();
                     if n_specs == 0 {
                         // printf(1): the format text repeats once per arg
-                        let text = java_str_lit(&printf_unescape(fmt));
+                        let text = java_str_lit(&printf_unescape(&fmt));
                         let passes = if fmt_args.is_empty() { 1 } else { fmt_args.len() };
                         for _ in 0..passes {
                             pieces.push(text.clone());
