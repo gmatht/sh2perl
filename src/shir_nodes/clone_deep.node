@@ -1,0 +1,16 @@
+# shir_nodes/clone_deep.node — CloneDeep: a DEEP COPY of any store value
+# (`x.clone()` under the Rust Clone bound).
+#
+# GENERIC. Soundness: Rust's clone NEVER aliases the original (that is
+# the contract of the Clone bound), so an independent deep copy is the
+# exact semantics for every store-representable value (strings, numbers,
+# arrays, records). An IDENTITY lowering would be the aliasing bug the
+# value-store model must not guess.
+# Backends: JS structuredClone(value) (Node >=17 global); other backends
+# may refuse until they pick their deep-copy primitive (Perl would be
+# Storable::dclone).
+
+node CloneDeep
+tag "CloneDeep"
+kind expr
+field value: expr
