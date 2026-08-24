@@ -7519,6 +7519,9 @@ impl Render {
             // real argv for $0 / positional params (function-call
             // emulation saves/restores _sh_argv around its own sites)
             self.emit("  _sh_argv = _mav; _sh_argc = _mac;");
+            // bash seeds HOSTNAME itself — the gate env may not carry it
+            // (064_21: ${HOSTNAME:-localhost} took the default)
+            self.emit("  if (!getenv(\"HOSTNAME\")) { static char _hn[256]; if (gethostname(_hn, sizeof _hn) == 0) setenv(\"HOSTNAME\", _hn, 0); }");
         }
         // Only REAL shell-out sites (bash -c subprocesses) need the
         // preamble: their children share fd 1 — unbuffered stdout keeps
@@ -9063,6 +9066,29 @@ fn collect_assigned_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                         {
                             out.insert(n.to_string());
                         }
+                    }
+                }
+            }
+        }
+        // `unset V` — a WRITE (it clears the var): a subshell body that
+        // unsets must save/restore like any assignment (064_20: the
+        // inner subshell's unset DEBUG leaked to the outer scope)
+        IrExpr::Call { func, args }
+            if (func == "exec" || func == "builtin")
+                && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "unset") =>
+        {
+            let mut words: Vec<&IrExpr> = Vec::new();
+            for a in args.iter().skip(1) {
+                match a {
+                    IrExpr::Array(items) => words.extend(items.iter()),
+                    other => words.push(other),
+                }
+            }
+            for w in words {
+                if let IrExpr::Str(ws, _) = w {
+                    let n = ws.trim();
+                    if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        out.insert(n.to_string());
                     }
                 }
             }
