@@ -514,6 +514,8 @@ impl Render {
             self.emit("static int _sh_rc = 0;");
             self.emit("static int _sh_argc = 0; static char **_sh_argv = 0;");
             self.emit("static char _sh_opts[] = \"hB\"; /* $- — option flags */");
+            self.emit("/* background jobs (fork-based) reaped by bare wait */");
+            self.emit("static pid_t _sh_bg_pids[512]; static size_t _sh_bg_n = 0;");
             self.emit("static char *_sh_cmd = 0; static size_t _sh_cap = 0;");
             self.emit("static char *_sh_wb = 0; static size_t _sh_wcap = 0;");
             self.emit("static char *_sh_wrap = 0; static size_t _sh_wrapcap = 0;");
@@ -6225,6 +6227,14 @@ impl Render {
                     }
                     // `! cmd` / `! pipeline` — bash stores the NEGATED rc
                     // in $?: the statement must ASSIGN back, not discard
+                    IrExpr::Call { func, args }
+                        if (func == "exec" || func == "builtin")
+                            && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "wait") =>
+                    {
+                        // bare wait: reap the forked background jobs
+                        self.emit("{ for (size_t _wi = 0; _wi < _sh_bg_n; _wi++) waitpid(_sh_bg_pids[_wi], 0, 0); _sh_bg_n = 0; _sh_rc = 0; }");
+                        return;
+                    }
                     IrExpr::BinOp { lhs, op: crate::ir::BinOpKind::Not, .. }
                         if matches!(
                             lhs.as_ref(),
@@ -6981,13 +6991,35 @@ impl Render {
                     self.emit(&format!("{site};"));
                 }
             }
-            IrStmt::Block(body) | IrStmt::Background(body) => {
+            IrStmt::Block(body) => {
                 self.emit("{");
                 self.depth += 1;
                 for s in body {
                     self.stmt(s);
                 }
                 self.depth -= 1;
+                self.emit("}");
+            }
+            IrStmt::Background(body) => {
+                // bash forks the job onto a COPY of the shell state —
+                // fork() is the native mapping: async ordering AND the
+                // copy semantics come free ({ x=2; } & cannot leak x=2
+                // into the parent: 105_background_copy_semantics), no
+                // synchronous child-bash site needed
+                let bg = self.temp_seq;
+                self.temp_seq += 1;
+                self.emit(&format!("{{ pid_t _bg{bg} = fork();"));
+                self.emit(&format!("  if (_bg{bg} == 0) {{"));
+                self.depth += 1;
+                for s in body {
+                    self.stmt(s);
+                }
+                self.emit("fflush(stdout); _exit(0);");
+                self.depth -= 1;
+                self.emit("  }");
+                self.emit(&format!(
+                    "  if (_bg{bg} > 0 && _sh_bg_n < sizeof _sh_bg_pids / sizeof *_sh_bg_pids) _sh_bg_pids[_sh_bg_n++] = _bg{bg};"
+                ));
                 self.emit("}");
             }
             IrStmt::Subshell(body) => {
