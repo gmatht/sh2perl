@@ -3228,7 +3228,9 @@ impl Render {
                 _ => {}
             }
         }
-        let rhs = if self.is_num(&t.var) {
+        // an arith-written var (the goto restructure's flags) hoists as
+        // int64 — its assignments must coerce string values numerically
+        let rhs = if self.is_num(&t.var) || self.arith_ints.contains(&t.var) {
             self.expr_num(expr)
         } else if self.is_str(&t.var) {
             self.expr_str(expr)
@@ -4425,6 +4427,118 @@ impl Render {
             self.written.insert(n.clone());
             if n.contains('[') {
                 self.arrays.insert(n.clone());
+            }
+        }
+        // Pre-scan: vars written by ARITH assignments / inc-decs anywhere
+        // (cstyleFor steps, the goto restructure's flags) hoist as int64 —
+        // EVERY assignment to them must coerce numerically, including
+        // ones rendered before the arith write is seen (the C frontend's
+        // `j = "0"` init vs `j++` step).
+        {
+            use IrStmt::*;
+            fn note_arith(e: &IrExpr, out: &mut BTreeSet<String>) {
+                if let IrExpr::Arith(a) = e {
+                    match &**a {
+                        ArithAst::Assign { var, .. } | ArithAst::IncDec { var, .. } => {
+                            out.insert(var.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            fn note_str_arith(sv: &str, out: &mut BTreeSet<String>) {
+                for tk in sv.split_whitespace() {
+                    if let Some(base) =
+                        tk.strip_suffix("++").or_else(|| tk.strip_suffix("--"))
+                    {
+                        let base = base.trim_matches('(').trim_matches(')');
+                        if !base.is_empty() {
+                            out.insert(base.to_string());
+                        }
+                    }
+                }
+            }
+            let mut stack: Vec<&IrStmt> = prog.stmts.iter().collect();
+            while let Some(st) = stack.pop() {
+                match st {
+                    Assign { targets, expr, .. } => {
+                        note_arith(expr, &mut self.arith_ints);
+                        if let IrExpr::Call { func: f, args } = expr {
+                            if matches!(f.as_str(), "arith" | "arithEval" | "let" | "fnCall" | "fnValue")
+                            {
+                                for a in args {
+                                    if let IrExpr::Str(sv, _) = a {
+                                        note_str_arith(sv, &mut self.arith_ints);
+                                    }
+                                    if let IrExpr::Array(items) = a {
+                                        for it in items {
+                                            if let IrExpr::Str(sv, _) = it {
+                                                note_str_arith(sv, &mut self.arith_ints);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = targets;
+                        }
+                    }
+                    Expr(IrExpr::Arith(a)) => {
+                        if let ArithAst::Assign { var, .. } | ArithAst::IncDec { var, .. } =
+                            &**a
+                        {
+                            self.arith_ints.insert(var.clone());
+                        }
+                    }
+                    Expr(IrExpr::Call { func, args })
+                        if func == "arith" || func == "arithEval" || func == "let" =>
+                    {
+                        for a in args {
+                            if let IrExpr::Str(sv, _) = a {
+                                note_str_arith(sv, &mut self.arith_ints);
+                            }
+                        }
+                    }
+                    ForInit { init, step, body, .. } => {
+                        for st in init.iter().chain(step.iter()) {
+                            match st {
+                                IrStmt::Assign { expr, .. } | IrStmt::Expr(expr) => {
+                                    note_arith(expr, &mut self.arith_ints);
+                                    if let IrExpr::Call { args, .. } = expr {
+                                        for a in args {
+                                            if let IrExpr::Str(sv, _) = a {
+                                                note_str_arith(sv, &mut self.arith_ints);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        for b in body {
+                            stack.push(b);
+                        }
+                    }
+                    If { then, elsifs, else_, .. } => {
+                        for b in then {
+                            stack.push(b);
+                        }
+                        for (_, b) in elsifs {
+                            for b in b {
+                                stack.push(b);
+                            }
+                        }
+                        for b in else_ {
+                            stack.push(b);
+                        }
+                    }
+                    While { body, .. } | DoWhile { body, .. } | Block(body)
+                    | Subshell(body) | Function { body, .. } => {
+                        for b in body {
+                            stack.push(b);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         // Pre-scan: need_vars (param-expansion reads the vars map) and
