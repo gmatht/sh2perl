@@ -27,6 +27,11 @@ struct JavaCtx {
     block_seq: usize,
     /// a case clause used a glob pattern → sh2Glob helper needed
     need_glob: bool,
+    /// inside a hoisted user-function body: getVar("N") reads the
+    /// positional param `a[N-1]`, Return returns the value
+    in_function: bool,
+    /// user functions hoisted to class level (rendered before main)
+    pending_fns: Vec<String>,
 }
 
 /// Render a ShIR program to Java source. `Err` on a construct outside
@@ -59,6 +64,24 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
     // String field (empty default — bash reads an unset var as "")
     let mut fields: Vec<String> = Vec::new();
     collect_vars(&prog.stmts, &mut fields);
+    let has_fns = prog.stmts.iter().any(|st| {
+        matches!(st, IrStmt::Function { name, .. } if name != "main")
+    });
+    if has_fns {
+        out.push_str("    static String[] __sh_fArgs = new String[0];\n");
+        out.push_str("    static String __sh_fArg(int n) {\n");
+        out.push_str("        String[] a = __sh_fArgs;\n");
+        out.push_str("        return (n >= 1 && n <= a.length) ? a[n - 1] : \"\";\n");
+        out.push_str("    }\n");
+        out.push_str("    static String[] __sh_setArgs(String... a) {\n");
+        out.push_str("        __sh_fArgs = a;\n");
+        out.push_str("        return a;\n");
+        out.push_str("    }\n");
+    }
+    // every assignment target / store / arith read becomes a static
+    // String field (empty default — bash reads an unset var as "")
+    let mut fields: Vec<String> = Vec::new();
+    collect_vars(&prog.stmts, &mut fields);
     for f in fields {
         indent(&mut out, 1);
         out.push_str(&format!("static String {f} = \"\";\n"));
@@ -77,6 +100,9 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
         }
     }
     out.push_str("    }\n");
+    for f in &ctx.pending_fns {
+        out.push_str(f);
+    }
     out.push_str("}\n");
     Ok(out)
 }
@@ -141,6 +167,7 @@ fn collect_vars(stmts: &[IrStmt], out: &mut Vec<String>) {
                 collect_vars_expr(cond, out);
             }
             IrStmt::Block(b) => collect_vars(b, out),
+            IrStmt::Function { body, .. } => collect_vars(body, out),
             _ => {}
         }
     }
@@ -470,6 +497,20 @@ impl JavaCtx {
             }
             IrStmt::Return(v) => {
                 indent(out, d);
+                if self.in_function {
+                    // user-function VALUE return (strings are the value
+                    // model; numeric contexts coerce via sh2Num)
+                    indent(out, d);
+                    match v {
+                        Some(x) => {
+                            let mut r = String::new();
+                            expr_to_java(x, &mut r)?;
+                            out.push_str(&format!("return {r};\n"));
+                        }
+                        None => out.push_str("return \"\";\n"),
+                    }
+                    return Ok(());
+                }
                 match v {
                     Some(x) => {
                         out.push_str("return ");
@@ -590,22 +631,35 @@ impl JavaCtx {
                 Ok(())
             }
             IrStmt::Function { name, body, .. } => {
+                // HOIST to class level: a `static` method nested inside
+                // main is invalid Java. The fn takes its POSITIONAL
+                // params as `String[] a` (the body's getVar("N") reads —
+                // the $1 convention) and returns the value string.
                 let id = java_ident(name);
-                let ret = if body_has_return(body) {
-                    "String"
-                } else {
-                    "void"
-                };
-                indent(out, d);
-                out.push_str(&format!("static {ret} {id}() {{\n"));
+                let prev = self.in_function;
+                self.in_function = true;
+                let mut saved = std::mem::take(out);
+                let mut fntext = String::new();
+                fntext.push_str(&format!(
+                    "{ind}static String {id}(String[] a) throws Exception {{\n",
+                    ind = "    ".repeat(d)
+                ));
                 for b in body {
-                    self.stmt_to_java(b, d + 1, out)?;
+                    self.stmt_to_java(b, d + 1, &mut fntext)?;
                 }
-                indent(out, d);
-                if ret == "String" {
-                    out.push_str("return \"\";\n");
+                if !body_has_return(body) {
+                    // a void-ish fn still needs a value-return (call sites
+                    // read __SH_RET / discard)
+                    fntext.push_str(&format!(
+                        "{ind}return \"\";\n",
+                        ind = "    ".repeat(d + 1)
+                    ));
                 }
-                out.push_str("}\n");
+                fntext.push_str(&format!("{}}}
+", "    ".repeat(d)));
+                self.pending_fns.push(fntext);
+                self.in_function = prev;
+                *out = saved;
                 Ok(())
             }
             IrStmt::Redirect { inner, redirects } => {
@@ -1259,13 +1313,34 @@ fn arith_need_mem(a: &ArithAst) -> bool {
 
 fn word_to_java(e: &IrExpr) -> Result<String, String> {
     match e {
+        // fnValue(name, [args]) — a user-function VALUE call: set the
+        // positional-args channel then invoke (the fn reads $1.. via
+        // __sh_fArg)
+        IrExpr::Call { func, args, .. } if func == "fnValue" => {
+            if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Array(items))) =
+                (args.first(), args.get(1))
+            {
+                let vals: Vec<String> = items.iter().map(|w| word_to_java(w)).collect::<Result<_, _>>()?;
+                return Ok(format!(
+                    "{name}(__sh_setArgs(new String[]{{{vals}}}))",
+                    vals = vals.join(", ")
+                ));
+            }
+            Err("fnValue with unsupported shape".into())
+        }
         IrExpr::Str(s, _) => Ok(java_str_lit(s)),
         IrExpr::Call { func, args, .. } if func == "getVar" => {
             if let Some(IrExpr::Str(name, _)) = args.first() {
-                Ok(format!("({name} == null ? \"\" : {name})"))
-            } else {
-                Err("getVar with non-literal name (v1)".into())
+                // a DIGIT name is the positional param ($1 convention):
+                // inside hoisted functions this reads __sh_fArg(N)
+                if let Ok(k) = name.parse::<usize>() {
+                    if (1..=9).contains(&k) {
+                        return Ok(format!("__sh_fArg({k})"));
+                    }
+                }
+                return Ok(format!("({name} == null ? \"\" : {name})"));
             }
+            Err("getVar with non-literal name (v1)".into())
         }
         IrExpr::Var(name, _) => Ok(format!("({name} == null ? \"\" : {name})")),
         IrExpr::Arith(a) => Ok(format!("Long.toString({})", arith_str(a)?)),
@@ -1336,6 +1411,83 @@ fn word_to_java(e: &IrExpr) -> Result<String, String> {
     }
 }
 
+/// Max positional param index (`getVar("N")`) read anywhere in `body`.
+fn collect_max_param(stmts: &[IrStmt], max: &mut usize) {
+    fn scan_expr(e: &IrExpr, max: &mut usize) {
+        if let IrExpr::Call { func, args, .. } = e {
+            if func == "getVar" {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if let Ok(k) = n.parse::<usize>() {
+                        if k > *max {
+                            *max = k;
+                        }
+                    }
+                }
+            }
+            for a in args {
+                scan_expr(a, max);
+            }
+        } else if let IrExpr::Arith(a) = e {
+            scan_arith_param(a, max);
+        }
+    }
+    fn scan_arith_param(a: &ArithAst, max: &mut usize) {
+        match a {
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
+                if let Ok(k) = name.parse::<usize>() {
+                    if k > *max {
+                        *max = k;
+                    }
+                }
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                scan_arith_param(lhs, max);
+                scan_arith_param(rhs, max);
+            }
+            _ => {}
+        }
+    }
+    fn scan_stmt(st: &IrStmt, max: &mut usize) {
+        match st {
+            IrStmt::Assign { targets: _, expr, .. } => scan_expr(expr, max),
+            IrStmt::Expr(e) => scan_expr(e, max),
+            IrStmt::Return(Some(e)) => scan_expr(e, max),
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                scan_expr(cond, max);
+                for b in then {
+                    scan_stmt(b, max);
+                }
+                for (_, b) in elsifs {
+                    for x in b {
+                        scan_stmt(x, max);
+                    }
+                }
+                for b in else_ {
+                    scan_stmt(b, max);
+                }
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                scan_expr(cond, max);
+                for b in body {
+                    scan_stmt(b, max);
+                }
+            }
+            IrStmt::Block(body) | IrStmt::Function { body, .. } => {
+                for b in body {
+                    scan_stmt(b, max);
+                }
+            }
+            _ => {}
+        }
+    }
+    // walk: find every getVar("N") in the body
+    fn go(st: &IrStmt, max: &mut usize) {
+        scan_stmt(st, max);
+    }
+    let _ = go;
+}
+
+
 fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
     match e {
         IrExpr::Str(s, _) => {
@@ -1344,11 +1496,18 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
         }
         IrExpr::Call { func, args, .. } if func == "getVar" => {
             if let Some(IrExpr::Str(name, _)) = args.first() {
+                // a DIGIT name is the positional param ($1 convention):
+                // inside hoisted user functions this reads __sh_fArg(N)
+                if let Ok(k) = name.parse::<usize>() {
+                    if (1..=9).contains(&k) {
+                        out.push_str(&format!("__sh_fArg({k})"));
+                        return Ok(());
+                    }
+                }
                 out.push_str(name);
-                Ok(())
-            } else {
-                Err("getVar with non-literal name (v1)".into())
+                return Ok(());
             }
+            Err("getVar with non-literal name (v1)".into())
         }
         IrExpr::Call { func, args, .. } if func == "setArray" => {
             // `declare -a arr=(a b c)` — render as a bracketed array string
