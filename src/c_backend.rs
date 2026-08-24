@@ -7056,7 +7056,20 @@ impl Render {
                                 self.emit(&format!("{name} = (long long)atoll((char*)({v}));"));
                             }
                             Some(v) => {
-                                self.emit(&format!("{name} = strdup((char*)({v}));"));
+                                // a FIXED BUFFER cannot be reassigned —
+                                // copy into it (j = strdup("0") on
+                                // char j[21] was an assignment-to-array)
+                                if let Some(b) = self.buf_bound(&d.name) {
+                                    self.emit_guarded_copy(
+                                        &name,
+                                        b,
+                                        &format!("(char*)({v})"),
+                                    );
+                                } else {
+                                    self.emit(&format!(
+                                        "{name} = strdup((char*)({v}));"
+                                    ));
+                                }
                             }
                             None => {
                                 self.emit(&format!("{name} = NULL;"));
