@@ -2190,10 +2190,30 @@ impl Render {
         let Some(IrExpr::Array(items)) = args.get(1) else {
             return self.printf_fallback(args);
         };
-        let Some(IrExpr::Str(fmt, _)) = items.first() else {
+        // The format may be a bare Str OR a single-lit Interpolate (the
+        // frontends wrap every word in interpolation parts) — normalize.
+        let fmt_owned: Option<String> = match items.first() {
+            Some(IrExpr::Str(s, _)) => Some(s.clone()),
+            Some(IrExpr::Interpolate(parts)) if !parts.is_empty() => {
+                let mut t = String::new();
+                let mut all_lit = true;
+                for p in parts {
+                    match p {
+                        crate::ir::InterpPart::Lit(s) => t.push_str(s),
+                        _ => {
+                            all_lit = false;
+                            break;
+                        }
+                    }
+                }
+                if all_lit { Some(t) } else { None }
+            }
+            _ => None,
+        };
+        let Some(fmt) = fmt_owned else {
             return self.printf_fallback(args);
         };
-        let parsed = match Self::printf_parse(fmt) {
+        let parsed = match Self::printf_parse(&fmt) {
             Some(p) => p,
             None => return self.printf_fallback(args),
         };
@@ -2203,11 +2223,13 @@ impl Render {
             return self.printf_fallback(args);
         }
         let arg_exprs: Vec<String> = fmt_args.iter().map(|a| self.expr(a)).collect();
-        // a spec with flags/width/prec must keep the runtime builtin
+        // flags/width/prec lower NATIVELY onto python's format()
+        // mini-language (%-10s -> format(x, "<10"), %05d -> "05d"); a
+        // combo the mapping can't express keeps the runtime builtin.
+        // (printf default alignment for ALL conversions is RIGHT, which
+        // matches python's default too — only '-' flips to '<'.)
         let complex = els.iter().any(|(_, s)| match s {
-            Some((flags, width, prec, _)) => {
-                !flags.is_empty() || *width > 0 || prec.is_some()
-            }
+            Some((flags, _, _, _)) => flags.contains('#'),
             None => false,
         });
         if complex {
@@ -2223,7 +2245,7 @@ impl Render {
         let mut pieces: Vec<String> = Vec::new();
         if n_specs == 0 {
             // no specs: the format text repeats once per arg
-            let text = Self::py_str(&Self::printf_unescape(fmt));
+            let text = Self::py_str(&Self::printf_unescape(&fmt));
             if passes > 1 {
                 pieces.push(format!("({text} * {passes})"));
             } else {
@@ -2237,10 +2259,64 @@ impl Render {
                         let arg = arg_exprs.get(ai).cloned().unwrap_or_else(|| "\"\"".into());
                         ai += 1;
                         match conv {
-                            's' => pieces.push(format!("str({arg})")),
-                            'd' | 'i' | 'u' => {
-                                self.need_atoi = true;
-                                pieces.push(format!("str(__sh_atoi({arg}))"));
+                            's' | 'd' | 'i' | 'u' => {
+                                let mut py_spec = String::new();
+                                if let Some((flags, width, prec, cv)) = spec {
+                                    if flags.contains('-') {
+                                        py_spec.push('<');
+                                    } else if flags.contains('+') {
+                                        py_spec.push('+');
+                                    } else if flags.contains(' ') {
+                                        py_spec.push(' ');
+                                    }
+                                    if flags.contains('0')
+                                        && !flags.contains('-')
+                                        && *width > 0
+                                        && *cv != 's'
+                                    {
+                                        py_spec.push('0');
+                                    }
+                                    if *width > 0 {
+                                        py_spec.push_str(&width.to_string());
+                                    }
+                                    if let Some(p) = prec {
+                                        if *cv == 's' {
+                                            py_spec.push('.');
+                                            py_spec.push_str(&p.to_string());
+                                        } else {
+                                            return self.printf_fallback(args);
+                                        }
+                                    }
+                                    // python's type set has no i/u —
+                                    // they are d in every respect here
+                                    if *cv == 's' {
+                                        py_spec.push('s');
+                                    } else {
+                                        py_spec.push('d');
+                                    }
+                                }
+                                let plain = matches!(py_spec.as_str(), "s" | "d");
+                                match conv {
+                                    's' => {
+                                        if plain {
+                                            pieces.push(format!("str({arg})"));
+                                        } else {
+                                            pieces
+                                                .push(format!("format({arg}, \"{py_spec}\")"));
+                                        }
+                                    }
+                                    _ => {
+                                        self.need_atoi = true;
+                                        if plain {
+                                            pieces
+                                                .push(format!("str(__sh_atoi({arg}))"));
+                                        } else {
+                                            pieces.push(format!(
+                                                "format(__sh_atoi({arg}), \"{py_spec}\")"
+                                            ));
+                                        }
+                                    }
+                                }
                             }
                             _ => unreachable!("printf_parse gates the conversions"),
                         }
@@ -3073,7 +3149,15 @@ impl Render {
                         argv.join(", ")
                     ));
                 } else {
-                    self.emit(&format!("subprocess.run([{}])", argv.join(", ")));
+                    // native-first: reuse the exec CALL arm so printf /
+                    // echo / exit / cd lower natively. A bare
+                    // subprocess.run here both raised on command-not-found
+                    // AND skipped the format handling entirely.
+                    let rendered = self.call(
+                        "exec",
+                        &[(*cmd).clone(), IrExpr::Array(args.clone())],
+                    );
+                    self.emit(&rendered);
                 }
             }
             IrStmt::Block(b) => {
