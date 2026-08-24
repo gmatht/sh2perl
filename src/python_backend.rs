@@ -2153,20 +2153,13 @@ impl Render {
                                                     if let Some(IrExpr::Str(c, _)) =
                                                         args.first()
                                                     {
-                                                        one.push(c.clone());
+                                                        one.push(Self::py_str(c));
                                                     }
                                                     if let Some(IrExpr::Array(items)) =
                                                         args.get(1)
                                                     {
                                                         for it in items {
-                                                            match self.expr(it) {
-                                                                x if x.starts_with('"') => {
-                                                                    one.push(x)
-                                                                }
-                                                                _ => {
-                                                                    ok = false;
-                                                                }
-                                                            }
+                                                            one.push(self.py_value(it));
                                                         }
                                                     }
                                                     rest_argv.push(one);
@@ -2199,9 +2192,6 @@ impl Render {
                                     let n = rest_argv.len();
                                     for (i, argv) in rest_argv.iter().enumerate() {
                                         let pyargs = argv
-                                            .iter()
-                                            .map(|a| Self::py_str(a))
-                                            .collect::<Vec<_>>()
                                             .join(", ");
                                         if i == n - 1 {
                                             self.emit(&format!(
@@ -3388,6 +3378,30 @@ impl Render {
                         self.emit(&format!("print({v})"));
                         return;
                     }
+                    // pipeline(...) at STATEMENT position: stdout goes to
+                    // the terminal (the generic call arm CAPTURES, which
+                    // silently discarded multi-stage output like
+                    // 'echo hi | tr | sort | head')
+                    if func == "pipeline" {
+                        if let Some(IrExpr::Array(sts)) = call_args.first() {
+                            let mut ok = true;
+                            let bodies: Vec<&[IrStmt]> = sts
+                                .iter()
+                                .map(|st| match st {
+                                    IrExpr::Arrow(b) => b.as_slice(),
+                                    _ => {
+                                        ok = false;
+                                        &[][..]
+                                    }
+                                })
+                                .collect();
+                            if ok && !bodies.iter().any(|b| b.is_empty()) {
+                                if self.try_emit_pipeline(bodies) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     // and(Arrow, Arrow, ..) — &&-chained STATEMENT groups
                     // (the process-substitution lowering: mktemp captures,
                     // tmp writes, then the command). Render every group as
@@ -3963,11 +3977,11 @@ impl Render {
                             IrExpr::Call { func, args } if func == "exec" => {
                                 let mut one = Vec::new();
                                 if let Some(IrExpr::Str(c, _)) = args.first() {
-                                    one.push(c.clone());
+                                    one.push(Self::py_str(c));
                                 }
                                 if let Some(IrExpr::Array(items)) = args.get(1) {
                                     for it in items.iter() {
-                                        one.push(self.expr(it));
+                                        one.push(self.py_value(it));
                                     }
                                 }
                                 rest_argv.push(one);
@@ -3995,11 +4009,7 @@ impl Render {
                     let mut prev = "_buf.getvalue()".to_string();
                     let n = rest_argv.len();
                     for (i, argv) in rest_argv.iter().enumerate() {
-                        let pyargs = argv
-                            .iter()
-                            .map(|a| Self::py_str(a))
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let pyargs = argv.join(", ");
                         if i == n - 1 {
                             self.emit(&format!(
                                 "subprocess.run([{}], input={}, text=True)",
@@ -4133,6 +4143,110 @@ impl Render {
     }
 
     // ── program ──────────────────────────────────────────────────────
+
+    /// An IR expression as a python STR-typed runtime value expression
+    /// (string literals stay literals; vars/numbers coerce via str()).
+    fn py_value(&mut self, e: &IrExpr) -> String {
+        let x = self.expr(e);
+        if x.starts_with('"') {
+            x
+        } else {
+            format!("str({x})")
+        }
+    }
+
+    /// Emit a multi-stage pipeline whose stdout goes to the TERMINAL.
+    /// Every stage lowers to a python argv (f-strings/vars preserved) or,
+    /// for a leading complex stage (for/while loops over python state),
+    /// renders natively under redirect_stdout; stages chain via stdin.
+    /// Returns false when no shape applies (caller falls back).
+    fn try_emit_pipeline(&mut self, bodies: Vec<&[IrStmt]>) -> bool {
+        if bodies.len() < 2 {
+            return false;
+        }
+        let mut plans: Vec<Option<Vec<String>>> = Vec::new();
+        for b in bodies.iter() {
+            match b {
+                [IrStmt::Expr(e)] => match e {
+                    IrExpr::Call { func, args } if func == "exec" => {
+                        let mut one = Vec::new();
+                        if let Some(IrExpr::Str(c, _)) = args.first() {
+                            one.push(Self::py_str(c));
+                        }
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            for it in items.iter() {
+                                one.push(self.py_value(it));
+                            }
+                        }
+                        plans.push(Some(one));
+                    }
+                    _ => plans.push(None),
+                },
+                [IrStmt::Exec { cmd, args, .. }] => {
+                    let mut one = Vec::new();
+                    if let IrExpr::Str(c, _) = cmd {
+                        one.push(Self::py_str(c));
+                    }
+                    for it in args.iter() {
+                        one.push(self.py_value(it));
+                    }
+                    plans.push(Some(one));
+                }
+                _ => plans.push(None),
+            }
+        }
+        // every stage after the first must be argv; the FIRST may be a
+        // native-render stage (None)
+        if plans[1..].iter().any(|p| p.is_none()) || plans[0].is_none() && bodies[0].is_empty() {
+            return false;
+        }
+        self.emit("import io");
+        self.emit("import contextlib");
+        let mut prev: String;
+        match plans[0] {
+            None => {
+                self.emit("_buf = io.StringIO()");
+                self.emit("with contextlib.redirect_stdout(_buf):");
+                self.depth += 1;
+                for s in bodies[0] {
+                    self.stmt(s);
+                }
+                self.depth -= 1;
+                prev = "_buf.getvalue()".to_string();
+            }
+            Some(ref argv0) => {
+                let pyargs = argv0
+                    .join(", ");
+                self.emit(&format!(
+                    "_p0 = subprocess.run([{}], text=True, capture_output=True).stdout",
+                    pyargs
+                ));
+                prev = "_p0".to_string();
+            }
+        }
+        self.emit("sys.stdout.flush()");
+        let n = bodies.len();
+        for i in 1..n {
+            let argv = match &plans[i] {
+                Some(a) => a,
+                None => return false,
+            };
+            let pyargs = argv.join(", ");
+            if i == n - 1 {
+                self.emit(&format!(
+                    "subprocess.run([{}], input={}, text=True)",
+                    pyargs, prev
+                ));
+            } else {
+                self.emit(&format!(
+                    "_p{i} = subprocess.run([{}], input={}, text=True, capture_output=True).stdout",
+                    pyargs, prev
+                ));
+                prev = format!("_p{i}");
+            }
+        }
+        true
+    }
 
     fn program(&mut self, prog: &IrProgram) {
         // Pass 1: collect declared vars (assign targets, declare lists,
