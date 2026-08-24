@@ -58,6 +58,8 @@ pub struct Render {
     need_sys: bool,
     /// needs the `__sh_exec` subprocess helper
     need_subprocess: bool,
+    /// needs the __sh_inc_pre/__sh_inc_post helpers (a $(( x++ )) VALUE)
+    need_inc: bool,
     /// needs the `__sh_capture` helper (bash `$()` semantics: stdout only,
     /// trailing newlines stripped, NEVER raises — command-not-found/failure
     /// yields "" and the script continues, like bash)
@@ -1040,9 +1042,21 @@ impl Render {
                 // (int() of an int-typed var is a no-op.)
                 format!("int({})", self.py_ident(name))
             }
-            ArithAst::Index { .. } => {
-                self.mark_todo("arith Index");
-                "0".into()
+            ArithAst::Index { var, key, .. } => {
+                // arithmetic array subscript: a[1] + 1 — native list/dict
+                // subscript on the collected root (list mode bounds-guarded
+                // like render_array_read; dict via .get)
+                if self.array_dict_roots.contains(var) {
+                    let ke = match key.as_ref() {
+                        ArithAst::Num(n) => Self::py_str(&n.to_string()),
+                        _ => self.arith(key),
+                    };
+                    format!("({}.get({}, \"\"))", self.py_ident(var), ke)
+                } else {
+                    let k = self.arith(key);
+                    let r = self.py_ident(var);
+                    format!("int({r}[{k}] if len({r}) > {k} else 0)")
+                }
             }
             ArithAst::Bin { op, lhs, rhs } => {
                 let l = self.arith(lhs);
@@ -1076,10 +1090,23 @@ impl Render {
                 self.arith(test),
                 self.arith(else_)
             ),
-            ArithAst::Assign { .. } | ArithAst::IncDec { .. } => {
-                // runtime setVar semantics (x+=, x++) — sh2.arith stub
+            ArithAst::Assign { .. } => {
+                // runtime setVar semantics (x+=) — sh2.arith stub
                 self.sh2_calls.insert("arith".into());
-                format!("sh2_arith()")
+                "sh2_arith()".into()
+            }
+            ArithAst::IncDec { var, delta, prefix } => {
+                // x++ / ++x in VALUE position: bash yields the OLD value
+                // for postfix and the NEW value for prefix, then updates.
+                // The __sh_inc_pre/__sh_inc_post helpers do exactly that on
+                // module globals (native — no store round-trip).
+                self.need_inc = true;
+                let d = delta.to_string();
+                if *prefix {
+                    format!("__sh_inc_pre({}, {})", Self::py_str(var), d)
+                } else {
+                    format!("__sh_inc_post({}, {})", Self::py_str(var), d)
+                }
             }
             ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
             ArithAst::Cast { arg, .. } => self.arith(arg),
@@ -1239,6 +1266,65 @@ impl Render {
                 }
                 self.sh2_stub("captureWords", args, "captureWords")
             }
+            // join(...) — the core's StringPart lowering WRAPS every
+            // ${..} expansion in join(<expr>) (shir.rs StringPart::Param /
+            // MapKeys / ArrayIndex): unwrap and route.
+            "join" => {
+                match args.first() {
+                    // join(param(op, name, ..)) — any parameter expansion
+                    Some(IrExpr::Call { func, args: pargs }) if func == "param" => {
+                        self.call("param", pargs)
+                    }
+                    // join(arrayIndex(name, key)) — single element read
+                    Some(IrExpr::Call { func, args: iargs })
+                        if func == "arrayIndex" =>
+                    {
+                        match (iargs.first(), iargs.get(1)) {
+                            (Some(IrExpr::Str(name, _)), Some(key)) => {
+                                let k = self.expr(key);
+                                let r = self.py_ident(name);
+                                if self.array_dict_roots.contains(name) {
+                                    format!("{r}.get({k}, \"\")")
+                                } else {
+                                    format!("({r}[{k}] if len({r}) > {k} else \"\")")
+                                }
+                            }
+                            _ => self.sh2_stub("join", args, "join"),
+                        }
+                    }
+                    // join(arrayItems(name)) — all values, space-joined
+                    Some(IrExpr::Call { func, args: iargs })
+                        if func == "arrayItems" =>
+                    {
+                        match iargs.first() {
+                            Some(IrExpr::Str(name, _)) => {
+                                let r = self.py_ident(name);
+                                if self.array_dict_roots.contains(name) {
+                                    format!("\" \".join(str(v) for v in {r}.values())")
+                                } else {
+                                    format!("\" \".join(str(x) for x in {r})")
+                                }
+                            }
+                            _ => self.sh2_stub("join", args, "join"),
+                        }
+                    }
+                    _ => self.sh2_stub("join", args, "join"),
+                }
+            }
+            // setArrayAppend(name, elems) — arr+=(x y): native list extend
+            // on collected roots
+            "setArrayAppend" => {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    if self.var_types.contains_key(name) || self.array_keys.contains_key(name) {
+                        let elems = args
+                            .get(1)
+                            .map(|a| self.expr(a))
+                            .unwrap_or_else(|| "[]".into());
+                        return format!("{} += {elems}", self.py_ident(name));
+                    }
+                }
+                self.sh2_stub("setArrayAppend", args, "setArrayAppend")
+            }
             // redirect(inner, [redirect objects]) used in expression
             // chains (`cmd 2>/dev/null && ...`): run the inner body under
             // bash -c and return its STATUS so && / || chaining stays
@@ -1313,10 +1399,31 @@ impl Render {
                         return format!("os.chdir({dir})");
                     }
                     if cmd == "read" {
-                        // `read var` — read a line into the store (sh2_setVar
-                        // triggers the store runtime).
+                        // `read [-r] var` — read a line into the target(s).
+                        // Flags ("-r") precede the variable names; a plain
+                        // name assigns NATIVELY (the old path stuffed the
+                        // FLAG into the store key: sh2_setVar("-r", ..)!).
                         if let Some(IrExpr::Array(items)) = args.get(1) {
-                            if let Some(IrExpr::Str(v, _)) = items.first() {
+                            let targets: Vec<&IrExpr> =
+                                items.iter().skip_while(|i| {
+                                    matches!(i, IrExpr::Str(s, _) if s.starts_with('-'))
+                                }).collect();
+                            if let [single] = targets.as_slice() {
+                                if let IrExpr::Str(v, _) = single {
+                                    if Self::is_plain_name(v)
+                                        && !self.store_written.contains(v)
+                                    {
+                                        return format!(
+                                            "{} = sys.stdin.readline().rstrip(\"\\n\")",
+                                            self.py_ident(v)
+                                        );
+                                    }
+                                }
+                            }
+                            // multi-var / store targets: first name keeps
+                            // the line, the rest stay empty (bash splits on
+                            // IFS; the corpus never exercises that)
+                            if let Some(IrExpr::Str(v, _)) = targets.first() {
                                 self.sh2_calls.insert("setVar".into());
                                 return format!(
                                     "sh2_setVar({}, sys.stdin.readline().rstrip(\"\\n\"))",
@@ -1326,9 +1433,14 @@ impl Render {
                         }
                     }
                     if cmd == "unset" {
-                        // `unset var` — remove from the store
+                        // `unset var` — a NATIVE var re-initializes to ""
+                        // (shell unset reads as empty); only runtime-store
+                        // vars pop the store
                         if let Some(IrExpr::Array(items)) = args.get(1) {
                             if let Some(IrExpr::Str(v, _)) = items.first() {
+                                if Self::is_plain_name(v) && !self.store_written.contains(v) {
+                                    return format!("{} = \"\"", self.py_ident(v));
+                                }
                                 self.sh2_calls.insert("setVar".into());
                                 return format!(
                                     "__sh_store.pop({}, None)",
@@ -1789,7 +1901,7 @@ impl Render {
             // (the C array `a[4]`); untyped names keep the runtime store.
             "setArray" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    if self.var_types.contains_key(name) {
+                    if self.var_types.contains_key(name) || self.array_keys.contains_key(name) {
                         let elems = args
                             .get(1)
                             .map(|a| self.expr(a))
@@ -3504,6 +3616,21 @@ impl Render {
             self.emit("        return subprocess.call(argv) == 0");
             self.emit("    except OSError:");
             self.emit("        return False");
+        }
+        if self.need_inc {
+            self.emit("");
+            // $(( x++ )) / $(( ++x )) as a VALUE: postfix yields the OLD
+            // value, prefix the NEW one; both update the variable. Module
+            // globals keep it native (no store round-trip).
+            self.emit("def __sh_inc_pre(var, d):");
+            self.emit("    v = int(globals().get(var, 0)) + d");
+            self.emit("    globals()[var] = v");
+            self.emit("    return v");
+            self.emit("");
+            self.emit("def __sh_inc_post(var, d):");
+            self.emit("    v = int(globals().get(var, 0))");
+            self.emit("    globals()[var] = v + d");
+            self.emit("    return v");
         }
         if self.need_capture {
             self.emit("");
