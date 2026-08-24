@@ -2232,9 +2232,12 @@ impl Render {
         self.sh2_stub("printf", args, "printf")
     }
 
-    fn printf_call(&mut self, args: &[IrExpr]) -> String {
+    /// Build the python string-concatenation expression for a printf's
+    /// output; None when the format uses something the native mapping
+    /// can't express (caller keeps the runtime builtin).
+    fn printf_pieces(&mut self, args: &[IrExpr]) -> Option<String> {
         let Some(IrExpr::Array(items)) = args.get(1) else {
-            return self.printf_fallback(args);
+            return None;
         };
         // The format may be a bare Str OR a single-lit Interpolate (the
         // frontends wrap every word in interpolation parts) — normalize.
@@ -2257,16 +2260,16 @@ impl Render {
             _ => None,
         };
         let Some(fmt) = fmt_owned else {
-            return self.printf_fallback(args);
+            return None;
         };
         let parsed = match Self::printf_parse(&fmt) {
             Some(p) => p,
-            None => return self.printf_fallback(args),
+            None => return None,
         };
         let (els, n_specs) = parsed;
         let fmt_args: Vec<&IrExpr> = items[1..].iter().collect();
         if fmt_args.iter().any(|a| matches!(a, IrExpr::Array(_))) {
-            return self.printf_fallback(args);
+            return None;
         }
         let arg_exprs: Vec<String> = fmt_args.iter().map(|a| self.expr(a)).collect();
         // flags/width/prec lower NATIVELY onto python's format()
@@ -2279,7 +2282,7 @@ impl Render {
             None => false,
         });
         if complex {
-            return self.printf_fallback(args);
+            return None;
         }
         let passes = if n_specs == 0 {
             arg_exprs.len().max(1)
@@ -2330,7 +2333,7 @@ impl Render {
                                             py_spec.push('.');
                                             py_spec.push_str(&p.to_string());
                                         } else {
-                                            return self.printf_fallback(args);
+                                            return None;
                                         }
                                     }
                                     // python's type set has no i/u —
@@ -2372,7 +2375,14 @@ impl Render {
                 }
             }
         }
-        format!("sys.stdout.write({})", pieces.join(" + "))
+        Some(pieces.join(" + "))
+    }
+
+    fn printf_call(&mut self, args: &[IrExpr]) -> String {
+        match self.printf_pieces(args) {
+            Some(expr) => format!("sys.stdout.write({expr})"),
+            None => self.printf_fallback(args),
+        }
     }
 
     /// Parse a printf format into (text-or-spec elements, n_specs); each
@@ -3320,9 +3330,64 @@ impl Render {
                 }
             }
             IrStmt::Redirect { inner, redirects } => {
-                // render the inner commands; apply a simple fd-1 write
-                // redirect (`> file`) by writing to the file (capture-free
-                // approximation for the v1 subset).
+                // NATIVE FAST PATH: `printf ... > file` / `echo ... > file`
+                // — the single most common write-redirect shape. The
+                // previous approximation wrote an EMPTY file (the content
+                // went to stdout instead), corrupting every downstream
+                // `ls`/`cat`/checksum in the script.
+                let mut handled = false;
+                if let ([IrStmt::Expr(e)], Some(r)) =
+                    (inner.as_slice(), redirects.iter().find(|r| r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "a")))
+                {
+                    if let IrExpr::Call { func, args } = e {
+                        if func == "exec" {
+                            if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                                let content: Option<String> = match cmd.as_str() {
+                                    "echo" => {
+                                        args.get(1).and_then(|a| match a {
+                                            IrExpr::Array(items) => {
+                                                let rendered: Option<Vec<String>> = items
+                                                    .iter()
+                                                    .map(|i| self.expr(i).into())
+                                                    .collect();
+                                                rendered.map(|rs| {
+                                                    if rs.is_empty() {
+                                                        "\"\\n\"".to_string()
+                                                    } else {
+                                                        format!(
+                                                            "{} + \"\\n\"",
+                                                            rs.join(" + ' ' + ")
+                                                        )
+                                                    }
+                                                })
+                                            }
+                                            _ => None,
+                                        })
+                                    }
+                                    "printf" => {
+                                        // reuse the printf pieces builder
+                                        self.printf_pieces(args)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(content) = content {
+                                    let p = self.expr(&r.target);
+                                    let mode = if r.mode == "a" { "'a'" } else { "'w'" };
+                                    self.emit(&format!("with open({p}, {mode}) as _f:"));
+                                    self.depth += 1;
+                                    self.emit(&format!("_f.write({content})"));
+                                    self.depth -= 1;
+                                    // non-fd1 redirects on the same stmt:
+                                    // stderr is discarded by contract — drop
+                                    handled = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if handled {
+                    return;
+                }
                 for s in inner {
                     self.stmt(s);
                 }
