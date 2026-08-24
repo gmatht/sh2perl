@@ -161,6 +161,9 @@ pub struct Render {
     /// the definitions themselves (name, body) — emitted in the
     /// preamble (BEFORE main: C has no nested function definitions).
     fn_defs: Vec<(String, Vec<IrStmt>)>,
+    /// forward declarations for the hoisted functions (emitted before
+    /// their definitions so call order never matters)
+    fn_fwd_decls: Vec<String>,
     /// distinct sh2.* callee names that need stubs
     sh2_calls: BTreeSet<String>,
     need_upper: bool,
@@ -173,6 +176,8 @@ pub struct Render {
     /// a heredoc terminator was just emitted — the next raw token must
     /// start on a fresh line (the terminator must be alone on its line)
     heredoc_nl: bool,
+    /// emit the _sh_import_env runtime helper (source/eval state pull)
+    need_state_import: bool,
     /// vars assigned as SHELL TEXT in the current command buffer — the
     /// child bash owns their value for this site; re-exporting the stale
     /// C var inside the same buffer would clobber it (091_while_pipe_var:
@@ -484,6 +489,22 @@ impl Render {
         if self.need_stat {
             self.emit("#include <sys/stat.h>");
         }
+        if self.need_state_import {
+            // source/eval state pull: import the child's KEY=VALUE dump
+            // into the environment (env-fallback reads pick it up)
+            self.emit("static void _sh_import_env(void) {");
+            self.emit("  FILE *_pf = fopen(\"/tmp/.shellstate_pull\", \"r\");");
+            self.emit("  if (!_pf) return;");
+            self.emit("  static char _pl[65536];");
+            self.emit("  while (fgets(_pl, sizeof _pl, _pf)) {");
+            self.emit("    size_t _pn = strlen(_pl); while (_pn && (_pl[_pn-1]=='\\n'||_pl[_pn-1]=='\\r')) _pl[--_pn] = 0;");
+            self.emit("    char *_eq = strchr(_pl, '=');");
+            self.emit("    if (!_eq || _eq == _pl) continue;");
+            self.emit("    *_eq = 0; setenv(_pl, _eq + 1, 1);");
+            self.emit("  }");
+            self.emit("  fclose(_pf); remove(\"/tmp/.shellstate_pull\");");
+            self.emit("}"); 
+        }
         if self.need_fnmatch || self.need_sh {
             // the shell-out runtime's ${s#pat} strip helpers use fnmatch
             self.emit("#include <fnmatch.h>");
@@ -514,6 +535,8 @@ impl Render {
             self.emit("static int _sh_rc = 0;");
             self.emit("static int _sh_argc = 0; static char **_sh_argv = 0;");
             self.emit("static char _sh_opts[] = \"hB\"; /* $- — option flags */");
+            self.emit("/* background jobs (fork-based) reaped by bare wait */");
+            self.emit("static pid_t _sh_bg_pids[512]; static size_t _sh_bg_n = 0;");
             self.emit("static char *_sh_cmd = 0; static size_t _sh_cap = 0;");
             self.emit("static char *_sh_wb = 0; static size_t _sh_wcap = 0;");
             self.emit("static char *_sh_wrap = 0; static size_t _sh_wrapcap = 0;");
@@ -1506,6 +1529,9 @@ impl Render {
                 }
             }
         }
+        // forward declaration: a function may CALL another defined later
+        // (nested defs are hoisted in collection order — 081 inner/outer)
+        self.fn_fwd_decls.push(format!("static void {fname}(void);"));
         self.emit(&format!("static void {fname}(void) {{"));
         self.depth += 1;
         let mut local_lines: Vec<&String> = Vec::new();
@@ -1948,6 +1974,15 @@ impl Render {
                                 )),
                             }
                         }
+                        Some(n) if n == "@" || n == "*" => {
+                            // "$@" / "$*" — the JOINED positional value,
+                            // evaluated at site-build time while _sh_argv
+                            // is live (an env export of "@" is always
+                            // empty: generator-system-echo-checkqx)
+                            let t = self.str_temp(65536);
+                            self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+                            word(self, t);
+                        }
                         Some(n) => {
                             let v = if self.is_num(n) {
                                 let t = self.num_temp(&self.c_ident(n));
@@ -2141,6 +2176,37 @@ impl Render {
                             }
                             IrExpr::Call { func, args } if func == "getVar" => {
                                 let n = Self::str_arg(args, 0).unwrap_or_default();
+                                if n == "@" || n == "*" {
+                                    // "$@" — the JOINED positional value at
+                                    // site-build time (an env export of "@"
+                                    // is always empty)
+                                    let t = self.str_temp(65536);
+                                    self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+                                    // mid-word: GLUE the runtime value in
+                                    // as a double-quoted piece (`"hello $@"`
+                                    // is ONE word — a word separator would
+                                    // double the space)
+                                    match buf {
+                                        CmdBuf::Shared => {
+                                            self.emit("_sh_add(\"\\\"\");");
+                                            self.emit(&format!("_sh_add({t});"));
+                                            self.emit("_sh_add(\"\\\"\");");
+                                        }
+                                        CmdBuf::Private(id) => {
+                                            self.emit(&format!(
+                                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"\\\"\");"
+                                            ));
+                                            self.emit(&format!(
+                                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {t});"
+                                            ));
+                                            self.emit(&format!(
+                                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"\\\"\");"
+                                            ));
+                                        }
+                                    }
+                                    first_seg = false;
+                                    return;
+                                }
                                 let v = if n == "?" {
                                     self.num_temp("_sh_rc")
                                 } else if self.is_num(&n) {
@@ -3631,6 +3697,23 @@ impl Render {
         self.arith_string_site(s)
     }
 
+    /// Shell-text initializers for every KNOWN array whose ident appears
+    /// in the given shell text — the child bash needs them materialized.
+    fn array_inits_for_text(&self, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for n in &self.arrays {
+            let id = self.c_ident(n);
+            if text.contains(&id) {
+                out.push(format!(
+                    "_sh_idx_init(&_sh_cmd, &_sh_cap, {}, {id}, {id}_len);",
+                    Self::cstr(n)
+                ));
+                out.push("_sh_add(\";\");".to_string());
+            }
+        }
+        out
+    }
+
     /// `$N` / `${N}` (positionals), `$#`, `$?` → their numeric C reads.
     /// bash expands these BEFORE the arith parser sees the text.
     fn arith_subst_specials(s: &str) -> String {
@@ -3865,10 +3948,16 @@ impl Render {
     fn test_shell_site(&mut self, s: &str) -> String {
         let s = s.to_string();
         let flat = !s.contains(' ');
+        // arrays the text indexes must be MATERIALIZED into the child
+        // command (`[ "$n" -lt $(( a[1] + a[2] )) ]` — a lives C-side)
+        let arr_inits = self.array_inits_for_text(&s);
         self.shell_site(
-            |r| {
+            move |r| {
                 r.sh_export_vars(&s);
                 r.emit("_sh_reset();");
+                for l in &arr_inits {
+                    r.emit(l);
+                }
                 if flat {
                     r.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[[ {s} ]]"))));
                 } else {
@@ -5452,9 +5541,12 @@ impl Render {
                 ));
             } else {
                 self.assoc_arrays.insert(var.to_string());
+                // bash strips subscript QUOTES at parse time — `m["os"]=v`
+                // stores key `os` (the raw shIR text keeps them)
+                let kc = k.trim().trim_matches(|c| c == '"' || c == '\'');
                 self.emit(&format!(
                     "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {}, {v});",
-                    Self::cstr(k)
+                    Self::cstr(kc)
                 ));
             }
         } else {
@@ -5496,7 +5588,14 @@ impl Render {
             // flat pairs: k1, v1, k2, v2 ...
             let mut i = 0;
             while i + 1 < items.len() {
-                let k = self.value_c(&items[i]);
+                // strip subscript quotes from literal string keys
+                // (`m["os"]=v` stores key `os`)
+                let k = match &items[i] {
+                    IrExpr::Str(ks, _) => {
+                        Self::cstr(ks.trim().trim_matches(|c| c == '"' || c == '\''))
+                    }
+                    other => self.value_c(other),
+                };
                 let v = self.value_c(&items[i + 1]);
                 self.emit(&format!(
                     "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {k}, {v});"
@@ -5654,6 +5753,18 @@ impl Render {
         } else if looks_like_arith(key) {
             // `${arr[(2*$i)-1]}` — an arithmetic index expression
             self.arith_text_expr(key)
+        } else if is_ident(key.trim())
+            && (self.store.contains(key.trim()) || self.var_types.contains_key(key.trim()))
+        {
+            // `${args[i]}` — bash arithmetic subscripts allow BARE var
+            // names: a bare identifier naming a program var reads its
+            // value (atoll("i") would be a constant 0)
+            let t = key.trim();
+            if self.is_num(t) {
+                format!("(long long)({})", self.c_ident(t))
+            } else {
+                format!("(long long)atoll({})", self.store_read(t))
+            }
         } else {
             format!("(long long)atoll({})", Self::cstr(key))
         };
@@ -6203,6 +6314,14 @@ impl Render {
                     }
                     // `! cmd` / `! pipeline` — bash stores the NEGATED rc
                     // in $?: the statement must ASSIGN back, not discard
+                    IrExpr::Call { func, args }
+                        if (func == "exec" || func == "builtin")
+                            && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "wait") =>
+                    {
+                        // bare wait: reap the forked background jobs
+                        self.emit("{ for (size_t _wi = 0; _wi < _sh_bg_n; _wi++) waitpid(_sh_bg_pids[_wi], 0, 0); _sh_bg_n = 0; _sh_rc = 0; }");
+                        return;
+                    }
                     IrExpr::BinOp { lhs, op: crate::ir::BinOpKind::Not, .. }
                         if matches!(
                             lhs.as_ref(),
@@ -6268,14 +6387,71 @@ impl Render {
                                 },
                                 false,
                             );
+                            self.emit("{ int _went = 0;");
                             self.emit(&format!("while ({site}) {{"));
                             self.depth += 1;
+                            self.emit("_went = 1;");
                             for s in &body_stmts {
                                 self.stmt(s);
                             }
                             self.depth -= 1;
                             self.emit("}");
+                            // bash: a while whose condition failed BEFORE
+                            // the first body run exits 0 (the last cond
+                            // rc must not leak into $?)
+                            self.emit("if (!_went) _sh_rc = 0;");
+                            self.emit("}");
                         }
+                        return;
+                    }
+                    // `.` / `source` / `eval` — the executed text must
+                    // share state with the PARENT: the child dumps ALL
+                    // its variables after the text runs and the parent
+                    // imports them into the environment (dot-source-lib:
+                    // shared=secret). Store-var reads keep their C value;
+                    // env-fallback reads (env-style/unknown names) pick
+                    // the sourced values up.
+                    IrExpr::Call { func, args }
+                        if (func == "exec" || func == "builtin")
+                            && matches!(
+                                args.first(),
+                                Some(IrExpr::Str(c, _))
+                                    if c == "." || c == "source" || c == "eval"
+                            ) =>
+                    {
+                        self.need_state_import = true;
+                        let args_v = args.clone();
+                        // one fixed state file: sites run sequentially, so
+                        // each dump+import pair completes before the next
+                        let path = "/tmp/.shellstate_pull";
+                        let site = self.shell_site(
+                            |r| {
+                                r.emit("_sh_reset();");
+                                for a in &args_v {
+                                    match a {
+                                        IrExpr::Array(items) => {
+                                            for it in items {
+                                                r.sh_word(CmdBuf::Shared, it);
+                                            }
+                                        }
+                                        other => r.sh_word(CmdBuf::Shared, other),
+                                    }
+                                }
+                                // dump EVERY variable after the text runs,
+                                // redirected to a private temp file
+                                // (stdout parity: nothing on fd 1)
+                                r.emit(&format!(
+                                    "_sh_addraw({});",
+                                    Self::cstr(&format!(
+                                        " ; for _sk in $(compgen -v) ; do printf '%s=%s\\n' \"$_sk\" \"${{!_sk}}\" ; done > {}",
+                                        path
+                                    ))
+                                ));
+                            },
+                            false,
+                        );
+                        self.emit(&format!("{site};"));
+                        self.emit("_sh_import_env();");
                         return;
                     }
                     _ => {}
@@ -6870,12 +7046,18 @@ impl Render {
                 // emits must refresh EVERY iteration, not hoist before
                 // the loop.
                 let c = self.cond_site(cond);
+                self.emit("{ int _went = 0;");
                 self.emit(&format!("while ({c}) {{"));
                 self.depth += 1;
+                self.emit("_went = 1;");
                 for s in body {
                     self.stmt(s);
                 }
                 self.depth -= 1;
+                self.emit("}");
+                // bash: a while whose condition failed BEFORE the first
+                // body run exits 0 (the cond rc must not leak into $?)
+                self.emit("if (!_went) { _sh_rc = 0; }");
                 self.emit("}");
             }
             IrStmt::DoWhile { body, cond, until } => {
@@ -6959,13 +7141,35 @@ impl Render {
                     self.emit(&format!("{site};"));
                 }
             }
-            IrStmt::Block(body) | IrStmt::Background(body) => {
+            IrStmt::Block(body) => {
                 self.emit("{");
                 self.depth += 1;
                 for s in body {
                     self.stmt(s);
                 }
                 self.depth -= 1;
+                self.emit("}");
+            }
+            IrStmt::Background(body) => {
+                // bash forks the job onto a COPY of the shell state —
+                // fork() is the native mapping: async ordering AND the
+                // copy semantics come free ({ x=2; } & cannot leak x=2
+                // into the parent: 105_background_copy_semantics), no
+                // synchronous child-bash site needed
+                let bg = self.temp_seq;
+                self.temp_seq += 1;
+                self.emit(&format!("{{ pid_t _bg{bg} = fork();"));
+                self.emit(&format!("  if (_bg{bg} == 0) {{"));
+                self.depth += 1;
+                for s in body {
+                    self.stmt(s);
+                }
+                self.emit("fflush(stdout); _exit(0);");
+                self.depth -= 1;
+                self.emit("  }");
+                self.emit(&format!(
+                    "  if (_bg{bg} > 0 && _sh_bg_n < sizeof _sh_bg_pids / sizeof *_sh_bg_pids) _sh_bg_pids[_sh_bg_n++] = _bg{bg};"
+                ));
                 self.emit("}");
             }
             IrStmt::Subshell(body) => {
@@ -7024,7 +7228,13 @@ impl Render {
                         let kw = if first { "if" } else { "else if" };
                         first = false;
                         let flags = if self.nocasematch { " | FNM_CASEFOLD" } else { "" };
-                        let pat_c = Self::cstr(strip_glob(pat));
+                        // a QUOTED pattern keeps its quote chars in the
+                        // shIR text (`''` arrived as two-quote string):
+                        // strip them — bash matches the DEQUOTED word,
+                        // and an empty pattern must match the empty value
+                        let pat_text = strip_glob(pat)
+                            .trim_matches(|c| c == '"' || c == '\'');
+                        let pat_c = Self::cstr(pat_text);
                         self.emit(&format!(
                             "{kw} (fnmatch({pat_c}, {d}, 0{flags}) == 0) {{"
                         ));
@@ -7419,6 +7629,17 @@ impl Render {
         }
         fn_out = std::mem::replace(&mut self.out, saved_out);
         self.fn_defs = fn_defs;
+        // forward declarations head the function block (calls may occur
+        // in any definition order)
+        if !self.fn_fwd_decls.is_empty() {
+            let mut with_fwd: Vec<String> = Vec::new();
+            for d in std::mem::take(&mut self.fn_fwd_decls) {
+                with_fwd.push(d);
+            }
+            with_fwd.push(String::new());
+            with_fwd.extend(fn_out.iter().cloned());
+            fn_out = with_fwd;
+        }
         // fn-locals referenced by site/capture helpers hoist to FILE
         // scope (the helpers are file-scope functions; emit_function
         // already excluded them from the fn's local block)
@@ -7497,6 +7718,9 @@ impl Render {
             // real argv for $0 / positional params (function-call
             // emulation saves/restores _sh_argv around its own sites)
             self.emit("  _sh_argv = _mav; _sh_argc = _mac;");
+            // bash seeds HOSTNAME itself — the gate env may not carry it
+            // (064_21: ${HOSTNAME:-localhost} took the default)
+            self.emit("  if (!getenv(\"HOSTNAME\")) { static char _hn[256]; if (gethostname(_hn, sizeof _hn) == 0) setenv(\"HOSTNAME\", _hn, 0); }");
         }
         // Only REAL shell-out sites (bash -c subprocesses) need the
         // preamble: their children share fd 1 — unbuffered stdout keeps
@@ -7672,6 +7896,12 @@ fn collect_fn_defs(
             IrStmt::Function { name, body, .. } => {
                 names.insert(name.clone());
                 defs.push((name.clone(), body.clone()));
+                // NESTED definitions (`inner()` inside `outer(){}`) are
+                // also functions — bash defines them at CALL time, the C
+                // render hoists them file-scope (081_nested_functions:
+                // the `inner` call shelled out because the name was
+                // never registered)
+                collect_fn_defs(body, names, defs);
             }
             IrStmt::If { then, elsifs, else_, .. } => {
                 collect_fn_defs(then, names, defs);
@@ -9045,6 +9275,29 @@ fn collect_assigned_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                 }
             }
         }
+        // `unset V` — a WRITE (it clears the var): a subshell body that
+        // unsets must save/restore like any assignment (064_20: the
+        // inner subshell's unset DEBUG leaked to the outer scope)
+        IrExpr::Call { func, args }
+            if (func == "exec" || func == "builtin")
+                && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "unset") =>
+        {
+            let mut words: Vec<&IrExpr> = Vec::new();
+            for a in args.iter().skip(1) {
+                match a {
+                    IrExpr::Array(items) => words.extend(items.iter()),
+                    other => words.push(other),
+                }
+            }
+            for w in words {
+                if let IrExpr::Str(ws, _) = w {
+                    let n = ws.trim();
+                    if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        out.insert(n.to_string());
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -9751,15 +10004,33 @@ fn brace_expand(args: &[IrExpr]) -> Vec<String> {
     if groups.is_empty() {
         return vec![format!("{prefix}{suffix}")];
     }
-    let mut out: Vec<String> = vec![String::new()];
-    for g in &groups {
+    // the MIDDLES are the literal text BETWEEN consecutive braces
+    // (`file_{a..z}_{1..10}.{txt,log}` — "_" joins group 0→1, "." 1→2);
+    // dropping them glued the words together (064_02)
+    let middles: Vec<String> = args
+        .get(2)
+        .and_then(|a| match a {
+            IrExpr::Json(v) => v.as_array().map(|xs| {
+                xs.iter()
+                    .map(|x| x.as_str().unwrap_or_default().to_string())
+                    .collect()
+            }),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut out: Vec<String> = groups
+        .first()
+        .cloned()
+        .unwrap_or_else(|| vec![String::new()]);
+    for (gi, g) in groups.iter().enumerate().skip(1) {
         if g.is_empty() {
             continue;
         }
+        let m = middles.get(gi - 1).cloned().unwrap_or_default();
         let mut next = Vec::new();
         for o in &out {
             for item in g {
-                next.push(format!("{o}{item}"));
+                next.push(format!("{o}{m}{item}"));
             }
         }
         out = next;

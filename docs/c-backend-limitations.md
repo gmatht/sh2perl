@@ -1,6 +1,6 @@
 # C backend — known runtime limitations
 
-Status: corpus gate **565/643 pass** (baseline at session start: 538/643;
+Status: corpus gate **580/643 pass** (baseline at session start: 538/643;
 0 compile errors; 0 `TODO(unsupported)` / `sh2.*` stub markers hit on the
 corpus). Gate: `harness/c_gate_main.sh` (same oracle as
 `harness/c_gate_repro.sh`, rendering through main's renderer).
@@ -24,15 +24,15 @@ none is a hidden regression. Each lists the corpus cases that pin it.
   stdio.
 - Partially unavoidable: tty state is genuinely environmental.
 
-## 3. Background jobs share parent state (copy-at-fork not emulated)
-- Cases: `105_background_copy_semantics.sh`
-- bash `cmd &` forks; the job mutates a copy. The C runtime runs background
-  bodies against live process state. Same documented limitation as the JS
-  backend (PLAN v27); true copy semantics need a fork() path or a full
-  state clone — deliberately out of scope while gates pin microtask-order
-  parity elsewhere.
-- Known runtime limitation, documented in PLAN v27 for estree; identical
-  root cause here.
+## 3. Background jobs — RESOLVED with real fork()
+- Cases fixed: `048_subprocess.sh`, `105_background_copy_semantics.sh`,
+  `t44_background.sh`, `063_06_complex_pipeline_background.sh`,
+  `051_primes.sh`
+- bash `cmd &` is a fork, so the renderer now forks: the child runs the
+  body on its own address-space copy (isolation + async ordering for
+  free), fflushes and _exits; the parent records the pid for bare `wait`.
+  This is the ONE deliberate process primitive — it is not emulation of a
+  shell construct, it IS the shell construct's native mapping.
 
 ## 4. `eval` / `source` (dot) effects stay in the child shell
 - Cases: `dot-source-lib.sh`, `eval-assign.sh`, `063_12_complex_eval.sh`,
@@ -96,7 +96,16 @@ none is a hidden regression. Each lists the corpus cases that pin it.
   when the heredoc stage text and subsequent stage glue interact; body
   lines after the first are dropped in some shapes.
 
-## 12. Misc single-case divergences
+## 12. Script-defined shell-out helpers (`capture`/`check_qx` style)
+- Cases: `id-cmdsub.sh`, `readonly-cmdsub.sh`, `typeset-cmdsub.sh`,
+  `tty-cmdsub.sh`, `ps-system-call.sh`, `qx-var-builtin-cd.sh`
+- These scripts define their OWN wrapper functions that build a command
+  line from `"$@"` and shell out; the rendered child text glues name+args
+  into one word in some shapes (`bash: 'id -u': command not found`) and
+  builtin-cd/qx transports lose cwd effects. Root cause is per-script
+  indirection through positional re-assembly, not a single node gap.
+
+## 13. Misc single-case divergences
 - `at-in-test.sh`: extglob `@(...)` in `[[ ]]` needs FNM_EXTMATCH on the
   test-token path (implemented for `=` compares; the `@(alt)` inside a
   larger pattern still misses).

@@ -18819,7 +18819,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                         ]),
                     };
                     let mut body_stmts: Vec<Stmt> = vec![bind];
-                    body_stmts.extend(fl.body.iter().filter_map(stmt_to_estree));
+                    // Loop-var reads are bare identifiers (the callback
+                    // param): register in LIFTED_STRING so Var(name) renders
+                    // natively inside the body, then restore.
+                    {
+                        let mut ls = LIFTED_STRING.lock().unwrap();
+                        let mut had = ls.take();
+                        if let Some(ref mut s) = had { s.insert(fl.var.clone()); }
+                        body_stmts.extend(fl.body.iter().filter_map(stmt_to_estree));
+                        *ls = had;
+                    }
                     let cb = Expr::ArrowFunctionExpression {
                         params: vec![var],
                         body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
@@ -33915,22 +33924,78 @@ fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
         "FieldExtract" => {
             let text = children.get(0)?;
             let node = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()?;
-            let idx = node.fields.first().and_then(|f| match f {
-                crate::ir::FieldRange::Single(i) => Some((i - 1) as i64),
-                _ => None,
-            })?;
-            let split = crate::estree::method_call(expr_to_estree(text), "split", vec![crate::estree::str_lit(&node.delimiter)]);
-            Some(Expr::MemberExpression {
-                object: Box::new(split),
-                property: Box::new(crate::estree::Expr::Literal { value: serde_json::json!(idx), raw: None, regex: None }),
-                computed: true,
-                optional: false,
+            // bash cut semantics, verified:
+            //   printf 'a:b:c\nd:e\nf\n' | cut -d: -f2-3  → b:c / e / f
+            //   …                | cut -d: -f1,3           → a:c / d / f
+            //   …                | cut -d: -f3,1           → a:c (order
+            //      normalized ascending)
+            //   a line WITHOUT the delimiter passes through WHOLE (unless
+            //   -s, which drops it — value position: ""). Missing trailing
+            //   fields contribute nothing ("d:e" -f1,3 → "d", NOT "d:").
+            // Composition: (t.includes(D)
+            //    ? t.split(D).filter((_, i) => [ids…].includes(i)).join(D)
+            //    : (suppress ? "" : t))
+            let mut ids: Vec<i64> = Vec::new();
+            for f in &node.fields {
+                match f {
+                    crate::ir::FieldRange::Single(i) => ids.push(*i as i64 - 1),
+                    crate::ir::FieldRange::Range { start, end } => {
+                        let lo = *start as i64;
+                        let hi = *end as i64;
+                        if hi - lo > 4096 { return None; } // absurd spec — fallback
+                        let mut i = lo - 1;
+                        while i <= hi - 1 { ids.push(i); i += 1; }
+                    }
+                }
+            }
+            ids.retain(|&i| i >= 0);
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.is_empty() { return None; }
+            let lit_ids = crate::estree::Expr::ArrayExpression {
+                elements: ids.iter().map(|i| Some(crate::estree::int_lit_expr(*i))).collect(),
+            };
+            let i_ident = crate::estree::ident("i");
+            let filt = Expr::ArrowFunctionExpression {
+                params: vec![crate::estree::ident("_"), i_ident.clone()],
+                body: ArrowBody::Expr(Box::new(crate::estree::method_call(
+                    lit_ids, "includes", vec![Expr::Identifier { name: "i".to_string() }]))),
+                expression: true, r#async: false,
+            };
+            let picked = crate::estree::method_call(
+                crate::estree::method_call(
+                    crate::estree::method_call(expr_to_estree(text), "split", vec![crate::estree::str_lit(&node.delimiter)]),
+                    "filter", vec![filt]),
+                "join", vec![crate::estree::str_lit(&node.delimiter)]);
+            let has_delim = crate::estree::method_call(expr_to_estree(text), "includes", vec![crate::estree::str_lit(&node.delimiter)]);
+            let bare = if node.suppress_no_delim {
+                crate::estree::str_lit("")
+            } else {
+                expr_to_estree(text)
+            };
+            Some(Expr::ConditionalExpression {
+                test: Box::new(has_delim),
+                consequent: Box::new(picked),
+                alternate: Box::new(bare),
             })
         }
         "TakeLines" => {
             let text = children.get(0)?;
             let count = children.get(1)?;
             let node = n.as_any().downcast_ref::<crate::shir_nodes::TakeLines>()?;
+            if node.bytes {
+                // head/tail -c count BYTES, not lines: a plain substring of
+                // the in-memory text (ASCII-exact; bash counts raw bytes).
+                let sliced = if node.from_end {
+                    crate::estree::method_call(expr_to_estree(text), "slice", vec![Expr::UnaryExpression {
+                        operator: "-".to_string(), prefix: true,
+                        argument: Box::new(expr_to_estree(count)),
+                    }])
+                } else {
+                    crate::estree::method_call(expr_to_estree(text), "slice", vec![crate::estree::int_lit_expr(0), expr_to_estree(count)])
+                };
+                return Some(sliced);
+            }
             let lines = crate::estree::method_call(expr_to_estree(text), "split", vec![crate::estree::str_lit("\n")]);
             let sliced = if node.from_end {
                 crate::estree::method_call(lines, "slice", vec![Expr::UnaryExpression {
@@ -33979,10 +34044,30 @@ fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
                 let mapf = Expr::ArrowFunctionExpression {
                     params: vec![c.clone()], body: ArrowBody::Expr(Box::new(cond)), expression: true, r#async: false,
                 };
-                let mapped = crate::estree::method_call(
-                    crate::estree::method_call(t, "split", vec![crate::estree::str_lit("")]),
-                    "map", vec![mapf]);
-                Some(crate::estree::method_call(mapped, "join", vec![crate::estree::str_lit("")]))
+                let mut out = if node.to.is_empty() {
+                    // `tr -s SET` with NO SET2 (or a bare squeeze): the
+                    // translate is an identity — squeeze operates on the
+                    // SET chars themselves.
+                    t
+                } else {
+                    let mapped = crate::estree::method_call(
+                        crate::estree::method_call(t, "split", vec![crate::estree::str_lit("")]),
+                        "map", vec![mapf]);
+                    crate::estree::method_call(mapped, "join", vec![crate::estree::str_lit("")])
+                };
+                if node.squeeze {
+                    // bash `tr -s`: every RUN of an output-set char collapses
+                    // to ONE copy ("  spaced  " -> " spaced "), NOT removal —
+                    // replace(/c+/g, "c") per output-set char.
+                    let sq_chars = if node.to.is_empty() { &node.from } else { &node.to };
+                    for ch in sq_chars.chars() {
+                        out = crate::estree::method_call(out, "replace", vec![
+                            crate::estree::regex_lit_flags(&format!("{}+", regex_escape_lit(ch)), "g"),
+                            crate::estree::str_lit(&ch.to_string()),
+                        ]);
+                    }
+                }
+                Some(out)
             }
         }
         "PathName" => {

@@ -143,14 +143,38 @@ bash** at statement level:
 | `head -n K F` | ForEachLine(F, Output(l), limit=K) — early-exit streaming head | ✅ |
 | `grep -c P F` | ForEachLine(F, guarded n+=1) → count | ✅ |
 | `printf 'X%.0s' ARGS…` | RepeatStr("X", static-count incl. brace ranges) | ✅ |
+| `x=$(echo X \| cut/tr/wc/sed …)` | capture-assign → value composition + SetChildError(0); grep excluded (status idiom) | ✅ |
+| `echo "$v" \| cut/tr/sed/wc/head/tail` | variable-source pipelines (single getVar/interpolated echo arg) reduce natively | ✅ |
+| `grep P F \| cut flags` / `cat F \| cut flags` | ForEachLine(F, if Contains(l,P) then Output(FieldExtract)) — ALL cut args passed (glued-flag filter used to drop ':','2') | ✅ |
+| `head/tail -c N` on static text | folds to the EXACT byte substring (already_nl=true — never re-append) | ✅ |
+| `tr -s SET` | squeeze = run collapse to ONE char (`replace(/c+/g,"c")`), identity translate when SET2 empty; `-d -s` and range squeeze sets refuse → runtime | ✅ |
+| `cut -dD -fN-M` / `-fN,M` | FieldExtract ranges: split + ascending index pick, no-delim line passes whole, missing trailing fields dropped — native in estree/java/perl | ✅ |
 
-**Scope boundary:** reductions fire at **statement level only** (`emit=true`).
-Inside a `$(...)` capture the body must remain the original COMMAND (to
-produce stdout the capture collects) — reducing it to a bare value breaks
-the capture. So capture-internal constructs fall back to `sh2.*` / the
-original command (correct, just not reduced). This is the documented
-"anything the core cannot reduce falls back" rule.
+**Newline-exactness rule (as-built):** the stage-1 extractor records whether
+bash's source output ends with a terminal newline (echo: always; printf:
+last literal; bare literals: their own text). Line-oriented ops pass that
+through so the Output wrapper re-appends ONLY an echo-stripped newline; wc
+always prints its own terminating newline; byte-takes fold to exact bytes
+and never append.
+
+**Backend renderings of ForEachLine (all O(1) memory, zero fork/exec):**
+
+| Backend | rendering | verified |
+|---|---|---|
+| js/estree | `sh2.eachLine(src, (l) => {…}, limit?)` — readline over createReadStream in the runtime | ✅ byte-exact vs bash |
+| perl | `open my $fh,'<',src or die; while (my $l = <$fh>) { chomp $l; … } close $fh;` — fresh per-loop handle, loop vars never scalar-hoisted | ✅ byte-exact vs bash |
+| java | `try (BufferedReader __r = new BufferedReader(new FileReader(src))) { String l; while ((l = __r.readLine()) != null) { … } }` (+ counter break for limit) | ✅ compiled + run, byte-exact vs bash |
+| zig | `openFile` + `takeDelimiter('\n')` reader loop (capture→loop-var bind; counter break for limit) + sh2* primitive helpers (Contains/Sub/Case/ReplaceLit-literal/Fields/TakeLines/Basename/Dirname/TrimSides); regex patterns refuse → runtime | ✅ compiled + run, byte-exact vs bash |
+
+**Scope boundary (updated):** capture-internal reduction NO LONGER falls
+back wholesale — `try_reduce_capture_assign` reduces the ASSIGN's
+expression (`x=$(echo X | cut/tr/wc/sed …)` → value composition +
+`SetChildError(0)`), preserving the trailing-newline strip and `$?`. grep
+stays excluded from captures by design (status idiom, not a value idiom).
+Dynamic-source pipelines reduce to ForEachLine streaming compositions;
+anything the core cannot reduce falls back explicitly to the runtime
+(`sh2.fieldExtract`, `sh2.pipelineSync`, …) — never an eager slurp.
 
 **Not yet reduced (fall back to original):** `tail F` (cannot stream), `sort`/`uniq`, `seq | head`,
 `awk`, `[[ $x == P* ]]` (test-string parsing), multi-stage pipelines with a
-dynamic (file/grep) source.
+dynamic source beyond the two-stage grep/cat forms above.

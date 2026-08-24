@@ -5016,6 +5016,26 @@ fn parse_brace_expansion(lexer: &mut Lexer) -> Result<Word, ParserError> {
     // Flush any remaining accumulated text
     flush_acc(&mut items, &mut acc);
 
+    // bash: a RANGE is only expanded when it is the ENTIRE brace content
+    // (`{1..5}` → 1..5). A brace with a top-level comma (`{1..3,7..9}`)
+    // expands as ALTERNATION OF LITERALS — each part stays the literal
+    // text `1..3` / `7..9` (bash prints "1..3 7..9", never 1 2 3 7 8 9).
+    if items.len() > 1 {
+        items = items
+            .into_iter()
+            .map(|it| match it {
+                BraceItem::Range(r) => {
+                    let mut text = format!("{}..{}", r.start, r.end);
+                    if let Some(st) = r.step {
+                        text.push_str(&format!("..{st}"));
+                    }
+                    BraceItem::Literal(text)
+                }
+                other => other,
+            })
+            .collect();
+    }
+
     Ok(Word::BraceExpansion(
         BraceExpansion {
             prefix: None,
