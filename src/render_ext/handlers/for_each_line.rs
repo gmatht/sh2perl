@@ -17,7 +17,7 @@ pub(crate) fn render(ctx: &mut RenderCtx, n: &ForEachLine) -> bool {
     let path = ir_expr_to_perl(&n.source);
     // A dedicated lexical handle per loop keeps nesting safe.
     ctx.out.push_str(&format!(
-        "open my $_fl_fh{k}, '<', {}; unless (defined $_fl_fh{k}) {{ $! = 1; die \"open failed\\n\"; }}\n",
+        "open my $_fl_fh{k}, '<', {}; unless (defined $_fl_fh{k}) {{ $! = 1; croak \"open failed\\n\"; }}\n",
         path
     ));
     for _ in 0..indent { ctx.out.push_str("    "); }
