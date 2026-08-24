@@ -3470,6 +3470,35 @@ impl Render {
     /// let / control-flow calls, then `_ = expr` fallback.
     fn stmt_expr(&mut self, e: &IrExpr) {
         match e {
+            // setVar(name, value) — the frontend-emitted store write: a
+            // native typed assignment (dotted struct names sanitize to
+            // go identifiers; reads route through the same ident_of)
+            IrExpr::Call { func, args } if func == "setVar" => {
+                if let (Some(IrExpr::Str(name, _)), Some(value)) =
+                    (args.first(), args.get(1))
+                {
+                    self.mark_written(name);
+                    let m = self.go_ident(name);
+                    let rhs = if self.is_num(name) {
+                        self.expr_num(value)
+                    } else if self.is_str(name) {
+                        self.expr_str(value)
+                    } else {
+                        self.expr_any(value)
+                    };
+                    self.flush_sides();
+                    let sync = self.sync_inline(name);
+                    self.emit(&format!("{m} = {rhs};{sync}"));
+                    return;
+                }
+                self.mark_todo("setVar");
+            }
+            IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
+                // user-function call in statement position
+                let v = self.expr_any(e);
+                self.flush_sides();
+                self.emit(&format!("_ = {v};"));
+            }
             IrExpr::Call { func, args } if func == "exec" => {
                 if let Some(IrExpr::Str(cmd, _)) = args.first() {
                     if self.exec_builtin_stmt(cmd, args) {
