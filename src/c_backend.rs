@@ -2322,8 +2322,12 @@ impl Render {
 
     /// Append a `[ ... ]` test to a command buffer.
     fn sh_test_text(&mut self, buf: CmdBuf, t: &str) {
+        let t = respace_test_text(t);
         match buf {
-            CmdBuf::Shared => self.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[ {t} ]")))),
+            CmdBuf::Shared => self.emit(&format!(
+                "_sh_addraw({});",
+                Self::cstr(&format!("[ {t} ]"))
+            )),
             CmdBuf::Private(id) => self.emit(&format!(
                 "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
                 Self::cstr(&format!(" [ {t} ]"))
@@ -4029,7 +4033,7 @@ impl Render {
     /// (flattened forms) or `[ <text> ]` (spaced forms) — the child bash
     /// runs the command substitutions itself.
     fn test_shell_site(&mut self, s: &str) -> String {
-        let s = s.to_string();
+        let s = respace_test_text(s).to_string();
         let flat = !s.contains(' ');
         // arrays the text indexes must be MATERIALIZED into the child
         // command (`[ "$n" -lt $(( a[1] + a[2] )) ]` — a lives C-side)
@@ -10228,4 +10232,71 @@ mod tests {
             NumSpec::Num("%lld", true)
         );
     }
+}
+
+/// The core flattens comparisons (`$x==y` — no spaces): as ONE word bash
+/// reads a 1-arg always-true test. Re-space ==/!=/=/<=/> OUTSIDE $()/${}
+/// substitutions ([[ ]] → [ ] transport).
+fn respace_test_text(t: &str) -> String {
+        let chars: Vec<char> = t.chars().collect();
+        let mut spaced = String::new();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i] == '$'
+                && i + 1 < chars.len()
+                && matches!(chars[i + 1], '(' | '{')
+            {
+                // copy the whole substitution verbatim
+                let open = chars[i + 1];
+                let close = if open == '(' { ')' } else { '}' };
+                spaced.push(chars[i]);
+                spaced.push(open);
+                let mut d = 1;
+                i += 2;
+                while i < chars.len() && d > 0 {
+                    spaced.push(chars[i]);
+                    if chars[i] == open {
+                        d += 1;
+                    } else if chars[i] == close {
+                        d -= 1;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            let two: String = chars[i..(i + 2).min(chars.len())].iter().collect();
+            if matches!(two.as_str(), "==" | "!=" | "<=" | ">=") {
+                if !spaced.ends_with(' ') && !spaced.is_empty() {
+                    spaced.push(' ');
+                }
+                spaced.push_str(&two);
+                i += 2;
+                if i < chars.len() && chars[i] != ' ' {
+                    spaced.push(' ');
+                }
+                continue;
+            }
+            if c_eq(&chars, i) {
+                if !spaced.ends_with(' ') && !spaced.is_empty() {
+                    spaced.push(' ');
+                }
+                spaced.push('=');
+                i += 1;
+                if i < chars.len() && chars[i] != ' ' {
+                    spaced.push(' ');
+                }
+                continue;
+            }
+            spaced.push(chars[i]);
+            i += 1;
+        }
+    spaced
+}
+
+/// Is the char at `i` a single `=` comparison (not `==`)?
+fn c_eq(chars: &[char], i: usize) -> bool {
+    chars[i] == '='
+        && i + 1 < chars.len()
+        && chars[i + 1] != '='
+        && (i == 0 || chars[i - 1] != '!' && chars[i - 1] != '<' && chars[i - 1] != '>' && chars[i - 1] != '=')
 }
