@@ -1667,10 +1667,7 @@ fn try_lower_grep_cut(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
     if !(f2 == "exec" || f2 == "builtin") { return None; }
     let [IrExpr::Str(n2, _), IrExpr::Array(ca)] = a2.as_slice() else { return None };
     if n2 != "cut" { return None; }
-    let flags: Vec<IrExpr> = ca.iter().filter(|x| matches!(x, IrExpr::Str(s, _) if s.starts_with('-'))).cloned().collect();
-    if flags.len() != ca.len() { return None; } // positional file in pipe stage = wrong shape
-
-    let field = try_lower_cut(loop_var_read("__l"), &flags)?;
+    let field = try_lower_cut(loop_var_read("__l"), ca)?;
     let cond = IrExpr::Ext(Box::new(StringContains {
         text: loop_var_read("__l"),
         pattern: pat,
@@ -1718,19 +1715,15 @@ fn try_lower_cat_pipe(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
         if f2 == "exec" || f2 == "builtin" {
             if let [IrExpr::Str(n2, _), IrExpr::Array(ca)] = a2.as_slice() {
                 if n2 == "cut" {
-                    let flags: Vec<IrExpr> = ca.iter().filter(|x| matches!(x,
-                        IrExpr::Str(s, _) if s.starts_with('-'))).cloned().collect();
-                    if flags.len() == ca.len() {
-                        if let Some(field) = try_lower_cut(loop_var_read("__l"), &flags) {
-                            return Some(IrStmt::Ext(Box::new(ForEachLine {
-                                source: path,
-                                var: "__l".to_string(),
-                                limit: None,
-                                body: vec![IrStmt::Output {
-                                    value: field, newline: true, target: None,
-                                }],
-                            })));
-                        }
+                    if let Some(field) = try_lower_cut(loop_var_read("__l"), ca) {
+                        return Some(IrStmt::Ext(Box::new(ForEachLine {
+                            source: path,
+                            var: "__l".to_string(),
+                            limit: None,
+                            body: vec![IrStmt::Output {
+                                value: field, newline: true, target: None,
+                            }],
+                        })));
                     }
                 }
             }
