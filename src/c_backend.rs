@@ -2706,9 +2706,58 @@ impl Render {
                     if let Some(cmd) = args.first() {
                         self.sh_word(buf, cmd);
                     }
-                    if let Some(IrExpr::Array(items)) = args.get(1) {
-                        for w in items {
-                            self.sh_word(buf, w);
+                    // `echo -e …` inside a TEXT stage: the words are
+                    // single-quoted so the CHILD prints raw backslashes —
+                    // interpret the escapes at RENDER time instead
+                    let mut skip_echo_e = false;
+                    if Self::str_arg(args, 0).as_deref() == Some("echo") {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if matches!(items.first(), Some(IrExpr::Str(f, _)) if f == "-e") {
+                                skip_echo_e = true;
+                                let lit_of = |w: &IrExpr| -> Option<String> {
+                                    match w {
+                                        IrExpr::Str(s, _) => Some(s.clone()),
+                                        IrExpr::Interpolate(parts) => {
+                                            let mut out = String::new();
+                                            for p in flatten_parts(parts) {
+                                                match p {
+                                                    InterpPart::Lit(l) => {
+                                                        out.push_str(&l)
+                                                    }
+                                                    _ => return None,
+                                                }
+                                            }
+                                            Some(out)
+                                        }
+                                        _ => None,
+                                    }
+                                };
+                                for w in items.iter().skip(1) {
+                                    if let Some(txt) = lit_of(w) {
+                                        let u = unescape_echo_e(&txt)
+                                            .unwrap_or_else(|| txt.clone());
+                                        match buf {
+                                            CmdBuf::Shared => self.emit(&format!(
+                                                "_sh_word({});",
+                                                Self::cstr(&u)
+                                            )),
+                                            CmdBuf::Private(id) => self.emit(&format!(
+                                                "_sh_bword(&_c{id}_cmd, &_c{id}_cap, {});",
+                                                Self::cstr(&u)
+                                            )),
+                                        }
+                                    } else {
+                                        self.sh_word(buf, w);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !skip_echo_e {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            for w in items {
+                                self.sh_word(buf, w);
+                            }
                         }
                     }
                 }
