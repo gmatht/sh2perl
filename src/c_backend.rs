@@ -3720,6 +3720,7 @@ impl Render {
                 if words.iter().all(|w| self.echo_native_ok(w)) {
                     let mut parts = Vec::new();
                     let mut skip_nl = false;
+                    let mut saw_e = false;
                     if let Some(IrExpr::Array(items)) = args.get(1) {
                         // consume the -n/-e/-E flags (bash echo builtin)
                         let mut items: Vec<&IrExpr> = items.iter().collect();
@@ -3727,7 +3728,10 @@ impl Render {
                             if fl == "-n" {
                                 skip_nl = true;
                                 items.remove(0);
-                            } else if fl == "-e" || fl == "-E" {
+                            } else if fl == "-e" {
+                                saw_e = true;
+                                items.remove(0);
+                            } else if fl == "-E" {
                                 items.remove(0);
                             } else {
                                 break;
@@ -3742,6 +3746,29 @@ impl Render {
                     }
                     if !skip_nl {
                         parts.push(Part::Lit("\n".to_string()));
+                    }
+                    // -e interprets backslash escapes in LITERAL text
+                    // (`\n=== Example 2` printed the raw "\n")
+                    if saw_e {
+                        let mut np: Vec<Part> = Vec::new();
+                        let mut stopped = false;
+                        for pt in parts {
+                            match pt {
+                                Part::Lit(t) => match unescape_echo_e(&t) {
+                                    Some(u) => np.push(Part::Lit(u)),
+                                    None => {
+                                        // \c — stop output, no newline
+                                        stopped = true;
+                                        break;
+                                    }
+                                },
+                                other => np.push(other),
+                            }
+                        }
+                        parts = np;
+                        if stopped {
+                            skip_nl = true;
+                        }
                     }
                     // `$?` inside the args must be read BEFORE the
                     // `_sh_rc = 0` below clobbers it — pre-capture
@@ -4021,6 +4048,27 @@ impl Render {
                 }
             }
             if let Some(ws) = Self::str_arg(&[(*words[i]).clone()], 0) {
+                // bare `export NAME` / `export arr` (no '='): sync the
+                // CURRENT value into the environment — children ($ENV in
+                // perl, _sh_export'd refs) must see it
+                if !ws.contains('=') && is_ident(&ws) {
+                    let id = self.c_ident(&ws);
+                    if self.is_num(&ws) {
+                        self.emit(&format!(
+                            "{{ char _b[32]; snprintf(_b, sizeof _b, \"%lld\", (long long)({id})); setenv(\"{ws}\", _b, 1); }}"
+                        ));
+                    } else if self.arrays.contains(&ws) || self.assoc_arrays.contains(&ws) {
+                        // arrays cannot cross exec — skip
+                    } else {
+                        let v = self.store_read(&ws);
+                        self.emit(&format!(
+                            "setenv({}, {v} ? {v} : \"\", 1);",
+                            Self::cstr(&ws)
+                        ));
+                    }
+                    i += 1;
+                    continue;
+                }
                 if let Some((name, val)) = ws.split_once('=') {
                     if !name.is_empty()
                         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -9580,6 +9628,41 @@ fn collect_vars_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
 /// The core wraps unquoted glob patterns in a `\x01SH2GLOB\x01` marker
 /// (shir.rs GLOB_MAGIC) to distinguish literal text from a glob; the C
 /// renderer strips it before emitting the pattern anywhere.
+/// bash `echo -e` backslash-escape interpretation. None = `\c`
+/// (stop output entirely).
+fn unescape_echo_e(s: &str) -> Option<String> {
+    let ch: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < ch.len() {
+        if ch[i] == '\\' && i + 1 < ch.len() {
+            match ch[i + 1] {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                'a' => out.push('\x07'),
+                'b' => out.push('\x08'),
+                'f' => out.push('\x0c'),
+                'v' => out.push('\x0b'),
+                '\\' => out.push('\\'),
+                '\'' => out.push('\''),
+                '"' => out.push('"'),
+                'c' => return None,
+                other => {
+                    // unknown escape: keep both characters
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+            i += 2;
+            continue;
+        }
+        out.push(ch[i]);
+        i += 1;
+    }
+    Some(out)
+}
+
 fn strip_glob(s: &str) -> &str {
     s.strip_prefix("\u{1}SH2GLOB\u{1}").unwrap_or(s)
 }
