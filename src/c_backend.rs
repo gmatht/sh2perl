@@ -5022,7 +5022,11 @@ impl Render {
         } else if name.starts_with('$') || name.chars().all(|c| c.is_ascii_digit()) {
             // positional $N — the function-call argv (empty at top level)
             self.need_sh = true;
-            format!("(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")")
+            format!("(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\"")
+        } else if self.arrays.contains(&name) {
+            // bare `${arr}` = element 0 (param ops fall through here too)
+            let id = self.c_ident(&name);
+            format!("(({id}_len > 0 && {id}[0]) ? {id}[0] : \"\")")
         } else if self.store.contains(&name) {
             self.store_ref(&name)
         } else {
