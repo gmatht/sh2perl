@@ -226,6 +226,10 @@ pub struct Render {
     /// buffer (`NAME=` + value = one word) — consumed by the next
     /// word-append
     glue_next_word: bool,
+    /// NATIVE statements deferred to AFTER the enclosing site's
+    /// system() call — a native mapfile reading a FIFO must run once the
+    /// child (which spawns the FIFO writer) has started, not before it
+    pending_native_stmts: Vec<IrStmt>,
     /// emitted shell-out site helper bodies (`static int _sh_site_N(void) {...}`)
     site_bodies: Vec<String>,
     /// emitted capture helper bodies (`static char *_cap_N(void) {...}`)
@@ -2037,13 +2041,36 @@ impl Render {
         // the C-truthiness (chains/ifs/whiles all use this convention)
         let _ = invert;
         let ret = "  return !_sh_system_rc();";
+        // deferred NATIVE statements (mapfile-from-FIFO etc.) run AFTER
+        // system(): the child may be what unblocks them (a FIFO writer)
+        let mut native_lines: Vec<String> = Vec::new();
+        let natives: Vec<IrStmt> = std::mem::take(&mut self.pending_native_stmts);
+        if !natives.is_empty() {
+            let saved = std::mem::take(&mut self.out);
+            let saved_depth = self.depth;
+            self.depth = 1;
+            for st in &natives {
+                self.stmt(st);
+            }
+            self.depth = saved_depth;
+            native_lines = std::mem::replace(&mut self.out, saved);
+        }
         let mut s = format!("static int _sh_site_{id}(void) {{\n");
         for line in body_out {
             s.push_str(&line);
             s.push('\n');
         }
-        s.push_str(ret);
-        s.push_str("\n}");
+        if !native_lines.is_empty() {
+            s.push_str("  int _site_rc = _sh_system_rc();\n");
+            for line in native_lines {
+                s.push_str(&line);
+                s.push('\n');
+            }
+            s.push_str("  return !_site_rc;\n}");
+        } else {
+            s.push_str(ret);
+            s.push_str("\n}");
+        }
         self.site_bodies.push(s);
         self.site_ids.push(id);
         format!("_sh_site_{id}()")
@@ -2859,13 +2886,16 @@ impl Render {
                                         "_sh_addraw({});",
                                         Self::cstr(&format!("{}=", t.var))
                                     ));
+                                    // GLUE: NAME= + value is ONE word
+                                    // (`__ps_tmp0= '/tmp/…'` made bash run
+                                    // the path as a COMMAND)
                                     let v = format!("({id} ? {id} : \"\")");
                                     match buf {
                                         CmdBuf::Shared => {
-                                            self.emit(&format!("_sh_word({v});"))
+                                            self.emit(&format!("_sh_add({v});"))
                                         }
                                         CmdBuf::Private(bid) => self.emit(&format!(
-                                            "_sh_bword(&_c{bid}_cmd, &_c{bid}_cap, {v});"
+                                            "_sh_badd(&_c{bid}_cmd, &_c{bid}_cap, {v});"
                                         )),
                                     }
                                     continue;
@@ -6000,15 +6030,29 @@ impl Render {
             },
             "capture" | "captureWords" => self.capture_call(args),
             "and" | "or" => {
-                // `A && B` / `A || B` — run each Arrow as a shell site
+                // `A && B` / `A || B` — run each Arrow as a shell site.
+                // A side containing a NATIVE statement (mapfile from file)
+                // must route it through stmt(): as child text the array
+                // assignment would be lost
                 let mut parts: Vec<String> = Vec::new();
                 for a in args {
                     if let IrExpr::Arrow(stmts) = a {
                         let stmts = stmts.clone();
+                        let natives: Vec<IrStmt> = stmts
+                            .iter()
+                            .filter(|st| is_mapfile_redirect(st))
+                            .cloned()
+                            .collect();
+                        let text: Vec<IrStmt> = stmts
+                            .iter()
+                            .filter(|st| !is_mapfile_redirect(st))
+                            .cloned()
+                            .collect();
+                        self.pending_native_stmts.extend(natives);
                         let s = self.shell_site(
-                            |r| {
+                            move |r| {
                                 r.emit("_sh_reset();");
-                                r.sh_stage(CmdBuf::Shared, &stmts);
+                                r.sh_stage(CmdBuf::Shared, &text);
                             },
                             false,
                         );
@@ -7190,6 +7234,43 @@ impl Render {
     }
 
     fn stmt(&mut self, s: &IrStmt) {
+        // `mapfile -t NAME < FILE` / `readarray …`: run NATIVELY — reading
+        // the lines in a child loses the array (bash arrays cannot cross
+        // exec), which broke every `< <(producer)` mapfile use
+        if let IrStmt::Redirect { inner, redirects } = s {
+            if is_mapfile_redirect(s) && redirects.len() == 1 {
+                if let (Some(items), Some(crate::ir::IrRedirect { target, .. })) = (
+                    inner_first_words(inner),
+                    redirects.first(),
+                ) {
+                    let mut striptail = true;
+                    let mut name: Option<String> = None;
+                    for w in items.iter() {
+                        match w {
+                            IrExpr::Str(f, _) if f.starts_with('-') => {
+                                if f != "-t" {
+                                    striptail = false;
+                                }
+                            }
+                            IrExpr::Str(n, _) => {
+                                name = Some(n.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(name) = name {
+                        self.arrays.insert(name.clone());
+                        let id = self.c_ident(&name);
+                        let t = self.value_c(target);
+                        let strip = if striptail { "1" } else { "0" };
+                        self.emit(&format!(
+                            "{{ FILE *_mf = fopen({t}, \"r\"); if (_mf) {{ static char _mfl[65536]; while (fgets(_mfl, sizeof _mfl, _mf)) {{ size_t _mn = strlen(_mfl); if ({strip}) {{ while (_mn && (_mfl[_mn-1]=='\\n'||_mfl[_mn-1]=='\\r')) _mfl[--_mn]=0; }} if ({id}_len < {ARR_CAP}) {id}[{id}_len++] = strdup(_mfl); }} fclose(_mf); }} }}"
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
         // `A || continue` / `A && break` (also exit): a flow statement
         // inside an and/or chain cannot live in a shell site (the site
         // rendered `|| 1` and NEVER continued). Peel it: evaluate the
@@ -10361,6 +10442,27 @@ fn is_printf_v_call(args: &[IrExpr]) -> bool {
         )
 }
 
+
+/// A Redirect whose inner command is `mapfile`/`readarray` reading stdin
+/// from a FILE — renderable natively (arrays cannot cross exec).
+fn is_mapfile_redirect(s: &IrStmt) -> bool {
+    match s {
+        IrStmt::Redirect { inner, redirects } => {
+            let is_mapfile = matches!(
+                inner.first(),
+                Some(IrStmt::Expr(IrExpr::Call { func, args }))
+                    if (func == "exec" || func == "builtin")
+                        && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "mapfile" || c == "readarray")
+            );
+            is_mapfile
+                && redirects.len() == 1
+                && redirects[0].fd == Some(0)
+                && redirects[0].mode == "r"
+        }
+        _ => false,
+    }
+}
+
 pub struct Self3;
 impl Self3 {
     fn str_is(args: &[IrExpr], i: usize, want: &str) -> bool {
@@ -10371,6 +10473,22 @@ impl Self3 {
             IrExpr::Str(s, _) => Some(s.clone()),
             _ => None,
         }
+    }
+}
+
+
+/// The word list of an exec/builtin Call statement's args (`[cmd, Array]`).
+fn inner_first_words(inner: &[IrStmt]) -> Option<&Vec<IrExpr>> {
+    match inner.first() {
+        Some(IrStmt::Expr(IrExpr::Call { func, args }))
+            if func == "exec" || func == "builtin" =>
+        {
+            match args.get(1) {
+                Some(IrExpr::Array(items)) => Some(items),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
