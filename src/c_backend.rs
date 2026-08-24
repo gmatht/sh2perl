@@ -682,16 +682,28 @@ impl Render {
             self.emit("  }");
             self.emit("  d[dn] = 0; return d;");
             self.emit("}");
-            self.emit("/* wrap the built command as `bash -c '<cmd>'` (single-quote escaped) */");
+            self.emit("/* wrap the built command as `bash -c '<cmd>' <args…>` (single-quote escaped, current positionals appended) */");
             self.emit("static void _sh_wrap_cmd(const char *cmd) {");
             self.emit("  size_t n = strlen(cmd), need = n * 2 + 16;");
+            self.emit("  for (int i = 0; i < _sh_argc; i++) need += (_sh_argv[i] ? strlen(_sh_argv[i]) : 0) * 6 + 4;");
             self.emit("  _sh_grow(&_sh_wrap, &_sh_wrapcap, need);");
             self.emit("  char *p = _sh_wrap; strcpy(p, \"bash -c '\"); p += 9;");
             self.emit("  for (const char *c = cmd; *c; c++) {");
-            self.emit("    if (*c == '\\'') { memcpy(p, \"'\\\"'\\\"'\", 5); p += 5; }");
+            self.emit("if (*c == '\\'') { memcpy(p, \"'\\\"'\\\"'\", 5); p += 5; }");
             self.emit("    else *p++ = *c;");
             self.emit("  }");
-            self.emit("  *p++ = '\\''; *p = 0;");
+            // pass the CURRENT positionals to the child ("$@" / $1 inside
+            // command substitutions and sites must see the enclosing
+            // function's parameters â bash subshell semantics)
+            self.emit("  for (int i = 0; i < _sh_argc; i++) {");
+            self.emit("    if (!_sh_argv[i]) continue;");
+            self.emit("*p++ = ' '; *p++ = '\\'';");
+            self.emit("    for (const char *a = _sh_argv[i]; *a; a++) {");
+            self.emit("if (*a == '\\'') { memcpy(p, \"'\\\"'\\\"'\", 5); p += 5; }");
+            self.emit("      else *p++ = *a;");
+            self.emit("    }");
+            self.emit("*p++ = '\\'';");
+            self.emit("  }");
             self.emit("}");
             self.emit("static int _sh_system_rc(void) {");
             self.emit("  _sh_wrap_cmd(_sh_cmd ? _sh_cmd : \"\");");
