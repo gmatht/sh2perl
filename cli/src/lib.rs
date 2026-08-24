@@ -1031,6 +1031,7 @@ exit $main_exit_code;
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
+            debashl::transforms::ternary_desugar::transform_program(&mut prog);
             print!("{}", debashl::ir::shir_to_perl(&prog));
         }
         "--shir-in-sh" => {
@@ -1056,6 +1057,9 @@ exit $main_exit_code;
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
+            // C frontend's ternary call → backend-neutral Ternary + test-call
+            // (the estree arm keeps its native ternary lowering — byte-pinned)
+            debashl::transforms::ternary_desugar::transform_program(&mut prog);
             print!("{}", match debashl::sh_backend::shir_to_sh(&prog) {
                 Ok(s) => s,
                 Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
@@ -1090,6 +1094,9 @@ exit $main_exit_code;
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
+            // C frontend's ternary call → backend-neutral Ternary + test-call
+            // (the estree arm keeps its native ternary lowering — byte-pinned)
+            debashl::transforms::ternary_desugar::transform_program(&mut prog);
             debashl::shir_passes::optimize::optimize(&mut prog);
             let out = match args[1].as_str() {
                 "--shir-in-c" => Ok(debashl::c_backend::shir_to_c(&prog)),

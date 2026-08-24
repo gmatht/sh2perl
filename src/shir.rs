@@ -4644,6 +4644,11 @@ use std::collections::{HashMap, HashSet};
                 walk_expr(lhs, acc, multi_run);
                 walk_expr(rhs, acc, multi_run);
             }
+            IrExpr::Ext(n) => {
+                for c in n.children() {
+                    walk_expr(c, acc, multi_run);
+                }
+            }
             IrExpr::Index { key, .. } | IrExpr::Capture { expr: key, .. } => {
                 walk_expr(key, acc, multi_run);
             }
@@ -8216,6 +8221,7 @@ fn is_safe_grep_literal(pat: &str) -> bool {
 fn command_to_ir(cmd: &Command) -> IrExpr {
     match cmd {
         Command::TestExpression(t) => {
+            eprintln!("DBG command_to_ir TestExpression expr={:?}", t.expression);
             if t.modifiers.double {
                 call("test", vec![st(&t.expression), st("[[")])
             } else {
@@ -13266,6 +13272,14 @@ pub(crate) fn numeric_lift_vars(prog: &IrProgram) -> HashSet<String> {
                 }
             }
             IrExpr::Capture { expr, .. } => walk_expr(expr, excluded, string_ctx, in_copy),
+            IrExpr::Ext(n) => {
+                // transform-declared nodes: descend into child expressions
+                // (a read hidden inside an Ext node must keep its var
+                // store-bound — see the lift_walk_expr Ext arm).
+                for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                    walk_expr(c, excluded, string_ctx, in_copy);
+                }
+            }
             IrExpr::Array(elems) => {
                 for el in elems {
                     walk_expr(el, excluded, string_ctx, in_copy);
@@ -16284,6 +16298,16 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                             return Some(Stmt::ExpressionStatement { expression: dead });
                         }
                     }
+                    // status_exec marker (shir-native-stmt's
+                    // `exec("true"/"false", [])`): a PURE lastExit writer.
+                    // When the write is dead (never read) the marker has no
+                    // observable effect — drop the whole statement instead of
+                    // emitting a full `sh2.exec` call with an unread write.
+                    if let [IrExpr::Str(n, _), IrExpr::Array(items)] = args.as_slice() {
+                        if matches!(n.as_str(), "true" | "false") && items.is_empty() {
+                            return None;
+                        }
+                    }
                 }
             }
             // Per-function `local` native lift: a statement-position
@@ -16587,6 +16611,13 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     IrExpr::Call { func, args } if func == "line" => {
                         expr_to_estree(expr)
                     }
+                    // `n = n + 1` — lifted numeric self-add (ForEachLine
+                    // streaming counter): native binding arithmetic.
+                    IrExpr::BinOp { lhs, op: BinOpKind::Add, rhs } => Expr::BinaryExpression {
+                        operator: "+".to_string(),
+                        left: Box::new(expr_to_estree(lhs)),
+                        right: Box::new(expr_to_estree(rhs)),
+                    },
                     _ => unreachable!("lifted var assigned an unanalysed source"),
                 };
                 return Some(Stmt::ExpressionStatement {
@@ -18769,10 +18800,61 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
             unreachable!("RawText (Perl-only) reached the ESTree renderer")
         }
         IrStmt::Ext(node) => {
-            // Extensible node: dispatch to the ESTree handler (if any).
-            // Currently unsupported — refuse loudly.
-            unreachable!("Ext node ({}) reached the ESTree renderer without a handler",
-                node.tag())
+            // Statement-level Ext nodes with ESTree renderings. ForEachLine
+            // lowers to the runtime's STREAMING line iterator:
+            //   sh2.eachLine(<source>, (<var>) => { <body> })
+            // (readline over createReadStream inside the runtime — O(1)
+            // memory, never a whole-file read).
+            return match node.tag() {
+                "ForEachLine" => {
+                    let fl = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>()
+                        .expect("tag/type agree");
+                    let var = crate::estree::ident(&fl.var);
+                    // Bind the JS param into the runtime store: composed
+                    // bodies read the line via getVar (the param('',name)
+                    // read form), so the value must BE in the store.
+                    let bind = Stmt::ExpressionStatement {
+                        expression: crate::estree::sh2_call("setVar", vec![
+                            crate::estree::str_lit(&fl.var), var.clone(),
+                        ]),
+                    };
+                    let mut body_stmts: Vec<Stmt> = vec![bind];
+                    // Loop-var reads are bare identifiers (the callback
+                    // param): register in LIFTED_STRING so Var(name) renders
+                    // natively inside the body, then restore.
+                    {
+                        let mut ls = LIFTED_STRING.lock().unwrap();
+                        let mut had = ls.take();
+                        if let Some(ref mut s) = had { s.insert(fl.var.clone()); }
+                        body_stmts.extend(fl.body.iter().filter_map(stmt_to_estree));
+                        *ls = had;
+                    }
+                    let cb = Expr::ArrowFunctionExpression {
+                        params: vec![var],
+                        body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
+                            body: body_stmts,
+                        })),
+                        expression: false,
+                        r#async: false,
+                    };
+                    // limit? → third arg: the runtime closes the reader
+                    // after that many lines (streaming head, O(K) memory).
+                    let mut call_args = vec![expr_to_estree(&fl.source), cb];
+                    if let Some(lim) = &fl.limit {
+                        call_args.push(expr_to_estree(lim));
+                    }
+                    // AWAITED: bash pipelines are synchronous; without the
+                    // await, later statements (e.g. printing the counter)
+                    // run before any line arrives.
+                    Some(Stmt::ExpressionStatement {
+                        expression: Expr::AwaitExpression {
+                            argument: Box::new(crate::estree::sh2_call("eachLine", call_args)),
+                        },
+                    })
+                }
+                other => unreachable!(
+                    "Ext statement node ({other}) reached the ESTree renderer without a handler"),
+            };
         }
 
         other => unreachable!("Perl-only IR statement reached the ESTree renderer: {other:?}"),
@@ -28598,6 +28680,11 @@ fn lift_mark_all_idents_args(e: &IrExpr, out: &mut HashSet<String>) {
                 lift_mark_all_idents_args(v, out);
             }
         }
+        IrExpr::Ext(n) => {
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                lift_mark_all_idents_args(c, out);
+            }
+        }
         _ => {}
     }
 }
@@ -28614,6 +28701,11 @@ fn lift_mark_str_args(e: &IrExpr, string_ctx: &mut HashSet<String>) {
                 lift_mark_str_args(v, string_ctx);
             }
         }
+        IrExpr::Ext(n) => {
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                lift_mark_str_args(c, string_ctx);
+            }
+        }
         _ => {}
     }
 }
@@ -28622,6 +28714,11 @@ fn lift_mark_write_builtin_vars(e: &IrExpr, excluded: &mut HashSet<String>) {
         IrExpr::Array(elems) => {
             for el in elems {
                 lift_mark_write_builtin_vars(el, excluded);
+            }
+        }
+        IrExpr::Ext(n) => {
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                lift_mark_write_builtin_vars(c, excluded);
             }
         }
         IrExpr::Str(sv, _) => {
@@ -28645,6 +28742,17 @@ fn lift_walk_expr(
             // excluded: the renderer injects lifted values into them,
             // so a lifted var may appear inside them.
             let let_args_native = func == "exec" && arith_let_args_native(args);
+            // pointer indirection (&x / *x): the named slot MUST stay
+            // store-bound — derefGet/derefSet resolve through getVar/
+            // setVar at runtime, which read the STORE (a lifted native
+            // binding would desync the alias)
+            if matches!(func.as_str(), "addrVar" | "derefGet" | "derefSet") {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if lift_is_ident(n) && !n.starts_with('#') {
+                        excluded.insert(n.clone());
+                    }
+                }
+            }
             // `arith` texts are handled by the arith block below (the
             // native-lowerable ones are exempt from ALL store marks).
             if func != "getVar"
@@ -28881,6 +28989,16 @@ fn lift_walk_expr(
             }
         }
         IrExpr::Capture { expr, .. } => lift_walk_expr(expr, excluded, string_ctx, in_copy),
+        IrExpr::Ext(n) => {
+            // transform-declared nodes: descend into their child
+            // expressions so reads hidden inside an Ext node keep the
+            // host var OUT of the native-lift candidate set (a lifted
+            // var has no store entry — a getVar inside an opaque node
+            // would read "" and silently corrupt the program).
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                lift_walk_expr(c, excluded, string_ctx, in_copy);
+            }
+        }
         IrExpr::Array(elems) => {
             for el in elems {
                 lift_walk_expr(el, excluded, string_ctx, in_copy);
@@ -29211,6 +29329,10 @@ fn lift_expr_mentions(e: &IrExpr, name: &str) -> bool {
                     | "arraySlice"
                     | "setArray"
                     | "setArrayAppend"
+                    | "addrVar"
+                    | "derefGet"
+                    | "derefSet"
+                    | "appendTo"
             ) {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     if n == name {
@@ -29262,6 +29384,9 @@ fn lift_expr_mentions(e: &IrExpr, name: &str) -> bool {
             lift_expr_mentions(expr, name) || lift_expr_mentions(default, name)
         }
         IrExpr::Capture { expr, .. } => lift_expr_mentions(expr, name),
+        IrExpr::Ext(n) => crate::shir_nodes::ExtExpr::children(&**n)
+            .into_iter()
+            .any(|c| lift_expr_mentions(c, name)),
         _ => false,
     }
 }
@@ -31486,7 +31611,15 @@ fn expr_known_nospace(e: &IrExpr) -> bool {
     }
 }
 
+/// Public wrapper for the drop-in handler modules (render_ext_estree/*):
+/// they lower child IrExprs through the SAME ESTree renderer the core
+/// uses, so native node handlers compose with every core expression form.
+pub(crate) fn expr_to_estree_pub(e: &IrExpr) -> Expr {
+    expr_to_estree(e)
+}
+
 fn expr_to_estree(e: &IrExpr) -> Expr {
+
     match e {
         IrExpr::Int(i) => Expr::Literal {
             value: serde_json::Value::from(*i),
@@ -31529,6 +31662,20 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         IrExpr::Splice(e) => Expr::SpreadElement {
             argument: Box::new(expr_to_estree(e)),
         },
+        IrExpr::Ext(n) => {
+            // Drop-in ESTree handler registry first (build.rs-scanned
+            // src/render_ext_estree/handlers/ — new nodes render natively
+            // with zero core edits), then the hand-written table.
+            if let Some(native) = crate::render_ext_estree::render(n.as_ref()) {
+                return native;
+            }
+            // Native ESTree rendering (real JS: .split/.includes/.length/...).
+            if let Some(native) = ext_to_native_estree(n.as_ref()) {
+                return native;
+            }
+            // No native form — fall back to a sh2.* runtime call (never panic).
+            crate::estree::sh2_call(&snake_tag(n.tag()), vec![])
+        }
         // A numeric-range iterable (`seq_range_for`'s bare `Range`
         // For.iter shape): the ESTree surface has no range literal, so
         // render the materialized string list. The native ForStatement
@@ -31821,6 +31968,36 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
             // SH2_ASSUME_NO_ENV contract — see [`never_written_read`])
             if func == "getVar" {
                 if let [IrExpr::Str(name, _)] = args.as_slice() {
+                    // `${#s}` — length of a LIFTED / native-store string.
+                    // The runtime getVar("#s") reads the STORE, which is
+                    // empty for a lifted var (the 010_substring_loop
+                    // regression: `len=${#s}` came back 0 and the while
+                    // loop never ran — empty output). Emit the native
+                    // binding's `.length` instead.
+                    if let Some(base) = name.strip_prefix('#') {
+                        let len_expr = |obj: Expr| Expr::CallExpression {
+                            callee: Box::new(Expr::Identifier {
+                                name: "String".to_string(),
+                            }),
+                            arguments: vec![Expr::MemberExpression {
+                                object: Box::new(obj),
+                                property: Box::new(Expr::Identifier {
+                                    name: "length".to_string(),
+                                }),
+                                computed: false,
+                                optional: false,
+                            }],
+                            optional: false,
+                        };
+                        if is_lifted(base) {
+                            return len_expr(Expr::Identifier {
+                                name: base.to_string(),
+                            });
+                        }
+                        if native_store_read_ok(base) {
+                            return len_expr(native_store_read(base));
+                        }
+                    }
                     // `--true64` slot var: the slot IS the home (echo /
                     // printf / interpolation observation points read the
                     // native int64 element — BigInt stringifies exactly)
@@ -33517,6 +33694,52 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         // ESTree-reachable positions (bash conditions go through the
         // `test` text channel; `$((…))` goes through `Arith`), but the
         // contract round-trips them (shir_json.rs / shir_json_in.rs) and
+        // The general arithmetic / string / bitwise BinOp (the operator
+        // table mirrors js_backend.rs): Add/Concat → `+`, Sub → `-`,
+        // Mul → `*`, Div → `/`, Mod → `%`, Pow → `**`, BitAnd → `&`,
+        // BitOr → `|`, BitXor → `^`, ShiftL → `<<`, ShiftR → `>>`. The
+        // shir-native-stmt transform emits Concat for literal echo args
+        // (`echo a b` → `"a" + " " + "b"`); the C frontend emits the
+        // arithmetic/bitwise forms. Parens are the caller's concern.
+        IrExpr::BinOp {
+            op:
+                op @ (BinOpKind::Add
+                | BinOpKind::Sub
+                | BinOpKind::Mul
+                | BinOpKind::Div
+                | BinOpKind::Mod
+                | BinOpKind::Pow
+                | BinOpKind::Concat
+                | BinOpKind::BitAnd
+                | BinOpKind::BitOr
+                | BinOpKind::BitXor
+                | BinOpKind::ShiftL
+                | BinOpKind::ShiftR),
+            lhs,
+            rhs,
+        } => {
+            let l = expr_to_estree(lhs);
+            let r = expr_to_estree(rhs);
+            let js_op = match op {
+                BinOpKind::Add | BinOpKind::Concat => "+",
+                BinOpKind::Sub => "-",
+                BinOpKind::Mul => "*",
+                BinOpKind::Div => "/",
+                BinOpKind::Mod => "%",
+                BinOpKind::Pow => "**",
+                BinOpKind::BitAnd => "&",
+                BinOpKind::BitOr => "|",
+                BinOpKind::BitXor => "^",
+                BinOpKind::ShiftL => "<<",
+                BinOpKind::ShiftR => ">>",
+                _ => unreachable!("arith/string/bitwise arm: non-op {op:?}"),
+            };
+            Expr::BinaryExpression {
+                operator: js_op.to_string(),
+                left: Box::new(l),
+                right: Box::new(r),
+            }
+        }
         // the Perl backend already renders them — the operator table
         // mirrors js_backend.rs (Eq→`==`, Ne→`!=`, Lt→`<`, Gt→`>`,
         // Le→`<=`, Ge→`>=`; parens are the caller's concern).
@@ -33600,6 +33823,286 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
         other => unreachable!("Perl-only IR expression reached the ESTree renderer: {other:?}"),
     }
 }
+/// Render an ExtExpr node to NATIVE ESTree (no sh2.* fallback) — real
+/// JS: `.split()`, `.includes()`, `.length`, `.trim()`, etc.
+fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
+    let children: Vec<&IrExpr> = n.children();
+    match n.tag() {
+        "StrLen" => {
+            let text = children.get(0)?;
+            Some(Expr::MemberExpression {
+                object: Box::new(expr_to_estree(text)),
+                property: Box::new(Expr::Identifier { name: "length".to_string() }),
+                computed: false,
+                optional: false,
+            })
+        }
+        "CaseTransform" => {
+            let text = children.get(0)?;
+            let upper = n.as_any().downcast_ref::<crate::shir_nodes::CaseTransform>()?.upper;
+            Some(crate::estree::method_call(expr_to_estree(text),
+                if upper { "toUpperCase" } else { "toLowerCase" }, vec![]))
+        }
+        "StringContains" => {
+            let text = children.get(0)?;
+            let pat = children.get(1)?;
+            Some(crate::estree::method_call(expr_to_estree(text), "includes", vec![expr_to_estree(pat)]))
+        }
+        "StringAffix" => {
+            let text = children.get(0)?;
+            let pat = children.get(1)?;
+            let prefix = n.as_any().downcast_ref::<crate::shir_nodes::StringAffix>()?.prefix;
+            Some(crate::estree::method_call(expr_to_estree(text),
+                if prefix { "startsWith" } else { "endsWith" }, vec![expr_to_estree(pat)]))
+        }
+        "StringTrim" => {
+            let text = children.get(0)?;
+            Some(crate::estree::method_call(expr_to_estree(text), "trim", vec![]))
+        }
+        "RepeatStr" => {
+            let text = children.get(0)?;
+            let count = children.get(1)?;
+            Some(crate::estree::method_call(expr_to_estree(text), "repeat", vec![expr_to_estree(count)]))
+        }
+        "SubStrExtract" => {
+            let text = children.get(0)?;
+            let offset = children.get(1)?;
+            let len = children.get(2).copied().unwrap_or_else(|| &IrExpr::Int(-1));
+            // substring(start, start+length) — JS end is EXCLUSIVE, not a length.
+            let end = Expr::BinaryExpression {
+                operator: "+".to_string(),
+                left: Box::new(expr_to_estree(offset)),
+                right: Box::new(expr_to_estree(len)),
+            };
+            Some(crate::estree::method_call(expr_to_estree(text), "substring",
+                vec![expr_to_estree(offset), end]))
+        }
+        "RegSub" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::RegSub>()?;
+            // text.replace(/pat/g, repl) or text.replace(/pat/, repl)
+            let re = crate::estree::regex_lit_flags(&node.pattern,
+                if node.global { "g" } else { "" });
+            Some(crate::estree::method_call(expr_to_estree(text), "replace",
+                vec![re, crate::estree::str_lit(&node.replacement)]))
+        }
+        "Split" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::Split>()?;
+            let delim = if node.is_regex {
+                crate::estree::regex_lit(&node.delim)
+            } else {
+                crate::estree::str_lit(&node.delim)
+            };
+            Some(crate::estree::method_call(expr_to_estree(text), "split", vec![delim]))
+        }
+        "RegCount" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::RegCount>()?;
+            // (text.match(/pat/g) || []).length
+            let matched = crate::estree::method_call(expr_to_estree(text), "match",
+                vec![crate::estree::regex_lit(&node.pattern)]);
+            let arr = Expr::LogicalExpression {
+                operator: "||".to_string(),
+                left: Box::new(matched),
+                right: Box::new(Expr::ArrayExpression { elements: vec![] }),
+            };
+            Some(Expr::MemberExpression {
+                object: Box::new(arr),
+                property: Box::new(Expr::Identifier { name: "length".to_string() }),
+                computed: false, optional: false,
+            })
+        }
+        "ArrayLen" => {
+            let array = children.get(0)?;
+            Some(Expr::MemberExpression {
+                object: Box::new(expr_to_estree(array)),
+                property: Box::new(Expr::Identifier { name: "length".to_string() }),
+                computed: false, optional: false,
+            })
+        }
+        "FieldExtract" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()?;
+            // bash cut semantics, verified:
+            //   printf 'a:b:c\nd:e\nf\n' | cut -d: -f2-3  → b:c / e / f
+            //   …                | cut -d: -f1,3           → a:c / d / f
+            //   …                | cut -d: -f3,1           → a:c (order
+            //      normalized ascending)
+            //   a line WITHOUT the delimiter passes through WHOLE (unless
+            //   -s, which drops it — value position: ""). Missing trailing
+            //   fields contribute nothing ("d:e" -f1,3 → "d", NOT "d:").
+            // Composition: (t.includes(D)
+            //    ? t.split(D).filter((_, i) => [ids…].includes(i)).join(D)
+            //    : (suppress ? "" : t))
+            let mut ids: Vec<i64> = Vec::new();
+            for f in &node.fields {
+                match f {
+                    crate::ir::FieldRange::Single(i) => ids.push(*i as i64 - 1),
+                    crate::ir::FieldRange::Range { start, end } => {
+                        let lo = *start as i64;
+                        let hi = *end as i64;
+                        if hi - lo > 4096 { return None; } // absurd spec — fallback
+                        let mut i = lo - 1;
+                        while i <= hi - 1 { ids.push(i); i += 1; }
+                    }
+                }
+            }
+            ids.retain(|&i| i >= 0);
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.is_empty() { return None; }
+            let lit_ids = crate::estree::Expr::ArrayExpression {
+                elements: ids.iter().map(|i| Some(crate::estree::int_lit_expr(*i))).collect(),
+            };
+            let i_ident = crate::estree::ident("i");
+            let filt = Expr::ArrowFunctionExpression {
+                params: vec![crate::estree::ident("_"), i_ident.clone()],
+                body: ArrowBody::Expr(Box::new(crate::estree::method_call(
+                    lit_ids, "includes", vec![Expr::Identifier { name: "i".to_string() }]))),
+                expression: true, r#async: false,
+            };
+            let picked = crate::estree::method_call(
+                crate::estree::method_call(
+                    crate::estree::method_call(expr_to_estree(text), "split", vec![crate::estree::str_lit(&node.delimiter)]),
+                    "filter", vec![filt]),
+                "join", vec![crate::estree::str_lit(&node.delimiter)]);
+            let has_delim = crate::estree::method_call(expr_to_estree(text), "includes", vec![crate::estree::str_lit(&node.delimiter)]);
+            let bare = if node.suppress_no_delim {
+                crate::estree::str_lit("")
+            } else {
+                expr_to_estree(text)
+            };
+            Some(Expr::ConditionalExpression {
+                test: Box::new(has_delim),
+                consequent: Box::new(picked),
+                alternate: Box::new(bare),
+            })
+        }
+        "TakeLines" => {
+            let text = children.get(0)?;
+            let count = children.get(1)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::TakeLines>()?;
+            if node.bytes {
+                // head/tail -c count BYTES, not lines: a plain substring of
+                // the in-memory text (ASCII-exact; bash counts raw bytes).
+                let sliced = if node.from_end {
+                    crate::estree::method_call(expr_to_estree(text), "slice", vec![Expr::UnaryExpression {
+                        operator: "-".to_string(), prefix: true,
+                        argument: Box::new(expr_to_estree(count)),
+                    }])
+                } else {
+                    crate::estree::method_call(expr_to_estree(text), "slice", vec![crate::estree::int_lit_expr(0), expr_to_estree(count)])
+                };
+                return Some(sliced);
+            }
+            let lines = crate::estree::method_call(expr_to_estree(text), "split", vec![crate::estree::str_lit("\n")]);
+            let sliced = if node.from_end {
+                crate::estree::method_call(lines, "slice", vec![Expr::UnaryExpression {
+                    operator: "-".to_string(), prefix: true,
+                    argument: Box::new(expr_to_estree(count)),
+                }])
+            } else {
+                crate::estree::method_call(lines, "slice", vec![crate::estree::int_lit_expr(0), expr_to_estree(count)])
+            };
+            Some(crate::estree::method_call(sliced, "join", vec![crate::estree::str_lit("\n")]))
+        }
+        "CharTranslate" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::CharTranslate>()?;
+            let t = expr_to_estree(text);
+            if node.delete {
+                // text.split('').filter(c => !from.includes(c)).join('')
+                let c = crate::estree::ident("c");
+                let filt = crate::estree::method_call(
+                    crate::estree::method_call(t.clone(), "split", vec![crate::estree::str_lit("")]),
+                    "filter",
+                    vec![Expr::ArrowFunctionExpression {
+                        params: vec![c.clone()], body: ArrowBody::Expr(Box::new(
+                            Expr::UnaryExpression { operator: "!".to_string(), prefix: true,
+                                argument: Box::new(crate::estree::method_call(crate::estree::str_lit(&node.from), "includes", vec![c])) }
+                        )), expression: true, r#async: false,
+                    }],
+                );
+                Some(crate::estree::method_call(filt, "join", vec![crate::estree::str_lit("")]))
+            } else {
+                // text.split('').map(c => from.includes(c) ? to[from.indexOf(c)] : c).join('')
+                let c = crate::estree::ident("c");
+                let i = crate::estree::ident("i");
+                let idx = crate::estree::method_call(crate::estree::str_lit(&node.from), "indexOf", vec![c.clone()]);
+                // to[from.indexOf(c)] — index into `to` by c's position in `from`,
+                // NOT by the map index (a repeated char would index past `to`).
+                let repl = Expr::MemberExpression {
+                    object: Box::new(crate::estree::str_lit(&node.to)), property: Box::new(idx.clone()), computed: true, optional: false,
+                };
+                let cond = Expr::ConditionalExpression {
+                    test: Box::new(Expr::BinaryExpression { operator: ">=".to_string(),
+                        left: Box::new(idx.clone()), right: Box::new(crate::estree::int_lit_expr(0)) }),
+                    consequent: Box::new(repl),
+                    alternate: Box::new(c.clone()),
+                };
+                let mapf = Expr::ArrowFunctionExpression {
+                    params: vec![c.clone()], body: ArrowBody::Expr(Box::new(cond)), expression: true, r#async: false,
+                };
+                let mut out = if node.to.is_empty() {
+                    // `tr -s SET` with NO SET2 (or a bare squeeze): the
+                    // translate is an identity — squeeze operates on the
+                    // SET chars themselves.
+                    t
+                } else {
+                    let mapped = crate::estree::method_call(
+                        crate::estree::method_call(t, "split", vec![crate::estree::str_lit("")]),
+                        "map", vec![mapf]);
+                    crate::estree::method_call(mapped, "join", vec![crate::estree::str_lit("")])
+                };
+                if node.squeeze {
+                    // bash `tr -s`: every RUN of an output-set char collapses
+                    // to ONE copy ("  spaced  " -> " spaced "), NOT removal —
+                    // replace(/c+/g, "c") per output-set char.
+                    let sq_chars = if node.to.is_empty() { &node.from } else { &node.to };
+                    for ch in sq_chars.chars() {
+                        out = crate::estree::method_call(out, "replace", vec![
+                            crate::estree::regex_lit_flags(&format!("{}+", regex_escape_lit(ch)), "g"),
+                            crate::estree::str_lit(&ch.to_string()),
+                        ]);
+                    }
+                }
+                Some(out)
+            }
+        }
+        "PathName" => {
+            let text = children.get(0)?;
+            let node = n.as_any().downcast_ref::<crate::shir_nodes::PathName>()?;
+            let split = crate::estree::method_call(expr_to_estree(text), "split", vec![crate::estree::str_lit("/")]);
+            if node.which == "dirname" {
+                // split('/').slice(0, -1).join('/')
+                Some(crate::estree::method_call(
+                    crate::estree::method_call(split, "slice", vec![crate::estree::int_lit_expr(0), crate::estree::int_lit_expr(-1)]),
+                    "join", vec![crate::estree::str_lit("/")]))
+            } else {
+                // split('/').pop()
+                Some(crate::estree::method_call(split, "pop", vec![]))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// snake_case of an Ext tag ("CaseTransform" → "case_transform") — used for
+/// the sh2.* fallback callee name.
+fn snake_tag(tag: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in tag.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 { out.push('_'); }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 
 fn interpolate_to_estree(parts: &[InterpPart]) -> Expr {
     let mut quasis = Vec::new();

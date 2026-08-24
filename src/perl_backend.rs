@@ -544,6 +544,17 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "0".to_string()
             }
+            IrExpr::Ext(n) => {
+                let ctx = crate::render_ext_expr::ExprRenderCtx {
+                    backend: crate::render_ext_expr::Backend::Perl,
+                    indent: 0,
+                };
+                if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
+                    code
+                } else {
+                    format!("sh2.{}(...)", n.tag())
+                }
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr(i)).collect();
                 format!("({})", elems.join(", "))
@@ -588,6 +599,18 @@ impl Render {
         match e {
             IrExpr::Call { func, args } if func == "exec" || func == "let" => {
                 format!("(({}) == 0)", self.expr(e))
+            }
+            IrExpr::Call { func, args } if func == "contains" => {
+                // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+                // perl index(STR, SUBSTR) >= 0.
+                if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
+                    let n = self.expr(needle);
+                    let p = self.expr(pattern);
+                    format!("(index({n}, {p}) >= 0)")
+                } else {
+                    self.mark_todo("call contains");
+                    "0".to_string()
+                }
             }
             _ => self.expr(e),
         }
@@ -860,6 +883,17 @@ impl Render {
 
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            "contains" => {
+                // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+                // perl index(STR, SUBSTR) >= 0.
+                if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
+                    let n = self.expr(needle);
+                    let p = self.expr(pattern);
+                    return format!("(index({n}, {p}) >= 0)");
+                }
+                self.mark_todo("call contains");
+                "0".into()
+            }
             "getVar" => match Self::str_arg(args, 0) {
                 Some(name) => self.var_ref(&name),
                 None => {

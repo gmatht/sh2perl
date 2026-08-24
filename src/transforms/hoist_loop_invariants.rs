@@ -166,6 +166,14 @@ fn expr_reads(e: &IrExpr, var: &str) -> bool {
                     if n == var { return true; }
                 }
             }
+            // a $name reference inside ANY string argument is also a read
+            // (the slice start `${s:$i:1}` arrives as Str("$i"), the test
+            // operands as Str("$x") — a bare Str node is opaque to the walk)
+            if args.iter().any(|a| {
+                matches!(a, IrExpr::Str(s, _) if str_reads(var, s))
+            }) {
+                return true;
+            }
             args.iter().any(|a| expr_reads(a, var))
         }
         IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
@@ -173,6 +181,80 @@ fn expr_reads(e: &IrExpr, var: &str) -> bool {
             _ => false,
         }),
         _ => false,
+    }
+}
+
+/// Does `s` contain a bare `$name` / `${name}` reference to `var`? The A1
+/// encodes the slice start of `${s:$i:1}` as Str("$i") (a `$var` inside a
+/// DoubleQuoted string) — a Str node is opaque to the walk above, so the
+/// hoist-LICM check must scan the string text itself, like the census's
+/// test_string_reads does for the `test` operator.
+fn str_reads(var: &str, s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '$' && i + 1 < bytes.len() {
+            let start = i + 1;
+            let mut j = start;
+            if bytes[j] == b'{' {
+                j += 1;
+                let w = j;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'}' {
+                    if &bytes[w..j] == var.as_bytes() { return true; }
+                    i = j + 1;
+                    continue;
+                }
+                // unbalanced — fall through to the bare scan
+            }
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if &bytes[start..j] == var.as_bytes() { return true; }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Insert every bare `$name` / `${name}` reference in `s` into `out`.
+fn str_read_names(s: &str, out: &mut HashSet<String>) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '$' && i + 1 < bytes.len() {
+            let start = i + 1;
+            let mut j = start;
+            if bytes[j] == b'{' {
+                j += 1;
+                let w = j;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'}' {
+                    if j > w { out.insert(String::from_utf8_lossy(&bytes[w..j]).into_owned()); }
+                    i = j + 1;
+                    continue;
+                }
+            }
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j > start { out.insert(String::from_utf8_lossy(&bytes[start..j]).into_owned()); }
+            i = j;
+        } else {
+            i += 1;
+        }
     }
 }
 
@@ -251,6 +333,13 @@ fn read_set_into(e: &IrExpr, out: &mut HashSet<String>) {
             } else if matches!(func.as_str(), "getVar" | "listVar" | "arrayItems" | "arrayLen" | "arrayIndex") {
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     out.insert(n.clone());
+                }
+            }
+            // a $name reference inside ANY string argument is a read of
+            // name (the slice start `${s:$i:1}` arrives as Str("$i"))
+            for a in args {
+                if let IrExpr::Str(s, _) = a {
+                    str_read_names(s, out);
                 }
             }
             for a in args {

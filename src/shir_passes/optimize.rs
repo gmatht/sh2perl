@@ -61,6 +61,7 @@ pub fn expr_reads(name: &str, e: &IrExpr) -> bool {
         }
         IrExpr::Splice(inner) => expr_reads(name, inner),
         IrExpr::Arith(ast) => arith_reads(name, ast),
+        IrExpr::Ext(_) => false,
         IrExpr::Object(pairs) => pairs.iter().any(|(_, v)| expr_reads(name, v)),
         IrExpr::MethodCall { obj, args, .. } => {
             expr_reads(name, obj) || args.iter().any(|a| expr_reads(name, a))
@@ -87,13 +88,14 @@ pub fn expr_reads(name: &str, e: &IrExpr) -> bool {
                         return true;
                     }
                 }
-            } else if func == "test" {
-                // `[ "$x" -eq 5 ]` string operands carry $names
-                for a in args {
-                    if let IrExpr::Str(s, _) = a {
-                        if test_string_reads(name, s) {
-                            return true;
-                        }
+            }
+            // $name references inside ANY string argument are reads — the
+            // `test` operands (`[ "$x" -eq 5 ]`) AND the slice start of
+            // `${s:$i:1}` (param's "slice" carries the index as Str("$i"))
+            for a in args {
+                if let IrExpr::Str(s, _) = a {
+                    if test_string_reads(name, s) {
+                        return true;
                     }
                 }
             }
@@ -442,6 +444,7 @@ fn expr_reads_name(name: &str, e: &IrExpr) -> bool {
         }
         IrExpr::Splice(inner) => expr_reads_name(name, inner),
         IrExpr::Arith(ast) => arith_reads_name(name, ast),
+        IrExpr::Ext(_) => false,
         IrExpr::Object(pairs) => pairs.iter().any(|(_, v)| expr_reads_name(name, v)),
         IrExpr::MethodCall { obj, args, .. } => {
             expr_reads_name(name, obj) || args.iter().any(|a| expr_reads_name(name, a))
@@ -1244,6 +1247,7 @@ fn expr_pure(e: &IrExpr) -> bool {
         IrExpr::Object(pairs) => pairs.iter().all(|(_, v)| expr_pure(v)),
         IrExpr::Splice(inner) => expr_pure(inner),
         IrExpr::Index { key, .. } => expr_pure(key),
+        IrExpr::Ext(_) => false,
         IrExpr::Arith(_) => true, // compound writes checked by the caller
         IrExpr::MethodCall { obj, args, .. } => expr_pure(obj) && args.iter().all(expr_pure),
         IrExpr::Call { func, args } => {
@@ -1553,12 +1557,36 @@ fn collect_stmt_read_names(st: &IrStmt, out: &mut Vec<String>) {
 fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
     match e {
         IrExpr::Var(n, _) | IrExpr::Ident(n) => out.push(n.clone()),
+        IrExpr::Ext(n) => {
+            // transform-declared nodes: reads hidden inside an Ext node
+            // keep the host var alive (a zero-read store drop would
+            // delete a write the ext node's operand still reads).
+            for c in crate::shir_nodes::ExtExpr::children(&**n) {
+                collect_expr_read_names(c, out);
+            }
+        }
         IrExpr::Index { var, key } => {
             out.push(var.clone());
             collect_expr_read_names(key, out);
         }
-        IrExpr::Int(_) | IrExpr::Str(_, _) | IrExpr::Bool(_) | IrExpr::Json(_)
+        IrExpr::Int(_) | IrExpr::Bool(_) | IrExpr::Json(_)
         | IrExpr::RawExpr(_) | IrExpr::Regex { .. } | IrExpr::Range { .. } => {}
+        IrExpr::Str(s, _) => {
+            // `$name` / `${name}` tokens inside ANY string operand:
+            // several lowerings evaluate string operands at runtime with
+            // expansion semantics (test/testArith/fparith/ternary conds
+            // from the C frontend, the sh2.test fallback, ...), and the
+            // native-first arms read those operands' `$name`s at EMISSION
+            // time (try_native_test -> store_var_read -> never-written
+            // fold). A store whose only "read" lives inside such a string
+            // must survive DCE, or the cond evaluates the never-written
+            // "" fold instead of the variable (c-sh-go t65_ternary /
+            // t64_bitwise_cond / t23_float regressions). Conservative:
+            // over-marking only shrinks the elimination set.
+            for nm in bare_dollar_names(s) {
+                out.push(nm);
+            }
+        }
         IrExpr::BinOp { lhs, rhs, .. } => {
             collect_expr_read_names(lhs, out);
             collect_expr_read_names(rhs, out);
@@ -1599,6 +1627,7 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
         }
         IrExpr::Splice(inner) => collect_expr_read_names(inner, out),
         IrExpr::Arith(ast) => collect_arith_read_names(ast, out),
+        IrExpr::Ext(_) => (),
         IrExpr::Object(pairs) => {
             for (_, v) in pairs {
                 collect_expr_read_names(v, out);
@@ -1633,11 +1662,31 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                         out.push(n[..pos].to_string());
                     }
                 }
-            } else if func == "arrayIndex" {
+            } else if func == "arrayIndex"
+                || func == "addrVar"
+                || func == "derefGet"
+                || func == "derefSet"
+            {
+                // pointer indirection (&x / *x): the named slot is BOTH
+                // read and written through the reference
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     out.push(n.clone());
                 }
+                if func == "derefSet" {
+                    if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                        out.push(n.clone());
+                    }
+                }
             } else if func == "test" || func == "let" {
+                // `ternary` (the C frontend's `cond ? a : b`): args[0] is
+                // the cond TEST-STRING — try_native_test lowers it by
+                // scanning `$name` operands natively, so a store write a
+                // DCE would drop (no AST read) changes the answer from
+                // the var's value to the never-written fold ""
+                // (c-sh-go t65_ternary regression: every cond evaluated
+                // false). The branch args are already-lowered values —
+                // scanning them is harmless over-marking. Same shape as
+                // test/let: string mentions are runtime reads.
                 for a in args {
                     if let IrExpr::Str(s, _) = a {
                         for nm in bare_dollar_names(s) {

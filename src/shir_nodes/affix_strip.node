@@ -1,0 +1,19 @@
+# shir_nodes/affix_strip.node — expression-level semantic IR node.
+# AffixStrip: single-occurrence affix removal (Go strings.TrimPrefix /
+# strings.TrimSuffix over arbitrary words; bash ${s#p} / ${s%p}).
+#
+# GENERIC (any frontend lowering affix strips on non-named operands).
+# text is any expression evaluating to a string; pattern is the affix
+# to strip (stringified like the host). When the affix is present it
+# is removed ONCE; otherwise the text flows through unchanged.
+# prefix=true strips a LEADING affix, false a TRAILING one.
+#
+# Backends: Perl index()/substr(), JS startsWith/slice,
+#           C strncmp/memcmp loop, Rust strip_prefix/strip_suffix
+
+node AffixStrip
+tag "AffixStrip"
+kind expr
+field text: expr
+field pattern: expr
+field prefix: bool

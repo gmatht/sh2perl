@@ -1,0 +1,16 @@
+# shir_nodes/deref.node — Deref: read through a reference (`*p`).
+#
+# GENERIC (Go *p auto-deref reads, Zig p.*, C-like *p). Matching read
+# side of AddressOf (see address_of.node for the pair contract):
+#   - reference-capable backends render a true dereference
+#     (Perl: ${...} / @{...});
+#   - value-only backends pass the operand through (snapshot semantics;
+#     nil-deref detection stays with guards the frontend already emits,
+#     e.g. `p == nil`).
+# WRITES through a dereference have no node here by design: they are a
+# storage effect, refused by frontends rather than guessed.
+
+node Deref
+tag "Deref"
+kind expr
+field pointer: expr

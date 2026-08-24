@@ -23,31 +23,30 @@ pub mod builtin;
 pub mod inline_pure_fns; // marketplace offer (estree-20260813-182431) // core-requests/shir-builtin-op: exec(cmd∈builtins) → the native `builtin` op
 pub mod grep_o; // `grep -o PAT` → the generic grepMatches(text, pattern, flags) op
 pub mod process_subst;
+pub mod ternary_desugar; // C frontend's `ternary(cond,a,b)` call → backend-neutral Ternary + test-call (non-estree backends)
 pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
 /// Registered transforms. The estree worker APPENDS entries here (and a
 /// `pub mod <name>;` above) when a worker-submitted transform is accepted
 /// into the crate. Each entry is (name, transform_fn).
 pub mod shir_pipeline_native;
+pub mod dead_fn_elim; // generic: remove never-referenced shell functions
+pub mod text_ops; // common shell commands → semantic IR nodes (cut/tr/sed/head/tail/wc)
 pub mod sub; // placeholder so the module compiles with an empty registry
 pub mod sync_ok_loops; // worker-submitted: loop sync/batch verdicts (analysis-only; the renderer hooks read them)
 pub mod shir_native_stmt; // worker-submitted: redirect/herestring/test-chain shapes → native stmt forms
-// OFFERED transforms (core-requests/transforms/offered/) — staged for per-backend bisect
-pub mod const_capture_fold;
-pub mod const_condition_elim;
-pub mod copy_propagation;
-pub mod dead_store_elim;
-pub mod div_mod_pow2;
-pub mod hoist_loop_invariants;
-pub mod redundant_store_elim;
-pub mod string_accumulator;
-pub mod test_simplification;
-pub mod unreachable_after_exit;
-pub mod counted_while_forinit;
-pub mod merge_init_assignments;
+// New transforms merged from the workspace (core-requests/transforms/done).
+pub mod background_decide; // `&` background → THREAD/FORK class (analysis; feeds renderer hooks)
+pub mod bc_float_clean; // strip redundant `+ 0.0` before `echo … | bc` (native float emulation)
+pub mod direct_calls; // `v=$(sq 3)` of a defined pure-output fn → in-process Capture{Call}
+pub mod escape_classes; // per-var STORE requirement census (feeds escape/hoist analyses)
+pub mod for_recovery; // counter-while → native For recovery
+pub mod function_purity; // function-level side-effect classes by call-graph fixpoint
+pub mod i32_provable; // PROVABLY-32-bit arith annotations
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
         ("shir-pipeline-native", shir_pipeline_native::transform),
+        ("dead-fn-elim", dead_fn_elim::transform),
         // (name, <name>::transform) — estree worker adds entries here
         ("inline-pure-fns", inline_pure_fns::inline_pure_fns),
         ("sync-ok-loops", sync_ok_loops::transform),
@@ -61,43 +60,24 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // native-stmt normalisation (fail-shir: perl shell-out elimination):
         // `echo args > file` → Block-wrapped exec (native select redirect),
         // empty herestrings → status exec, `test && echo || echo` → If.
-        //
-        // GATED OFF BY DEFAULT: this prior-session rewrite regresses the
-        // estree gate — its `status_exec(true)` markers break the estree
-        // dead-flags pass (66 estree unit-test failures: 72 with it on → 6
-        // with it off; the backend renderers are unaffected either way,
-        // 26/26 with or without it). The dead-flags liveness interaction
-        // is subtle (the `exec true` status marker isn't dropped from
-        // `Block([…, exec true])`), so it stays disabled by default until
-        // that is fixed. Re-enable per-run with
-        // DEBASHC_TRANSFORMS=shir-native-stmt.
-        // ("shir-native-stmt", shir_native_stmt::transform),
-        // ── OFFERED (core-requests/transforms/offered/) — staged for the per-backend bisect —
-        ("arith-identity", arith_identity::transform),
-        ("const-capture-fold", const_capture_fold::transform),
-        ("const-condition-elim", const_condition_elim::transform),
-        ("copy-propagation", copy_propagation::transform),
-        // GATED OFF BY DEFAULT: dead-store-elim is over-aggressive for the
-        // current unit tests — it removes assignments to UNREAD variables
-        // (`x=42`, `y=$((x+1))`, …) that the estree-lowering and shIR
-        // analysis tests check, causing 11 test failures (18 with it on →
-        // 7 with it off; the backend renderers are unaffected, 26/26 with
-        // or without it). Re-enable per-run with
-        // DEBASHC_TRANSFORMS=dead-store-elim.
-        ("dead-store-elim", dead_store_elim::transform),
-        ("div-mod-pow2", div_mod_pow2::transform),
-        ("hoist-loop-invariants", hoist_loop_invariants::transform),
-        ("redundant-store-elim", redundant_store_elim::transform),
-        ("string-accumulator", string_accumulator::transform),
-        ("test-simplification", test_simplification::transform),
-        ("unreachable-after-exit", unreachable_after_exit::transform),
-        ("counted-while-forinit", counted_while_forinit::transform),
-        ("merge-init-assignments", merge_init_assignments::transform),
         // NOTE: exec-to-builtin (shir-builtin-op-20260816) is NOT in the
         // ast_to_ir channel — the rewrite happens at the A1 EXPORT
         // (shir_json::shir_to_shir_json) so the analyses and every
         // exec-keyed renderer arm stay untouched; the exported contract
         // carries the op and the renderers erase/accept at entry.
+        //
+        // New transforms merged from the workspace (core-requests/transforms/done).
+        // Analyses (escape-classes, function-purity, background-decide, i32-provable)
+        // compute statics the renderer hooks read; direct-calls / for-recovery /
+        // bc-float-clean make structural rewrites.
+        ("background-decide", background_decide::transform),
+        ("bc-float-clean", bc_float_clean::transform),
+        ("direct-calls", direct_calls::transform),
+        ("escape-classes", escape_classes::transform),
+        ("for-recovery", for_recovery::transform),
+        ("function-purity", function_purity::transform),
+        ("i32-provable", i32_provable::transform),
+        ("text-ops", text_ops::transform),
     ]
 }
 
