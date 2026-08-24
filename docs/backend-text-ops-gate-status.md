@@ -32,6 +32,22 @@ iteration construct (`sh2.eachLine` / `while(<$fh>)` /
 All four backends match bash byte-for-byte on the suite (js/pl/zig run;
 java compiled+run).
 
+## UPDATE 2 — worktree merge: java 79→253, then worker regression to 73
+
+Merging `backend/java` into main (2b9a2f6c) — two commits touching only
+src/java_backend.rs (+330/−51: brace expansion cartesian products,
+printf fixes, test-text tokenization, [[ =~ ]]/extglob/nocasematch,
+fn_list/argv runtime model) — took the behavior gate from **79 pass /
+448 skip to 253 pass / 187 skip**. The merge answered "does merging
+worktree commits help": decisively yes for java.
+
+Follow-up commits by the java worker (d6c2e622, af7092e5, fd08dcf5)
+regressed it back to 73/30/448 — the refusals returned. Evidence filed
+as core-requests/java-behavior-gate-regression.md; acceptance check for
+that worker should be `DEBASHC_TRANSFORMS=text-ops bash
+harness/backend_behavior.sh java` (the goal gate), not only their own
+numbered suite.
+
 ## UPDATE — construct-normalisation transforms landed
 
 The four named blockers were re-triaged and three of four addressed by
