@@ -54,6 +54,44 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 }
 
 fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<String>) {
+    // ── construct normalisations (docs/shir-reductions.md §Normalisation
+    // transforms): let / local / read — re-expressed in vocabulary every
+    // backend already renders. Runs FIRST, for every statement shape.
+    if emit {
+        if let Some(repl) = try_normalize_construct_stmt(stmt) {
+            *stmt = repl;
+            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // `(( x > 3 ))` / `let "x > 3"` in If/While CONDITION position →
+        // native Arith comparison (the zsh-sh-go frontend lowers these to
+        // exec("let", [text])).
+        if let IrStmt::If { cond, .. } | IrStmt::While { cond, .. } = stmt {
+            if let IrExpr::Call { func, args, .. } = cond {
+                if (func == "exec" || func == "builtin")
+                    && matches!(args.as_slice(),
+                        [IrExpr::Str(n, _), IrExpr::Array(wa)]
+                            if n == "let"
+                                && matches!(wa.as_slice(), [IrExpr::Str(_, _)]))
+                {
+                    let text_opt = if let [_, IrExpr::Array(wa)] = args.as_slice() {
+                        match wa.as_slice() {
+                            [IrExpr::Str(tx, _)] => Some(tx.clone()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(text) = text_opt {
+                        if let Some(repl) = let_cond_from_text(&text) {
+                            *cond = repl;
+                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    }
     match stmt {
         // ShIR pipeline: IrExpr::Call { func: "pipeline", args: [Array(stages)] }
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
@@ -423,6 +461,18 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
 
 fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
     match expr {
+        // `(( x > 3 ))` / `let "x > 3"` in CONDITION position: the zsh-sh-go
+        // and posix frontends lower these to exec("let", [text]) — parse the
+        // arithmetic text here so EVERY backend renders a native comparison
+        // instead of a runtime let call (§Normalisation transforms).
+        IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+            if let Some(replacement) = try_normalize_let_cond(args) {
+                *expr = replacement;
+                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            for a in args.iter_mut() { lower_expr(a, arrays); }
+        }
         // ${#var} → StrLen
         IrExpr::Call { func, args } if func == "param" => {
             if let Some(replacement) = try_lower_param_len(args) {
@@ -1865,6 +1915,212 @@ fn try_lower_find_wc(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
         md.map(IrExpr::Int),
         nf,
     ))
+}
+
+/// Frontend-ingest normalisations: apply ONLY the let-condition and read
+/// lifts to an already-ingested A1 (the fish/zsh frontends emit those
+/// constructs as opaque exec calls). Runs when DEBASHC_TRANSFORMS lists
+/// text-ops; deliberately narrower than transform() — everything else in
+/// the ingest keeps its baseline shape.
+pub fn normalize_frontend_constructs(stmts: &mut Vec<IrStmt>) {
+    fn normalize_read(s: &mut IrStmt) -> bool {
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+            if func == "exec" || func == "builtin" {
+                if let [IrExpr::Str(n, _), IrExpr::Array(wa)] = args.as_slice() {
+                    if n == "read"
+                        && wa.len() == 1
+                        && matches!(&wa[0], IrExpr::Str(v, _) if !v.starts_with('-'))
+                    {
+                        let var = match &wa[0] {
+                            IrExpr::Str(v, _) => v.clone(),
+                            _ => unreachable!(),
+                        };
+                        *s = IrStmt::Assign {
+                            targets: vec![AssignTarget { var, sigil: None, indices: vec![] }],
+                            expr: IrExpr::Ext(Box::new(ReadLine {})),
+                            asm: None,
+                        };
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    fn cond_let(cond: &mut IrExpr) -> bool {
+        if let IrExpr::Call { func, args } = cond {
+            if func == "exec" || func == "builtin" {
+                if let [IrExpr::Str(n, _), IrExpr::Array(wa)] = args.as_slice() {
+                    if n == "let" {
+                        if let [IrExpr::Str(tx, _)] = wa.as_slice() {
+                            if let Some(repl) = let_cond_from_text(tx) {
+                                *cond = repl;
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+    fn walk(s: &mut Vec<IrStmt>) {
+        let mut i = 0;
+        while i < s.len() {
+            if normalize_read(&mut s[i]) {
+                i += 1;
+                continue;
+            }
+            match &mut s[i] {
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    cond_let(cond);
+                    walk(then);
+                    for (_, b) in elsifs.iter_mut() { walk(b); }
+                    walk(else_);
+                }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { body, cond, .. } => {
+                    cond_let(cond);
+                    walk(body);
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) => walk(b),
+                IrStmt::Function { body, .. } => walk(body),
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    walk(stmts)
+}
+
+/// Construct normalisations for statement-level exec calls
+/// (docs/shir-reductions.md §Normalisation transforms).
+fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
+    // `local v=…` / `local v` — the parser lowers these to Declare{local}
+    // before transforms run. Our flat variable model has one scope per
+    // program, so a local declaration IS an assignment (bash: the var is
+    // created/overwritten for the function's lifetime; the corpus never
+    // relies on shadow-restore).
+    if let IrStmt::Declare { vars, init, local: true } = stmt {
+        let mut stmts: Vec<IrStmt> = Vec::new();
+        for v in vars {
+            let expr = init.clone()
+                .unwrap_or_else(|| IrExpr::Str(String::new(), StrStyle::DoubleQuoted));
+            stmts.push(IrStmt::Assign {
+                targets: vec![AssignTarget { var: v.name.clone(), sigil: None, indices: vec![] }],
+                expr,
+                asm: None,
+            });
+        }
+        return Some(IrStmt::Block(stmts));
+    }
+
+    // only statement-level exec/builtin calls carry these constructs
+    let (cmd, cmd_args) = match stmt {
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
+            match args.as_slice() {
+                [IrExpr::Str(n, _), IrExpr::Array(a)] => (n.as_str(), a.as_slice()),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let strs: Option<Vec<&str>> = cmd_args.iter().map(|a| match a {
+        IrExpr::Str(s, _) => Some(s.as_str()),
+        IrExpr::Interpolate(p) if p.len() == 1 => match &p[0] {
+            InterpPart::Lit(s) => Some(s.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }).collect();
+
+    // `local v=val …` → plain assigns (flat variable model)
+    if cmd == "local" {
+        let words = strs?;
+        let mut stmts: Vec<IrStmt> = Vec::new();
+        for w in &words {
+            match w.split_once('=') {
+                Some((name, val)) => stmts.push(IrStmt::Assign {
+                    targets: vec![AssignTarget { var: name.to_string(), sigil: None, indices: vec![] }],
+                    expr: IrExpr::Str(val.to_string(), StrStyle::DoubleQuoted),
+                    asm: None,
+                }),
+                None => stmts.push(IrStmt::Assign {
+                    targets: vec![AssignTarget { var: w.to_string(), sigil: None, indices: vec![] }],
+                    expr: IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+                    asm: None,
+                }),
+            }
+        }
+        return Some(IrStmt::Block(stmts));
+    }
+
+    // `read VAR` (single variable) → Assign{VAR, ReadLine}
+    if cmd == "read" {
+        let words = strs?;
+        if words.len() == 1 && !words[0].starts_with('-') {
+            return Some(IrStmt::Assign {
+                targets: vec![AssignTarget { var: words[0].to_string(), sigil: None, indices: vec![] }],
+                expr: IrExpr::Ext(Box::new(ReadLine {})),
+                asm: None,
+            });
+        }
+        return None; // multi-var / flag shapes fall back explicitly
+    }
+
+    // `let "i=…"` / `let "i<3"` (statement position): assignments become
+    // native arith assigns; bare comparisons are status-only → no-op true.
+    if cmd == "let" {
+        let words = strs?;
+        let mut stmts: Vec<IrStmt> = Vec::new();
+        for w in &words {
+            // an assignment word (`x=expr`, also x+=expr) lowers natively;
+            // a pure comparison in statement position sets $? only
+            if let Some(eq) = w.find('=').filter(|&i| i > 0
+                && w[..i].chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !w[..i].ends_with('<') && !w[..i].ends_with('>')
+                && !w[..i].ends_with('!'))
+            {
+                let (name, rhs) = (&w[..eq], &w[eq + 1..]);
+                let rhs = rhs.strip_prefix('+').unwrap_or(rhs); // += form
+                let ast = crate::shir::parse_arith(rhs)?;
+                stmts.push(IrStmt::Assign {
+                    targets: vec![AssignTarget { var: name.to_string(), sigil: None, indices: vec![] }],
+                    expr: IrExpr::Arith(Box::new(ast)),
+                    asm: None,
+                });
+            } else if crate::shir::parse_arith(w).is_some() {
+                // comparison-only: bash sets $? by the truth value; our
+                // callers use it in conditions (handled at expr level), a
+                // bare statement is a no-op with status 0
+                continue;
+            } else {
+                return None;
+            }
+        }
+        return Some(IrStmt::Block(stmts));
+    }
+
+    None
+}
+
+/// exec("let", [TEXT]) in CONDITION position → native Arith comparison.
+fn try_normalize_let_cond(args: &[IrExpr]) -> Option<IrExpr> {
+    let [IrExpr::Str(n, _), IrExpr::Array(wa)] = args else { return None };
+    if n != "let" { return None; }
+    let [IrExpr::Str(text, _)] = wa.as_slice() else { return None };
+    let_cond_from_text(text)
+}
+
+/// The let-condition core: parse the arithmetic TEXT into a native
+/// comparison. Assignment-shaped text is not a condition.
+fn let_cond_from_text(text: &str) -> Option<IrExpr> {
+    // assignment-shaped text is not a condition
+    if text.contains('=') && !matches!(text.chars().next(), Some(c) if c.is_ascii_digit()) {
+        let body = text.trim_start_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+        if body.starts_with('=') { return None; }
+    }
+    let ast = crate::shir::parse_arith(text)?;
+    Some(IrExpr::Arith(Box::new(ast)))
 }
 
 /// A statement-level `find ARGS` (no pipeline): print each entry path.

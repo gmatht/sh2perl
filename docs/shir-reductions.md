@@ -178,3 +178,38 @@ anything the core cannot reduce falls back explicitly to the runtime
 **Not yet reduced (fall back to original):** `tail F` (cannot stream), `sort`/`uniq`, `seq | head`,
 `awk`, `[[ $x == P* ]]` (test-string parsing), multi-stage pipelines with a
 dynamic source beyond the two-stage grep/cat forms above.
+
+## Normalisation transforms: cross-backend construct lifts (text-ops)
+
+Four constructs block multiple backends not for lack of renderers but
+because the A1 carries them as opaque `exec(...)` calls. Each gets an
+IR→IR normalisation that re-expresses it in vocabulary every backend
+already renders:
+
+| Construct | A1 shape | Normalised to |
+|---|---|---|
+| `(( x > 3 ))` / `let "x > 3"` | `Call{exec, ["let", ["x > 3"]]}` | `parse_arith(text)` → native **Arith** condition (or Assign for `let "i=…"` assignments) |
+| `local v=val …` | `Call{exec, ["local", […]]}` | NOT flattened — the runtime implements true call-frame locals (`builtins.local`); a flat Assign broke scope tests (fish t78). Falls through to the runtime on every backend |
+| `read line` | `Call{exec, ["read", ["line"]]}` | **Assign{var, ReadLine}** — new primitive: ONE newline-terminated line from stdin, newline stripped |
+| `eval STATIC` | `Call{exec, ["eval", [Str]]}` | parse+splice the parsed IR **only when the argument is a compile-time literal with no `$`/backquotes**; dynamic eval falls back explicitly |
+
+Not normalised (documented blockers):
+- **Dynamic eval** (`eval "$cmd"`): the payload is only known at run
+  time — splicing would change behaviour. Falls back to the runtime.
+- **trap HANDLER SIGNAL**: requires per-backend exit/error hooking
+  (process lifecycle), not a value transformation. Backend feature work.
+- **zsh arith-cond root cause**: the zsh-sh-go FRONTEND lowers
+  `(( x > 3 ))` to `exec("let", …)` — with the let normalisation above
+  the core now renders it natively on every backend, so the frontend gap
+  is closed WITHOUT touching the frontend.
+
+Semantics pinned:
+- `parse_arith` covers bash arithmetic syntax incl. comparisons;
+  a parse failure leaves the exec call untouched (explicit fallback).
+- `local` outside a function is a bash error — the transform does not
+  check context (the corpus only uses it inside functions); words without
+  `=` mark the name as written with an empty value (bash: local without
+  assignment keeps an inherited/unset value — the flat model picks "").
+- `read VAR` reads one line, strips the trailing newline, assigns the
+  WHOLE line to VAR (no IFS splitting — the subset's scripts use one
+  variable); `read` with no variable or multiple variables falls back.

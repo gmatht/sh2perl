@@ -57,6 +57,20 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
     if stmts_use_ext_value(&prog.stmts) {
         out.push_str(EXT_HELPERS);
     }
+    {
+        // the stdin reader preamble: emitted when any ReadLine is present;
+        // reuses EXT_HELPERS' statics where possible but declares its own
+        let mut ctx_probe = JavaCtx::default();
+        let _ = &mut ctx_probe;
+        if stmts_need_readline(&prog.stmts) {
+            out.push_str("    static java.io.BufferedReader __stdin = null;\n");
+            out.push_str("    static String sh2ReadLine() throws Exception {\n");
+            out.push_str("        if (__stdin == null) __stdin = new java.io.BufferedReader(new java.io.InputStreamReader(java.lang.System.in));\n");
+            out.push_str("        String l = __stdin.readLine();\n");
+            out.push_str("        return l == null ? \"\" : l;\n");
+            out.push_str("    }\n");
+        }
+    }
     if stmts_need_glob(&prog.stmts) {
         out.push_str(GLOB_HELPER);
     }
@@ -1899,7 +1913,10 @@ fn ext_value_to_java(node: &dyn crate::shir_nodes::ExtExpr, stringify: bool) -> 
     };
     let bool_str = |b: String| if stringify { format!("Boolean.toString({})", b) } else { b };
     match node.tag() {
-        "StrLen" => Ok(if stringify {
+            // `read VAR` normalisation: one stdin line via the shared
+            // BufferedReader (created lazily in main's preamble)
+            "ReadLine" => Ok("sh2ReadLine()".to_string()),
+            "StrLen" => Ok(if stringify {
             format!("String.valueOf(({}).length())", child(0)?)
         } else {
             format!("({}).length()", child(0)?)
@@ -2299,6 +2316,36 @@ fn stmts_need_glob(stmts: &[IrStmt]) -> bool {
                     IrStmt::Expr(e) => matches!(e, IrExpr::Ext(_)),
                     _ => false,
                 }),
+            _ => false,
+        })
+    }
+    walk(stmts)
+}
+
+/// Does any expression carry a ReadLine primitive? (the stdin reader
+/// preamble is emitted only then)
+fn stmts_need_readline(stmts: &[IrStmt]) -> bool {
+    fn expr_has(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Ext(n) => n.tag() == "ReadLine",
+            IrExpr::Call { args, .. } => args.iter().any(expr_has),
+            IrExpr::Array(items) => items.iter().any(expr_has),
+            IrExpr::BinOp { lhs, rhs, .. } => expr_has(lhs) || expr_has(rhs),
+            _ => false,
+        }
+    }
+    fn walk(s: &[IrStmt]) -> bool {
+        s.iter().any(|st| match st {
+            IrStmt::Assign { expr, .. } => expr_has(expr),
+            IrStmt::Output { value, .. } => expr_has(value),
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                expr_has(cond) || walk(then) || walk(else_)
+                    || elsifs.iter().any(|(_, b)| walk(b))
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { body, cond, .. } => {
+                expr_has(cond) || walk(body)
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) => walk(b),
             _ => false,
         })
     }

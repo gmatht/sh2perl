@@ -851,12 +851,17 @@ impl Render {
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     if self.is_num(name) {
+                        self.mark_read(name);
                         return ('d', self.expr_num(e));
                     }
                     // a DECLARED non-num var homes as a string — print it
                     // raw (sh2IntStr would wrap a []const u8 in an i64
                     // conversion and fail to compile)
                     if self.declared(name) {
+                        // NB: mark_read — skipping it emits a spurious
+                        // dead-var `_ = x;` guard for vars assigned inside
+                        // loops/walkers
+                        self.mark_read(name);
                         return ('s', self.zig_ident(name));
                     }
                     return ('s', self.expr_str(e));
@@ -1499,6 +1504,13 @@ impl Render {
         let ch = node.children();
         let child = |slf: &mut Self, i: usize| -> Option<String> { Some(slf.expr_any(ch.get(i)?)) };
         match node.tag() {
+            // `read VAR` normalisation: one stdin line, newline stripped;
+            // EOF → "" (the helper owns the stdin reader state)
+            "ReadLine" => {
+                self.need_ext = true;
+                // rendered INSIDE main → init.io is in scope at the call
+                Some("sh2ReadLine(init.io)".to_string())
+            }
             "StrLen" => {
                 self.need_intstr = true;
                 Some(format!("sh2IntStr(@intCast(({}).len))", child(self, 0)?))
@@ -2552,7 +2564,20 @@ impl Render {
             self.emit("    if (i == 0) return \"/\";");
             self.emit("    return t[0..i];");
             self.emit("}");
-            self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
+                        self.emit("var __rl_file: std.Io.File = undefined;");
+            self.emit("var __rl_buf: [4096]u8 = undefined;");
+            self.emit("var __rl_rdr: std.Io.File.Reader = undefined;");
+            self.emit("var __rl_init: bool = false;");
+            self.emit("fn sh2ReadLine(io: std.Io) []const u8 {");
+            self.emit("    if (!__rl_init) {");
+            self.emit("        __rl_file = std.Io.File.stdin();");
+            self.emit("        __rl_rdr = __rl_file.reader(io, &__rl_buf);");
+            self.emit("        __rl_init = true;");
+            self.emit("    }");
+            self.emit("    const line = __rl_rdr.interface.takeDelimiter('\\n') catch return \"\";");
+            self.emit("    return line orelse \"\";");
+            self.emit("}");
+self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
             self.emit("    var s = t;");
             self.emit("    while (s.len > 0 and s[s.len - 1] == '\\n') s = s[0 .. s.len - 1];");
             self.emit("    return s;");
