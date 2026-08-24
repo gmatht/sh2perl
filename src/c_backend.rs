@@ -186,6 +186,8 @@ pub struct Render {
     need_stat: bool,
     /// fnmatch.h (test glob `==`/`!=` with * or ?)
     need_fnmatch: bool,
+    /// string-var ++/-- helpers (sequence-point-safe inc/dec)
+    need_incdec: bool,
     /// regex.h (test `=~`)
     need_regex: bool,
     /// grepMatches (`grep -o` lift) native match-all helper
@@ -685,6 +687,27 @@ impl Render {
             self.emit("  int rc = pclose(p);");
             self.emit("  _sh_rc = (rc == -1) ? 127 : (WIFEXITED(rc) ? WEXITSTATUS(rc) : 1);");
             self.emit("  while (n > 0 && (buf[n - 1] == '\\n' || buf[n - 1] == '\\r')) buf[--n] = 0;");
+            self.emit("}");
+            self.emit("/* string-var ++/-- — function-call boundaries are sequence");
+            self.emit("   points, so two mutations in one expression stay ordered */");
+            self.emit("static long long _sh_postinc(char **v, int d) {");
+            self.emit("  long long r = atoll(*v ? *v : \"\");");
+            self.emit("  char b[32]; snprintf(b, sizeof b, \"%lld\", (long long)(r + d));");
+            self.emit("  free(*v); *v = strdup(b); return r;");
+            self.emit("}");
+            self.emit("static long long _sh_preinc(char **v, int d) {");
+            self.emit("  long long r = atoll(*v ? *v : \"\") + d;");
+            self.emit("  char b[32]; snprintf(b, sizeof b, \"%lld\", r);");
+            self.emit("  free(*v); *v = strdup(b); return r;");
+            self.emit("}");
+            self.emit("/* fixed-buffer forms: write in place (bound asserted elsewhere) */");
+            self.emit("static long long _sh_postinc_buf(char *v, int d) {");
+            self.emit("  long long r = atoll(v);");
+            self.emit("  snprintf(v, 32, \"%lld\", (long long)(r + d)); return r;");
+            self.emit("}");
+            self.emit("static long long _sh_preinc_buf(char *v, int d) {");
+            self.emit("  long long r = atoll(v) + d;");
+            self.emit("  snprintf(v, 32, \"%lld\", r); return r;");
             self.emit("}");
             self.emit("/* eval / . : import a NUL-separated env dump back into this process */");
             self.emit("static void _sh_import_env(const char *path) {");
@@ -1301,17 +1324,26 @@ impl Render {
                         format!("{}{}", name, if *delta >= 0 { "++" } else { "--" })
                     }
                 } else {
-                    // a Str var: read the value, compute, write back —
-                    // `i++` on a char* would be a pointer increment
-                    let store = self.store_read(var);
-                    let t = self.num_temp(&format!(
-                        "((long long)atoll({store}) {})",
-                        if *delta >= 0 { "+ 1" } else { "- 1" }
-                    ));
+                    // a Str var: helper calls — SEQUENCE POINTS are
+                    // well-defined across functions, unlike the hoisted-
+                    // temp strcpy form (two mutations in one expression,
+                    // `j = i++ + ++i`, read stale temps and lost the
+                    // second write). postinc returns the OLD value,
+                    // preinc the NEW one.
+                    self.need_incdec = true;
+                    let d = if *delta >= 0 { "1" } else { "-1" };
                     if self.buf_bound(var).is_some() {
-                        format!("(strcpy({name}, {t}), atoll({t}))")
+                        // fixed buffer: write IN PLACE (&name has the
+                        // wrong pointer type for a char** helper)
+                        if *prefix {
+                            format!("_sh_preinc_buf({name}, {d})")
+                        } else {
+                            format!("_sh_postinc_buf({name}, {d})")
+                        }
+                    } else if *prefix {
+                        format!("_sh_preinc(&{name}, {d})")
                     } else {
-                        format!("({name} = {t}, atoll({t}))")
+                        format!("_sh_postinc(&{name}, {d})")
                     }
                 }
             }
@@ -1766,6 +1798,16 @@ impl Render {
                 },
                 "join" => self.join_value(args),
                 "arith" => {
+                    // NATIVE first: parse the arith text ourselves —
+                    // side-effecting forms (i++ + ++i) then mutate the C
+                    // vars directly instead of losing the writes in a
+                    // child bash
+                    if let Some(s) = Self::str_arg(args, 0) {
+                        if let Some(a) = crate::shir::parse_arith(&s) {
+                            let x = self.arith(&a);
+                            return self.num_temp(&x);
+                        }
+                    }
                     // VALUE context `x=$(( dyn ))`: capture the arith
                     // RESULT (the call() dispatch's first `arith` arm is
                     // the truthiness site — wrong for a value). The
@@ -3727,6 +3769,19 @@ impl Render {
                 // native printf for the safe format subset (%s/%d/%% etc.),
                 // falling back to shell-out for bash-specific conversions
                 // (%b, %q, %(…)T, \c, recycling) — favour native C
+                if matches!(words.first(), Some(IrExpr::Str(s, _)) if s == "-v") {
+                    if let (Some(v), Some(fmtw)) = (words.get(1), words.get(2)) {
+                        if let Some(name) = Self::str_arg(&[(*v).clone()], 0) {
+                            let rest: Vec<&IrExpr> = words.iter().skip(2).copied().collect();
+                            if let Some(p) = self.try_native_printf_into(&rest, Some(&self.c_ident(&name))) {
+                                self.store.insert(name.clone());
+                                self.need_sh = true;
+                                return format!("(_sh_rc = 0, {p})");
+                            }
+                        }
+                        let _ = fmtw;
+                    }
+                }
                 if let Some(p) = self.try_native_printf(&words) {
                     self.need_sh = true;
                     format!("(_sh_rc = 0, {p})")
@@ -6116,8 +6171,34 @@ impl Render {
     /// `\c` / `\0NNN` escapes, and format-recycling (extra/insufficient
     /// args) — the conservative path keeps those on `bash -c`.
     fn try_native_printf(&mut self, words: &[&IrExpr]) -> Option<String> {
+        self.try_native_printf_into(words, None)
+    }
+
+    /// `printf -v VAR fmt args…` renders into VAR (a snprintf into the
+    /// store) instead of stdout; `into == None` writes stdout.
+    fn try_native_printf_into(&mut self, words: &[&IrExpr], into: Option<&str>) -> Option<String> {
+        // the format word is often a pure-literal Interpolate — collapse
+        // it so printf -v formats don't fall back to shell-out
         let fmt_str = match words.first() {
             Some(IrExpr::Str(s, _)) => s.clone(),
+            Some(IrExpr::Interpolate(parts)) => {
+                let mut out = String::new();
+                let mut all_lit = true;
+                for p in flatten_parts(parts) {
+                    match p {
+                        InterpPart::Lit(l) => out.push_str(&l),
+                        InterpPart::Expr(_) => {
+                            all_lit = false;
+                            break;
+                        }
+                    }
+                }
+                if all_lit {
+                    out
+                } else {
+                    return None;
+                }
+            }
             _ => return None,
         };
         let args = &words[1..];
@@ -6231,6 +6312,30 @@ impl Render {
         // format-recycling (bash reuses fmt for leftover args) needs shell-out
         if arg_i != args.len() {
             return None;
+        }
+        if let Some(dest) = into {
+            // assign the formatted text to a variable (printf -v)
+            let name = dest;
+            if cargs.is_empty() {
+                if let Some(b) = self.buf_bound(name) {
+                    return Some(format!(
+                        "(strcpy({name}, {}), 1)",
+                        Self::cstr(&fmt)
+                    ));
+                }
+                return Some(format!("({name} = {}, 1)", Self::cstr(&fmt)));
+            }
+            let t = self.str_temp(65536);
+            let store = if self.buf_bound(name).is_some() {
+                format!("strcpy({}, {t})", name)
+            } else {
+                format!("{name} = strdup({t});")
+            };
+            return Some(format!(
+                "({{ snprintf({t}, sizeof {t}, {}, {args}); {store} }})",
+                Self::cstr(&fmt),
+                args = cargs.join(", "),
+            ));
         }
         if cargs.is_empty() {
             Some(format!("fputs({}, stdout)", Self::cstr(&fmt)))
@@ -6382,6 +6487,30 @@ impl Render {
     }
 
     fn stmt(&mut self, s: &IrStmt) {
+        // statement-position `printf -v VAR …`: assign NATIVELY instead of
+        // losing the assignment in a child bash
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+            if (func == "exec" || func == "builtin")
+                && Self::str_arg(args, 0).as_deref() == Some("printf")
+            {
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    if matches!(items.first(), Some(IrExpr::Str(sv, _)) if sv == "-v") {
+                        if let Some(IrExpr::Str(name, _)) = items.get(1) {
+                            let rest: Vec<&IrExpr> =
+                                items.iter().skip(2).collect();
+                            if let Some(p) = self.try_native_printf_into(
+                                &rest,
+                                Some(&self.c_ident(name)),
+                            ) {
+                                self.store.insert(name.clone());
+                                self.emit(&format!("(_sh_rc = 0, {p});"));
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         match s {
             IrStmt::Expr(e) => {
                 match e {
@@ -9054,6 +9183,15 @@ fn collect_vars_full(
 /// Collect vars ASSIGNED in a statement list (Assign/Declare targets,
 /// arith x=/x++/x--), not mere reads — the per-function hoist declares
 /// exactly these (a read-only var is the caller's).
+/// exec/builtin args of a `printf -v VAR …` call.
+fn is_printf_v_call(args: &[IrExpr]) -> bool {
+    matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "printf")
+        && matches!(
+            args.get(1),
+            Some(IrExpr::Array(items)) if matches!(items.first(), Some(IrExpr::Str(s, _)) if s == "-v")
+        )
+}
+
 fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
@@ -9062,6 +9200,18 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     out.insert(t.var.clone());
                 }
                 collect_assigned_expr(expr, out);
+            }
+            // `printf -v NAME …` ASSIGNS the formatted text to NAME —
+            // the var must hoist a declaration or the native -v lowering
+            // writes an undeclared identifier
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if is_printf_v_call(args) =>
+            {
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    if let Some(IrExpr::Str(n, _)) = items.get(1) {
+                        out.insert(n.clone());
+                    }
+                }
             }
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
@@ -9174,6 +9324,19 @@ fn collect_vars_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             }
         }
         IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+            // `printf -v NAME …` assigns NAME — the hoist must see it or
+            // the native -v lowering writes an undeclared identifier
+            if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                if cmd == "printf" {
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        if matches!(items.first(), Some(IrExpr::Str(s, _)) if s == "-v") {
+                            if let Some(IrExpr::Str(n, _)) = items.get(1) {
+                                out.insert(n.clone());
+                            }
+                        }
+                    }
+                }
+            }
             // `let "i++"` hides its var inside a STRING arg — the hoist
             // must see it or the loop var is undeclared in C.
             if let Some(IrExpr::Str(cmd, _)) = args.first() {
