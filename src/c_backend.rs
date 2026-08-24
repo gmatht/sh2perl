@@ -692,6 +692,7 @@ impl Render {
             self.emit("if (*c == '\\'') { memcpy(p, \"'\\\"'\\\"'\", 5); p += 5; }");
             self.emit("    else *p++ = *c;");
             self.emit("  }");
+            self.emit("  *p++ = '\\''; *p = 0;");
             // pass the CURRENT positionals to the child ("$@" / $1 inside
             // command substitutions and sites must see the enclosing
             // function's parameters â bash subshell semantics)
