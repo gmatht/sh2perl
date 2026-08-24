@@ -9913,15 +9913,33 @@ fn brace_expand(args: &[IrExpr]) -> Vec<String> {
     if groups.is_empty() {
         return vec![format!("{prefix}{suffix}")];
     }
-    let mut out: Vec<String> = vec![String::new()];
-    for g in &groups {
+    // the MIDDLES are the literal text BETWEEN consecutive braces
+    // (`file_{a..z}_{1..10}.{txt,log}` — "_" joins group 0→1, "." 1→2);
+    // dropping them glued the words together (064_02)
+    let middles: Vec<String> = args
+        .get(2)
+        .and_then(|a| match a {
+            IrExpr::Json(v) => v.as_array().map(|xs| {
+                xs.iter()
+                    .map(|x| x.as_str().unwrap_or_default().to_string())
+                    .collect()
+            }),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut out: Vec<String> = groups
+        .first()
+        .cloned()
+        .unwrap_or_else(|| vec![String::new()]);
+    for (gi, g) in groups.iter().enumerate().skip(1) {
         if g.is_empty() {
             continue;
         }
+        let m = middles.get(gi - 1).cloned().unwrap_or_default();
         let mut next = Vec::new();
         for o in &out {
             for item in g {
-                next.push(format!("{o}{item}"));
+                next.push(format!("{o}{m}{item}"));
             }
         }
         out = next;
