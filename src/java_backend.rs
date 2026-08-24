@@ -67,6 +67,12 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
     let has_fns = prog.stmts.iter().any(|st| {
         matches!(st, IrStmt::Function { name, .. } if name != "main")
     });
+    if has_fns || prog.stmts.iter().any(|st| matches!(st, IrStmt::Function { .. })) {
+        out.push_str("    static String __sh_line(String s, int n) {\n");
+        out.push_str("        String[] p = s.split(\"\\\\n\");\n");
+        out.push_str("        return (n >= 0 && n < p.length) ? p[n] : \"\";\n");
+        out.push_str("    }\n");
+    }
     if has_fns {
         out.push_str("    static String[] __sh_fArgs = new String[0];\n");
         out.push_str("    static String __sh_fArg(int n) {\n");
@@ -243,6 +249,10 @@ fn java_home(name: &str) -> String {
 }
 
 fn push_var(name: &str, out: &mut Vec<String>) {
+    // positional params ($1..) are NOT fields — they read __sh_fArg(N)
+    if name.chars().all(|c| c.is_ascii_digit()) {
+        return;
+    }
     let j = java_home(name);
     if !out.iter().any(|v| *v == j) {
         out.push(j);
@@ -868,12 +878,75 @@ impl JavaCtx {
 
 fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), String> {
     match e {
-        IrExpr::Call { func, args, .. } if func == "test" => {
+        // setVar(cap, capture(Arrow[fnCall(f, args)])) — the C frontend's
+        // outparam channel: the callee echoes its out-param values; the
+        // caller captures STDOUT into the var (System.out redirection)
+        IrExpr::Call { func, args, .. } if func == "setVar" => {
+            if let (Some(IrExpr::Str(name, _)), Some(val)) = (args.first(), args.get(1)) {
+                if let IrExpr::Call { func: cf, args: cargs, .. } = val {
+                    if cf == "capture" {
+                        if let Some(IrExpr::Arrow(body)) = cargs.first() {
+                            let mut call_src = String::new();
+                            let mut captured = false;
+                            for st in body.iter() {
+                                if let IrStmt::Expr(IrExpr::Call { func: f2, args: a2, .. }) = st {
+                                    if f2 == "fnCall" || f2 == "fnValue" {
+                                        if let Some(IrExpr::Str(fname, _)) = a2.first() {
+                                            let mut vals: Vec<String> = Vec::new();
+                                            if let Some(IrExpr::Array(items)) = a2.get(1) {
+                                                for w in items {
+                                                    vals.push(word_to_java(w)?);
+                                                }
+                                            }
+                                            call_src = format!(
+                                                "{}(__sh_setArgs(new String[]{{{}}}))",
+                                                java_ident(fname),
+                                                vals.join(", ")
+                                            );
+                                            captured = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if captured {
+                                indent(out, d);
+                                out.push_str("java.io.PrintStream __old = System.out;\n");
+                                indent(out, d);
+                                out.push_str("java.io.ByteArrayOutputStream __b = new java.io.ByteArrayOutputStream();\n");
+                                indent(out, d);
+                                out.push_str("System.setOut(new java.io.PrintStream(__b));\n");
+                                indent(out, d);
+                                out.push_str(&call_src);
+                                if !call_src.ends_with(';') {
+                                    out.push(';');
+                                }
+                                out.push('\n');
+                                indent(out, d);
+                                out.push_str("System.setOut(__old);\n");
+                                indent(out, d);
+                                out.push_str(&format!(
+                                    "{} = __b.toString();\n",
+                                    java_home(name)
+                                ));
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+
             // a bare `[ cond ]` statement: emit the condition truth
             if let Some(IrExpr::Str(s, _)) = args.first() {
                 let c = test_render(s).unwrap_or_else(|| "true".to_string());
-                indent(out, d);
-                out.push_str(&format!("boolean __t = {c};\n"));
+                let seq = {
+                    // expr_stmt_to_java is a free fn: thread uniqueness via
+                    // a static counter (atomic would be overkill — the
+                    // render is single-threaded)
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static SEQ: AtomicUsize = AtomicUsize::new(0);
+                    SEQ.fetch_add(1, Ordering::Relaxed) + 1
+                };
+                out.push_str(&format!("boolean __t{seq} = {c};\n"));
                 return Ok(());
             }
             Ok(())
@@ -1597,6 +1670,17 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
                 return Ok(());
             }
             Err("getVar with non-literal name (v1)".into())
+        }
+        IrExpr::Call { func, args, .. } if func == "line" => {
+            // multi-return line read (`line(cap, N)`): the Nth newline-
+            // split field of the captured output
+            if let (Some(v), Some(IrExpr::Str(i, _))) = (args.first(), args.get(1)) {
+                let ve = word_to_java(v)?;
+                let n: usize = i.parse().unwrap_or(0);
+                out.push_str(&format!("__sh_line({ve}, {n})"));
+                return Ok(());
+            }
+            Err("line with unsupported shape".into())
         }
         IrExpr::Call { func, args, .. } if func == "setArray" => {
             // `declare -a arr=(a b c)` — render as a bracketed array string
