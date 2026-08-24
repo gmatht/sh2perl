@@ -1469,6 +1469,46 @@ impl Render {
         match s {
             IrStmt::Ext(_) => panic!("zig backend: Ext node unsupported"),
             IrStmt::Expr(e) => {
+                // setVar(name, value) — the frontend-emitted store write:
+                // a typed assignment to the var's zig home (dotted struct
+                // names sanitize consistently for reads)
+                if let IrExpr::Call { func, args } = e {
+                    if func == "setVar" {
+                        if let (Some(IrExpr::Str(name, _)), Some(value)) =
+                            (args.first(), args.get(1))
+                        {
+                            let v = self.zig_ident(name);
+                            self.mark_written(name);
+                            let rhs = if self.is_num(name) {
+                                self.expr_num(value)
+                            } else {
+                                self.expr_str(value)
+                            };
+                            self.emit(&format!("{v} = {rhs};"));
+                            return;
+                        }
+                    }
+                    if func == "fnCall" || func == "fnValue" {
+                        if let Some(IrExpr::Str(name, _)) = args.first() {
+                            let m = self.zig_ident(name);
+                            self.mark_read(name);
+                            let call_args: Vec<String> = args
+                                .get(1)
+                                .and_then(|a| match a {
+                                    IrExpr::Array(items) => Some(
+                                        items.iter().map(|w| self.expr_str(w)).collect(),
+                                    ),
+                                    _ => None,
+                                })
+                                .unwrap_or_default();
+                            self.emit(&format!(
+                                "_ = {m}(&[_][]const u8{{ {} }});",
+                                call_args.join(", ")
+                            ));
+                            return;
+                        }
+                    }
+                }
                 // statement-position arith (`runs++` — the do-while idiom):
                 // render natively (`runs += 1;`) instead of the sh2Arith
                 // stub (which was called without being emitted)
@@ -2232,7 +2272,10 @@ impl Render {
         // zig 0.16 errors on a `var` that is never mutated — emit `const`
         // unless the rendered body assigns the name somewhere
         let mut decls: Vec<String> = Vec::new();
-        for v in &written {
+        // self.written (not the pass-1 local): setVar arms discovered
+        // during body rendering add their names here
+        let written_now: Vec<String> = self.written.iter().cloned().collect();
+        for v in &written_now {
             // user-function locals hoist with their fn — never in main
             if self.fn_locals.contains(v) {
                 continue;
