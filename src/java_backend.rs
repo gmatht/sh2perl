@@ -933,21 +933,41 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
                         }
                     }
                 }
+            // a PLAIN setVar: typed assignment to the sanitized home
+            if let (Some(IrExpr::Str(name, _)), Some(val)) = (args.first(), args.get(1)) {
+                let v = word_to_java(val)?;
+                indent(out, d);
+                out.push_str(&format!("{} = {};\n", java_home(name), v));
+                return Ok(());
+            }
             }
 
-            // a bare `[ cond ]` statement: emit the condition truth
-            if let Some(IrExpr::Str(s, _)) = args.first() {
-                let c = test_render(s).unwrap_or_else(|| "true".to_string());
-                let seq = {
-                    // expr_stmt_to_java is a free fn: thread uniqueness via
-                    // a static counter (atomic would be overkill — the
-                    // render is single-threaded)
+            // a bare `[ cond ]` / arith-truth statement: emit the
+            // a bare `[ cond ]` / arith-truth statement: emit the
+            // condition truth — ONLY for actual condition calls (a
+            // setVar's NAME argument must never render as a -n test of
+            // itself)
+            if matches!(
+                func.as_str(),
+                "test" | "testArith" | "arith"
+            ) {
+                if let Some(IrExpr::Str(s2, _)) = args.first() {
+                    let norm = norm_arith_text(s2);
+                    let c = match crate::shir::parse_arith(norm.trim()) {
+                        Some(ast) => {
+                            let mut r = String::new();
+                            arith_to_java(&ast, &mut r)?;
+                            format!("(({}) != 0)", r)
+                        }
+                        None => test_render(s2).unwrap_or_else(|| "true".to_string()),
+                    };
                     use std::sync::atomic::{AtomicUsize, Ordering};
-                    static SEQ: AtomicUsize = AtomicUsize::new(0);
-                    SEQ.fetch_add(1, Ordering::Relaxed) + 1
-                };
-                out.push_str(&format!("boolean __t{seq} = {c};\n"));
-                return Ok(());
+                    static TSEQ: AtomicUsize = AtomicUsize::new(0);
+                    let seq = TSEQ.fetch_add(1, Ordering::Relaxed) + 1;
+                    indent(out, d);
+                    out.push_str(&format!("boolean __t{seq} = {c};\n"));
+                    return Ok(());
+                }
             }
             Ok(())
         }
