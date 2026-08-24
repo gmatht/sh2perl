@@ -3187,6 +3187,28 @@ impl Render {
             self.emit(&format!("{m}[{key}] = {rhs};"));
             return;
         }
+        // a BAKED array-element target ("a[0]" — the C frontend's
+        // dynamic-array writes arrive as store keys with the index baked
+        // into the name): route through the runtime arrays map so reads
+        // via arrIdx see the same home
+        if let Some(close) = t.var.find('[') {
+            if t.var.ends_with(']') {
+                let base = &t.var[..close];
+                let key_text = &t.var[close + 1..t.var.len() - 1];
+                if let Ok(ki) = key_text.parse::<i64>() {
+                    self.mark_arr(base);
+                    self.mark_written(base);
+                    self.mark_written(&t.var);
+                    let rhs = self.expr_any(expr);
+                    self.flush_sides();
+                    let sync = self.sync_inline(base);
+                    self.emit(&format!(
+                        "{base} = setArrAt({base}, {ki}, {rhs});{sync}"
+                    ));
+                    return;
+                }
+            }
+        }
         let m = self.go_ident(&t.var);
         self.mark_written(&t.var);
         // array assignment forms
@@ -6121,6 +6143,12 @@ const RUNTIME_HELPERS: &[&str] = &[
     "}",
     "",
     "func arrLen(a []any) int64 { return int64(len(a)) }",
+    "",
+    "func setArrAt(a []any, i int64, v any) []any {",
+    "    for int64(len(a)) <= i { a = append(a, nil) }",
+    "    a[i] = v",
+    "    return a",
+    "}",
     "",
     "func arrIdx(a []any, i int64) any {",
     "    if i >= 0 && int(i) < len(a) { return a[i] }",
