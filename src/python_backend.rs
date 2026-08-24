@@ -1376,6 +1376,51 @@ impl Render {
                         }
                         _ => {}
                     }
+                    // ${var+word} family — the frontend folds parameter
+                    // expansions into the NAME ("MYVAR+set"). Decode the
+                    // suffix: two-char ops first (:+ :- := :?), then single
+                    // (+ - = ?). Set-ness uses the collected write sets
+                    // (unset == never-written); empty-vs-unset is not
+                    // modeled (all vars pre-declare ""), matching the
+                    // runtime's own scalar store semantics.
+                    if name.len() > 1 && !name.starts_with('$')
+                        && !name.chars().next().unwrap().is_ascii_digit()
+                    {
+                        let bytes = name.as_bytes();
+                        let mut pos: Option<usize> = None;
+                        for i in 1..bytes.len() {
+                            if matches!(bytes[i], b'+' | b'-' | b'=' | b'?') {
+                                pos = Some(i);
+                                break;
+                            }
+                        }
+                        if let Some(i) = pos {
+                            let (root, rest) = name.split_at(i);
+                            let word = &rest[1..];
+                            let colon_form = root.ends_with(':');
+                            let root = root.trim_end_matches(':');
+                            let is_set = self.written.contains(root)
+                                || self.store_written.contains(root)
+                                || self.var_types.contains_key(root);
+                            let non_empty = is_set; // cannot distinguish; see comment
+                            match (&rest[..1], colon_form) {
+                                ("+", false) => {
+                                    return if is_set { Self::py_str(word) } else { "\"\"".into() }
+                                }
+                                (":+" | "+", true) | (":+", _) => {
+                                    return if non_empty { Self::py_str(word) } else { "\"\"".into() }
+                                }
+                                ("-", false) => {
+                                    return if is_set {
+                                        self.call("getVar", &[IrExpr::Str(root.to_string(), crate::ir::StrStyle::DoubleQuoted)])
+                                    } else {
+                                        Self::py_str(word)
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     // bracket target: native list/dict subscript
                     // (`${arr[1]}`, `${map[foo]}`, `${map[$k]}`)
                     if let Some((root, key)) = Self::split_target(name) {
@@ -1962,12 +2007,28 @@ impl Render {
                 stages.iter().map(|s| IrExpr::Arrow(s.clone())).collect();
             return Some(self.call("pipeline", &[IrExpr::Array(stage_arrows)]));
         }
+        // `$(cmd > file 2>/dev/null)` — a redirect-statement body: run
+        // the whole group under bash -c with its redirects re-rendered
+        if let [IrStmt::Redirect { inner, redirects, .. }] = body {
+            let inner_text = self.body_shell_text(inner)?;
+            let mut text = format!("( {inner_text} )");
+            for r in redirects.iter() {
+                let t = self.expr(&r.target);
+                match r.mode.as_str() {
+                    "w" => text.push_str(&format!(">{t}")),
+                    "a" => text.push_str(&format!(">>{t}")),
+                    "r" => text.push_str(&format!("<{t}")),
+                    _ => {}
+                }
+            }
+            self.need_subprocess = true;
+            self.need_capture = true;
+            return Some(format!("__sh_capture_bash({})", Self::py_str(&text)));
+        }
         if let Some(text) = self.body_shell_text(body) {
             self.need_subprocess = true;
-            return Some(format!(
-                "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
-                Self::py_str(&text)
-            ));
+            self.need_capture = true;
+            return Some(format!("__sh_capture_bash({})", Self::py_str(&text)));
         }
         None
     }
@@ -3240,10 +3301,14 @@ impl Render {
             // yields status 127 and the script CONTINUES, like bash
             self.emit("def __sh_exec(argv):");
             self.emit("    import subprocess");
+            // bash truth convention: rc 0 = success = TRUE. Returning the
+            // raw rc would invert every `if cmd:` / `cmd && cmd` chain
+            // (python treats 0 as falsy). Command-not-found -> False, like
+            // a failed command; the script continues either way.
             self.emit("    try:");
-            self.emit("        return subprocess.call(argv)");
+            self.emit("        return subprocess.call(argv) == 0");
             self.emit("    except OSError:");
-            self.emit("        return 127");
+            self.emit("        return False");
         }
         if self.need_capture {
             self.emit("");
