@@ -576,6 +576,10 @@ here either); file CONTENTS are never opened. Backends implement the
 walk once (JS runtime member, Perl opendir-recursion, Java Files.walk,
 Zig recursive iterator); the core decides what `find` means.
 
-Implementation order: .node declaration → text_ops reductions (statement,
-pipeline-count, capture-count) → renderers (estree runtime member +
-whitelist row, perl, java, zig) → targeted byte-exact tests → corpus sweep.
+**LANDED** (in that order). All four backends byte-exact vs bash for the
+capture count, `-type d` listing (start point included) and nested walks:
+estree `sh2.walkLines` runtime member (+gate whitelist row), perl
+recursive opendir/readdir callback, java `Files.find`/`Files.walk`
+(start-point parity via find's own root visit), zig list-then-iterate
+(O(tree) metadata, contents never opened). Corpus sweeps stay green in
+both configs.
