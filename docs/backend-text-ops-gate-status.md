@@ -15,7 +15,7 @@ sh2perl examples; sweeps via `fail-estree` with
 | pl (backend corpus render+run vs bash) | fail-estree PERL path | 274/551 (50%) | **+10 vs baseline** (264); ForEachLine open/while/chomp loops land |
 | fish | frontend-js-gate fish | 78/80 (97%) | n/a |
 | zsh | frontend-js-gate zsh | 87/90 (96%) | n/a |
-| java | backend_behavior | 69 pass / 30 fail / 452 skip | targeted streaming idioms byte-exact (compiled+run) |
+| java | backend_behavior | 70 pass / 26 fail / 455 skip | targeted streaming idioms byte-exact (compiled+run) |
 | zig | backend_behavior | 0 / 551 skip | targeted streaming idioms byte-exact (compiled+run); corpus scripts exceed renderer coverage |
 
 Regression safety (both configs): panic count 0; cargo test --lib 382
@@ -44,10 +44,12 @@ java compiled+run).
 3. **zsh (87/90)**: `t36_read_stdin` (same read gap) +
    `t73_zsh_arith_cond` — zsh arithmetic-condition `(( x > 3 ))` if-lowering
    gap in the zsh-sh-go frontend.
-4. **java (69/99 runnable)**: `shir_to_java`'s v1 subset errors on
-   functions, arrays, assoc arrays, case-with-fallthrough and other
-   constructs → 452 skips; among runnable files 30 stdout mismatches are
-   non-text_ops lowerings (process substitution, advanced param ops).
+4. **java (70/99 runnable)**: `shir_to_java`'s v1 subset errors on
+   functions, arrays, assoc arrays and other constructs → 455 skips; among
+   runnable files 26 stdout mismatches are non-text_ops feature gaps:
+   ANSI-C $'…' quoting, `local`, trap/eval semantics, heredoc-redirect,
+   process substitution. Case-glob patterns (`*llo`) and tight `[[ x==y ]]
+   comparisons now lower natively (sh2Glob + quote-aware op split).
 5. **zig (0/551 gated)**: renders the reduced text-ops subset natively
    (idiom suite green) but general corpus scripts hit mark_todo paths
    (`sort`/`uniq`/multi-stage pipelines/user functions) whose emitted

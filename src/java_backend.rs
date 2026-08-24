@@ -25,6 +25,8 @@ struct JavaCtx {
     loop_depth: usize,
     block_labels: Vec<String>,
     block_seq: usize,
+    /// a case clause used a glob pattern → sh2Glob helper needed
+    need_glob: bool,
 }
 
 /// Render a ShIR program to Java source. `Err` on a construct outside
@@ -49,6 +51,9 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
     }
     if stmts_use_ext_value(&prog.stmts) {
         out.push_str(EXT_HELPERS);
+    }
+    if stmts_need_glob(&prog.stmts) {
+        out.push_str(GLOB_HELPER);
     }
     // every assignment target / store / arith read becomes a static
     // String field (empty default — bash reads an unset var as "")
@@ -544,7 +549,21 @@ impl JavaCtx {
                         .patterns
                         .iter()
                         .filter(|p| p.as_str() != "*")
-                        .map(|p| format!("{}.equals({})", dstr, java_str_lit(p)))
+                        .map(|p| {
+                            // bash case patterns are GLOBS (* ? [...]).
+                            // A literal-safe pattern stays .equals();
+                            // anything with wildcards lowers to the
+                            // sh2Glob regex translation.
+                            let literal = !p.chars().any(|c| "*?[".contains(c));
+                            if literal {
+                                format!("{}.equals({})", dstr, java_str_lit(p))
+                            } else if p.as_str() == "*" {
+                                "true".to_string()
+                            } else {
+                                self.need_glob = true;
+                                format!("sh2Glob({}, {})", dstr, java_str_lit(p))
+                            }
+                        })
                         .collect();
                     if conds.is_empty() && is_default {
                         indent(out, d);
@@ -1655,6 +1674,19 @@ fn is_mem_func(func: &str) -> bool {
 /// [v], and -a/-o conjunctions. Anything else → None (the caller keeps
 /// the v1 fallback).
 fn test_render(s: &str) -> Option<String> {
+    // The IR packs tight comparisons (`"$var"=="value"`) — split on the
+    // first ==/!= that sits OUTSIDE quotes, then render both sides.
+    for op in ["==", "!="] {
+        if let Some((l, r)) = split_test_op(s, op) {
+            let a = test_render(l.trim())?;
+            let b = test_render(r.trim())?;
+            return Some(if op == "==" {
+                format!("({a}.equals({b}))")
+            } else {
+                format!("(!{a}.equals({b}))")
+            });
+        }
+    }
     for (sep, joiner) in [(" -a ", " && "), (" -o ", " || ")] {
         if s.contains(sep) {
             let mut parts = Vec::new();
@@ -1702,6 +1734,34 @@ fn test_render(s: &str) -> Option<String> {
         [v] => Some(format!("(!{}.isEmpty())", test_operand(v)?)),
         _ => None,
     }
+}
+
+/// Split `s` on the first `op` occurring OUTSIDE double/single quotes.
+fn split_test_op<'a>(s: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' | b'\'' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    if b[i] == b'\\' { i += 1; }
+                    i += 1;
+                }
+            }
+            _ => {
+                if s[i..].starts_with(op) {
+                    // not part of a longer op (!= vs =): require the char
+                    // before isn't '!' when matching '==' is fine; simple
+                    // left-to-right first hit wins
+                    return Some((&s[..i], &s[i + op.len()..]));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// A test operand → a Java STRING expression (a field read for `$name`,
@@ -1762,6 +1822,54 @@ fn stmts_use_ext_value(stmts: &[IrStmt]) -> bool {
 
 /// Shared helpers for the text-ops primitive lowerings. Emitted only when
 /// a primitive value node is present (see stmts_use_ext_value).
+/// Does any case clause carry a glob (non-literal, non-*) pattern?
+fn stmts_need_glob(stmts: &[IrStmt]) -> bool {
+    fn walk(s: &[IrStmt]) -> bool {
+        s.iter().any(|st| match st {
+            IrStmt::Case { clauses, .. } => clauses.iter().any(|cl| {
+                cl.patterns.iter().any(|p| {
+                    p.as_str() != "*" && p.chars().any(|c| "*?[".contains(c))
+                })
+            }),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => walk(b),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                walk(then) || walk(else_)
+                    || elsifs.iter().any(|(_, b)| walk(b))
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::ForInit { body, .. } => walk(body),
+            _ => false,
+        })
+    }
+    walk(stmts)
+}
+
+const GLOB_HELPER: &str = r#"    static boolean sh2Glob(String s, String pat) {
+        StringBuilder re = new StringBuilder();
+        for (int i = 0; i < pat.length(); i++) {
+            char c = pat.charAt(i);
+            switch (c) {
+                case '*' -> re.append(".*");
+                case '?' -> re.append('.');
+                case '[' -> {
+                    int j = i + 1;
+                    if (j < pat.length() && pat.charAt(j) == '!' || pat.charAt(j) == '^') j++;
+                    while (j < pat.length() && pat.charAt(j) != ']') j++;
+                    String cls = pat.substring(i, Math.min(j + 1, pat.length()));
+                    if (cls.startsWith("[!")) cls = "[" + cls.substring(2);
+                    if (j >= pat.length()) { re.append("\\").append(c); continue; }
+                    re.append(cls.replace("\\", "\\"));
+                    i = Math.min(j, pat.length() - 1);
+                }
+                default -> {
+                    if ("\\.^$[]{}()|+?".indexOf(c) >= 0) re.append('\\');
+                    re.append(c);
+                }
+            }
+        }
+        return s.matches(re.toString());
+    }
+"#;
+
 const EXT_HELPERS: &str = r#"    static String sh2Take(String t, int k, boolean fromEnd) {
         String[] L = t.split("\\n", -1);
         int n = L.length;
