@@ -2342,6 +2342,43 @@ impl Render {
             first_stmt = false;
             match s {
                 IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
+                    // a command reading a C-side array (`${LIST:-}`) needs
+                    // it MATERIALIZED into the child command
+                    {
+                        let mut texts: Vec<String> = Vec::new();
+                        fn gather(e: &IrExpr, out: &mut Vec<String>) {
+                            match e {
+                                IrExpr::Str(s, _) => out.push(s.clone()),
+                                IrExpr::Array(items) => items.iter().for_each(|x| gather(x, out)),
+                                IrExpr::Interpolate(parts) => parts.iter().for_each(|p| {
+                                    if let InterpPart::Expr(x) = p { gather(x, out) }
+                                }),
+                                IrExpr::Call { args, .. } => args.iter().for_each(|x| gather(x, out)),
+                                _ => {}
+                            }
+                        }
+                        for a in args {
+                            gather(a, &mut texts);
+                        }
+                        let joined = texts.join(" ");
+                        let names: Vec<String> = self.arrays.iter().cloned().collect();
+                        for n in names {
+                            // assoc arrays materialize via _sh_assoc_init
+                            if self.assoc_arrays.contains(&n) {
+                                continue;
+                            }
+                            let id = self.c_ident(&n);
+                            if !joined.is_empty() && joined.contains(&id) {
+                                self.emit(&format!(
+                                    "_sh_idx_init(&_sh_cmd, &_sh_cap, {}, {}, {}_len);",
+                                    Self::cstr(&n),
+                                    id,
+                                    id
+                                ));
+                                self.sh_add(buf, ";");
+                            }
+                        }
+                    }
                     // `while IFS= read -r line` — the core splits the
                     // env-prefix assignment into words (cmd=NAME,
                     // args[0]="=", args[1]=value?): glue NAME=value and
@@ -3659,10 +3696,14 @@ impl Render {
 
     /// A shell-out exec site (statement or expr position).
     fn shell_exec(&mut self, args: &[IrExpr]) -> String {
+        let arr_inits = self.array_inits_for_args(&args);
         let args = args.to_vec();
         self.shell_site(
-            |r| {
+            move |r| {
                 r.emit("_sh_reset();");
+                for l in &arr_inits {
+                    r.emit(l);
+                }
                 if let Some(cmd) = Self::str_arg(&args, 0) {
                     r.sh_word(
                         CmdBuf::Shared,
@@ -3702,6 +3743,11 @@ impl Render {
     fn array_inits_for_text(&self, text: &str) -> Vec<String> {
         let mut out = Vec::new();
         for n in &self.arrays {
+            // assoc arrays are emitted by the assoc loop below (their C
+            // storage is map_k/map_v/map_n — no plain `map` ident)
+            if self.assoc_arrays.contains(n) {
+                continue;
+            }
             let id = self.c_ident(n);
             if text.contains(&id) {
                 out.push(format!(
@@ -3711,7 +3757,44 @@ impl Render {
                 out.push("_sh_add(\";\");".to_string());
             }
         }
+        // ASSOC arrays live as map_k/map_v/map_n — their initializer is
+        // `_sh_assoc_init` (a plain ident mention must not emit the
+        // indexed form: 009_arrays/029_arrays_associative)
+        for n in &self.assoc_arrays {
+            let id = self.c_ident(n);
+            if text.contains(&id) {
+                out.push(format!(
+                    "_sh_assoc_init(&_sh_cmd, &_sh_cap, {}, {id}_k, {id}_v, {id}_n);",
+                    Self::cstr(n)
+                ));
+                out.push("_sh_add(\";\");".to_string());
+            }
+        }
         out
+    }
+
+    /// Same over a command's ARG EXPRS (shell_exec sites): any Str text
+    /// mentioning an array ident triggers the initializer.
+    fn array_inits_for_args(&self, args: &[IrExpr]) -> Vec<String> {
+        let mut texts: Vec<String> = Vec::new();
+        fn gather(e: &IrExpr, out: &mut Vec<String>) {
+            match e {
+                IrExpr::Str(s, _) => out.push(s.clone()),
+                IrExpr::Array(items) => items.iter().for_each(|x| gather(x, out)),
+                IrExpr::Interpolate(parts) => parts.iter().for_each(|p| {
+                    if let InterpPart::Expr(x) = p {
+                        gather(x, out)
+                    }
+                }),
+                IrExpr::Call { args, .. } => args.iter().for_each(|x| gather(x, out)),
+                _ => {}
+            }
+        }
+        for a in args {
+            gather(a, &mut texts);
+        }
+        let joined = texts.join(" ");
+        self.array_inits_for_text(&joined)
     }
 
     /// `$N` / `${N}` (positionals), `$#`, `$?` → their numeric C reads.
@@ -4784,6 +4867,15 @@ impl Render {
             // positional $N — the function-call argv (empty at top level)
             self.need_sh = true;
             format!("(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")")
+        } else if self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
+            // `${LIST:-}` / `${MAP[k]}` — an ARRAY read: element 0 for
+            // scalars (the array_join path handles the @/* forms above)
+            let id = self.c_ident(&name);
+            if self.assoc_arrays.contains(&name) {
+                format!("(char*)_sh_assoc_get({id}_k, {id}_v, {id}_n, \"\")")
+            } else {
+                format!("(({id}_len > 0 && {id}[0]) ? {id}[0] : \"\")")
+            }
         } else if self.store.contains(&name) {
             self.store_ref(&name)
         } else {
