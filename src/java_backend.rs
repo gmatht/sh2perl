@@ -536,6 +536,77 @@ impl JavaCtx {
                 out.push_str("} }\n");
                 Ok(())
             }
+            IrStmt::Ext(node) if node.tag() == "WalkDir" => {
+                // STREAMING directory walk (docs/shir-primitives.md
+                // §WalkDir): Files.walk with maxDepth — entries one at a
+                // time via try-with-resources, contents never read.
+                let wd = node.as_any().downcast_ref::<crate::shir_nodes::WalkDir>()
+                    .ok_or("tag/type")?;
+                indent(out, d);
+                out.push_str("{ java.util.stream.Stream<java.nio.file.Path> __w = null;
+");
+                indent(out, d);
+                out.push_str("  try {
+");
+                indent(out, d + 1);
+                let mut src = String::new();
+                expr_to_java(&wd.source, &mut src)?;
+                let maxd = match &wd.maxdepth {
+                    Some(e) => {
+                        let mut s = String::new();
+                        expr_to_java(e, &mut s)?;
+                        format!("((int) Long.parseLong({}))", s)
+                    }
+                    None => "Integer.MAX_VALUE".to_string(),
+                };
+                let tf = match &wd.type_filter {
+                    Some(x) => x.as_str(),
+                    None => "",
+                };
+                if tf.is_empty() {
+                    out.push_str(&format!(
+                        "__w = java.nio.file.Files.walk(java.nio.file.Paths.get({src}), {maxd});
+",
+                        src = src, maxd = maxd
+                    ));
+                } else {
+                    // type filter inside walk: f → regular file, d → dir;
+                    // GNU find evaluates the START too — add it explicitly.
+                    // Files.find evaluates the START too (GNU find parity)
+                    let bi = if tf == "f" {
+                        "(p, a) -> java.nio.file.Files.isRegularFile(p)"
+                    } else {
+                        "(p, a) -> java.nio.file.Files.isDirectory(p)"
+                    };
+                    out.push_str(&format!(
+                        "__w = java.nio.file.Files.find(java.nio.file.Paths.get({src}), {maxd}, {bi});
+",
+                        src = src, bi = bi, maxd = maxd
+                    ));
+                }
+                indent(out, d);
+                out.push_str("      __w.forEach(p -> {
+");
+                indent(out, d + 1);
+                out.push_str(&format!("String {} = p.toString();
+", wd.var));
+                for b in &wd.body {
+                    self.stmt_to_java(b, d + 1, out)?;
+                }
+                indent(out, d);
+                out.push_str("      });
+");
+                indent(out, d);
+                out.push_str("  } catch (java.io.IOException __e) {
+");
+                indent(out, d);
+                out.push_str("  } finally { if (__w != null) __w.close(); }
+");
+                indent(out, d);
+                out.push_str("}
+");
+                Ok(())
+            }
             IrStmt::Case {
                 discriminant,
                 clauses,

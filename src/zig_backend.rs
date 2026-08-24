@@ -1644,6 +1644,75 @@ impl Render {
                 self.depth -= 1;
                 self.emit("}");
             }
+            IrStmt::Ext(node) if node.tag() == "WalkDir" => {
+                // STREAMING directory walk (docs/shir-primitives.md
+                // §WalkDir): entries collected into a path LIST (O(tree)
+                // metadata — file CONTENTS are never opened), then iterated
+                // inline so the body captures main's locals naturally.
+                let wd = node.as_any().downcast_ref::<crate::shir_nodes::WalkDir>()
+                    .expect("tag/type agree");
+                let src = self.expr_any(&wd.source);
+                let n = self.tmp_counter;
+                self.tmp_counter += 1;
+                let lv = self
+                    .mangle
+                    .get(&wd.var)
+                    .cloned()
+                    .unwrap_or_else(|| self.zig_ident(&wd.var));
+                let tf = match &wd.type_filter {
+                    Some(x) => x.as_str(),
+                    None => "",
+                };
+                let md = match &wd.maxdepth {
+                    Some(e) => self.expr_num(e),
+                    None => "0".into(),
+                };
+                self.mark_written(&wd.var);
+                self.mark_read(&wd.var);
+                self.var_types.insert(wd.var.clone(), IrType::Str);
+                self.emit("{");
+                self.emit(&format!("    var __wl{}: std.ArrayList([]const u8) = .empty;", n));
+                self.emit(&format!("    const W{} = struct {{", n));
+                self.emit("        fn matches(t: []const u8, isdir: bool) bool {");
+                self.emit("            if (t.len == 0) return true;");
+                self.emit("            if (std.mem.eql(u8, t, \"d\")) return isdir;");
+                self.emit("            return !isdir;");
+                self.emit("        }");
+                self.emit("        fn go(al: std.mem.Allocator, io: std.Io, dpath: []const u8, l: *std.ArrayList([]const u8), t: []const u8, max: i64, depth: i64) void {");
+                self.emit("            // GNU find evaluates the START point too");
+                self.emit("            blk0: {");
+                self.emit("                const st0 = std.Io.Dir.cwd().statFile(io, dpath, .{}) catch break :blk0;");
+                self.emit("                if (matches(t, st0.kind == .directory)) l.append(al, dpath) catch return;");
+                self.emit("            }");
+                self.emit("            if (max != 0 and depth >= max) return;");
+                self.emit("            var d = std.Io.Dir.cwd().openDir(io, dpath, .{ .iterate = true }) catch return;");
+                self.emit("            defer d.close(io);");
+                self.emit("            var it = d.iterate();");
+                self.emit("            while (it.next(io) catch return) |e| {");
+                self.emit("                const full = std.fmt.allocPrint(al, \"{s}/{s}\", .{ dpath, e.name }) catch continue;");
+                self.emit("                const isdir = (e.kind == .directory);");
+                self.emit("                if (matches(t, isdir)) l.append(al, full) catch continue;");
+                self.emit("                if (isdir and (max == 0 or depth + 1 < max)) go(al, io, full, l, t, max, depth + 1);");
+                self.emit("            }");
+                self.emit("        }");
+                self.emit("    }.go;");
+                self.emit(&format!(
+                    "    W{}(std.heap.page_allocator, init.io, {}, &__wl{}, \"{tf}\", {md}, 0);",
+                    n, src, n, tf = tf, md = md
+                ));
+                self.emit(&format!(
+                    "    for (__wl{}.items) |__ln{}| {{",
+                    n, n
+                ));
+                self.depth += 1;
+                self.emit(&format!("    {} = __ln{};", lv, n));
+                for b in &wd.body {
+                    self.stmt(b);
+                }
+                self.depth -= 1;
+                self.emit("    }");
+                self.emit("}");
+            }
             IrStmt::Ext(_) => panic!("zig backend: Ext node unsupported"),
             IrStmt::Expr(e) => {
                 // setVar(name, value) — the frontend-emitted store write:

@@ -69,6 +69,17 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                             return;
                         }
                     }
+                    // `find P [-maxdepth N] [-type f|d] | wc -l` →
+                    // STREAMING directory-walk count (no entry list).
+                    if emit {
+                        if let [IrExpr::Arrow(b1), IrExpr::Arrow(b2)] = stages.as_slice() {
+                            if let Some(repl) = try_lower_find_wc(b1, b2) {
+                                *stmt = repl;
+                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }
                     // `grep P F | wc -l` → STREAMING filtered line count.
                     // Statement-level Block replacement (counter loop).
                     if emit {
@@ -329,6 +340,15 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                                 target: None,
                             }],
                         })));
+                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+                if emit && cmd == "find" {
+                    // bare `find P [-maxdepth N] [-type f|d]` → WalkDir
+                    // printing each entry path (streaming, no entry list).
+                    if let Some(repl) = try_lower_find_stmt(cmd_args) {
+                        *stmt = with_status_zero(repl);
                         LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -1535,6 +1555,56 @@ fn try_reduce_capture_assign(stmt: &IrStmt, arrays: &std::collections::HashSet<S
     }).collect();
     if stage_bodies.len() != 2 { return None; }
 
+    // `x=$(find ARGS | wc -l)` → streaming directory-walk count assigned
+    // to the target (find's exit status is 0 on success; allowlisted).
+    {
+        let find_wc = stage_bodies.len() == 2
+            && matches!(stage_bodies[0], [IrStmt::Expr(IrExpr::Call { ref func, ref args })]
+                if (func == "exec" || func == "builtin")
+                    && matches!(args.as_slice(),
+                        [IrExpr::Str(n, _), IrExpr::Array(_)] if n == "find"));
+        if find_wc {
+            if let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = stage_bodies[1] {
+                if f2 == "exec" || f2 == "builtin" {
+                    if let [IrExpr::Str(n2, _), IrExpr::Array(wa)] = a2.as_slice() {
+                        if n2 == "wc"
+                            && wa.len() == 1
+                            && matches!(&wa[0], IrExpr::Str(f, _) if f.as_str() == "-l")
+                        {
+                            if let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] =
+                                stage_bodies[0]
+                            {
+                                if let [IrExpr::Str(_, _), IrExpr::Array(fa)] = a1.as_slice() {
+                                    if let Some((path, tf, md)) = parse_find_args(fa) {
+                                        let mut block = walk_dir_count(
+                                            IrExpr::Str(path, StrStyle::DoubleQuoted),
+                                            tf,
+                                            md.map(IrExpr::Int),
+                                        );
+                                        if let IrStmt::Block(ref mut stmts) = block {
+                                            // the counter is the capture VALUE:
+                                            // swap the trailing Output for the Assign
+                                            if let Some(IrStmt::Output { value, .. }) = stmts.last_mut() {
+                                                let value = value.clone();
+                                                *stmts.last_mut().unwrap() = IrStmt::Assign {
+                                                    targets,
+                                                    expr: value,
+                                                    asm,
+                                                };
+                                                return Some(block);
+                                            }
+                                        }
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Source must be a clean literal echo/printf (no flags/backslash escapes).
     let text = extract_text_from_stage(stage_bodies[0])?;
 
@@ -1611,6 +1681,124 @@ fn streaming_line_count(source: IrExpr, guard: Option<IrExpr>) -> IrStmt {
             target: None,
         },
     ])
+}
+
+/// GNU find subset: [PATH] [-maxdepth N] [-type f|d]. Anything else
+/// (-name, -perm, multi-path, expressions) is not lowered → None.
+fn parse_find_args(args: &[IrExpr]) -> Option<(String, Option<String>, Option<i64>)> {
+    let mut strs: Vec<&str> = Vec::new();
+    for x in args {
+        match x {
+            IrExpr::Str(s, _) => strs.push(s.as_str()),
+            IrExpr::Interpolate(p) if p.len() == 1 => match &p[0] {
+                InterpPart::Lit(s) => strs.push(s.as_str()),
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    let mut path: Option<String> = None;
+    let mut tf: Option<String> = None;
+    let mut md: Option<i64> = None;
+    let mut i = 0;
+    while i < strs.len() {
+        match strs[i] {
+            "-maxdepth" => {
+                let v = strs.get(i + 1)?.parse::<i64>().ok()?;
+                md = Some(v);
+                i += 2;
+            }
+            "-type" => {
+                let v = strs.get(i + 1)?;
+                if !matches!(*v, "f" | "d") { return None; }
+                tf = Some(v.to_string());
+                i += 2;
+            }
+            s if s.starts_with('-') => return None,
+            p => {
+                if path.is_some() { return None; } // multi-path → fallback
+                path = Some(p.to_string());
+                i += 1;
+            }
+        }
+    }
+    Some((path?, tf, md))
+}
+
+/// Streaming directory-entry counter: `n=0; WalkDir(src, l, n+=1)` — the
+/// tree is walked entry-by-entry; contents are never opened.
+fn walk_dir_count(source: IrExpr, type_filter: Option<String>, maxdepth: Option<IrExpr>) -> IrStmt {
+    let k = LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let cnt = format!("__lc{}", k);
+    let lv = format!("__l{}", k);
+    let incr = IrStmt::Assign {
+        targets: vec![AssignTarget { var: cnt.clone(), sigil: None, indices: vec![] }],
+        expr: IrExpr::BinOp {
+            lhs: Box::new(IrExpr::Var(cnt.clone(), None)),
+            op: BinOpKind::Add,
+            rhs: Box::new(IrExpr::Int(1)),
+        },
+        asm: None,
+    };
+    IrStmt::Block(vec![
+        IrStmt::Assign {
+            targets: vec![AssignTarget { var: cnt.clone(), sigil: None, indices: vec![] }],
+            expr: IrExpr::Int(0),
+            asm: None,
+        },
+        IrStmt::Ext(Box::new(WalkDir {
+            source,
+            var: lv,
+            body: vec![incr],
+            type_filter,
+            maxdepth: maxdepth.map(Box::new),
+        })),
+        IrStmt::Output {
+            value: IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![IrExpr::Str(cnt, StrStyle::DoubleQuoted)],
+            },
+            newline: true,
+            target: None,
+        },
+    ])
+}
+
+/// `find ARGS | wc -l` — stage1 find subset, stage2 exactly wc -l.
+fn try_lower_find_wc(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stage1 else { return None };
+    if !(func == "exec" || func == "builtin") { return None; }
+    let [IrExpr::Str(n, _), IrExpr::Array(a)] = args.as_slice() else { return None };
+    if n != "find" { return None; }
+    let wc_ok = matches!(stage2,
+        [IrStmt::Expr(IrExpr::Call { func, args })]
+            if (func == "exec" || func == "builtin")
+                && matches!(args.as_slice(),
+                    [IrExpr::Str(n, _), IrExpr::Array(wa)] if n == "wc" && wa.len() == 1
+                        && matches!(&wa[0], IrExpr::Str(f, _) if f.as_str() == "-l")));
+    if !wc_ok { return None; }
+    let (path, tf, md) = parse_find_args(a)?;
+    Some(walk_dir_count(
+        IrExpr::Str(path, StrStyle::DoubleQuoted),
+        tf,
+        md.map(IrExpr::Int),
+    ))
+}
+
+/// A statement-level `find ARGS` (no pipeline): print each entry path.
+fn try_lower_find_stmt(cmd_args: &[IrExpr]) -> Option<IrStmt> {
+    let (path, tf, md) = parse_find_args(cmd_args)?;
+    Some(IrStmt::Ext(Box::new(WalkDir {
+        source: IrExpr::Str(path, StrStyle::DoubleQuoted),
+        var: "__l".to_string(),
+        body: vec![IrStmt::Output {
+            value: loop_var_read("__l"),
+            newline: true,
+            target: None,
+        }],
+        type_filter: tf,
+        maxdepth: md.map(|v| Box::new(IrExpr::Int(v))),
+    })))
 }
 
 /// `grep P F | wc -l` → streaming filtered count. Static args only:
