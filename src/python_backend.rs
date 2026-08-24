@@ -1666,6 +1666,29 @@ impl Render {
                             return format!("str(len({}))", self.py_ident(name));
                         }
                     }
+                    // ${x#pat} / ${x##pat} / ${x%pat} / ${x%%pat} —
+                    // prefix/suffix removal via the native __sh_strip
+                    // runtime-free helper (same one test operands use)
+                    if matches!(op.as_str(), "#" | "##" | "%" | "%%") {
+                        if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Str(pat, _))) =
+                            (args.get(1), args.get(2))
+                        {
+                            self.need_strip = true;
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.clone(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            return format!(
+                                "__sh_strip({}, {}, {})",
+                                Self::py_str(pat),
+                                Self::py_str(op),
+                                v
+                            );
+                        }
+                    }
                     // param("slice", name, sel, off[:len]) — the array
                     // expansion family:
                     //   ("slice","#arr","@","")    → ${#arr[@]}  (length)
@@ -2349,6 +2372,26 @@ impl Render {
                 match args.first() {
                     Some(inner) => self.expr_shell_text(inner),
                     None => None,
+                }
+            }
+            // pipeline CALL form (`$(echo one; echo two | wc -l)` keeps
+            // the pipe as a Call in the capture body): stages re-render
+            // as shell text joined by |
+            IrExpr::Call { func, args } if func == "pipeline" => {
+                if let Some(IrExpr::Array(sts)) = args.first() {
+                    let mut ss = Vec::new();
+                    for st in sts.iter() {
+                        match st {
+                            IrExpr::Arrow(b) => ss.push(self.body_shell_text(b)?),
+                            other => {
+                                let t = self.expr_shell_text(other)?;
+                                ss.push(t);
+                            }
+                        }
+                    }
+                    Some(ss.join(" | "))
+                } else {
+                    None
                 }
             }
             // word lists (`for k in ${!map[@]}` lowers to Array[param(..)])
@@ -3724,7 +3767,108 @@ impl Render {
                     self.stmt(s);
                 }
             }
-            IrStmt::Pipeline { stages, .. } => {
+            IrStmt::Pipeline { stages, cmd_str, .. } => {
+                // NATIVE-FIRST (keeps python-side state alive across the
+                // pipe: 'echo "hello $name" | tr' must see $name!):
+                // leading stage renders natively under redirect_stdout,
+                // remaining exec stages chain via stdin.
+                let mut rest_argv: Vec<Vec<String>> = Vec::new();
+                let mut nat_ok = stages.len() >= 2;
+                for st in stages.iter().skip(1) {
+                    if !nat_ok {
+                        break;
+                    }
+                    match st.as_slice() {
+                        [IrStmt::Expr(e)] => match e {
+                            IrExpr::Call { func, args } if func == "exec" => {
+                                let mut one = Vec::new();
+                                if let Some(IrExpr::Str(c, _)) = args.first() {
+                                    one.push(c.clone());
+                                }
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    for it in items.iter() {
+                                        one.push(self.expr(it));
+                                    }
+                                }
+                                rest_argv.push(one);
+                            }
+                            _ => nat_ok = false,
+                        },
+                        _ => nat_ok = false,
+                    }
+                }
+                if nat_ok && !rest_argv.is_empty() {
+                    self.emit("import io");
+                    self.emit("import contextlib");
+                    self.emit("_buf = io.StringIO()");
+                    self.emit("with contextlib.redirect_stdout(_buf):");
+                    self.depth += 1;
+                    if let Some(first) = stages.first() {
+                        for s in first.iter() {
+                            self.stmt(s);
+                        }
+                    }
+                    self.depth -= 1;
+                    // buffered stdout would interleave out of order with
+                    // the external stage's output
+                    self.emit("sys.stdout.flush()");
+                    let mut prev = "_buf.getvalue()".to_string();
+                    let n = rest_argv.len();
+                    for (i, argv) in rest_argv.iter().enumerate() {
+                        let pyargs = argv
+                            .iter()
+                            .map(|a| Self::py_str(a))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if i == n - 1 {
+                            self.emit(&format!(
+                                "subprocess.run([{}], input={}, text=True)",
+                                pyargs, prev
+                            ));
+                        } else {
+                            self.emit(&format!(
+                                "_p{i} = subprocess.run([{}], input={}, text=True, capture_output=True).stdout",
+                                pyargs, prev
+                            ));
+                            prev = format!("_p{i}");
+                        }
+                    }
+                    return;
+                }
+                // The pipe is SEMANTIC here: rendering stages sequentially
+                // loses it (t03: 'echo .. | tr a-z A-Z' printed BOTH).
+                // Prefer the parser's original command text; else re-render
+                // each stage as shell text; run under bash -c with stdout
+                // inherited (statement context). Documented fork/exec escape.
+                let text = match cmd_str {
+                    Some(t) => Some(t.clone()),
+                    None => {
+                        let mut ss = Vec::new();
+                        let mut ok = true;
+                        for stage in stages.iter() {
+                            match self.body_shell_text(stage) {
+                                Some(t) => ss.push(t),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok {
+                            Some(ss.join(" | "))
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(text) = text {
+                    self.need_subprocess = true;
+                    self.emit(&format!(
+                        "__sh_exec([\"bash\", \"-c\", {}])",
+                        Self::py_str(&text)
+                    ));
+                    return;
+                }
                 for st in stages {
                     for s in st {
                         self.stmt(s);
