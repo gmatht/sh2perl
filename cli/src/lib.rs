@@ -1025,7 +1025,7 @@ exit $main_exit_code;
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
-            print!("{}", debashl::c_backend::shir_to_c(&prog));
+            print!("{}", match debashl::java_backend::shir_to_java(&prog) { Ok(s) => s, Err(e) => { eprintln!("render: {}", e); std::process::exit(1); } });
         }
 "--shir-in-perl" => {
             if args.len() < 3 { println!("Error: --shir-in-perl requires input"); return; }
