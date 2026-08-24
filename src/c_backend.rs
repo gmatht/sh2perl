@@ -11403,11 +11403,8 @@ fn dollar_brace_args(body: &str) -> Option<Vec<IrExpr>> {
     } else {
         return None;
     };
-    // nested expansions in the operand stay unmodeled (the renderer's
-    // default_word handles quoted literals only)
-    if arg.contains('$') || arg.contains('`') {
-        return None;
-    }
+    // a $-bearing operand is fine: param_call's default_word expands it
+    // recursively (heredoc_body_c) — ${v:-${w:-$(cmd)}} nests
     Some(vec![s(&op), s(&name), s(&arg)])
 }
 
