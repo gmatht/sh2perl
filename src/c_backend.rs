@@ -2220,6 +2220,24 @@ impl Render {
                             self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
                             word(self, t);
                         }
+                        Some("IFS") => {
+                            // bash RESETS an inherited IFS to " \t\n" at
+                            // startup — a child can never see it. Expand
+                            // the parent's VALUE inline (quoted).
+                            let v = if self.is_num("IFS") {
+                                self.num_temp(&self.c_ident("IFS"))
+                            } else {
+                                self.store_read("IFS")
+                            };
+                            match buf {
+                                CmdBuf::Shared => self.emit(&format!(
+                                    "_sh_word((char*)({v}));"
+                                )),
+                                CmdBuf::Private(id) => self.emit(&format!(
+                                    "_sh_bword(&_c{id}_cmd, &_c{id}_cap, (char*)({v}));"
+                                )),
+                            }
+                        }
                         Some(n) => {
                             let v = if self.is_num(n) {
                                 let t = self.num_temp(&self.c_ident(n));
