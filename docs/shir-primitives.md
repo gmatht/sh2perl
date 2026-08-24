@@ -488,3 +488,53 @@ For each handled idiom, generate js/pl/C output and assert the file is
 consumed via the line-iteration construct (readline/getline/scanner) and
 that NO readFileSync/readFile/whole-buffer call appears for it. This check
 joins the byte-exact targeted tests.
+
+## As-built: the phase-2 design landed (text_ops + renderers)
+
+The §"Streaming & capture-aware reduction design" above is IMPLEMENTED.
+Deviations discovered while making it byte-exact (each verified against
+bash on targeted scripts, then corpus-swept):
+
+1. **Terminal-newline tracking.** The extractor returns
+   `(text, implicit_nl)` — echo appends `\n` unconditionally; printf only
+   when its last literal ends with one; a dynamic printf source is refused
+   (unknowable → runtime fallback). The statement Output wrapper re-appends
+   ONLY an echo-stripped newline; `wc` always prints its own terminating
+   newline after the number.
+2. **Byte-takes fold statically.** `head/tail -c N` slice the RAW text
+   INCLUDING its trailing-newline state — reducible only when text AND
+   count are static; the fold produces bash's exact bytes and never lets
+   the wrapper re-append. Dynamic byte-takes fall back (a wrong-newline
+   eager lowering is worse than the runtime).
+3. **Squeeze ≠ deletion.** `tr -s SET` collapses RUNS of each output-set
+   char to ONE copy (`replace(/c+/g,"c")`, identity translate when SET2 is
+   empty). `-d -s` and range/class squeeze sets refuse to lower.
+4. **FieldExtract covers ranges natively** with GNU cut semantics: a line
+   without the delimiter passes through whole (unless -s), selection is
+   ascending regardless of list order, missing trailing fields contribute
+   nothing ("d:e" -f1,3 → "d", NOT "d:").
+5. **Mutex discipline.** The estree ForEachLine arm registers the loop var
+   in LIFTED_STRING by VALUE SWAP (take → insert → store → render →
+   restore), never holding the guard across the body render — inner
+   `is_lifted_str` re-locks the same non-reentrant mutex (deadlock).
+6. **Gate allowlist.** The estree structural gate accepts the pure-CPU
+   callees these lowerings emit (`substring`, `pop`) and LogicalExpression
+   receivers (`(getVar(x) ?? "")` coalescing) — same class as the already-
+   allowed `slice`/`includes`.
+7. **Opt-in gate composition.** text_ops runs only when DEBASHC_TRANSFORMS
+   explicitly lists it (A/B isolation), and then composes arith-forms
+   first — otherwise exercising text-ops alone would regress `let`/`(( ))`
+   scripts purely because another transform went missing.
+
+### No-slurp verification method (as-run)
+
+Targeted idiom script (`wc -l <F`; `grep P F | wc -l`; `grep P F | cut`;
+`cat F | wc -l`; `cut F`; `tr <F`; `sed s F`; `head -n K F`):
+render per backend, assert the file is consumed via the line-iteration
+construct and NO whole-file read appears:
+
+| Backend | streaming construct | whole-file reads | verdict vs bash |
+|---|---|---|---|
+| js/estree | 7× `sh2.eachLine` | 0 `readFileSync`/`readFile(` | byte-exact |
+| perl | 7× `open my $fh … while(<$fh>)` | none | byte-exact |
+| java | 7× `BufferedReader.readLine` | 0 `readAllBytes/readString/readAllLines` | compiled + run, byte-exact |
