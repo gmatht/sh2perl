@@ -173,6 +173,8 @@ pub struct Render {
     /// a heredoc terminator was just emitted — the next raw token must
     /// start on a fresh line (the terminator must be alone on its line)
     heredoc_nl: bool,
+    /// emit the _sh_import_env runtime helper (source/eval state pull)
+    need_state_import: bool,
     /// vars assigned as SHELL TEXT in the current command buffer — the
     /// child bash owns their value for this site; re-exporting the stale
     /// C var inside the same buffer would clobber it (091_while_pipe_var:
@@ -483,6 +485,22 @@ impl Render {
         self.emit("#include <ctype.h>"); // tolower/... in text transforms
         if self.need_stat {
             self.emit("#include <sys/stat.h>");
+        }
+        if self.need_state_import {
+            // source/eval state pull: import the child's KEY=VALUE dump
+            // into the environment (env-fallback reads pick it up)
+            self.emit("static void _sh_import_env(void) {");
+            self.emit("  FILE *_pf = fopen(\"/tmp/.shellstate_pull\", \"r\");");
+            self.emit("  if (!_pf) return;");
+            self.emit("  static char _pl[65536];");
+            self.emit("  while (fgets(_pl, sizeof _pl, _pf)) {");
+            self.emit("    size_t _pn = strlen(_pl); while (_pn && (_pl[_pn-1]=='\\n'||_pl[_pn-1]=='\\r')) _pl[--_pn] = 0;");
+            self.emit("    char *_eq = strchr(_pl, '=');");
+            self.emit("    if (!_eq || _eq == _pl) continue;");
+            self.emit("    *_eq = 0; setenv(_pl, _eq + 1, 1);");
+            self.emit("  }");
+            self.emit("  fclose(_pf); remove(\"/tmp/.shellstate_pull\");");
+            self.emit("}"); 
         }
         if self.need_fnmatch || self.need_sh {
             // the shell-out runtime's ${s#pat} strip helpers use fnmatch
@@ -6378,6 +6396,56 @@ impl Render {
                             self.emit("if (!_went) _sh_rc = 0;");
                             self.emit("}");
                         }
+                        return;
+                    }
+                    // `.` / `source` / `eval` — the executed text must
+                    // share state with the PARENT: the child dumps ALL
+                    // its variables after the text runs and the parent
+                    // imports them into the environment (dot-source-lib:
+                    // shared=secret). Store-var reads keep their C value;
+                    // env-fallback reads (env-style/unknown names) pick
+                    // the sourced values up.
+                    IrExpr::Call { func, args }
+                        if (func == "exec" || func == "builtin")
+                            && matches!(
+                                args.first(),
+                                Some(IrExpr::Str(c, _))
+                                    if c == "." || c == "source" || c == "eval"
+                            ) =>
+                    {
+                        self.need_state_import = true;
+                        let args_v = args.clone();
+                        // one fixed state file: sites run sequentially, so
+                        // each dump+import pair completes before the next
+                        let path = "/tmp/.shellstate_pull";
+                        let site = self.shell_site(
+                            |r| {
+                                r.emit("_sh_reset();");
+                                for a in &args_v {
+                                    match a {
+                                        IrExpr::Array(items) => {
+                                            for it in items {
+                                                r.sh_word(CmdBuf::Shared, it);
+                                            }
+                                        }
+                                        other => r.sh_word(CmdBuf::Shared, other),
+                                    }
+                                }
+                                // dump EVERY variable after the text runs,
+                                // redirected to a private temp file
+                                // (stdout parity: nothing on fd 1)
+                                r.emit(&format!(
+                                    "_sh_addraw({});",
+                                    Self::cstr(&format!(
+                                        " ; for _sk in $(compgen -v) ; do printf '%s=%s\\n' \"$_sk\" \"${{!_sk}}\" ; done > {}",
+                                        path
+                                    ))
+                                ));
+                            },
+                            false,
+                        );
+                        self.emit(&format!("{site};"));
+                        self.emit("_sh_import_env();");
                         return;
                     }
                     _ => {}
