@@ -3700,9 +3700,10 @@ impl Render {
                         let id = self.c_ident(name);
                         // `local x=$1` — the core splits `x=` and the
                         // VALUE EXPR into separate word args
-                        let value_expr: Option<&IrExpr> = if val.is_empty() && i + 1 < words.len() {
-                            // the core splits `x=` from its value word
-                            // (`typeset -l lc="HELLO WORLD"` → lc= + Str)
+                        let value_expr: Option<&IrExpr> = if val.is_empty()
+                            && i + 1 < words.len()
+                            && !matches!(words[i + 1], IrExpr::Str(_, _))
+                        {
                             i += 1;
                             Some(words[i])
                         } else {
