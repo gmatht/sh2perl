@@ -8082,8 +8082,11 @@ mod tests {
             r.fragment
         );
         assert!(
-            r.fragment.contains("carp '"),
-            "the emulation's carp call is executable Perl: {}",
+            r.fragment.contains("croak \""),
+            // the streaming foreach-line lowering aborts an unopenable
+            // file with croak (die from the caller's perspective) — the
+            // Carp import above keeps it executable in embeds
+            "the emulation's error path is executable Perl: {}",
             r.fragment
         );
         assert!(r.refusals.is_empty(), "refusals: {:?}", r.refusals);
