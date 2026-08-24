@@ -140,6 +140,8 @@ pub struct Render {
     /// preamble emits the sh2_mem* runtime.
     need_mem: bool,
     todo: usize,
+    /// Fresh file-handle suffix for ForEachLine streaming loops.
+    fh_counter: usize,
 }
 
 /// Render an `IrProgram` to Perl source.
@@ -292,6 +294,10 @@ impl Render {
             _ => {
                 if is_env_style_var_name(name) {
                     format!("$ENV{{{}}}", name)
+                } else if self.loop_vars.contains(name) {
+                    // For-loop / ForEachLine vars are declared by their
+                    // loop (`while (my $v = …)`) — never scalar-hoisted.
+                    format!("${}", ident(name))
                 } else {
                     self.scalars.insert(name.to_string());
                     format!("${}", ident(name))
@@ -1837,7 +1843,41 @@ impl Render {
 
     fn stmt(&mut self, s: &IrStmt) {
         match s {
-            IrStmt::Ext(_) => panic!("perl backend: Ext node unsupported"),
+            IrStmt::Ext(node) => {
+                if node.tag() == "ForEachLine" {
+                    // STREAMING line iteration (docs/shir-primitives.md
+                    // §ForEachLine): open + while(<$fh>) + chomp — O(1)
+                    // memory, never a whole-file read. The body reads the
+                    // loop var as an ordinary scalar; limit → early last.
+                    let fl = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>()
+                        .expect("tag/type agree");
+                    let src = self.expr(&fl.source);
+                    let fh = format!("$__sh2_fh{}", self.fh_counter);
+                    self.fh_counter += 1;
+                    let lv = format!("${}", ident(&fl.var));
+                    // The loop var must not be `my`-hoisted as an outer
+                    // scalar (the while condition declares it).
+                    self.loop_vars.insert(fl.var.clone());
+                    self.emit(&format!("open my {fh}, '<', {src} or die \"open: $!\\n\";"));
+                    self.emit(&format!("while (my {lv} = <{fh}>) {{"));
+                    self.depth += 1;
+                    self.emit(&format!("chomp {lv};"));
+                    if let Some(lim) = &fl.limit {
+                        // head -n K: read K lines then stop (streaming
+                        // early-exit; $. is per-handle since we close it).
+                        let le = self.expr(lim);
+                        self.emit(&format!("last if $. > {le};"));
+                    }
+                    for b in &fl.body {
+                        self.stmt(b);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                    self.emit(&format!("close {fh};"));
+                    return;
+                }
+                panic!("perl backend: Ext node unsupported: {}", node.tag())
+            }
             IrStmt::Expr(e) => match e {
                 IrExpr::Call { func, args } => match func.as_str() {
                     "exec" => self.exec_stmt(args),

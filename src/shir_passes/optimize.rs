@@ -1662,9 +1662,20 @@ fn collect_expr_read_names(e: &IrExpr, out: &mut Vec<String>) {
                         out.push(n[..pos].to_string());
                     }
                 }
-            } else if func == "arrayIndex" {
+            } else if func == "arrayIndex"
+                || func == "addrVar"
+                || func == "derefGet"
+                || func == "derefSet"
+            {
+                // pointer indirection (&x / *x): the named slot is BOTH
+                // read and written through the reference
                 if let Some(IrExpr::Str(n, _)) = args.first() {
                     out.push(n.clone());
+                }
+                if func == "derefSet" {
+                    if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                        out.push(n.clone());
+                    }
                 }
             } else if func == "test" || func == "let" {
                 // `ternary` (the C frontend's `cond ? a : b`): args[0] is
@@ -1714,9 +1725,13 @@ fn bare_dollar_names(s: &str) -> Vec<String> {
             }
             let nm = &s[w..j];
             if !nm.is_empty()
-                && (j >= bytes.len() || !braced || bytes[j] == b'}')
                 && crate::shared_utils::SharedUtils::is_variable_name(nm)
             {
+                // braced expansions with OPERATORS (`${x% *}`, `${x:-d}`)
+                // end the scan at the operator — record the name anyway:
+                // over-marking only shrinks the elimination set, while
+                // missing it dropped the var's only store as dead
+                // (param-expand-hash)
                 out.push(nm.to_string());
             }
             i = if braced && j < bytes.len() { j + 1 } else { j };
