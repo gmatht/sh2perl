@@ -230,7 +230,7 @@ pub struct Render {
 
 /// Which command-text buffer a word append targets: the SHARED
 /// builder (statement-level sites) or a capture site's private one.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum CmdBuf {
     Shared,
     Private(usize),
@@ -819,6 +819,32 @@ impl Render {
             self.emit("  strncpy(d, sc, best); d[best] = 0;");
             self.emit("  return d;");
             self.emit("}");
+            // \"$@\" expansion: each positional becomes its OWN shell
+            // word ('id -u' as ONE word made bash fail command-not-found).
+            // Self-contained so runtime trimming keeps them intact.
+            self.emit("static void _sh_sq_into(char **b, size_t *cap, const char *s) {");
+            self.emit("  size_t l = *b ? strlen(*b) : 0;");
+            self.emit("  size_t sl = s ? strlen(s) : 0;");
+            self.emit("  size_t need = l + sl * 4 + 8;");
+            self.emit("  if (need > *cap || !*b) { *b = (char*)realloc(*b, need); *cap = need; if (!*b) return; }");
+            self.emit("  char *o = *b + l; *o++ = ' '; *o++ = '\\'';");
+            self.emit("  for (; s && *s; s++) {");
+            self.emit("    if (*s == '\\'') { memcpy(o, \"'\\\\''\", 4); o += 4; }");
+            self.emit("    else *o++ = *s;");
+            self.emit("  }");
+            self.emit("  *o++ = '\\''; *o = 0;");
+            self.emit("}");
+            self.emit("static void _sh_argv_words(char **b, size_t *cap) {");
+            self.emit("  for (int i = 1; i < _sh_argc; i++) {");
+            self.emit("    if (_sh_argv[i]) _sh_sq_into(b, cap, _sh_argv[i]);");
+            self.emit("  }");
+            self.emit("}");
+            self.emit("static void _sh_argv_words_shared(void) {");
+            self.emit("  for (int i = 1; i < _sh_argc; i++) {");
+            self.emit("    if (_sh_argv[i]) _sh_sq_into(&_sh_cmd, &_sh_cap, _sh_argv[i]);");
+            self.emit("  }");
+            self.emit("}");
+            self.emit("");
             self.emit("");
             self.runtime_end = self.out.len();
             self.runtime_known = true;
@@ -1694,6 +1720,7 @@ impl Render {
                     if name == "@" || name == "*" {
                         let t = self.str_temp(4096);
                         self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_1"); }
                         return t;
                     }
                     if name.chars().all(|c| c.is_ascii_digit()) {
@@ -1938,6 +1965,25 @@ impl Render {
                 return;
             }
         }
+        // WHOLE-WORD `"$@"` / `"$*"` (as arrayItems/getVar/@): each
+        // positional is its OWN shell word — a joined single word made
+        // bash read 'id -u' as one command name
+        if let IrExpr::Call { func, args } = e {
+            let is_at = matches!(func.as_str(), "arrayItems" | "listVar" | "getVar")
+                && matches!(
+                    args.first(),
+                    Some(IrExpr::Str(n, _)) if n == "@" || n == "*"
+                );
+            if is_at {
+                match buf {
+                    CmdBuf::Shared => self.emit("_sh_argv_words_shared();"),
+                    CmdBuf::Private(id) => self.emit(&format!(
+                        "_sh_argv_words(&_c{id}_cmd, &_c{id}_cap);"
+                    )),
+                }
+                return;
+            }
+        }
         match e {
             IrExpr::Str(s, _) => word(self, Self::cstr(s)),
             IrExpr::Int(i) => word(self, format!("\"{i}\"")),
@@ -1959,9 +2005,16 @@ impl Render {
                             word(self, t);
                         }
                         Some("@") | Some("*") => {
-                            let t = self.str_temp(4096);
-                            self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-                            word(self, t);
+                            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("SH_WORD @ reached"); }
+                            // "$@" in word position: EACH positional is its
+                            // OWN shell word ('id -u' as one joined word
+                            // made bash fail command-not-found)
+                            match buf {
+                                CmdBuf::Shared => self.emit("_sh_argv_words_shared();"),
+                                CmdBuf::Private(id) => self.emit(&format!(
+                                    "_sh_argv_words(&_c{id}_cmd, &_c{id}_cap);"
+                                )),
+                            }
                         }
                         Some(n) if n.chars().all(|c| c.is_ascii_digit()) => {
                             self.emit(&format!(
@@ -1975,13 +2028,15 @@ impl Render {
                             }
                         }
                         Some(n) if n == "@" || n == "*" => {
-                            // "$@" / "$*" — the JOINED positional value,
-                            // evaluated at site-build time while _sh_argv
-                            // is live (an env export of "@" is always
-                            // empty: generator-system-echo-checkqx)
-                            let t = self.str_temp(65536);
-                            self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-                            word(self, t);
+                            // "$@" in command/word position: EACH positional
+                            // expands to its OWN shell word (a joined single
+                            // word made bash read 'id -u' as one command)
+                            match buf {
+                                CmdBuf::Shared => self.emit("_sh_argv_words_shared();"),
+                                CmdBuf::Private(id) => self.emit(&format!(
+                                    "_sh_argv_words(&_c{id}_cmd, &_c{id}_cap);"
+                                )),
+                            }
                         }
                         Some(n) => {
                             let v = if self.is_num(n) {
@@ -2182,6 +2237,7 @@ impl Render {
                                     // is always empty)
                                     let t = self.str_temp(65536);
                                     self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_2"); }
                                     // mid-word: GLUE the runtime value in
                                     // as a double-quoted piece (`"hello $@"`
                                     // is ONE word — a word separator would
@@ -4864,6 +4920,7 @@ impl Render {
             self.need_sh = true;
             let t = self.str_temp(4096);
             self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_3"); }
             t
         } else if self.var_types.contains_key(&name) && self.is_num(&name) {
             self.num_temp(&self.c_ident(&name))
@@ -5117,6 +5174,7 @@ impl Render {
                     self.need_sh = true;
                     let t = self.str_temp(4096);
                     self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_4"); }
                     return t;
                 }
                 if name.chars().all(|c| c.is_ascii_digit()) {
@@ -5886,6 +5944,7 @@ impl Render {
             self.need_sh = true;
             let t = self.str_temp(4096);
             self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_5"); }
             return t;
         }
         self.arrays.insert(var.to_string());
@@ -5972,6 +6031,7 @@ impl Render {
                             self.need_sh = true;
                             let t = self.str_temp(4096);
                             self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_6"); }
                             return vec![Part::Arg(t, NumSpec::Str)];
                         }
                         if name.chars().all(|c| c.is_ascii_digit()) {
@@ -6933,6 +6993,7 @@ impl Render {
                                 // bash runs the body exactly once
                                 let t = self.str_temp(4096);
                                 self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_7"); }
                                 self.emit(&format!("{var_name} = {t};"));
                                 self.emit("{");
                                 self.depth += 1;
