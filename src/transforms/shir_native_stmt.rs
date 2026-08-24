@@ -951,6 +951,29 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
     }).collect();
     if parts.is_empty() { return IrExpr::Bool(false); }
     let text = parts.join(" ");
+    render_test_text(text)
+}
+
+/// Render one test-string (already word-joined). Compound conds
+/// (`$i -eq 1 && $j -eq 1` — the C frontend's goto guards) split on
+/// top-level && / || and recurse; single segments go through the token
+/// forms below.
+fn render_test_text(text: String) -> IrExpr {
+    for (word, is_and) in [("&&", true), ("||", false)] {
+        if let Some(pos) = text.find(&format!(" {} ", word)) {
+            let (l, r) = text.split_at(pos);
+            let r = &r[word.len() + 2..];
+            return IrExpr::BinOp {
+                op: if is_and { crate::ir::BinOpKind::And } else { crate::ir::BinOpKind::Or },
+                lhs: Box::new(render_test_text(l.to_string())),
+                rhs: Box::new(render_test_text(r.to_string())),
+            };
+        }
+    }
+    render_test_tokens(&text)
+}
+
+fn render_test_tokens(text: &str) -> IrExpr {
     let mut tokens: Vec<&str> = text.split_whitespace().collect();
     // the `[[ ... ]]` form appends a trailing `[[` marker word
     if tokens.last() == Some(&"[[") {
@@ -968,6 +991,28 @@ fn render_test_words(words: &[&IrExpr]) -> IrExpr {
             "-n" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("length(\"{}\")", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Int(0)) },
             "=" | "==" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(left.to_string(), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(right.to_string(), StrStyle::Raw)) },
             "!=" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(left.to_string(), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(right.to_string(), StrStyle::Raw)) },
+            "=~" => {
+                // `[[ $s =~ re ]]` — regex match (triage-perl t68_case_glob,
+                // regex_test_op_renders_match). The rhs is a bare ERE
+                // pattern; single-quoted so delimiter/interpolation chars
+                // stay literal (Perl's dialect ≈ ERE for the corpus).
+                let l = left.trim().trim_matches('"');
+                let r = right.trim().trim_matches('"').replace('\'', "\\'");
+                IrExpr::Str(format!("({} =~ '{}')", l, r), StrStyle::Raw)
+            }
+            // numeric comparisons (`-eq`/`-ne`/`-gt`/`-ge`/`-lt`/`-le`):
+            // the operands are `${name}` refs or literals — Perl numifies
+            // with `(0+...)`, matching bash test's numeric semantics (an
+            // empty/non-numeric operand numifies to 0; a warning goes to
+            // stderr only). Before this arm these fell to the regex hack
+            // below, which is ALWAYS TRUE whenever the string contains
+            // `-eq` etc. — c-corpus rich.c rendered every loop-if taken.
+            "-eq" => IrExpr::BinOp { op: crate::ir::BinOpKind::Eq, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
+            "-ne" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ne, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
+            "-gt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Gt, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
+            "-ge" => IrExpr::BinOp { op: crate::ir::BinOpKind::Ge, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
+            "-lt" => IrExpr::BinOp { op: crate::ir::BinOpKind::Lt, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
+            "-le" => IrExpr::BinOp { op: crate::ir::BinOpKind::Le, lhs: Box::new(IrExpr::Str(format!("(0+{})", left), StrStyle::Raw)), rhs: Box::new(IrExpr::Str(format!("(0+{})", right), StrStyle::Raw)) },
             "-ef" => {
                 // Compare device and inode: (stat(f))[0] eq (stat(g))[0] && (stat(f))[1] eq (stat(g))[1]
                 let stat_left = IrExpr::Str(format!("(stat(\"{}\"))[0]", left), StrStyle::Raw);

@@ -25,6 +25,8 @@ struct JavaCtx {
     loop_depth: usize,
     block_labels: Vec<String>,
     block_seq: usize,
+    /// a case clause used a glob pattern → sh2Glob helper needed
+    need_glob: bool,
 }
 
 /// Render a ShIR program to Java source. `Err` on a construct outside
@@ -46,6 +48,12 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
     }
     if stmts_need_mem(&prog.stmts) {
         out.push_str(MEM_PREAMBLE);
+    }
+    if stmts_use_ext_value(&prog.stmts) {
+        out.push_str(EXT_HELPERS);
+    }
+    if stmts_need_glob(&prog.stmts) {
+        out.push_str(GLOB_HELPER);
     }
     // every assignment target / store / arith read becomes a static
     // String field (empty default — bash reads an unset var as "")
@@ -163,6 +171,11 @@ fn collect_vars_expr(e: &IrExpr, out: &mut Vec<String>) {
         IrExpr::Index { var, key } => {
             push_var(var, out);
             collect_vars_expr(key, out);
+        }
+        IrExpr::Ext(node) => {
+            for c in node.children() {
+                collect_vars_expr(c, out);
+            }
         }
         _ => {}
     }
@@ -487,6 +500,42 @@ impl JavaCtx {
                 }
                 Ok(())
             }
+            IrStmt::Ext(node) if node.tag() == "ForEachLine" => {
+                // STREAMING line iteration (docs/shir-primitives.md
+                // §ForEachLine): BufferedReader.readLine — O(1) memory,
+                // never a whole-file read; readLine strips the newline.
+                let fl = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>()
+                    .ok_or("tag/type")?;
+                let lv = &fl.var;
+                let lim_stmt = if let Some(lim) = &fl.limit {
+                    // head -n K: stop after K lines (streaming early-exit)
+                    let mut le = String::new();
+                    expr_to_java(lim, &mut le)?;
+                    format!("if (++__n >= sh2Num({le})) break;\n")
+                } else {
+                    String::new()
+                };
+                indent(out, d);
+                out.push_str("{ long __n = 0; try (java.io.BufferedReader __r = new java.io.BufferedReader(new java.io.FileReader(");
+                expr_to_java(&fl.source, out)?;
+                out.push_str("))) {\n");
+                indent(out, d + 1);
+                out.push_str(&format!("String {lv};\n"));
+                indent(out, d + 1);
+                out.push_str(&format!("while (({lv} = __r.readLine()) != null) {{\n"));
+                for b in &fl.body {
+                    self.stmt_to_java(b, d + 2, out)?;
+                }
+                if !lim_stmt.is_empty() {
+                    indent(out, d + 2);
+                    out.push_str(&lim_stmt);
+                }
+                indent(out, d + 1);
+                out.push_str("}\n");
+                indent(out, d);
+                out.push_str("} }\n");
+                Ok(())
+            }
             IrStmt::Case {
                 discriminant,
                 clauses,
@@ -500,7 +549,21 @@ impl JavaCtx {
                         .patterns
                         .iter()
                         .filter(|p| p.as_str() != "*")
-                        .map(|p| format!("{}.equals({})", dstr, java_str_lit(p)))
+                        .map(|p| {
+                            // bash case patterns are GLOBS (* ? [...]).
+                            // A literal-safe pattern stays .equals();
+                            // anything with wildcards lowers to the
+                            // sh2Glob regex translation.
+                            let literal = !p.chars().any(|c| "*?[".contains(c));
+                            if literal {
+                                format!("{}.equals({})", dstr, java_str_lit(p))
+                            } else if p.as_str() == "*" {
+                                "true".to_string()
+                            } else {
+                                self.need_glob = true;
+                                format!("sh2Glob({}, {})", dstr, java_str_lit(p))
+                            }
+                        })
                         .collect();
                     if conds.is_empty() && is_default {
                         indent(out, d);
@@ -696,6 +759,19 @@ impl JavaCtx {
                 out.push_str(&format!("({l}){jop}({r})"));
                 Ok(())
             }
+            IrExpr::Ext(node) => {
+                // StringContains renders raw (a boolean condition); other
+                // value primitives in condition position are truthy strings
+                // (non-empty = true) — render and test non-empty.
+                let n = node.as_ref();
+                if n.tag() == "StringContains" {
+                    let s = ext_value_to_java(n, false)?;
+                    out.push_str(&s);
+                } else {
+                    out.push_str("true");
+                }
+                Ok(())
+            }
             IrExpr::Call { .. } => {
                 out.push_str("true");
                 Ok(())
@@ -745,10 +821,30 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
                     let Some(IrExpr::Array(items)) = args.get(1) else {
                         return Err("printf without an args array (v1)".into());
                     };
-                    let Some(IrExpr::Str(fmt, _)) = items.first() else {
-                        return Err("printf with a non-literal format (v1)".into());
+                    let fmt = match items.first() {
+                        Some(IrExpr::Str(s, _)) => s.clone(),
+                        Some(IrExpr::Interpolate(parts)) => {
+                            // an f-string format whose parts are all literal
+                            let mut t = String::new();
+                            let mut ok = true;
+                            for p in parts {
+                                match p {
+                                    crate::ir::InterpPart::Lit(s) => t.push_str(s),
+                                    _ => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if ok {
+                                t
+                            } else {
+                                return Err("printf with a non-literal format (v1)".into());
+                            }
+                        }
+                        _ => return Err("printf with a non-literal format (v1)".into()),
                     };
-                    let parsed = printf_parse(fmt);
+                    let parsed = printf_parse(&fmt);
                     let Some((els, n_specs)) = parsed else {
                         // complex spec — the v1 raw join
                         indent(out, d);
@@ -768,7 +864,7 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
                     let mut pieces: Vec<String> = Vec::new();
                     if n_specs == 0 {
                         // printf(1): the format text repeats once per arg
-                        let text = java_str_lit(&printf_unescape(fmt));
+                        let text = java_str_lit(&printf_unescape(&fmt));
                         let passes = if fmt_args.is_empty() { 1 } else { fmt_args.len() };
                         for _ in 0..passes {
                             pieces.push(text.clone());
@@ -1050,6 +1146,22 @@ fn stmts_need_sh2num(stmts: &[IrStmt]) -> bool {
         IrStmt::While { cond, body, .. } => expr_need_sh2num(cond) || stmts_need_sh2num(body),
         IrStmt::DoWhile { body, cond, .. } => stmts_need_sh2num(body) || expr_need_sh2num(cond),
         IrStmt::Block(b) => stmts_need_sh2num(b),
+        // text-ops ForEachLine bodies carry sh2Num arithmetic
+        IrStmt::Ext(node) => node.children().iter().any(|c| match c {
+            IrStmt::Expr(e) => expr_need_sh2num(e),
+            IrStmt::Assign { expr, .. } => expr_need_sh2num(expr),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                expr_need_sh2num(cond)
+                    || stmts_need_sh2num(then)
+                    || stmts_need_sh2num(else_)
+                    || elsifs.iter().any(|(cc, b)| expr_need_sh2num(cc) || stmts_need_sh2num(b))
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { body, cond, .. } => {
+                expr_need_sh2num(cond) || stmts_need_sh2num(body)
+            }
+            IrStmt::Output { value, .. } => expr_need_sh2num(value),
+            _ => false,
+        }),
         _ => false,
     })
 }
@@ -1077,6 +1189,8 @@ fn expr_need_sh2num(e: &IrExpr) -> bool {
         IrExpr::Arith(_) => true,
         IrExpr::Call { func, .. } if func == "test" => true,
         IrExpr::Call { func, .. } if is_mem_func(func) => true,
+        // text-ops numeric string arithmetic renders through sh2Num
+        IrExpr::BinOp { .. } => true,
         IrExpr::Array(items) => items.iter().any(expr_need_sh2num),
         _ => false,
     }
@@ -1288,7 +1402,156 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
             }
             Err("capture not in the v1 Java subset".into())
         }
+        IrExpr::Int(v) => {
+            out.push_str(&java_str_lit(&v.to_string()));
+            Ok(())
+        }
+        IrExpr::BinOp { lhs, op, rhs } => {
+            // numeric string arithmetic: bash vars are strings, so render
+            // through sh2Num coercion then back to a string
+            let jop = match op {
+                crate::ir::BinOpKind::Add => "+",
+                crate::ir::BinOpKind::Sub => "-",
+                crate::ir::BinOpKind::Mul => "*",
+                crate::ir::BinOpKind::Div => "/",
+                _ => return Err(format!("BinOp not in the Java value subset: {op:?}")),
+            };
+            let mut l = String::new();
+            expr_to_java(lhs, &mut l)?;
+            let mut r = String::new();
+            expr_to_java(rhs, &mut r)?;
+            out.push_str(&format!(
+                "String.valueOf(sh2Num({l}) {jop} sh2Num({r}))",
+                l = l, r = r, jop = jop
+            ));
+            Ok(())
+        }
+        IrExpr::Ext(node) => {
+            let s = ext_value_to_java(node.as_ref(), true)?;
+            out.push_str(&s);
+            Ok(())
+        }
         other => Err(format!("expr not in the v1 Java subset: {other:?}")),
+    }
+}
+
+/// A text-ops primitive Ext value → a JAVA expression.
+/// `stringify` selects the value-position form (everything is a String —
+/// bash vars are strings); condition position wants raw booleans/numbers.
+fn ext_value_to_java(node: &dyn crate::shir_nodes::ExtExpr, stringify: bool) -> Result<String, String> {
+    let ch = node.children();
+    let child = |i: usize| -> Result<String, String> {
+        let mut s = String::new();
+        expr_to_java(ch.get(i).ok_or("ext: missing child")?, &mut s)?;
+        Ok(s)
+    };
+    let bool_str = |b: String| if stringify { format!("Boolean.toString({})", b) } else { b };
+    match node.tag() {
+        "StrLen" => Ok(if stringify {
+            format!("String.valueOf(({}).length())", child(0)?)
+        } else {
+            format!("({}).length()", child(0)?)
+        }),
+        "CaseTransform" => {
+            let n = node.as_any().downcast_ref::<crate::shir_nodes::CaseTransform>().ok_or("tag/type")?;
+            let m = if n.upper { "toUpperCase" } else { "toLowerCase" };
+            Ok(format!("({}).{}()", child(0)?, m))
+        }
+        "SubStrExtract" => {
+            let off = child(1)?;
+            match ch.get(2) {
+                Some(IrExpr::Int(len)) => {
+                    if *len < 0 {
+                        Ok(format!("({}).substring({})", child(0)?, off))
+                    } else {
+                        Ok(format!("({}).substring({}, {} + {})", child(0)?, off, off, len))
+                    }
+                }
+                Some(lx) => {
+                    let mut l = String::new();
+                    expr_to_java(lx, &mut l)?;
+                    Ok(format!("({}).substring({}, {} + Long.parseLong({}))", child(0)?, off, off, l))
+                }
+                None => Ok(format!("({}).substring({})", child(0)?, off)),
+            }
+        }
+        "RegSub" => {
+            let n = node.as_any().downcast_ref::<crate::shir_nodes::RegSub>().ok_or("tag/type")?;
+            let m = if n.global { "replaceAll" } else { "replaceFirst" };
+            Ok(format!("({}).{}({}, {})", child(0)?, m,
+                java_str_lit(&n.pattern), java_str_lit(&n.replacement)))
+        }
+        "StringContains" => {
+            let b = format!("(({}).contains({}))", child(0)?, child(1)?);
+            Ok(bool_str(b))
+        }
+        "StringTrim" => {
+            let n = node.as_any().downcast_ref::<crate::shir_nodes::StringTrim>().ok_or("tag/type")?;
+            let t = child(0)?;
+            let mut e = t;
+            if n.leading { e = format!("{}.replaceFirst(\"^\\\\s+\", \"\")", e); }
+            if n.trailing { e = format!("{}.replaceFirst(\"\\\\s+$\", \"\")", e); }
+            if !n.leading && !n.trailing { e = format!("({}).strip()", e.clone()); }
+            Ok(e)
+        }
+        "TakeLines" => {
+            let n = node.as_any().downcast_ref::<crate::shir_nodes::TakeLines>().ok_or("tag/type")?;
+            let cnt = match ch.get(1) {
+                Some(IrExpr::Int(v)) => v.to_string(),
+                _ => return Err("TakeLines non-static count not in the Java subset".into()),
+            };
+            if n.bytes {
+                let t = child(0)?;
+                return Ok(if n.from_end {
+                    format!("do {{ String _t = {}; int _k = {}; _t = _t.substring(java.lang.Math.max(0, _t.length() - _k)); _t; }}", t, cnt)
+                } else {
+                    format!("do {{ String _t = {}; int _k = {}; _t = _t.substring(0, java.lang.Math.min(_t.length(), _k)); _t; }}", t, cnt)
+                });
+            }
+            Ok(format!("sh2Take({}, {}, {})", child(0)?, cnt, if n.from_end { "true" } else { "false" }))
+        }
+        "FieldExtract" => {
+            let n = node.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>().ok_or("tag/type")?;
+            let mut ids: Vec<i64> = Vec::new();
+            for f in &n.fields {
+                match f {
+                    crate::ir::FieldRange::Single(i) => ids.push(*i as i64 - 1),
+                    crate::ir::FieldRange::Range { start, end } => {
+                        let (lo, hi) = (*start as i64, *end as i64);
+                        if hi - lo > 4096 { return Err("FieldExtract absurd range".into()); }
+                        let mut i = lo - 1;
+                        while i <= hi - 1 { ids.push(i); i += 1; }
+                    }
+                }
+            }
+            ids.retain(|&i| i >= 0);
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.is_empty() { return Err("FieldExtract no fields".into()); }
+            let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+            Ok(format!("sh2Fields({}, {}, new int[]{{{}}}, {})",
+                child(0)?, java_str_lit(&n.delimiter), list,
+                if n.suppress_no_delim { "true" } else { "false" }))
+        }
+        "PathName" => {
+            let n = node.as_any().downcast_ref::<crate::shir_nodes::PathName>().ok_or("tag/type")?;
+            let f = if n.which == "dirname" { "sh2Dirname" } else { "sh2Basename" };
+            Ok(format!("{}({})", f, child(0)?))
+        }
+        "RegCount" => {
+            let n = node.as_any().downcast_ref::<crate::shir_nodes::RegCount>().ok_or("tag/type")?;
+            let raw = format!("java.util.regex.Pattern.compile({}).matcher({}).results().count()",
+                java_str_lit(&n.pattern), child(0)?);
+            Ok(if stringify { format!("String.valueOf({})", raw) } else { raw })
+        }
+        "RepeatStr" => {
+            let cnt = match ch.get(1) {
+                Some(IrExpr::Int(v)) => v.to_string(),
+                _ => return Err("RepeatStr non-static count not in the Java subset".into()),
+            };
+            Ok(format!("({}).repeat({})", child(0)?, cnt))
+        }
+        other => Err(format!("ext value not in the Java subset: {other}")),
     }
 }
 
@@ -1411,6 +1674,19 @@ fn is_mem_func(func: &str) -> bool {
 /// [v], and -a/-o conjunctions. Anything else → None (the caller keeps
 /// the v1 fallback).
 fn test_render(s: &str) -> Option<String> {
+    // The IR packs tight comparisons (`"$var"=="value"`) — split on the
+    // first ==/!= that sits OUTSIDE quotes, then render both sides.
+    for op in ["==", "!="] {
+        if let Some((l, r)) = split_test_op(s, op) {
+            let a = test_render(l.trim())?;
+            let b = test_render(r.trim())?;
+            return Some(if op == "==" {
+                format!("({a}.equals({b}))")
+            } else {
+                format!("(!{a}.equals({b}))")
+            });
+        }
+    }
     for (sep, joiner) in [(" -a ", " && "), (" -o ", " || ")] {
         if s.contains(sep) {
             let mut parts = Vec::new();
@@ -1460,6 +1736,34 @@ fn test_render(s: &str) -> Option<String> {
     }
 }
 
+/// Split `s` on the first `op` occurring OUTSIDE double/single quotes.
+fn split_test_op<'a>(s: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' | b'\'' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    if b[i] == b'\\' { i += 1; }
+                    i += 1;
+                }
+            }
+            _ => {
+                if s[i..].starts_with(op) {
+                    // not part of a longer op (!= vs =): require the char
+                    // before isn't '!' when matching '==' is fine; simple
+                    // left-to-right first hit wins
+                    return Some((&s[..i], &s[i + op.len()..]));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// A test operand → a Java STRING expression (a field read for `$name`,
 /// a literal otherwise). The numeric ops wrap it in sh2Num; the string
 /// ops use it as-is. `$?` and the specials are unrepresentable → None
@@ -1481,6 +1785,130 @@ fn test_operand(t: &str) -> Option<String> {
 /// strings, element offsets scaled by the type's size at load/store.
 /// The estree ref stores STRING slots; the java arena stores longs
 /// (store values coerce via sh2Num) and memLoad stringifies.
+/// Does any statement carry a text-ops primitive VALUE node? (The helper
+/// preamble is emitted only then — unused private statics would bloat the
+/// trivial programs.)
+fn stmts_use_ext_value(stmts: &[IrStmt]) -> bool {
+    fn expr_has(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Ext(_) => true,
+            IrExpr::Call { args, .. } => args.iter().any(expr_has),
+            IrExpr::Array(items) => items.iter().any(expr_has),
+            IrExpr::Capture { expr, .. } => expr_has(expr),
+            IrExpr::BinOp { lhs, rhs, .. } => expr_has(lhs) || expr_has(rhs),
+            _ => false,
+        }
+    }
+    fn walk(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Assign { targets: _, expr, .. } => expr_has(expr),
+            IrStmt::Expr(e) => expr_has(e),
+            IrStmt::Output { value, .. } => expr_has(value),
+            IrStmt::If { cond, then, elsifs, else_ } => {
+                expr_has(cond) || then.iter().any(walk)
+                    || elsifs.iter().any(|(_, b)| b.iter().any(walk))
+                    || else_.iter().any(walk)
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { body, cond, .. } => {
+                expr_has(cond) || body.iter().any(walk)
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => b.iter().any(walk),
+            IrStmt::Ext(n) => n.tag() == "ForEachLine",
+            _ => false,
+        }
+    }
+    stmts.iter().any(walk)
+}
+
+/// Shared helpers for the text-ops primitive lowerings. Emitted only when
+/// a primitive value node is present (see stmts_use_ext_value).
+/// Does any case clause carry a glob (non-literal, non-*) pattern?
+fn stmts_need_glob(stmts: &[IrStmt]) -> bool {
+    fn walk(s: &[IrStmt]) -> bool {
+        s.iter().any(|st| match st {
+            IrStmt::Case { clauses, .. } => clauses.iter().any(|cl| {
+                cl.patterns.iter().any(|p| {
+                    p.as_str() != "*" && p.chars().any(|c| "*?[".contains(c))
+                })
+            }),
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => walk(b),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                walk(then) || walk(else_)
+                    || elsifs.iter().any(|(_, b)| walk(b))
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::ForInit { body, .. } => walk(body),
+            _ => false,
+        })
+    }
+    walk(stmts)
+}
+
+const GLOB_HELPER: &str = r#"    static boolean sh2Glob(String s, String pat) {
+        StringBuilder re = new StringBuilder();
+        for (int i = 0; i < pat.length(); i++) {
+            char c = pat.charAt(i);
+            switch (c) {
+                case '*' -> re.append(".*");
+                case '?' -> re.append('.');
+                case '[' -> {
+                    int j = i + 1;
+                    if (j < pat.length() && pat.charAt(j) == '!' || pat.charAt(j) == '^') j++;
+                    while (j < pat.length() && pat.charAt(j) != ']') j++;
+                    String cls = pat.substring(i, Math.min(j + 1, pat.length()));
+                    if (cls.startsWith("[!")) cls = "[" + cls.substring(2);
+                    if (j >= pat.length()) { re.append("\\").append(c); continue; }
+                    re.append(cls.replace("\\", "\\"));
+                    i = Math.min(j, pat.length() - 1);
+                }
+                default -> {
+                    if ("\\.^$[]{}()|+?".indexOf(c) >= 0) re.append('\\');
+                    re.append(c);
+                }
+            }
+        }
+        return s.matches(re.toString());
+    }
+"#;
+
+const EXT_HELPERS: &str = r#"    static String sh2Take(String t, int k, boolean fromEnd) {
+        String[] L = t.split("\\n", -1);
+        int n = L.length;
+        StringBuilder b = new StringBuilder();
+        if (fromEnd) {
+            int s0 = Math.max(0, n - k);
+            for (int i = s0; i < n; i++) { b.append(L[i]); if (i < n - 1) b.append('\n'); }
+        } else {
+            int e0 = Math.min(k, n);
+            for (int i = 0; i < e0; i++) { b.append(L[i]); if (i < e0 - 1) b.append('\n'); }
+        }
+        return b.toString();
+    }
+    static String sh2Fields(String t, String d, int[] ids, boolean suppress) {
+        if (!t.contains(d)) return suppress ? "" : t;
+        String[] p = t.split(java.util.regex.Pattern.quote(d), -1);
+        StringBuilder b = new StringBuilder();
+        boolean first = true;
+        for (int id : ids) {
+            if (id >= 0 && id < p.length) {
+                if (!first) b.append(d);
+                b.append(p[id]);
+                first = false;
+            }
+        }
+        return b.toString();
+    }
+    static String sh2Basename(String t) {
+        int i = t.lastIndexOf('/');
+        return i < 0 ? t : t.substring(i + 1);
+    }
+    static String sh2Dirname(String t) {
+        int i = t.lastIndexOf('/');
+        if (i < 0) return ".";
+        if (i == 0) return "/";
+        return t.substring(0, i);
+    }
+"#;
+
 const MEM_PREAMBLE: &str = r#"    static long sh2_memSeq = 0;
     static java.util.HashMap<String, long[]> sh2_memArena = new java.util.HashMap<String, long[]>();
     static long sh2_memPos(String h) {

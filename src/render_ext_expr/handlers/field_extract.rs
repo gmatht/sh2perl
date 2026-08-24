@@ -32,17 +32,26 @@ pub(crate) fn render(node: &FieldExtract, ctx: &ExprRenderCtx) -> Option<String>
 }
 
 fn render_perl(node: &FieldExtract, indices: &[u32]) -> Option<String> {
+    // NOTE: the result must not START with "(" — the statement emitter
+    // renders `say {expr};`, and `say (split(..))[0]` parses as a function
+    // call (syntax error). Wrap in do { … } which is always a term.
     let text = crate::ir::ir_expr_to_perl(&node.text);
     let delim = format!("'{}'", node.delimiter.replace('\'', "''"));
 
     if indices.len() == 1 {
-        Some(format!("(split({}, {}, -1))[{}]", delim, text, indices[0]))
+        Some(format!(
+            "do {{ my @_p = split({}, {}, -1); $_p[{}] }}",
+            delim, text, indices[0]
+        ))
     } else {
-        let idx_list: String = indices.iter()
-            .map(|i| format!("$_[{}]", i))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(format!("join({}, (split({}, {}, -1))[{}])", delim, delim, text, idx_list))
+        // bash cut drops MISSING trailing fields ("d:e" -f1,3 → "d", not
+        // "d:") and normalizes ascending — grep the indices to those the
+        // line actually has before joining.
+        let idx_list: String = indices.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        Some(format!(
+            "do {{ my @_p = split({}, {}, -1); join({}, map {{ $_p[$_] }} grep {{ $_ <= $#_p }} ({})) }}",
+            delim, text, delim, idx_list
+        ))
     }
 }
 

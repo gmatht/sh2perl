@@ -14,7 +14,10 @@ fn render(backend: &str, content: &str) -> Option<String> {
     match backend {
         "js" => Some(debashl::js_backend::shir_to_js(&prog)),
         "go" => Some(debashl::go_backend::shir_to_go(&prog)),
-        "java" => debashl::java_backend::shir_to_java(&prog).ok(),
+        "java" => match debashl::java_backend::shir_to_java(&prog) {
+            Ok(s) => Some(s),
+            Err(e) => { if std::env::var("SCAN_DEBUG").is_ok() { eprintln!("java err: {e}"); } None }
+        },
         "python" => Some(debashl::python_backend::shir_to_python(&prog)),
         "rust" => Some(debashl::rust_backend::shir_to_rust(&prog)),
         "zig" => Some(debashl::zig_backend::shir_to_zig(&prog)),

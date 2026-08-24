@@ -6337,6 +6337,7 @@ const RUNTIME_HELPERS: &[&str] = &[
     "",
     "func bprintfStr(f string, a ...string) string {",
     "    f = bEsc(f)",
+    "    if len(a) == 0 { return f }",
     "    var out strings.Builder",
     "    for len(a) > 0 {",
     "        var used int",

@@ -560,11 +560,15 @@ fn string_read_names(s: &str, reads: &mut HashSet<String>) {
                 {
                     j += 1;
                 }
-                if j < bytes.len() && bytes[j] == b'}' {
-                    if j > w { reads.insert(String::from_utf8_lossy(&bytes[w..j]).into_owned()); }
-                    i = j + 1;
-                    continue;
-                }
+                // a name was scanned — record it even when the `}` is
+                // missing or delayed by expansion OPERATORS
+                // (`${MAXWAIT% *}`, `${x:-d}`: the core may also drop a
+                // trailing `}` when the pattern holds a `#`) — failing
+                // to count it judged the var never-read and DSE dropped
+                // its only store (param-expand-hash)
+                if j > w { reads.insert(String::from_utf8_lossy(&bytes[w..j]).into_owned()); }
+                i = j + 1;
+                continue;
             }
             while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                 j += 1;
