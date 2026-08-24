@@ -563,27 +563,35 @@ impl JavaCtx {
                     Some(x) => x.as_str(),
                     None => "",
                 };
-                if tf.is_empty() {
-                    out.push_str(&format!(
-                        "__w = java.nio.file.Files.walk(java.nio.file.Paths.get({src}), {maxd});
-",
-                        src = src, maxd = maxd
-                    ));
-                } else {
-                    // type filter inside walk: f → regular file, d → dir;
-                    // GNU find evaluates the START too — add it explicitly.
-                    // Files.find evaluates the START too (GNU find parity)
-                    let bi = if tf == "f" {
-                        "(p, a) -> java.nio.file.Files.isRegularFile(p)"
+                let mut preds: Vec<String> = Vec::new();
+                if !tf.is_empty() {
+                    preds.push(if tf == "f" {
+                        "java.nio.file.Files.isRegularFile(p)".to_string()
                     } else {
-                        "(p, a) -> java.nio.file.Files.isDirectory(p)"
-                    };
-                    out.push_str(&format!(
-                        "__w = java.nio.file.Files.find(java.nio.file.Paths.get({src}), {maxd}, {bi});
-",
-                        src = src, bi = bi, maxd = maxd
+                        "java.nio.file.Files.isDirectory(p)".to_string()
+                    });
+                }
+                if let Some(nf) = &wd.name_filter {
+                    // -name GLOB: PathMatcher matches the BASE NAME
+                    self.need_glob = true;
+                    preds.push(format!(
+                        "sh2Glob(p.getFileName().toString(), {})",
+                        java_str_lit(nf)
                     ));
                 }
+                let bi = format!(
+                    "(p, a) -> {}",
+                    if preds.is_empty() {
+                        "true".to_string()
+                    } else {
+                        preds.join(" && ")
+                    }
+                );
+                out.push_str(&format!(
+                    "__w = java.nio.file.Files.find(java.nio.file.Paths.get({src}), {maxd}, {bi});
+",
+                    src = src, maxd = maxd, bi = bi
+                ));
                 indent(out, d);
                 out.push_str("      __w.forEach(p -> {
 ");
@@ -1480,6 +1488,15 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
         IrExpr::BinOp { lhs, op, rhs } => {
             // numeric string arithmetic: bash vars are strings, so render
             // through sh2Num coercion then back to a string
+            if *op == crate::ir::BinOpKind::Concat {
+                // string concatenation: both sides are String fields
+                let mut l = String::new();
+                expr_to_java(lhs, &mut l)?;
+                let mut r = String::new();
+                expr_to_java(rhs, &mut r)?;
+                out.push_str(&format!("(({l}) + ({r}))"));
+                return Ok(());
+            }
             let jop = match op {
                 crate::ir::BinOpKind::Add => "+",
                 crate::ir::BinOpKind::Sub => "-",
@@ -1908,6 +1925,16 @@ fn stmts_need_glob(stmts: &[IrStmt]) -> bool {
                     || elsifs.iter().any(|(_, b)| walk(b))
             }
             IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::ForInit { body, .. } => walk(body),
+            // find -name lowers its filter through sh2Glob
+            IrStmt::Ext(node) if node.tag() == "WalkDir" => node
+                .as_any()
+                .downcast_ref::<crate::shir_nodes::WalkDir>()
+                .map(|wd| wd.name_filter.is_some())
+                .unwrap_or(false)
+                || node.children().iter().any(|c| match c {
+                    IrStmt::Expr(e) => matches!(e, IrExpr::Ext(_)),
+                    _ => false,
+                }),
             _ => false,
         })
     }
