@@ -1368,6 +1368,47 @@ impl Render {
     /// Render a Call as an expression (any-compatible).
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            "line" => {
+                // multi-return line read (`line(cap, N)` = the C frontend's
+                // outparam channel): String(v).split('\n')[N]
+                if let (Some(v), Some(IrExpr::Str(i, _))) = (args.first(), args.get(1)) {
+                    let ve = self.expr_any(v);
+                    let n: usize = i.parse().unwrap_or(0);
+                    // s2s coerces any-typed homes (the capture writes any)
+                    return format!("__sh_line(s2s({ve}), {n})");
+                }
+                self.sh2_stub("line")
+            }
+            "fnValue" | "fnCall" => {
+                // a user-function call — values flow as strings; the
+                // positional-param convention reads fArgs inside
+                let name = args
+                    .first()
+                    .and_then(|a| match a {
+                        IrExpr::Str(nm, _) => Some(self.go_ident(nm)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "sh2TODO".to_string());
+                self.mark_read(
+                    args.first()
+                        .and_then(|a| match a {
+                            IrExpr::Str(nm, _) => Some(nm.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                );
+                self.need_fargs = true;
+                let call_args: Vec<String> = args
+                    .get(1)
+                    .and_then(|a| match a {
+                        IrExpr::Array(elems) => {
+                            Some(elems.iter().map(|e| self.expr_str(e)).collect())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                format!("{name}(&[_]string{{ {} }})", call_args.join(", "))
+            }
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     return self.getvar_any(name);
@@ -1721,6 +1762,39 @@ impl Render {
 
     /// `capture(Arrow)` body → capture lowering.
     fn capture_arrow(&mut self, body: &[IrStmt]) -> String {
+        // The C frontend's outparam channel: capture(Arrow[fnCall(..)]) —
+        // the callee ECHOES its out-param values; the caller captures
+        // STDOUT via a pipe (statement sides + a value expression)
+        if let [IrStmt::Expr(IrExpr::Call { func, args })] = body {
+            if func == "fnCall" || func == "fnValue" {
+                if let Some(IrExpr::Str(nm, _)) = args.first() {
+                    let m = self.go_ident(nm);
+                    self.mark_read(nm);
+                    self.need_fargs = true;
+                    let vals: Vec<String> = args
+                        .get(1)
+                        .and_then(|a| match a {
+                            IrExpr::Array(elems) => {
+                                Some(elems.iter().map(|e| self.expr_str(e)).collect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    self.sides.push(
+                        "__sh_old := os.Stdout; __r, __w, _ := os.Pipe(); os.Stdout = __w"
+                            .to_string(),
+                    );
+                    self.sides.push(format!(
+                        "fArgs = []string{{{}}}; {m}(); fArgs = nil;",
+                        vals.join(", ")
+                    ));
+                }
+                self.sides
+                    .push("__w.Close(); __b, _ := io.ReadAll(__r); os.Stdout = __sh_old"
+                        .to_string());
+                return "s2s(string(__b))".to_string();
+            }
+        }
         if let Some((cmd, argv)) = self.body_single_exec(body) {
             let mut parts = vec![cmd];
             parts.extend(argv);
@@ -6070,6 +6144,12 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    if len(fArgs) > 0 { return fArgs }",
     "    if len(os.Args) > 1 { return os.Args[1:] }",
     "    return nil",
+    "}",
+    "",
+    "func __sh_line(s string, n int) string {",
+    "    parts := strings.Split(s, \"\\n\")",
+    "    if n >= 0 && n < len(parts) { return parts[n] }",
+    "    return \"\"",
     "}",
     "",
     "func paramAt(i int) string {",
