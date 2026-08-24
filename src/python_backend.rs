@@ -2125,9 +2125,14 @@ impl Render {
             // no-op (mirrors the estree nospace fold); the read's own
             // rendering is the value
             "split" => {
+                // IFS word-splitting of an unquoted scalar — the RESULT IS
+                // A LIST of words (for-in iterates them individually; the
+                // old scalar form collapsed the iteration)
                 if let Some(IrExpr::Call { func, args: inner }) = args.first() {
                     if func == "getVar" {
-                        return self.call("getVar", inner);
+                        if let Some(IrExpr::Str(n, _)) = inner.first() {
+                            return format!("{}.split()", self.py_ident(n));
+                        }
                     }
                 }
                 self.sh2_stub("split", args, "split")
@@ -3803,6 +3808,22 @@ impl Render {
                                     if sel == "@" || sel == "*" =>
                                 {
                                     Some("sys.argv[1:]".to_string())
+                                }
+                                _ => None,
+                            }
+                        }
+                        // unquoted \$scalar — IFS word-split iteration
+                        IrExpr::Call { func, args } if func == "split" => {
+                            match args.first() {
+                                Some(IrExpr::Call { func: f2, args: iargs })
+                                    if f2 == "getVar" =>
+                                {
+                                    match iargs.first() {
+                                        Some(IrExpr::Str(n, _)) => {
+                                            Some(format!("{}.split()", self.py_ident(n)))
+                                        }
+                                        _ => None,
+                                    }
                                 }
                                 _ => None,
                             }
