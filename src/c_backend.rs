@@ -4301,8 +4301,14 @@ impl Render {
                                   "?("]
                         .iter()
                         .fold(s.clone(), |acc, e| acc.replace(e, &format!(" {e}")));
-                    // the operator needs its spaces too ("$x"= @(...) is
-                    // still a syntax error → "$x" = @(...)
+                    // the OPERATOR needs its spaces too ("$f1== !(…)"/
+                    // '"$x"= @(...)' are syntax errors → "$f1" == …)
+                    for o in ["!=", "=="] {
+                        let padded = format!(" {o} ");
+                        if sp.contains(o) && !sp.contains(&padded) {
+                            sp = sp.replace(o, &padded);
+                        }
+                    }
                     if !sp.contains("==") && !sp.contains("!=") {
                         sp = sp.replacen('=', " = ", 1);
                     }
