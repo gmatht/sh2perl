@@ -2007,6 +2007,19 @@ impl Render {
                 stages.iter().map(|s| IrExpr::Arrow(s.clone())).collect();
             return Some(self.call("pipeline", &[IrExpr::Array(stage_arrows)]));
         }
+        // `$(cp a b && echo ok)` — a single BinOp chain of exec calls:
+        // re-render the whole expression as shell text and run it under
+        // bash -c (documented fork/exec escape — no native python
+        // equivalent for status-chained command groups)
+        if let [IrStmt::Expr(e)] = body {
+            if matches!(e, IrExpr::BinOp { .. }) {
+                if let Some(text) = self.expr_shell_text(e) {
+                    self.need_subprocess = true;
+                    self.need_capture = true;
+                    return Some(format!("__sh_capture_bash({})", Self::py_str(&text)));
+                }
+            }
+        }
         // `$(cmd > file 2>/dev/null)` — a redirect-statement body: run
         // the whole group under bash -c with its redirects re-rendered
         if let [IrStmt::Redirect { inner, redirects, .. }] = body {
@@ -2031,6 +2044,39 @@ impl Render {
             return Some(format!("__sh_capture_bash({})", Self::py_str(&text)));
         }
         None
+    }
+
+    /// Render an exec-call EXPRESSION tree (BinOp &&/|| chains over exec
+    /// leaves) back to shell text for the bash -c fallback.
+    fn expr_shell_text(&self, e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Call { func, args } if func == "exec" => {
+                let mut one = Vec::new();
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    one.push(Self::sh_quote(cmd));
+                }
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for it in items {
+                        one.push(self.sh_arg(it)?);
+                    }
+                }
+                Some(one.join(" "))
+            }
+            IrExpr::BinOp { lhs, op, rhs } => {
+                let op_text = match op {
+                    crate::ir::BinOpKind::And => "&&",
+                    crate::ir::BinOpKind::Or => "||",
+                    _ => return None,
+                };
+                Some(format!(
+                    "{} {} {}",
+                    self.expr_shell_text(lhs)?,
+                    op_text,
+                    self.expr_shell_text(rhs)?
+                ))
+            }
+            _ => None,
+        }
     }
 
     fn body_shell_text(&self, body: &[IrStmt]) -> Option<String> {
