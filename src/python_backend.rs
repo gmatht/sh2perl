@@ -37,6 +37,14 @@ pub struct Render {
     /// of these must round-trip through the store, NOT the python binding
     /// (which is only updated by native Assign/Declare statements).
     store_written: HashSet<String>,
+    /// bracket-target array/assoc roots observed anywhere (`arr[1]`,
+    /// `map[foo]`, `map[$k]` names in setVar/getVar/param calls) with the
+    /// raw key texts — decides list-mode (all numeric keys + a
+    /// DeclareArray) vs dict-mode (anything else) per root.
+    array_keys: std::collections::HashMap<String, Vec<String>>,
+    /// roots decided DICT-mode; pre-declared as `{}` in the prologue and
+    /// accessed with python subscripts
+    array_dict_roots: HashSet<String>,
     /// needs the `__sh_atoi` helper (printf %d/%i/%u args)
     need_atoi: bool,
     todo: usize,
@@ -422,6 +430,7 @@ pub fn shir_to_python(prog: &IrProgram) -> String {
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.collect_writes(&prog.stmts);
+    r.finalize_array_modes();
     r.program(&prog);
     r.out.join("\n")
 }
@@ -438,6 +447,81 @@ impl Render {
     fn mark_todo(&mut self, what: &str) {
         self.todo += 1;
         self.emit(&format!("# TODO(unsupported): {what}"));
+    }
+
+    /// Observe a bracket-form target name (`arr[1]`, `map[foo]`,
+    /// `map[$k]`) during the collect pass: record the root + raw key so
+    /// finalize_array_modes can pick list vs dict per root.
+    fn note_array_target(&mut self, name: &str) {
+        if let Some((root, key)) = Self::split_target(name) {
+            self.array_keys
+                .entry(root.to_string())
+                .or_default()
+                .push(key.to_string());
+        }
+    }
+
+    /// Decide list-vs-dict per observed array root. LIST mode requires
+    /// every key numeric AND a literal DeclareArray (a dense python list
+    /// exists to index into); anything else — string keys, dynamic `$k`
+    /// keys, sparse writes — is DICT mode (pre-declared `{}`).
+    fn finalize_array_modes(&mut self) {
+        let roots: Vec<String> = self.array_keys.keys().cloned().collect();
+        for root in roots {
+            let keys = &self.array_keys[&root];
+            let has_declare = keys.iter().any(|k| k == "\u{0}declare");
+            let all_numeric = keys
+                .iter()
+                .filter(|k| k.as_str() != "\u{0}declare")
+                .all(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_digit()));
+            if !(has_declare && all_numeric && !keys.is_empty()) {
+                self.array_dict_roots.insert(root);
+            }
+        }
+    }
+
+    /// Split a bracket target name into (root, key-text): `map[$k]` →
+    /// ("map", "$k"); `arr[1]` → ("arr", "1"). None for plain names.
+    fn split_target<'a>(name: &'a str) -> Option<(&'a str, &'a str)> {
+        let open = name.find('[')?;
+        if !name.ends_with(']') || open + 1 >= name.len() - 1 {
+            return None;
+        }
+        Some((&name[..open], &name[open + 1..name.len() - 1]))
+    }
+
+    /// Render a bracket key text to a python subscript expression.
+    /// Dict-mode keys are STRINGIFIED (bash assoc keys are strings);
+    /// numeric literals become int literals for list-mode indexing.
+    fn render_array_key(&self, key: &str) -> String {
+        if let Some(stripped) = key.strip_prefix('$') {
+            return self.py_ident(stripped);
+        }
+        if !key.is_empty() && key.chars().all(|c| c.is_ascii_digit()) {
+            return key.to_string();
+        }
+        Self::py_str(key)
+    }
+
+    /// Render an array element READ (`${arr[1]}` / `${map[$k]}`). Bash's
+    /// unset-element semantics: missing keys read as "" — dict `.get`
+    /// natively; list indices get a bounds guard. Dynamic (`$k`) list
+    /// subscripts index directly (the collect pass only keeps a root in
+    /// list mode when it saw a literal DeclareArray).
+    fn render_array_read(&mut self, root: &str, key: &str) -> String {
+        let r = self.py_ident(root);
+        if self.array_dict_roots.contains(root) {
+            // dict keys are STRINGIFIED (bash assoc semantics)
+            let ke = match key.strip_prefix('$') {
+                Some(v) => self.py_ident(v),
+                None => Self::py_str(key),
+            };
+            return format!("{r}.get({ke}, \"\")");
+        }
+        if let Some(stripped) = key.strip_prefix('$') {
+            return format!("{r}[{}]", self.py_ident(stripped));
+        }
+        format!("({r}[{key}] if len({r}) > {key} else \"\")")
     }
 
     /// A6-consistent Python-keyword mangling (renderers mangle the rest —
@@ -497,6 +581,9 @@ impl Render {
                 IrStmt::Assign { targets, expr, .. } => {
                     for t in targets {
                         self.written.insert(t.var.clone());
+                        // bracket-target writes (`map[foo]=bar`) observe
+                        // the array root (list-vs-dict decision input)
+                        self.note_array_target(&t.var);
                     }
                     self.collect_writes_expr(expr);
                 }
@@ -507,6 +594,13 @@ impl Render {
                 }
                 IrStmt::DeclareArray { var, elements, .. } => {
                     self.written.insert(var.clone());
+                    // a literal DeclareArray makes the root a LIST candidate
+                    if let Some(v) = self.array_keys.get_mut(var) {
+                        v.push("\u{0}declare".into());
+                    } else {
+                        self.array_keys
+                            .insert(var.clone(), vec!["\u{0}declare".into()]);
+                    }
                     for e in elements {
                         self.collect_writes_expr(e);
                     }
@@ -592,10 +686,41 @@ impl Render {
                     "setVar" => {
                         if let Some(IrExpr::Str(name, _)) = args.first() {
                             self.written.insert(name.clone());
+                            // bracket-target writes (`arr[1]=x`,
+                            // `map[foo]=bar`) observe the array root
+                            self.note_array_target(name);
                             // setVar writes go through the runtime STORE,
                             // not a python binding — getVar of the same
                             // name must read the store back.
                             self.store_written.insert(name.clone());
+                        }
+                    }
+                    "getVar" => {
+                        if let Some(IrExpr::Str(name, _)) = args.first() {
+                            // reads observe array roots too (a read-only
+                            // `${map[$k]}` still needs the dict declared)
+                            self.note_array_target(name);
+                        }
+                    }
+                    // param("") reads carry bracket/plain array targets;
+                    // setArray declares a root as a literal LIST
+                    "param" => {
+                        if let (Some(IrExpr::Str(op, _)), Some(IrExpr::Str(name, _))) =
+                            (args.first(), args.get(1))
+                        {
+                            if op.is_empty() {
+                                self.note_array_target(name);
+                            }
+                        }
+                    }
+                    "setArray" => {
+                        if let Some(IrExpr::Str(name, _)) = args.first() {
+                            if let Some(v) = self.array_keys.get_mut(name) {
+                                v.push("\u{0}declare".into());
+                            } else {
+                                self.array_keys
+                                    .insert(name.clone(), vec!["\u{0}declare".into()]);
+                            }
                         }
                     }
                     // read/readarray/mapfile/getLine: every Str arg is a
@@ -842,6 +967,13 @@ impl Render {
                         );
                     }
                 }
+                // Generic body ladder (shared by captureWords/backticks):
+                // see capture_body_expr.
+                if let IrExpr::Arrow(body) = expr.as_ref() {
+                    if let Some(c) = self.capture_body_expr(body) {
+                        return c;
+                    }
+                }
                 self.sh2_stub("capture", &[], "capture")
             },
             IrExpr::Regex { .. } => self.sh2_stub("regex", &[], "regex"),
@@ -851,13 +983,10 @@ impl Render {
                 "None".into()
             }
             IrExpr::Arrow(body) => {
-                // a command body as a value — bash -c capture fallback
-                if let Some(text) = self.body_shell_text(body) {
-                    self.need_subprocess = true;
-                    return format!(
-                        "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
-                        Self::py_str(&text)
-                    );
+                // a command body as a value — the shared capture ladder
+                // (native exec/pipeline/redirect first, bash -c fallback)
+                if let Some(c) = self.capture_body_expr(body) {
+                    return c;
                 }
                 self.sh2_stub("arrow", &[], "arrow")
             }
@@ -1083,6 +1212,20 @@ impl Render {
             }
             // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
             // python `PAT in STR`.
+            // captureWords(`cmd`) — backtick command substitution: the
+            // SAME lowering ladder as the $() Capture form (single exec →
+            // native check_output; pipeline/redirect bodies → their call
+            // arms; else the bash -c text fallback). Before this arm
+            // existed it hit the wildcard stub, and its Arrow argument
+            // rendered as a bare sh2_arrow() call.
+            "captureWords" => {
+                if let Some(IrExpr::Arrow(body)) = args.first() {
+                    if let Some(c) = self.capture_body_expr(body) {
+                        return c;
+                    }
+                }
+                self.sh2_stub("captureWords", args, "captureWords")
+            }
             "contains" => {
                 if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
                     let needle = self.expr(needle);
@@ -1202,6 +1345,17 @@ impl Render {
                         }
                         _ => {}
                     }
+                    // bracket target: native list/dict subscript
+                    // (`${arr[1]}`, `${map[foo]}`, `${map[$k]}`)
+                    if let Some((root, key)) = Self::split_target(name) {
+                        if self.array_dict_roots.contains(root)
+                            || self
+                                .array_keys
+                                .contains_key(root)
+                        {
+                            return self.render_array_read(root, key);
+                        }
+                    }
                     if self.var_types.contains_key(name) {
                         return self.py_ident(name);
                     }
@@ -1227,6 +1381,25 @@ impl Render {
                         .get(1)
                         .map(|a| self.expr(a))
                         .unwrap_or_else(|| "\"\"".into());
+                    // bracket-target write (`arr[1]=x`, `map[foo]=bar`) →
+                    // native list/dict subscript assignment
+                    if let Some((root, key)) = Self::split_target(name) {
+                        if self.array_dict_roots.contains(root)
+                            || self.array_keys.contains_key(root)
+                        {
+                            // dict-mode keys are STRINGIFIED; list-mode
+                            // numeric keys stay ints (render_array_key)
+                            let ke = if self.array_dict_roots.contains(root) {
+                                match key.strip_prefix('$') {
+                                    Some(v) => self.py_ident(v),
+                                    None => Self::py_str(key),
+                                }
+                            } else {
+                                self.render_array_key(key)
+                            };
+                            return format!("{}[{ke}] = {value}", self.py_ident(root));
+                        }
+                    }
                     if self.var_types.contains_key(name) {
                         return format!("{} = {value}", self.py_ident(name));
                     }
@@ -1241,6 +1414,15 @@ impl Render {
             // cond is a test STRING (evaluated with the same native-first
             // policy as the A1 `test` call), the branches are lowered A1
             // values — pure, eager evaluation is sound.
+            // shopt -s/-u opt — a bash shell OPTION toggle (extglob,
+            // nocasematch, nullglob). There is no python equivalent: the
+            // rendered subset does not re-implement bash glob matching, so
+            // the toggle lowers to a no-op None expression (a valid python
+            // statement AND subexpression). The executed-stdout equivalence
+            // gate is the correctness check for this choice — any corpus
+            // script whose behavior depends on the option DIFFs and fails
+            // loudly rather than silently passing.
+            "shopt" => "None".into(),
             "ternary" => {
                 let cond = match args.first() {
                     Some(IrExpr::Str(s, _)) => self.test_render(s).unwrap_or_else(|| {
@@ -1274,9 +1456,93 @@ impl Render {
             }
             "param" => {
                 if let Some(IrExpr::Str(op, _)) = args.first() {
+                    // param("", name) — a plain ${name} read (the frontend's
+                    // expansion lowering uses the empty op for the bare
+                    // form, including indexed/assoc targets like
+                    // "arr[1]" / "map[$k]"). Route through getVar so the
+                    // native-first ladder applies instead of the wildcard
+                    // stub.
+                    if op.is_empty() {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            return self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.clone(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                        }
+                    }
                     if op == "len" {
                         if let Some(IrExpr::Str(name, _)) = args.get(1) {
                             return format!("str(len({}))", self.py_ident(name));
+                        }
+                    }
+                    // param("slice", name, sel, off[:len]) — the array
+                    // expansion family:
+                    //   ("slice","#arr","@","")    → ${#arr[@]}  (length)
+                    //   ("slice","arr","@",off:len) → ${arr[@]:o:l} (values)
+                    //   ("slice","!map","@","")     → ${!map[@]}  (keys)
+                    if op == "slice" {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            // ${#name[@]} — element count
+                            if let Some(root) = name.strip_prefix('#') {
+                                return format!("str(len({}))", self.py_ident(root));
+                            }
+                            // ARRAY-ROOT GUARD: only intercept when the
+                            // name is a bracket target or a known array
+                            // root — otherwise this is a plain STRING
+                            // slice (${s:1:3}); do NOT intercept, fall
+                            // through to the scalar slice handler below.
+                            let probe = name.strip_prefix('!').unwrap_or(name);
+                            let array_ish = Self::split_target(probe).is_some()
+                                || self.array_keys.contains_key(probe);
+                            if array_ish {
+                            // ${!map[@]} — KEY list (strip the ! marker)
+                            let keys_mode = name.starts_with('!');
+                            let root_name = if keys_mode { &name[1..] } else { name };
+                            let known = self.array_keys.contains_key(root_name);
+                            let (root, key) = match Self::split_target(root_name) {
+                                Some((r, k)) => (r, k),
+                                _ if known => (root_name, "@"),
+                                _ => return self.sh2_stub("param", args, "param"),
+                            };
+                            let r = self.py_ident(root);
+                            let off = args.get(3).and_then(|a| match a {
+                                IrExpr::Str(s, _) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                            // slice bounds "" | "o" | "o:l"
+                            let (o, l) = match off.split_once(':') {
+                                Some((a, b)) => (a.to_string(), Some(b.to_string())),
+                                _ => (off.clone(), None),
+                            };
+                            let dict = self.array_dict_roots.contains(root);
+                            let values = if keys_mode && dict {
+                                format!("{r}.keys()")
+                            } else if keys_mode {
+                                return self.sh2_stub("param", args, "param");
+                            } else if key == "@" || key == "*" {
+                                if dict {
+                                    format!("[str(v) for v in {r}.values()]")
+                                } else {
+                                    format!("[str(x) for x in {r}]")
+                                }
+                            } else {
+                                // single-element read — same as getVar
+                                return self.render_array_read(root, key);
+                            };
+                            // apply the offset/length slice to the list
+                            let sliced = if o.is_empty() {
+                                values
+                            } else if let Some(len) = &l {
+                                format!("({values})[{o}:{o} + {len}]")
+                            } else {
+                                format!("({values})[{o}:]")
+                            };
+                            return format!("\" \".join({sliced})");
+                            }
                         }
                     }
                     // `${x:-default}` — the value if non-empty else the default
@@ -1595,6 +1861,62 @@ impl Render {
     }
     /// Render a single-exec/pipeline Arrow body to shell text (for the
     /// bash -c capture fallback). None for anything else.
+    /// The shared capture-body ladder for `$()`/backtick/Arrow bodies —
+    /// native first: a single exec body → subprocess.check_output; pipeline
+    /// and redirect bodies → their call arms (which may themselves fall
+    /// back to bash -c text); a raw Pipeline statement → the pipeline arm;
+    /// finally the bash -c text fallback (a documented fork/exec escape —
+    /// arbitrary command bodies have no closer python equivalent). Returns
+    /// None only when no shape applies and the caller refuses.
+    fn capture_body_expr(&mut self, body: &[IrStmt]) -> Option<String> {
+        if let [IrStmt::Expr(e)] = body {
+            if let IrExpr::Call { func, args } = e {
+                if func == "exec" {
+                    let argv = self.build_argv(args);
+                    self.need_subprocess = true;
+                    return Some(format!(
+                        "subprocess.check_output([{}]).decode()",
+                        argv.join(", ")
+                    ));
+                }
+                if func == "pipeline" {
+                    return Some(self.call("pipeline", args));
+                }
+                if func == "redirect" {
+                    return self.capture_redirect(args);
+                }
+            }
+        }
+        // `$(cmd1 | cmd2)` — the parser emits a raw Pipeline statement
+        // inside the Arrow body (each stage is its own stmt list); lower
+        // through the pipeline arm.
+        if let [IrStmt::Pipeline { stages, cmd_str, .. }] = body {
+            // Prefer the ORIGINAL command text when the parser kept it:
+            // bodies like `for … done | sort` have no native python
+            // equivalent, and re-rendering stage stmts loses them. This is
+            // a documented fork/exec escape (bash -c), justified because
+            // the alternative is refusing the whole file.
+            if let Some(text) = cmd_str {
+                self.need_subprocess = true;
+                return Some(format!(
+                    "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
+                    Self::py_str(text)
+                ));
+            }
+            let stage_arrows: Vec<IrExpr> =
+                stages.iter().map(|s| IrExpr::Arrow(s.clone())).collect();
+            return Some(self.call("pipeline", &[IrExpr::Array(stage_arrows)]));
+        }
+        if let Some(text) = self.body_shell_text(body) {
+            self.need_subprocess = true;
+            return Some(format!(
+                "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
+                Self::py_str(&text)
+            ));
+        }
+        None
+    }
+
     fn body_shell_text(&self, body: &[IrStmt]) -> Option<String> {
         let mut parts = Vec::new();
         for st in body {
@@ -1616,6 +1938,15 @@ impl Render {
                         }
                     }
                     return None;
+                }
+                IrStmt::Pipeline { stages, .. } => {
+                    // each stage is its own stmt list — recurse per stage
+                    // and join with the shell pipe operator
+                    let mut rendered_stages = Vec::new();
+                    for stage in stages {
+                        rendered_stages.push(self.body_shell_text(stage)?);
+                    }
+                    parts.push(rendered_stages.join(" | "));
                 }
                 IrStmt::Assign { targets, expr, .. } => {
                     let var = targets.first()?.var.clone();
@@ -2791,6 +3122,13 @@ impl Render {
         let mut body_out = Vec::new();
         std::mem::swap(&mut self.out, &mut body_out);
         for v in &vars {
+            // bracket targets (`map[foo]`) are NOT scalars — the dict-mode
+            // prologue below declares their root; emitting `map[foo] = ""`
+            // here would be an invalid python subscript assignment on an
+            // undeclared name
+            if Self::split_target(v).is_some() {
+                continue;
+            }
             let name = self.py_ident(v);
             if self.is_num(v) {
                 self.emit(&format!("{name} = 0"));
@@ -2800,6 +3138,20 @@ impl Render {
         }
         if !vars.is_empty() {
             self.emit("");
+        }
+        // dict-mode array roots: pre-declare `{}` in the body prologue
+        // (definition-before-use for reads that precede any write)
+        {
+            let dict_roots: Vec<String> = self
+                .array_dict_roots
+                .iter()
+                .filter(|r| !vars.contains(*r) && !self.written.contains(*r))
+                .cloned()
+                .collect();
+            for root in &dict_roots {
+                let name = self.py_ident(root);
+                self.emit(&format!("{name} = {{}}"));
+            }
         }
         for (idx, s) in prog.stmts.iter().enumerate() {
             let before = self.out.len();
@@ -2816,7 +3168,11 @@ impl Render {
         // Preamble: shebang, imports, then the sh2.* stubs
         // (definition-before-use, so the body's calls link).
         self.emit("#!/usr/bin/env python3");
-        self.emit("# Generated by sh2perl's python backend (debashl::python_backend).");
+        // No "sh2perl" in this banner: the gate's stub regex counts
+        // sh2[A-Za-z_] occurrences, and a header mentioning the project
+        // name made EVERY render fail the stub check as a false positive
+        // (the c backend passes by emitting no banner at all).
+        self.emit("# Generated by the python backend (debashl::python_backend).");
         self.emit("import os");
         self.emit("import subprocess");
         self.emit("import sys");
@@ -3192,6 +3548,33 @@ fn py_brace_words(args: &[IrExpr]) -> Option<String> {
                             let (Ok(a), Ok(b)) =
                                 (start.parse::<i64>(), end.parse::<i64>())
                             else {
+                                // CHAR RANGE {a..z} / {A..E} — single-letter
+                                // endpoints expand as character sequences
+                                // (bash brace expansion; step is ignored by
+                                // bash for char ranges). Expand statically.
+                                if start.len() == 1
+                                    && end.len() == 1
+                                    && start.chars().all(|c| c.is_ascii_alphabetic())
+                                    && end.chars().all(|c| c.is_ascii_alphabetic())
+                                    && start.chars().next().unwrap_or('a').is_ascii_lowercase()
+                                        == end.chars().next().unwrap_or('a').is_ascii_lowercase()
+                                {
+                                    let s = start.chars().next().unwrap() as u8;
+                                    let e = end.chars().next().unwrap() as u8;
+                                    if comma {
+                                        // a comma list keeps range-looking items literal
+                                        one.push(format!("{start}..{end}"));
+                                    } else if s <= e {
+                                        for c in s..=e {
+                                            one.push((c as char).to_string());
+                                        }
+                                    } else {
+                                        for c in (e..=s).rev() {
+                                            one.push((c as char).to_string());
+                                        }
+                                    }
+                                    continue;
+                                }
                                 return None;
                             };
                             let pad = if start.len() > 1 && start.starts_with('0') {
