@@ -12563,7 +12563,7 @@ fn arith_lowerable(a: &ArithAst) -> bool {
 /// arithEval try/catch cannot express the zero-divisor abort once a
 /// native write has already happened — `$((x = 1/0))` must abort BEFORE
 /// the write, only the runtime evaluator orders that).
-fn parse_arith_native(src: &str) -> Option<ArithAst> {
+pub fn parse_arith_native(src: &str) -> Option<ArithAst> {
     let a = parse_arith(src)?;
     if !arith_lowerable(&a) || (arith_has_div_mod(&a) && arith_has_write(&a)) {
         return None;

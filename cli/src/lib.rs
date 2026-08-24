@@ -975,7 +975,36 @@ exit $main_exit_code;
                 Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
             }
         }
-        "--shir-in-perl" => {
+                "--shir-in-java" => {
+            if args.len() < 3 { println!("Error: --shir-in-java requires input"); return; }
+            let input = &args[2];
+            let content = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e); std::process::exit(1);
+                }
+                Ok(s)
+            } else {
+                fs::read_to_string(input)
+            };
+            let content = match content {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+            };
+            // the shared core pipeline (mirrors the --shir-in-estree arm):
+            // strip_cfor lowers the C-style ForInit (step spliced before
+            // every continue), restructure_goto_only folds goto/label
+            // pairs, process_subst materializes captures.
+            debashl::shir_passes::strip_cfor(&mut prog);
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
+            print!("{}", match debashl::java_backend::shir_to_java(&prog) { Ok(s) => s, Err(e) => { eprintln!("render: {}", e); std::process::exit(1); } });
+        }
+"--shir-in-perl" => {
             if args.len() < 3 { println!("Error: --shir-in-perl requires input"); return; }
             let input = &args[2];
             let content = if input == "-" {
