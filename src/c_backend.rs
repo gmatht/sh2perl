@@ -4698,11 +4698,33 @@ impl Render {
     /// runs the command substitutions itself.
     fn test_shell_site(&mut self, s: &str) -> String {
         let s = s.to_string();
-        // extglob patterns (@(…) etc.) need the shopt enabled in the child
+        // extglob patterns (@(…) etc.) need the shopt enabled in the
+        // child AND spaces around the comparison operator (`$f1==!(…)`
+        // is a bash syntax error)
         let flat = !s.contains(' ');
+        let ext = ["@(", "+(", "!(",
+                   "?("].iter().any(|e| s.contains(e));
+        let mut sp = s.clone();
+        if ext {
+            for o in ["!(", "+(", "?(", "@("] {
+                sp = sp.replace(o, &format!(" {o}"));
+            }
+            let mut padded = None;
+            for o in ["!=", "=="] {
+                if sp.contains(o) && !sp.contains(&format!(" {o} ")) {
+                    padded = Some(sp.replace(o, &format!(" {o} ")));
+                    break;
+                }
+            }
+            if let Some(p) = padded {
+                sp = p;
+            } else if !sp.contains("==") && !sp.contains("!=") {
+                sp = sp.replacen('=', " = ", 1);
+            }
+        }
         // arrays the text indexes must be MATERIALIZED into the child
         // command (`[ "$n" -lt $(( a[1] + a[2] )) ]` — a lives C-side)
-        let arr_inits = self.array_inits_for_text(&s);
+        let arr_inits = self.array_inits_for_text(&sp);
         self.shell_site(
             move |r| {
                 r.sh_export_vars(&s);
@@ -4710,7 +4732,16 @@ impl Render {
                 for l in &arr_inits {
                     r.emit(l);
                 }
-                if flat {
+                if ext {
+                    r.emit(&format!(
+                        "_sh_addraw({});",
+                        Self::cstr("shopt -s extglob >/dev/null 2>&1;")
+                    ));
+                    r.emit(&format!(
+                        "_sh_addraw({});",
+                        Self::cstr(&format!("[[ {sp} ]]"))
+                    ));
+                } else if flat {
                     r.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[[ {s} ]]"))));
                 } else {
                     r.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[ {s} ]"))));
