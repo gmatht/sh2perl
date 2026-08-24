@@ -226,6 +226,9 @@ pub struct Render {
     /// buffer (`NAME=` + value = one word) — consumed by the next
     /// word-append
     glue_next_word: bool,
+    /// the script READS \\$PIPESTATUS — pipeline sites must export the
+    /// stage statuses (env-import) so the reads see them
+    need_pipestatus: bool,
     /// NATIVE statements deferred to AFTER the enclosing site's
     /// system() call — a native mapfile reading a FIFO must run once the
     /// child (which spawns the FIFO writer) has started, not before it
@@ -883,6 +886,19 @@ impl Render {
             self.emit("  while (*p && dn + 1 < cap) d[dn++] = *p++;");
             self.emit("  d[dn] = 0;");
             self.emit("  return d;");
+            self.emit("}");
+            self.emit("/* $PIPESTATUS[i] — comma-joined stage statuses imported from the pipeline child */");
+            self.emit("static char *_sh_ps(size_t i) {");
+            self.emit("  /* ring of buffers: two reads in ONE printf must not alias */");
+            self.emit("  static char bufs[4][32]; static int rk = 0;");
+            self.emit("  char *buf = bufs[rk]; rk = (rk + 1) % 4;");
+            self.emit("  const char *j = getenv(\"__shps_j\");");
+            self.emit("  if (!j) { buf[0] = 0; return buf; }");
+            self.emit("  size_t k = 0;");
+            self.emit("  while (*j && k < i) { if (*j == ',') k++; j++; }");
+            self.emit("  size_t n = 0;");
+            self.emit("  while (j[n] && j[n] != ',' && n < 30) { buf[n] = j[n]; n++; }");
+            self.emit("  buf[n] = 0; return buf;");
             self.emit("}");
             self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
             self.emit("static char *_sh_strippre(char *d, size_t cap, const char *s, const char *pat, int greedy) {");
@@ -5536,6 +5552,17 @@ impl Render {
         let Some(name) = Self::str_arg(args, 1) else {
             return "0".into();
         };
+        // ${PIPESTATUS[N]} — per-stage statuses of the last pipeline
+        // (exported by the pipeline site's state-import suffix)
+        if let Some(rest) = name
+            .strip_prefix("PIPESTATUS[")
+            .and_then(|r| r.strip_suffix(']'))
+        {
+            if let Ok(i) = rest.parse::<usize>() {
+                self.need_sh = true;
+                return format!("(char*)_sh_ps({i})");
+            }
+        }
         // `${#arr[@]}` — the core spells it param("slice", "#arr", "@", "")
         if name.starts_with('#')
             && (name.ends_with("[@]")
@@ -6069,6 +6096,36 @@ impl Render {
             }
             "pipeline" => {
                 let args = args.to_vec();
+                // $PIPESTATUS reads anywhere → state-import tail
+                if self.need_pipestatus {
+                    let id = self.site_seq;
+                    self.site_seq += 1;
+                    let saved = std::mem::take(&mut self.out);
+                    let saved_depth = self.depth;
+                    self.depth = 0;
+                    self.emit(&format!(
+                        "{{ static char _envf{id}[64]; snprintf(_envf{id}, sizeof _envf{id}, \"/tmp/.shstate.%ld\", (long)getpid()); _sh_export(\"_SH2ENVF\", _envf{id}); }}"
+                    ));
+                    self.emit("_sh_reset();");
+                    let a2 = args.clone();
+                    self.sh_pipeline_text(CmdBuf::Shared, &a2);
+                    self.emit(&format!(
+                        "_sh_addraw({});",
+                        Self::cstr(" ; __shps_raw=(${PIPESTATUS[@]}) ; __shps_rc=$? ; __shps_j=\"$(IFS=, ; printf '%s' \"${__shps_raw[*]}\")\" ; export __shps_j ; [ \"$__shps_rc\" -eq 0 ]")
+                    ));
+                    let body_out = std::mem::replace(&mut self.out, saved);
+                    self.depth = saved_depth;
+                    let mut s2 = format!("static int _sh_site_{id}(void) {{\n");
+                    for line in body_out {
+                        s2.push_str(&line);
+                        s2.push('\n');
+                    }
+                    s2.push_str("  return !_sh_state_run();\n}");
+                    self.site_bodies.push(s2);
+                    self.site_ids.push(id);
+                    self.need_sh = true;
+                    return format!("_sh_site_{id}()");
+                }
                 self.shell_site(
                     |r| {
                         r.emit("_sh_reset();");
@@ -8315,6 +8372,40 @@ impl Render {
                             .map(|st| IrExpr::Arrow(st.clone()))
                             .collect(),
                     )];
+                    // the script reads $PIPESTATUS: run the pipeline via
+                    // _sh_state_run (env import) with a suffix exporting
+                    // the per-stage statuses into __shps_j
+                    if self.need_pipestatus {
+                        let id = self.site_seq;
+                        self.site_seq += 1;
+                        let saved = std::mem::take(&mut self.out);
+                        let saved_depth = self.depth;
+                        self.depth = 0;
+                        self.emit(&format!(
+                            "{{ static char _envf{id}[64]; snprintf(_envf{id}, sizeof _envf{id}, \"/tmp/.shstate.%ld\", (long)getpid()); _sh_export(\"_SH2ENVF\", _envf{id}); }}"
+                        ));
+                        self.emit("_sh_reset();");
+                        let args_c = args.clone();
+                        self.sh_pipeline_text(CmdBuf::Shared, &args_c);
+                        self.emit(&format!(
+                            "_sh_addraw({});",
+                            Self::cstr(" ; __shps_raw=(${PIPESTATUS[@]}) ; __shps_rc=$? ; __shps_j=\"$(IFS=, ; printf '%s' \"${__shps_raw[*]}\")\" ; export __shps_j ; [ \"$__shps_rc\" -eq 0 ]")
+                        ));
+                        let body_out = std::mem::replace(&mut self.out, saved);
+                        self.depth = saved_depth;
+                        let mut s2 =
+                            format!("static int _sh_site_{id}(void) {{\n");
+                        for line in body_out {
+                            s2.push_str(&line);
+                            s2.push('\n');
+                        }
+                        s2.push_str("  return !_sh_state_run();\n}");
+                        self.site_bodies.push(s2);
+                        self.site_ids.push(id);
+                        self.need_sh = true;
+                        self.emit(&format!("_sh_site_{id}();"));
+                        return;
+                    }
                     let site = self.shell_site(
                         |r| {
                             r.emit("_sh_reset();");
@@ -8755,6 +8846,87 @@ impl Render {
         // collect the untyped store names (getVar/param reads, Assign
         // targets, Declare lists) — they hoist as `char*` entries
         collect_store_names(&prog.stmts, &mut self.store);
+        // \\$PIPESTATUS reads anywhere? pipeline sites then export the
+        // per-stage statuses through the state-import channel
+        fn scan_ps_expr(e: &IrExpr, out: &mut bool) {
+            if *out {
+                return;
+            }
+            match e {
+                IrExpr::Call { func, args } if func == "param" => {
+                    if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                        if n.starts_with("PIPESTATUS[") {
+                            *out = true;
+                        }
+                    }
+                }
+                IrExpr::Interpolate(parts) => {
+                    for p in parts {
+                        if let InterpPart::Expr(x) = p {
+                            scan_ps_expr(x, out);
+                        }
+                    }
+                }
+                IrExpr::Array(items) => {
+                    for x in items {
+                        scan_ps_expr(x, out);
+                    }
+                }
+                IrExpr::Arrow(stmts) => {
+                    scan_ps_stmts(stmts, out);
+                }
+                IrExpr::Call { args, .. } => {
+                    for x in args {
+                        scan_ps_expr(x, out);
+                    }
+                }
+                IrExpr::BinOp { lhs, rhs, .. } => {
+                    scan_ps_expr(lhs, out);
+                    scan_ps_expr(rhs, out);
+                }
+                IrExpr::Object(fields) => {
+                    for (_, v) in fields {
+                        scan_ps_expr(v, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn scan_ps_stmts(stmts: &[IrStmt], out: &mut bool) {
+            for st in stmts {
+                match st {
+                    IrStmt::Expr(e) => scan_ps_expr(e, out),
+                    IrStmt::If { cond, then, elsifs, else_, .. } => {
+                        scan_ps_expr(cond, out);
+                        scan_ps_stmts(then, out);
+                        for (_, b) in elsifs {
+                            scan_ps_stmts(b, out);
+                        }
+                        scan_ps_stmts(else_, out);
+                    }
+                    IrStmt::While { cond, body, .. }
+                    | IrStmt::DoWhile { cond, body, .. } => {
+                        scan_ps_expr(cond, out);
+                        scan_ps_stmts(body, out);
+                    }
+                    IrStmt::For { iter, body, .. } => {
+                        scan_ps_expr(iter, out);
+                        scan_ps_stmts(body, out);
+                    }
+                    IrStmt::Pipeline { stages, .. } => {
+                        for s2 in stages {
+                            scan_ps_stmts(s2, out);
+                        }
+                    }
+                    IrStmt::Redirect { inner, .. } => scan_ps_stmts(inner, out),
+                    IrStmt::Block(body)
+                    | IrStmt::Subshell(body)
+                    | IrStmt::Background(body) => scan_ps_stmts(body, out),
+                    _ => {}
+                }
+            }
+        }
+        scan_ps_stmts(&prog.stmts, &mut self.need_pipestatus);
         for v in &self.store {
             vars.insert(v.clone());
         }
