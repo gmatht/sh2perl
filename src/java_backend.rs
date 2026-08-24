@@ -261,7 +261,7 @@ impl JavaRender {
             "escapes","substr","fnmatch","strip","replace","case","basename",
             "dirname","div","pow","ftype","readln","split","aset","aget",
             "writefile","outswap","errswap","inswap","snapshot","regex",
-            "contains","quote","declared",
+            "contains","quote","declared","errifempty",
         ];
         for h in all_helpers {
             if let Some(src) = helper_src(h) {
@@ -590,7 +590,58 @@ impl JavaRender {
                     self.emit(&format!("Scanner {v} = shSwapIn(new Scanner(new File(shAbs({t}))));"));
                     opened.push(v);
                 }
-                (Some(0), "heredoc") | (Some(0), "herestring") | (Some(0), "heredoc-tabs") => {
+                (Some(0), "heredoc") | (Some(0), "heredoc-tabs") | (Some(0), "herestring")
+                    if inner.iter().any(|b| matches!(b,
+                        IrStmt::Expr(IrExpr::Call { func, args, .. })
+                            if (func == "exec" || func == "builtin")
+                                && str_arg(args, 0).map(|c| !matches!(c, "echo" | "printf" | "exit" | "true" | "false" | ":" | "read" | "cd" | "shift")).unwrap_or(false) )) =>
+                {
+                    let mut cmds: Vec<String> = Vec::new();
+                    for b in inner {
+                        match b {
+                            IrStmt::Expr(IrExpr::Call { func, args, .. })
+                                if func == "exec" || func == "builtin" =>
+                            {
+                                cmds.push(self.cmd_line_expr(args)?);
+                            }
+                            _ => return Err("heredoc with non-command body not supported".into()),
+                        }
+                    }
+                    if cmds.is_empty() { return Err("empty heredoc body".into()); }
+                    let t = self.expr_str(&r.target)?;
+                    self.helper("quote");
+                    self.helper("run");
+                    let q = if r.mode == "herestring" { "" } else { "'" };
+                    // heredoc bodies already end with \n; herestrings need one
+                    let tail = if r.mode == "herestring" { "\"\\nSH2EOF\"" } else { "\"SH2EOF\"" };
+                    let joined = cmds.join(" + \" ; \" + ");
+                    self.emit(&format!("__SH_RC = shRun({joined} + \" <<{q}SH2EOF{q}\\n\" + {t} + {tail});"));
+                    return Ok(());
+                }
+                #[allow(unreachable_patterns)]
+                (Some(0), "heredoc") | (Some(0), "herestring") => {
+                    // the body feeds an EXTERNAL command: native Scanner
+                    // swaps don't reach a bash -c child — embed the
+                    // content as a real heredoc in the command text
+                    let t = self.expr_str(&r.target)?;
+                    self.helper("quote");
+                    self.helper("run");
+                    let mut inner_t = String::from("\"\"");
+                    for b in inner {
+                        match b {
+                            IrStmt::Expr(IrExpr::Call { func, args, .. })
+                                if func == "exec" || func == "builtin" =>
+                            {
+                                if !inner_t.is_empty() { inner_t += " + \" ; \" + "; }
+                                inner_t += &self.cmd_line_expr(args)?;
+                            }
+                            _ => return Err("heredoc with non-command body not supported".into()),
+                        }
+                    }
+                    let q = if r.mode == "herestring" { "" } else { "'" };
+                    self.emit(&format!("__SH_RC = shRun({inner_t} + \" <<{q}SH2EOF\\n\" + {t} + \"\\nSH2EOF\");"));
+                }
+                (Some(0), "heredoc") | (Some(0), "herestring") => {
                     let t = self.expr_str(&r.target)?;
                     let content = if r.mode == "herestring" { t } else { format!("{t} + \"\\n\"") };
                     self.redir_seq += 1;
@@ -640,14 +691,17 @@ impl JavaRender {
     fn stage_expr(&mut self, stage: &[IrStmt]) -> Result<String, String> {
         self.helper("quote");
         match stage {
-            [IrStmt::Expr(IrExpr::Call { func, args, .. })]
-                if func == "exec" || func == "builtin" || func == "test" =>
+            [IrStmt::Expr(IrExpr::Call { args, .. })]
+                if matches!(args.first().and_then(|a| str_arg(std::slice::from_ref(a), 0)), Some("exec") | Some("builtin") | Some("test"))
+                    || matches!(args.first(), Some(IrExpr::Str(s, _)) if matches!(s.as_str(), "exec"|"builtin"|"test")) =>
             {
-                let cmd = str_arg(args, 0).ok_or("stage: non-literal command")?;
-                let words = self.words_to_args(&args[1.min(args.len())..])?;
-                let mut parts = vec![format!("shQuote({})", jstr(cmd))];
-                for w in words { parts.push(format!("shQuote({w})")); }
-                Ok(parts.join(" + \" \" + "))
+                // args may be [cmd-name, words...] OR [words...] with the
+                // call form carrying the name — normalize:
+                if matches!(args.first(), Some(IrExpr::Str(s, _)) if matches!(s.as_str(), "exec"|"builtin"|"test")) {
+                    self.cmd_line_expr(&args[1.min(args.len())..])
+                } else {
+                    self.cmd_line_expr(args)
+                }
             }
             other => Err(format!("pipeline stage not representable as process text: {other:?}")),
         }
@@ -957,10 +1011,16 @@ impl JavaRender {
                     self.emit(&format!("fn_{}();", sanitize(other)));
                     return Ok(());
                 }
-                let words = self.words_to_args(rest)?;
-                let mut all = vec![jstr(other)];
-                all.extend(words.into_iter().map(|w| format!("shQuote({w})")));
-                let line = all.join(" + \" \" + ");
+                let mut pieces: Vec<(String, bool)> = Vec::new();
+                match args.first() {
+                    Some(IrExpr::Str(c, _)) => pieces.push((
+                        jstr(&c.replace("\u{1}SH2GLOB\u{1}", "")), c.contains("\u{1}SH2GLOB\u{1}"))),
+                    _ => pieces.push((jstr(other), true)),
+                }
+                for w in flatten_words(rest) {
+                    pieces.extend(self.word_pieces(w)?);
+                }
+                let line = self.pieces_join(&pieces);
                 self.helper("quote");
                 self.helper("run");
                 self.emit(&format!("__SH_RC = shRun({line});"));
@@ -998,6 +1058,13 @@ impl JavaRender {
             IrExpr::Array(items) => {
                 let mut parts = Vec::new();
                 for it in items {
+                    if let IrExpr::Call { func, .. } = it {
+                        // "$@" / "$*" iterables stay runtime lists
+                        if func == "listVar" {
+                            parts.push("__SH_ARGV".to_string());
+                            continue;
+                        }
+                    }
                     if let IrExpr::Call { func, args, .. } = it {
                         if func == "brace" {
                             for x in brace_expand(args)? {
@@ -1439,6 +1506,12 @@ impl JavaRender {
                 self.emit("__SH_RC = 0;");
                 return Ok("\"\"".to_string());
             }
+            IrExpr::Call { func, args, .. } if func == "brace" => {
+                // multi-word expansion joins with spaces here; loop position
+                // handles it word-per-word via for_items
+                let xs = brace_expand(args)?;
+                return Ok(jstr(&xs.join(" ")));
+            }
             IrExpr::Call { func, args, .. } if func == "setArray" => {
                 let name = str_arg(args, 0).ok_or("setArray: no name")?;
                 let items = match args.get(1) {
@@ -1458,7 +1531,12 @@ impl JavaRender {
 
     fn expr_str_inner(&mut self, e: &IrExpr) -> Result<String, String> {
         match e {
-            IrExpr::Str(s, _) => Ok(jstr(s)),
+            IrExpr::Str(s, _) => {
+                // \u{1}SH2GLOB\u{1} marks glob-to-expand patterns; bash-text
+                // children glob the bare pattern naturally
+                let cleaned = s.replace("\u{1}SH2GLOB\u{1}", "");
+                Ok(jstr(&cleaned))
+            }
             IrExpr::Int(i) => Ok(format!("String.valueOf((long) {i})")),
             IrExpr::Bool(b) => Ok(format!("String.valueOf({b})")),
             IrExpr::Var(name, _) | IrExpr::Ident(name) => self.getvar_str(name),
@@ -1886,11 +1964,11 @@ impl JavaRender {
                 Ok(format!("shDirname({})", self.getvar_str(&name)?))
             }
             ":?" => {
-                // ${var?msg}: bash aborts when unset/empty; an expression
-                // cannot abort — approximate with :- (documented limitation)
+                // ${var?msg}: bash aborts when unset/empty
                 let m = self.expr_str(args.get(2).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
                 let base = self.getvar_str(&name)?;
-                Ok(format!("({base}.isEmpty() ? {m} : {base})"))
+                self.helper("errifempty");
+                Ok(format!("shErrIfEmpty({base}, {m})"))
             }
             other => Err(format!("parameter expansion op {other:?} not in the java subset")),
         }
@@ -2070,14 +2148,55 @@ impl JavaRender {
         }
     }
 
+    /// One arg → pieces (java expr, needs_quotes). Glob-marked patterns and
+    /// brace expansions become MULTIPLE unquoted words.
+    fn word_piece(&mut self, e: &IrExpr) -> Result<(String, bool), String> {
+        Ok(self.word_pieces(e)?.remove(0))
+    }
+
+    fn word_pieces(&mut self, e: &IrExpr) -> Result<Vec<(String, bool)>, String> {
+        match e {
+            IrExpr::Str(t, _) if t.contains("\u{1}SH2GLOB\u{1}") => {
+                Ok(vec![(jstr(&t.replace("\u{1}SH2GLOB\u{1}", "")), false)])
+            }
+            IrExpr::Call { func, args, .. } if func == "brace" => {
+                let xs = brace_expand(args)?;
+                Ok(xs.into_iter().map(|x| (jstr(&x), false)).collect())
+            }
+            IrExpr::Array(items) => {
+                let mut out = Vec::new();
+                for it in items.iter() { out.extend(self.word_pieces(it)?); }
+                Ok(out)
+            }
+            other => Ok(vec![(self.expr_str(other)?, true)]),
+        }
+    }
+
+    fn pieces_join(&mut self, pieces: &[(String, bool)]) -> String {
+        let mut out = String::new();
+        for (i, (e, q)) in pieces.iter().enumerate() {
+            if i > 0 { out += " + \" \" + "; }
+            if *q { out += &format!("shQuote({e})"); } else { out += e; }
+        }
+        out
+    }
+
     /// builtin/exec args → Java expression of the quoted command line.
     fn cmd_line_expr(&mut self, args: &[IrExpr]) -> Result<String, String> {
         self.helper("quote");
-        let cmd = str_arg(args, 0).ok_or("command: non-literal command word")?;
-        let words = self.words_to_args(&args[1.min(args.len())..])?;
-        let mut parts = vec![format!("shQuote({})", jstr(cmd))];
-        for w in words { parts.push(format!("shQuote({w})")); }
-        Ok(parts.join(" + \" \" + "))
+        let mut pieces: Vec<(String, bool)> = Vec::new();
+        match args.first() {
+            Some(IrExpr::Str(c, _)) => pieces.push((
+                jstr(&c.replace("\u{1}SH2GLOB\u{1}", "")), c.contains("\u{1}SH2GLOB\u{1}"))),
+            Some(other) => pieces.push((self.expr_str(other)?, true)),
+            None => return Err("command: no command word".into()),
+        }
+        for w in args.iter().skip(1) {
+            for x in flatten_words(std::slice::from_ref(w)) {
+                pieces.extend(self.word_pieces(x)?);
+            }
+        }
+        Ok(self.pieces_join(&pieces))
     }
 
     // ── arithmetic AST ───────────────────────────────────────────────
@@ -2651,6 +2770,11 @@ fn helper_src(name: &str) -> Option<&'static str> {
         "regex" => r#"    static boolean shRegex(String pat, String flags) { return false; }
 "#,
         "incdec" => "",
+        "errifempty" => r#"    static String shErrIfEmpty(String v, String msg) {
+        if (v.isEmpty()) { System.err.println(msg); System.exit(1); }
+        return v;
+    }
+"#,
         "contains" => r#"    static long shContains(String hay, String needle) {
         return hay.contains(needle) ? 1L : 0L;
     }
@@ -2706,14 +2830,32 @@ fn brace_expand(args: &[IrExpr]) -> Result<Vec<String>, String> {
     }
     let g = groups.ok_or("brace: no group json")?;
     let arr = g.as_array().ok_or("brace: group json not an array")?;
-    // the outer array holds ONE group (see brace_ir); expand it
-    let items = expand_group(arr.first().ok_or("brace: empty group")?)?;
-    Ok(items.into_iter().map(|i| format!("{prefix}{i}{suffix}")).collect())
+    // the outer array holds the brace's groups ({a,b}{1,2} -> two) —
+    // cartesian product across them
+    let mut out: Vec<String> = vec![String::new()];
+    for grp in arr {
+        let expanded = expand_group(grp)?;
+        let mut next: Vec<String> = Vec::new();
+        for base in &out {
+            for x in &expanded {
+                next.push(format!("{base}{x}"));
+            }
+        }
+        out = next;
+    }
+    // interleave middles between repeated expansions (rare; empty usually)
+    if !middles.is_empty() && out.len() == middles.len() * out.len() / out.len() && !middles.is_empty() {
+        // middles apply per-item suffixes in zsh-style braces; bash corpus
+        // uses empty — append as extra suffix alternatives is not needed
+    }
+    Ok(out.into_iter().map(|i| format!("{prefix}{i}{suffix}")).collect())
 }
 
 fn expand_group(items: &serde_json::Value) -> Result<Vec<String>, String> {
     let arr = items.as_array().ok_or("brace item group not an array")?;
-    let mut out: Vec<String> = vec![String::new()];
+    // a group's items are ALTERNATIVES ({a,b} -> a | b): the union of each
+    // item's own expansion (nested items may contribute several)
+    let mut out: Vec<String> = Vec::new();
     for it in arr {
         let one: Vec<String> = if let Some(s) = it.as_str() {
             vec![s.to_string()]
@@ -2722,11 +2864,18 @@ fn expand_group(items: &serde_json::Value) -> Result<Vec<String>, String> {
             let start = parts.first().and_then(|x| x.as_str()).unwrap_or("0").to_string();
             let end = parts.get(1).and_then(|x| x.as_str()).unwrap_or("0").to_string();
             let step: i64 = parts.get(2).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).unwrap_or(1);
+            // {00..04..2}: zero-pad to the widest operand's width
+            let width = start.len().max(end.len());
+            let padded = (start.starts_with('0') && start.len() > 1)
+                      || (end.starts_with('0') && end.len() > 1);
             if let (Ok(a), Ok(b)) = (start.parse::<i64>(), end.parse::<i64>()) {
                 let mut v = Vec::new();
                 let mut i = a;
                 while if step > 0 { i <= b } else { i >= b } {
-                    v.push(i.to_string());
+                    let n = i.abs().to_string();
+                    v.push(if padded && (n.len() as usize) < width {
+                        format!("{}{}", "0".repeat(width - n.len()), if i < 0 { n } else { n })
+                    } else { n });
                     i += step;
                     if v.len() > 100_000 { break; }
                 }
@@ -2737,9 +2886,8 @@ fn expand_group(items: &serde_json::Value) -> Result<Vec<String>, String> {
                 let b = end.chars().next().unwrap_or('z') as u8;
                 let mut v = Vec::new();
                 let mut c = a as i32;
-                loop {
+                while if step > 0 { c as u8 <= b } else { c as u8 >= b } {
                     v.push((c as u8 as char).to_string());
-                    if (step > 0 && c as u8 >= b) || (step < 0 && c as u8 <= b) { break; }
                     c += step as i32;
                     if v.len() > 1000 { break; }
                 }
@@ -2752,13 +2900,7 @@ fn expand_group(items: &serde_json::Value) -> Result<Vec<String>, String> {
         } else {
             return Err("unknown brace item".into());
         };
-        let mut next = Vec::with_capacity(out.len() * one.len());
-        for base in &out {
-            for o in &one {
-                next.push(format!("{base}{o}"));
-            }
-        }
-        out = next;
+        out.extend(one);
     }
     Ok(out)
 }
