@@ -111,7 +111,7 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     // per top-level statement index: read census for var names
     let mut counts: Vec<HashMap<String, usize>> = Vec::new();
     for s in stmts.iter() {
-        let mut reads = Vec::new();
+        let mut reads: Vec<String> = Vec::new();
         stmt_reads(s, &mut reads);
         let mut m: HashMap<String, usize> = HashMap::new();
         for r in reads {
@@ -121,21 +121,18 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
     }
 
     // reads inside FUNCTION definitions: call time unknown — any var
-    // mentioned there is ineligible everywhere (attributed globally)
+    // mentioned there is ineligible everywhere
     let mut fn_read_names: BTreeSet<String> = BTreeSet::new();
     fn collect_fn_reads(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
         for s in stmts {
-            match s {
-                IrStmt::Function { name, body, .. } => {
-                    out.insert(name.clone());
-                    let mut reads = Vec::new();
-                    for b in body {
-                        stmt_reads(b, &mut reads);
-                    }
+            if let IrStmt::Function { name, body, .. } = s {
+                out.insert(name.clone());
+                for b in body.iter() {
+                    let mut reads: Vec<String> = Vec::new();
+                    stmt_reads(b, &mut reads);
                     out.extend(reads);
                     collect_fn_reads(body, out);
                 }
-                _ => {}
             }
         }
     }
@@ -143,70 +140,62 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 
     let exported = exported_names(stmts);
 
+    // candidate shape: For{iter: Array[Call{"split", [Var X]}]}
     let mut changed = false;
-    let dbg = std::env::var("SH2C_DEBUG").is_ok();
-    if dbg { eprintln!("SIP pass: {} top-level stmts", stmts.len()); }
     for (i, s) in stmts.iter_mut().enumerate() {
-        if dbg && matches!(*s, IrStmt::For { .. }) { eprintln!("SIP: For stmt at {i}"); }
-        if let IrStmt::For { iter, .. } = s {
-            if let IrExpr::Call { args: sargs, .. } = iter {
-                if std::env::var("SH2C_DEBUG").is_ok() {
-                    eprintln!("SIP For iter0={:?}", sargs.first());
-                }
-            }
-            let eligible = match &*iter {
-                IrExpr::Call { func, args }
-                    if func == "split"
-                        && matches!(args.first(), Some(IrExpr::Var(x, _) | IrExpr::Ident(x)) if is_plain_mutable_name(x)) =>
-                {
-                    let x = match args.first() {
-                        Some(IrExpr::Var(x, _) | IrExpr::Ident(x)) => x.clone(),
-                        _ => unreachable!(),
-                    };
-                    let cnt_i =
-                        counts.get(i).and_then(|m| m.get(&x)).copied().unwrap_or(0);
-                    let later = counts.iter().skip(i + 1).any(|m| m.contains_key(&x));
-                    if std::env::var("SH2C_DEBUG").is_ok() {
-                        eprintln!(
-                            "SIP x={x} cnt_i={cnt_i} later={later} fn={} exp={} args0={:?}",
-                            fn_read_names.contains(&x),
-                            exported.contains(&x),
-                            args.first()
-                        );
-                    }
-                    cnt_i == 1
-                        && !later
-                        && !fn_read_names.contains(&x)
-                        && !exported.contains(&x)
-                }
-                _ => false,
-            };
-            if std::env::var("SH2C_DEBUG").is_ok() {
-                eprintln!("SIP eligible={eligible}");
-            }
-            if !eligible {
-                continue;
-            }
-            let IrExpr::Call { args, .. } = &*iter else { continue };
-            let Some(IrExpr::Var(x, sigil)) = args.first() else {
-                continue;
-            };
-            let (x, sigil) = (x.clone(), *sigil);
-            let delim = match args.get(1) {
-                Some(IrExpr::Str(d, st)) => (d.clone(), st.clone()),
-                _ => (" ".to_string(), crate::ir::StrStyle::DoubleQuoted),
-            };
-            *iter = IrExpr::Ext(Box::new(crate::shir_nodes::Split {
-                text: IrExpr::Var(x, sigil),
-                delim: delim.0,
-                is_regex: false,
-                in_place: true,
-            }));
-            changed = true;
+        let IrStmt::For { iter, .. } = s else { continue };
+        let IrExpr::Array(items) = &*iter else { continue };
+        if items.len() != 1 {
+            continue;
         }
+        let IrExpr::Call { func, args } = &items[0] else { continue };
+        if func != "split" {
+            continue;
+        }
+        // the source arrives as getVar("y") OR Var("y")
+        let xv: String = match args.first() {
+            Some(IrExpr::Var(v, _)) | Some(IrExpr::Ident(v)) => v.clone(),
+            Some(IrExpr::Call { func, args: ca })
+                if func == "getVar" && matches!(ca.first(), Some(IrExpr::Str(_, _))) =>
+            {
+                match ca.first() {
+                    Some(IrExpr::Str(nm, _)) => nm.clone(),
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        if !is_plain_mutable_name(&xv) {
+            continue;
+        }
+        let x = xv.clone();
+        let cnt_i = counts.get(i).and_then(|m| m.get(&x)).copied().unwrap_or(0);
+        let later = counts.iter().skip(i + 1).any(|m| m.contains_key(&x));
+        let ok =
+            cnt_i == 1 && !later && !fn_read_names.contains(&x) && !exported.contains(&x);
+        if !ok {
+            continue;
+        }
+        // eligible: swap the legacy split-call for the marked Ext(Split);
+        // the For iter stays a word-list ARRAY (shape preserved)
+        *iter = IrExpr::Array(vec![IrExpr::Ext(Box::new(crate::shir_nodes::Split {
+            text: IrExpr::Var(x.clone(), None),
+            delim: delim_from(args),
+            is_regex: false,
+            in_place: true,
+        }))]);
+        changed = true;
     }
     changed
 }
+
+fn delim_from(args: &[IrExpr]) -> String {
+    match args.get(1) {
+        Some(IrExpr::Str(d, _)) => d.clone(),
+        _ => " ".to_string(),
+    }
+}
+
 
 fn is_plain_mutable_name(x: &str) -> bool {
     !x.is_empty()

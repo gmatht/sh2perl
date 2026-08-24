@@ -7,3 +7,8 @@ kind expr
 field text: expr
 field delim: string
 field is_regex: bool
+# in_place: the source buffer may be DESTROYED (delimiters stamped with
+# NUL) — set by liveness analysis when the source var is dead after the
+# split. C renders an in-place tokenizer on the var's own storage; GC'd
+# string languages ignore it (immutable strings — flag meaningless).
+field in_place: optional_bool
