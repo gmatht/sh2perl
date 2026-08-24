@@ -4676,10 +4676,40 @@ impl Render {
             "\\>" => format!("(strcmp({l}, {r}) > 0)"),
             "\\<" => format!("(strcmp({l}, {r}) < 0)"),
             "=" | "==" | "!=" => {
-                let has_glob = raw_l.contains('*')
-                    || raw_l.contains('?')
-                    || raw_r.contains('*')
-                    || raw_r.contains('?');
+                // glob probe must IGNORE variable references (`$?` is not
+                // a glob '?') and surrounding quotes (`"0"` is a literal)
+                let probe = |s: &str| -> String {
+                    let ch: Vec<char> = s.chars().collect();
+                    let mut out = String::new();
+                    let mut i = 0;
+                    while i < ch.len() {
+                        if ch[i] == '$' && i + 1 < ch.len() {
+                            let mut j = i + 1;
+                            while j < ch.len()
+                                && (ch[j].is_alphanumeric()
+                                    || ch[j] == '_'
+                                    || ch[j] == '?'
+                                    || ch[j] == '#'
+                                    || ch[j] == '@'
+                                    || ch[j] == '*')
+                            {
+                                j += 1;
+                            }
+                            if j == i + 1 {
+                                j += 1;
+                            }
+                            i = j;
+                            continue;
+                        }
+                        out.push(ch[i]);
+                        i += 1;
+                    }
+                    out.trim_matches('\'' ).trim_matches('"').to_string()
+                };
+                let pl = probe(raw_l);
+                let pr = probe(raw_r);
+                let has_glob =
+                    pl.contains('*') || pl.contains('?') || pr.contains('*') || pr.contains('?');
                 if has_glob {
                     // `[[ x == pattern ]]` — glob match (fnmatch);
                     // extglobs (`!(a)`, `@(a|b)`, `+(a)`, ...) use
@@ -4699,7 +4729,20 @@ impl Render {
                     } else {
                         flags.to_string()
                     };
-                    let m = format!("fnmatch({}, {l}, 0{flags}) == 0", Self::cstr(strip_glob(&pat)));
+                    let pat_dq = {
+                        let t = pat.trim();
+                        let fch = t.chars().next().unwrap_or(' ');
+                        let lch = t.chars().last().unwrap_or(' ');
+                        if t.len() >= 2 && ((fch == '"' && lch == '"') || (fch == '\'' && lch == '\'')) {
+                            t[1..t.len() - 1].to_string()
+                        } else {
+                            t.to_string()
+                        }
+                    };
+                    let m = format!(
+                        "fnmatch({}, {l}, 0{flags}) == 0",
+                        Self::cstr(strip_glob(&pat_dq))
+                    );
                     if neg {
                         format!("(!{m})")
                     } else {
@@ -4859,11 +4902,55 @@ impl Render {
                 ));
                 return t;
             }
+            // `$?` / `$$` / `$#` / `$N` — specials have NO ident name;
+            // returning "" here made `[ "$?" = "0" ]` compare empty
+            if dequoted.starts_with('$') && dequoted.len() > 1 {
+                self.need_sh = true;
+                match &dequoted[1..] {
+                    "?" => return self.num_temp("_sh_rc"),
+                    "$" => return self.num_temp("getpid()"),
+                    "#" => {
+                        return self
+                            .num_temp("((_sh_argc > 0) ? (_sh_argc - 1) : 0)")
+                    }
+                    d if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) => {
+                        return format!(
+                            "(({} < _sh_argc && _sh_argv[{}]) ? _sh_argv[{}] : \"\")",
+                            d, d, d
+                        );
+                    }
+                    _ => {}
+                }
+            }
             "\"\"".into()
         } else if raw.starts_with('$') && raw.len() > 1 {
-            // positional / special ($1, $#, $@) — empty argv in the gate
+            // positional / special vars — $? is the LAST STATUS (a
+            // constant "" broke `[ "$?" = "0" ]` chains)
             self.need_sh = true;
-            "\"\"".into()
+            match &raw[1..] {
+                "?" => self.num_temp("_sh_rc"),
+                "$" => self.num_temp("getpid()"),
+                "#" => {
+                    self.num_temp("((_sh_argc > 0) ? (_sh_argc - 1) : 0)")
+                }
+                d if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) => {
+                    format!(
+                        "(({} < _sh_argc && _sh_argv[{}]) ? _sh_argv[{}] : \"\")",
+                        d, d, d
+                    )
+                }
+                _ => "\"\"".into(),
+            }
+        } else if stripped.len() >= 2 {
+            // dequote quoted literals (`"0"` matched as a fnmatch pattern
+            // WITH quote chars and never matched)
+            let f = stripped.chars().next().unwrap();
+            let l = stripped.chars().last().unwrap();
+            if (f == '"' && l == '"') || (f == '\'' && l == '\'') {
+                Self::cstr(&stripped[1..stripped.len() - 1])
+            } else {
+                Self::cstr(stripped)
+            }
         } else {
             Self::cstr(stripped)
         }
