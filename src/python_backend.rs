@@ -45,6 +45,12 @@ pub struct Render {
     /// roots decided DICT-mode; pre-declared as `{}` in the prologue and
     /// accessed with python subscripts
     array_dict_roots: HashSet<String>,
+    /// ordered (index, name, is_unset) ops from the collect walk — decides
+    /// whether a variable's LAST state is unset (`${x:-def}` must apply
+    /// after `unset x`, which the plain written-set cannot express)
+    seq_ops: Vec<(usize, String, bool)>,
+    /// vars whose LAST recorded op is an unset
+    unset_vars: HashSet<String>,
     /// needs the `__sh_atoi` helper (printf %d/%i/%u args)
     need_atoi: bool,
     todo: usize,
@@ -60,6 +66,8 @@ pub struct Render {
     need_subprocess: bool,
     /// needs the __sh_inc_pre/__sh_inc_post helpers (a $(( x++ )) VALUE)
     need_inc: bool,
+    /// needs the __sh_assign helper (${x:=default} assignment side effect)
+    need_assign: bool,
     /// needs the `__sh_capture` helper (bash `$()` semantics: stdout only,
     /// trailing newlines stripped, NEVER raises — command-not-found/failure
     /// yields "" and the script continues, like bash)
@@ -436,6 +444,7 @@ pub fn shir_to_python(prog: &IrProgram) -> String {
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.collect_writes(&prog.stmts);
+    r.finalize_unset_states();
     r.finalize_array_modes();
     r.program(&prog);
     r.out.join("\n")
@@ -471,6 +480,19 @@ impl Render {
     /// every key numeric AND a literal DeclareArray (a dense python list
     /// exists to index into); anything else — string keys, dynamic `$k`
     /// keys, sparse writes — is DICT mode (pre-declared `{}`).
+    fn finalize_unset_states(&mut self) {
+        let mut last: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        for (_, name, is_unset) in self.seq_ops.iter() {
+            last.insert(name.clone(), *is_unset);
+        }
+        for (name, was_unset) in last {
+            if was_unset {
+                self.unset_vars.insert(name);
+            }
+        }
+    }
+
     fn finalize_array_modes(&mut self) {
         let roots: Vec<String> = self.array_keys.keys().cloned().collect();
         for root in roots {
@@ -590,6 +612,9 @@ impl Render {
                         // bracket-target writes (`map[foo]=bar`) observe
                         // the array root (list-vs-dict decision input)
                         self.note_array_target(&t.var);
+                        if Self::split_target(&t.var).is_none() {
+                            self.seq_ops.push((self.seq_ops.len(), t.var.clone(), false));
+                        }
                     }
                     self.collect_writes_expr(expr);
                 }
@@ -695,6 +720,9 @@ impl Render {
                             // bracket-target writes (`arr[1]=x`,
                             // `map[foo]=bar`) observe the array root
                             self.note_array_target(name);
+                            if Self::split_target(name).is_none() {
+                                self.seq_ops.push((self.seq_ops.len(), name.clone(), false));
+                            }
                             // setVar writes go through the runtime STORE,
                             // not a python binding — getVar of the same
                             // name must read the store back.
@@ -717,6 +745,13 @@ impl Render {
                             if op.is_empty() {
                                 self.note_array_target(name);
                             }
+                            // ':=' WRITES the variable when unset — later
+                            // reads must observe it (t04/t27)
+                            if op == ":=" && Self::split_target(name).is_none() {
+                                self.written.insert(name.clone());
+                                self.seq_ops
+                                    .push((self.seq_ops.len(), name.clone(), false));
+                            }
                         }
                     }
                     "setArray" => {
@@ -735,6 +770,9 @@ impl Render {
                         for a in args {
                             if let IrExpr::Str(name, _) = a {
                                 self.written.insert(name.clone());
+                                if func == "unset" {
+                                    self.seq_ops.push((self.seq_ops.len(), name.clone(), true));
+                                }
                             }
                         }
                     }
@@ -1511,22 +1549,33 @@ impl Render {
                             let word = &rest[1..];
                             let colon_form = root.ends_with(':');
                             let root = root.trim_end_matches(':');
-                            let is_set = self.written.contains(root)
-                                || self.store_written.contains(root)
-                                || self.var_types.contains_key(root);
+                            let is_set = !self.unset_vars.contains(root)
+                                && (self.written.contains(root)
+                                    || self.store_written.contains(root)
+                                    || self.var_types.contains_key(root));
                             let non_empty = is_set; // cannot distinguish; see comment
+                            // the baked suffix keeps SOURCE quoting:
+                            // ${@:-"default"} -> word '"default"' —
+                            // strip one layer of surrounding quotes
+                            let mut w = word;
+                            if w.len() >= 2
+                                && ((w.starts_with('"') && w.ends_with('"'))
+                                    || (w.starts_with('\'') && w.ends_with('\'')))
+                            {
+                                w = &w[1..w.len() - 1];
+                            }
                             match (&rest[..1], colon_form) {
                                 ("+", false) => {
-                                    return if is_set { Self::py_str(word) } else { "\"\"".into() }
+                                    return if is_set { Self::py_str(w) } else { "\"\"".into() }
                                 }
                                 (":+" | "+", true) | (":+", _) => {
-                                    return if non_empty { Self::py_str(word) } else { "\"\"".into() }
+                                    return if non_empty { Self::py_str(w) } else { "\"\"".into() }
                                 }
                                 ("-", false) => {
                                     return if is_set {
                                         self.call("getVar", &[IrExpr::Str(root.to_string(), crate::ir::StrStyle::DoubleQuoted)])
                                     } else {
-                                        Self::py_str(word)
+                                        Self::py_str(w)
                                     }
                                 }
                                 _ => {}
@@ -1666,6 +1715,27 @@ impl Render {
                             return format!("str(len({}))", self.py_ident(name));
                         }
                     }
+                    // ${x:?msg} — error+exit when unset/empty; else
+                    // the value (bash: message to STDERR, shell exits 1)
+                    if op == ":?" {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            self.need_sys = true;
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.clone(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            let msg = match args.get(2) {
+                                Some(IrExpr::Str(s, _)) => Self::py_str(s),
+                                _ => "\"parameter null or not set\"".to_string(),
+                            };
+                            return format!(
+                                "({v} if {v} != \"\" else sys.exit({msg}))"
+                            );
+                        }
+                    }
                     // ${x#pat} / ${x##pat} / ${x%pat} / ${x%%pat} —
                     // prefix/suffix removal via the native __sh_strip
                     // runtime-free helper (same one test operands use)
@@ -1784,7 +1854,30 @@ impl Render {
                             (args.get(1), args.get(2))
                         {
                             let v = self.call("getVar", &[IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted)]);
-                            let d = self.expr(def);
+                            // ${x:-"word"} keeps SOURCE quotes in the baked
+                            // default string — strip ONE layer so python
+                            // prints `default`, not `"default"`
+                            let d = match def {
+                                IrExpr::Str(s, _) if s.len() >= 2
+                                    && ((s.starts_with('"') && s.ends_with('"'))
+                                        || (s.starts_with('\'') && s.ends_with('\''))) =>
+                                {
+                                    Self::py_str(&s[1..s.len() - 1])
+                                }
+                                _ => self.expr(def),
+                            };
+                            if op == ":=" {
+                                // ':=' ASSIGNS the default when unset —
+                                // __sh_assign writes the module global and
+                                // yields the value (a bare walrus would
+                                // overwrite the var even when set)
+                                self.need_assign = true;
+                                let pv = self.py_ident(name);
+                                return format!(
+                                    "({v} if {v} != \"\" else __sh_assign({}, {d}))",
+                                    Self::py_str(name)
+                                );
+                            }
                             if op == ":-" {
                                 return format!("({v} if {v} != \"\" else {d})");
                             }
@@ -4079,6 +4172,14 @@ impl Render {
             self.emit("    v = int(globals().get(var, 0))");
             self.emit("    globals()[var] = v + d");
             self.emit("    return v");
+        }
+        if self.need_assign {
+            self.emit("");
+            // ${x:=default}: write the default INTO the module global and
+            // yield it (native, no store round-trip)
+            self.emit("def __sh_assign(var, val):");
+            self.emit("    globals()[var] = val");
+            self.emit("    return val");
         }
         if self.need_capture {
             self.emit("");
