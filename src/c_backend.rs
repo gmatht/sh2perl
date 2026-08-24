@@ -3836,6 +3836,14 @@ impl Render {
     fn default_word(&mut self, x: &IrExpr) -> String {
         if let IrExpr::Str(s, _) = x {
             let t = s.trim();
+            // a default containing EXPANSIONS (`${MOUNTPOINT:-${NAME}}` —
+            // the nested `${NAME}` arrives as literal text) must be
+            // evaluated, not emitted verbatim
+            if t.contains('$') {
+                if let Some(v) = self.dollar_text_value(t) {
+                    return v;
+                }
+            }
             let chars: Vec<char> = t.chars().collect();
             if chars.len() >= 2
                 && ((chars[0] == '"' && chars[chars.len() - 1] == '"')
@@ -5693,6 +5701,40 @@ impl Render {
         let mut lit = String::new();
         while i < chars.len() {
             if chars[i] == '$' && i + 1 < chars.len() {
+                // `${name}` — braced form (parameter-expansion-nested:
+                // the default operand carries the literal text)
+                if chars[i + 1] == '{' {
+                    let mut j = i + 2;
+                    while j < chars.len() && chars[j] != '}' {
+                        j += 1;
+                    }
+                    let inner: String = chars[i + 2..j.min(chars.len())].iter().collect();
+                    if !inner.is_empty()
+                        && inner
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        if !lit.is_empty() {
+                            parts.push(Self::cstr(&lit));
+                            lit.clear();
+                        }
+                        let v = if self.is_num(&inner) {
+                            self.num_temp(&self.c_ident(&inner))
+                        } else if self.store.contains(&inner) {
+                            self.store_ref(&inner)
+                        } else {
+                            self.need_sh = true;
+                            format!(
+                                "(getenv({}) ? getenv({}) : \"\")",
+                                Self::cstr(&inner),
+                                Self::cstr(&inner)
+                            )
+                        };
+                        parts.push(v);
+                        i = j + 1;
+                        continue;
+                    }
+                }
                 let mut j = i + 1;
                 while j < chars.len()
                     && (chars[j].is_ascii_alphanumeric() || chars[j] == '_')
