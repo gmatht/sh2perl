@@ -78,6 +78,11 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                                 LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                                 return;
                             }
+                            if let Some(repl) = try_lower_grep_text_cmd(b1, b2) {
+                                *stmt = repl;
+                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
                             if let Some(repl) = try_lower_grep_count(b1, b2) {
                                 *stmt = repl;
                                 LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1679,6 +1684,52 @@ fn try_lower_grep_cut(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
         body: vec![IrStmt::If {
             cond,
             then: vec![IrStmt::Output { value: field, newline: true, target: None }],
+            elsifs: vec![],
+            else_: vec![],
+        }],
+    })))
+}
+
+/// `grep P F | tr/sed ARGS…` → ForEachLine(F, if Contains(l,P) then
+/// Output(<primitive>(l))). Same shape as try_lower_grep_cut but for the
+/// per-line TEXT transforms (cut has its own arm — flag-only static).
+fn try_lower_grep_text_cmd(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
+    // stage1: grep P F (no flags, two literals)
+    let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] = stage1 else { return None };
+    if !(f1 == "exec" || f1 == "builtin") { return None; }
+    let [IrExpr::Str(n1, _), IrExpr::Array(ga)] = a1.as_slice() else { return None };
+    if n1 != "grep" || ga.len() != 2 { return None; }
+    let mut gs: Vec<&str> = Vec::new();
+    for x in ga.iter() {
+        match x {
+            IrExpr::Str(s, _) => gs.push(s.as_str()),
+            IrExpr::Interpolate(p) if p.len() == 1 => {
+                match &p[0] { InterpPart::Lit(s) => gs.push(s.as_str()), _ => return None }
+            }
+            _ => return None,
+        }
+    }
+    if gs.len() != 2 || gs[1].starts_with('-') { return None; }
+    let pat = IrExpr::Str(gs[0].to_string(), StrStyle::DoubleQuoted);
+    let path = IrExpr::Str(gs[1].to_string(), StrStyle::DoubleQuoted);
+
+    let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = stage2 else { return None };
+    if !(f2 == "exec" || f2 == "builtin") { return None; }
+    let [IrExpr::Str(n2, _), IrExpr::Array(ca)] = a2.as_slice() else { return None };
+    if !matches!(n2.as_str(), "tr" | "sed") { return None; }
+
+    let val = lower_text_cmd(loop_var_read("__l"), n2, ca)?;
+    let cond = IrExpr::Ext(Box::new(StringContains {
+        text: loop_var_read("__l"),
+        pattern: pat,
+    }));
+    Some(IrStmt::Ext(Box::new(ForEachLine {
+        source: path,
+        var: "__l".to_string(),
+        limit: None,
+        body: vec![IrStmt::If {
+            cond,
+            then: vec![IrStmt::Output { value: val, newline: true, target: None }],
             elsifs: vec![],
             else_: vec![],
         }],
