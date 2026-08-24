@@ -237,7 +237,8 @@ impl JavaRender {
             o.push('\n');
         }
         // assemble: header fields discovered during rendering
-        let mut header = String::from("    static long __SH_RC = 0;\n    static String __SH_T = \"\";\n    static String __SH_CWD = System.getProperty(\"user.dir\");\n    static List<String> __SH_ARGV = new ArrayList<>();\n    static Scanner __SH_IN = new Scanner(System.in);\n");
+        let mut header = String::from("    static long __SH_RC = 0;\n    static String __SH_T = \"\";\n    static boolean __SH_NOCASE = false;
+    static String __SH_CWD = System.getProperty(\"user.dir\");\n    static List<String> __SH_ARGV = new ArrayList<>();\n    static Scanner __SH_IN = new Scanner(System.in);\n");
         for f in &self.fields {
             header.push_str(&format!("    static String __v_{f} = \"\";\n"));
         }
@@ -261,7 +262,7 @@ impl JavaRender {
             "escapes","substr","fnmatch","strip","replace","case","basename",
             "dirname","div","pow","ftype","readln","split","aset","aget",
             "writefile","outswap","errswap","inswap","snapshot","regex",
-            "contains","quote","declared","errifempty",
+            "contains","quote","declared","errifempty","regexm","eq",
         ];
         for h in all_helpers {
             if let Some(src) = helper_src(h) {
@@ -1215,6 +1216,10 @@ impl JavaRender {
         for piece in split_eq_ops(t) {
             if piece == "=" || piece == "==" || piece == "!=" {
                 w.push(TestTok::S(piece));
+            } else if piece.starts_with('~') {
+                // regex marker ([[ s =~ ~re ]]) — keep verbatim; the
+                // trailing $ anchor must not be treated as a variable
+                w.push(TestTok::S(piece));
             } else if piece.contains('$') {
                 match self.expand_dollars(&piece) {
                     Ok(e) => w.push(TestTok::E(e)),
@@ -1405,8 +1410,26 @@ impl JavaRender {
                         };
                         Ok(format!("(shNum({l}) {cmp} shNum({r}))"))
                     }
-                    "=" | "==" => Ok(format!("(({}).equals({r}))", l)),
-                    "!=" => Ok(format!("(({}).equals({r}) == false)", l)),
+                    "=" | "=~" | "==" | "!=" if matches!(&w[2], TestTok::S(txt) if
+                        txt.starts_with('~') || txt.chars().any(|c| matches!(c, '*' | '?' | '['))) =>
+                    {
+                        let neg = op == "!=";
+                        if let TestTok::S(txt) = &w[2] {
+                            if let Some(rx) = txt.strip_prefix('~') {
+                                // regex match ([[ s =~ re ]] — the IR keeps
+                                // a ~ marker on the pattern)
+                                self.helper("regexm");
+                                let cmp = if neg { " == false" } else { "" };
+                                return Ok(format!("(shRegexMatch({l}, {jstr_rx}){cmp})", jstr_rx = jstr(rx)));
+                            }
+                        }
+                        // [[ ]] pattern match (RHS unquoted glob)
+                        self.helper("fnmatch");
+                        Ok(if neg { format!("(shFnmatch({r}, {l}) == false)") }
+                           else { format!("(shFnmatch({r}, {l}))") })
+                    }
+                    "=" | "==" => { self.helper("eq"); Ok(format!("(shEq({}, {}))", l, r)) }
+                    "!=" => { self.helper("eq"); Ok(format!("(!shEq({}, {}))", l, r)) }
                     "-nt" | "-ot" | "-ef" => {
                         self.helper("ftype");
                         let cmp = if op == "-nt" { ">" } else if op == "-ot" { "<" } else { "==" };
@@ -1502,7 +1525,18 @@ impl JavaRender {
                 // ${!prefix@} key listing — no assoc-map tracking; empty
                 return Ok("\"\"".to_string());
             }
-            IrExpr::Call { func, .. } if func == "shopt" => {
+            IrExpr::Call { func, args, .. } if func == "shopt" => {
+                // nocasematch toggles case-insensitive [[ == ]] comparisons
+                let mut on = false;
+                let mut is_nc = false;
+                for a in args.iter() {
+                    match a {
+                        IrExpr::Str(t, _) if t.contains("nocase") => is_nc = true,
+                        IrExpr::Bool(b) => on = *b,
+                        _ => {}
+                    }
+                }
+                if is_nc { self.emit(&format!("__SH_NOCASE = {on};")); }
                 self.emit("__SH_RC = 0;");
                 return Ok("\"\"".to_string());
             }
@@ -2303,11 +2337,21 @@ impl JavaRender {
         let both_num = matches!(lhs, IrExpr::Int(_) | IrExpr::Arith(_)) &&
                        matches!(rhs, IrExpr::Int(_) | IrExpr::Arith(_));
         self.helper("num");
+        // regex match: [[ s =~ re ]] lowers to Eq whose RHS carries a ~ marker
+        if *op == BinOpKind::Eq {
+            if let IrExpr::Str(rv, _) = rhs {
+                if let Some(re) = rv.strip_prefix('~') {
+                    self.helper("regexm");
+                    let l2 = l.trim_start_matches('(').trim_end_matches(')');
+                    return Ok(format!("(shRegexMatch({l2}, {}))", jstr(re)));
+                }
+            }
+        }
         Ok(match op {
             BinOpKind::Eq if both_num => format!("(shNum({l}) == shNum({r}))"),
-            BinOpKind::Eq => format!("(({}).equals({}))", l, r),
+            BinOpKind::Eq => { self.helper("eq"); format!("(shEq({}, {}))", l, r) }
             BinOpKind::Ne if both_num => format!("(shNum({l}) != shNum({r}))"),
-            BinOpKind::Ne => format!("(({}).equals({}) == false)", l, r),
+            BinOpKind::Ne => { self.helper("eq"); format!("(!shEq({}, {}))", l, r) }
             BinOpKind::Lt => format!("(shNum({l}) < shNum({r}))"),
             BinOpKind::Le => format!("(shNum({l}) <= shNum({r}))"),
             BinOpKind::Gt => format!("(shNum({l}) > shNum({r}))"),
@@ -2548,8 +2592,76 @@ fn helper_src(name: &str) -> Option<&'static str> {
     }
 "#,
         "fnmatch" => r#"    static boolean shFnmatch(String pat, String s) {
+        if (pat.indexOf('(') >= 0 && pat.matches(".*[!@?+*]\\(.*")) {
+            try {
+                StringBuilder re = new StringBuilder();
+                shExtglobToRegex(pat, re);
+                return s.matches(re.toString());
+            } catch (Exception e) { /* fall through to plain fnmatch */ }
+        }
         return shFnmatchImpl(pat.codePoints().toArray(), s, 0, 0);
     }
+
+    /** Translate a bash extglob pattern (!(x) @(x) ?(x) +(x) *(x)) to Java regex. */
+    static void shExtglobToRegex(String pat, StringBuilder out) {
+        int i = 0;
+        while (i < pat.length()) {
+            char c = pat.charAt(i);
+            if ((c == '!' || c == '@' || c == '?' || c == '+' || c == '*')
+                && i + 1 < pat.length() && pat.charAt(i + 1) == '(') {
+                int depth = 1; int j = i + 2;
+                while (j < pat.length() && depth > 0) {
+                    if (pat.charAt(j) == '(') depth++;
+                    if (pat.charAt(j) == ')') depth--;
+                    j++;
+                }
+                String inner = pat.substring(i + 2, j - 1);
+                // translate alternatives separately
+                java.util.List<String> alts = new ArrayList<>();
+                StringBuilder cur = new StringBuilder(); int d2 = 0;
+                for (char x : inner.toCharArray()) {
+                    if (x == '(') d2++;
+                    if (x == ')') d2--;
+                    if (x == '|' && d2 == 0) { alts.add(cur.toString()); cur.setLength(0); }
+                    else cur.append(x);
+                }
+                alts.add(cur.toString());
+                StringBuilder altsRe = new StringBuilder();
+                for (int k = 0; k < alts.size(); k++) {
+                    if (k > 0) altsRe.append('|');
+                    StringBuilder one = new StringBuilder();
+                    shExtglobToRegex(alts.get(k), one);
+                    altsRe.append("(?:").append(one).append(")");
+                }
+                switch (c) {
+                    case '!': out.append("(?:(?!").append(altsRe).append(").)*"); break;
+                    case '@': out.append("(?:").append(altsRe).append(")"); break;
+                    case '?': out.append("(?:").append(altsRe).append(")?"); break;
+                    case '+': out.append("(?:").append(altsRe).append(")+"); break;
+                    default:  out.append("(?:").append(altsRe).append(")*");
+                }
+                i = j;
+                continue;
+            }
+            switch (c) {
+                case '*': out.append(".*"); break;
+                case '?': out.append('.'); break;
+                case '.': out.append("\\."); break;
+                case '\\': out.append("\\\\"); break;
+                case '[': out.append('['); break;
+                case ']': out.append(']'); break;
+                case '^': out.append("\\^"); break;
+                case '$': out.append("\\$"); break;
+                case '(': case ')': case '{': case '}':
+                case '+': case '|':
+                    if (c=='['||c==']') { out.append(c); break; }
+                    out.append('\\').append(c); break;
+                default: out.append(c);
+            }
+            i++;
+        }
+    }
+
     static boolean shFnmatchImpl(int[] p, String s, int pi, int si) {
         int[] t = s.codePoints().toArray();
         while (pi < p.length) {
@@ -2770,6 +2882,14 @@ fn helper_src(name: &str) -> Option<&'static str> {
         "regex" => r#"    static boolean shRegex(String pat, String flags) { return false; }
 "#,
         "incdec" => "",
+        "eq" => r#"    static boolean shEq(String a, String b) {
+        return __SH_NOCASE ? a.equalsIgnoreCase(b) : a.equals(b);
+    }
+"#,
+        "regexm" => r#"    static boolean shRegexMatch(String s, String re) {
+        try { return s.matches(re); } catch (Exception e) { return false; }
+    }
+"#,
         "errifempty" => r#"    static String shErrIfEmpty(String v, String msg) {
         if (v.isEmpty()) { System.err.println(msg); System.exit(1); }
         return v;
@@ -2789,20 +2909,37 @@ fn split_test_text(t: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
-    let mut brace = 0i32; // inside ${ ... } whitespace is not a separator
-    for c in t.chars() {
+    let ch: Vec<char> = t.chars().collect();
+    let mut i = 0;
+    while i < ch.len() {
+        let c = ch[i];
         match quote {
-            Some(q) => { if c == q { quote = None; cur.push(c); } else { cur.push(c); } }
+            Some(q) => {
+                cur.push(c);
+                if c == q { quote = None; }
+            }
             None => {
-                if c == '"' || c == '\'' { quote = Some(c); cur.push(c); }
-                else if c == '$' { brace += 100; cur.push(c); }
-                else if c == '{' && brace >= 100 { brace += 1; cur.push(c); }
-                else if c == '}' && brace > 100 { brace -= 1; cur.push(c); }
-                else if c.is_whitespace() && brace < 100 {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                    cur.push(c);
+                } else if c == '$' && i + 1 < ch.len() && ch[i + 1] == '{' {
+                    // ${...}: copy verbatim until the matching '}'
+                    let mut depth = 0i32;
+                    while i < ch.len() {
+                        cur.push(ch[i]);
+                        if ch[i] == '{' { depth += 1; }
+                        if ch[i] == '}' { depth -= 1; if depth == 0 { i += 1; break; } }
+                        i += 1;
+                    }
+                    continue;
+                } else if c.is_whitespace() {
                     if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
-                } else { if c == '}' && brace >= 100 { brace -= 100; } cur.push(c); }
+                } else {
+                    cur.push(c);
+                }
             }
         }
+        i += 1;
     }
     if !cur.is_empty() { out.push(cur); }
     out
