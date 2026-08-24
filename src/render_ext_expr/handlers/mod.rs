@@ -3,6 +3,7 @@
     pub(crate) mod array_len;
     pub(crate) mod string_trim;
     pub(crate) mod path_name;
+    pub(crate) mod regexp_find;
     pub(crate) mod str_len;
     pub(crate) mod affix_strip;
     pub(crate) mod case_transform;

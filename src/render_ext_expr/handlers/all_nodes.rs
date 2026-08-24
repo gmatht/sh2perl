@@ -383,6 +383,25 @@ pub fn affix_strip(node: &AffixStrip, ctx: &ExprRenderCtx) -> Option<String> {
     }
 }
 
+// ── RegexpFind ───────────────────────────────────────────────────────
+
+pub fn regexp_find(node: &RegexpFind, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        Backend::Perl => {
+            // leftmost match via a capturing group; "" when no match
+            let text = crate::ir::ir_expr_to_perl(&node.text);
+            let pat = crate::ir::ir_expr_to_perl(&node.pattern);
+            Some(format!("do {{ my $m; ({} =~ /({})/) && ($m = $1); $m // \"\" }}", text, pat))
+        }
+        Backend::Estree => {
+            let text = render_child(&node.text, ctx)?;
+            let pat = render_child(&node.pattern, ctx)?;
+            Some(format!("(({}).match(new RegExp({})) || [\"\"])[0]", text, pat))
+        }
+        _ => None,
+    }
+}
+
 // ── CutsetTrim ──────────────────────────────────────────────────────
 
 pub fn cutset_trim(node: &CutsetTrim, ctx: &ExprRenderCtx) -> Option<String> {
