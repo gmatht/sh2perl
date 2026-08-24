@@ -125,6 +125,13 @@ pub struct Render {
     need_run: bool,
     loop_depth: usize,
     todo: usize,
+    /// inside a user-function body (A1 Function): getVar("N") reads the
+    /// positional param __args[N-1], Return returns the value, not exit
+    in_function: bool,
+    /// user functions hoisted OUT of main (rendered before it)
+    pending_fns: Vec<String>,
+    /// vars local to a hoisted user function (never declared in main)
+    fn_locals: BTreeSet<String>,
     /// counter for generated temp names (for-loop item bindings)
     tmp_counter: usize,
 }
@@ -778,6 +785,12 @@ impl Render {
             IrExpr::Int(_) | IrExpr::Arith(_) => ('d', self.expr_num(e)),
             IrExpr::Str(_, _) | IrExpr::Interpolate(_) => ('s', self.expr_str(e)),
             IrExpr::Bool(_) => ('b', self.expr_bool(e)),
+            // a user-function call returns the STRING model — print it
+            // with {s} (a %d of int 42 and {s} of "42" produce the same
+            // stdout); a numeric context would coerce via sh2ToInt
+            IrExpr::Call { func, .. } if func == "fnValue" || func == "fnCall" => {
+                ('s', self.expr_str(e))
+            }
             IrExpr::Var(name, _) => {
                 if self.is_num(name) {
                     ('d', self.expr_num(e))
@@ -945,10 +958,68 @@ impl Render {
 
     /// String-typed context for a Call (stub callees take no args so the
     /// generated call always compiles; stubs return []const u8 by default).
+    /// An arith STRING (`($x % 2)`, `$j*3+$k == 4` — the C frontend's
+    /// testArith/ternary-cond shape): normalize $refs, parse, render via
+    /// the Arith AST walker. None when it doesn't parse.
+    fn arith_text(&mut self, s: &str) -> Option<String> {
+        let norm: String = s
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if c == '$'
+                    && i + 1 < s.len()
+                    && (s[i + 1..].starts_with('{')
+                        || s[i + 1..]
+                            .chars()
+                            .next()
+                            .map_or(false, |n| n.is_ascii_alphabetic() || n == '_'))
+                {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let norm = norm.replace('{', " ").replace('}', " ");
+        let ast = crate::shir::parse_arith(norm.trim())?;
+        Some(self.arith(&ast))
+    }
+
     fn call_str(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            "fnValue" | "fnCall" => {
+                // a user-function call: name(args...) — values flow as
+                // strings (the positional-param convention); a numeric
+                // context coerces via sh2ToInt at the read site
+                let name = args
+                    .first()
+                    .and_then(|a| match a {
+                        IrExpr::Str(n, _) => Some(self.zig_ident(n)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "sh2TODO".to_string());
+                let call_args: Vec<String> = args
+                    .get(1)
+                    .and_then(|a| match a {
+                        IrExpr::Array(elems) => {
+                            Some(elems.iter().map(|e| self.expr_str(e)).collect())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                format!("{name}(&[_][]const u8{{ {} }})", call_args.join(", "))
+            }
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
+                    // inside a user function: getVar("N") is the POSITIONAL
+                    // PARAMETER read ($1 convention — the C frontend's
+                    // outparam/param channel), not an env lookup
+                    if self.in_function && name.bytes().all(|b| b.is_ascii_digit()) && !name.is_empty() {
+                        let idx: usize = name.parse().unwrap_or(1);
+                        return format!(
+                            "(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"
+                        );
+                    }
                     if self.declared(name) {
                         let m = self.zig_ident(name);
                         self.mark_read(name);
@@ -985,6 +1056,12 @@ impl Render {
                 format!("[_] []const u8{{{}}}", parts.join(", "))
             }
             "arith" => {
+                if let Some(IrExpr::Str(sv, _)) = args.first() {
+                    if let Some(x) = self.arith_text(sv) {
+                        self.need_intstr = true;
+                        return format!("sh2IntStr({x})");
+                    }
+                }
                 self.need_intstr = true;
                 format!("sh2IntStr(sh2Arith())")
             }
@@ -995,7 +1072,14 @@ impl Render {
     /// i64-typed context for a Call.
     fn call_num(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
-            "arith" => "sh2Arith()".to_string(),
+            "arith" => {
+                if let Some(IrExpr::Str(sv, _)) = args.first() {
+                    if let Some(x) = self.arith_text(sv) {
+                        return x;
+                    }
+                }
+                "sh2Arith()".to_string()
+            }
             "test" => format!("@intFromBool({})", self.call_bool(func, args)),
             _ => {
                 self.need_toint = true;
@@ -1027,7 +1111,14 @@ impl Render {
                 self.sh2_calls.insert("contains".into());
                 "sh2Contains()".to_string()
             }
-            "arith" => "(sh2Arith() != 0)".to_string(),
+            "arith" => {
+                if let Some(IrExpr::Str(sv, _)) = args.first() {
+                    if let Some(x) = self.arith_text(sv) {
+                        return format!("({x} != 0)");
+                    }
+                }
+                "(sh2Arith() != 0)".to_string()
+            }
             "getVar" => {
                 self.need_truthy = true;
                 format!("sh2Truthy({})", self.call_str(func, args))
@@ -1183,6 +1274,11 @@ impl Render {
                     }
                 }
                 out
+            }
+            // a user-function call returns the STRING model — {s} prints
+            // ints-as-strings identically to %d
+            IrExpr::Call { func, .. } if func == "fnValue" || func == "fnCall" => {
+                vec![('s', self.expr_str(e))]
             }
             IrExpr::Arith(a) => vec![('d', self.arith(a))],
             IrExpr::Bool(b) => {
@@ -1360,6 +1456,34 @@ impl Render {
         match s {
             IrStmt::Ext(_) => panic!("zig backend: Ext node unsupported"),
             IrStmt::Expr(e) => {
+                // statement-position arith (`runs++` — the do-while idiom):
+                // render natively (`runs += 1;`) instead of the sh2Arith
+                // stub (which was called without being emitted)
+                if let IrExpr::Arith(a) = e {
+                    if let ArithAst::IncDec { var, delta, .. } = &**a {
+                        let v = self.zig_ident(var);
+                        self.mark_read(var);
+                        let d = delta.unsigned_abs();
+                        let zop = if *delta >= 0 { "+" } else { "-" };
+                        self.emit(&format!("{v} {zop}= {d};"));
+                        return;
+                    }
+                    if let ArithAst::Assign { var, op, rhs } = &**a {
+                        let v = self.zig_ident(var);
+                        self.mark_read(var);
+                        let r = self.arith(rhs);
+                        let zop = match op.as_str() {
+                            "+=" => "+=",
+                            "-=" => "-=",
+                            "*=" => "*=",
+                            "/=" => "/=",
+                            "%=" => "%=",
+                            _ => "=",
+                        };
+                        self.emit(&format!("{v} {zop}= {r};"));
+                        return;
+                    }
+                }
                 if let IrExpr::Call { func, args } = e {
                     if func == "exec" {
                         if let Some(IrExpr::Str(cmd, _)) = args.first() {
@@ -1413,16 +1537,45 @@ impl Render {
                                                     parts.push(('s', Self::zig_str("%")));
                                                     continue;
                                                 }
+                                                // consume flags/width/length
+                                                // modifiers (`%lld`, `%u`,
+                                                // `%5d`): the value model is
+                                                // int-as-string or i64
+                                                while let Some(&f) = chars.peek() {
+                                                    if matches!(f, 'l' | 'h' | 'z' | 'j' | 't' | 'L')
+                                                        || f.is_ascii_digit()
+                                                        || matches!(f, '-' | '+' | ' ' | '#')
+                                                    {
+                                                        chars.next();
+                                                    } else {
+                                                        break;
+                                                    }
+                                                }
                                                 let spec = match chars.peek() {
                                                     Some('s') => { chars.next(); 's' }
-                                                    Some('d') | Some('i') => { chars.next(); 'd' }
+                                                    Some('d') | Some('i') | Some('u') => { chars.next(); 'd' }
+                                                    Some('x') | Some('X') | Some('o') => { chars.next(); 'd' }
+                                                    Some('c') => { chars.next(); 's' }
                                                     Some('\n') => { chars.next(); 's' }
                                                     _ => { parts.push(('s', Self::zig_str("%"))); continue; }
                                                 };
                                                 if let Some(a) = rest.get(argi) {
                                                     argi += 1;
-                                                    let pa = self.parts_of(a);
-                                                    parts.push(if pa.len() == 1 { (spec, pa[0].1.clone()) } else { pa[0].clone() });
+                                                    let mut pa = self.parts_of(a);
+                                                    if pa.len() == 1 {
+                                                        // a %d over a
+                                                        // string-model value
+                                                        // (the user-fn
+                                                        // convention) prints
+                                                        // identically with {s}
+                                                        if spec == 'd' && pa[0].0 == 's' {
+                                                            parts.push(('s', pa[0].1.clone()));
+                                                            continue;
+                                                        }
+                                                        parts.push((spec, pa[0].1.clone()));
+                                                    } else {
+                                                        parts.push(pa[0].clone());
+                                                    }
                                                 } else {
                                                     parts.push((spec, if spec == 'd' { "0".into() } else { "\"\"".into() }));
                                                 }
@@ -1793,6 +1946,13 @@ impl Render {
                 self.mark_todo(&format!("stmt {:?}", s));
             }
             IrStmt::Return(v) => {
+                if self.in_function {
+                    // user-function value return: strings are the value
+                    // model (numeric contexts coerce at the read site)
+                    let r = v.as_ref().map(|e| self.expr_str(e)).unwrap_or_default();
+                    self.emit(&format!("return {r};"));
+                    return;
+                }
                 match v {
                     Some(e) => {
                         let code = self.expr_num(e);
@@ -1802,15 +1962,51 @@ impl Render {
                 }
             }
             IrStmt::Function { name, body, .. } => {
-                // Render as a Zig fn.
+                // Render as a hoisted Zig fn taking POSITIONAL params:
+                // `fn name(__args: []const []const u8) []const u8` — the
+                // body's getVar("N") reads route through __args (the
+                // $1 convention), Return returns the value string.
+                // Hoisted out of main (pending_fns) — a fn nested inside
+                // another fn is legal zig but the decls/return machinery
+                // above assumes top level.
                 let id = self.zig_ident(name);
-                self.emit(&format!("fn {id}() void {{"));
-                self.depth += 1;
+                let prev_in_fn = self.in_function;
+                self.in_function = true;
+                let mut saved = std::mem::take(&mut self.out);
                 for s in body {
                     self.stmt(s);
                 }
-                self.depth -= 1;
-                self.emit("}");
+                std::mem::swap(&mut saved, &mut self.out);
+                self.in_function = prev_in_fn;
+                let mut locals: BTreeSet<String> = BTreeSet::new();
+                for st in body {
+                    if let IrStmt::Assign { targets, .. } = st {
+                        for t in targets {
+                            locals.insert(t.var.clone());
+                        }
+                    }
+                    if let IrStmt::Declare { vars, .. } = st {
+                        for d in vars {
+                            locals.insert(d.name.clone());
+                        }
+                    }
+                }
+                self.fn_locals.extend(locals.iter().cloned());
+                let mut fntext = format!(
+                    "fn {id}(__args: []const []const u8) []const u8 {{\n"
+                );
+                for v in &locals {
+                    let m = self.zig_ident(v);
+                    if self.is_num(v) {
+                        fntext.push_str(&format!("    var {m}: i64 = 0;\n"));
+                    } else {
+                        fntext.push_str(&format!("    var {m}: []const u8 = \"\";\n"));
+                    }
+                }
+                fntext.push_str(&saved.join("\n"));
+                fntext.push('\n');
+                fntext.push_str("}\n");
+                self.pending_fns.push(fntext);
             }
             IrStmt::Try { .. } => self.mark_todo("try"),
             IrStmt::Select { .. } => self.mark_todo("select"),
@@ -1996,15 +2192,37 @@ impl Render {
             }
         }
         self.emit("");
-        self.emit("pub fn main() !void {");
+        // hoisted user functions render BEFORE main (zig order-free, but
+        // keep the listing readable)
+        let pending = std::mem::take(&mut self.pending_fns);
+        if !pending.is_empty() {
+            self.emit("");
+            for f in &pending {
+                for line in f.lines() {
+                    self.emit(line);
+                }
+            }
+        }
+        self.emit("pub fn main(init: std.process.Init) !void {");
         // hoisted declarations (typed by the A2 verdicts)
+        // zig 0.16 errors on a `var` that is never mutated — emit `const`
+        // unless the rendered body assigns the name somewhere
         let mut decls: Vec<String> = Vec::new();
         for v in &written {
+            // user-function locals hoist with their fn — never in main
+            if self.fn_locals.contains(v) {
+                continue;
+            }
             let m = self.zig_ident(v);
+            let mutated = body_stmts.iter().any(|l| {
+                let pat = [format!("{m} ="), format!("{m}="), format!("{m} +="), format!("{m} -="), format!("{m} *="), format!("{m} /="), format!("{m} %="), format!("{m}++"), format!("{m}--")];
+                pat.iter().any(|p| l.contains(p.as_str()))
+            });
+            let kw = if mutated { "var" } else { "const" };
             if self.is_num(v) {
-                decls.push(format!("    var {m}: i64 = 0;"));
+                decls.push(format!("    {kw} {m}: i64 = 0;"));
             } else {
-                decls.push(format!("    var {m}: []const u8 = \"\";"));
+                decls.push(format!("    {kw} {m}: []const u8 = \"\";"));
             }
         }
         if !decls.is_empty() {
@@ -2149,7 +2367,9 @@ fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     collect_written(&c.body, out);
                 }
             }
-            IrStmt::Function { body, .. } => collect_written(body, out),
+            // user-function locals are hoisted with their fn — not
+            // main-level declarations
+            IrStmt::Function { .. } => {}
             IrStmt::Pipeline { stages, .. } => {
                 for st in stages {
                     collect_written(st, out);
