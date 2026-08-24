@@ -7315,10 +7315,26 @@ impl Render {
                                     self.emit("}");
                                     return;
                                 }
-                                // indexed elements
+                                // indexed elements (an ASSOC array iterates
+                                // its VALUES: aa_v[0..aa_n])
                                 self.arrays.insert(name.clone());
                                 self.need_sh = true;
                                 let aid = self.c_ident(&name);
+                                if self.assoc_arrays.contains(&name) {
+                                    self.emit(&format!(
+                                        "for (size_t _ai_{aid} = 0; _ai_{aid} < {aid}_n; _ai_{aid}++) {{"
+                                    ));
+                                    self.depth += 1;
+                                    self.emit(&format!(
+                                        "{var_name} = {aid}_v[_ai_{aid}];"
+                                    ));
+                                    for s in body {
+                                        self.stmt(s);
+                                    }
+                                    self.depth -= 1;
+                                    self.emit("}");
+                                    return;
+                                }
                                 self.emit(&format!(
                                     "for (size_t _ai_{aid} = 0; _ai_{aid} < {aid}_len; _ai_{aid}++) {{"
                                 ));
@@ -7340,7 +7356,10 @@ impl Render {
                 if items.len() == 1 {
                     if let IrExpr::Call { func, args } = &items[0] {
                         if func == "captureWords" || func == "capture" {
-                            let cap = self.capture_call(&[items[0].clone()]);
+                            // pass the capture's INNER Arrow args —
+                            // wrapping the whole call yielded an empty site
+                            let inner: Vec<IrExpr> = args.clone();
+                            let cap = self.capture_call(&inner);
                             self.need_sh = true;
                             let wn = format!("_wn_{}", self.temp_seq);
                             self.temp_seq += 1;
