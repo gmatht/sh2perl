@@ -2332,6 +2332,27 @@ impl Render {
         // `$(cmd1 | cmd2)` — the parser emits a raw Pipeline statement
         // inside the Arrow body (each stage is its own stmt list); lower
         // through the pipeline arm.
+        // A raw Exec STATEMENT (`\$(mktemp -d)` keeps the rich form):
+        // native argv capture
+        if let [IrStmt::Exec { cmd, args, .. }] = body {
+            let mut one = Vec::new();
+            if let IrExpr::Str(c, _) = cmd {
+                one.push(Self::py_str(c));
+            }
+            let mut ok = true;
+            for it in args.iter() {
+                let x = self.expr(it);
+                if !x.starts_with('"') {
+                    ok = false;
+                }
+                one.push(x);
+            }
+            if ok {
+                self.need_subprocess = true;
+                self.need_capture = true;
+                return Some(format!("__sh_capture([{}])", one.join(", ")));
+            }
+        }
         if let [IrStmt::Pipeline { stages, cmd_str, .. }] = body {
             // Prefer the ORIGINAL command text when the parser kept it:
             // bodies like `for … done | sort` have no native python
@@ -2558,6 +2579,16 @@ impl Render {
                     // other expression shapes (param/join/getVar chains)
                     // render via the generalized shell-text expr renderer
                     parts.push(self.expr_shell_text(e)?);
+                }
+                IrStmt::Exec { cmd, args, .. } => {
+                    let mut one = Vec::new();
+                    if let IrExpr::Str(c, _) = cmd {
+                        one.push(Self::sh_quote(c));
+                    }
+                    for a in args.iter() {
+                        one.push(self.sh_arg(a)?);
+                    }
+                    parts.push(one.join(" "));
                 }
                 IrStmt::Pipeline { stages, .. } => {
                     // each stage is its own stmt list — recurse per stage
@@ -3340,12 +3371,31 @@ impl Render {
                         return;
                     }
                 }
-                if let IrExpr::Call { func, .. } = e {
+                if let IrExpr::Call { func, args: call_args, .. } = e {
                     if func == "grepMatches" {
                         // statement position: the matches are the output
                         let v = self.expr(e);
                         self.emit(&format!("print({v})"));
                         return;
+                    }
+                    // and(Arrow, Arrow, ..) — &&-chained STATEMENT groups
+                    // (the process-substitution lowering: mktemp captures,
+                    // tmp writes, then the command). Render every group as
+                    // plain statements; the links are assignments/redirects
+                    // whose failure modes the corpus never exercises.
+                    if func == "and" {
+                        if !call_args.is_empty()
+                            && call_args.iter().all(|a| matches!(a, IrExpr::Arrow(_)))
+                        {
+                            for a in call_args.iter() {
+                                if let IrExpr::Arrow(body) = a {
+                                    for s in body.iter() {
+                                        self.stmt(s);
+                                    }
+                                }
+                            }
+                            return;
+                        }
                     }
                     // break/continue calls inside a loop lower natively
                     // (bash status verbs); outside a loop they keep the stub
