@@ -4663,7 +4663,10 @@ fn arith_to_sh(a: &ArithAst) -> String {
     match a {
         ArithAst::Num(n) => n.to_string(),
         ArithAst::Var(name) | ArithAst::Ident(name) => {
-            if NUM_VARS.lock().unwrap().contains(name) {
+            // dotted struct-field names sanitize exactly like the setVar
+            // write arm (`p.x` → `p_x`) — the read must hit the same home
+            let name = name.replace('.', "_");
+            if NUM_VARS.lock().unwrap().contains(&name) {
                 // known-numeric var: bare read (dash rejects quoted
                 // expansions inside $(( )); the analysis guarantees the
                 // value is numeric text)
