@@ -84,7 +84,11 @@ pub fn all() -> Vec<(&'static str, TransformFn)> {
         // split-in-place: liveness-proven destructive buffer reuse for
         // `for w in $var` iteration (C tokenizes the var's own buffer;
         // GC'd languages ignore the flag — see shir_passes/split_inplace)
-        ("split-in-place", crate::shir_passes::split_inplace::transform),
+        // ("split-in-place", crate::shir_passes::split_inplace::transform):
+        //   PENDING — activating it changes embed/Carp output (test
+        //   ir::tests::embed_injects_carp_for_emulations regresses); the
+        //   c worker's in-flight work continues. Flip this line when done.
+        //   (Module declared in shir_passes/mod.rs; compiles inert.)
     ]
 }
 

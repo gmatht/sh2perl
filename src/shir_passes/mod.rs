@@ -51,7 +51,10 @@ pub mod metric;
 pub mod optimize; // const_prop + dead_store_elim (the A1 optimizer family)
 pub mod pattern;
 pub mod restructure;
-pub mod split_inplace; // split-in-place: destructive buffer reuse for for-in-split iteration
+// split_inplace: registered-but-PARKED in transforms.rs pending the
+// c worker's embed/Carp interaction fix; declaration kept so the tree
+// compiles either way.
+pub mod split_inplace;
 pub mod strip;
 pub mod transform;
 
