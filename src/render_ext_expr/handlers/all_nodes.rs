@@ -352,6 +352,35 @@ pub fn affix_strip(node: &AffixStrip, ctx: &ExprRenderCtx) -> Option<String> {
     }
 }
 
+// ── CutsetTrim ──────────────────────────────────────────────────────
+
+pub fn cutset_trim(node: &CutsetTrim, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        Backend::Perl => {
+            // strip ALL leading/trailing chars present in the cutset;
+            // \Q..\E quotes the set so metachars stay literal
+            let text = crate::ir::ir_expr_to_perl(&node.text);
+            let cut = crate::ir::ir_expr_to_perl(&node.cutset);
+            Some(format!(
+                "do {{ my $t = {}; my $c = {}; $t =~ s/^[\\Q$c\\E]+//; $t =~ s/[\\Q$c\\E]+$//; $t }}",
+                text, cut
+            ))
+        }
+        Backend::Estree => None,
+        Backend::Go => {
+            let text = render_child(&node.text, ctx)?;
+            let cut = render_child(&node.cutset, ctx)?;
+            Some(format!("strings.Trim({}, {})", text, cut))
+        }
+        Backend::Rust => {
+            let text = render_child(&node.text, ctx)?;
+            let cut = render_child(&node.cutset, ctx)?;
+            Some(format!("{}.trim_matches(|c| {}.contains(c))", text, cut))
+        }
+        _ => None,
+    }
+}
+
 // ── RepeatStr ────────────────────────────────────────────────────────
 
 pub fn repeat_str(node: &RepeatStr, ctx: &ExprRenderCtx) -> Option<String> {

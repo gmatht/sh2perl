@@ -11,6 +11,7 @@
     pub(crate) mod char_translate;
     pub(crate) mod reg_count;
     pub(crate) mod string_contains;
+    pub(crate) mod cutset_trim;
     pub(crate) mod clone_deep;
     pub(crate) mod take_lines;
     pub(crate) mod reg_sub;
