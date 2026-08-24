@@ -42,6 +42,8 @@ pub mod escape_classes; // per-var STORE requirement census (feeds escape/hoist 
 pub mod for_recovery; // counter-while → native For recovery
 pub mod function_purity; // function-level side-effect classes by call-graph fixpoint
 pub mod i32_provable; // PROVABLY-32-bit arith annotations
+pub mod seq_range_for; // worker-submitted: `for i in $(seq A B)` → native numeric range loop
+
 
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
