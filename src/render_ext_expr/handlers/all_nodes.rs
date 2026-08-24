@@ -402,6 +402,21 @@ pub fn regexp_find(node: &RegexpFind, ctx: &ExprRenderCtx) -> Option<String> {
     }
 }
 
+// ── CgoCall ──────────────────────────────────────────────────────────
+
+pub fn cgo_call(node: &CgoCall, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        // The faithful execution of a cgo-bound call is the NATIVE call
+        // — only the C frontend build can provide it. Perl/JS render a
+        // loud runtime failure, never silence.
+        Backend::Perl => Some(format!(
+            "die \"debashc: cgo-path construct {} requires the C frontend build\\n\";",
+            node.target
+        )),
+        _ => None,
+    }
+}
+
 // ── CutsetTrim ──────────────────────────────────────────────────────
 
 pub fn cutset_trim(node: &CutsetTrim, ctx: &ExprRenderCtx) -> Option<String> {

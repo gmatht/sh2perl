@@ -9,5 +9,6 @@
     pub(crate) mod cutset_trim;
     pub(crate) mod clone_deep;
     pub(crate) mod element_read;
+    pub(crate) mod cgo_call;
     pub(crate) mod field_read;
 
