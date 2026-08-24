@@ -5319,15 +5319,18 @@ impl Render {
                 } else if op == "!=" {
                     if self.nocasematch {
                         // shopt -s nocasematch: == compares are
-                        // case-insensitive
+                        // case-insensitive; patterns arrive QUOTED
+                        let dq = raw_r
+                            .trim_matches(|c| c == '"' || c == '\'');
                         self.need_fnmatch = true;
-                        format!("(fnmatch({}, {l}, FNM_CASEFOLD) != 0)", Self::cstr(&raw_r))
+                        format!("(fnmatch({}, {l}, FNM_CASEFOLD) != 0)", Self::cstr(dq))
                     } else {
                         format!("(strcmp({l}, {r}) != 0)")
                     }
                 } else if self.nocasematch {
+                    let dq = raw_r.trim_matches(|c| c == '"' || c == '\'');
                     self.need_fnmatch = true;
-                    format!("(fnmatch({}, {l}, FNM_CASEFOLD) == 0)", Self::cstr(&raw_r))
+                    format!("(fnmatch({}, {l}, FNM_CASEFOLD) == 0)", Self::cstr(dq))
                 } else {
                     format!("(strcmp({l}, {r}) == 0)")
                 }
@@ -6169,10 +6172,14 @@ impl Render {
                 if s.contains("nocasematch") && s.contains("-s") {
                     self.nocasematch = true;
                 }
+                // `shopt -u nocasematch` — the flag turns OFF again
+                if s.contains("nocasematch") && (s.contains("-u") || s.contains("+s")) {
+                    self.nocasematch = false;
+                }
                 // Bool form: shopt("nocasematch", true)
                 if let Some(IrExpr::Bool(b)) = args.get(1) {
-                    if s.contains("nocasematch") && *b {
-                        self.nocasematch = true;
+                    if s.contains("nocasematch") {
+                        self.nocasematch = *b;
                     }
                 }
                 self.need_sh = true;
@@ -8708,6 +8715,56 @@ impl Render {
                 self.depth -= 1;
                 self.emit("}");
             }
+            // NEW-CORE NODE: ForEachLine — STREAMING line iteration over
+            // a file (O(1) memory; the node doc pins "C getline"). The
+            // loop var is STRING-typed by construction.
+            IrStmt::Ext(ref node) if node.tag() == "ForEachLine" => {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static FL_N: AtomicUsize = AtomicUsize::new(0);
+                let k = FL_N.fetch_add(1, Ordering::Relaxed);
+                let fl = node.as_any()
+                    .downcast_ref::<crate::shir_nodes::ForEachLine>()
+                    .expect("tag/type agree");
+                self.store.insert(fl.var.clone());
+                self.var_types.insert(fl.var.clone(), IrType::Str);
+                let var = self.c_ident(&fl.var);
+                let src = self.value_c(&fl.source);
+                self.emit(&format!("{{"));
+                self.emit(&format!(
+                    "  long long _lim{k} = -1;"
+                ));
+                if let Some(limit) = &fl.limit {
+                    let lv = self.value_num_dollar(limit);
+                    self.emit(&format!("  _lim{k} = {lv};"));
+                }
+                self.emit(&format!(
+                    "  FILE *_ff{k} = fopen({src}, \"r\");"
+                ));
+                self.emit(&format!("  if (_ff{k}) {{"));
+                self.emit(&format!(
+                    "    static char _fll{k}[65536]; long long _fli{k} = 0;"
+                ));
+                self.emit(&format!(
+                    "    while (fgets(_fll{k}, sizeof _fll{k}, _ff{k})) {{"
+                ));
+                self.depth += 3;
+                self.emit(&format!(
+                    "size_t _fn{k} = strlen(_fll{k}); while (_fn{k} && (_fll{k}[_fn{k}-1]=='\\n' || _fll{k}[_fn{k}-1]=='\\r')) _fll{k}[--_fn{k}] = 0;"
+                ));
+                self.emit(&format!("{var} = strdup(_fll{k});"));
+                for b in &fl.body {
+                    self.stmt(b);
+                }
+                self.depth -= 1;
+                self.emit(&format!(
+                    "if (_lim{k} >= 0 && ++_fli{k} >= _lim{k}) break;"
+                ));
+                self.depth -= 2;
+                self.emit("    }");
+                self.emit(&format!("    fclose(_ff{k});"));
+                self.emit("  }");
+                self.emit("}");
+            }
             other => self.mark_todo(&format!("stmt {:?}", other)),
         }
     }
@@ -10340,8 +10397,9 @@ fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     if std::env::var("SH2_DBG_VARS").is_ok() && !stmts.is_empty() {
         eprintln!("DBG csn n={} first_type={}", stmts.len(), match &stmts[0] { IrStmt::Assign{..} => "Assign", IrStmt::Expr(_) => "Expr", _ => "?" });
     }
-    for s in stmts {
-        match s {
+        for s in stmts {
+        collect_ext_foreach_line_vars(s, out);
+    match s {
             IrStmt::Assign { targets, expr, .. } => {
                 if std::env::var("SH2_DBG_VARS").is_ok() {
                     eprintln!("DBG csn assign -> {:?}", targets.iter().map(|t| t.var.clone()).collect::<Vec<_>>());
@@ -10578,8 +10636,9 @@ fn collect_vars_full(
     out: &mut BTreeSet<String>,
     for_vars: &mut BTreeSet<String>,
 ) {
-    for s in stmts {
-        match s {
+        for s in stmts {
+        collect_ext_foreach_line_vars(s, out);
+    match s {
             IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
@@ -10646,6 +10705,19 @@ fn is_printf_v_call(args: &[IrExpr]) -> bool {
         )
 }
 
+
+/// ForEachLine ext-node vars must HOIST (the streaming loop assigns them)
+fn collect_ext_foreach_line_vars(st: &IrStmt, out: &mut BTreeSet<String>) {
+    if let IrStmt::Ext(n) = st {
+        if n.tag() == "ForEachLine" {
+            if let Some(fl) = n.as_any()
+                .downcast_ref::<crate::shir_nodes::ForEachLine>()
+            {
+                out.insert(fl.var.clone());
+            }
+        }
+    }
+}
 
 /// A Redirect whose inner command is `mapfile`/`readarray` reading stdin
 /// from a FILE — renderable natively (arrays cannot cross exec).
