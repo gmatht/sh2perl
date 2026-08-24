@@ -6832,7 +6832,9 @@ impl Render {
                         fmt.push_str("%s");
                         // cast: the arg may be a stub call returning
                         // long long — printf("%s", long long) is UB.
-                        cargs.push(format!("(char*)({v})"));
+                        // NULL-guard: glibc prints "(null)" for %s(NULL);
+                        // bash prints "" for an unset variable
+                        cargs.push(format!("(char*)(({v}) ? ({v}) : \"\")"));
                     }
                 },
             }
