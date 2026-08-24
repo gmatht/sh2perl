@@ -1913,7 +1913,7 @@ impl JavaRender {
                 let inner = self.getvar_str(&name)?;
                 Ok(format!("String.valueOf(shLen({inner}))"))
             }
-            "#len" | "#" => {
+            "len" => {
                 self.helper("len");
                 let inner = self.getvar_str(&name)?;
                 Ok(format!("String.valueOf(shLen({inner}))"))
