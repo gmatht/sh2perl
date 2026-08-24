@@ -3384,10 +3384,6 @@ impl Render {
                     _ => None,
                 }) == Some("-v")
                 {
-                    if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("PRINTF_V reached"); }
-                    if std::env::var("SH2C_DEBUG").is_ok() {
-                        eprintln!("VGUARD w1={:?} w2={:?}", words.get(1), words.get(2));
-                    }
                     // the fmt may arrive as Str or an all-literal
                     // Interpolate (`"%s-%s"` → Lit parts)
                     let fmt_text: Option<String> = words.get(2).and_then(|w| match w {
@@ -3856,7 +3852,6 @@ impl Render {
 
     /// A shell-out exec site (statement or expr position).
     fn shell_exec(&mut self, args: &[IrExpr]) -> String {
-        if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("SHELL_EXEC {:?}", args.first()); }
         let arr_inits = self.array_inits_for_args(&args);
         let args = args.to_vec();
         self.shell_site(
@@ -6275,7 +6270,6 @@ impl Render {
         let mut fmt = String::new();
         let mut cargs: Vec<String> = Vec::new();
         let mut arg_i = 0usize;
-        if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("BFMT fmt={:?} nargs={}", fmt_str, args.len()); }
         let mut it = fmt_str.chars().peekable();
         while let Some(ch) = it.next() {
             match ch {
