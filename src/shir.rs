@@ -33894,6 +33894,13 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
 fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
     let children: Vec<&IrExpr> = n.children();
     match n.tag() {
+        // ONE line from stdin, newline stripped; EOF → "" (bash read
+        // semantics for the single-variable subset). Awaited — stdin is
+        // async in the JS runtime.
+        "ReadLine" => {
+            let call = crate::estree::sh2_call("readLine", vec![]);
+            Some(Expr::AwaitExpression { argument: Box::new(call) })
+        }
         "StrLen" => {
             let text = children.get(0)?;
             Some(Expr::MemberExpression {

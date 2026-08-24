@@ -144,6 +144,8 @@ pub struct Render {
     fh_counter: usize,
     /// WalkDir used → __sh2_walk preamble helper needed.
     need_walk: bool,
+    /// ReadLine used → __sh2_read_line preamble helper needed.
+    need_readline: bool,
 }
 
 /// Render an `IrProgram` to Perl source.
@@ -194,6 +196,13 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
             r.emit(line);
         }
         r.emit("");
+    }
+    if r.need_readline {
+        r.emit("");
+        r.emit("sub __sh2_read_line {");
+        r.emit("    my $l = <STDIN>;");
+        r.emit("    return defined $l ? do { chomp $l; $l } : '';");
+        r.emit("}");
     }
     if r.need_walk {
         // STREAMING directory walk (docs/shir-primitives.md §WalkDir):
@@ -605,6 +614,11 @@ impl Render {
                 "0".to_string()
             }
             IrExpr::Ext(n) => {
+                // `read VAR` normalisation: one stdin line, chomped
+                if n.tag() == "ReadLine" {
+                    self.need_readline = true;
+                    return "__sh2_read_line()".to_string();
+                }
                 let ctx = crate::render_ext_expr::ExprRenderCtx {
                     backend: crate::render_ext_expr::Backend::Perl,
                     indent: 0,

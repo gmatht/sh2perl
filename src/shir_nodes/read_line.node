@@ -1,0 +1,11 @@
+# shir_nodes/read_line.node — ONE line from standard input.
+#
+# Normalises `read VAR` (docs/shir-reductions.md §Normalisation
+# transforms): the value is the line WITHOUT its trailing newline; EOF
+# yields the empty string. No IFS splitting (the subset's scripts read a
+# single variable). Backends: JS runtime sh2.readLine, Perl scalar(<STDIN>)
+# chomped, Java BufferedReader stdin, Zig stdin reader.
+
+node ReadLine
+tag "ReadLine"
+kind expr

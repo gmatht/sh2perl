@@ -67,6 +67,12 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
     let has_fns = prog.stmts.iter().any(|st| {
         matches!(st, IrStmt::Function { name, .. } if name != "main")
     });
+    if has_fns || prog.stmts.iter().any(|st| matches!(st, IrStmt::Function { .. })) {
+        out.push_str("    static String __sh_line(String s, int n) {\n");
+        out.push_str("        String[] p = s.split(\"\\\\n\");\n");
+        out.push_str("        return (n >= 0 && n < p.length) ? p[n] : \"\";\n");
+        out.push_str("    }\n");
+    }
     if has_fns {
         out.push_str("    static String[] __sh_fArgs = new String[0];\n");
         out.push_str("    static String __sh_fArg(int n) {\n");
@@ -243,6 +249,10 @@ fn java_home(name: &str) -> String {
 }
 
 fn push_var(name: &str, out: &mut Vec<String>) {
+    // positional params ($1..) are NOT fields — they read __sh_fArg(N)
+    if name.chars().all(|c| c.is_ascii_digit()) {
+        return;
+    }
     let j = java_home(name);
     if !out.iter().any(|v| *v == j) {
         out.push(j);
@@ -585,85 +595,6 @@ impl JavaCtx {
                 out.push_str("} }\n");
                 Ok(())
             }
-            IrStmt::Ext(node) if node.tag() == "WalkDir" => {
-                // STREAMING directory walk (docs/shir-primitives.md
-                // §WalkDir): Files.walk with maxDepth — entries one at a
-                // time via try-with-resources, contents never read.
-                let wd = node.as_any().downcast_ref::<crate::shir_nodes::WalkDir>()
-                    .ok_or("tag/type")?;
-                indent(out, d);
-                out.push_str("{ java.util.stream.Stream<java.nio.file.Path> __w = null;
-");
-                indent(out, d);
-                out.push_str("  try {
-");
-                indent(out, d + 1);
-                let mut src = String::new();
-                expr_to_java(&wd.source, &mut src)?;
-                let maxd = match &wd.maxdepth {
-                    Some(e) => {
-                        let mut s = String::new();
-                        expr_to_java(e, &mut s)?;
-                        format!("((int) Long.parseLong({}))", s)
-                    }
-                    None => "Integer.MAX_VALUE".to_string(),
-                };
-                let tf = match &wd.type_filter {
-                    Some(x) => x.as_str(),
-                    None => "",
-                };
-                let mut preds: Vec<String> = Vec::new();
-                if !tf.is_empty() {
-                    preds.push(if tf == "f" {
-                        "java.nio.file.Files.isRegularFile(p)".to_string()
-                    } else {
-                        "java.nio.file.Files.isDirectory(p)".to_string()
-                    });
-                }
-                if let Some(nf) = &wd.name_filter {
-                    // -name GLOB: PathMatcher matches the BASE NAME
-                    self.need_glob = true;
-                    preds.push(format!(
-                        "sh2Glob(p.getFileName().toString(), {})",
-                        java_str_lit(nf)
-                    ));
-                }
-                let bi = format!(
-                    "(p, a) -> {}",
-                    if preds.is_empty() {
-                        "true".to_string()
-                    } else {
-                        preds.join(" && ")
-                    }
-                );
-                out.push_str(&format!(
-                    "__w = java.nio.file.Files.find(java.nio.file.Paths.get({src}), {maxd}, {bi});
-",
-                    src = src, maxd = maxd, bi = bi
-                ));
-                indent(out, d);
-                out.push_str("      __w.forEach(p -> {
-");
-                indent(out, d + 1);
-                out.push_str(&format!("String {} = p.toString();
-", wd.var));
-                for b in &wd.body {
-                    self.stmt_to_java(b, d + 1, out)?;
-                }
-                indent(out, d);
-                out.push_str("      });
-");
-                indent(out, d);
-                out.push_str("  } catch (java.io.IOException __e) {
-");
-                indent(out, d);
-                out.push_str("  } finally { if (__w != null) __w.close(); }
-");
-                indent(out, d);
-                out.push_str("}
-");
-                Ok(())
-            }
             IrStmt::Case {
                 discriminant,
                 clauses,
@@ -833,6 +764,12 @@ impl JavaCtx {
     /// evaluator; an unparsed shape keeps the v1 `true` fallback).
     fn cond_to_java(&self, cond: &IrExpr, out: &mut String) -> Result<(), String> {
         match cond {
+            IrExpr::Var(name, _) => {
+                // a bare variable condition (the goto restructure's flag
+                // guards): truthiness of the string home — nonempty=true
+                out.push_str(&format!("(!({name} == null || {name}.isEmpty()))"));
+                Ok(())
+            }
             IrExpr::Call { func, .. } if func == "getVar" => {
                 expr_to_java(cond, out)?;
                 out.push_str(" != null");
@@ -947,13 +884,96 @@ impl JavaCtx {
 
 fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), String> {
     match e {
-        IrExpr::Call { func, args, .. } if func == "test" => {
-            // a bare `[ cond ]` statement: emit the condition truth
-            if let Some(IrExpr::Str(s, _)) = args.first() {
-                let c = test_render(s).unwrap_or_else(|| "true".to_string());
+        // setVar(cap, capture(Arrow[fnCall(f, args)])) — the C frontend's
+        // outparam channel: the callee echoes its out-param values; the
+        // caller captures STDOUT into the var (System.out redirection)
+        IrExpr::Call { func, args, .. } if func == "setVar" => {
+            if let (Some(IrExpr::Str(name, _)), Some(val)) = (args.first(), args.get(1)) {
+                if let IrExpr::Call { func: cf, args: cargs, .. } = val {
+                    if cf == "capture" {
+                        if let Some(IrExpr::Arrow(body)) = cargs.first() {
+                            let mut call_src = String::new();
+                            let mut captured = false;
+                            for st in body.iter() {
+                                if let IrStmt::Expr(IrExpr::Call { func: f2, args: a2, .. }) = st {
+                                    if f2 == "fnCall" || f2 == "fnValue" {
+                                        if let Some(IrExpr::Str(fname, _)) = a2.first() {
+                                            let mut vals: Vec<String> = Vec::new();
+                                            if let Some(IrExpr::Array(items)) = a2.get(1) {
+                                                for w in items {
+                                                    vals.push(word_to_java(w)?);
+                                                }
+                                            }
+                                            call_src = format!(
+                                                "{}(__sh_setArgs(new String[]{{{}}}))",
+                                                java_ident(fname),
+                                                vals.join(", ")
+                                            );
+                                            captured = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if captured {
+                                indent(out, d);
+                                out.push_str("java.io.PrintStream __old = System.out;\n");
+                                indent(out, d);
+                                out.push_str("java.io.ByteArrayOutputStream __b = new java.io.ByteArrayOutputStream();\n");
+                                indent(out, d);
+                                out.push_str("System.setOut(new java.io.PrintStream(__b));\n");
+                                indent(out, d);
+                                out.push_str(&call_src);
+                                if !call_src.ends_with(';') {
+                                    out.push(';');
+                                }
+                                out.push('\n');
+                                indent(out, d);
+                                out.push_str("System.setOut(__old);\n");
+                                indent(out, d);
+                                out.push_str(&format!(
+                                    "{} = __b.toString();\n",
+                                    java_home(name)
+                                ));
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            // a PLAIN setVar: typed assignment to the sanitized home
+            if let (Some(IrExpr::Str(name, _)), Some(val)) = (args.first(), args.get(1)) {
+                let v = word_to_java(val)?;
                 indent(out, d);
-                out.push_str(&format!("boolean __t = {c};\n"));
+                out.push_str(&format!("{} = {};\n", java_home(name), v));
                 return Ok(());
+            }
+            }
+
+            // a bare `[ cond ]` / arith-truth statement: emit the
+            // a bare `[ cond ]` / arith-truth statement: emit the
+            // condition truth — ONLY for actual condition calls (a
+            // setVar's NAME argument must never render as a -n test of
+            // itself)
+            if matches!(
+                func.as_str(),
+                "test" | "testArith" | "arith"
+            ) {
+                if let Some(IrExpr::Str(s2, _)) = args.first() {
+                    let norm = norm_arith_text(s2);
+                    let c = match crate::shir::parse_arith(norm.trim()) {
+                        Some(ast) => {
+                            let mut r = String::new();
+                            arith_to_java(&ast, &mut r)?;
+                            format!("(({}) != 0)", r)
+                        }
+                        None => test_render(s2).unwrap_or_else(|| "true".to_string()),
+                    };
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static TSEQ: AtomicUsize = AtomicUsize::new(0);
+                    let seq = TSEQ.fetch_add(1, Ordering::Relaxed) + 1;
+                    indent(out, d);
+                    out.push_str(&format!("boolean __t{seq} = {c};\n"));
+                    return Ok(());
+                }
             }
             Ok(())
         }
@@ -1092,6 +1112,12 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
             indent(out, d);
             out.push_str(&format!("{} = ", java_home(&name)));
             out.push_str(&word_to_java(val)?);
+            out.push_str(";\n");
+            Ok(())
+        }
+        IrExpr::Call { func, .. } if func == "break" || func == "continue" => {
+            indent(out, d);
+            out.push_str(func);
             out.push_str(";\n");
             Ok(())
         }
@@ -1677,6 +1703,17 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
             }
             Err("getVar with non-literal name (v1)".into())
         }
+        IrExpr::Call { func, args, .. } if func == "line" => {
+            // multi-return line read (`line(cap, N)`): the Nth newline-
+            // split field of the captured output
+            if let (Some(v), Some(IrExpr::Str(i, _))) = (args.first(), args.get(1)) {
+                let ve = word_to_java(v)?;
+                let n: usize = i.parse().unwrap_or(0);
+                out.push_str(&format!("__sh_line({ve}, {n})"));
+                return Ok(());
+            }
+            Err("line with unsupported shape".into())
+        }
         IrExpr::Call { func, args, .. } if func == "setArray" => {
             // `declare -a arr=(a b c)` — render as a bracketed array string
             let mut parts = String::new();
@@ -1736,15 +1773,6 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
         IrExpr::BinOp { lhs, op, rhs } => {
             // numeric string arithmetic: bash vars are strings, so render
             // through sh2Num coercion then back to a string
-            if *op == crate::ir::BinOpKind::Concat {
-                // string concatenation: both sides are String fields
-                let mut l = String::new();
-                expr_to_java(lhs, &mut l)?;
-                let mut r = String::new();
-                expr_to_java(rhs, &mut r)?;
-                out.push_str(&format!("(({l}) + ({r}))"));
-                return Ok(());
-            }
             let jop = match op {
                 crate::ir::BinOpKind::Add => "+",
                 crate::ir::BinOpKind::Sub => "-",
@@ -1882,6 +1910,12 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
             let bf = word_to_java(else_)?;
             out.push_str(&format!("({cc} ? {bt} : {bf})"));
             Ok(())
+        }
+        IrExpr::Call { func, .. } if func == "break" || func == "continue" => {
+            // the goto/loop-control signal verbs: java break/continue
+            out.push_str(func);
+            out.push_str(";\n");
+            return Ok(());
         }
         other => Err(format!("expr not in the v1 Java subset: {other:?}")),
     }
@@ -2289,16 +2323,6 @@ fn stmts_need_glob(stmts: &[IrStmt]) -> bool {
                     || elsifs.iter().any(|(_, b)| walk(b))
             }
             IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::ForInit { body, .. } => walk(body),
-            // find -name lowers its filter through sh2Glob
-            IrStmt::Ext(node) if node.tag() == "WalkDir" => node
-                .as_any()
-                .downcast_ref::<crate::shir_nodes::WalkDir>()
-                .map(|wd| wd.name_filter.is_some())
-                .unwrap_or(false)
-                || node.children().iter().any(|c| match c {
-                    IrStmt::Expr(e) => matches!(e, IrExpr::Ext(_)),
-                    _ => false,
-                }),
             _ => false,
         })
     }

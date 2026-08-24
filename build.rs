@@ -288,6 +288,7 @@ fn rust_ty(ftype: &str) -> &'static str {
         "exprs" => "Vec<crate::ir::IrExpr>",
         "stmts" => "Vec<crate::ir::IrStmt>",
         "optional_string" => "Option<String>",
+        "optional_bool" => "bool",
         "optional_expr" => "Option<Box<crate::ir::IrExpr>>",
         "vec_field_range" => "Vec<crate::ir::FieldRange>",
         other => panic!("unknown shir_nodes field type {other}"),
@@ -296,7 +297,7 @@ fn rust_ty(ftype: &str) -> &'static str {
 
 fn gen_json_build(fname: &str, ftype: &str) -> String {
     let raw = match ftype {
-        "string" | "optional_string" | "vec_field_range" => {
+        "string" | "optional_string" | "optional_bool" | "vec_field_range" => {
             format!("            \"{fname}\": self.{fname}.clone(),\n")
         }
         "int" => format!("            \"{fname}\": self.{fname},\n"),
@@ -333,6 +334,11 @@ fn gen_json_read(fname: &str, ftype: &str, struct_name: &str) -> String {
         ),
         "int" => format!("v[\"{fname}\"].as_i64().ok_or(\"{struct_name}.{fname}\")?"),
         "bool" => format!("v[\"{fname}\"].as_bool().ok_or(\"{struct_name}.{fname}\")?"),
+        // optional_bool: absent/null → false (additive-contract safe: old
+        // A1 JSONs without the field parse with the default)
+        "optional_bool" => format!(
+            "v.get(\"{fname}\").and_then(|b| b.as_bool()).unwrap_or(false)"
+        ),
         "optional_string" => format!("v[\"{fname}\"].as_str().map(|s| s.to_string())"),
         "expr" => format!("crate::shir_nodes::enc::json_to_expr(&v[\"{fname}\"])?"),
         "optional_expr" => format!(

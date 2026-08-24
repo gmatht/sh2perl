@@ -402,6 +402,21 @@ pub fn regexp_find(node: &RegexpFind, ctx: &ExprRenderCtx) -> Option<String> {
     }
 }
 
+// ── CgoCall ──────────────────────────────────────────────────────────
+
+pub fn cgo_call(node: &CgoCall, ctx: &ExprRenderCtx) -> Option<String> {
+    match ctx.backend {
+        // The faithful execution of a cgo-bound call is the NATIVE call
+        // — only the C frontend build can provide it. Perl/JS render a
+        // loud runtime failure, never silence.
+        Backend::Perl => Some(format!(
+            "die \"debashc: cgo-path construct {} requires the C frontend build\\n\";",
+            node.target
+        )),
+        _ => None,
+    }
+}
+
 // ── CutsetTrim ──────────────────────────────────────────────────────
 
 pub fn cutset_trim(node: &CutsetTrim, ctx: &ExprRenderCtx) -> Option<String> {
@@ -528,6 +543,26 @@ pub fn split(node: &Split, ctx: &ExprRenderCtx) -> Option<String> {
         Backend::Rust => Some(format!("{}.split('{}')", text, node.delim)),
         Backend::C => None,
         Backend::Zig => Some(format!("std.mem.splitScalar(u8, {}, '{}')", text, node.delim)),
+        _ => None,
+    }
+}
+
+// ── WordCount ────────────────────────────────────────────────────────
+
+pub fn word_count(node: &WordCount, ctx: &ExprRenderCtx) -> Option<String> {
+    let text = render_text(ctx, &node.text)?;
+    match ctx.backend {
+        Backend::Perl => {
+            Some(format!("scalar(grep {{ length }} split(/\\\\s+/, {}, -1))", text))
+        }
+        Backend::Estree => {
+            Some(format!("({}).split(/\\s+/).filter(w => w).length", text))
+        }
+        Backend::Go => Some(format!("len(strings.Fields({}))", text)),
+        Backend::Rust => Some(format!("{}.split_whitespace().count()", text)),
+        // C: inline transition-count scan — no allocation (the natural
+        // wc -w rendering; a materialised split() is the JS/Perl idiom)
+        Backend::C => Some(format!("_sh_wc_words({})", text)),
         _ => None,
     }
 }

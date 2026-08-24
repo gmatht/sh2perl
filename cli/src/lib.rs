@@ -977,6 +977,20 @@ exit $main_exit_code;
             // process-in/out into temp-file form (core request
             // sh-20260807-130936) — same as the file pipeline's transform.
             debashl::transforms::process_subst::transform_program(&mut prog);
+            // Frontend-emitted A1 carries constructs as opaque exec calls
+            // (let conditions, read, …) — normalise them through the SAME
+            // gated channel the direct path uses (text_ops is opt-in:
+            // DEBASHC_TRANSFORMS must list it, keeping default ingests
+            // byte-stable).
+            // ONLY text-ops here (opt-in): pulling every registered
+            // transform into the ingest path changed constructs that were
+            // already passing (e.g. fish set -l scoping via the runtime).
+            if std::env::var("DEBASHC_TRANSFORMS")
+                .map(|v| v.split(',').any(|s| s.trim() == "text-ops"))
+                .unwrap_or(false)
+            {
+                debashl::transforms::text_ops::normalize_frontend_constructs(&mut prog.stmts);
+            }
             match debashl::shir::shir_to_estree_json(&prog) {
                 Ok(s) => println!("{}", s),
                 Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }

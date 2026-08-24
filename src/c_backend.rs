@@ -178,6 +178,8 @@ pub struct Render {
     heredoc_nl: bool,
     /// emit the _sh_import_env runtime helper (source/eval state pull)
     need_state_import: bool,
+    /// emit the _sh_wc_words word-count helper (WordCount ext node)
+    need_wc_words: bool,
     /// typeset -l / -u vars: every assignment is case-folded
     lower_attrs: Vec<String>,
     upper_attrs: Vec<String>,
@@ -273,6 +275,9 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
     let mut capture_vars = BTreeSet::new();
     collect_capture_vars(&prog.stmts, &mut capture_vars);
+    // in-place split targets are also unbounded: the tokenizer writes
+    // NULs into the var's own storage (a const/bounded decl would break)
+    collect_inplace_split_text_vars(&prog.stmts, &mut capture_vars);
     r.capture_vars = capture_vars;
     r.var_ranges = ranges;
     r.var_widths = widths;
@@ -300,6 +305,69 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         }
     });
     r.out.join("\n")
+}
+
+/// Var names that are the TEXT operand of any Ext(Split{in_place:true}) —
+/// these must NOT be const-lifted (the in-place tokenizer writes NULs into
+/// their storage; a const declaration would segfault).
+fn collect_inplace_split_text_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    fn walk_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+        match e {
+            IrExpr::Ext(n) if n.tag() == "Split" => {
+                if let Some(sp) = n.as_any().downcast_ref::<crate::shir_nodes::Split>() {
+                    if sp.in_place {
+                        if let IrExpr::Var(xv, _) = &sp.text {
+                            out.insert(xv.clone());
+                        }
+                    }
+                }
+            }
+            IrExpr::Call { func, args } => {
+                if func == "split" {
+                    if let Some(IrExpr::Var(xv, _)) = args.first() {
+                        out.insert(xv.clone());
+                    }
+                }
+                for a in args { walk_expr(a, out); }
+            }
+            IrExpr::Array(items) => items.iter().for_each(|x| walk_expr(x, out)),
+            _ => {}
+        }
+    }
+    fn walk_stmt(s: &IrStmt, out: &mut BTreeSet<String>) {
+        match s {
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => walk_expr(e, out),
+            IrStmt::Assign { targets, expr, .. } => {
+                walk_expr(expr, out);
+                for t in targets { for i in &t.indices { walk_expr(i, out); } }
+            }
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                walk_expr(cond, out);
+                for b in then { walk_stmt(b, out); }
+                for (_, b) in elsifs { for s in b { walk_stmt(s, out); } }
+                for s in else_ { walk_stmt(s, out); }
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr(cond, out);
+                for s in body { walk_stmt(s, out); }
+            }
+            IrStmt::For { iter, body, .. } => {
+                walk_expr(iter, out);
+                for s in body { walk_stmt(s, out); }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages { for s in st { walk_stmt(s, out); } }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for s in inner { walk_stmt(s, out); }
+            }
+            IrStmt::Block(body) | IrStmt::Background(body) => {
+                for s in body { walk_stmt(s, out); }
+            }
+            _ => {}
+        }
+    }
+    for s in stmts { walk_stmt(s, out); }
 }
 
 impl Render {
@@ -491,6 +559,18 @@ impl Render {
         self.emit("#include <ctype.h>"); // tolower/... in text transforms
         if self.need_stat {
             self.emit("#include <sys/stat.h>");
+        }
+        if self.need_wc_words {
+            // wc -w: inline word-count scan — no allocation
+            self.emit("static long long _sh_wc_words(const char *s) {");
+            self.emit("  long long count = 0; int in_word = 0;");
+            self.emit("  for (; s && *s; s++) {");
+            self.emit("    if (*s == ' ' || *s == '\\t' || *s == '\\n' || *s == '\\r' || *s == '\\f' || *s == '\\v') in_word = 0;");
+            self.emit("    else { if (!in_word) count++; in_word = 1; }");
+            self.emit("  }");
+            self.emit("  return count;");
+            self.emit("}");
+            self.emit("");
         }
         if self.need_state_import {
             // source/eval state pull: import the child's KEY=VALUE dump
@@ -692,6 +772,7 @@ impl Render {
             self.emit("if (*c == '\\'') { memcpy(p, \"'\\\"'\\\"'\", 5); p += 5; }");
             self.emit("    else *p++ = *c;");
             self.emit("  }");
+            self.emit("  *p++ = '\\''; *p = 0;");
             // pass the CURRENT positionals to the child ("$@" / $1 inside
             // command substitutions and sites must see the enclosing
             // function's parameters â bash subshell semantics)
@@ -1212,6 +1293,26 @@ impl Render {
                     "0".into()
                 }
             },
+            IrExpr::Ext(n) => {
+                // transform-declared nodes: dispatch by tag. WordCount is
+                // the natural C rendering (inline scan, no allocation);
+                // unknown tags refuse loudly (refuse > guess).
+                match n.tag() {
+                    "WordCount" => {
+                        let kids = crate::shir_nodes::ExtExpr::children(&**n);
+                        let t = kids
+                            .first()
+                            .map(|e| self.value_c(e))
+                            .unwrap_or_else(|| "\"\"".into());
+                        self.need_wc_words = true;
+                        format!("_sh_wc_words({t})")
+                    }
+                    other_tag => {
+                        self.mark_todo(&format!("ext node {}", other_tag));
+                        "0".into()
+                    }
+                }
+            }
             other => {
                 self.mark_todo(&format!("expr {:?}", other));
                 "0".into()
@@ -3699,9 +3800,10 @@ impl Render {
                         let id = self.c_ident(name);
                         // `local x=$1` — the core splits `x=` and the
                         // VALUE EXPR into separate word args
-                        let value_expr: Option<&IrExpr> = if val.is_empty() && i + 1 < words.len() {
-                            // the core splits `x=` from its value word
-                            // (`typeset -l lc="HELLO WORLD"` → lc= + Str)
+                        let value_expr: Option<&IrExpr> = if val.is_empty()
+                            && i + 1 < words.len()
+                            && !matches!(words[i + 1], IrExpr::Str(_, _))
+                        {
                             i += 1;
                             Some(words[i])
                         } else {
@@ -7198,7 +7300,7 @@ impl Render {
                     ));
                     let var_name = self.c_ident(var);
                     self.emit(&format!(
-                        "for (size_t _wi_{wn} = 0; _wi_{wn} < _wc_{wn}; _wi_{wn}++) {{"
+                        "for (size_t _wi_{ws} = 0; _wi_{ws} < _wc_{wn}; _wi_{ws}++) {{"
                     ));
                     self.depth += 1;
                     self.emit(&format!("{var_name} = {ws}[_wi_{wn}];"));
@@ -7317,7 +7419,7 @@ impl Render {
                             ));
                             let var_name = self.c_ident(var);
                             self.emit(&format!(
-                                "for (size_t _wi_{wn} = 0; _wi_{wn} < _wc_{wn}; _wi_{wn}++) {{"
+                                "for (size_t _wi_{ws} = 0; _wi_{ws} < _wc_{wn}; _wi_{ws}++) {{"
                             ));
                             self.depth += 1;
                             self.emit(&format!(
@@ -7331,19 +7433,40 @@ impl Render {
                             return;
                         }
                         if func == "split" {
-                            // `for w in $y` — split the value at runtime
+                            // `for w in $y` — split the value at runtime.
+                            // In-place variant: when the liveness pass proved
+                            // $y dead after the loop AND its text is a plain
+                            // mutable store var, tokenize the var's OWN
+                            // buffer — no 64 KB copy (split-in-place pass)
+                            let mut inplace_id: Option<String> = None;
+                            if args.len() >= 1 {
+                                if let IrExpr::Var(x, _) | IrExpr::Ident(x) = &args[0] {
+                                    if self.store.contains(x) || self.var_types.contains_key(x) {
+                                        inplace_id = Some(self.c_ident(x));
+                                    }
+                                }
+                            }
                             let v = self.value_c(&args[0]);
                             self.need_sh = true;
                             let wn = format!("_wn_{}", self.temp_seq);
                             self.temp_seq += 1;
                             let ws = format!("_ws_{}", self.temp_seq);
                             self.temp_seq += 1;
-                            self.emit(&format!(
-                                "char {wn}[65536]; strncpy({wn}, {v}, 65535); {wn}[65535] = 0; char *{ws}[1024]; size_t _wc_{wn} = _sh_split({wn}, {ws}, 1024);"
-                            ));
+                            if let Some(xid) = &inplace_id {
+                                // tokens point INTO x's own buffer; bash's
+                                // copy-on-write semantics preserved by the
+                                // liveness proof (x dead after this loop)
+                                self.emit(&format!(
+                                    "char *{ws}[1024]; size_t _wc_{ws} = _sh_split({xid}, {ws}, 1024);"
+                                ));
+                            } else {
+                                self.emit(&format!(
+                                    "char {wn}[65536]; strncpy({wn}, {v}, 65535); {wn}[65535] = 0; char *{ws}[1024]; size_t _wc_{wn} = _sh_split({wn}, {ws}, 1024);"
+                                ));
+                            }
                             let var_name = self.c_ident(var);
                             self.emit(&format!(
-                                "for (size_t _wi_{wn} = 0; _wi_{wn} < _wc_{wn}; _wi_{wn}++) {{"
+                                "for (size_t _wi_{ws} = 0; _wi_{ws} < _wc_{ws}; _wi_{ws}++) {{"
                             ));
                             self.depth += 1;
                             self.emit(&format!("{var_name} = {ws}[_wi_{wn}];"));
@@ -7354,6 +7477,80 @@ impl Render {
                             self.emit("}");
                             return;
                         }
+                    }
+                }
+                // IN-PLACE SPLIT iterator (`for w in $y` after the
+                // split-inplace pass): tokens point INTO y's own buffer —
+                // no 64 KB copy. Const-LIFTED sources stay on the copy
+                // form (their storage is read-only).
+                enum SplitIter<'a> {
+                    Direct(String),
+                    Copy(&'a IrExpr),
+                    None,
+                }
+                let split_iter: SplitIter = match items.as_slice() {
+                    [IrExpr::Ext(n_ext)] if n_ext.tag() == "Split" => {
+                        match n_ext.as_any().downcast_ref::<crate::shir_nodes::Split>() {
+                            Some(sp) if sp.in_place => match &sp.text {
+                                IrExpr::Var(xv, _) => {
+                                    if self.const_lifted.contains(xv)
+                                        || !(self.store.contains(xv)
+                                            || self.var_types.contains_key(xv))
+                                    {
+                                        SplitIter::Copy(&sp.text)
+                                    } else {
+                                        SplitIter::Direct(self.c_ident(xv))
+                                    }
+                                }
+                                _ => SplitIter::None,
+                            },
+                            _ => SplitIter::None,
+                        }
+                    }
+                    _ => SplitIter::None,
+                };
+                match split_iter {
+                    SplitIter::None => {}
+                    SplitIter::Copy(text_e) => {
+                        let v = self.value_c(text_e);
+                        let wn = format!("_wn_{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        let ws = format!("_ws_{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!(
+                            "char {wn}[65536]; strncpy({wn}, {v}, 65535); {wn}[65535] = 0; char *{ws}[1024]; size_t _wc_{wn} = _sh_split({wn}, {ws}, 1024);"
+                        ));
+                        let var_name = self.c_ident(var);
+                        self.emit(&format!(
+                            "for (size_t _wi_{wn} = 0; _wi_{wn} < _wc_{wn}; _wi_{wn}++) {{"
+                        ));
+                        self.depth += 1;
+                        self.emit(&format!("{var_name} = {ws}[_wi_{wn}];"));
+                        for s in body {
+                            self.stmt(s);
+                        }
+                        self.depth -= 1;
+                        self.emit("}");
+                        return;
+                    }
+                    SplitIter::Direct(xid) => {
+                        let ws = format!("_ws_{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        let var_name = self.c_ident(var);
+                        self.emit(&format!(
+                            "char *{ws}[1024]; size_t _wc_{ws} = _sh_split({xid}, {ws}, 1024);"
+                        ));
+                        self.emit(&format!(
+                            "for (size_t _wi_{ws} = 0; _wi_{ws} < _wc_{ws}; _wi_{ws}++) {{"
+                        ));
+                        self.depth += 1;
+                        self.emit(&format!("{var_name} = {ws}[_wi_{ws}];"));
+                        for s in body {
+                            self.stmt(s);
+                        }
+                        self.depth -= 1;
+                        self.emit("}");
+                        return;
                     }
                 }
                 let n = items.len();
@@ -7924,6 +8121,7 @@ impl Render {
         // collect function definitions at ANY depth (a function may be
         // defined inside a block/loop — the shellbench eval benches do).
         collect_fn_defs(&prog.stmts, &mut self.functions, &mut self.fn_defs);
+        // In-place split targets (`for w in $y` where $y feeds a Split)
         // `typeset -i n` / `declare -i n` — the INTEGER ATTRIBUTE must
         // mark the var Int BEFORE the hoist (the decl renders as
         // `long long n` and later `n=n+1` evaluates arith:
