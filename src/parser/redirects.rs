@@ -61,7 +61,7 @@ pub fn parse_redirect_header(lexer: &mut Lexer) -> Result<Redirect, ParserError>
         Some(Token::HereString) => RedirectOperator::HereString,
         Some(Token::RedirectOutErr) => RedirectOperator::StderrOutput,
         Some(Token::RedirectInErr) => RedirectOperator::StderrInput,
-        Some(Token::RedirectOutClobber) => RedirectOperator::Output, // Use Output as fallback
+        Some(Token::RedirectOutClobber) => RedirectOperator::ClobberOutput,
         Some(Token::RedirectAll) => RedirectOperator::Output,        // Use Output as fallback
         Some(Token::RedirectAllAppend) => RedirectOperator::Append,  // Use Append as fallback
         _ => {

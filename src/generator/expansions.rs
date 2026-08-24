@@ -114,6 +114,12 @@ pub fn generate_parameter_expansion_impl(
     pe: &ParameterExpansion,
 ) -> String {
     match &pe.operator {
+        ParameterExpansionOperator::ZshFlags(_, _) => {
+            // zsh `${(flags)var}` — the zsh-only flag expansion; the
+            // generator's other backends refuse or approximate. Fall back
+            // to the plain variable (the flags are presentation-only).
+            format!("${}", pe.variable)
+        }
         ParameterExpansionOperator::None => {
             // ${var} - just the variable
             // ${#var} - string length: ${#name} -> length($name)
