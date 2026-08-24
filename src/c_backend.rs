@@ -5452,9 +5452,12 @@ impl Render {
                 ));
             } else {
                 self.assoc_arrays.insert(var.to_string());
+                // bash strips subscript QUOTES at parse time — `m["os"]=v`
+                // stores key `os` (the raw shIR text keeps them)
+                let kc = k.trim().trim_matches(|c| c == '"' || c == '\'');
                 self.emit(&format!(
                     "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {}, {v});",
-                    Self::cstr(k)
+                    Self::cstr(kc)
                 ));
             }
         } else {
@@ -5496,7 +5499,14 @@ impl Render {
             // flat pairs: k1, v1, k2, v2 ...
             let mut i = 0;
             while i + 1 < items.len() {
-                let k = self.value_c(&items[i]);
+                // strip subscript quotes from literal string keys
+                // (`m["os"]=v` stores key `os`)
+                let k = match &items[i] {
+                    IrExpr::Str(ks, _) => {
+                        Self::cstr(ks.trim().trim_matches(|c| c == '"' || c == '\''))
+                    }
+                    other => self.value_c(other),
+                };
                 let v = self.value_c(&items[i + 1]);
                 self.emit(&format!(
                     "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {k}, {v});"
@@ -5654,6 +5664,18 @@ impl Render {
         } else if looks_like_arith(key) {
             // `${arr[(2*$i)-1]}` — an arithmetic index expression
             self.arith_text_expr(key)
+        } else if is_ident(key.trim())
+            && (self.store.contains(key.trim()) || self.var_types.contains_key(key.trim()))
+        {
+            // `${args[i]}` — bash arithmetic subscripts allow BARE var
+            // names: a bare identifier naming a program var reads its
+            // value (atoll("i") would be a constant 0)
+            let t = key.trim();
+            if self.is_num(t) {
+                format!("(long long)({})", self.c_ident(t))
+            } else {
+                format!("(long long)atoll({})", self.store_read(t))
+            }
         } else {
             format!("(long long)atoll({})", Self::cstr(key))
         };
