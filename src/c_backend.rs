@@ -1950,6 +1950,15 @@ impl Render {
                                 )),
                             }
                         }
+                        Some(n) if n == "@" || n == "*" => {
+                            // "$@" / "$*" — the JOINED positional value,
+                            // evaluated at site-build time while _sh_argv
+                            // is live (an env export of "@" is always
+                            // empty: generator-system-echo-checkqx)
+                            let t = self.str_temp(65536);
+                            self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+                            word(self, t);
+                        }
                         Some(n) => {
                             let v = if self.is_num(n) {
                                 let t = self.num_temp(&self.c_ident(n));
@@ -2143,6 +2152,37 @@ impl Render {
                             }
                             IrExpr::Call { func, args } if func == "getVar" => {
                                 let n = Self::str_arg(args, 0).unwrap_or_default();
+                                if n == "@" || n == "*" {
+                                    // "$@" — the JOINED positional value at
+                                    // site-build time (an env export of "@"
+                                    // is always empty)
+                                    let t = self.str_temp(65536);
+                                    self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+                                    // mid-word: GLUE the runtime value in
+                                    // as a double-quoted piece (`"hello $@"`
+                                    // is ONE word — a word separator would
+                                    // double the space)
+                                    match buf {
+                                        CmdBuf::Shared => {
+                                            self.emit("_sh_add(\"\\\"\");");
+                                            self.emit(&format!("_sh_add({t});"));
+                                            self.emit("_sh_add(\"\\\"\");");
+                                        }
+                                        CmdBuf::Private(id) => {
+                                            self.emit(&format!(
+                                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"\\\"\");"
+                                            ));
+                                            self.emit(&format!(
+                                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {t});"
+                                            ));
+                                            self.emit(&format!(
+                                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"\\\"\");"
+                                            ));
+                                        }
+                                    }
+                                    first_seg = false;
+                                    return;
+                                }
                                 let v = if n == "?" {
                                     self.num_temp("_sh_rc")
                                 } else if self.is_num(&n) {
