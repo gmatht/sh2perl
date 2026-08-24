@@ -178,6 +178,9 @@ pub struct Render {
     heredoc_nl: bool,
     /// emit the _sh_import_env runtime helper (source/eval state pull)
     need_state_import: bool,
+    /// typeset -l / -u vars: every assignment is case-folded
+    lower_attrs: Vec<String>,
+    upper_attrs: Vec<String>,
     /// vars assigned as SHELL TEXT in the current command buffer — the
     /// child bash owns their value for this site; re-exporting the stale
     /// C var inside the same buffer would clobber it (091_while_pipe_var:
@@ -1720,7 +1723,6 @@ impl Render {
                     if name == "@" || name == "*" {
                         let t = self.str_temp(4096);
                         self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_1"); }
                         return t;
                     }
                     if name.chars().all(|c| c.is_ascii_digit()) {
@@ -2005,7 +2007,6 @@ impl Render {
                             word(self, t);
                         }
                         Some("@") | Some("*") => {
-                            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("SH_WORD @ reached"); }
                             // "$@" in word position: EACH positional is its
                             // OWN shell word ('id -u' as one joined word
                             // made bash fail command-not-found)
@@ -2237,7 +2238,6 @@ impl Render {
                                     // is always empty)
                                     let t = self.str_temp(65536);
                                     self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_2"); }
                                     // mid-word: GLUE the runtime value in
                                     // as a double-quoted piece (`"hello $@"`
                                     // is ONE word — a word separator would
@@ -3622,22 +3622,46 @@ impl Render {
                         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                     {
                         self.store.insert(name.to_string());
+                        // typeset -l/-u: fold a literal value's case
+                        let val = &self.apply_case_attr(name, val);
                         let id = self.c_ident(name);
                         // `local x=$1` — the core splits `x=` and the
                         // VALUE EXPR into separate word args
-                        let value_expr: Option<&IrExpr> = if val.is_empty()
-                            && i + 1 < words.len()
-                            && !matches!(words[i + 1], IrExpr::Str(_, _))
-                        {
+                        let value_expr: Option<&IrExpr> = if val.is_empty() && i + 1 < words.len() {
+                            // the core splits `x=` from its value word
+                            // (`typeset -l lc="HELLO WORLD"` → lc= + Str)
                             i += 1;
                             Some(words[i])
                         } else {
                             None
                         };
-                        if let Some(e) = value_expr {
-                            let v = self.value_c(e);
+                        if let Some(orig_e) = value_expr {
+                            // typeset -l/-u: fold a literal value's case
+                            let e: IrExpr = match orig_e {
+                                IrExpr::Str(s, _) => IrExpr::Str(
+                                    self.apply_case_attr(name, s),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                ),
+                                IrExpr::Interpolate(parts)
+                                    if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+                                {
+                                    let text: String = parts
+                                        .iter()
+                                        .filter_map(|p| match p {
+                                            InterpPart::Lit(l) => Some(l.clone()),
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    IrExpr::Str(
+                                        self.apply_case_attr(name, &text),
+                                        crate::ir::StrStyle::DoubleQuoted,
+                                    )
+                                }
+                                other => other.clone(),
+                            };
+                            let v = self.value_c(&e);
                             if self.is_num(name) {
-                                let n = self.expr_as_num(e);
+                                let n = self.expr_as_num(&e);
                                 self.emit(&format!("{id} = {n};"));
                             } else if let Some(b) = self.buf_bound(name) {
                                 self.emit_guarded_copy(&id, b, &v);
@@ -3659,15 +3683,27 @@ impl Render {
                                 self.emit(&format!("{id} = {v};"));
                             }
                         } else if let Some(b) = self.buf_bound(name) {
-                            let v = Self::cstr(val);
+                            let v = Self::cstr(&self.apply_case_attr(name, val));
                             self.emit_guarded_copy(&id, b, &v);
                         } else {
-                            self.emit(&format!("{id} = {};", Self::cstr(val)));
+                            let v = self.apply_case_attr(name, val);
+                            self.emit(&format!("{id} = {};", Self::cstr(&v)));
                         }
                     }
                 }
             }
             i += 1;
+        }
+    }
+
+    /// typeset -l/-u: fold a LITERAL assignment's case at render time
+    fn apply_case_attr(&self, name: &str, val: &str) -> String {
+        if self.lower_attrs.iter().any(|v| v == name) {
+            val.to_lowercase()
+        } else if self.upper_attrs.iter().any(|v| v == name) {
+            val.to_uppercase()
+        } else {
+            val.to_string()
         }
     }
 
@@ -4920,7 +4956,6 @@ impl Render {
             self.need_sh = true;
             let t = self.str_temp(4096);
             self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_3"); }
             t
         } else if self.var_types.contains_key(&name) && self.is_num(&name) {
             self.num_temp(&self.c_ident(&name))
@@ -5174,7 +5209,6 @@ impl Render {
                     self.need_sh = true;
                     let t = self.str_temp(4096);
                     self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_4"); }
                     return t;
                 }
                 if name.chars().all(|c| c.is_ascii_digit()) {
@@ -5944,7 +5978,6 @@ impl Render {
             self.need_sh = true;
             let t = self.str_temp(4096);
             self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_5"); }
             return t;
         }
         self.arrays.insert(var.to_string());
@@ -6031,7 +6064,6 @@ impl Render {
                             self.need_sh = true;
                             let t = self.str_temp(4096);
                             self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_6"); }
                             return vec![Part::Arg(t, NumSpec::Str)];
                         }
                         if name.chars().all(|c| c.is_ascii_digit()) {
@@ -6711,6 +6743,64 @@ impl Render {
                         return;
                     }
                 }
+                // typeset -i: an Int-typed target whose RHS is BASH ARITH
+                // TEXT (`n=n+1` arrives as Str("n+1")) evaluates natively;
+                // a non-numeric string coerces to 0 (bash integer attr)
+                if self.is_num(&t.var) {
+                    let txt: Option<String> = match expr {
+                        IrExpr::Str(s, _) => Some(s.clone()),
+                        IrExpr::Interpolate(parts) => {
+                            let mut all_lit = String::new();
+                            let mut ok = true;
+                            for p in parts {
+                                match p {
+                                    InterpPart::Lit(l) => all_lit.push_str(l),
+                                    InterpPart::Expr(_) => { ok = false; break; }
+                                }
+                            }
+                            if ok { Some(all_lit) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some(txt) = txt {
+                        if !txt.contains('$') {
+                            if let Some(ast) = crate::shir::parse_arith(&txt) {
+                                let v = self.arith_sequenced(&ast);
+                                let idn = self.c_ident(&t.var);
+                                self.emit(&format!("{idn} = {v};"));
+                                self.need_sh = true;
+                                self.emit(&format!("_sh_rc = (({idn}) != 0) ? 0 : 1;"));
+                                return;
+                            }
+                            self.emit(&format!("{} = 0;", self.c_ident(&t.var)));
+                            self.emit("_sh_rc = 1;");
+                            return;
+                        }
+                    }
+                }
+                // typeset -l/-u: fold LITERAL assignments' case at
+                // render time (typeset-cmdsub lc/uc)
+                let case_folded;
+                let expr = match expr {
+                    IrExpr::Str(s, _) => {
+                        case_folded = self.apply_case_attr(&t.var, s);
+                        &IrExpr::Str(case_folded, crate::ir::StrStyle::DoubleQuoted)
+                    }
+                    IrExpr::Interpolate(parts)
+                        if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) =>
+                    {
+                        let text: String = parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                InterpPart::Lit(l) => Some(l.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        case_folded = self.apply_case_attr(&t.var, &text);
+                        &IrExpr::Str(case_folded, crate::ir::StrStyle::DoubleQuoted)
+                    }
+                    other => other,
+                };
                 let name = self.c_ident(&t.var);
                 if let Some(b) = self.buf_bound(&t.var) {
                     // a bounded string var: the debug-only length assert
@@ -6730,6 +6820,19 @@ impl Render {
                 }
                 let is_num = self.is_num(&t.var);
                 let rhs = if is_num {
+                    if let IrExpr::Str(sv, _) = expr {
+                        // `n=n+1` under typeset -i: the core keeps the
+                        // BASH TEXT (bare-ident arithmetic) — evaluate it
+                        // natively instead of storing the literal string
+                        if sv.parse::<i64>().is_err() {
+                            if let Some(ast) = crate::shir::parse_arith(sv) {
+                                let v = self.arith_sequenced(&ast);
+                                let t2 = self.num_temp(&v);
+                                self.emit(&format!("{name} = {t2};"));
+                                return;
+                            }
+                        }
+                    }
                     if let IrExpr::Call { func, .. } = expr {
                         if func == "arith" {
                             // `n=$(( dyn ))` — the arith VALUE (the
@@ -6993,7 +7096,6 @@ impl Render {
                                 // bash runs the body exactly once
                                 let t = self.str_temp(4096);
                                 self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
-            if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("JOIN_SITE_7"); }
                                 self.emit(&format!("{var_name} = {t};"));
                                 self.emit("{");
                                 self.depth += 1;
@@ -7693,6 +7795,22 @@ impl Render {
         // collect function definitions at ANY depth (a function may be
         // defined inside a block/loop — the shellbench eval benches do).
         collect_fn_defs(&prog.stmts, &mut self.functions, &mut self.fn_defs);
+        // `typeset -i n` / `declare -i n` — the INTEGER ATTRIBUTE must
+        // mark the var Int BEFORE the hoist (the decl renders as
+        // `long long n` and later `n=n+1` evaluates arith:
+        // typeset-cmdsub printed the raw text 'n+1')
+        {
+            let mut ints: Vec<String> = Vec::new();
+            collect_int_attr_vars(&prog.stmts, &mut ints);
+            for n in ints {
+                self.var_types.insert(n, IrType::Int);
+            }
+            let mut lowers: Vec<String> = Vec::new();
+            let mut uppers: Vec<String> = Vec::new();
+            collect_case_attr_vars(&prog.stmts, &mut lowers, &mut uppers);
+            self.lower_attrs = lowers;
+            self.upper_attrs = uppers;
+        }
         // vars that appear ONLY inside function bodies (var_types covers
         // them too, but they must NOT be hoisted into main — the
         // function declares its own copy).
@@ -8077,6 +8195,123 @@ fn collect_fn_defs(
             | IrStmt::Block(body)
             | IrStmt::Subshell(body)
             | IrStmt::Background(body) => collect_fn_defs(body, names, defs),
+            _ => {}
+        }
+    }
+}
+
+/// Names given the INTEGER attribute (`typeset -i n` / `declare -i`) —
+/// collected at any depth so the hoist declares them numeric.
+
+/// Names given the CASE attributes (`typeset -l x` lowercases every
+/// assignment; `-u` uppercases) — applied to literal Str assigns.
+fn collect_case_attr_vars(stmts: &[IrStmt], lower: &mut Vec<String>, upper: &mut Vec<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if (func == "exec" || func == "builtin")
+                    && matches!(
+                        args.first(),
+                        Some(IrExpr::Str(c, _))
+                            if c == "typeset" || c == "declare" || c == "local"
+                    ) =>
+            {
+                let mut attr = ' ';
+                let mut words: Vec<&IrExpr> = Vec::new();
+                for a in args.iter().skip(1) {
+                    match a {
+                        IrExpr::Array(items) => words.extend(items.iter()),
+                        other => words.push(other),
+                    }
+                }
+                for w in words {
+                    if let IrExpr::Str(ws, _) = w {
+                        if ws == "-l" { attr = 'l'; }
+                        else if ws == "-u" { attr = 'u'; }
+                        else if ws.starts_with('-') && !ws.contains('=') { continue; }
+                        else if let Some((n, _)) = ws.split_once('=') {
+                            push_attr(n, attr, lower, upper);
+                            attr = ' ';
+                        } else if is_ident(ws) {
+                            push_attr(ws, attr, lower, upper);
+                            attr = ' ';
+                        }
+                    }
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_case_attr_vars(then, lower, upper);
+                for (_, b) in elsifs { collect_case_attr_vars(b, lower, upper); }
+                collect_case_attr_vars(else_, lower, upper);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::For { body, .. } => collect_case_attr_vars(body, lower, upper),
+            IrStmt::Function { body, .. } => collect_case_attr_vars(body, lower, upper),
+            _ => {}
+        }
+    }
+}
+
+fn push_attr(n: &str, attr: char, lower: &mut Vec<String>, upper: &mut Vec<String>) {
+    if !is_ident(n) || attr == ' ' { return; }
+    let v = n.to_string();
+    if attr == 'l' { if !lower.contains(&v) { lower.push(v); } }
+    else if attr == 'u' { if !upper.contains(&v) { upper.push(v); } }
+}
+
+fn collect_int_attr_vars(stmts: &[IrStmt], out: &mut Vec<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if (func == "exec" || func == "builtin")
+                    && matches!(
+                        args.first(),
+                        Some(IrExpr::Str(c, _))
+                            if c == "typeset" || c == "declare" || c == "local"
+                    ) =>
+            {
+                let mut int_attr = false;
+                let mut words: Vec<&IrExpr> = Vec::new();
+                for a in args.iter().skip(1) {
+                    match a {
+                        IrExpr::Array(items) => words.extend(items.iter()),
+                        other => words.push(other),
+                    }
+                }
+                for w in words {
+                    if let IrExpr::Str(ws, _) = w {
+                        if ws == "-i" {
+                            int_attr = true;
+                        } else if ws.starts_with('-') && !ws.contains('=') {
+                            continue;
+                        } else if let Some((n, _)) = ws.split_once('=') {
+                            if int_attr && is_ident(n) {
+                                out.push(n.to_string());
+                            }
+                        } else if int_attr && is_ident(ws) {
+                            out.push(ws.to_string());
+                        }
+                    }
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_int_attr_vars(then, out);
+                for (_, b) in elsifs {
+                    collect_int_attr_vars(b, out);
+                }
+                collect_int_attr_vars(else_, out);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body)
+            | IrStmt::For { body, .. } => collect_int_attr_vars(body, out),
+            IrStmt::Function { body, .. } => collect_int_attr_vars(body, out),
             _ => {}
         }
     }
