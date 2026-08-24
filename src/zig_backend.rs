@@ -144,11 +144,25 @@ pub fn shir_to_zig(prog: &IrProgram) -> String {
     // builtin-op fallback arm (shir-builtin-op-20260816): the zig backend
     // has NOT accepted the `builtin` op — render as exec.
     crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
-    // A2: the type verdicts are computed at serialization time in the JSON
-    // path; the library path must run the same analysis.
-    prog.var_types = crate::shir::analyze_var_types(&prog);
+    // A2: the type verdicts — the FRONTEND's own var_types (the C
+    // frontend emits Int32/Int64 for typed decls) take precedence;
+    // analyze_var_types fills in names the frontend left untyped. A
+    // blind overwrite DOWNGRADED typed vars to untyped (empty map for
+    // frontend-only programs), leaving string homes with i64-typed
+    // reads/writes that did not compile.
+    let provided: std::collections::HashSet<String> =
+        prog.var_types.iter().map(|(n, _)| n.clone()).collect();
+    let analyzed = crate::shir::analyze_var_types(&prog);
+    for (n, t) in analyzed {
+        if !provided.contains(&n) {
+            prog.var_types.push((n, t));
+        }
+    }
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
+    if std::env::var("ZIG_DBG").is_ok() {
+        eprintln!("DBG var_types: {:?}", r.var_types);
+    }
     r.program(&prog);
     r.out.join("\n")
 }
@@ -815,6 +829,9 @@ impl Render {
                 ('s', self.expr_str(e))
             }
             IrExpr::Var(name, _) => {
+                // mark the read so the dead-var guard never discards a
+                // variable that is used in printf output
+                self.mark_read(name);
                 if self.is_num(name) {
                     ('d', self.expr_num(e))
                 } else {
@@ -822,6 +839,7 @@ impl Render {
                 }
             }
             IrExpr::Ident(name) => {
+                self.mark_read(name);
                 if self.is_num(name) {
                     ('d', self.expr_num(e))
                 } else {
@@ -850,6 +868,7 @@ impl Render {
             // A2 verdict so numeric vars keep the {d} specifier.
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
+                    self.mark_read(name);
                     if self.is_num(name) {
                         return ('d', self.expr_num(e));
                     }
