@@ -54,7 +54,7 @@ pub mod restructure;
 // split_inplace: registered-but-PARKED in transforms.rs pending the
 // c worker's embed/Carp interaction fix; declaration kept so the tree
 // compiles either way.
-pub mod split_inplace;
+pub mod split_inplace; // destructive buffer reuse for for-in-split iteration
 pub mod strip;
 pub mod transform;
 
