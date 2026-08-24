@@ -745,6 +745,23 @@ pub fn parse_shir_json_to_estree(filename: &str) {
     }
 }
 
+/// Ingest a ShIR JSON file and emit idiomatic JS source via the
+/// worktree-local js backend renderer (src/js_backend.rs). Closes the
+/// frontend → shIR → JS path; the js backend is a scaffold renderer
+/// (sh2.* stubs for anything outside the lowable subset).
+pub fn parse_shir_json_to_js(filename: &str) {
+    let content = match std::fs::read_to_string(filename) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("read {}: {}", filename, e); return; }
+    };
+    let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+    };
+    let js = debashl::js_backend::shir_to_js(&prog);
+    print!("{}", js);
+}
+
 pub fn interactive_mode() {
     println!("Interactive mode - type 'quit' to exit");
     println!("{}", "=".repeat(50));
