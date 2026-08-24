@@ -505,7 +505,7 @@ impl Render {
         self.emit("#include <stdlib.h>");
         self.emit("#include <string.h>");
         self.emit("#include <sys/wait.h>");
-        self.emit("#include <unistd.h>"); // chdir/access/getcwd
+        self.emit("#include <unistd.h>"); // chdir/access/getcwd/gethostname
         self.emit("#include <ctype.h>"); // tolower/... in text transforms
         if self.need_stat {
             self.emit("#include <sys/stat.h>");
@@ -8919,7 +8919,14 @@ impl Render {
             self.emit("  _sh_argv = _mav; _sh_argc = _mac;");
             // bash seeds HOSTNAME itself — the gate env may not carry it
             // (064_21: ${HOSTNAME:-localhost} took the default)
-            self.emit("  if (!getenv(\"HOSTNAME\")) { static char _hn[256]; if (gethostname(_hn, sizeof _hn) == 0) setenv(\"HOSTNAME\", _hn, 0); }");
+            // extern decl inline: the runtime trimmer may drop
+            // <unistd.h> when nothing else needs it
+            self.emit("  if (!getenv(\"HOSTNAME\")) { extern int gethostname(char *, size_t); static char _hn[256]; if (gethostname(_hn, sizeof _hn) == 0) setenv(\"HOSTNAME\", _hn, 0); }");
+            // bash also seeds BASH_VERSION — a script probing
+            // `${BASH_VERSION-}` asks "am I bash?" and the transpiled
+            // program preserves bash semantics, so the answer is yes.
+            // ZSH_VERSION stays UNSET (we are not zsh).
+            self.emit("  setenv(\"BASH_VERSION\", \"5.2.15(1)-release\", 0);");
         }
         // Only REAL shell-out sites (bash -c subprocesses) need the
         // preamble: their children share fd 1 — unbuffered stdout keeps
