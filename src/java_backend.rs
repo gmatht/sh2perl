@@ -238,7 +238,7 @@ impl JavaRender {
         }
         // assemble: header fields discovered during rendering
         let mut header = String::from("    static long __SH_RC = 0;\n    static String __SH_T = \"\";\n    static boolean __SH_NOCASE = false;
-    static String __SH_CWD = System.getProperty(\"user.dir\");\n    static List<String> __SH_ARGV = new ArrayList<>();\n    static Scanner __SH_IN = new Scanner(System.in);\n");
+    static String __SH_CWD = System.getProperty(\"user.dir\");\n    static LinkedHashMap<String, String> __SH_EXPORTS = new LinkedHashMap<>();\n    static List<String> __SH_ARGV = new ArrayList<>();\n    static Scanner __SH_IN = new Scanner(System.in);\n");
         for f in &self.fields {
             header.push_str(&format!("    static String __v_{f} = \"\";\n"));
         }
@@ -692,17 +692,10 @@ impl JavaRender {
     fn stage_expr(&mut self, stage: &[IrStmt]) -> Result<String, String> {
         self.helper("quote");
         match stage {
-            [IrStmt::Expr(IrExpr::Call { args, .. })]
-                if matches!(args.first().and_then(|a| str_arg(std::slice::from_ref(a), 0)), Some("exec") | Some("builtin") | Some("test"))
-                    || matches!(args.first(), Some(IrExpr::Str(s, _)) if matches!(s.as_str(), "exec"|"builtin"|"test")) =>
+            [IrStmt::Expr(IrExpr::Call { func, args, .. })]
+                if func == "exec" || func == "builtin" || func == "test" =>
             {
-                // args may be [cmd-name, words...] OR [words...] with the
-                // call form carrying the name — normalize:
-                if matches!(args.first(), Some(IrExpr::Str(s, _)) if matches!(s.as_str(), "exec"|"builtin"|"test")) {
-                    self.cmd_line_expr(&args[1.min(args.len())..])
-                } else {
-                    self.cmd_line_expr(args)
-                }
+                self.cmd_line_expr(args)
             }
             other => Err(format!("pipeline stage not representable as process text: {other:?}")),
         }
@@ -782,10 +775,20 @@ impl JavaRender {
             }
             IrExpr::Call { func, .. } if func == "continue" => { self.emit("continue;"); Ok(()) }
             IrExpr::Call { func, .. } if func == "break" => { self.emit("break;"); Ok(()) }
-            IrExpr::BinOp { op: BinOpKind::And | BinOpKind::Or, .. } => {
-                let c = self.cond_bool(e)?;
-                self.emit(&format!("{{ boolean __b = {c}; }}"));
-                Ok(())
+            IrExpr::BinOp { ref op, lhs, rhs, .. }
+                if matches!(*op, BinOpKind::And | BinOpKind::Or) =>
+            {
+                // statement-position command chain: stdout passes through
+                let sep = if matches!(*op, BinOpKind::And) { " && " } else { " || " };
+                if let IrExpr::BinOp { lhs, rhs, .. } = e {
+                    let l = self.side_text(lhs)?;
+                    let r = self.side_text(rhs)?;
+                    self.helper("quote");
+                    self.helper("run");
+                    self.emit(&format!("__SH_RC = shRun({l} + \"{sep}\" + {r});"));
+                    return Ok(());
+                }
+                unreachable!()
             }
             other => {
                 // an expression evaluated for side effects; pure literals are
@@ -923,11 +926,12 @@ impl JavaRender {
                         if let Some(eq) = s.find('=') {
                             let (n, v) = (&s[..eq], &s[eq + 1..]);
                             self.ensure_field(n);
-                            self.emit(&format!("__v_{} = {};", sanitize(n), jstr(v)));
+                            self.emit(&format!("__v_{} = {}; __SH_EXPORTS.put(\"{}\", __v_{});", sanitize(n), jstr(v), n, sanitize(n)));
                         } else {
+                            // bare `export NAME` marks the CURRENT value for
+                            // child processes — never re-read from env
                             self.ensure_field(s);
-                            self.helper("env");
-                            self.emit(&format!("__v_{} = shEnv({});", sanitize(s), jstr(s)));
+                            self.emit(&format!("__SH_EXPORTS.put(\"{}\", __v_{});", s, sanitize(s)));
                         }
                     }
                 }
@@ -2490,6 +2494,7 @@ fn helper_src(name: &str) -> Option<&'static str> {
         try {
             ProcessBuilder pb = new ProcessBuilder("bash", "-c", cmdline);
             pb.directory(new File(shCwd()));
+            pb.environment().putAll(__SH_EXPORTS);
             pb.redirectErrorStream(false);
             pb.inheritIO();
             Process p = pb.start();
@@ -2510,6 +2515,7 @@ fn helper_src(name: &str) -> Option<&'static str> {
         try {
             ProcessBuilder pb = new ProcessBuilder("bash", "-c", cmdline);
             pb.directory(new File(shCwd()));
+            pb.environment().putAll(__SH_EXPORTS);
             pb.redirectErrorStream(false);
             Process p = pb.start();
             byte[] out = p.getInputStream().readAllBytes();
@@ -2558,16 +2564,32 @@ fn helper_src(name: &str) -> Option<&'static str> {
                 if (c == '%' && i + 1 < f.length()) {
                     char n = f.charAt(++i);
                     if (n == '%') { sb.append('%'); continue; }
-                    String arg = ai < args.length ? args[ai++] : "";
+                    // flags + width: [-0-9]* before the conversion char
+                    int wstart = i;
+                    while (i + 1 < f.length() && (f.charAt(i) == '-' || Character.isDigit(f.charAt(i)))) i++;
+                    String fw = f.substring(wstart, i);
+                    n = f.charAt(i);
+                    boolean leftJust = fw.contains("-");
+                    int width = 0;
+                    try { String dg = fw.replace("-", ""); if (!dg.isEmpty()) width = Integer.parseInt(dg); }
+                    catch (Exception e2) { width = 0; }
+                    String arg = ai < args.length ? args[ai] : "";
                     used++;
                     if (n == 'd' || n == 'i') {
                         try { sb.append(Long.parseLong(arg.trim())); } catch (Exception e) { sb.append("0"); }
                     } else if (n == 's') {
-                        sb.append(arg);
+                        StringBuilder padded = new StringBuilder(arg);
+                        while (padded.length() < width) {
+                            if (leftJust) padded.append(' '); else padded.insert(0, ' ');
+                        }
+                        sb.append(padded);
+                        if (ai < args.length) ai++;
                     } else if (n == 'b') {
                         sb.append(arg.replace("\\n", "\n").replace("\\t", "\t"));
+                        if (ai < args.length) ai++;
                     } else {
                         sb.append(arg);
+                        if (ai < args.length) ai++;
                     }
                 } else sb.append(c);
             }
