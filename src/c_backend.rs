@@ -9487,6 +9487,19 @@ fn is_printf_v_call(args: &[IrExpr]) -> bool {
         )
 }
 
+pub struct Self3;
+impl Self3 {
+    fn str_is(args: &[IrExpr], i: usize, want: &str) -> bool {
+        matches!(args.get(i), Some(IrExpr::Str(s, _)) if s == want)
+    }
+    fn str_arg(w: &IrExpr) -> Option<String> {
+        match w {
+            IrExpr::Str(s, _) => Some(s.clone()),
+            _ => None,
+        }
+    }
+}
+
 fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
@@ -9505,6 +9518,38 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 if let Some(IrExpr::Array(items)) = args.get(1) {
                     if let Some(IrExpr::Str(n, _)) = items.get(1) {
                         out.insert(n.clone());
+                    }
+                }
+            }
+            // `unset NAME` MUTATES the variable (a subshell must save and
+            // restore it or the unset leaks to the parent)
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if (func == "exec" || func == "builtin")
+                    && Self3::str_is(args, 0, "unset") =>
+            {
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for w in items {
+                        if let Some(n) = Self3::str_arg(w) {
+                            let base = n.split('[').next().unwrap_or(&n);
+                            if is_ident(base) && !base.is_empty() {
+                                out.insert(base.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            // `read NAME` assigns too
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if (func == "exec" || func == "builtin")
+                    && Self3::str_is(args, 0, "read") =>
+            {
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for w in items {
+                        if let Some(n) = Self3::str_arg(w) {
+                            if !n.starts_with('-') && is_ident(&n) {
+                                out.insert(n);
+                            }
+                        }
                     }
                 }
             }
