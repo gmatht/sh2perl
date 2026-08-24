@@ -25,6 +25,8 @@ struct JavaCtx {
     loop_depth: usize,
     block_labels: Vec<String>,
     block_seq: usize,
+    /// shell function names defined at top level (call-site wiring)
+    funcs: Vec<String>,
     /// a case clause used a glob pattern → sh2Glob helper needed
     need_glob: bool,
     /// inside a hoisted user-function body: getVar("N") reads the
@@ -121,6 +123,27 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
     out.push_str("    public static void main(String[] args) throws Exception {\n");
     // source-mapping comments: ` // line N` (the shIR convention)
     let mut ctx = JavaCtx::default();
+    fn collect_fn_names(stmts: &[IrStmt], out: &mut Vec<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Function { name, body, .. } => {
+                    out.push(name.clone());
+                    collect_fn_names(body, out);
+                }
+                IrStmt::Block(b)
+                | IrStmt::Subshell(b)
+                | IrStmt::If { then: b, .. }
+                | IrStmt::While { body: b, .. }
+                | IrStmt::DoWhile { body: b, .. } => collect_fn_names(b, out),
+                IrStmt::If { elsifs, else_, .. } => {
+                    for (_, eb) in elsifs { collect_fn_names(eb, out); }
+                    collect_fn_names(else_, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    collect_fn_names(&prog.stmts, &mut ctx.funcs);
     for (idx, st) in prog.stmts.iter().enumerate() {
         let before = out.len();
         ctx.stmt_to_java(st, 2, &mut out)?;
@@ -293,6 +316,34 @@ fn is_plain_name(s: &str) -> bool {
 
 impl JavaCtx {
     fn stmt_to_java(&mut self, st: &IrStmt, d: usize, out: &mut String) -> Result<(), String> {
+        // user-function CALL site: exec("f", args) where f is a defined
+        // shell function → set positional params, invoke (the body's own
+        // echo/printf writes go to stdout during the call, exactly like
+        // bash command execution; the return value is discarded).
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = st {
+            if func == "exec" || func == "builtin" {
+                if let [IrExpr::Str(cmd, _), IrExpr::Array(items)] = args.as_slice() {
+                    if self.funcs.iter().any(|f| f == cmd) && java_ident(cmd) != "main" {
+                        let mut cargs: Vec<String> = Vec::new();
+                        for w in items {
+                            cargs.push(word_to_java(w)?);
+                        }
+                        indent(out, d);
+                        if cargs.is_empty() {
+                            out.push_str("__sh_setArgs();
+");
+                        } else {
+                            out.push_str(&format!("__sh_setArgs({});
+", cargs.join(", ")));
+                        }
+                        indent(out, d);
+                        out.push_str(&format!("{}(__sh_fArgs);
+", java_ident(cmd)));
+                        return Ok(());
+                    }
+                }
+            }
+        }
         match st {
             IrStmt::Expr(e) => expr_stmt_to_java(e, d, out),
             IrStmt::Assign { targets, expr, asm, .. } => {
