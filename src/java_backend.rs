@@ -1899,6 +1899,12 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
             out.push_str(&format!("({cc} ? {bt} : {bf})"));
             Ok(())
         }
+        IrExpr::Call { func, .. } if func == "break" || func == "continue" => {
+            // the goto/loop-control signal verbs: java break/continue
+            out.push_str(func);
+            out.push_str(";\n");
+            return Ok(());
+        }
         other => Err(format!("expr not in the v1 Java subset: {other:?}")),
     }
 }
