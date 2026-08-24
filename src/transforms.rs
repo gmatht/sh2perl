@@ -43,6 +43,7 @@ pub mod for_recovery; // counter-while → native For recovery
 pub mod function_purity; // function-level side-effect classes by call-graph fixpoint
 pub mod i32_provable; // PROVABLY-32-bit arith annotations
 
+
 pub fn all() -> Vec<(&'static str, TransformFn)> {
     vec![
         ("shir-pipeline-native", shir_pipeline_native::transform),

@@ -384,6 +384,16 @@ fn erase(st: &mut IrStmt) -> bool {
             }
             changed
         }
+        IrStmt::Pipeline { stages, .. } => {
+            // pipeline stages are stmt lists — erase inside them too,
+            // or captures of `a | b` keep `builtin` calls the renderer
+            // cannot match (008_simple_backup backtick pipelines)
+            let mut changed = false;
+            for stage in stages.iter_mut() {
+                changed |= erase_stmts(stage);
+            }
+            changed
+        }
         IrStmt::If {
             cond,
             then,

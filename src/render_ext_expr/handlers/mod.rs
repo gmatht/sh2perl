@@ -3,12 +3,14 @@
     pub(crate) mod array_len;
     pub(crate) mod string_trim;
     pub(crate) mod path_name;
+    pub(crate) mod regexp_find;
     pub(crate) mod str_len;
     pub(crate) mod affix_strip;
     pub(crate) mod case_transform;
     pub(crate) mod repeat_str;
     pub(crate) mod field_extract;
     pub(crate) mod char_translate;
+    pub(crate) mod word_count;
     pub(crate) mod reg_count;
     pub(crate) mod string_contains;
     pub(crate) mod cutset_trim;
@@ -17,6 +19,7 @@
     pub(crate) mod reg_sub;
     pub(crate) mod string_affix;
     pub(crate) mod char_extract;
+    pub(crate) mod cgo_call;
     pub(crate) mod field_read;
     pub(crate) mod split;
 

@@ -684,6 +684,27 @@ pub fn parse_shir_json_to_perl(filename: &str) {
     print!("{}", perl);
 }
 
+/// Read a ShIR JSON file and render the rust backend (shir_to_rust).
+/// Mirrors parse_shir_json_to_perl — the rust worktree's renderer entry.
+pub fn parse_shir_json_to_rust(filename: &str) {
+    let content = match std::fs::read_to_string(filename) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("read {}: {}", filename, e); return; }
+    };
+    let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(0); }
+    };
+    // the shared core pipeline (mirrors the --shir-in-estree arm):
+    // strip_cfor lowers the C-style ForInit (step spliced before every
+    // continue), restructure_goto_only folds goto/label pairs, process_subst
+    // materializes captures.
+    debashl::shir_passes::strip_cfor(&mut prog);
+    debashl::shir_passes::restructure_goto_only(&mut prog);
+    debashl::transforms::process_subst::transform_program(&mut prog);
+    print!("{}", debashl::rust_backend::shir_to_rust(&prog));
+}
+
 /// Parse shell input and emit ShIR JSON. `raw=true` omits the trailing
 /// newline (the contract for machine consumers); `raw=false` adds it
 /// (human-readable default). Fixes the long-standing --shir --raw lie.
@@ -743,6 +764,23 @@ pub fn parse_shir_json_to_estree(filename: &str) {
         Ok(s) => println!("{}", s),
         Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
     }
+}
+
+/// Ingest a ShIR JSON file and emit idiomatic JS source via the
+/// worktree-local js backend renderer (src/js_backend.rs). Closes the
+/// frontend → shIR → JS path; the js backend is a scaffold renderer
+/// (sh2.* stubs for anything outside the lowable subset).
+pub fn parse_shir_json_to_js(filename: &str) {
+    let content = match std::fs::read_to_string(filename) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("read {}: {}", filename, e); return; }
+    };
+    let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+    };
+    let js = debashl::js_backend::shir_to_js(&prog);
+    print!("{}", js);
 }
 
 pub fn interactive_mode() {

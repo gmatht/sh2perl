@@ -1,0 +1,18 @@
+# shir_nodes/regexp_find.node — expression-level semantic IR node.
+# RegexpFind: LEFTMOST regex match as a string (Go
+# regexp.MustCompile(pat) + re.FindString(s); sed/grep -o family).
+#
+# GENERIC (any frontend whose source language has regex literals).
+# text is any expression evaluating to a string; pattern is the regex
+# source (dialect: ERE/RE2-class — char classes, anchors, quantifiers,
+# groups). Yields "" when nothing matches.
+#
+# Backends: JS (TEXT.match(new RegExp(PAT)) || [""])[0],
+#           Perl do { my $m; ($T =~ /($P)/) && ($m = $1); $m // "" },
+#           Rust reg.find(), C regexec loop
+
+node RegexpFind
+tag "RegexpFind"
+kind expr
+field text: expr
+field pattern: expr

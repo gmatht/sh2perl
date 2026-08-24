@@ -32,6 +32,61 @@ iteration construct (`sh2.eachLine` / `while(<$fh>)` /
 All four backends match bash byte-for-byte on the suite (js/pl/zig run;
 java compiled+run).
 
+## UPDATE — construct-normalisation transforms landed
+
+The four named blockers were re-triaged and three of four addressed by
+IR→IR normalisations (docs/shir-reductions.md §Normalisation transforms):
+
+- **zsh arith-cond**: CLOSED — the core now normalises exec("let", [text])
+  conditions to native Arith; zsh gate 87→88/90 (t73 green).
+- **read-stdin**: CLOSED for the single-variable subset — new ReadLine
+  primitive with renderers on js/perl/java/zig; fish+zsh t36 now fail
+  only on EMPTY-VARIABLE ARGUMENT DROPPING (`echo got $line` with empty
+  $line prints "got" in fish/zsh, "got " in the translation) — a
+  word-expansion gap in the FRONTENDS' emitted A1, not the renderers.
+- **local**: deliberately NOT transformed — the runtime already implements
+  true call-frame locals; an IR-level flatten regressed scoping tests.
+  Falls through to the runtime on every backend (no fork/exec).
+- **ANSI-C quoting / eval / trap re-triaged**: the A1 already decodes
+  ANSI-C escapes at parse time (014's java failure was printf %-10s
+  padding + set -e, since fixed/covered separately); corpus `eval` uses
+  are DYNAMIC (payload only known at run time) → explicit fallback is
+  the only correct behaviour; trap needs per-backend lifecycle hooks.
+
+### Do the java gates run all 551 examples? YES — measured
+
+`harness/backend_behavior.sh java` defaults to `examples/*.sh` (all 551).
+Every file is attempted; the buckets are outcomes, not exclusions:
+
+| bucket | count | meaning |
+|---|---|---|
+| pass | 79 | rendered → compiled → stdout matched bash |
+| fail | 24–28 | rendered+compiled but stdout differed |
+| skip | ~448 | `shir_to_java` REFUSED the file (v1-subset Err → exit 1) or the generated code failed to compile |
+
+Measured refusal-reason breakdown over the 551 (SCAN_DEBUG instrumented
+scan_backend, one first-error per file):
+
+| refused construct | files |
+|---|---|
+| `${var:-d}` family — param ops | 46 |
+| command substitution / capture in value position | 41 |
+| Interpolate containing an unsupported sub-expression | 39 |
+| expression-position pipelines | 35 |
+| exec of external commands inside words/interpolations | ~45 |
+| `{a,b}` brace expansion | 13 |
+| arith in string position | 7 |
+| redirect / captureWords / listVar / getVar / shopt / setArrayAppend | ~25 |
+
+So the skip bucket is exactly the java renderer's v1-parity backlog:
+the SAME A1 renders 551/551 on the js backend. Closing the gate means
+teaching `shir_to_java` these shapes (param ops and interpolation
+sub-expressions being the two biggest chunks), not changing the harness.
+
+(The fish/zsh/pl FRONTEND gates are a different meter: each runs its own
+frontend's testdata dir — 80/90/68 files — through
+frontend→A1→estree→run vs a native run of that source language.)
+
 ## Precise blockers per backend (why 100% is not yet demonstrated)
 
 1. **pl corpus (274/551)**: the perl renderer's v1 subset refuses most

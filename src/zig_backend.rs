@@ -851,12 +851,17 @@ impl Render {
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     if self.is_num(name) {
+                        self.mark_read(name);
                         return ('d', self.expr_num(e));
                     }
                     // a DECLARED non-num var homes as a string — print it
                     // raw (sh2IntStr would wrap a []const u8 in an i64
                     // conversion and fail to compile)
                     if self.declared(name) {
+                        // NB: mark_read — skipping it emits a spurious
+                        // dead-var `_ = x;` guard for vars assigned inside
+                        // loops/walkers
+                        self.mark_read(name);
                         return ('s', self.zig_ident(name));
                     }
                     return ('s', self.expr_str(e));
@@ -1499,6 +1504,13 @@ impl Render {
         let ch = node.children();
         let child = |slf: &mut Self, i: usize| -> Option<String> { Some(slf.expr_any(ch.get(i)?)) };
         match node.tag() {
+            // `read VAR` normalisation: one stdin line, newline stripped;
+            // EOF → "" (the helper owns the stdin reader state)
+            "ReadLine" => {
+                self.need_ext = true;
+                // rendered INSIDE main → init.io is in scope at the call
+                Some("sh2ReadLine(init.io)".to_string())
+            }
             "StrLen" => {
                 self.need_intstr = true;
                 Some(format!("sh2IntStr(@intCast(({}).len))", child(self, 0)?))
@@ -1523,6 +1535,12 @@ impl Render {
                 // pattern must be a LITERAL (no regex metachars) — zig has
                 // no std regex; real regexes fall back to the runtime.
                 let n = node.as_any().downcast_ref::<crate::shir_nodes::RegSub>()?;
+                // the command-substitution newline strip (`\n+$`, first
+                // only) is a NAMED primitive here: trim trailing newlines
+                if !n.global && n.pattern == "\n+$" {
+                    self.need_ext = true;
+                    return Some(format!("sh2TrimRightNl({})", child(self, 0)?));
+                }
                 if n.pattern.chars().any(|c| ".*+?[](){}|^$\\\\".contains(c) || c == '"') {
                     return None;
                 }
@@ -1642,6 +1660,87 @@ impl Render {
                     self.stmt(b);
                 }
                 self.depth -= 1;
+                self.emit("}");
+            }
+            IrStmt::Ext(node) if node.tag() == "WalkDir" => {
+                // STREAMING directory walk (docs/shir-primitives.md
+                // §WalkDir): entries collected into a path LIST (O(tree)
+                // metadata — file CONTENTS are never opened), then iterated
+                // inline so the body captures main's locals naturally.
+                let wd = node.as_any().downcast_ref::<crate::shir_nodes::WalkDir>()
+                    .expect("tag/type agree");
+                let src = self.expr_any(&wd.source);
+                let n = self.tmp_counter;
+                self.tmp_counter += 1;
+                let lv = self
+                    .mangle
+                    .get(&wd.var)
+                    .cloned()
+                    .unwrap_or_else(|| self.zig_ident(&wd.var));
+                let tf = match &wd.type_filter {
+                    Some(x) => x.as_str(),
+                    None => "",
+                };
+                let md = match &wd.maxdepth {
+                    Some(e) => self.expr_num(e),
+                    None => "0".into(),
+                };
+                let nf = match &wd.name_filter {
+                    Some(x) => Self::zig_str(x),
+                    None => "\"\"".to_string(),
+                };
+                self.need_ext = true; // sh2GlobName fn
+                self.mark_written(&wd.var);
+                self.mark_read(&wd.var);
+                self.var_types.insert(wd.var.clone(), IrType::Str);
+                self.emit("{");
+                self.emit(&format!("    var __wl{}: std.ArrayList([]const u8) = .empty;", n));
+                self.emit(&format!("    const W{} = struct {{", n));
+                self.emit("        fn matches(t: []const u8, nm: []const u8, full: []const u8, isdir: bool) bool {");
+                self.emit("            // -name GLOB on the BASE NAME (independent of -type)");
+                self.emit("            if (nm.len != 0) {");
+                self.emit("                const bn = if (std.mem.lastIndexOfScalar(u8, full, '/')) |ix| full[ix + 1 ..] else full;");
+                self.emit("                if (!sh2GlobName(nm, bn)) return false;");
+                self.emit("            }");
+                self.emit("            if (t.len != 0) {");
+                self.emit("                if (std.mem.eql(u8, t, \"d\") != isdir) return false;");
+                self.emit("            }");
+                self.emit("            return true;");
+                self.emit("        }");
+                self.emit("        fn go(al: std.mem.Allocator, io: std.Io, dpath: []const u8, l: *std.ArrayList([]const u8), t: []const u8, nm: []const u8, max: i64, depth: i64) void {");
+                self.emit("            // GNU find evaluates the START point too");
+                self.emit("            blk0: {");
+                self.emit("                const st0 = std.Io.Dir.cwd().statFile(io, dpath, .{}) catch break :blk0;");
+                self.emit("                const bn0 = if (std.mem.lastIndexOfScalar(u8, dpath, '/')) |ix| dpath[ix + 1 ..] else dpath;");
+                self.emit("                if (matches(t, nm, bn0, st0.kind == .directory)) l.append(al, dpath) catch return;");
+                self.emit("            }");
+                self.emit("            if (max != 0 and depth >= max) return;");
+                self.emit("            var d = std.Io.Dir.cwd().openDir(io, dpath, .{ .iterate = true }) catch return;");
+                self.emit("            defer d.close(io);");
+                self.emit("            var it = d.iterate();");
+                self.emit("            while (it.next(io) catch return) |e| {");
+                self.emit("                const full = std.fmt.allocPrint(al, \"{s}/{s}\", .{ dpath, e.name }) catch continue;");
+                self.emit("                const isdir = (e.kind == .directory);");
+                self.emit("                if (matches(t, nm, e.name, isdir)) l.append(al, full) catch continue;");
+                self.emit("                if (isdir and (max == 0 or depth + 1 < max)) go(al, io, full, l, t, nm, max, depth + 1);");
+                self.emit("            }");
+                self.emit("        }");
+                self.emit("    }.go;");
+                self.emit(&format!(
+                    "    W{}(std.heap.page_allocator, init.io, {}, &__wl{}, \"{tf}\", {nf}, {md}, 0);",
+                    n, src, n, tf = tf, nf = nf, md = md
+                ));
+                self.emit(&format!(
+                    "    for (__wl{}.items) |__ln{}| {{",
+                    n, n
+                ));
+                self.depth += 1;
+                self.emit(&format!("    {} = __ln{};", lv, n));
+                for b in &wd.body {
+                    self.stmt(b);
+                }
+                self.depth -= 1;
+                self.emit("    }");
                 self.emit("}");
             }
             IrStmt::Ext(_) => panic!("zig backend: Ext node unsupported"),
@@ -2464,6 +2563,55 @@ impl Render {
             self.emit("    const i = std.mem.lastIndexOfScalar(u8, t, '/') orelse return \".\";");
             self.emit("    if (i == 0) return \"/\";");
             self.emit("    return t[0..i];");
+            self.emit("}");
+                        self.emit("var __rl_file: std.Io.File = undefined;");
+            self.emit("var __rl_buf: [4096]u8 = undefined;");
+            self.emit("var __rl_rdr: std.Io.File.Reader = undefined;");
+            self.emit("var __rl_init: bool = false;");
+            self.emit("fn sh2ReadLine(io: std.Io) []const u8 {");
+            self.emit("    if (!__rl_init) {");
+            self.emit("        __rl_file = std.Io.File.stdin();");
+            self.emit("        __rl_rdr = __rl_file.reader(io, &__rl_buf);");
+            self.emit("        __rl_init = true;");
+            self.emit("    }");
+            self.emit("    const line = __rl_rdr.interface.takeDelimiter('\\n') catch return \"\";");
+            self.emit("    return line orelse \"\";");
+            self.emit("}");
+self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
+            self.emit("    var s = t;");
+            self.emit("    while (s.len > 0 and s[s.len - 1] == '\\n') s = s[0 .. s.len - 1];");
+            self.emit("    return s;");
+            self.emit("}");
+            self.emit("fn sh2GlobName(pat: []const u8, name: []const u8) bool {");
+            self.emit("    // fnmatch-style: * ? [cls] — recursive matcher, no regex");
+            self.emit("    if (pat.len == 0) return name.len == 0;");
+            self.emit("    if (pat[0] == '*') {");
+            self.emit("        var k: usize = 0;");
+            self.emit("        while (k <= name.len) : (k += 1) {");
+            self.emit("            if (sh2GlobName(pat[1..], name[k..])) return true;");
+            self.emit("        }");
+            self.emit("        return false;");
+            self.emit("    }");
+            self.emit("    if (name.len == 0) return false;");
+            self.emit("    if (pat[0] == '?') return sh2GlobName(pat[1..], name[1..]);");
+            self.emit("    if (pat[0] == '[') {");
+            self.emit("        const close = std.mem.indexOfScalar(u8, pat, ']') orelse return false;");
+            self.emit("        if (close < 2) return false;");
+            self.emit("        var body = pat[1..close];");
+            self.emit("        const negate = body[0] == '!' or body[0] == '^';");
+            self.emit("        if (negate) body = body[1..];");
+            self.emit("        var hit = false;");
+            self.emit("        var bi: usize = 0;");
+            self.emit("        while (bi < body.len) : (bi += 1) {");
+            self.emit("            if (bi + 2 < body.len and body[bi + 1] == '-') {");
+            self.emit("                if (name[0] >= body[bi] and name[0] <= body[bi + 2]) hit = true;");
+            self.emit("                bi += 2;");
+            self.emit("            } else if (body[bi] == name[0]) hit = true;");
+            self.emit("        }");
+            self.emit("        if (hit != negate) return sh2GlobName(pat[close + 1 ..], name[1..]);");
+            self.emit("        return false;");
+            self.emit("    }");
+            self.emit("    return pat[0] == name[0] and sh2GlobName(pat[1..], name[1..]);");
             self.emit("}");
             self.emit("fn sh2TrimSides(t: []const u8, lead: bool, trail: bool) []const u8 {");
             self.emit("    var s = t;");

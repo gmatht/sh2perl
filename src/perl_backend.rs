@@ -142,6 +142,10 @@ pub struct Render {
     todo: usize,
     /// Fresh file-handle suffix for ForEachLine streaming loops.
     fh_counter: usize,
+    /// WalkDir used → __sh2_walk preamble helper needed.
+    need_walk: bool,
+    /// ReadLine used → __sh2_read_line preamble helper needed.
+    need_readline: bool,
 }
 
 /// Render an `IrProgram` to Perl source.
@@ -189,6 +193,65 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     if r.need_mem {
         r.emit("");
         for line in MEM_RUNTIME.lines() {
+            r.emit(line);
+        }
+        r.emit("");
+    }
+    if r.need_readline {
+        r.emit("");
+        r.emit("sub __sh2_read_line {");
+        r.emit("    my $l = <STDIN>;");
+        r.emit("    return defined $l ? do { chomp $l; $l } : '';");
+        r.emit("}");
+    }
+    if r.need_walk {
+        // STREAMING directory walk (docs/shir-primitives.md §WalkDir):
+        // GNU find subset — entries delivered one at a time to the
+        // callback, file contents never opened; the START point is
+        // evaluated against the predicates too (find . -type d lists .).
+        // maxdepth: 0 = unlimited; children of a depth-$d dir sit at
+        // $d+1 and are visited only while $d+1 <= $max.
+        for line in [
+            "sub __sh2_fnmatch {",
+            "    my ($pat, $name) = @_;",
+            "    my $re = '';",
+            "    for my $i (0 .. length($pat)-1) {",
+            "        my $c = substr($pat, $i, 1);",
+            "        if ($c eq '*') { $re .= '[^/]*'; }",
+            "        elsif ($c eq '?') { $re .= '[^/]'; }",
+            "        elsif ($c eq '[') {",
+            "            my $j = $i + 1;",
+            "            $j++ if substr($pat, $j, 1) eq '!' || substr($pat, $j, 1) eq '^';",
+            "            $j++ while $j < length($pat) && substr($pat, $j, 1) ne ']';",
+            "            if ($j >= length($pat)) { $re .= '\\['; next; }",
+            "            my $cls = substr($pat, $i, $j - $i + 1);",
+            "            $cls =~ s/^\\[!/[^/;",
+            "            $re .= $cls; $i = $j;",
+            "        }",
+            "        else { $re .= \"\\Q$c\\E\"; }",
+            "    }",
+            "    return $name =~ /^${re}$/;",
+            "}",
+            "sub __sh2_walk {",
+            "    my ($dir, $cb, $type, $max, $name, $depth) = @_;",
+            "    my $ok0 = ($type eq '' || ($type eq 'f' ? (-f $dir && !-d _) : -d $dir))",
+            "        && ($name eq '' || __sh2_fnmatch($name, $dir));",
+            "    $cb->($dir) if $ok0;",
+            "    opendir(my $dh, $dir) or return;",
+            "    while (my $e = readdir($dh)) {",
+            "        next if $e eq '.' || $e eq '..';",
+            "        my $full = \"$dir/$e\";",
+            "        my $isdir = -d $full;",
+            "        my $nm = (split('/', $full))[-1];",
+            "        my $ok = ($type eq '' ? 1 : ($type eq 'f' ? (-f $full) : $isdir))",
+            "            && ($name eq '' || __sh2_fnmatch($name, $nm));",
+            "        $cb->($full) if $ok;",
+            "        if ($isdir && ($max == 0 || $depth + 1 < $max)) {",
+            "            __sh2_walk($full, $cb, $type, $max, $name, $depth + 1);",
+            "        }",
+            "    }",
+            "}",
+        ] {
             r.emit(line);
         }
         r.emit("");
@@ -551,6 +614,11 @@ impl Render {
                 "0".to_string()
             }
             IrExpr::Ext(n) => {
+                // `read VAR` normalisation: one stdin line, chomped
+                if n.tag() == "ReadLine" {
+                    self.need_readline = true;
+                    return "__sh2_read_line()".to_string();
+                }
                 let ctx = crate::render_ext_expr::ExprRenderCtx {
                     backend: crate::render_ext_expr::Backend::Perl,
                     indent: 0,
@@ -1843,6 +1911,42 @@ impl Render {
 
     fn stmt(&mut self, s: &IrStmt) {
         match s {
+            IrStmt::Ext(node) if node.tag() == "WalkDir" => {
+                // STREAMING directory walk (docs/shir-primitives.md
+                // §WalkDir): recursive opendir/readdir — entries one at a
+                // time, file contents never opened.
+                let wd = node.as_any().downcast_ref::<crate::shir_nodes::WalkDir>()
+                    .expect("tag/type agree");
+                self.need_walk = true;
+                let src = self.expr(&wd.source);
+                // the callback binds the var by assignment → hoist a lexical
+                self.scalars.insert(wd.var.clone());
+                let lv = format!("${}", ident(&wd.var));
+                let tf = match &wd.type_filter {
+                    Some(x) => x.as_str(),
+                    None => "",
+                };
+                let md = match &wd.maxdepth {
+                    Some(e) => crate::ir::ir_expr_to_perl(e),
+                    None => "0".to_string(),
+                };
+                let nf = match &wd.name_filter {
+                    Some(x) => format!("\"{}\"", x.replace('\'', "\\\'")),
+                    None => "''".to_string(),
+                };
+                self.emit(&format!(
+                    "__sh2_walk({}, sub {{ {} = shift;",
+                    src, lv
+                ));
+                // NB: initial depth 0 is passed in the tail line below
+                // NB: closing paren emitted with the tail line below
+                self.depth += 1;
+                for b in &wd.body {
+                    self.stmt(b);
+                }
+                self.depth -= 1;
+                self.emit(&format!("}}, \"{}\", {}, {}, 0);", tf, md, nf));
+            }
             IrStmt::Ext(node) => {
                 if node.tag() == "ForEachLine" {
                     // STREAMING line iteration (docs/shir-primitives.md

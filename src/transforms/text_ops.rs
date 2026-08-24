@@ -54,6 +54,88 @@ pub fn transform(stmts: &mut Vec<IrStmt>) -> bool {
 }
 
 fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<String>) {
+    // ── SUBSHELL SCOPE ISOLATION: `(a=2; …)` runs in a copy of the shell
+    // — writes inside must NOT leak out. Our flat-variable backends render
+    // Subshell as a plain block (writes leak). Normalise: snapshot every
+    // scalar the body WRITES into fresh temps, run the body, restore.
+    // Array/hash writes, function definitions and unset keep the original
+    // shape (explicit fallback).
+    if emit {
+        if let IrStmt::Subshell(body) = stmt {
+            let mut written: Vec<String> = Vec::new();
+            let supported = collect_scalar_writes(body, &mut written)
+                && !written.iter().any(|v| v.starts_with("__"));
+            if supported {
+                written.sort();
+                written.dedup();
+                let k = LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                let mut out_stmts: Vec<IrStmt> = Vec::new();
+                for (i, v) in written.iter().enumerate() {
+                    // save current value (" " model: never-assigned reads "")
+                    out_stmts.push(IrStmt::Assign {
+                        targets: vec![AssignTarget {
+                            var: format!("__sv{}_{}", k, i),
+                            sigil: None,
+                            indices: vec![],
+                        }],
+                        expr: IrExpr::Var(v.clone(), None),
+                        asm: None,
+                    });
+                }
+                out_stmts.extend(body.iter().cloned());
+                for (i, v) in written.iter().enumerate() {
+                    // restore
+                    out_stmts.push(IrStmt::Assign {
+                        targets: vec![AssignTarget { var: v.clone(), sigil: None, indices: vec![] }],
+                        expr: IrExpr::Var(format!("__sv{}_{}", k, i), None),
+                        asm: None,
+                    });
+                }
+                *stmt = IrStmt::Block(out_stmts);
+                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    // ── construct normalisations (docs/shir-reductions.md §Normalisation
+    // transforms): let / local / read — re-expressed in vocabulary every
+    // backend already renders. Runs FIRST, for every statement shape.
+    if emit {
+        if let Some(repl) = try_normalize_construct_stmt(stmt) {
+            *stmt = repl;
+            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // `(( x > 3 ))` / `let "x > 3"` in If/While CONDITION position →
+        // native Arith comparison (the zsh-sh-go frontend lowers these to
+        // exec("let", [text])).
+        if let IrStmt::If { cond, .. } | IrStmt::While { cond, .. } = stmt {
+            if let IrExpr::Call { func, args, .. } = cond {
+                if (func == "exec" || func == "builtin")
+                    && matches!(args.as_slice(),
+                        [IrExpr::Str(n, _), IrExpr::Array(wa)]
+                            if n == "let"
+                                && matches!(wa.as_slice(), [IrExpr::Str(_, _)]))
+                {
+                    let text_opt = if let [_, IrExpr::Array(wa)] = args.as_slice() {
+                        match wa.as_slice() {
+                            [IrExpr::Str(tx, _)] => Some(tx.clone()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(text) = text_opt {
+                        if let Some(repl) = let_cond_from_text(&text) {
+                            *cond = repl;
+                            LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    }
     match stmt {
         // ShIR pipeline: IrExpr::Call { func: "pipeline", args: [Array(stages)] }
         IrStmt::Expr(IrExpr::Call { func, args }) if func == "pipeline" => {
@@ -67,6 +149,17 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                             *stmt = repl;
                             LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                             return;
+                        }
+                    }
+                    // `find P [-maxdepth N] [-type f|d] | wc -l` →
+                    // STREAMING directory-walk count (no entry list).
+                    if emit {
+                        if let [IrExpr::Arrow(b1), IrExpr::Arrow(b2)] = stages.as_slice() {
+                            if let Some(repl) = try_lower_find_wc(b1, b2) {
+                                *stmt = repl;
+                                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
                         }
                     }
                     // `grep P F | wc -l` → STREAMING filtered line count.
@@ -333,6 +426,15 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
                         return;
                     }
                 }
+                if emit && cmd == "find" {
+                    // bare `find P [-maxdepth N] [-type f|d]` → WalkDir
+                    // printing each entry path (streaming, no entry list).
+                    if let Some(repl) = try_lower_find_stmt(cmd_args) {
+                        *stmt = with_status_zero(repl);
+                        LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
                 if emit && cmd == "printf" {
                     if let Some(val) = try_lower_printf_repeat(cmd_args) {
                         // printf emits NO trailing newline.
@@ -403,6 +505,18 @@ fn lower_stmt(stmt: &mut IrStmt, emit: bool, arrays: &std::collections::HashSet<
 
 fn lower_expr(expr: &mut IrExpr, arrays: &std::collections::HashSet<String>) {
     match expr {
+        // `(( x > 3 ))` / `let "x > 3"` in CONDITION position: the zsh-sh-go
+        // and posix frontends lower these to exec("let", [text]) — parse the
+        // arithmetic text here so EVERY backend renders a native comparison
+        // instead of a runtime let call (§Normalisation transforms).
+        IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+            if let Some(replacement) = try_normalize_let_cond(args) {
+                *expr = replacement;
+                LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            for a in args.iter_mut() { lower_expr(a, arrays); }
+        }
         // ${#var} → StrLen
         IrExpr::Call { func, args } if func == "param" => {
             if let Some(replacement) = try_lower_param_len(args) {
@@ -994,9 +1108,10 @@ fn try_lower_wc(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
         // wc -c → StrLen (text.length)
         Some(IrExpr::Ext(Box::new(StrLen { text })))
     } else {
-        // wc -l / wc -w → ArrayLen(Split(text, delim)) — a COMPOSITION of
-        // primitives. Backends implement Split + ArrayLen once; no bespoke
-        // LineCount/WordCount nodes.
+        // wc -l → RegCount(text, /\n/) (newline count, NOT split-length:
+        // off by one on the trailing newline). wc -w → WordCount(text):
+        // a dedicated node — C renders an inline transition-count scan
+        // (no allocation), JS/Perl the split-length idiom.
         if lower_l {
             // wc -l is a NEWLINE COUNT (each line ends in \n) — NOT
             // split('\n').length (off by one on trailing newline).
@@ -1008,10 +1123,11 @@ fn try_lower_wc(text: IrExpr, args: &[IrExpr]) -> Option<IrExpr> {
                 pattern: "\\n".to_string(),
             })))
         } else {
-            // wc -w → ArrayLen(Split(text, /\s+/))
-            Some(IrExpr::Ext(Box::new(ArrayLen {
-                array: IrExpr::Ext(Box::new(Split { text, delim: "\\s+".to_string(), is_regex: true })),
-            })))
+            // wc -w → WordCount(text) — a dedicated node: C renders an
+            // inline transition-count scan (no allocation), JS/Perl the
+            // split-length idiom (docs/shir-reductions.md, source-aware
+            // literal-string row of the wc table)
+            Some(IrExpr::Ext(Box::new(WordCount { text })))
         }
     }
 }
@@ -1168,10 +1284,13 @@ mod tests {
     }
 
     #[test]
-    fn wc_w_is_split_plus_arraylen() {
+    fn wc_w_is_wordcount_node() {
         let r = try_lower_wc(st("hello"), &[st("-w")]).unwrap();
         let IrExpr::Ext(n) = &r else { panic!("expected Ext") };
-        assert!(n.as_any().downcast_ref::<ArrayLen>().is_some(), "wc -w → ArrayLen(Split)");
+        assert!(
+            n.as_any().downcast_ref::<WordCount>().is_some(),
+            "wc -w → WordCount (C renders an inline scan, no allocation)"
+        );
     }
 
     // ── grep reduction ──────────────────────────────────────────────
@@ -1503,6 +1622,170 @@ fn try_lower_printf_repeat(args: &[IrExpr]) -> Option<IrExpr> {
 /// simple sed) — these exit 0 on static input, so `SetChildError(0)` preserves
 /// $?. grep is excluded (status idiom). Counts append the echo trailing \n.
 fn try_reduce_capture_assign(stmt: &IrStmt, arrays: &std::collections::HashSet<String>) -> Option<IrStmt> {
+    if std::env::var("SH2C_DEBUG").is_ok() {
+        if let IrStmt::Assign { expr, .. } = stmt {
+            if matches!(expr, IrExpr::Capture { .. }) {
+                eprintln!("REDUCE_CAP called");
+            }
+        }
+    }
+    // `x=$(find ARGS)` (bare command capture, NO pipeline) → accumulator
+    // over WalkDir + command-substitution newline strip. Self-contained
+    // peek: the shared extraction below demands a 2-stage pipeline.
+    if let IrStmt::Assign { targets, asm, expr, .. } = stmt {
+        if let IrExpr::Capture { expr: ci, native: false } = expr {
+            if let IrExpr::Arrow(body) = ci.as_ref() {
+                if let [IrStmt::Expr(IrExpr::Call { func, args })] = body.as_slice() {
+                    if func == "exec" || func == "builtin" {
+                        if let [IrExpr::Str(n, _), IrExpr::Array(fa)] = args.as_slice() {
+                            if n == "find" {
+                                if let Some((path, tf, md, nf)) = parse_find_args(fa) {
+                                    let target0 = &targets[0].var;
+                                    let acc = target0.clone();
+                                    let append = IrStmt::Assign {
+                                        targets: vec![AssignTarget { var: acc.clone(), sigil: None, indices: vec![] }],
+                                        expr: IrExpr::BinOp {
+                                            lhs: Box::new(IrExpr::Var(acc.clone(), None)),
+                                            op: BinOpKind::Concat,
+                                            rhs: Box::new(IrExpr::BinOp {
+                                                lhs: Box::new(loop_var_read("__l")),
+                                                op: BinOpKind::Concat,
+                                                rhs: Box::new(IrExpr::Str("\n".to_string(), StrStyle::DoubleQuoted)),
+                                            }),
+                                        },
+                                        asm: None,
+                                    };
+                                    return Some(IrStmt::Block(vec![
+                                        IrStmt::Assign {
+                                            targets: vec![AssignTarget { var: acc, sigil: None, indices: vec![] }],
+                                            expr: IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+                                            asm: None,
+                                        },
+                                        IrStmt::Ext(Box::new(WalkDir {
+                                            source: IrExpr::Str(path, StrStyle::DoubleQuoted),
+                                            var: "__l".to_string(),
+                                            body: vec![append],
+                                            type_filter: tf,
+                                            name_filter: nf,
+                                            maxdepth: md.map(|v| Box::new(IrExpr::Int(v))),
+                                        })),
+                                        IrStmt::Assign {
+                                            targets: targets.clone(),
+                                            expr: IrExpr::Ext(Box::new(RegSub {
+                                                text: IrExpr::Var(target0.clone(), None),
+                                                pattern: "\n+$".to_string(),
+                                                replacement: String::new(),
+                                                global: false,
+                                                line_mode: false,
+                                            })),
+                                            asm: asm.clone(),
+                                        },
+                                        IrStmt::SetChildError(IrExpr::Int(0)),
+                                    ]));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // `x=$(wc -w <<< "text")` — a HERE-STRING on fd 0 feeding ONE
+    // reducible command lowers to the composed Ext VALUE over the
+    // here-text (WordCount/StrLen/RegCount/…). Same status contract as
+    // the pipeline arm: these exit 0 on static input.
+    //
+    // Shape (A1): Capture → Arrow → [Expr(Call pipeline,
+    //   [Arrow([Expr(exec NAME words)]),
+    //    Array([{fd:0, mode:"herestring", target:text}])])]
+    {
+        let text_ir: Option<IrExpr> = None;
+        let _ = text_ir;
+        if let IrStmt::Assign { targets, asm, expr, .. } = stmt {
+            if let IrExpr::Capture { expr: ci, native: false } = expr {
+                if let IrExpr::Arrow(body) = ci.as_ref() {
+                    if std::env::var("SH2C_DEBUG").is_ok() {
+                        eprintln!("HEREDOC-ARM body={:?}", body.as_slice().iter().map(|s| format!("{:?}", std::mem::discriminant(s))).collect::<Vec<_>>());
+                    }
+                    if let [IrStmt::Expr(IrExpr::Call { func, args })] = body.as_slice() {
+                        if func != "pipeline" {
+                            return None;
+                        }
+                        let mut stage_cmd: Option<(&str, &[IrExpr])> = None;
+                        let mut heredoc_text: Option<&IrExpr> = None;
+                        if let Some(IrExpr::Arrow(stage)) = args.first() {
+                            if let [IrStmt::Expr(IrExpr::Call { func: sf, args: sa })] =
+                                stage.as_slice()
+                            {
+                                if sf == "exec" || sf == "builtin" {
+                                    if let [IrExpr::Str(n, _), IrExpr::Array(fa)] =
+                                        sa.as_slice()
+                                    {
+                                        stage_cmd = Some((n.as_str(), fa.as_slice()));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(IrExpr::Array(specs)) = args.get(1) {
+                            for sp in specs {
+                                if let IrExpr::Object(fields) = sp {
+                                    let mut fd0 = false;
+                                    let mut is_herestring = false;
+                                    let mut target: Option<&IrExpr> = None;
+                                    for (k, v) in fields {
+                                        match k.as_str() {
+                                            "fd" => {
+                                                if matches!(v, IrExpr::Int(f) if *f == 0)
+                                                {
+                                                    fd0 = true;
+                                                }
+                                            }
+                                            "mode" => {
+                                                if matches!(
+                                                    v,
+                                                    IrExpr::Str(m, _)
+                                                        if m == "herestring"
+                                                            || m == "heredoc"
+                                                )
+                                                {
+                                                    is_herestring = true;
+                                                }
+                                            }
+                                            "target" => target = Some(v),
+                                            _ => {}
+                                        }
+                                    }
+                                    if fd0 && is_herestring {
+                                        heredoc_text = target;
+                                    }
+                                }
+                            }
+                        }
+                        if let (
+                            Some((cmd_name, cmd_args)),
+                            Some(text_ir),
+                        ) = (stage_cmd, heredoc_text)
+                        {
+                            if let Some(value) =
+                                try_lower_command(text_ir.clone(), cmd_name, cmd_args)
+                            {
+                                return Some(IrStmt::Block(vec![
+                                    IrStmt::Assign {
+                                        targets: targets.clone(),
+                                        expr: value,
+                                        asm: asm.clone(),
+                                    },
+                                    IrStmt::SetChildError(IrExpr::Int(0)),
+                                ]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Peek (immutable), build replacement from cloned pieces.
     let (targets, asm, stages) = match stmt {
         IrStmt::Assign { targets, asm, expr, .. } => {
@@ -1533,7 +1816,56 @@ fn try_reduce_capture_assign(stmt: &IrStmt, arrays: &std::collections::HashSet<S
     let stage_bodies: Vec<&[IrStmt]> = stages.iter().map(|s| match s {
         IrExpr::Arrow(b) => b.as_slice(), _ => unreachable!("checked above"),
     }).collect();
-    if stage_bodies.len() != 2 { return None; }
+    // `x=$(find ARGS | wc -l)` → streaming directory-walk count assigned
+    // to the target (find's exit status is 0 on success; allowlisted).
+    {
+        let find_wc = stage_bodies.len() == 2
+            && matches!(stage_bodies[0], [IrStmt::Expr(IrExpr::Call { ref func, ref args })]
+                if (func == "exec" || func == "builtin")
+                    && matches!(args.as_slice(),
+                        [IrExpr::Str(n, _), IrExpr::Array(_)] if n == "find"));
+        if find_wc {
+            if let [IrStmt::Expr(IrExpr::Call { func: f2, args: a2 })] = stage_bodies[1] {
+                if f2 == "exec" || f2 == "builtin" {
+                    if let [IrExpr::Str(n2, _), IrExpr::Array(wa)] = a2.as_slice() {
+                        if n2 == "wc"
+                            && wa.len() == 1
+                            && matches!(&wa[0], IrExpr::Str(f, _) if f.as_str() == "-l")
+                        {
+                            if let [IrStmt::Expr(IrExpr::Call { func: f1, args: a1 })] =
+                                stage_bodies[0]
+                            {
+                                if let [IrExpr::Str(_, _), IrExpr::Array(fa)] = a1.as_slice() {
+                                    if let Some((path, tf, md, nf)) = parse_find_args(fa) {
+                                        let mut block = walk_dir_count(
+                                            IrExpr::Str(path, StrStyle::DoubleQuoted),
+                                            tf,
+                                            md.map(IrExpr::Int),
+                                            nf,
+                                        );
+                                        if let IrStmt::Block(ref mut stmts) = block {
+                                            // the counter is the capture VALUE:
+                                            // swap the trailing Output for the Assign
+                                            if let Some(IrStmt::Output { value, .. }) = stmts.last_mut() {
+                                                let value = value.clone();
+                                                *stmts.last_mut().unwrap() = IrStmt::Assign {
+                                                    targets,
+                                                    expr: value,
+                                                    asm,
+                                                };
+                                                return Some(block);
+                                            }
+                                        }
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Source must be a clean literal echo/printf (no flags/backslash escapes).
     let text = extract_text_from_stage(stage_bodies[0])?;
@@ -1611,6 +1943,426 @@ fn streaming_line_count(source: IrExpr, guard: Option<IrExpr>) -> IrStmt {
             target: None,
         },
     ])
+}
+
+/// GNU find subset: [PATH] [-maxdepth N] [-type f|d]. Anything else
+/// (-name, -perm, multi-path, expressions) is not lowered → None.
+#[allow(clippy::type_complexity)]
+fn parse_find_args(
+    args: &[IrExpr],
+) -> Option<(String, Option<String>, Option<i64>, Option<String>)> {
+    // (path, -type, -maxdepth, -name glob)
+
+    let mut strs: Vec<&str> = Vec::new();
+    for x in args {
+        match x {
+            IrExpr::Str(s, _) => strs.push(s.as_str()),
+            IrExpr::Interpolate(p) if p.len() == 1 => match &p[0] {
+                InterpPart::Lit(s) => strs.push(s.as_str()),
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    let mut path: Option<String> = None;
+    let mut tf: Option<String> = None;
+    let mut md: Option<i64> = None;
+    let mut nf: Option<String> = None;
+    let mut i = 0;
+    while i < strs.len() {
+        match strs[i] {
+            "-maxdepth" => {
+                let v = strs.get(i + 1)?.parse::<i64>().ok()?;
+                md = Some(v);
+                i += 2;
+            }
+            "-type" => {
+                let v = strs.get(i + 1)?;
+                if !matches!(*v, "f" | "d") { return None; }
+                tf = Some(v.to_string());
+                i += 2;
+            }
+            "-name" => {
+                // a basename GLOB — carried verbatim; renderers implement
+                // fnmatch-style matching. Multiple -name (implicit -o
+                // semantics in GNU find) → not lowered.
+                if nf.is_some() { return None; }
+                nf = Some(strs.get(i + 1)?.to_string());
+                i += 2;
+            }
+            s if s.starts_with('-') => return None,
+            p => {
+                if path.is_some() { return None; } // multi-path → fallback
+                path = Some(p.to_string());
+                i += 1;
+            }
+        }
+    }
+    Some((path?, tf, md, nf))
+}
+
+/// Streaming directory-entry counter: `n=0; WalkDir(src, l, n+=1)` — the
+/// tree is walked entry-by-entry; contents are never opened.
+fn walk_dir_count(
+    source: IrExpr,
+    type_filter: Option<String>,
+    maxdepth: Option<IrExpr>,
+    name_filter: Option<String>,
+) -> IrStmt {
+    let k = LIFT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let cnt = format!("__lc{}", k);
+    let lv = format!("__l{}", k);
+    let incr = IrStmt::Assign {
+        targets: vec![AssignTarget { var: cnt.clone(), sigil: None, indices: vec![] }],
+        expr: IrExpr::BinOp {
+            lhs: Box::new(IrExpr::Var(cnt.clone(), None)),
+            op: BinOpKind::Add,
+            rhs: Box::new(IrExpr::Int(1)),
+        },
+        asm: None,
+    };
+    IrStmt::Block(vec![
+        IrStmt::Assign {
+            targets: vec![AssignTarget { var: cnt.clone(), sigil: None, indices: vec![] }],
+            expr: IrExpr::Int(0),
+            asm: None,
+        },
+        IrStmt::Ext(Box::new(WalkDir {
+            source,
+            var: lv,
+            body: vec![incr],
+            type_filter,
+            name_filter,
+            maxdepth: maxdepth.map(Box::new),
+        })),
+        IrStmt::Output {
+            value: IrExpr::Call {
+                func: "getVar".to_string(),
+                args: vec![IrExpr::Str(cnt, StrStyle::DoubleQuoted)],
+            },
+            newline: true,
+            target: None,
+        },
+    ])
+}
+
+/// `find ARGS | wc -l` — stage1 find subset, stage2 exactly wc -l.
+fn try_lower_find_wc(stage1: &[IrStmt], stage2: &[IrStmt]) -> Option<IrStmt> {
+    let [IrStmt::Expr(IrExpr::Call { func, args })] = stage1 else { return None };
+    if !(func == "exec" || func == "builtin") { return None; }
+    let [IrExpr::Str(n, _), IrExpr::Array(a)] = args.as_slice() else { return None };
+    if n != "find" { return None; }
+    let wc_ok = matches!(stage2,
+        [IrStmt::Expr(IrExpr::Call { func, args })]
+            if (func == "exec" || func == "builtin")
+                && matches!(args.as_slice(),
+                    [IrExpr::Str(n, _), IrExpr::Array(wa)] if n == "wc" && wa.len() == 1
+                        && matches!(&wa[0], IrExpr::Str(f, _) if f.as_str() == "-l")));
+    if !wc_ok { return None; }
+    let (path, tf, md, nf) = parse_find_args(a)?;
+    Some(walk_dir_count(
+        IrExpr::Str(path, StrStyle::DoubleQuoted),
+        tf,
+        md.map(IrExpr::Int),
+        nf,
+    ))
+}
+
+/// Frontend-ingest normalisations: apply ONLY the let-condition and read
+/// lifts to an already-ingested A1 (the fish/zsh frontends emit those
+/// constructs as opaque exec calls). Runs when DEBASHC_TRANSFORMS lists
+/// text-ops; deliberately narrower than transform() — everything else in
+/// the ingest keeps its baseline shape.
+pub fn normalize_frontend_constructs(stmts: &mut Vec<IrStmt>) {
+    fn normalize_read(s: &mut IrStmt) -> bool {
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+            if func == "exec" || func == "builtin" {
+                if let [IrExpr::Str(n, _), IrExpr::Array(wa)] = args.as_slice() {
+                    if n == "read"
+                        && wa.len() == 1
+                        && matches!(&wa[0], IrExpr::Str(v, _) if !v.starts_with('-'))
+                    {
+                        let var = match &wa[0] {
+                            IrExpr::Str(v, _) => v.clone(),
+                            _ => unreachable!(),
+                        };
+                        *s = IrStmt::Assign {
+                            targets: vec![AssignTarget { var, sigil: None, indices: vec![] }],
+                            expr: IrExpr::Ext(Box::new(ReadLine {})),
+                            asm: None,
+                        };
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    fn cond_let(cond: &mut IrExpr) -> bool {
+        if let IrExpr::Call { func, args } = cond {
+            if func == "exec" || func == "builtin" {
+                if let [IrExpr::Str(n, _), IrExpr::Array(wa)] = args.as_slice() {
+                    if n == "let" {
+                        if let [IrExpr::Str(tx, _)] = wa.as_slice() {
+                            if let Some(repl) = let_cond_from_text(tx) {
+                                *cond = repl;
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+    fn walk(s: &mut Vec<IrStmt>) {
+        let mut i = 0;
+        while i < s.len() {
+            if normalize_read(&mut s[i]) {
+                i += 1;
+                continue;
+            }
+            match &mut s[i] {
+                IrStmt::If { cond, then, elsifs, else_, .. } => {
+                    cond_let(cond);
+                    walk(then);
+                    for (_, b) in elsifs.iter_mut() { walk(b); }
+                    walk(else_);
+                }
+                IrStmt::While { cond, body, .. } | IrStmt::DoWhile { body, cond, .. } => {
+                    cond_let(cond);
+                    walk(body);
+                }
+                IrStmt::Block(b) | IrStmt::Subshell(b) => walk(b),
+                IrStmt::Function { body, .. } => walk(body),
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    walk(stmts)
+}
+
+/// Collect every SCALAR variable name the statement list WRITES (plain
+/// Assign targets, setVar stores, read-normalised assigns). Returns false
+/// when the body uses constructs the subshell-isolation lowering cannot
+/// snapshot: array/hash writes, declarations, function definitions, unset.
+fn collect_scalar_writes(stmts: &[IrStmt], out: &mut Vec<String>) -> bool {
+    for s in stmts {
+        let ok = match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                for tgt in targets {
+                    if !tgt.indices.is_empty() || tgt.sigil.is_some() {
+                        return false;
+                    }
+                    out.push(tgt.var.clone());
+                }
+                collect_scalar_writes_expr(expr, out)
+            }
+            IrStmt::Expr(e) => collect_scalar_writes_expr(e, out),
+            IrStmt::Output { value, .. } => collect_scalar_writes_expr(value, out),
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                collect_scalar_writes_expr(cond, out)
+                    && collect_scalar_writes(then, out)
+                    && else_.iter().all(|_| true)
+                    && collect_scalar_writes(else_, out)
+                    && elsifs.iter().map(|(_, b)| b).all(|b| collect_scalar_writes(b, out))
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { body, cond, .. } => {
+                collect_scalar_writes_expr(cond, out) && collect_scalar_writes(body, out)
+            }
+            IrStmt::For { var, iter, body } => {
+                out.push(var.clone());
+                collect_scalar_writes_expr(iter, out) && collect_scalar_writes(body, out)
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) => collect_scalar_writes(b, out),
+            IrStmt::Pipeline { stages, .. } => stages.iter().all(|st| collect_scalar_writes(st, out)),
+            IrStmt::Function { .. } | IrStmt::Declare { .. } | IrStmt::DeclareArray { .. } => false,
+            // ForInit/Case/Try/Redirect/background etc.: conservative fallback
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+fn collect_scalar_writes_expr(e: &IrExpr, out: &mut Vec<String>) -> bool {
+    match e {
+        IrExpr::Call { func, args } => {
+            if func == "setVar" || func == "setArray" || func == "setArrayAppend" {
+                return false; // dynamic/array stores — not snapshotted
+            }
+            args.iter().all(|a| collect_scalar_writes_expr(a, out))
+        }
+        IrExpr::Var(_, _) | IrExpr::Str(_, _) | IrExpr::Int(_) | IrExpr::Bool(_) => true,
+        IrExpr::Arith(a) => {
+            // arith assignments inside expressions write dynamically
+            !matches!(a.as_ref(), ArithAst::Assign { .. } | ArithAst::IncDec { .. })
+                || {
+                    return false;
+                }
+        }
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            collect_scalar_writes_expr(lhs, out) && collect_scalar_writes_expr(rhs, out)
+        }
+        IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+            InterpPart::Lit(_) => true,
+            InterpPart::Expr(x) => collect_scalar_writes_expr(x, out),
+        }),
+        IrExpr::Ext(n) => n.children().iter().all(|c| collect_scalar_writes_expr(c, out)),
+        IrExpr::Capture { .. } => false,
+        _ => true,
+    }
+}
+
+/// Construct normalisations for statement-level exec calls
+/// (docs/shir-reductions.md §Normalisation transforms).
+fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
+    // `local v=…` / `local v` — the parser lowers these to Declare{local}
+    // before transforms run. Our flat variable model has one scope per
+    // program, so a local declaration IS an assignment (bash: the var is
+    // created/overwritten for the function's lifetime; the corpus never
+    // relies on shadow-restore).
+    if let IrStmt::Declare { vars, init, local: true } = stmt {
+        let mut stmts: Vec<IrStmt> = Vec::new();
+        for v in vars {
+            let expr = init.clone()
+                .unwrap_or_else(|| IrExpr::Str(String::new(), StrStyle::DoubleQuoted));
+            stmts.push(IrStmt::Assign {
+                targets: vec![AssignTarget { var: v.name.clone(), sigil: None, indices: vec![] }],
+                expr,
+                asm: None,
+            });
+        }
+        return Some(IrStmt::Block(stmts));
+    }
+
+    // only statement-level exec/builtin calls carry these constructs
+    let (cmd, cmd_args) = match stmt {
+        IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
+            match args.as_slice() {
+                [IrExpr::Str(n, _), IrExpr::Array(a)] => (n.as_str(), a.as_slice()),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let strs: Option<Vec<&str>> = cmd_args.iter().map(|a| match a {
+        IrExpr::Str(s, _) => Some(s.as_str()),
+        IrExpr::Interpolate(p) if p.len() == 1 => match &p[0] {
+            InterpPart::Lit(s) => Some(s.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }).collect();
+
+    // `local v=val …` → plain assigns (flat variable model)
+    if cmd == "local" {
+        let words = strs?;
+        let mut stmts: Vec<IrStmt> = Vec::new();
+        for w in &words {
+            match w.split_once('=') {
+                Some((name, val)) => stmts.push(IrStmt::Assign {
+                    targets: vec![AssignTarget { var: name.to_string(), sigil: None, indices: vec![] }],
+                    expr: IrExpr::Str(val.to_string(), StrStyle::DoubleQuoted),
+                    asm: None,
+                }),
+                None => stmts.push(IrStmt::Assign {
+                    targets: vec![AssignTarget { var: w.to_string(), sigil: None, indices: vec![] }],
+                    expr: IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
+                    asm: None,
+                }),
+            }
+        }
+        return Some(IrStmt::Block(stmts));
+    }
+
+    // `read VAR` (single variable) → Assign{VAR, ReadLine}
+    if cmd == "read" {
+        let words = strs?;
+        if words.len() == 1 && !words[0].starts_with('-') {
+            return Some(IrStmt::Assign {
+                targets: vec![AssignTarget { var: words[0].to_string(), sigil: None, indices: vec![] }],
+                expr: IrExpr::Ext(Box::new(ReadLine {})),
+                asm: None,
+            });
+        }
+        return None; // multi-var / flag shapes fall back explicitly
+    }
+
+    // `let "i=…"` / `let "i<3"` (statement position): assignments become
+    // native arith assigns; bare comparisons are status-only → no-op true.
+    if cmd == "let" {
+        let words = strs?;
+        let mut stmts: Vec<IrStmt> = Vec::new();
+        for w in &words {
+            // an assignment word (`x=expr`, also x+=expr) lowers natively;
+            // a pure comparison in statement position sets $? only
+            if let Some(eq) = w.find('=').filter(|&i| i > 0
+                && w[..i].chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !w[..i].ends_with('<') && !w[..i].ends_with('>')
+                && !w[..i].ends_with('!'))
+            {
+                let (name, rhs) = (&w[..eq], &w[eq + 1..]);
+                let rhs = rhs.strip_prefix('+').unwrap_or(rhs); // += form
+                let ast = crate::shir::parse_arith(rhs)?;
+                stmts.push(IrStmt::Assign {
+                    targets: vec![AssignTarget { var: name.to_string(), sigil: None, indices: vec![] }],
+                    expr: IrExpr::Arith(Box::new(ast)),
+                    asm: None,
+                });
+            } else if crate::shir::parse_arith(w).is_some() {
+                // comparison-only: bash sets $? by the truth value; our
+                // callers use it in conditions (handled at expr level), a
+                // bare statement is a no-op with status 0
+                continue;
+            } else {
+                return None;
+            }
+        }
+        return Some(IrStmt::Block(stmts));
+    }
+
+    None
+}
+
+/// exec("let", [TEXT]) in CONDITION position → native Arith comparison.
+fn try_normalize_let_cond(args: &[IrExpr]) -> Option<IrExpr> {
+    let [IrExpr::Str(n, _), IrExpr::Array(wa)] = args else { return None };
+    if n != "let" { return None; }
+    let [IrExpr::Str(text, _)] = wa.as_slice() else { return None };
+    let_cond_from_text(text)
+}
+
+/// The let-condition core: parse the arithmetic TEXT into a native
+/// comparison. Assignment-shaped text is not a condition.
+fn let_cond_from_text(text: &str) -> Option<IrExpr> {
+    // assignment-shaped text is not a condition
+    if text.contains('=') && !matches!(text.chars().next(), Some(c) if c.is_ascii_digit()) {
+        let body = text.trim_start_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+        if body.starts_with('=') { return None; }
+    }
+    let ast = crate::shir::parse_arith(text)?;
+    Some(IrExpr::Arith(Box::new(ast)))
+}
+
+/// A statement-level `find ARGS` (no pipeline): print each entry path.
+fn try_lower_find_stmt(cmd_args: &[IrExpr]) -> Option<IrStmt> {
+    let (path, tf, md, nf) = parse_find_args(cmd_args)?;
+    Some(IrStmt::Ext(Box::new(WalkDir {
+        source: IrExpr::Str(path, StrStyle::DoubleQuoted),
+        var: "__l".to_string(),
+        body: vec![IrStmt::Output {
+            value: loop_var_read("__l"),
+            newline: true,
+            target: None,
+        }],
+        type_filter: tf,
+        name_filter: nf,
+        maxdepth: md.map(|v| Box::new(IrExpr::Int(v))),
+    })))
 }
 
 /// `grep P F | wc -l` → streaming filtered count. Static args only:

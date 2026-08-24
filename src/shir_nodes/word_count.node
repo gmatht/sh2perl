@@ -1,0 +1,11 @@
+# shir_nodes/word_count.node — word count of a string (bash `wc -w`,
+# literal-string source; whitespace-delimited, /\s+/ equivalent).
+#
+# Backends: JS text.split(/\s+/).filter(w=>w).length, Perl
+# scalar(() = split /\s+/), C inline transition-count scan (_sh_wc_words,
+# no allocation), Go strings.Fields len, Rust split_whitespace().count().
+
+node WordCount
+tag "WordCount"
+kind expr
+field text: expr

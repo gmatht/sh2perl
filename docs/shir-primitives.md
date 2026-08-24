@@ -538,3 +538,71 @@ construct and NO whole-file read appears:
 | js/estree | 7× `sh2.eachLine` | 0 `readFileSync`/`readFile(` | byte-exact |
 | perl | 7× `open my $fh … while(<$fh>)` | none | byte-exact |
 | java | 7× `BufferedReader.readLine` | 0 `readAllBytes/readString/readAllLines` | compiled + run, byte-exact |
+
+### 4. WalkDir — the directory-stream primitive (design, pre-implementation)
+
+`find PATH -type f|-type d [-maxdepth N] [| wc -l]` is the remaining
+dynamic-source family. Its source reads a DIRECTORY TREE, not a file —
+a different leaf than ForEachLine's line reader, so it gets its own
+statement primitive rather than being forced through one:
+
+```
+node WalkDir
+tag "WalkDir"
+field source: expr          # start path (single; multi-path finds fall back)
+field var: string           # loop var: the entry path AS FIND PRINTS IT
+                            # (start-prefixed, "./x" for a "." start)
+field body: stmts           # existing VALUE primitives per entry
+field type_filter: optional_string   # "f" | "d" | None (any)
+field maxdepth: optional_expr        # None = full recursion
+```
+
+Semantics pinned to GNU find: depth-first preorder, entries visited in
+readdir order (count-only consumers can't observe order), `-type f`
+regular files only, `-type d` directories only, `-maxdepth N` stops the
+descent at depth N (start = depth 0). Predicates beyond these (-name,
+-perm, …) are NOT lowered — explicit runtime fallback.
+
+Compositions:
+
+| Pipeline | Reduction |
+|---|---|
+| `find P -type f \| wc -l` | `n=0; WalkDir(P, l, type=f, n+=1)` |
+| `find P -maxdepth 1 -type f \| wc -l` | same + maxdepth=1 |
+| `find P …` (statement) | `WalkDir(P, l, …, Output(l))` |
+
+No-slurp note: directory ENTRIES are metadata (bash materializes nothing
+here either); file CONTENTS are never opened. Backends implement the
+walk once (JS runtime member, Perl opendir-recursion, Java Files.walk,
+Zig recursive iterator); the core decides what `find` means.
+
+#### Extension: `-name GLOB` (glob predicate)
+
+`-name PATTERN` filters entries by their BASE NAME against a shell glob
+(`*`, `?`, `[...]`; no regex). The start point is evaluated against it
+too (GNU parity). Renderers implement glob matching once per backend
+(regex translation at runtime / `fnmatch`-style matcher); patterns are
+carried verbatim in the node (`field name_filter: optional_string`).
+
+#### Extension: bare-find captures (accumulator form)
+
+``x=$(find ARGS)`` has no pipeline to hide the loop in, so the capture
+reducer lowers it to an ACCUMULATOR over the same WalkDir statement:
+
+```
+target=""
+WalkDir(…) { target = target + l + "\n" }
+target = <capture value>          # trailing "\n" stripped like $()
+SetChildError(0)
+```
+
+find exits 0 on success (allowlisted); the trailing-newline strip matches
+command-substitution semantics exactly.
+
+**LANDED** (in that order). All four backends byte-exact vs bash for the
+capture count, `-type d` listing (start point included) and nested walks:
+estree `sh2.walkLines` runtime member (+gate whitelist row), perl
+recursive opendir/readdir callback, java `Files.find`/`Files.walk`
+(start-point parity via find's own root visit), zig list-then-iterate
+(O(tree) metadata, contents never opened). Corpus sweeps stay green in
+both configs.

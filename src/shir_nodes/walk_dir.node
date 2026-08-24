@@ -1,0 +1,18 @@
+# shir_nodes/walk_dir.node — STREAMING directory-tree iteration (find).
+#
+# The directory-source primitive: reduces `find PATH -type f|-type d
+# [-maxdepth N]` and `find … | wc -l` pipelines to a lazy per-entry loop —
+# the tree is walked entry-by-entry (O(depth) memory beyond the loop var),
+# never materialized as a list, and file CONTENTS are never opened.
+# Body statements use the existing VALUE primitives per entry. See
+# docs/shir-primitives.md §WalkDir for the pinned GNU find semantics.
+
+node WalkDir
+tag "WalkDir"
+field source: expr
+field var: string
+field body: stmts
+field type_filter: optional_string
+# -name GLOB (basename glob match); renderers implement fnmatch-style
+field name_filter: optional_string
+field maxdepth: optional_expr

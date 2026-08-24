@@ -12563,7 +12563,7 @@ fn arith_lowerable(a: &ArithAst) -> bool {
 /// arithEval try/catch cannot express the zero-divisor abort once a
 /// native write has already happened — `$((x = 1/0))` must abort BEFORE
 /// the write, only the runtime evaluator orders that).
-fn parse_arith_native(src: &str) -> Option<ArithAst> {
+pub fn parse_arith_native(src: &str) -> Option<ArithAst> {
     let a = parse_arith(src)?;
     if !arith_lowerable(&a) || (arith_has_div_mod(&a) && arith_has_write(&a)) {
         return None;
@@ -18821,13 +18821,18 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     let mut body_stmts: Vec<Stmt> = vec![bind];
                     // Loop-var reads are bare identifiers (the callback
                     // param): register in LIFTED_STRING so Var(name) renders
-                    // natively inside the body, then restore.
+                    // natively inside the body. MUST NOT hold the mutex
+                    // guard across the body render — inner expr_to_estree
+                    // calls is_lifted_str, which re-locks the SAME
+                    // non-reentrant mutex (deadlock). Swap the value
+                    // instead: take → insert → store → render → restore.
                     {
-                        let mut ls = LIFTED_STRING.lock().unwrap();
-                        let mut had = ls.take();
-                        if let Some(ref mut s) = had { s.insert(fl.var.clone()); }
+                        let orig = LIFTED_STRING.lock().unwrap().take();
+                        let mut with_var = orig.clone().unwrap_or_default();
+                        with_var.insert(fl.var.clone());
+                        *LIFTED_STRING.lock().unwrap() = Some(with_var);
                         body_stmts.extend(fl.body.iter().filter_map(stmt_to_estree));
-                        *ls = had;
+                        *LIFTED_STRING.lock().unwrap() = orig;
                     }
                     let cb = Expr::ArrowFunctionExpression {
                         params: vec![var],
@@ -18849,6 +18854,67 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     Some(Stmt::ExpressionStatement {
                         expression: Expr::AwaitExpression {
                             argument: Box::new(crate::estree::sh2_call("eachLine", call_args)),
+                        },
+                    })
+                }
+                "WalkDir" => {
+                    // STREAMING directory walk (docs/shir-primitives.md
+                    // §WalkDir): sh2.walkLines(path, {type,maxdepth}, cb) —
+                    // entries delivered one at a time, contents never read.
+                    let wd = node.as_any().downcast_ref::<crate::shir_nodes::WalkDir>()
+                        .expect("tag/type agree");
+                    let var = crate::estree::ident(&wd.var);
+                    let bind = Stmt::ExpressionStatement {
+                        expression: crate::estree::sh2_call("setVar", vec![
+                            crate::estree::str_lit(&wd.var), var.clone(),
+                        ]),
+                    };
+                    let mut body_stmts: Vec<Stmt> = vec![bind];
+                    // same value-swap discipline as ForEachLine: never hold
+                    // the LIFTED_STRING guard across the body render
+                    {
+                        let orig = LIFTED_STRING.lock().unwrap().take();
+                        let mut with_var = orig.clone().unwrap_or_default();
+                        with_var.insert(wd.var.clone());
+                        *LIFTED_STRING.lock().unwrap() = Some(with_var);
+                        body_stmts.extend(wd.body.iter().filter_map(stmt_to_estree));
+                        *LIFTED_STRING.lock().unwrap() = orig;
+                    }
+                    let cb = Expr::ArrowFunctionExpression {
+                        params: vec![var],
+                        body: ArrowBody::Block(Box::new(Stmt::BlockStatement {
+                            body: body_stmts,
+                        })),
+                        expression: false,
+                        r#async: false,
+                    };
+                    let mut opts_props: Vec<(String, Expr)> = Vec::new();
+                    if let Some(tf) = &wd.type_filter {
+                        opts_props.push(("type".to_string(), crate::estree::str_lit(tf)));
+                    }
+                    if let Some(nf) = &wd.name_filter {
+                        opts_props.push(("name".to_string(), crate::estree::str_lit(nf)));
+                    }
+                    if let Some(md) = &wd.maxdepth {
+                        opts_props.push(("maxdepth".to_string(), expr_to_estree(md)));
+                    }
+                    let _ = &mut opts_props;
+                    let opts = Expr::ObjectExpression {
+                        properties: opts_props.into_iter().map(|(k, v)| Property {
+                            type_: "Property",
+                            key: Expr::Identifier { name: k },
+                            value: v,
+                            kind: "init",
+                            computed: false,
+                            shorthand: false,
+                        }).collect(),
+                    };
+                    Some(Stmt::ExpressionStatement {
+                        expression: Expr::AwaitExpression {
+                            argument: Box::new(crate::estree::sh2_call(
+                                "walkLines",
+                                vec![expr_to_estree(&wd.source), opts, cb],
+                            )),
                         },
                     })
                 }
@@ -33828,6 +33894,13 @@ fn expr_to_estree(e: &IrExpr) -> Expr {
 fn ext_to_native_estree(n: &dyn crate::shir_nodes::ExtExpr) -> Option<Expr> {
     let children: Vec<&IrExpr> = n.children();
     match n.tag() {
+        // ONE line from stdin, newline stripped; EOF → "" (bash read
+        // semantics for the single-variable subset). Awaited — stdin is
+        // async in the JS runtime.
+        "ReadLine" => {
+            let call = crate::estree::sh2_call("readLine", vec![]);
+            Some(Expr::AwaitExpression { argument: Box::new(call) })
+        }
         "StrLen" => {
             let text = children.get(0)?;
             Some(Expr::MemberExpression {
