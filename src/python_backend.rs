@@ -68,6 +68,14 @@ pub struct Render {
     need_inc: bool,
     /// needs the __sh_assign helper (${x:=default} assignment side effect)
     need_assign: bool,
+    /// needs the __sh_ctx_cap fd-level stdout capture context manager
+    need_capfd: bool,
+    /// counter for unique _capN redirect_stdout capture buffers
+    cap_seq: usize,
+    /// >0 while rendering inside a redirect_stdout capture block: nested
+    /// pipelines must CAPTURE their tail stage instead of writing to the
+    /// terminal
+    cap_depth: usize,
     /// needs the `__sh_capture` helper (bash `$()` semantics: stdout only,
     /// trailing newlines stripped, NEVER raises — command-not-found/failure
     /// yields "" and the script continues, like bash)
@@ -1480,6 +1488,25 @@ impl Render {
                             }
                         }
                     }
+                    if cmd == "mapfile" || cmd == "readarray" {
+                        // `mapfile [-t] var` — lines of stdin into a LIST
+                        // (-t strips the trailing newline per line, which
+                        // str.splitlines() does exactly)
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            let targets: Vec<&IrExpr> = items
+                                .iter()
+                                .skip_while(|i| {
+                                    matches!(i, IrExpr::Str(s, _) if s.starts_with('-'))
+                                })
+                                .collect();
+                            if let [IrExpr::Str(v, _)] = targets.as_slice() {
+                                return format!(
+                                    "{} = sys.stdin.read().splitlines()",
+                                    self.py_ident(v)
+                                );
+                            }
+                        }
+                    }
                     if cmd == "unset" {
                         // `unset var` — a NATIVE var re-initializes to ""
                         // (shell unset reads as empty); only runtime-store
@@ -1722,6 +1749,14 @@ impl Render {
                     }
                     if op == "len" {
                         if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            // scalar ${#x}: x may hold an INT (typed vars
+                            // render int) — len() needs the string form;
+                            // arrays keep the direct len
+                            if Self::split_target(name).is_none()
+                                && !self.array_keys.contains_key(name)
+                            {
+                                return format!("str(len(str({})))", self.py_ident(name));
+                            }
                             return format!("str(len({}))", self.py_ident(name));
                         }
                     }
@@ -1847,14 +1882,16 @@ impl Render {
                                     crate::ir::StrStyle::DoubleQuoted,
                                 )],
                             );
+                            // the var may hold an INT (typed vars render
+                            // int) — string methods need the str form
                             match op.as_str() {
-                                "^^" => return format!("{v}.upper()"),
-                                ",," => return format!("{v}.lower()"),
+                                "^^" => return format!("str({v}).upper()"),
+                                ",," => return format!("str({v}).lower()"),
                                 "^" => return format!(
-                                    "({v}[:1].upper() + {v}[1:] if {v} else \"\")"
+                                    "(str({v})[:1].upper() + str({v})[1:] if {v} else \"\")"
                                 ),
                                 _ => return format!(
-                                    "({v}[:1].lower() + {v}[1:] if {v} else \"\")"
+                                    "(str({v})[:1].lower() + str({v})[1:] if {v} else \"\")"
                                 ),
                             }
                         }
@@ -1897,10 +1934,13 @@ impl Render {
                     // \${s:off:len}` — substring slice
                     if op == "slice" {
                         if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            // scalar STRING slice: the var may hold an INT
+                            // (typed vars render int) — subscript the
+                            // string form
                             let v = self.call("getVar", &[IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted)]);
                             let o = self.expr_as_num(&args[2]);
                             let l = self.expr_as_num(&args[3]);
-                            return format!("{v}[{o}:{o}+{l}]");
+                            return format!("str({v})[{o}:{o}+{l}]");
                         }
                     }
                     // \${x##*/} / basename / dirname — native os.path
@@ -1975,7 +2015,9 @@ impl Render {
                                 let p = Self::py_str(pat);
                                 let r = Self::py_str(repl);
                                 let cnt = if op == "/" { "1" } else { "-1" };
-                                return format!("{v}.replace({p}, {r}, {cnt})");
+                                // the var may hold an INT (typed vars
+                                // render int) — str() first
+                                return format!("str({v}).replace({p}, {r}, {cnt})");
                             }
                         }
                     }
@@ -2399,12 +2441,100 @@ impl Render {
             self.need_capture = true;
             return Some(format!("__sh_capture_bash({})", Self::py_str(&text)));
         }
-        if let Some(text) = self.body_shell_text(body) {
-            self.need_subprocess = true;
-            self.need_capture = true;
-            return Some(format!("__sh_capture_bash({})", Self::py_str(&text)));
+        // NATIVE-FIRST CAPTURE FALLBACK — ONLY for bodies that never
+        // write to stdout directly (no bare exec/pipeline): assignments,
+        // file redirects, loop bookkeeping over PYTHON-side state (the
+        // process-substitution temps). Such bodies lose their state under
+        // a bash -c re-render, so they must render natively; the captured
+        // buffer text IS the $(...) value. Bodies WITH direct externals
+        // keep the bash -c escape — exact shell semantics, and their
+        // externals would otherwise bypass the redirect_stdout buffer.
+        // NATIVE-FIRST CAPTURE FALLBACK via FD-LEVEL redirection: the body
+        // renders NATIVELY (assignments, redirects, loops, && groups over
+        // python-side temps — state preserved) while fd 1 points at a temp
+        // file, so BOTH python prints AND external commands land in the
+        // $(...) value. bash $() strips ALL trailing newlines.
+        self.need_capfd = true;
+        self.cap_seq += 1;
+        let fvar = format!("_cap{}f", self.cap_seq);
+        self.emit(&format!(
+            "{fvar} = tempfile.TemporaryFile(mode='w+b')"
+        ));
+        self.emit(&format!("with __sh_ctx_cap({fvar}):"));
+        self.depth += 1;
+        for s in body.iter() {
+            self.stmt(s);
         }
-        None
+        self.depth -= 1;
+        // external stages advanced the SHARED file offset — seek(0)
+        Some(format!(
+            "({fvar}.seek(0) or {fvar}.read().decode(errors='replace').rstrip(\"\\n\"))"
+        ))
+    }
+
+    /// Does this body contain DIRECT stdout-writing externals (bare Exec
+    /// statements / exec-pipeline calls)? Captures (Call{capture}) are
+    /// opaque — their output is consumed by assignment, never leaked.
+    fn body_writes_stdout(&self, body: &[IrStmt]) -> bool {
+        for st in body {
+            match st {
+                IrStmt::Exec { .. } => return true,
+                IrStmt::Expr(e) => {
+                    if self.expr_writes_stdout(e) {
+                        return true;
+                    }
+                }
+                IrStmt::Block(b) => {
+                    if self.body_writes_stdout(b) {
+                        return true;
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => {
+                    if self.body_writes_stdout(inner) {
+                        return true;
+                    }
+                }
+                IrStmt::For { body: b, .. } | IrStmt::While { body: b, .. } => {
+                    if self.body_writes_stdout(b) {
+                        return true;
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    if self.body_writes_stdout(then)
+                        || elsifs.iter().any(|(_, eb)| self.body_writes_stdout(eb))
+                        || self.body_writes_stdout(else_)
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn expr_writes_stdout(&self, e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } => match func.as_str() {
+                "exec" | "pipeline" => true,
+                "capture" | "captureWords" => false,
+                _ => args.iter().any(|a| self.expr_writes_stdout(a)),
+            },
+            IrExpr::Capture { expr, .. } => self.expr_writes_stdout(expr),
+            IrExpr::Arrow(body) => body.iter().any(|s| match s {
+                IrStmt::Exec { .. } => true,
+                IrStmt::Expr(x) => self.expr_writes_stdout(x),
+                _ => false,
+            }),
+            IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+                crate::ir::InterpPart::Expr(x) => self.expr_writes_stdout(x),
+                _ => false,
+            }),
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                self.expr_writes_stdout(lhs) || self.expr_writes_stdout(rhs)
+            }
+            _ => false,
+        }
     }
 
     /// Render an exec-call EXPRESSION tree (BinOp &&/|| chains over exec
@@ -4124,6 +4254,37 @@ impl Render {
                 if handled {
                     return;
                 }
+                // fd-0 READ redirect (`cmd < file`, incl. `< <(…)`) —
+                // swap sys.stdin for the inner statements so read/mapfile/
+                // cat-style stdin consumers see the file
+                let mut stdin_target: Option<String> = None;
+                for r in redirects.iter() {
+                    if r.fd.unwrap_or(1) == 0 && r.mode == "r" {
+                        stdin_target = Some(self.expr(&r.target));
+                    }
+                }
+                if let Some(f) = &stdin_target {
+                    self.need_sys = true;
+                    self.emit(&format!("_sin_save = sys.stdin"));
+                    self.emit(&format!("sys.stdin = open({f})"));
+                    for s in inner.iter() {
+                        self.stmt(s);
+                    }
+                    self.emit("sys.stdin.close()");
+                    self.emit("sys.stdin = _sin_save");
+                    // any fd-1 write redirects still handled below
+                    for r in redirects.iter() {
+                        if r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "a") {
+                            let p = self.expr(&r.target);
+                            let mode = if r.mode == "a" { "'a'" } else { "'w'" };
+                            self.emit(&format!("with open({p}, {mode}) as _f:"));
+                            self.depth += 1;
+                            self.emit("_f.write('')");
+                            self.depth -= 1;
+                        }
+                    }
+                    return;
+                }
                 for s in inner {
                     self.stmt(s);
                 }
@@ -4232,17 +4393,25 @@ impl Render {
                 None => return false,
             };
             let pyargs = argv.join(", ");
-            if i == n - 1 {
+            if i == n - 1 && self.cap_depth == 0 {
+                // statement context: output to the terminal
                 self.emit(&format!(
                     "subprocess.run([{}], input={}, text=True)",
                     pyargs, prev
                 ));
             } else {
+                // capture context ($( ... )) or intermediate stage:
+                // capture and print the yielded text
                 self.emit(&format!(
                     "_p{i} = subprocess.run([{}], input={}, text=True, capture_output=True).stdout",
                     pyargs, prev
                 ));
-                prev = format!("_p{i}");
+                if i == n - 1 {
+                    // sys.stdout.write: inside a redirect_stdout capture
+                    // this lands in the buffer (bash $() semantics);
+                    // at statement level it goes to the terminal
+                    self.emit(&format!("sys.stdout.write(_p{})", i));
+                }
             }
         }
         true
@@ -4368,6 +4537,25 @@ impl Render {
             self.emit("def __sh_assign(var, val):");
             self.emit("    globals()[var] = val");
             self.emit("    return val");
+        }
+        if self.need_capfd {
+            self.emit("");
+            // FD-level stdout capture for $( ...) bodies: BOTH python
+            // prints AND external commands land in the temp file (the
+            // io-level redirect_stdout cannot see subprocess output)
+            self.emit("import contextlib");
+            self.emit("import tempfile");
+            self.emit("@contextlib.contextmanager");
+            self.emit("def __sh_ctx_cap(f):");
+            self.emit("    sys.stdout.flush()");
+            self.emit("    saved = os.dup(1)");
+            self.emit("    os.dup2(f.fileno(), 1)");
+            self.emit("    try:");
+            self.emit("        yield");
+            self.emit("    finally:");
+            self.emit("        sys.stdout.flush()");
+            self.emit("        os.dup2(saved, 1)");
+            self.emit("        os.close(saved)");
         }
         if self.need_capture {
             self.emit("");
