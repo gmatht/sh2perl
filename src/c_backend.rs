@@ -275,6 +275,9 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
     let mut capture_vars = BTreeSet::new();
     collect_capture_vars(&prog.stmts, &mut capture_vars);
+    // in-place split targets are also unbounded: the tokenizer writes
+    // NULs into the var's own storage (a const/bounded decl would break)
+    collect_inplace_split_text_vars(&prog.stmts, &mut capture_vars);
     r.capture_vars = capture_vars;
     r.var_ranges = ranges;
     r.var_widths = widths;
@@ -302,6 +305,69 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
         }
     });
     r.out.join("\n")
+}
+
+/// Var names that are the TEXT operand of any Ext(Split{in_place:true}) —
+/// these must NOT be const-lifted (the in-place tokenizer writes NULs into
+/// their storage; a const declaration would segfault).
+fn collect_inplace_split_text_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    fn walk_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
+        match e {
+            IrExpr::Ext(n) if n.tag() == "Split" => {
+                if let Some(sp) = n.as_any().downcast_ref::<crate::shir_nodes::Split>() {
+                    if sp.in_place {
+                        if let IrExpr::Var(xv, _) = &sp.text {
+                            out.insert(xv.clone());
+                        }
+                    }
+                }
+            }
+            IrExpr::Call { func, args } => {
+                if func == "split" {
+                    if let Some(IrExpr::Var(xv, _)) = args.first() {
+                        out.insert(xv.clone());
+                    }
+                }
+                for a in args { walk_expr(a, out); }
+            }
+            IrExpr::Array(items) => items.iter().for_each(|x| walk_expr(x, out)),
+            _ => {}
+        }
+    }
+    fn walk_stmt(s: &IrStmt, out: &mut BTreeSet<String>) {
+        match s {
+            IrStmt::Expr(e) | IrStmt::Output { value: e, .. } => walk_expr(e, out),
+            IrStmt::Assign { targets, expr, .. } => {
+                walk_expr(expr, out);
+                for t in targets { for i in &t.indices { walk_expr(i, out); } }
+            }
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                walk_expr(cond, out);
+                for b in then { walk_stmt(b, out); }
+                for (_, b) in elsifs { for s in b { walk_stmt(s, out); } }
+                for s in else_ { walk_stmt(s, out); }
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                walk_expr(cond, out);
+                for s in body { walk_stmt(s, out); }
+            }
+            IrStmt::For { iter, body, .. } => {
+                walk_expr(iter, out);
+                for s in body { walk_stmt(s, out); }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages { for s in st { walk_stmt(s, out); } }
+            }
+            IrStmt::Redirect { inner, .. } => {
+                for s in inner { walk_stmt(s, out); }
+            }
+            IrStmt::Block(body) | IrStmt::Background(body) => {
+                for s in body { walk_stmt(s, out); }
+            }
+            _ => {}
+        }
+    }
+    for s in stmts { walk_stmt(s, out); }
 }
 
 impl Render {
@@ -8055,6 +8121,7 @@ impl Render {
         // collect function definitions at ANY depth (a function may be
         // defined inside a block/loop — the shellbench eval benches do).
         collect_fn_defs(&prog.stmts, &mut self.functions, &mut self.fn_defs);
+        // In-place split targets (`for w in $y` where $y feeds a Split)
         // `typeset -i n` / `declare -i n` — the INTEGER ATTRIBUTE must
         // mark the var Int BEFORE the hoist (the decl renders as
         // `long long n` and later `n=n+1` evaluates arith:
