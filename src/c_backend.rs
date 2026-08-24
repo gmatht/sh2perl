@@ -6578,6 +6578,64 @@ impl Render {
     }
 
     fn stmt(&mut self, s: &IrStmt) {
+        // `A || continue` / `A && break` (also exit): a flow statement
+        // inside an and/or chain cannot live in a shell site (the site
+        // rendered `|| 1` and NEVER continued). Peel it: evaluate the
+        // non-flow side natively and branch.
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+            if matches!(func.as_str(), "or" | "and") {
+                let sides: Vec<Vec<IrStmt>> = args
+                    .iter()
+                    .filter_map(|a| match a {
+                        IrExpr::Arrow(sts) => Some(sts.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if sides.len() == 2 {
+                    fn flow_of(sts: &[IrStmt]) -> Option<&'static str> {
+                        match sts.first() {
+                            Some(IrStmt::Expr(IrExpr::Call { func, .. }))
+                                if matches!(func.as_str(), "continue" | "break" | "exit") =>
+                            {
+                                match func.as_str() {
+                                    "continue" => Some("continue"),
+                                    "break" => Some("break"),
+                                    _ => Some("return"),
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
+                    let (flow_side, cond_side) = if flow_of(&sides[1]).is_some() {
+                        (1usize, 0usize)
+                    } else if flow_of(&sides[0]).is_some() {
+                        (0usize, 1usize)
+                    } else {
+                        (2, 1)
+                    };
+                    if flow_side <= 1 {
+                        let flow_kw = flow_of(&sides[flow_side]).unwrap();
+                        let mut v = "1".to_string();
+                        for st in &sides[cond_side] {
+                            match st {
+                                IrStmt::Expr(e) => v = self.expr(e),
+                                other => self.stmt(other),
+                            }
+                        }
+                        // or: flow runs when cond FALSE; and: when TRUE
+                        let guard = if (func == "or") == (flow_side == 1) {
+                            format!("(!({v}))")
+                        } else {
+                            format!("({v})")
+                        };
+                        self.emit(&format!(
+                            "if {guard} {{ {flow_kw}; }}"
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
         // statement-position `printf -v VAR …`: assign NATIVELY instead of
         // losing the assignment in a child bash
         if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
@@ -6623,9 +6681,29 @@ impl Render {
                     // `break || X` — break ALWAYS succeeds, X never runs
                     // (`continue || X` likewise) — the C break/continue
                     // cannot be an expression, so peel the BinOp
-                    IrExpr::BinOp { lhs, op, .. }
+                    IrExpr::BinOp { lhs, op, rhs, .. }
                         if matches!(op, crate::ir::BinOpKind::Or | crate::ir::BinOpKind::And) =>
                     {
+                        // `test || continue` / `test && break`: the flow
+                        // statement cannot live in a shell site (it
+                        // rendered `|| 1` and never flowed) — branch on
+                        // the natively-rendered condition
+                        let flow_kw = match rhs.as_ref() {
+                            IrExpr::Call { func, .. } if func == "continue" => Some("continue"),
+                            IrExpr::Call { func, .. } if func == "break" => Some("break"),
+                            _ => None,
+                        };
+                        if let (Some(kw), true) = (flow_kw, true) {
+                            let is_or = matches!(op, crate::ir::BinOpKind::Or);
+                            let l = self.expr(lhs);
+                            let guard = if is_or {
+                                format!("(!({l}))")
+                            } else {
+                                format!("({l})")
+                            };
+                            self.emit(&format!("if {guard} {{ {kw}; }}"));
+                            return;
+                        }
                         if let IrExpr::Call { func, .. } = lhs.as_ref() {
                             if func == "break" {
                                 self.emit("break;");
