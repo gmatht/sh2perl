@@ -764,6 +764,12 @@ impl JavaCtx {
     /// evaluator; an unparsed shape keeps the v1 `true` fallback).
     fn cond_to_java(&self, cond: &IrExpr, out: &mut String) -> Result<(), String> {
         match cond {
+            IrExpr::Var(name, _) => {
+                // a bare variable condition (the goto restructure's flag
+                // guards): truthiness of the string home — nonempty=true
+                out.push_str(&format!("(!({name} == null || {name}.isEmpty()))"));
+                Ok(())
+            }
             IrExpr::Call { func, .. } if func == "getVar" => {
                 expr_to_java(cond, out)?;
                 out.push_str(" != null");
@@ -1106,6 +1112,12 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
             indent(out, d);
             out.push_str(&format!("{} = ", java_home(&name)));
             out.push_str(&word_to_java(val)?);
+            out.push_str(";\n");
+            Ok(())
+        }
+        IrExpr::Call { func, .. } if func == "break" || func == "continue" => {
+            indent(out, d);
+            out.push_str(func);
             out.push_str(";\n");
             Ok(())
         }
