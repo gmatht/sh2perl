@@ -3633,6 +3633,23 @@ impl Render {
         self.arith_string_site(s)
     }
 
+    /// Shell-text initializers for every KNOWN array whose ident appears
+    /// in the given shell text — the child bash needs them materialized.
+    fn array_inits_for_text(&self, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for n in &self.arrays {
+            let id = self.c_ident(n);
+            if text.contains(&id) {
+                out.push(format!(
+                    "_sh_idx_init(&_sh_cmd, &_sh_cap, {}, {id}, {id}_len);",
+                    Self::cstr(n)
+                ));
+                out.push("_sh_add(\";\");".to_string());
+            }
+        }
+        out
+    }
+
     /// `$N` / `${N}` (positionals), `$#`, `$?` → their numeric C reads.
     /// bash expands these BEFORE the arith parser sees the text.
     fn arith_subst_specials(s: &str) -> String {
@@ -3867,10 +3884,16 @@ impl Render {
     fn test_shell_site(&mut self, s: &str) -> String {
         let s = s.to_string();
         let flat = !s.contains(' ');
+        // arrays the text indexes must be MATERIALIZED into the child
+        // command (`[ "$n" -lt $(( a[1] + a[2] )) ]` — a lives C-side)
+        let arr_inits = self.array_inits_for_text(&s);
         self.shell_site(
-            |r| {
+            move |r| {
                 r.sh_export_vars(&s);
                 r.emit("_sh_reset();");
+                for l in &arr_inits {
+                    r.emit(l);
+                }
                 if flat {
                     r.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[[ {s} ]]"))));
                 } else {
@@ -6300,12 +6323,19 @@ impl Render {
                                 },
                                 false,
                             );
+                            self.emit("{ int _went = 0;");
                             self.emit(&format!("while ({site}) {{"));
                             self.depth += 1;
+                            self.emit("_went = 1;");
                             for s in &body_stmts {
                                 self.stmt(s);
                             }
                             self.depth -= 1;
+                            self.emit("}");
+                            // bash: a while whose condition failed BEFORE
+                            // the first body run exits 0 (the last cond
+                            // rc must not leak into $?)
+                            self.emit("if (!_went) _sh_rc = 0;");
                             self.emit("}");
                         }
                         return;
@@ -6902,12 +6932,18 @@ impl Render {
                 // emits must refresh EVERY iteration, not hoist before
                 // the loop.
                 let c = self.cond_site(cond);
+                self.emit("{ int _went = 0;");
                 self.emit(&format!("while ({c}) {{"));
                 self.depth += 1;
+                self.emit("_went = 1;");
                 for s in body {
                     self.stmt(s);
                 }
                 self.depth -= 1;
+                self.emit("}");
+                // bash: a while whose condition failed BEFORE the first
+                // body run exits 0 (the cond rc must not leak into $?)
+                self.emit("if (!_went) { _sh_rc = 0; }");
                 self.emit("}");
             }
             IrStmt::DoWhile { body, cond, until } => {
