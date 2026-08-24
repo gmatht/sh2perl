@@ -161,6 +161,9 @@ pub struct Render {
     /// the definitions themselves (name, body) — emitted in the
     /// preamble (BEFORE main: C has no nested function definitions).
     fn_defs: Vec<(String, Vec<IrStmt>)>,
+    /// forward declarations for the hoisted functions (emitted before
+    /// their definitions so call order never matters)
+    fn_fwd_decls: Vec<String>,
     /// distinct sh2.* callee names that need stubs
     sh2_calls: BTreeSet<String>,
     need_upper: bool,
@@ -1526,6 +1529,9 @@ impl Render {
                 }
             }
         }
+        // forward declaration: a function may CALL another defined later
+        // (nested defs are hoisted in collection order — 081 inner/outer)
+        self.fn_fwd_decls.push(format!("static void {fname}(void);"));
         self.emit(&format!("static void {fname}(void) {{"));
         self.depth += 1;
         let mut local_lines: Vec<&String> = Vec::new();
@@ -7623,6 +7629,17 @@ impl Render {
         }
         fn_out = std::mem::replace(&mut self.out, saved_out);
         self.fn_defs = fn_defs;
+        // forward declarations head the function block (calls may occur
+        // in any definition order)
+        if !self.fn_fwd_decls.is_empty() {
+            let mut with_fwd: Vec<String> = Vec::new();
+            for d in std::mem::take(&mut self.fn_fwd_decls) {
+                with_fwd.push(d);
+            }
+            with_fwd.push(String::new());
+            with_fwd.extend(fn_out.iter().cloned());
+            fn_out = with_fwd;
+        }
         // fn-locals referenced by site/capture helpers hoist to FILE
         // scope (the helpers are file-scope functions; emit_function
         // already excluded them from the fn's local block)
@@ -7879,6 +7896,12 @@ fn collect_fn_defs(
             IrStmt::Function { name, body, .. } => {
                 names.insert(name.clone());
                 defs.push((name.clone(), body.clone()));
+                // NESTED definitions (`inner()` inside `outer(){}`) are
+                // also functions — bash defines them at CALL time, the C
+                // render hoists them file-scope (081_nested_functions:
+                // the `inner` call shelled out because the name was
+                // never registered)
+                collect_fn_defs(body, names, defs);
             }
             IrStmt::If { then, elsifs, else_, .. } => {
                 collect_fn_defs(then, names, defs);
