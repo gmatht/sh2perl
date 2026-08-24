@@ -6068,7 +6068,11 @@ impl Render {
                         fmt.push_str("%s");
                         // cast: the arg may be a stub call returning
                         // long long — printf("%s", long long) is UB.
-                        cargs.push(format!("(char*)({v})"));
+                        // A NULL char* prints "(null)" (glibc) where bash
+                        // prints "" — guard every %s arg
+                        cargs.push(format!(
+                            "((char*)({v}) ? (char*)({v}) : \"\")"
+                        ));
                     }
                 },
             }
