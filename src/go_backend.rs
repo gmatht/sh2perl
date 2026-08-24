@@ -1368,6 +1368,47 @@ impl Render {
     /// Render a Call as an expression (any-compatible).
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            "line" => {
+                // multi-return line read (`line(cap, N)` = the C frontend's
+                // outparam channel): String(v).split('\n')[N]
+                if let (Some(v), Some(IrExpr::Str(i, _))) = (args.first(), args.get(1)) {
+                    let ve = self.expr_any(v);
+                    let n: usize = i.parse().unwrap_or(0);
+                    // s2s coerces any-typed homes (the capture writes any)
+                    return format!("__sh_line(s2s({ve}), {n})");
+                }
+                self.sh2_stub("line")
+            }
+            "fnValue" | "fnCall" => {
+                // a user-function call — values flow as strings; the
+                // positional-param convention reads fArgs inside
+                let name = args
+                    .first()
+                    .and_then(|a| match a {
+                        IrExpr::Str(nm, _) => Some(self.go_ident(nm)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "sh2TODO".to_string());
+                self.mark_read(
+                    args.first()
+                        .and_then(|a| match a {
+                            IrExpr::Str(nm, _) => Some(nm.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                );
+                self.need_fargs = true;
+                let call_args: Vec<String> = args
+                    .get(1)
+                    .and_then(|a| match a {
+                        IrExpr::Array(elems) => {
+                            Some(elems.iter().map(|e| self.expr_str(e)).collect())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                format!("{name}(&[_]string{{ {} }})", call_args.join(", "))
+            }
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     return self.getvar_any(name);
@@ -1721,6 +1762,39 @@ impl Render {
 
     /// `capture(Arrow)` body → capture lowering.
     fn capture_arrow(&mut self, body: &[IrStmt]) -> String {
+        // The C frontend's outparam channel: capture(Arrow[fnCall(..)]) —
+        // the callee ECHOES its out-param values; the caller captures
+        // STDOUT via a pipe (statement sides + a value expression)
+        if let [IrStmt::Expr(IrExpr::Call { func, args })] = body {
+            if func == "fnCall" || func == "fnValue" {
+                if let Some(IrExpr::Str(nm, _)) = args.first() {
+                    let m = self.go_ident(nm);
+                    self.mark_read(nm);
+                    self.need_fargs = true;
+                    let vals: Vec<String> = args
+                        .get(1)
+                        .and_then(|a| match a {
+                            IrExpr::Array(elems) => {
+                                Some(elems.iter().map(|e| self.expr_str(e)).collect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    self.sides.push(
+                        "__sh_old := os.Stdout; __r, __w, _ := os.Pipe(); os.Stdout = __w"
+                            .to_string(),
+                    );
+                    self.sides.push(format!(
+                        "fArgs = []string{{{}}}; {m}(); fArgs = nil;",
+                        vals.join(", ")
+                    ));
+                }
+                self.sides
+                    .push("__w.Close(); __b, _ := io.ReadAll(__r); os.Stdout = __sh_old"
+                        .to_string());
+                return "s2s(string(__b))".to_string();
+            }
+        }
         if let Some((cmd, argv)) = self.body_single_exec(body) {
             let mut parts = vec![cmd];
             parts.extend(argv);
@@ -3228,7 +3302,9 @@ impl Render {
                 _ => {}
             }
         }
-        let rhs = if self.is_num(&t.var) {
+        // an arith-written var (the goto restructure's flags) hoists as
+        // int64 — its assignments must coerce string values numerically
+        let rhs = if self.is_num(&t.var) || self.arith_ints.contains(&t.var) {
             self.expr_num(expr)
         } else if self.is_str(&t.var) {
             self.expr_str(expr)
@@ -3470,6 +3546,35 @@ impl Render {
     /// let / control-flow calls, then `_ = expr` fallback.
     fn stmt_expr(&mut self, e: &IrExpr) {
         match e {
+            // setVar(name, value) — the frontend-emitted store write: a
+            // native typed assignment (dotted struct names sanitize to
+            // go identifiers; reads route through the same ident_of)
+            IrExpr::Call { func, args } if func == "setVar" => {
+                if let (Some(IrExpr::Str(name, _)), Some(value)) =
+                    (args.first(), args.get(1))
+                {
+                    self.mark_written(name);
+                    let m = self.go_ident(name);
+                    let rhs = if self.is_num(name) {
+                        self.expr_num(value)
+                    } else if self.is_str(name) {
+                        self.expr_str(value)
+                    } else {
+                        self.expr_any(value)
+                    };
+                    self.flush_sides();
+                    let sync = self.sync_inline(name);
+                    self.emit(&format!("{m} = {rhs};{sync}"));
+                    return;
+                }
+                self.mark_todo("setVar");
+            }
+            IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
+                // user-function call in statement position
+                let v = self.expr_any(e);
+                self.flush_sides();
+                self.emit(&format!("_ = {v};"));
+            }
             IrExpr::Call { func, args } if func == "exec" => {
                 if let Some(IrExpr::Str(cmd, _)) = args.first() {
                     if self.exec_builtin_stmt(cmd, args) {
@@ -4396,6 +4501,118 @@ impl Render {
             self.written.insert(n.clone());
             if n.contains('[') {
                 self.arrays.insert(n.clone());
+            }
+        }
+        // Pre-scan: vars written by ARITH assignments / inc-decs anywhere
+        // (cstyleFor steps, the goto restructure's flags) hoist as int64 —
+        // EVERY assignment to them must coerce numerically, including
+        // ones rendered before the arith write is seen (the C frontend's
+        // `j = "0"` init vs `j++` step).
+        {
+            use IrStmt::*;
+            fn note_arith(e: &IrExpr, out: &mut BTreeSet<String>) {
+                if let IrExpr::Arith(a) = e {
+                    match &**a {
+                        ArithAst::Assign { var, .. } | ArithAst::IncDec { var, .. } => {
+                            out.insert(var.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            fn note_str_arith(sv: &str, out: &mut BTreeSet<String>) {
+                for tk in sv.split_whitespace() {
+                    if let Some(base) =
+                        tk.strip_suffix("++").or_else(|| tk.strip_suffix("--"))
+                    {
+                        let base = base.trim_matches('(').trim_matches(')');
+                        if !base.is_empty() {
+                            out.insert(base.to_string());
+                        }
+                    }
+                }
+            }
+            let mut stack: Vec<&IrStmt> = prog.stmts.iter().collect();
+            while let Some(st) = stack.pop() {
+                match st {
+                    Assign { targets, expr, .. } => {
+                        note_arith(expr, &mut self.arith_ints);
+                        if let IrExpr::Call { func: f, args } = expr {
+                            if matches!(f.as_str(), "arith" | "arithEval" | "let" | "fnCall" | "fnValue")
+                            {
+                                for a in args {
+                                    if let IrExpr::Str(sv, _) = a {
+                                        note_str_arith(sv, &mut self.arith_ints);
+                                    }
+                                    if let IrExpr::Array(items) = a {
+                                        for it in items {
+                                            if let IrExpr::Str(sv, _) = it {
+                                                note_str_arith(sv, &mut self.arith_ints);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = targets;
+                        }
+                    }
+                    Expr(IrExpr::Arith(a)) => {
+                        if let ArithAst::Assign { var, .. } | ArithAst::IncDec { var, .. } =
+                            &**a
+                        {
+                            self.arith_ints.insert(var.clone());
+                        }
+                    }
+                    Expr(IrExpr::Call { func, args })
+                        if func == "arith" || func == "arithEval" || func == "let" =>
+                    {
+                        for a in args {
+                            if let IrExpr::Str(sv, _) = a {
+                                note_str_arith(sv, &mut self.arith_ints);
+                            }
+                        }
+                    }
+                    ForInit { init, step, body, .. } => {
+                        for st in init.iter().chain(step.iter()) {
+                            match st {
+                                IrStmt::Assign { expr, .. } | IrStmt::Expr(expr) => {
+                                    note_arith(expr, &mut self.arith_ints);
+                                    if let IrExpr::Call { args, .. } = expr {
+                                        for a in args {
+                                            if let IrExpr::Str(sv, _) = a {
+                                                note_str_arith(sv, &mut self.arith_ints);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        for b in body {
+                            stack.push(b);
+                        }
+                    }
+                    If { then, elsifs, else_, .. } => {
+                        for b in then {
+                            stack.push(b);
+                        }
+                        for (_, b) in elsifs {
+                            for b in b {
+                                stack.push(b);
+                            }
+                        }
+                        for b in else_ {
+                            stack.push(b);
+                        }
+                    }
+                    While { body, .. } | DoWhile { body, .. } | Block(body)
+                    | Subshell(body) | Function { body, .. } => {
+                        for b in body {
+                            stack.push(b);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         // Pre-scan: need_vars (param-expansion reads the vars map) and
@@ -5927,6 +6144,12 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    if len(fArgs) > 0 { return fArgs }",
     "    if len(os.Args) > 1 { return os.Args[1:] }",
     "    return nil",
+    "}",
+    "",
+    "func __sh_line(s string, n int) string {",
+    "    parts := strings.Split(s, \"\\n\")",
+    "    if n >= 0 && n < len(parts) { return parts[n] }",
+    "    return \"\"",
     "}",
     "",
     "func paramAt(i int) string {",

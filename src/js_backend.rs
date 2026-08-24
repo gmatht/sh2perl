@@ -159,10 +159,16 @@ impl Render {
             "eval",
         ];
         if name.is_empty() || JS_KEYWORDS.contains(&name) {
-            format!("{name}_")
-        } else {
-            name.to_string()
+            return format!("{name}_");
         }
+        // sanitize to a valid JS identifier — the C frontend's dotted
+        // struct names ("p.x") must read and write through the SAME
+        // mangled binding
+        let sanitized: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '$' { c } else { '_' })
+            .collect();
+        sanitized
     }
 
     fn js_str(s: &str) -> String {
@@ -668,7 +674,9 @@ impl Render {
             }
             return None; // $0 → argv0 (no standalone equivalent)
         }
-        if is_plain_name(name) {
+        {
+            // dotted struct names ("p.x") and plain names share the
+            // mangled-binding model — known_vars collects setVar targets
             if self.known_vars.contains(name) {
                 return Some(self.js_ident(name));
             }
@@ -1388,16 +1396,17 @@ impl Render {
                         if let (Some(IrExpr::Str(name, _)), Some(value)) =
                             (args.first(), args.get(1))
                         {
-                            if is_plain_name(name) {
-                                let nm = self.js_ident(name);
-                                let v = if self.is_num(name) {
-                                    self.expr_as_num(value)
-                                } else {
-                                    self.expr(value)
-                                };
-                                self.emit(&format!("{nm} = {v};"));
-                                return;
-                            }
+                            // dotted struct names ("p.x") sanitize to a
+                            // shared binding via js_ident — no
+                            // plain-name restriction
+                            let nm = self.js_ident(name);
+                            let v = if self.is_num(name) {
+                                self.expr_as_num(value)
+                            } else {
+                                self.expr(value)
+                            };
+                            self.emit(&format!("{nm} = {v};"));
+                            return;
                         }
                     }
                     // setArray("name", [...]) — a C array literal
@@ -1405,13 +1414,11 @@ impl Render {
                         if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Array(items))) =
                             (args.first(), args.get(1))
                         {
-                            if is_plain_name(name) {
-                                let nm = self.js_ident(name);
-                                let elems: Vec<String> =
-                                    items.iter().map(|e2| self.expr(e2)).collect();
-                                self.emit(&format!("{nm} = [{}];", elems.join(", ")));
-                                return;
-                            }
+                            let nm = self.js_ident(name);
+                            let elems: Vec<String> =
+                                items.iter().map(|e2| self.expr(e2)).collect();
+                            self.emit(&format!("{nm} = [{}];", elems.join(", ")));
+                            return;
                         }
                     }
                 }

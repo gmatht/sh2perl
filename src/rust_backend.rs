@@ -65,6 +65,8 @@ enum Part {
 pub struct Render {
     out: Vec<String>,
     depth: usize,
+    /// inside a hoisted user-function body: Return writes __SH_RET
+    in_function: bool,
     /// var name -> type verdict (A2); missing = Any (runtime store)
     var_types: HashMap<String, IrType>,
     /// vars written anywhere (declared at the top of main)
@@ -4302,6 +4304,45 @@ impl Render {
     /// Non-exec Calls in String context.
     fn call_str(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            // user-function call — the C frontend's value model flows as
+            // strings; functions are rendered as fns taking &mut Vec<String>
+            // out-params or returning String
+            "fnValue" | "fnCall" => {
+                // value-returning user-function call: the argv-swap call
+                // then read __SH_RET (the function's `return expr` home)
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    let m = self.fn_ident(name);
+                    let ws: Vec<String> = args
+                        .get(1)
+                        .and_then(|a| match a {
+                            IrExpr::Array(items) => {
+                                Some(items.iter().map(|w| self.expr_any(w)).collect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    return format!(
+                        "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RET.lock().unwrap().clone() }}",
+                        ws.join(", "),
+                        m
+                    );
+                }
+                "String::new()".to_string()
+            }
+            "line" => {
+                // multi-return line read (`line(cap, N)` = the C frontend's
+                // outparam channel): String(v).split('\n')[N] with "" default
+                self.add_helper("lines");
+                if let (Some(v), Some(IrExpr::Str(i, _))) = (args.first(), args.get(1)) {
+                    let ve = self.expr_any(v);
+                    let n: usize = i.parse().unwrap_or(0);
+                    return format!(
+                        "(__sh_lines(&{ve}).get({n}).cloned().unwrap_or_default())"
+                    );
+                }
+                self.mark_todo("line args");
+                return "String::new()".to_string();
+            }
             "capture" => self.capture_expr(args),
             "captureWords" => {
                 let w = self.capture_words_expr(args);
@@ -4496,6 +4537,45 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => match e {
+                // setVar(name, value) — the frontend-emitted store write:
+                // a typed assignment to the var's thread_local home (the
+                // C frontend's dotted struct names sanitize consistently
+                // for reads via the same rust_ident table)
+                IrExpr::Call { func, args } if func == "setVar" => {
+                    if let (Some(IrExpr::Str(name, _)), Some(value)) =
+                        (args.first(), args.get(1))
+                    {
+                        self.mark_written(name);
+                        let rhs = if self.is_num(name) {
+                            self.expr_num(value)
+                        } else {
+                            self.expr_str(value)
+                        };
+                        let emitted = if self.is_num(name) {
+                            self.write_num(name, &rhs)
+                        } else {
+                            self.write_str(name, &rhs)
+                        };
+                        self.emit(&emitted);
+                    }
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                }
+                IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
+                    // user-function call: the argv-swap convention (the
+                    // callee reads positional params via $1/__sh_arg)
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        let words: Vec<&IrExpr> = args
+                            .get(1)
+                            .and_then(|a| match a {
+                                IrExpr::Array(items) => Some(items.iter().collect()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        let st = self.fn_call_stmt(name, &words);
+                        self.emit(&st);
+                    }
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                }
                 IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_stmt(args),
                 IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
                     self.array_call_stmt_by_name(func, args);
@@ -4972,6 +5052,15 @@ impl Render {
                 self.emit(&format!("std::process::exit(({code}) as i32);"));
             }
             IrStmt::Return(e) => {
+                if self.in_function {
+                    // user-function VALUE return (strings are the value
+                    // model; numeric contexts coerce via __sh_atoi)
+                    let r = e.as_ref().map(|x| self.expr_str(x)).unwrap_or_default();
+                    self.emit(&format!(
+                        "*__SH_RET.lock().unwrap() = {r}; return;"
+                    ));
+                    return;
+                }
                 if let Some(x) = e {
                     let n = self.expr_num(x);
                     self.emit(&format!("__SH_RC.store(({n}) as i32, Ordering::SeqCst); return;"));
@@ -5350,9 +5439,13 @@ impl Render {
             let m = self.fn_ident(name);
             self.emit(&format!("fn {m}() {{"));
             self.depth += 1;
+            // user-function bodies return VALUES via __SH_RET (the C
+            // frontend's `return expr;` — strings are the value model)
+            self.in_function = true;
             for st in body {
                 self.stmt(st);
             }
+            self.in_function = false;
             self.depth -= 1;
             self.emit("}");
             self.emit("");
@@ -5381,6 +5474,7 @@ impl Render {
         self.emit("static __SH_BGPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
         self.emit("static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
         self.emit("static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
+    self.emit("static __SH_RET: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());");
         self.emit("");
         self.out.extend(decl_out.iter().cloned());
         for h in HELPER_ORDER {
@@ -5484,7 +5578,7 @@ const HELPER_ORDER: &[&str] = &[
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
-    "div", "mod", "arith_err", "capture", "run_traps",
+    "div", "mod", "arith_err", "capture", "run_traps", "lines",
 ];
 
 /// `${var}`, `${var:-N}`, `${var:-$other}`, `${arr[i]:-N}` inside an arith
@@ -5543,6 +5637,7 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
     match h {
         "wq" => &["q"],
         "print_words" => &["echo_esc"],
+        "lines" => &[],
         "printf" => &["q", "q_printf", "echo_esc", "atoi", "atou", "atof"],
         "capture_rc" => &["cap_bytes"],
         "run" => &["spawn"],
@@ -5558,6 +5653,9 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
 
 fn helper_source(h: &str) -> &'static str {
     match h {
+        "lines" => r#"fn __sh_lines(s: &str) -> Vec<String> {
+    s.split('\n').map(|x| x.to_string()).collect()
+}"#,
         "q" => r#"fn __sh_q(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 8);
     o.push('\'');
@@ -5752,6 +5850,10 @@ fn helper_source(h: &str) -> &'static str {
                     while j < ch.len() && ch[j].is_ascii_digit() { p.push(ch[j]); j += 1; }
                     prec = Some(p);
                 }
+                // C LENGTH MODIFIERS (`%lld`, `%zu`, `%hhd`) — skip them:
+                // an unconsumed 'l' leaked into the output verbatim
+                // (corpus-c 008_sized_ints printed "4000000000ld")
+                while j < ch.len() && "lhLzjt".contains(ch[j]) { j += 1; }
                 if j >= ch.len() { out.push('%'); break; }
                 let conv = ch[j];
                 i = j + 1;
@@ -8300,6 +8402,12 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             }
         }
         IrExpr::Call { func, args } => {
+            // setVar(name, _) — the frontend-emitted store write writes name
+            if func == "setVar" {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    out.insert(name.clone());
+                }
+            }
             // `assign(name, op, val)` — the arith-assignment writes name
             if func == "assign" {
                 if let Some(name) = str_arg(args, 0) {

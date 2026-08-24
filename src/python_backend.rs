@@ -902,7 +902,14 @@ impl Render {
             ArithAst::Var(name) | ArithAst::Ident(name) => {
                 // bash coerces arith operands to integers; python would
                 // string-repeat/double a str loop var, so wrap the read.
-                // (int() of an int-typed var is a no-op.)
+                // (int() of an int-typed var is a no-op.) A STORE-resident
+                // name (dotted struct fields — the C frontend flattens
+                // p.x to a store key) has no native binding: read via the
+                // store and coerce.
+                if self.store_written.contains(name) {
+                    self.sh2_calls.insert("getVar".into());
+                    return format!("__sh_atoi(sh2_getVar({}))", Self::py_str(name));
+                }
                 format!("int({})", self.py_ident(name))
             }
             ArithAst::Index { .. } => {
@@ -1045,6 +1052,23 @@ impl Render {
 
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            // arrayStore(name, idx, val) — the C frontend's array element
+            // write: pad the python list to the (dynamic) index, assign
+            "arrayStore" => {
+                if let (Some(IrExpr::Str(name, _)), Some(idx), Some(val)) =
+                    (args.first(), args.get(1), args.get(2))
+                {
+                    let m = self.py_ident(name);
+                    let i = self.expr(idx);
+                    let v = self.expr(val);
+                    self.emit(&format!("while len({m}) <= int({i}): {m}.append('')"));
+                    self.emit(&format!("{m}[int({i})] = {v}"));
+                    return "None".into();
+                }
+                self.sh2_stub("arrayStore", args, "arrayStore")
+            }
+            // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+            // python `PAT in STR`.
             "capture" => {
                 // The C frontend's outparam channel: capture(Arrow[
                 // fnCall(..)]) — the callee echoes its out-params, the
@@ -1227,10 +1251,17 @@ impl Render {
                         .get(1)
                         .map(|a| self.expr(a))
                         .unwrap_or_else(|| "\"\"".into());
+                    // store residency wins: a name written via setVar
+                    // anywhere reads back through the store — dotted
+                    // struct names ("c.hits") have no native binding
+                    if self.store_written.contains(name) {
+                        self.sh2_calls.insert("setVar".into());
+                        return format!("sh2_setVar({}, {value})", Self::py_str(name));
+                    }
                     if self.var_types.contains_key(name) {
                         return format!("{} = {value}", self.py_ident(name));
                     }
-                    if self.store_written.contains(name) && Self::is_plain_name(name) {
+                    if Self::is_plain_name(name) {
                         self.sh2_calls.insert("setVar".into());
                         return format!("sh2_setVar({}, {value})", Self::py_str(name));
                     }
@@ -1447,25 +1478,28 @@ impl Render {
             // (the C array `a[4]`); untyped names keep the runtime store.
             "setArray" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    if self.var_types.contains_key(name) {
-                        let elems = args
-                            .get(1)
-                            .map(|a| self.expr(a))
-                            .unwrap_or_else(|| "[]".into());
-                        return format!("{} = {elems}", self.py_ident(name));
-                    }
+                    // a native python list home (the C frontend's dynamic
+                    // arrays; element writes/reads are list ops)
+                    let elems = args
+                        .get(1)
+                        .map(|a| self.expr(a))
+                        .unwrap_or_else(|| "[]".into());
+                    return format!("{} = list({elems})", self.py_ident(name));
                 }
                 self.sh2_call("setArray", args)
             }
             "arrayIndex" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    if self.var_types.contains_key(name) {
-                        let key = args
-                            .get(1)
-                            .map(|a| self.expr(a))
-                            .unwrap_or_else(|| "0".into());
-                        return format!("{}[int({key})]", self.py_ident(name));
-                    }
+                    // native list home with a bounds default (bash reads
+                    // an unset element as "")
+                    let key = args
+                        .get(1)
+                        .map(|a| self.expr(a))
+                        .unwrap_or_else(|| "0".into());
+                    let m = self.py_ident(name);
+                    return format!(
+                        "({m}[int({key})] if len({m}) > int({key}) else '')"
+                    );
                 }
                 self.sh2_call("arrayIndex", args)
             }
@@ -2338,6 +2372,27 @@ impl Render {
                     self.mark_todo("array-index assign");
                     return;
                 }
+                // a BAKED array-element target (`a[0] = 4` — the C
+                // frontend's dynamic-array writes arrive as store keys
+                // "a[0]"): pad the python list to the index, then assign.
+                // The matching reads (`a[int(j)]`) are native list reads,
+                // so both sides share one home.
+                if let Some(close) = t.var.find('[') {
+                    if t.var.ends_with(']') {
+                        let base = &t.var[..close];
+                        let k = &t.var[close + 1..t.var.len() - 1];
+                        if let Ok(ki) = k.parse::<i64>() {
+                            let m = self.py_ident(base);
+                            self.written.insert(base.to_string());
+                            let rhs = self.expr(expr);
+                            self.emit(&format!(
+                                "while len({m}) <= {ki}: {m}.append('')"
+                            ));
+                            self.emit(&format!("{m}[{ki}] = {rhs}"));
+                            return;
+                        }
+                    }
+                }
                 let name = self.py_ident(&t.var);
                 // `s = s += n` (arith Assign on the same target) → `s += n`
                 // (python forbids assignment inside an expression)
@@ -2396,9 +2451,17 @@ impl Render {
                 self.emit(&format!("{name} = {rhs}"));
             }
             IrStmt::Declare { vars, init, .. } => {
+                // store-resident names (written via sh2_setVar elsewhere)
+                // have NO native home — a raw `p.y = ""` declaration is
+                // an unbound NameError; skip them
+                let vars: Vec<_> = vars
+                    .iter()
+                    .filter(|d| !self.store_written.contains(&d.name))
+                    .collect();
                 let init_expr = init.as_ref().map(|e| self.expr(e));
                 if vars.len() > 1 && init_expr.is_some() {
-                    let names: Vec<String> = vars.iter().map(|d| self.py_ident(&d.name)).collect();
+                    let names: Vec<String> =
+                        vars.iter().map(|d| self.py_ident(&d.name)).collect();
                     self.emit(&format!("{} = {}", names.join(" = "), init_expr.unwrap()));
                 } else {
                     for d in vars {
@@ -2774,6 +2837,15 @@ impl Render {
         let mut body_out = Vec::new();
         std::mem::swap(&mut self.out, &mut body_out);
         for v in &vars {
+            // store-resident names (dotted struct fields written via
+            // sh2_setVar) have no native binding — hoisting `p.y = ""`
+            // would be an unbound NameError
+            if self.store_written.contains(v) || v.contains('[') {
+                // store-resident names and baked array-element keys
+                // ("a[0]" — the C frontend's array writes) have no
+                // native binding
+                continue;
+            }
             let name = self.py_ident(v);
             if self.is_num(v) {
                 self.emit(&format!("{name} = 0"));
