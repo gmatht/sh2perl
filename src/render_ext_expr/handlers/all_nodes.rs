@@ -547,6 +547,26 @@ pub fn split(node: &Split, ctx: &ExprRenderCtx) -> Option<String> {
     }
 }
 
+// ── WordCount ────────────────────────────────────────────────────────
+
+pub fn word_count(node: &WordCount, ctx: &ExprRenderCtx) -> Option<String> {
+    let text = render_text(ctx, &node.text)?;
+    match ctx.backend {
+        Backend::Perl => {
+            Some(format!("scalar(grep {{ length }} split(/\\\\s+/, {}, -1))", text))
+        }
+        Backend::Estree => {
+            Some(format!("({}).split(/\\s+/).filter(w => w).length", text))
+        }
+        Backend::Go => Some(format!("len(strings.Fields({}))", text)),
+        Backend::Rust => Some(format!("{}.split_whitespace().count()", text)),
+        // C: inline transition-count scan — no allocation (the natural
+        // wc -w rendering; a materialised split() is the JS/Perl idiom)
+        Backend::C => Some(format!("_sh_wc_words({})", text)),
+        _ => None,
+    }
+}
+
 // ── ArrayLen ─────────────────────────────────────────────────────────
 
 pub fn array_len(node: &ArrayLen, ctx: &ExprRenderCtx) -> Option<String> {

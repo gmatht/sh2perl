@@ -10,6 +10,7 @@
     pub(crate) mod repeat_str;
     pub(crate) mod field_extract;
     pub(crate) mod char_translate;
+    pub(crate) mod word_count;
     pub(crate) mod reg_count;
     pub(crate) mod string_contains;
     pub(crate) mod cutset_trim;

@@ -178,6 +178,8 @@ pub struct Render {
     heredoc_nl: bool,
     /// emit the _sh_import_env runtime helper (source/eval state pull)
     need_state_import: bool,
+    /// emit the _sh_wc_words word-count helper (WordCount ext node)
+    need_wc_words: bool,
     /// typeset -l / -u vars: every assignment is case-folded
     lower_attrs: Vec<String>,
     upper_attrs: Vec<String>,
@@ -491,6 +493,18 @@ impl Render {
         self.emit("#include <ctype.h>"); // tolower/... in text transforms
         if self.need_stat {
             self.emit("#include <sys/stat.h>");
+        }
+        if self.need_wc_words {
+            // wc -w: inline word-count scan — no allocation
+            self.emit("static long long _sh_wc_words(const char *s) {");
+            self.emit("  long long count = 0; int in_word = 0;");
+            self.emit("  for (; s && *s; s++) {");
+            self.emit("    if (*s == ' ' || *s == '\\t' || *s == '\\n' || *s == '\\r' || *s == '\\f' || *s == '\\v') in_word = 0;");
+            self.emit("    else { if (!in_word) count++; in_word = 1; }");
+            self.emit("  }");
+            self.emit("  return count;");
+            self.emit("}");
+            self.emit("");
         }
         if self.need_state_import {
             // source/eval state pull: import the child's KEY=VALUE dump
@@ -1213,6 +1227,26 @@ impl Render {
                     "0".into()
                 }
             },
+            IrExpr::Ext(n) => {
+                // transform-declared nodes: dispatch by tag. WordCount is
+                // the natural C rendering (inline scan, no allocation);
+                // unknown tags refuse loudly (refuse > guess).
+                match n.tag() {
+                    "WordCount" => {
+                        let kids = crate::shir_nodes::ExtExpr::children(&**n);
+                        let t = kids
+                            .first()
+                            .map(|e| self.value_c(e))
+                            .unwrap_or_else(|| "\"\"".into());
+                        self.need_wc_words = true;
+                        format!("_sh_wc_words({t})")
+                    }
+                    other_tag => {
+                        self.mark_todo(&format!("ext node {}", other_tag));
+                        "0".into()
+                    }
+                }
+            }
             other => {
                 self.mark_todo(&format!("expr {:?}", other));
                 "0".into()
