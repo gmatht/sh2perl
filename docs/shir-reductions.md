@@ -164,7 +164,7 @@ and never append.
 | js/estree | `sh2.eachLine(src, (l) => {…}, limit?)` — readline over createReadStream in the runtime | ✅ byte-exact vs bash |
 | perl | `open my $fh,'<',src or die; while (my $l = <$fh>) { chomp $l; … } close $fh;` — fresh per-loop handle, loop vars never scalar-hoisted | ✅ byte-exact vs bash |
 | java | `try (BufferedReader __r = new BufferedReader(new FileReader(src))) { String l; while ((l = __r.readLine()) != null) { … } }` (+ counter break for limit) | ✅ compiled + run, byte-exact vs bash |
-| zig | reader loop — IrStmt::Ext still panics (documented gap below) | ❌ pending |
+| zig | `openFile` + `takeDelimiter('\n')` reader loop (capture→loop-var bind; counter break for limit) + sh2* primitive helpers (Contains/Sub/Case/ReplaceLit-literal/Fields/TakeLines/Basename/Dirname/TrimSides); regex patterns refuse → runtime | ✅ compiled + run, byte-exact vs bash |
 
 **Scope boundary (updated):** capture-internal reduction NO LONGER falls
 back wholesale — `try_reduce_capture_assign` reduces the ASSIGN's
