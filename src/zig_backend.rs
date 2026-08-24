@@ -259,7 +259,12 @@ impl Render {
     }
 
     fn is_num(&self, name: &str) -> bool {
-        self.var_types.get(name).copied() == Some(IrType::Int)
+        // the C frontend emits the SIZED kinds (Int32/Int64/UInt32/...)
+        // — a widthless Int alone left every typed var string-homed
+        matches!(
+            self.var_types.get(name),
+            Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
+        )
     }
 
     fn is_str(&self, name: &str) -> bool {
@@ -417,12 +422,12 @@ impl Render {
                 }
                 let m = self.zig_ident(name);
                 self.mark_read(name);
-                if self.is_str(name) {
-                    m
-                } else {
+                if self.is_num(name) {
+                    // an INT-homed var read in string context converts
                     self.need_intstr = true;
-                    format!("sh2IntStr({m})")
+                    return format!("sh2IntStr({m})");
                 }
+                m
             }
             IrExpr::Ident(name) => {
                 if !self.declared(name) {
@@ -828,13 +833,17 @@ impl Render {
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     if self.is_num(name) {
-                        ('d', self.expr_num(e))
-                    } else {
-                        ('s', self.expr_str(e))
+                        return ('d', self.expr_num(e));
                     }
-                } else {
-                    ('s', self.expr_str(e))
+                    // a DECLARED non-num var homes as a string — print it
+                    // raw (sh2IntStr would wrap a []const u8 in an i64
+                    // conversion and fail to compile)
+                    if self.declared(name) {
+                        return ('s', self.zig_ident(name));
+                    }
+                    return ('s', self.expr_str(e));
                 }
+                ('s', self.expr_str(e))
             }
             _ => ('s', self.expr_str(e)),
         }
@@ -906,6 +915,10 @@ impl Render {
                     "**" => format!("std.math.pow(i64, {l}, {r})"),
                     "&&" => format!("@intFromBool(({l} != 0) and ({r} != 0))"),
                     "||" => format!("@intFromBool(({l} != 0) or ({r} != 0))"),
+                    // zig signed ints forbid `%`/`/` truncation operators —
+                    // C semantics are truncated division/remainder (@rem)
+                    "/" => format!("@divTrunc({l}, {r})"),
+                    "%" => format!("@rem({l}, {r})"),
                     "==" | "!=" | "<" | ">" | "<=" | ">=" => {
                         format!("@intFromBool({l} {op} {r})")
                     }
@@ -1464,8 +1477,19 @@ impl Render {
                         let v = self.zig_ident(var);
                         self.mark_read(var);
                         let d = delta.unsigned_abs();
-                        let zop = if *delta >= 0 { "+" } else { "-" };
-                        self.emit(&format!("{v} {zop}= {d};"));
+                        // a STRING-homed var (the C frontend's value model
+                        // for untyped locals) coerces via sh2ToInt
+                        if self.is_num(var) {
+                            let zop = if *delta >= 0 { "+" } else { "-" };
+                            self.emit(&format!("{v} {zop}= {d};"));
+                        } else {
+                            // the value model is strings: convert back
+                            self.need_intstr = true;
+                            let op = if *delta >= 0 { "+" } else { "-" };
+                            self.emit(&format!(
+                                "{v} = sh2IntStr(sh2ToInt({v}) {op} {d});"
+                            ));
+                        }
                         return;
                     }
                     if let ArithAst::Assign { var, op, rhs } = &**a {
