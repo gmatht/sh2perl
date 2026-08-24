@@ -2126,9 +2126,13 @@ impl Render {
                             if let [IrStmt::Expr(e)] = body.as_slice() {
                                 if let IrExpr::Call { func, args } = e {
                                     if func == "exec" {
-                                        let argv = self.build_argv(args);
-                                        parts.push(argv.join(" "));
-                                        simple = true;
+                                        // SHELL words (sh_arg), not python
+                                        // expr() — f-strings leaked into
+                                        // the bash -c text ('fhello')
+                                        if let Some(w) = self.expr_shell_text(e) {
+                                            parts.push(w);
+                                            simple = true;
+                                        }
                                     }
                                 }
                             }
@@ -2148,8 +2152,9 @@ impl Render {
                     }
                     if !parts.is_empty() {
                         self.need_subprocess = true;
+                        self.need_capture = true;
                         return format!(
-                            "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
+                            "__sh_capture_bash({})",
                             Self::py_str(&parts.join(" | "))
                         );
                     }
@@ -2242,10 +2247,8 @@ impl Render {
             // the alternative is refusing the whole file.
             if let Some(text) = cmd_str {
                 self.need_subprocess = true;
-                return Some(format!(
-                    "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
-                    Self::py_str(text)
-                ));
+                self.need_capture = true;
+                return Some(format!("__sh_capture_bash({})", Self::py_str(text)));
             }
             let stage_arrows: Vec<IrExpr> =
                 stages.iter().map(|s| IrExpr::Arrow(s.clone())).collect();
@@ -2549,10 +2552,8 @@ impl Render {
             text.push_str(&self.redirect_shell_text(r)?);
         }
         self.need_subprocess = true;
-        Some(format!(
-            "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
-            Self::py_str(&text)
-        ))
+        self.need_capture = true;
+        Some(format!("__sh_capture_bash({})", Self::py_str(&text)))
     }
 
     /// `exec printf FMT ARGS...` → native `sys.stdout.write`, mirroring
