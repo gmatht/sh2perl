@@ -1019,11 +1019,13 @@ exit $main_exit_code;
             // the shared core pipeline (mirrors the --shir-in-estree arm):
             // strip_cfor lowers the C-style ForInit (step spliced before
             // every continue), restructure_goto_only folds goto/label
-            // pairs, process_subst materializes captures.
+            // pairs (cpp-sh-go t29_goto.cc — the un-restructured Goto hit
+            // the renderer's todo arm), process_subst materializes
+            // captures.
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
-            print!("{}", match debashl::java_backend::shir_to_java(&prog) { Ok(s) => s, Err(e) => { eprintln!("render: {}", e); std::process::exit(1); } });
+            print!("{}", debashl::c_backend::shir_to_c(&prog));
         }
 "--shir-in-perl" => {
             if args.len() < 3 { println!("Error: --shir-in-perl requires input"); return; }

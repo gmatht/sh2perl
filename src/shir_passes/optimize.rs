@@ -1770,6 +1770,19 @@ fn collect_arith_read_names(a: &ArithAst, out: &mut Vec<String>) {
 
 /// guard names: `declare -p x` / `export x` / `readonly x` exec args.
 fn collect_decl_guard(st: &IrStmt, out: &mut HashSet<String>) {
+    // declaration builtins arrive in TWO shapes — the legacy Exec with
+    // the whole command line as one string, and the A1 builtin Call
+    // (`[cmd, words…]`). Both must guard their name operands, or DSE
+    // deletes stores that `export NAME` makes observable
+    // (`X=…; export X; perl -e 'print $ENV{X}'` lost the store).
+    let mut guard_word = |w: &str, out: &mut HashSet<String>| {
+        if w.starts_with('-') || w.contains('=') {
+            return;
+        }
+        if w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !w.is_empty() {
+            out.insert(w.to_string());
+        }
+    };
     match st {
         IrStmt::Exec { args, .. } => {
             for a in args {
@@ -1778,11 +1791,25 @@ fn collect_decl_guard(st: &IrStmt, out: &mut HashSet<String>) {
                         || s.starts_with("readonly") || s.starts_with("typeset")
                     {
                         for w in s.split_whitespace() {
-                            if let Some(n) = w.strip_prefix("-p") {
-                                if !n.is_empty() {
-                                    out.insert(n.to_string());
-                                }
+                            if w.ends_with("-p") || w == "-p" {
+                                continue;
                             }
+                            guard_word(w, out);
+                        }
+                    }
+                }
+            }
+        }
+        IrStmt::Expr(IrExpr::Call { func, args })
+            if func == "exec" || func == "builtin" =>
+        {
+            let is_decl = matches!(args.first(), Some(IrExpr::Str(c, _))
+                if c == "export" || c == "declare" || c == "readonly" || c == "typeset");
+            if is_decl {
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for w in items {
+                        if let IrExpr::Str(ws, _) = w {
+                            guard_word(ws, out);
                         }
                     }
                 }
