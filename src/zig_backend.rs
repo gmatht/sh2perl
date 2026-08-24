@@ -1523,6 +1523,12 @@ impl Render {
                 // pattern must be a LITERAL (no regex metachars) — zig has
                 // no std regex; real regexes fall back to the runtime.
                 let n = node.as_any().downcast_ref::<crate::shir_nodes::RegSub>()?;
+                // the command-substitution newline strip (`\n+$`, first
+                // only) is a NAMED primitive here: trim trailing newlines
+                if !n.global && n.pattern == "\n+$" {
+                    self.need_ext = true;
+                    return Some(format!("sh2TrimRightNl({})", child(self, 0)?));
+                }
                 if n.pattern.chars().any(|c| ".*+?[](){}|^$\\\\".contains(c) || c == '"') {
                     return None;
                 }
@@ -1667,22 +1673,34 @@ impl Render {
                     Some(e) => self.expr_num(e),
                     None => "0".into(),
                 };
+                let nf = match &wd.name_filter {
+                    Some(x) => Self::zig_str(x),
+                    None => "\"\"".to_string(),
+                };
+                self.need_ext = true; // sh2GlobName fn
                 self.mark_written(&wd.var);
                 self.mark_read(&wd.var);
                 self.var_types.insert(wd.var.clone(), IrType::Str);
                 self.emit("{");
                 self.emit(&format!("    var __wl{}: std.ArrayList([]const u8) = .empty;", n));
                 self.emit(&format!("    const W{} = struct {{", n));
-                self.emit("        fn matches(t: []const u8, isdir: bool) bool {");
-                self.emit("            if (t.len == 0) return true;");
-                self.emit("            if (std.mem.eql(u8, t, \"d\")) return isdir;");
-                self.emit("            return !isdir;");
+                self.emit("        fn matches(t: []const u8, nm: []const u8, full: []const u8, isdir: bool) bool {");
+                self.emit("            // -name GLOB on the BASE NAME (independent of -type)");
+                self.emit("            if (nm.len != 0) {");
+                self.emit("                const bn = if (std.mem.lastIndexOfScalar(u8, full, '/')) |ix| full[ix + 1 ..] else full;");
+                self.emit("                if (!sh2GlobName(nm, bn)) return false;");
+                self.emit("            }");
+                self.emit("            if (t.len != 0) {");
+                self.emit("                if (std.mem.eql(u8, t, \"d\") != isdir) return false;");
+                self.emit("            }");
+                self.emit("            return true;");
                 self.emit("        }");
-                self.emit("        fn go(al: std.mem.Allocator, io: std.Io, dpath: []const u8, l: *std.ArrayList([]const u8), t: []const u8, max: i64, depth: i64) void {");
+                self.emit("        fn go(al: std.mem.Allocator, io: std.Io, dpath: []const u8, l: *std.ArrayList([]const u8), t: []const u8, nm: []const u8, max: i64, depth: i64) void {");
                 self.emit("            // GNU find evaluates the START point too");
                 self.emit("            blk0: {");
                 self.emit("                const st0 = std.Io.Dir.cwd().statFile(io, dpath, .{}) catch break :blk0;");
-                self.emit("                if (matches(t, st0.kind == .directory)) l.append(al, dpath) catch return;");
+                self.emit("                const bn0 = if (std.mem.lastIndexOfScalar(u8, dpath, '/')) |ix| dpath[ix + 1 ..] else dpath;");
+                self.emit("                if (matches(t, nm, bn0, st0.kind == .directory)) l.append(al, dpath) catch return;");
                 self.emit("            }");
                 self.emit("            if (max != 0 and depth >= max) return;");
                 self.emit("            var d = std.Io.Dir.cwd().openDir(io, dpath, .{ .iterate = true }) catch return;");
@@ -1691,14 +1709,14 @@ impl Render {
                 self.emit("            while (it.next(io) catch return) |e| {");
                 self.emit("                const full = std.fmt.allocPrint(al, \"{s}/{s}\", .{ dpath, e.name }) catch continue;");
                 self.emit("                const isdir = (e.kind == .directory);");
-                self.emit("                if (matches(t, isdir)) l.append(al, full) catch continue;");
-                self.emit("                if (isdir and (max == 0 or depth + 1 < max)) go(al, io, full, l, t, max, depth + 1);");
+                self.emit("                if (matches(t, nm, e.name, isdir)) l.append(al, full) catch continue;");
+                self.emit("                if (isdir and (max == 0 or depth + 1 < max)) go(al, io, full, l, t, nm, max, depth + 1);");
                 self.emit("            }");
                 self.emit("        }");
                 self.emit("    }.go;");
                 self.emit(&format!(
-                    "    W{}(std.heap.page_allocator, init.io, {}, &__wl{}, \"{tf}\", {md}, 0);",
-                    n, src, n, tf = tf, md = md
+                    "    W{}(std.heap.page_allocator, init.io, {}, &__wl{}, \"{tf}\", {nf}, {md}, 0);",
+                    n, src, n, tf = tf, nf = nf, md = md
                 ));
                 self.emit(&format!(
                     "    for (__wl{}.items) |__ln{}| {{",
@@ -2533,6 +2551,42 @@ impl Render {
             self.emit("    const i = std.mem.lastIndexOfScalar(u8, t, '/') orelse return \".\";");
             self.emit("    if (i == 0) return \"/\";");
             self.emit("    return t[0..i];");
+            self.emit("}");
+            self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
+            self.emit("    var s = t;");
+            self.emit("    while (s.len > 0 and s[s.len - 1] == '\\n') s = s[0 .. s.len - 1];");
+            self.emit("    return s;");
+            self.emit("}");
+            self.emit("fn sh2GlobName(pat: []const u8, name: []const u8) bool {");
+            self.emit("    // fnmatch-style: * ? [cls] — recursive matcher, no regex");
+            self.emit("    if (pat.len == 0) return name.len == 0;");
+            self.emit("    if (pat[0] == '*') {");
+            self.emit("        var k: usize = 0;");
+            self.emit("        while (k <= name.len) : (k += 1) {");
+            self.emit("            if (sh2GlobName(pat[1..], name[k..])) return true;");
+            self.emit("        }");
+            self.emit("        return false;");
+            self.emit("    }");
+            self.emit("    if (name.len == 0) return false;");
+            self.emit("    if (pat[0] == '?') return sh2GlobName(pat[1..], name[1..]);");
+            self.emit("    if (pat[0] == '[') {");
+            self.emit("        const close = std.mem.indexOfScalar(u8, pat, ']') orelse return false;");
+            self.emit("        if (close < 2) return false;");
+            self.emit("        var body = pat[1..close];");
+            self.emit("        const negate = body[0] == '!' or body[0] == '^';");
+            self.emit("        if (negate) body = body[1..];");
+            self.emit("        var hit = false;");
+            self.emit("        var bi: usize = 0;");
+            self.emit("        while (bi < body.len) : (bi += 1) {");
+            self.emit("            if (bi + 2 < body.len and body[bi + 1] == '-') {");
+            self.emit("                if (name[0] >= body[bi] and name[0] <= body[bi + 2]) hit = true;");
+            self.emit("                bi += 2;");
+            self.emit("            } else if (body[bi] == name[0]) hit = true;");
+            self.emit("        }");
+            self.emit("        if (hit != negate) return sh2GlobName(pat[close + 1 ..], name[1..]);");
+            self.emit("        return false;");
+            self.emit("    }");
+            self.emit("    return pat[0] == name[0] and sh2GlobName(pat[1..], name[1..]);");
             self.emit("}");
             self.emit("fn sh2TrimSides(t: []const u8, lead: bool, trail: bool) []const u8 {");
             self.emit("    var s = t;");

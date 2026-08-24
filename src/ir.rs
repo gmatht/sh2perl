@@ -2595,11 +2595,14 @@ fn perl_lhs_for(var: &str) -> String {
         return format!("$ENV{{{}}}", var);
     }
     let (base, idx) = split_indexed_var(var);
+    // dotted struct-field names sanitize exactly like var_read's
+    // fallback (`p.x` → `$p_x`) — the read must hit the same home
+    let base = base.replace('.', "_").replace('-', "_");
     match idx {
         Some(i) => format!(
             "${}{{\"{}\"}}",
             base,
-            i.replace('\"', "\\\"").replace('\'', "\\'"),
+            i.replace('\"', "\\\\\"").replace('\'', "\\\\'"),
             ),
         None => format!("${}", base),
     }
@@ -2633,10 +2636,18 @@ fn var_read(name: &str) -> String {
         "?" => "$CHILD_ERROR".to_string(),
         "@" | "*" => "@ARGV".to_string(),
         "$" => "$$".to_string(),
-        _ if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
+        _ if !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+        {
             format!("${}", name)
         }
-        _ => format!("${{{}}}", name),
+        // dotted struct-field names (the C frontend flattens p.x to a
+        // store key) sanitize to a valid identifier — `${p.x}` is a
+        // syntax error in Perl
+        _ => {
+            let m = name.replace('.', "_").replace('-', "_");
+            format!("${{{m}}}")
+        }
     }
 }
 
@@ -4819,6 +4830,9 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
                     let is_array_rhs =
                         matches!(expr, IrExpr::Call { func, .. } if func == "setArray");
                     let (base, idx) = split_indexed_var(&t.var);
+                    // dotted struct-field names sanitize to a valid perl
+                    // identifier (matches var_read / perl_lhs_for)
+                    let base = base.replace('.', "_").replace('-', "_");
                     let sigil = if is_array_rhs {
                         Sigil::Array
                     } else if idx.is_some() {
@@ -4826,8 +4840,8 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
                     } else {
                         t.sigil.unwrap_or(Sigil::Scalar)
                     };
-                    if !out.iter().any(|(n, _)| n == base) {
-                        out.push((base.to_string(), sigil));
+                    if !out.iter().any(|(n, _)| n == &base) {
+                        out.push((base, sigil));
                     }
                 }
             }
@@ -4858,6 +4872,19 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut Vec<(String, Sigil)>) {
                     out.push((var.clone(), Sigil::Scalar));
                 }
                 collect_assigned_vars(body, out);
+            }
+            // setVar(name, value) — the frontend-emitted store write
+            // (the C frontend's Assign lowering): declare the scalar so
+            // `my $p_x` hoists for the sanitized dotted reads/writes
+            IrStmt::Expr(IrExpr::Call { func, args, .. })
+                if func == "setVar" =>
+            {
+                if let Some(IrExpr::Str(nm, _)) = args.first() {
+                    let base = nm.replace('.', "_").replace('-', "_");
+                    if var_is_declarable(&base) && !out.iter().any(|(n, _)| n == &base) {
+                        out.push((base, Sigil::Scalar));
+                    }
+                }
             }
             IrStmt::While { body, .. }
             | IrStmt::DoWhile { body, .. }

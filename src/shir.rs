@@ -18892,6 +18892,9 @@ fn stmt_to_estree(stmt: &IrStmt) -> Option<Stmt> {
                     if let Some(tf) = &wd.type_filter {
                         opts_props.push(("type".to_string(), crate::estree::str_lit(tf)));
                     }
+                    if let Some(nf) = &wd.name_filter {
+                        opts_props.push(("name".to_string(), crate::estree::str_lit(nf)));
+                    }
                     if let Some(md) = &wd.maxdepth {
                         opts_props.push(("maxdepth".to_string(), expr_to_estree(md)));
                     }

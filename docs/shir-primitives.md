@@ -576,6 +576,29 @@ here either); file CONTENTS are never opened. Backends implement the
 walk once (JS runtime member, Perl opendir-recursion, Java Files.walk,
 Zig recursive iterator); the core decides what `find` means.
 
+#### Extension: `-name GLOB` (glob predicate)
+
+`-name PATTERN` filters entries by their BASE NAME against a shell glob
+(`*`, `?`, `[...]`; no regex). The start point is evaluated against it
+too (GNU parity). Renderers implement glob matching once per backend
+(regex translation at runtime / `fnmatch`-style matcher); patterns are
+carried verbatim in the node (`field name_filter: optional_string`).
+
+#### Extension: bare-find captures (accumulator form)
+
+``x=$(find ARGS)`` has no pipeline to hide the loop in, so the capture
+reducer lowers it to an ACCUMULATOR over the same WalkDir statement:
+
+```
+target=""
+WalkDir(…) { target = target + l + "\n" }
+target = <capture value>          # trailing "\n" stripped like $()
+SetChildError(0)
+```
+
+find exits 0 on success (allowlisted); the trailing-newline strip matches
+command-substitution semantics exactly.
+
 **LANDED** (in that order). All four backends byte-exact vs bash for the
 capture count, `-type d` listing (start point included) and nested walks:
 estree `sh2.walkLines` runtime member (+gate whitelist row), perl

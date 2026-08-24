@@ -203,19 +203,42 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
         // maxdepth: 0 = unlimited; children of a depth-$d dir sit at
         // $d+1 and are visited only while $d+1 <= $max.
         for line in [
+            "sub __sh2_fnmatch {",
+            "    my ($pat, $name) = @_;",
+            "    my $re = '';",
+            "    for my $i (0 .. length($pat)-1) {",
+            "        my $c = substr($pat, $i, 1);",
+            "        if ($c eq '*') { $re .= '[^/]*'; }",
+            "        elsif ($c eq '?') { $re .= '[^/]'; }",
+            "        elsif ($c eq '[') {",
+            "            my $j = $i + 1;",
+            "            $j++ if substr($pat, $j, 1) eq '!' || substr($pat, $j, 1) eq '^';",
+            "            $j++ while $j < length($pat) && substr($pat, $j, 1) ne ']';",
+            "            if ($j >= length($pat)) { $re .= '\\['; next; }",
+            "            my $cls = substr($pat, $i, $j - $i + 1);",
+            "            $cls =~ s/^\\[!/[^/;",
+            "            $re .= $cls; $i = $j;",
+            "        }",
+            "        else { $re .= \"\\Q$c\\E\"; }",
+            "    }",
+            "    return $name =~ /^${re}$/;",
+            "}",
             "sub __sh2_walk {",
-            "    my ($dir, $cb, $type, $max, $depth) = @_;",
-            "    my $ok0 = $type eq '' ? 1 : ($type eq 'f' ? (-f $dir && !-d _) : -d $dir);",
+            "    my ($dir, $cb, $type, $max, $name, $depth) = @_;",
+            "    my $ok0 = ($type eq '' || ($type eq 'f' ? (-f $dir && !-d _) : -d $dir))",
+            "        && ($name eq '' || __sh2_fnmatch($name, $dir));",
             "    $cb->($dir) if $ok0;",
             "    opendir(my $dh, $dir) or return;",
             "    while (my $e = readdir($dh)) {",
             "        next if $e eq '.' || $e eq '..';",
             "        my $full = \"$dir/$e\";",
             "        my $isdir = -d $full;",
-            "        my $ok = $type eq '' ? 1 : ($type eq 'f' ? (-f $full) : $isdir);",
+            "        my $nm = (split('/', $full))[-1];",
+            "        my $ok = ($type eq '' ? 1 : ($type eq 'f' ? (-f $full) : $isdir))",
+            "            && ($name eq '' || __sh2_fnmatch($name, $nm));",
             "        $cb->($full) if $ok;",
             "        if ($isdir && ($max == 0 || $depth + 1 < $max)) {",
-            "            __sh2_walk($full, $cb, $type, $max, $depth + 1);",
+            "            __sh2_walk($full, $cb, $type, $max, $name, $depth + 1);",
             "        }",
             "    }",
             "}",
@@ -1893,6 +1916,10 @@ impl Render {
                     Some(e) => crate::ir::ir_expr_to_perl(e),
                     None => "0".to_string(),
                 };
+                let nf = match &wd.name_filter {
+                    Some(x) => format!("\"{}\"", x.replace('\'', "\\\'")),
+                    None => "''".to_string(),
+                };
                 self.emit(&format!(
                     "__sh2_walk({}, sub {{ {} = shift;",
                     src, lv
@@ -1904,7 +1931,7 @@ impl Render {
                     self.stmt(b);
                 }
                 self.depth -= 1;
-                self.emit(&format!("}}, \"{}\", {}, 0);", tf, md));
+                self.emit(&format!("}}, \"{}\", {}, {}, 0);", tf, md, nf));
             }
             IrStmt::Ext(node) => {
                 if node.tag() == "ForEachLine" {

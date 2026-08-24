@@ -27,6 +27,11 @@ struct JavaCtx {
     block_seq: usize,
     /// a case clause used a glob pattern → sh2Glob helper needed
     need_glob: bool,
+    /// inside a hoisted user-function body: getVar("N") reads the
+    /// positional param `a[N-1]`, Return returns the value
+    in_function: bool,
+    /// user functions hoisted to class level (rendered before main)
+    pending_fns: Vec<String>,
 }
 
 /// Render a ShIR program to Java source. `Err` on a construct outside
@@ -59,6 +64,24 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
     // String field (empty default — bash reads an unset var as "")
     let mut fields: Vec<String> = Vec::new();
     collect_vars(&prog.stmts, &mut fields);
+    let has_fns = prog.stmts.iter().any(|st| {
+        matches!(st, IrStmt::Function { name, .. } if name != "main")
+    });
+    if has_fns {
+        out.push_str("    static String[] __sh_fArgs = new String[0];\n");
+        out.push_str("    static String __sh_fArg(int n) {\n");
+        out.push_str("        String[] a = __sh_fArgs;\n");
+        out.push_str("        return (n >= 1 && n <= a.length) ? a[n - 1] : \"\";\n");
+        out.push_str("    }\n");
+        out.push_str("    static String[] __sh_setArgs(String... a) {\n");
+        out.push_str("        __sh_fArgs = a;\n");
+        out.push_str("        return a;\n");
+        out.push_str("    }\n");
+    }
+    // every assignment target / store / arith read becomes a static
+    // String field (empty default — bash reads an unset var as "")
+    let mut fields: Vec<String> = Vec::new();
+    collect_vars(&prog.stmts, &mut fields);
     for f in fields {
         indent(&mut out, 1);
         out.push_str(&format!("static String {f} = \"\";\n"));
@@ -77,6 +100,9 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
         }
     }
     out.push_str("    }\n");
+    for f in &ctx.pending_fns {
+        out.push_str(f);
+    }
     out.push_str("}\n");
     Ok(out)
 }
@@ -141,6 +167,7 @@ fn collect_vars(stmts: &[IrStmt], out: &mut Vec<String>) {
                 collect_vars_expr(cond, out);
             }
             IrStmt::Block(b) => collect_vars(b, out),
+            IrStmt::Function { body, .. } => collect_vars(body, out),
             _ => {}
         }
     }
@@ -208,9 +235,17 @@ fn collect_vars_arith(a: &ArithAst, out: &mut Vec<String>) {
     }
 }
 
+/// Sanitize a shell var name to a valid Java identifier — the C
+/// frontend's dotted struct names ("p.x") must read and write through
+/// the SAME mangled binding.
+fn java_home(name: &str) -> String {
+    name.replace('.', "_").replace('-', "_")
+}
+
 fn push_var(name: &str, out: &mut Vec<String>) {
-    if is_plain_name(name) && !out.iter().any(|v| v == name) {
-        out.push(name.to_string());
+    let j = java_home(name);
+    if !out.iter().any(|v| *v == j) {
+        out.push(j);
     }
 }
 
@@ -470,6 +505,20 @@ impl JavaCtx {
             }
             IrStmt::Return(v) => {
                 indent(out, d);
+                if self.in_function {
+                    // user-function VALUE return (strings are the value
+                    // model; numeric contexts coerce via sh2Num)
+                    indent(out, d);
+                    match v {
+                        Some(x) => {
+                            let mut r = String::new();
+                            expr_to_java(x, &mut r)?;
+                            out.push_str(&format!("return {r};\n"));
+                        }
+                        None => out.push_str("return \"\";\n"),
+                    }
+                    return Ok(());
+                }
                 match v {
                     Some(x) => {
                         out.push_str("return ");
@@ -563,27 +612,35 @@ impl JavaCtx {
                     Some(x) => x.as_str(),
                     None => "",
                 };
-                if tf.is_empty() {
-                    out.push_str(&format!(
-                        "__w = java.nio.file.Files.walk(java.nio.file.Paths.get({src}), {maxd});
-",
-                        src = src, maxd = maxd
-                    ));
-                } else {
-                    // type filter inside walk: f → regular file, d → dir;
-                    // GNU find evaluates the START too — add it explicitly.
-                    // Files.find evaluates the START too (GNU find parity)
-                    let bi = if tf == "f" {
-                        "(p, a) -> java.nio.file.Files.isRegularFile(p)"
+                let mut preds: Vec<String> = Vec::new();
+                if !tf.is_empty() {
+                    preds.push(if tf == "f" {
+                        "java.nio.file.Files.isRegularFile(p)".to_string()
                     } else {
-                        "(p, a) -> java.nio.file.Files.isDirectory(p)"
-                    };
-                    out.push_str(&format!(
-                        "__w = java.nio.file.Files.find(java.nio.file.Paths.get({src}), {maxd}, {bi});
-",
-                        src = src, bi = bi, maxd = maxd
+                        "java.nio.file.Files.isDirectory(p)".to_string()
+                    });
+                }
+                if let Some(nf) = &wd.name_filter {
+                    // -name GLOB: PathMatcher matches the BASE NAME
+                    self.need_glob = true;
+                    preds.push(format!(
+                        "sh2Glob(p.getFileName().toString(), {})",
+                        java_str_lit(nf)
                     ));
                 }
+                let bi = format!(
+                    "(p, a) -> {}",
+                    if preds.is_empty() {
+                        "true".to_string()
+                    } else {
+                        preds.join(" && ")
+                    }
+                );
+                out.push_str(&format!(
+                    "__w = java.nio.file.Files.find(java.nio.file.Paths.get({src}), {maxd}, {bi});
+",
+                    src = src, maxd = maxd, bi = bi
+                ));
                 indent(out, d);
                 out.push_str("      __w.forEach(p -> {
 ");
@@ -661,22 +718,35 @@ impl JavaCtx {
                 Ok(())
             }
             IrStmt::Function { name, body, .. } => {
+                // HOIST to class level: a `static` method nested inside
+                // main is invalid Java. The fn takes its POSITIONAL
+                // params as `String[] a` (the body's getVar("N") reads —
+                // the $1 convention) and returns the value string.
                 let id = java_ident(name);
-                let ret = if body_has_return(body) {
-                    "String"
-                } else {
-                    "void"
-                };
-                indent(out, d);
-                out.push_str(&format!("static {ret} {id}() {{\n"));
+                let prev = self.in_function;
+                self.in_function = true;
+                let mut saved = std::mem::take(out);
+                let mut fntext = String::new();
+                fntext.push_str(&format!(
+                    "{ind}static String {id}(String[] a) throws Exception {{\n",
+                    ind = "    ".repeat(d)
+                ));
                 for b in body {
-                    self.stmt_to_java(b, d + 1, out)?;
+                    self.stmt_to_java(b, d + 1, &mut fntext)?;
                 }
-                indent(out, d);
-                if ret == "String" {
-                    out.push_str("return \"\";\n");
+                if !body_has_return(body) {
+                    // a void-ish fn still needs a value-return (call sites
+                    // read __SH_RET / discard)
+                    fntext.push_str(&format!(
+                        "{ind}return \"\";\n",
+                        ind = "    ".repeat(d + 1)
+                    ));
                 }
-                out.push_str("}\n");
+                fntext.push_str(&format!("{}}}
+", "    ".repeat(d)));
+                self.pending_fns.push(fntext);
+                self.in_function = prev;
+                *out = saved;
                 Ok(())
             }
             IrStmt::Redirect { inner, redirects } => {
@@ -776,6 +846,29 @@ impl JavaCtx {
                     }
                 }
                 out.push_str("true");
+                Ok(())
+            }
+            // testArith(Str) — the C frontend's arithmetic-truth condition
+            // (`(($i % 2) == 0)`, `($x & 1)`): parse and render via the
+            // Arith AST (a literal `true` made every such cond vacuous)
+            IrExpr::Call { func, args, .. }
+                if func == "testArith" || func == "arith" =>
+            {
+                // the C frontend's arithmetic-truth condition
+                // (`(($i % 2) == 0)`, `($x & 1)`): parse and render via
+                // the Arith AST (a literal `true` made every such cond
+                // vacuous)
+                if let Some(IrExpr::Str(s2, _)) = args.first() {
+                    let norm = norm_arith_text(s2);
+                    if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
+                        let mut r = String::new();
+                        arith_to_java(&ast, &mut r)?;
+                        // condition context: nonzero = true
+                        out.push_str(&format!("(({}) != 0)", r));
+                        return Ok(());
+                    }
+                }
+                out.push_str("false");
                 Ok(())
             }
             IrExpr::Call { func, args, .. } if func == "contains" => {
@@ -997,7 +1090,7 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
             };
             let val = args.get(1).ok_or("setVar without a value (v1)")?;
             indent(out, d);
-            out.push_str(&format!("{name} = "));
+            out.push_str(&format!("{} = ", java_home(&name)));
             out.push_str(&word_to_java(val)?);
             out.push_str(";\n");
             Ok(())
@@ -1330,15 +1423,71 @@ fn arith_need_mem(a: &ArithAst) -> bool {
 
 fn word_to_java(e: &IrExpr) -> Result<String, String> {
     match e {
+        // ternary(cond, a, b) — the C frontend's conditional: the cond is
+        // a test/testArith STRING, branches are lowered values
+        IrExpr::Ternary { cond, then, else_ } => {
+            let mut cc = String::new();
+            match cond.as_ref() {
+                IrExpr::Call { func, args, .. }
+                    if func == "test" || func == "testArith" || func == "arith" =>
+                {
+                    if let Some(IrExpr::Str(sv, _)) = args.first() {
+                        let norm = norm_arith_text(sv);
+                        match crate::shir::parse_arith(norm.trim()) {
+                            Some(ast) => {
+                                arith_to_java(&ast, &mut cc)?;
+                                cc = format!("(({}) != 0)", cc);
+                            }
+                            None => match test_render(sv) {
+                                Some(t) => cc.push_str(&t),
+                                None => cc.push_str("true"),
+                            },
+                        }
+                    }
+                }
+                other => expr_to_java(other, &mut cc)?,
+            }
+            let bt = word_to_java(then)?;
+            let bf = word_to_java(else_)?;
+            return Ok(format!("({cc} ? {bt} : {bf})"));
+        }
+        // fnValue(name, [args]) — a user-function VALUE call: set the
+        // positional-args channel then invoke (the fn reads $1.. via
+        // __sh_fArg)
+        IrExpr::Call { func, args, .. } if func == "fnValue" => {
+            if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Array(items))) =
+                (args.first(), args.get(1))
+            {
+                let vals: Vec<String> = items.iter().map(|w| word_to_java(w)).collect::<Result<_, _>>()?;
+                return Ok(format!(
+                    "{name}(__sh_setArgs(new String[]{{{vals}}}))",
+                    vals = vals.join(", ")
+                ));
+            }
+            Err("fnValue with unsupported shape".into())
+        }
         IrExpr::Str(s, _) => Ok(java_str_lit(s)),
+        // an INT literal in word position is the STRING model (the
+        // value flows as text; %d prints identically)
+        IrExpr::Int(i) => Ok(java_str_lit(&i.to_string())),
         IrExpr::Call { func, args, .. } if func == "getVar" => {
             if let Some(IrExpr::Str(name, _)) = args.first() {
-                Ok(format!("({name} == null ? \"\" : {name})"))
-            } else {
-                Err("getVar with non-literal name (v1)".into())
+                // a DIGIT name is the positional param ($1 convention):
+                // inside hoisted functions this reads __sh_fArg(N)
+                if let Ok(k) = name.parse::<usize>() {
+                    if (1..=9).contains(&k) {
+                        return Ok(format!("__sh_fArg({k})"));
+                    }
+                }
+                let j = java_home(name);
+                return Ok(format!("({j} == null ? \"\" : {j})"));
             }
+            Err("getVar with non-literal name (v1)".into())
         }
-        IrExpr::Var(name, _) => Ok(format!("({name} == null ? \"\" : {name})")),
+        IrExpr::Var(name, _) => {
+            let j = java_home(name);
+            Ok(format!("({j} == null ? \"\" : {j})"))
+        }
         IrExpr::Arith(a) => Ok(format!("Long.toString({})", arith_str(a)?)),
         IrExpr::Call { func, args, .. } if is_mem_func(func) => mem_call_java(func, args),
         IrExpr::Call { func, args, .. } if func == "split" => {
@@ -1407,6 +1556,106 @@ fn word_to_java(e: &IrExpr) -> Result<String, String> {
     }
 }
 
+/// Max positional param index (`getVar("N")`) read anywhere in `body`.
+/// Normalize an arith STRING for parse_arith (`$x`/`${x}` → bare idents).
+fn norm_arith_text(s: &str) -> String {
+    let norm: String = s
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if c == '$'
+                && i + 1 < s.len()
+                && (s[i + 1..].starts_with('{')
+                    || s[i + 1..]
+                        .chars()
+                        .next()
+                        .map_or(false, |n| n.is_ascii_alphabetic() || n == '_'))
+            {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    norm.replace('{', " ").replace('}', " ")
+}
+
+fn collect_max_param(stmts: &[IrStmt], max: &mut usize) {
+    fn scan_expr(e: &IrExpr, max: &mut usize) {
+        if let IrExpr::Call { func, args, .. } = e {
+            if func == "getVar" {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if let Ok(k) = n.parse::<usize>() {
+                        if k > *max {
+                            *max = k;
+                        }
+                    }
+                }
+            }
+            for a in args {
+                scan_expr(a, max);
+            }
+        } else if let IrExpr::Arith(a) = e {
+            scan_arith_param(a, max);
+        }
+    }
+    fn scan_arith_param(a: &ArithAst, max: &mut usize) {
+        match a {
+            ArithAst::Var(name) | ArithAst::Ident(name) => {
+                if let Ok(k) = name.parse::<usize>() {
+                    if k > *max {
+                        *max = k;
+                    }
+                }
+            }
+            ArithAst::Bin { lhs, rhs, .. } => {
+                scan_arith_param(lhs, max);
+                scan_arith_param(rhs, max);
+            }
+            _ => {}
+        }
+    }
+    fn scan_stmt(st: &IrStmt, max: &mut usize) {
+        match st {
+            IrStmt::Assign { targets: _, expr, .. } => scan_expr(expr, max),
+            IrStmt::Expr(e) => scan_expr(e, max),
+            IrStmt::Return(Some(e)) => scan_expr(e, max),
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
+                scan_expr(cond, max);
+                for b in then {
+                    scan_stmt(b, max);
+                }
+                for (_, b) in elsifs {
+                    for x in b {
+                        scan_stmt(x, max);
+                    }
+                }
+                for b in else_ {
+                    scan_stmt(b, max);
+                }
+            }
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+                scan_expr(cond, max);
+                for b in body {
+                    scan_stmt(b, max);
+                }
+            }
+            IrStmt::Block(body) | IrStmt::Function { body, .. } => {
+                for b in body {
+                    scan_stmt(b, max);
+                }
+            }
+            _ => {}
+        }
+    }
+    // walk: find every getVar("N") in the body
+    fn go(st: &IrStmt, max: &mut usize) {
+        scan_stmt(st, max);
+    }
+    let _ = go;
+}
+
+
 fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
     match e {
         IrExpr::Str(s, _) => {
@@ -1415,11 +1664,18 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
         }
         IrExpr::Call { func, args, .. } if func == "getVar" => {
             if let Some(IrExpr::Str(name, _)) = args.first() {
+                // a DIGIT name is the positional param ($1 convention):
+                // inside hoisted user functions this reads __sh_fArg(N)
+                if let Ok(k) = name.parse::<usize>() {
+                    if (1..=9).contains(&k) {
+                        out.push_str(&format!("__sh_fArg({k})"));
+                        return Ok(());
+                    }
+                }
                 out.push_str(name);
-                Ok(())
-            } else {
-                Err("getVar with non-literal name (v1)".into())
+                return Ok(());
             }
+            Err("getVar with non-literal name (v1)".into())
         }
         IrExpr::Call { func, args, .. } if func == "setArray" => {
             // `declare -a arr=(a b c)` — render as a bracketed array string
@@ -1480,6 +1736,15 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
         IrExpr::BinOp { lhs, op, rhs } => {
             // numeric string arithmetic: bash vars are strings, so render
             // through sh2Num coercion then back to a string
+            if *op == crate::ir::BinOpKind::Concat {
+                // string concatenation: both sides are String fields
+                let mut l = String::new();
+                expr_to_java(lhs, &mut l)?;
+                let mut r = String::new();
+                expr_to_java(rhs, &mut r)?;
+                out.push_str(&format!("(({l}) + ({r}))"));
+                return Ok(());
+            }
             let jop = match op {
                 crate::ir::BinOpKind::Add => "+",
                 crate::ir::BinOpKind::Sub => "-",
@@ -1500,6 +1765,122 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
         IrExpr::Ext(node) => {
             let s = ext_value_to_java(node.as_ref(), true)?;
             out.push_str(&s);
+            Ok(())
+        }
+        IrExpr::Call { func, args, .. } if func == "test" => {
+            if let Some(IrExpr::Str(s2, _)) = args.first() {
+                if let Some(c) = test_render(s2) {
+                    out.push_str(&c);
+                    return Ok(());
+                }
+            }
+            out.push_str("true");
+            Ok(())
+        }
+        // testArith(Str) — the C frontend's arithmetic-truth condition
+        IrExpr::Call { func, args, .. } if func == "testArith" => {
+            if let Some(IrExpr::Str(s2, _)) = args.first() {
+                let norm: String = s2
+                    .chars()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if c == '$'
+                            && i + 1 < s2.len()
+                            && (s2[i + 1..].starts_with('{')
+                                || s2[i + 1..]
+                                    .chars()
+                                    .next()
+                                    .map_or(false, |n| n.is_ascii_alphabetic() || n == '_'))
+                        {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                let norm = norm.replace('{', " ").replace('}', " ");
+                if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
+                    arith_to_java(&ast, out)?;
+                    return Ok(());
+                }
+            }
+            out.push_str("false");
+            Ok(())
+        }
+        IrExpr::Call { func, args, .. } if func == "ternary" => {
+            // cond ? a : b — the cond is a test/testArith STRING; the
+            // branches are lowered values. Render as the java conditional.
+            if let [c0, b0v, b1v] = args.as_slice() {
+                let mut cc = String::new();
+                match c0 {
+                    IrExpr::Str(sv, _) => {
+                        let norm: String = sv
+                            .chars()
+                            .enumerate()
+                            .map(|(i, ch)| {
+                                if ch == '$'
+                                    && i + 1 < sv.len()
+                                    && (sv[i + 1..].starts_with('{')
+                                        || sv[i + 1..]
+                                            .chars()
+                                            .next()
+                                            .map_or(false, |n| {
+                                                n.is_ascii_alphabetic() || n == '_'
+                                            }))
+                                {
+                                    ' '
+                                } else {
+                                    ch
+                                }
+                            })
+                            .collect();
+                        let norm = norm.replace('{', " ").replace('}', " ");
+                        match crate::shir::parse_arith(norm.trim()) {
+                            Some(ast) => arith_to_java(&ast, &mut cc)?,
+                            None => match test_render(sv) {
+                                Some(t) => cc.push_str(&t),
+                                None => cc.push_str("true"),
+                            },
+                        }
+                    }
+                    other => expr_to_java(other, &mut cc)?,
+                }
+                let mut bt = String::new();
+                expr_to_java(b0v, &mut bt)?;
+                let mut bf = String::new();
+                expr_to_java(b1v, &mut bf)?;
+                out.push_str(&format!("({cc} ? {bt} : {bf})"));
+                return Ok(());
+            }
+            Err("ternary with unsupported shape".into())
+        }
+        // ternary(cond, a, b) — the C frontend's conditional: the cond is
+        // a test/testArith STRING, the branches are lowered values
+        IrExpr::Ternary { cond, then, else_ } => {
+            let mut cc = String::new();
+            match cond.as_ref() {
+                IrExpr::Call { func, args, .. }
+                    if func == "test" || func == "testArith" || func == "arith" =>
+                {
+                    if let Some(IrExpr::Str(sv, _)) = args.first() {
+                        let norm = norm_arith_text(sv);
+                        match crate::shir::parse_arith(norm.trim()) {
+                            Some(ast) => {
+                                arith_to_java(&ast, &mut cc)?;
+                                cc = format!("(({}) != 0)", cc);
+                            }
+                            None => match test_render(sv) {
+                                Some(t) => cc.push_str(&t),
+                                None => cc.push_str("true"),
+                            },
+                        }
+                    }
+                }
+                other => expr_to_java(other, &mut cc)?,
+            }
+            let bt = word_to_java(then)?;
+            let bf = word_to_java(else_)?;
+            out.push_str(&format!("({cc} ? {bt} : {bf})"));
             Ok(())
         }
         other => Err(format!("expr not in the v1 Java subset: {other:?}")),
@@ -1659,7 +2040,7 @@ fn arith_to_java(a: &ArithAst, out: &mut String) -> Result<(), String> {
             Ok(())
         }
         ArithAst::Var(name) | ArithAst::Ident(name) => {
-            out.push_str(&format!("sh2Num({name})"));
+            out.push_str(&format!("sh2Num({})", java_home(name)));
             Ok(())
         }
         ArithAst::Bin { op, lhs, rhs } => {
@@ -1908,6 +2289,16 @@ fn stmts_need_glob(stmts: &[IrStmt]) -> bool {
                     || elsifs.iter().any(|(_, b)| walk(b))
             }
             IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } | IrStmt::ForInit { body, .. } => walk(body),
+            // find -name lowers its filter through sh2Glob
+            IrStmt::Ext(node) if node.tag() == "WalkDir" => node
+                .as_any()
+                .downcast_ref::<crate::shir_nodes::WalkDir>()
+                .map(|wd| wd.name_filter.is_some())
+                .unwrap_or(false)
+                || node.children().iter().any(|c| match c {
+                    IrStmt::Expr(e) => matches!(e, IrExpr::Ext(_)),
+                    _ => false,
+                }),
             _ => false,
         })
     }
