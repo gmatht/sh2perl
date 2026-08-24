@@ -1304,6 +1304,16 @@ impl Render {
                 }
                 self.sh2_stub("captureWords", args, "captureWords")
             }
+            // listVar("@") / listVar("*") — the positional PARAMETERS as
+            // a LIST (for iteration); scalars use getVar("@")
+            "listVar" => {
+                match args.first() {
+                    Some(IrExpr::Str(sel, _)) if sel == "@" || sel == "*" => {
+                        "\" \".join(sys.argv[1:])".to_string()
+                    }
+                    _ => self.sh2_stub("listVar", args, "listVar"),
+                }
+            }
             // join(...) — the core's StringPart lowering WRAPS every
             // ${..} expansion in join(<expr>) (shir.rs StringPart::Param /
             // MapKeys / ArrayIndex): unwrap and route.
@@ -3639,6 +3649,20 @@ impl Render {
                     IrExpr::Array(items) if items.len() == 1 => match &items[0] {
                         // {1..5} / {a,b} — the expanded WORDS are the
                         // iteration domain (as a python list)
+                        // "$@" — iterate the ACTUAL argv list (the
+                        // scalar join form would iterate ONE string)
+                        IrExpr::Call { func, args }
+                            if func == "listVar" =>
+                        {
+                            match args.first() {
+                                Some(IrExpr::Str(sel, _))
+                                    if sel == "@" || sel == "*" =>
+                                {
+                                    Some("sys.argv[1:]".to_string())
+                                }
+                                _ => None,
+                            }
+                        }
                         IrExpr::Call { func, args } if func == "brace" => {
                             match py_brace_list(args) {
                                 Some(words) => {
