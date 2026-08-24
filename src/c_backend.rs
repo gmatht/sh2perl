@@ -3375,6 +3375,70 @@ impl Render {
                 self.shell_exec(args)
             }
             "printf" => {
+                // `printf -v NAME fmt args…` — bash assigns the formatted
+                // text to NAME instead of stdout. The native C rendering
+                // IS snprintf (into a buffer, then into the variable's
+                // storage: env for fresh names, the C var for known ones)
+                if words.first().and_then(|w| match w {
+                    IrExpr::Str(s, _) => Some(s.as_str()),
+                    _ => None,
+                }) == Some("-v")
+                {
+                    if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("PRINTF_V reached"); }
+                    if std::env::var("SH2C_DEBUG").is_ok() {
+                        eprintln!("VGUARD w1={:?} w2={:?}", words.get(1), words.get(2));
+                    }
+                    // the fmt may arrive as Str or an all-literal
+                    // Interpolate (`"%s-%s"` → Lit parts)
+                    let fmt_text: Option<String> = words.get(2).and_then(|w| match w {
+                        IrExpr::Str(s, _) => Some(s.clone()),
+                        IrExpr::Interpolate(parts) => {
+                            let mut t = String::new();
+                            for p in parts {
+                                match p {
+                                    InterpPart::Lit(l) => t.push_str(l),
+                                    _ => return None,
+                                }
+                            }
+                            Some(t)
+                        }
+                        _ => None,
+                    });
+                    if let (Some(IrExpr::Str(name, _)), Some(fmt_text)) =
+                        (words.get(1), fmt_text)
+                    {
+                        let rest: Vec<&IrExpr> = words[3..].to_vec();
+                        if let Some((fmt, cargs)) = self.bash_format_to_c_with(&fmt_text, &rest)
+                        {
+                            self.need_sh = true;
+                            let nm = Self::cstr(name);
+                            let id = self.c_ident(name);
+                            let mut body = format!(
+                                "{{ int _pl; char _pv[8192]; _pl = snprintf(_pv, sizeof _pv, {}, {}); setenv({}, _pv, 1);",
+                                Self::cstr(&fmt),
+                                cargs.join(", "),
+                                nm
+                            );
+                            if self.store.contains(name) || self.var_types.contains_key(name) {
+                                if self.is_num(name) {
+                                    body.push_str(&format!(" {id} = atoll(_pv);"));
+                                } else if let Some(b) = self.buf_bound(name) {
+                                    body.push_str(&format!(
+                                        " strncpy({id}, _pv, {b} + 1); {id}[{b}] = 0;"
+                                    ));
+                                } else {
+                                    body.push_str(&format!(" {id} = strdup(_pv);"));
+                                }
+                            }
+                            body.push_str(" _sh_rc = (_pl < 0) ? 1 : 0; }");
+                            return body;
+                        }
+                    }
+                    // unsupported conversions (%b on dynamic args…) — the
+                    // child-bash site stays (its runtime printf -v assigns
+                    // in the child; parent reads via env may miss — same
+                    // limitation as before this arm existed)
+                }
                 // native printf for the safe format subset (%s/%d/%% etc.),
                 // falling back to shell-out for bash-specific conversions
                 // (%b, %q, %(…)T, \c, recycling) — favour native C
@@ -3792,6 +3856,7 @@ impl Render {
 
     /// A shell-out exec site (statement or expr position).
     fn shell_exec(&mut self, args: &[IrExpr]) -> String {
+        if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("SHELL_EXEC {:?}", args.first()); }
         let arr_inits = self.array_inits_for_args(&args);
         let args = args.to_vec();
         self.shell_site(
@@ -6183,14 +6248,34 @@ impl Render {
     /// `\c` / `\0NNN` escapes, and format-recycling (extra/insufficient
     /// args) — the conservative path keeps those on `bash -c`.
     fn try_native_printf(&mut self, words: &[&IrExpr]) -> Option<String> {
+        let (fmt, cargs) = self.bash_format_to_c(words)?;
+        if cargs.is_empty() {
+            Some(format!("fputs({}, stdout)", Self::cstr(&fmt)))
+        } else {
+            Some(format!("printf({}, {})", Self::cstr(&fmt), cargs.join(", ")))
+        }
+    }
+
+    /// Convert a bash printf format (+ args) into a C format string and
+    /// argument expressions. None → conversions outside the safe subset.
+    fn bash_format_to_c(&mut self, words: &[&IrExpr]) -> Option<(String, Vec<String>)> {
         let fmt_str = match words.first() {
             Some(IrExpr::Str(s, _)) => s.clone(),
             _ => return None,
         };
-        let args = &words[1..];
+        self.bash_format_to_c_with(&fmt_str, &words[1..])
+    }
+
+    /// Same over an already-extracted format string.
+    fn bash_format_to_c_with(
+        &mut self,
+        fmt_str: &str,
+        args: &[&IrExpr],
+    ) -> Option<(String, Vec<String>)> {
         let mut fmt = String::new();
         let mut cargs: Vec<String> = Vec::new();
         let mut arg_i = 0usize;
+        if std::env::var("SH2C_DEBUG").is_ok() { eprintln!("BFMT fmt={:?} nargs={}", fmt_str, args.len()); }
         let mut it = fmt_str.chars().peekable();
         while let Some(ch) = it.next() {
             match ch {
@@ -6299,11 +6384,7 @@ impl Render {
         if arg_i != args.len() {
             return None;
         }
-        if cargs.is_empty() {
-            Some(format!("fputs({}, stdout)", Self::cstr(&fmt)))
-        } else {
-            Some(format!("printf({}, {})", Self::cstr(&fmt), cargs.join(", ")))
-        }
+        Some((fmt, cargs))
     }
 
     // ── statements ───────────────────────────────────────────────────
