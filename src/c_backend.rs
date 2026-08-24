@@ -273,6 +273,10 @@ const ARR_CAP: usize = 1024;
 /// Render an `IrProgram` to C source (main() body).
 pub fn shir_to_c(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
+    if std::env::var("SH2_DBG_VARS").is_ok() {
+        eprintln!("DBG shir_to_c entry stmts={} t0={}", prog.stmts.len(),
+            match prog.stmts.first() { Some(IrStmt::Assign{..}) => "Assign", Some(IrStmt::Expr(_)) => "Expr", _ => "?" });
+    }
     // A2 + var_lengths: the analyses run at serialization time in the
     // JSON path; the library path must run the same ones.
     prog.var_types = crate::shir::analyze_var_types(&prog);
@@ -1467,6 +1471,7 @@ impl Render {
     /// per-function hoists.
     fn emit_var_decl(&mut self, v: &str) {
         let name = self.c_ident(v);
+        if v == "SHELL_VAR" { eprintln!("DBG emit_var_decl SHELL_VAR out_len={}", self.out.len()); }
         // const-markup lift: a Const var whose single top-level
         // assignment is a literal renders as a const declaration
         // initialized from that literal; the Assign stmt is dropped
@@ -4262,7 +4267,15 @@ impl Render {
                     } else if self.arrays.contains(&ws) || self.assoc_arrays.contains(&ws) {
                         // arrays cannot cross exec — skip
                     } else {
-                        let v = self.store_read(&ws);
+                        // a const-lifted var: reference the C ident —
+                        // reading getenv here would (a) miss the value and
+                        // (b) let unused-decl cleanup drop the lifted
+                        // declaration entirely
+                        let v = if self.const_lifted.contains(&ws) {
+                            self.c_ident(&ws)
+                        } else {
+                            self.store_read(&ws)
+                        };
                         self.emit(&format!(
                             "setenv({}, {v} ? {v} : \"\", 1);",
                             Self::cstr(&ws)
@@ -8818,6 +8831,9 @@ impl Render {
         // and the shell function names (their calls render `name();`).
         let mut vars: BTreeSet<String> = BTreeSet::new();
         let mut for_vars: BTreeSet<String> = BTreeSet::new();
+        if std::env::var("SH2_DBG_VARS").is_ok() {
+            eprintln!("DBG program stmts={} first={:?}", prog.stmts.len(), prog.stmts.first().map(std::mem::discriminant));
+        }
         collect_vars_full(&prog.stmts, &mut vars, &mut for_vars);
         // collect function definitions at ANY depth (a function may be
         // defined inside a block/loop — the shellbench eval benches do).
@@ -8966,6 +8982,9 @@ impl Render {
         }
         if !self.arrays.is_empty() {
             self.emit("");
+        }
+        if std::env::var("SH2_DBG_VARS").is_ok() {
+            eprintln!("DBG vars={:?} store={:?} lifted={:?}", vars, self.store, self.const_lifted);
         }
         for v in &vars {
             self.emit_var_decl(v);
@@ -10318,9 +10337,15 @@ fn collect_nested_declares_d(stmts: &[IrStmt], out: &mut BTreeSet<String>, depth
 /// Collect the untyped store names (getVar/param reads, assign targets,
 /// read/declare/unset builtin targets) so they hoist as `char*` entries.
 fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    if std::env::var("SH2_DBG_VARS").is_ok() && !stmts.is_empty() {
+        eprintln!("DBG csn n={} first_type={}", stmts.len(), match &stmts[0] { IrStmt::Assign{..} => "Assign", IrStmt::Expr(_) => "Expr", _ => "?" });
+    }
     for s in stmts {
         match s {
             IrStmt::Assign { targets, expr, .. } => {
+                if std::env::var("SH2_DBG_VARS").is_ok() {
+                    eprintln!("DBG csn assign -> {:?}", targets.iter().map(|t| t.var.clone()).collect::<Vec<_>>());
+                }
                 for t in targets {
                     out.insert(t.var.clone());
                 }
