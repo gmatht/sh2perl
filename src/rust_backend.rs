@@ -4496,6 +4496,34 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => match e {
+                // setVar(name, value) — the frontend-emitted store write:
+                // a typed assignment to the var's thread_local home (the
+                // C frontend's dotted struct names sanitize consistently
+                // for reads via the same rust_ident table)
+                IrExpr::Call { func, args } if func == "setVar" => {
+                    if let (Some(IrExpr::Str(name, _)), Some(value)) =
+                        (args.first(), args.get(1))
+                    {
+                        self.mark_written(name);
+                        let rhs = if self.is_num(name) {
+                            self.expr_num(value)
+                        } else {
+                            self.expr_str(value)
+                        };
+                        let emitted = if self.is_num(name) {
+                            self.write_num(name, &rhs)
+                        } else {
+                            self.write_str(name, &rhs)
+                        };
+                        self.emit(&emitted);
+                    }
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                }
+                IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
+                    let v = self.expr_any(e);
+                    self.emit(&format!("let _ = {v};"));
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                }
                 IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_stmt(args),
                 IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
                     self.array_call_stmt_by_name(func, args);
@@ -8300,6 +8328,12 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             }
         }
         IrExpr::Call { func, args } => {
+            // setVar(name, _) — the frontend-emitted store write writes name
+            if func == "setVar" {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    out.insert(name.clone());
+                }
+            }
             // `assign(name, op, val)` — the arith-assignment writes name
             if func == "assign" {
                 if let Some(name) = str_arg(args, 0) {
