@@ -3493,6 +3493,18 @@ impl Render {
                 // string — right for echo words, wrong for iteration)
                 let native_iter: Option<String> = match iter {
                     IrExpr::Array(items) if items.len() == 1 => match &items[0] {
+                        // {1..5} / {a,b} — the expanded WORDS are the
+                        // iteration domain (as a python list)
+                        IrExpr::Call { func, args } if func == "brace" => {
+                            match py_brace_list(args) {
+                                Some(words) => {
+                                    let elems: Vec<String> =
+                                        words.iter().map(|w| Self::py_str(w)).collect();
+                                    Some(format!("[{}]", elems.join(", ")))
+                                }
+                                None => None,
+                            }
+                        }
                         IrExpr::Call { func, args } if func == "param" => {
                             match (args.first(), args.get(1), args.get(2)) {
                                 (
@@ -4425,6 +4437,11 @@ fn collect_vars_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
 /// `{x,y}{1..2}` / `a{1..3}b` — compute the space-joined brace-expansion
 /// words. Returns None for any non-literal part (the renderer refuses).
 fn py_brace_words(args: &[IrExpr]) -> Option<String> {
+    let words = py_brace_words_list(args)?;
+    Some(words.join(" "))
+}
+
+fn py_brace_words_list(args: &[IrExpr]) -> Option<Vec<String>> {
     let pre = match args.first()? {
         IrExpr::Str(s, _) => s.clone(),
         _ => return None,
@@ -4539,6 +4556,12 @@ fn py_brace_words(args: &[IrExpr]) -> Option<String> {
         }
         combos = next;
     }
-    let words: Vec<String> = combos.iter().map(|c| format!("{pre}{c}{suf}")).collect();
-    Some(words.join(" "))
+    Some(combos.iter().map(|c| format!("{pre}{c}{suf}")).collect())
+}
+
+/// py_brace_list — the WORDS of a brace expansion as a list (for
+/// for-loop iteration, where the space-joined string form would collapse
+/// the whole expansion into ONE iteration).
+fn py_brace_list(args: &[IrExpr]) -> Option<Vec<String>> {
+    py_brace_words_list(args)
 }
