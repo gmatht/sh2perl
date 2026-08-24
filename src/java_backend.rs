@@ -62,6 +62,24 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
         // reuses EXT_HELPERS' statics where possible but declares its own
         let mut ctx_probe = JavaCtx::default();
         let _ = &mut ctx_probe;
+        if stmts_need_pad(&prog.stmts) {
+            out.push_str("    static String sh2Pad(String s, int w, boolean left) {\n");
+            out.push_str("        if (s.length() >= w) return s;\n");
+            out.push_str("        StringBuilder p = new StringBuilder();\n");
+            out.push_str("        for (int i = s.length(); i < w; i++) p.append(' ');\n");
+            out.push_str("        return left ? s + p : p + s;\n");
+            out.push_str("    }\n");
+            out.push_str("    static String sh2PadZero(String s, int w) {\n");
+            out.push_str("        boolean neg = s.startsWith(\"-\");\n");
+            out.push_str("        String b = neg ? s.substring(1) : s;\n");
+            out.push_str("        StringBuilder z = new StringBuilder();\n");
+            out.push_str("        for (int i = b.length(); i < w; i++) z.append('0');\n");
+            out.push_str("        return (neg ? \"-\" : \"\") + z + b;\n");
+            out.push_str("    }\n");
+            out.push_str("    static String sh2Trunc(String s, int n) {\n");
+            out.push_str("        return s.length() <= n ? s : s.substring(0, n);\n");
+            out.push_str("    }\n");
+        }
         if stmts_need_readline(&prog.stmts) {
             out.push_str("    static java.io.BufferedReader __stdin = null;\n");
             out.push_str("    static String sh2ReadLine() throws Exception {\n");
@@ -1022,7 +1040,23 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
                         }
                         _ => return Err("printf with a non-literal format (v1)".into()),
                     };
-                    let parsed = printf_parse(&fmt);
+                    let legacy = printf_parse(&fmt).map(|(els, n)| {
+                        (
+                            els.into_iter()
+                                .map(|(txt, spec)| {
+                                    (txt, spec.map(|c| PrintfSpec {
+                                        conv: c,
+                                        width: None,
+                                        left: false,
+                                        zero: false,
+                                        prec: None,
+                                    }))
+                                })
+                                .collect::<Vec<_>>(),
+                            n,
+                        )
+                    });
+                    let parsed = printf_parse_wide(&fmt).or(legacy);
                     let Some((els, n_specs)) = parsed else {
                         // complex spec — the v1 raw join
                         indent(out, d);
@@ -1062,10 +1096,34 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
                                         .cloned()
                                         .unwrap_or_else(|| "\"\"".into());
                                     ai += 1;
-                                    match conv {
-                                        's' => pieces.push(arg),
-                                        'd' | 'i' | 'u' => pieces
-                                            .push(format!("Long.toString(sh2Num({arg}))")),
+                                    match conv.conv {
+                                        's' => {
+                                            let mut a = arg;
+                                            if let Some(pr) = conv.prec {
+                                                a = format!("sh2Trunc({}, {})", a, pr);
+                                            }
+                                            pieces.push(match conv.width {
+                                                Some(w) => format!(
+                                                    "sh2Pad({}, {}, {})",
+                                                    a, w, conv.left
+                                                ),
+                                                None => a,
+                                            });
+                                        }
+                                        'd' | 'i' | 'u' => {
+                                            let base =
+                                                format!("Long.toString(sh2Num({arg}))");
+                                            pieces.push(match (conv.zero, conv.width) {
+                                                (true, Some(w)) => {
+                                                    format!("sh2PadZero({}, {})", base, w)
+                                                }
+                                                (_, Some(w)) => format!(
+                                                    "sh2Pad({}, {}, {})",
+                                                    base, w, conv.left
+                                                ),
+                                                _ => base,
+                                            });
+                                        }
                                         _ => unreachable!("printf_parse gates the conversions"),
                                     }
                                 } else {
@@ -1187,6 +1245,84 @@ fn java_str_lit(s: &str) -> String {
 /// %s/%d/%i/%u conversions over literal text runs. A flags/width/prec
 /// spec (or any other conversion) yields None — the caller keeps the
 /// v1 raw join. `%%` is an escaped percent.
+/// A parsed conversion with width/alignment: bash printf subset
+/// (%[flags][width][.prec]conv where conv ∈ s/d/i/u).
+#[derive(Clone, Debug)]
+pub struct PrintfSpec {
+    pub conv: char,
+    pub width: Option<usize>,
+    pub left: bool,
+    pub zero: bool,
+    pub prec: Option<usize>,
+}
+
+/// Width-aware parse (the plain `printf_parse` rejects any width/flags —
+/// `printf '%-10s …'` then degrades to a raw-format print). Returns None
+/// only for conversions outside the supported set.
+pub fn printf_parse_wide(fmt: &str) -> Option<(Vec<(String, Option<PrintfSpec>)>, usize)> {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut els: Vec<(String, Option<PrintfSpec>)> = Vec::new();
+    let mut text = String::new();
+    let mut n_specs = 0usize;
+    let mut pos = 0usize;
+    while pos < chars.len() {
+        if chars[pos] == '%' {
+            let mut i = pos + 1;
+            let mut left = false;
+            let mut zero = false;
+            while i < chars.len() && matches!(chars[i], '-' | '+' | ' ' | '0' | '#') {
+                match chars[i] {
+                    '-' => left = true,
+                    '0' => zero = true,
+                    _ => {}
+                }
+                i += 1;
+            }
+            let mut width: Option<usize> = None;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                width = Some(width.unwrap_or(0) * 10 + (chars[i] as usize - '0' as usize));
+                i += 1;
+            }
+            // precision accepted and applied to %s truncation only
+            let mut prec: Option<usize> = None;
+            if i < chars.len() && chars[i] == '.' {
+                i += 1;
+                let mut v = 0usize;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    v = v * 10 + (chars[i] as usize - '0' as usize);
+                    i += 1;
+                }
+                prec = Some(v);
+            }
+            let Some(&conv) = chars.get(i) else {
+                return None;
+            };
+            match conv {
+                's' | 'd' | 'i' | 'u' => {
+                    if !text.is_empty() {
+                        els.push((std::mem::take(&mut text), None));
+                    }
+                    els.push((String::new(), Some(PrintfSpec { conv, width, left, zero, prec })));
+                    n_specs += 1;
+                    pos = i + 1;
+                }
+                '%' => {
+                    text.push('%');
+                    pos = i + 1;
+                }
+                _ => return None,
+            }
+        } else {
+            text.push(chars[pos]);
+            pos += 1;
+        }
+    }
+    if !text.is_empty() {
+        els.push((text, None));
+    }
+    Some((els, n_specs))
+}
+
 fn printf_parse(fmt: &str) -> Option<(Vec<(String, Option<char>)>, usize)> {
     let chars: Vec<char> = fmt.chars().collect();
     let mut els: Vec<(String, Option<char>)> = Vec::new();
@@ -2316,6 +2452,48 @@ fn stmts_need_glob(stmts: &[IrStmt]) -> bool {
                     IrStmt::Expr(e) => matches!(e, IrExpr::Ext(_)),
                     _ => false,
                 }),
+            _ => false,
+        })
+    }
+    walk(stmts)
+}
+
+/// Does any printf carry a WIDTH/padding conversion? (the sh2Pad family
+/// preamble is emitted only then)
+fn stmts_need_pad(stmts: &[IrStmt]) -> bool {
+    fn expr_has(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+                if let (Some(IrExpr::Str(cmd, _)), Some(IrExpr::Array(items))) =
+                    (args.first(), args.get(1))
+                {
+                    if cmd == "printf" {
+                        if let Some(IrExpr::Str(fmt, _)) = items.first() {
+                            if printf_parse_wide(fmt).map(|(els, _)| els.iter().any(
+                                |(_, s)| matches!(s, Some(sp) if sp.width.is_some()),
+                            )).unwrap_or(false) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            IrExpr::Call { args, .. } => args.iter().any(expr_has),
+            IrExpr::Array(items) => items.iter().any(expr_has),
+            _ => false,
+        }
+    }
+    fn walk(s: &[IrStmt]) -> bool {
+        s.iter().any(|st| match st {
+            IrStmt::Expr(e) | IrStmt::Assign { expr: e, .. } => expr_has(e),
+            IrStmt::Output { value: e, .. } => expr_has(e),
+            IrStmt::If { then, elsifs, else_, .. } => {
+                walk(then) || walk(else_) || elsifs.iter().any(|(_, b)| walk(b))
+            }
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => walk(body),
+            IrStmt::Block(b) | IrStmt::Subshell(b) => walk(b),
+            IrStmt::Function { body, .. } => walk(body),
             _ => false,
         })
     }
