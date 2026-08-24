@@ -828,6 +828,21 @@ impl Render {
             self.emit("  d[dn] = 0;");
             self.emit("  return d;");
             self.emit("}");
+            self.emit("/* FIRST match only — bash ${var/pat/repl} */");
+            self.emit("static char *_sh_replace_first(char *d, size_t cap, const char *s, const char *pat, const char *repl) {");
+            self.emit("  size_t pn = strlen(pat), rn = strlen(repl), dn = 0;");
+            self.emit("  const char *p = s;");
+            self.emit("  if (!pn) { strncpy(d, s, cap - 1); d[cap - 1] = 0; return d; }");
+            self.emit("  const char *hit = strstr(p, pat);");
+            self.emit("  if (!hit) { strncpy(d, s, cap - 1); d[cap - 1] = 0; return d; }");
+            self.emit("  size_t pre = (size_t)(hit - p);");
+            self.emit("  while (pre-- && dn + 1 < cap) d[dn++] = *p++;");
+            self.emit("  for (size_t i = 0; i < rn && dn + 1 < cap; i++) d[dn++] = repl[i];");
+            self.emit("  p = hit + pn;");
+            self.emit("  while (*p && dn + 1 < cap) d[dn++] = *p++;");
+            self.emit("  d[dn] = 0;");
+            self.emit("  return d;");
+            self.emit("}");
             self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
             self.emit("static char *_sh_strippre(char *d, size_t cap, const char *s, const char *pat, int greedy) {");
             self.emit("  static char sc[65536];");
@@ -5242,8 +5257,15 @@ impl Render {
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
                 self.need_sh = true;
                 let t = self.str_temp(4096);
+                // `/` replaces the FIRST match only; `//` replaces all —
+                // one helper served both and \${y/one/1} clobbered every
+                let helper = if op == "//" {
+                    "_sh_replace"
+                } else {
+                    "_sh_replace_first"
+                };
                 self.emit(&format!(
-                    "_sh_replace({t}, sizeof {t}, {var_expr}, {}, {repl});",
+                    "{helper}({t}, sizeof {t}, {var_expr}, {}, {repl});",
                     Self::cstr(strip_glob(&pat))
                 ));
                 t
