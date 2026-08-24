@@ -7078,7 +7078,13 @@ impl Render {
                         let kw = if first { "if" } else { "else if" };
                         first = false;
                         let flags = if self.nocasematch { " | FNM_CASEFOLD" } else { "" };
-                        let pat_c = Self::cstr(strip_glob(pat));
+                        // a QUOTED pattern keeps its quote chars in the
+                        // shIR text (`''` arrived as two-quote string):
+                        // strip them — bash matches the DEQUOTED word,
+                        // and an empty pattern must match the empty value
+                        let pat_text = strip_glob(pat)
+                            .trim_matches(|c| c == '"' || c == '\'');
+                        let pat_c = Self::cstr(pat_text);
                         self.emit(&format!(
                             "{kw} (fnmatch({pat_c}, {d}, 0{flags}) == 0) {{"
                         ));

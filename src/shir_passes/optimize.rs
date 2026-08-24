@@ -1725,9 +1725,13 @@ fn bare_dollar_names(s: &str) -> Vec<String> {
             }
             let nm = &s[w..j];
             if !nm.is_empty()
-                && (j >= bytes.len() || !braced || bytes[j] == b'}')
                 && crate::shared_utils::SharedUtils::is_variable_name(nm)
             {
+                // braced expansions with OPERATORS (`${x% *}`, `${x:-d}`)
+                // end the scan at the operator — record the name anyway:
+                // over-marking only shrinks the elimination set, while
+                // missing it dropped the var's only store as dead
+                // (param-expand-hash)
                 out.push(nm.to_string());
             }
             i = if braced && j < bytes.len() { j + 1 } else { j };
