@@ -1484,6 +1484,14 @@ impl Render {
         collect_assigned_vars(body, &mut fvars);
         let mut declared = BTreeSet::new();
         collect_declare_names(body, &mut declared);
+        // nested-block declares hoist to the FN TOP (bash `local` is
+        // function-scoped; the in-block Declare renders as an assignment)
+        let mut nested_declared = BTreeSet::new();
+        collect_nested_declares(body, &mut nested_declared);
+        for v in &nested_declared {
+            declared.remove(v);
+            fvars.insert(v.clone());
+        }
         let fvars: BTreeSet<String> = fvars
             .iter()
             .filter(|v| {
@@ -7006,8 +7014,29 @@ impl Render {
                 } else {
                     init.as_ref().map(|e| self.expr(e))
                 };
+                // a `local` Declare inside a NESTED BLOCK: bash `local`
+                // scopes to the FUNCTION — a C block declaration would
+                // vanish at the closing brace (stderr_/rc used after the
+                // block were 'undeclared'). The fn-top hoist owns the
+                // storage; render an ASSIGNMENT.
+                let nested_fn_scope = self.in_function && self.depth > 1;
                 for d in vars {
                     let name = self.c_ident(&d.name);
+                    if nested_fn_scope {
+                        match &init_expr {
+                            Some(v) if self.is_num(&d.name) => {
+                                self.emit(&format!("{name} = (long long)atoll((char*)({v}));"));
+                            }
+                            Some(v) => {
+                                self.emit(&format!("{name} = strdup((char*)({v}));"));
+                            }
+                            None => {
+                                self.emit(&format!("{name} = NULL;"));
+                            }
+                        }
+                        self.decl_line_idx.insert(d.name.clone(), self.out.len() - 1);
+                        continue;
+                    }
                     if self.is_num(&d.name) {
                         let v = match &init_expr {
                             Some(v) if v.starts_with('"') || v.starts_with('(') => {
@@ -9077,6 +9106,13 @@ fn collect_array_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
 /// Names declared by Declare stmts (the per-function hoist skips them —
 /// the Declare stmt declares them at its position).
 fn collect_declare_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    collect_declare_names_at(stmts, out, 0)
+}
+
+/// `out` = every local-declared name. Declares inside NESTED BLOCKS are
+/// bash function-scoped but C-block-scoped — emit_function hoists those
+/// (the in-block Declare renders as an assignment).
+fn collect_declare_names_at(stmts: &[IrStmt], out: &mut BTreeSet<String>, depth: usize) {
     for s in stmts {
         match s {
             IrStmt::Declare { vars, .. } => {
@@ -9085,19 +9121,55 @@ fn collect_declare_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 }
             }
             IrStmt::If { then, elsifs, else_, .. } => {
-                collect_declare_names(then, out);
+                collect_declare_names_at(then, out, depth + 1);
                 for (_, b) in elsifs {
-                    collect_declare_names(b, out);
+                    collect_declare_names_at(b, out, depth + 1);
                 }
-                collect_declare_names(else_, out);
+                collect_declare_names_at(else_, out, depth + 1);
             }
             IrStmt::While { body, .. }
             | IrStmt::DoWhile { body, .. }
             | IrStmt::For { body, .. }
             | IrStmt::Block(body)
             | IrStmt::Subshell(body)
-            | IrStmt::Background(body) => collect_declare_names(body, out),
-            IrStmt::Function { body, .. } => collect_declare_names(body, out),
+            | IrStmt::Background(body) => {
+                collect_declare_names_at(body, out, depth + 1)
+            }
+            IrStmt::Function { body, .. } => collect_declare_names_at(body, out, 0),
+            _ => {}
+        }
+    }
+}
+
+/// Names local-declared at depth > 0 (inside a nested block) — these
+/// must HOIST (see collect_declare_names_at).
+fn collect_nested_declares(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    collect_nested_declares_d(stmts, out, 0)
+}
+fn collect_nested_declares_d(stmts: &[IrStmt], out: &mut BTreeSet<String>, depth: usize) {
+    for s in stmts {
+        match s {
+            IrStmt::Declare { vars, .. } if depth > 0 => {
+                for d in vars {
+                    out.insert(d.name.clone());
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_nested_declares_d(then, out, depth + 1);
+                for (_, b) in elsifs {
+                    collect_nested_declares_d(b, out, depth + 1);
+                }
+                collect_nested_declares_d(else_, out, depth + 1);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                collect_nested_declares_d(body, out, depth + 1)
+            }
+            IrStmt::Function { body, .. } => collect_nested_declares_d(body, out, 0),
             _ => {}
         }
     }
