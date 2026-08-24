@@ -3450,7 +3450,20 @@ impl Render {
                 r.emit(&format!("_sh_badd(&_c{id}_cmd, &_c{id}_cap, {v});"))
             }
         };
-        for rd in redirects {
+        // TWO passes: every non-heredoc redirect renders on the COMMAND
+        // LINE, heredocs LAST — their bodies occupy the FOLLOWING lines,
+        // so a target emitted after the body would become body content
+        // (`cat <<EOF > f` must read `cat > f <<EOF`)
+        let mut ordered: Vec<&crate::ir::IrRedirect> = redirects
+            .iter()
+            .filter(|r| !matches!(r.mode.as_str(), "heredoc" | "heredoc-tabs"))
+            .collect();
+        ordered.extend(
+            redirects
+                .iter()
+                .filter(|r| matches!(r.mode.as_str(), "heredoc" | "heredoc-tabs")),
+        );
+        for rd in ordered {
             let mode = rd.mode.as_str();
             let fd = rd.fd.unwrap_or(1);
             let fd_pre = if fd == 1 { String::new() } else { format!("{fd}") };
@@ -3497,7 +3510,11 @@ impl Render {
                     self.emit(&format!(
                         "{{ size_t _hl = strlen({v}); if (_hl == 0 || {v}[_hl - 1] != '\\n') _sh_add(\"\\n\"); }}"
                     ));
-                    add(self, "_SH2EOF_");
+                    // trailing NEWLINE after the delimiter: when more
+                    // command text follows (subshell close, redirects
+                    // reordered ahead, pipelines) the bare `_SH2EOF_` would
+                    // glue to it and never terminate the body
+                    add(self, "_SH2EOF_\n");
                 }
                 "herestring" => {
                     raw(self, "<<<");
@@ -3641,7 +3658,7 @@ impl Render {
             self.emit(&format!(
                 "{{ size_t _hl = strlen({v}); if (_hl == 0 || {v}[_hl - 1] != '\\n') _sh_add(\"\\n\"); }}"
             ));
-            self.emit(&format!("_sh_add({});", Self::cstr("_SH2EOF_\\n")));
+            self.emit(&format!("_sh_add({});", Self::cstr("_SH2EOF_\n")));
         }
     }
 
