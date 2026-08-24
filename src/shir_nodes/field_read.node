@@ -6,7 +6,10 @@
 # node — they keep refusing until a tuple contract lands. Named-variable
 # struct storage keeps existing A1 shapes; THIS node covers the
 # expression-position form frontends previously had no shape for.
-# Backends: JS obj.name (native MemberExpression), Perl $obj->{name}.
+# Numeric NAMES ("0", "1" on tuples) render COMPUTED access
+# (JS obj[0], Perl $obj->[0]) — the name is then an INDEX.
+# Backends: JS obj.name / obj[0] (native MemberExpression),
+# Perl $obj->{name} / $obj->[0].
 
 node FieldRead
 tag "FieldRead"
