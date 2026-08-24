@@ -58,6 +58,10 @@ pub struct Render {
     need_sys: bool,
     /// needs the `__sh_exec` subprocess helper
     need_subprocess: bool,
+    /// needs the `__sh_capture` helper (bash `$()` semantics: stdout only,
+    /// trailing newlines stripped, NEVER raises — command-not-found/failure
+    /// yields "" and the script continues, like bash)
+    need_capture: bool,
     need_capture_out: bool,
 }
 
@@ -915,8 +919,10 @@ impl Render {
                             if func == "exec" {
                                 let argv = self.build_argv(args);
                                 self.need_subprocess = true;
+                                    self.need_capture = true;
+                                    self.need_capture = true;
                                 return format!(
-                                    "subprocess.check_output([{}]).decode()",
+                                    "__sh_capture([{}])",
                                     argv.join(", ")
                                 );
                             }
@@ -1175,6 +1181,13 @@ impl Render {
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
             "capture" => {
+                // Generic body first (exec/pipeline/redirect/bash -c) —
+                // the fnCall outparam channel below only fits function calls.
+                if let Some(IrExpr::Arrow(body)) = args.first() {
+                    if let Some(c) = self.capture_body_expr(body) {
+                        return c;
+                    }
+                }
                 // The C frontend's outparam channel: capture(Arrow[
                 // fnCall(..)]) — the callee echoes its out-params, the
                 // caller captures STDOUT.
@@ -1225,6 +1238,24 @@ impl Render {
                     }
                 }
                 self.sh2_stub("captureWords", args, "captureWords")
+            }
+            // redirect(inner, [redirect objects]) used in expression
+            // chains (`cmd 2>/dev/null && ...`): run the inner body under
+            // bash -c and return its STATUS so && / || chaining stays
+            // faithful. stderr is discarded by the runtime contract, so fd-2
+            // redirects need no code. Documented fork/exec escape.
+            "redirect" => {
+                if let Some(IrExpr::Arrow(body)) = args.first() {
+                    if let Some(text) = self.body_shell_text(body) {
+                        self.need_subprocess = true;
+                        self.need_capture = true;
+                        return format!(
+                            "__sh_run_status([\"bash\", \"-c\", {}])",
+                            Self::py_str(&text)
+                        );
+                    }
+                }
+                self.sh2_stub("redirect", args, "redirect")
             }
             "contains" => {
                 if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
@@ -1756,7 +1787,7 @@ impl Render {
                     // parse natively: run `[ <test> ]` (fork/exec).
                     self.need_subprocess = true;
                     return format!(
-                        "(subprocess.check_output([\"bash\", \"-c\", {}]) == 0)",
+                        "(__sh_run_status([\"bash\", \"-c\", {}]) == 0)",
                         Self::py_str(&format!("[ {s} ]"))
                     );
                 }
@@ -1856,6 +1887,29 @@ impl Render {
                     None
                 }
             }
+            // "a${x}b" interpolation → shell text `a${x}b` (the python
+            // f-string form would leak the `f` prefix into the shell word)
+            IrExpr::Interpolate(parts) => {
+                let mut out = String::new();
+                for p in parts {
+                    match p {
+                        crate::ir::InterpPart::Lit(t) => out.push_str(t),
+                        crate::ir::InterpPart::Expr(x) => {
+                            if let IrExpr::Call { func, args }
+                            = x.as_ref() {
+                                if func == "getVar" {
+                                    if let Some(IrExpr::Str(n, _)) = args.first() {
+                                        out.push_str(&format!("${{{n}}}"));
+                                        continue;
+                                    }
+                                }
+                                return None;
+                            }
+                        }
+                    }
+                }
+                Some(Self::sh_quote(&out))
+            }
             _ => None,
         }
     }
@@ -1874,8 +1928,9 @@ impl Render {
                 if func == "exec" {
                     let argv = self.build_argv(args);
                     self.need_subprocess = true;
+                        self.need_capture = true;
                     return Some(format!(
-                        "subprocess.check_output([{}]).decode()",
+                        "__sh_capture([{}])",
                         argv.join(", ")
                     ));
                 }
@@ -2953,7 +3008,7 @@ impl Render {
                 if let Some(var) = capture {
                     let v = self.py_ident(var);
                     self.emit(&format!(
-                        "{v} = subprocess.check_output([{}]).decode()",
+                        "{v} = __sh_capture([{}])",
                         argv.join(", ")
                     ));
                 } else {
@@ -3181,9 +3236,37 @@ impl Render {
         }
         if self.need_subprocess {
             self.emit("");
+            // non-raising exec: command-not-found (FileNotFoundError)
+            // yields status 127 and the script CONTINUES, like bash
             self.emit("def __sh_exec(argv):");
             self.emit("    import subprocess");
-            self.emit("    return subprocess.call(argv)");
+            self.emit("    try:");
+            self.emit("        return subprocess.call(argv)");
+            self.emit("    except OSError:");
+            self.emit("        return 127");
+        }
+        if self.need_capture {
+            self.emit("");
+            // bash $() semantics as a helper: stdout only, ALL trailing
+            // newlines stripped (bash command substitution), never raises:
+            // a failed/missing command yields "" and the script continues
+            self.emit("def __sh_capture(argv):");
+            self.emit("    import subprocess");
+            self.emit("    try:");
+            self.emit("        r = subprocess.run(argv, stdout=subprocess.PIPE)");
+            self.emit("        return r.stdout.decode(errors='replace').rstrip('\\n')");
+            self.emit("    except OSError:");
+            self.emit("        return \"\"");
+            self.emit("");
+            self.emit("def __sh_capture_bash(script):");
+            self.emit("    return __sh_capture([\"bash\", \"-c\", script])");
+            self.emit("");
+            self.emit("def __sh_run_status(argv):");
+            self.emit("    import subprocess");
+            self.emit("    try:");
+            self.emit("        return subprocess.run(argv, stdout=subprocess.DEVNULL).returncode");
+            self.emit("    except OSError:");
+            self.emit("        return 127");
         }
         if self.need_capture_out || self.sh2_calls.contains(&"line".to_string()) {
             self.emit("def __sh_lines(v):");
