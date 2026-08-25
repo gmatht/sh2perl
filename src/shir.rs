@@ -12,7 +12,7 @@ use crate::bc::eval as bc_eval;
 use crate::estree::*;
 use crate::ir::*;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
@@ -3091,6 +3091,7 @@ pub fn ast_to_ir_with_lines(commands: &[Command], lines: &[usize]) -> IrProgram 
         var_const: vec![],
         var_lifetimes: vec![],
         var_nospace: vec![],
+        var_storage: vec![],
         var_bash_env: vec![],
     }
 }
@@ -3115,6 +3116,7 @@ pub fn ast_to_ir_raw(commands: &[Command]) -> IrProgram {
         var_const: vec![],
         var_lifetimes: vec![],
         var_nospace: vec![],
+        var_storage: vec![],
         var_bash_env: vec![],
     }
 }
@@ -4163,6 +4165,135 @@ pub fn program_may_custom_ifs(prog: &IrProgram) -> bool {
 /// [`program_may_custom_ifs`]).
 pub fn ifs_custom_possible() -> bool {
     IFS_CUSTOM.lock().unwrap().unwrap_or(false)
+}
+
+/// Unified storage-class selection per string variable. Combines the
+/// existing analyses (var_lengths, var_lifetimes, var_const,
+/// capture_vars, var_types) into a single verdict that backends can
+/// consult without re-deriving from scattered checks.
+///
+/// Cross-backend by design: the classification is language-neutral.
+/// Each backend maps the class to its own native representation.
+pub fn select_storage_classes(prog: &IrProgram) -> Vec<(String, crate::ir::StorageClass)> {
+    use crate::ir::StorageClass;
+    let mut out: Vec<(String, StorageClass)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Build lookup maps from existing analyses
+    let lengths: HashMap<String, Option<u64>> = prog.var_lengths.iter().cloned().collect();
+    let consts: HashMap<String, VarKind> = prog.var_const.iter().cloned().collect();
+    let lifetimes: HashMap<String, VarLifetime> = prog.var_lifetimes.iter().cloned().collect();
+    let types: HashMap<String, IrType> = prog.var_types.iter().cloned().collect();
+
+    // Capture vars (assigned from command substitutions)
+    let mut capture_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_capture_vars_shim(&prog.stmts, &mut capture_vars);
+
+    // Exported names
+    let exported = exported_var_names(prog);
+
+    // Collect all known string var names from all analyses
+    let mut all_names: BTreeSet<String> = BTreeSet::new();
+    for (n, _) in &lengths { all_names.insert(n.clone()); }
+    for (n, _) in &consts { all_names.insert(n.clone()); }
+    for (n, _) in &lifetimes { all_names.insert(n.clone()); }
+
+    for name in &all_names {
+        if seen.contains(name) { continue; }
+        seen.insert(name.clone());
+
+        let class = if types.get(name) == Some(&IrType::Int) {
+            // Range/provenance analysis proves integers only
+            StorageClass::Numeric
+        } else if exported.contains(name) {
+            // Exported or otherwise escapes the scope
+            StorageClass::Escaped
+        } else if capture_vars.contains(name) {
+            // Assigned from a command substitution — unbounded length
+            StorageClass::CaptureResult
+        } else if consts.get(name) == Some(&VarKind::Const) {
+            // Single-assignment literal, const-marked → read-only
+            StorageClass::ConstLiteral
+        } else if let Some(Some(bound)) = lengths.get(name) {
+            if *bound <= 1024 {
+                // Bounded and local → stack-allocated inline buffer
+                StorageClass::InlineBuffer
+            } else {
+                // Bound exceeds threshold → managed heap string
+                StorageClass::ManagedString
+            }
+        } else {
+            // No bound known, not captured, not exported → managed
+            StorageClass::ManagedString
+        };
+        out.push((name.clone(), class));
+    }
+    out.sort();
+    out
+}
+
+/// Shim: reuse c_backend's capture-var collector without importing it.
+fn collect_capture_vars_shim(stmts: &[IrStmt], out: &mut std::collections::HashSet<String>) {
+    fn walk_stmt(s: &[IrStmt], out: &mut std::collections::HashSet<String>) {
+        for st in s {
+            if let IrStmt::Assign { targets, expr, .. } = st {
+                let is_cap = matches!(expr, IrExpr::Capture { .. })
+                    || matches!(expr, IrExpr::Call { func, .. }
+                        if func == "capture" || func == "captureWords");
+                if is_cap {
+                    for t in targets { out.insert(t.var.clone()); }
+                }
+            }
+            // Recurse into nested statements (If/While/Block bodies etc.)
+            match st {
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    walk_stmt(then, out);
+                    for (_, b) in elsifs { walk_stmt(b, out); }
+                    walk_stmt(else_, out);
+                }
+                IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => walk_stmt(body, out),
+                IrStmt::For { body, .. } => walk_stmt(body, out),
+                IrStmt::Block(body) | IrStmt::Background(body) => walk_stmt(body, out),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages { walk_stmt(st, out); }
+                }
+                IrStmt::Redirect { inner, .. } => walk_stmt(inner, out),
+                _ => {}
+            }
+        }
+    }
+    walk_stmt(stmts, out);
+}
+
+/// Names that are export-visible (`export X` / `export X=val`).
+fn exported_var_names(prog: &IrProgram) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for s in &prog.stmts {
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+            if (func == "exec" || func == "builtin")
+                && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "export")
+            {
+                for a in args.iter().skip(1) {
+                    match a {
+                        IrExpr::Array(items) => items.iter().for_each(|it| {
+                            if let IrExpr::Str(ws, _) = it {
+                                if let Some((n, _)) = ws.split_once('=') { out.insert(n.to_string()); }
+                                else if is_ident_str(ws) { out.insert(ws.clone()); }
+                            }
+                        }),
+                        other => {
+                            if let IrExpr::Str(ws, _) = other { out.insert(ws.clone()); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn is_ident_str(s: &str) -> bool {
+    !s.is_empty() && s.chars().next().map_or(false, |c| c.is_ascii_alphabetic())
 }
 
 pub fn analyze_var_nospace(prog: &IrProgram) -> Vec<(String, bool)> {
@@ -36426,6 +36557,7 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         };
         // bare try/except: TryStatement + CatchClause + instanceof ladder

@@ -499,6 +499,48 @@ fn handle_nested(stmts: &mut Vec<IrStmt>, hit: Hit, n: &mut usize) -> bool {
             else_: vec![],
         });
     }
+    // 2b. GUARD THE TAIL between the goto's top-level ancestor and the
+    //     label. After the innermost `break` unwinds, every statement
+    //     in THIS list between them would otherwise run UNGUARDED (the
+    //     observed zig-sh-go spin: `no-match` printed forever because
+    //     `i` never advanced — the flag was set but nothing read it).
+    //     Skip the tail under the flag, and CLEAR the flag at the label
+    //     position so subsequent iterations start clean. Applies
+    //     generally: even with outer-loop guards, the unwind lands here.
+    let anc_idx = hit.path.first().map(|(i, _)| *i);
+    if std::env::var("RSDBG").is_ok() {
+        eprintln!("RSDBG handle_nested label={} lpos={} path_len={} loops={:?} anc={:?}", hit.label, hit.lpos, hit.path.len(), hit.loop_steps, anc_idx);
+    }
+    if let Some(aidx) = anc_idx {
+        // recompute the label position (outer guards above may have
+        // spliced bodies deeper — the top level is untouched by them)
+        let lpos_now = stmts
+            .iter()
+            .position(|s| matches!(s, IrStmt::Label(nm) if nm == &hit.label))
+            .unwrap_or(hit.lpos);
+        if aidx + 1 < lpos_now {
+            let tail: Vec<IrStmt> = stmts.drain(aidx + 1..lpos_now).collect();
+            let guarded = IrStmt::If {
+                cond: var(&flag),
+                then: vec![],
+                elsifs: vec![],
+                else_: tail,
+            };
+            stmts.insert(aidx + 1, guarded);
+        }
+        // clear the flag where the label was (fall-through entry point)
+        let lpos_after = stmts
+            .iter()
+            .position(|s| matches!(s, IrStmt::Label(nm) if nm == &hit.label));
+        if let Some(lp) = lpos_after {
+            stmts[lp] = assign_stmt(&flag, st("0"));
+        } else {
+            // label not found (drained as part of the tail?) — append
+            // the clear at the insertion boundary instead
+            stmts.insert(aidx + 1, assign_stmt(&flag, st("0")));
+        }
+        return true;
+    }
     // 3. remove the (now fall-through) label
     stmts.remove(hit.lpos);
     true
@@ -677,6 +719,7 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         }
     }

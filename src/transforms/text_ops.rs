@@ -2258,23 +2258,84 @@ fn try_normalize_construct_stmt(stmt: &IrStmt) -> Option<IrStmt> {
         _ => None,
     }).collect();
 
-    // `local v=val …` → plain assigns (flat variable model)
+    // `local v=val …` → plain assigns (flat variable model). The value may
+    // carry DYNAMIC parts (`local sqrt_n=$(echo x | bc)`) — the word is an
+    // Interpolate whose literal prefix names the variable and whose
+    // remaining parts concatenate into the value (captures included).
     if cmd == "local" {
-        let words = strs?;
         let mut stmts: Vec<IrStmt> = Vec::new();
-        for w in &words {
-            match w.split_once('=') {
-                Some((name, val)) => stmts.push(IrStmt::Assign {
-                    targets: vec![AssignTarget { var: name.to_string(), sigil: None, indices: vec![] }],
-                    expr: IrExpr::Str(val.to_string(), StrStyle::DoubleQuoted),
-                    asm: None,
+        for w in cmd_args {
+            let (name, value): (String, Option<IrExpr>) = match w {
+                IrExpr::Str(s, _) => match s.split_once('=') {
+                    Some((n, v)) => (
+                        n.to_string(),
+                        Some(IrExpr::Str(v.to_string(), StrStyle::DoubleQuoted)),
+                    ),
+                    None => (s.clone(), None),
+                },
+                IrExpr::Interpolate(parts) => {
+                    // find '=' inside a Lit part; everything from there on
+                    // is the value
+                    let mut done = false;
+                    let mut name: Option<String> = None;
+                    let mut rest: Vec<InterpPart> = Vec::new();
+                    for p in parts {
+                        if done {
+                            rest.push(p.clone());
+                            continue;
+                        }
+                        if let InterpPart::Lit(s) = p {
+                            if let Some(eq) = s.find('=') {
+                                name = Some(s[..eq].to_string());
+                                if eq + 1 < s.len() {
+                                    rest.push(InterpPart::Lit(s[eq + 1..].to_string()));
+                                }
+                                done = true;
+                                continue;
+                            }
+                        }
+                        if name.is_some() {
+                            rest.push(p.clone());
+                        } else if let InterpPart::Lit(pre) = p {
+                            // literal text BEFORE any '=' joins the name search:
+                            // multi-lit names are not a thing — bail
+                            if !pre.is_empty() && pre.chars().all(|c| c != '=') {
+                                name = Some(String::new());
+                                break;
+                            }
+                        } else {
+                            return None; // dynamic part before the '=' — ambiguous
+                        }
+                    }
+                    match name {
+                        Some(n) if !n.is_empty()
+                            && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                        {
+                            let value: Option<IrExpr> = match rest.len() {
+                                0 => None,
+                                1 => match &rest[0] {
+                                    InterpPart::Lit(s) => Some(IrExpr::Str(
+                                        s.clone(),
+                                        StrStyle::DoubleQuoted,
+                                    )),
+                                    InterpPart::Expr(x) => Some(x.as_ref().clone()),
+                                },
+                                _ => Some(IrExpr::Interpolate(rest)),
+                            };
+                            (n, value)
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            };
+            stmts.push(IrStmt::Assign {
+                targets: vec![AssignTarget { var: name, sigil: None, indices: vec![] }],
+                expr: value.unwrap_or_else(|| {
+                    IrExpr::Str(String::new(), StrStyle::DoubleQuoted)
                 }),
-                None => stmts.push(IrStmt::Assign {
-                    targets: vec![AssignTarget { var: w.to_string(), sigil: None, indices: vec![] }],
-                    expr: IrExpr::Str(String::new(), StrStyle::DoubleQuoted),
-                    asm: None,
-                }),
-            }
+                asm: None,
+            });
         }
         return Some(IrStmt::Block(stmts));
     }

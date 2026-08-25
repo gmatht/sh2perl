@@ -125,6 +125,9 @@ pub struct Render {
     /// analyze_string_lengths); None = unbounded. Only vars in the
     /// analysis' assign set appear.
     var_lengths: HashMap<String, Option<u64>>,
+    /// Unified storage-class selection per string variable (core analysis).
+    /// emit_var_decl consults this instead of re-deriving from scattered checks.
+    var_storage: HashMap<String, crate::ir::StorageClass>,
     /// var name -> conservative [lo, hi] (analyze_var_ranges + the
     /// Range/seq for-iter seeds the analysis doesn't track).
     var_ranges: HashMap<String, (i128, i128)>,
@@ -183,6 +186,9 @@ pub struct Render {
     /// true when ALL capture-assigned vars in the current scope are
     /// non-escaping → captures can share an arena freed at return
     arena_safe: bool,
+    /// vars declared as _sh_mstr (managed strings) — reads use .p,
+    /// writes use _sh_mstr_set; distinct from raw char* / bounded buf
+    managed_strings: BTreeSet<String>,
     /// TRUST mode: skip defensive copies, null guards, const exclusions.
     /// The input bash script is assumed correct — no runtime memory
     /// safety checks in the generated C. Faster but silently corrupts
@@ -295,6 +301,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     // JSON path; the library path must run the same ones.
     prog.var_types = crate::shir::analyze_var_types(&prog);
     prog.var_lengths = crate::shir::analyze_string_lengths(&prog);
+    prog.var_storage = crate::shir::select_storage_classes(&prog);
     prog.var_const = crate::shir::analyze_var_const(&prog);
     // Range analysis (M8 spike): conservative [lo, hi] per assigned var,
     // + the Range/seq for-iter seeds the analysis doesn't track (loop
@@ -308,6 +315,7 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
     r.var_lengths = prog.var_lengths.iter().cloned().collect();
+    r.var_storage = prog.var_storage.iter().cloned().collect();
     r.const_vars = prog.var_const.iter().cloned().collect();
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
     let mut capture_vars = BTreeSet::new();
@@ -1511,8 +1519,35 @@ impl Render {
     /// per-function hoists.
     fn emit_var_decl(&mut self, v: &str) {
         let name = self.c_ident(v);
-        if v == "SHELL_VAR" { eprintln!("DBG emit_var_decl SHELL_VAR out_len={}", self.out.len()); }
-        // const-markup lift: a Const var whose single top-level
+        // Storage-class selection: consult the unified analysis verdict
+        // instead of re-deriving from scattered checks. Falls through to
+        // the legacy paths for classes not yet handled natively.
+        if let Some(class) = self.var_storage.get(v) {
+            match class {
+                crate::ir::StorageClass::Numeric => {
+                    // already handled by is_num check below
+                }
+                crate::ir::StorageClass::ManagedString => {
+                    // TODO(sh2_str-migration): managed strings require
+                    // updating ~66 access sites (store_ref reads, strdup
+                    // assignments, format casts, exports). Deferred until
+                    // the tree is stable from concurrent normalisation work.
+                    // For now: raw char* with null-guard reads (safe).
+                    self.emit(&format!("char* {name} = NULL;"));
+                    return;
+                }
+                crate::ir::StorageClass::CaptureResult => {
+                    // capture targets stay raw char* for popen/fread
+                }
+                crate::ir::StorageClass::Escaped => {
+                    // must survive scope exit: raw heap pointer
+                    self.emit(&format!("char* {name} = NULL;"));
+                    return;
+                }
+                _ => {}
+            }
+        }
+                // const-markup lift: a Const var whose single top-level
         // assignment is a literal renders as a const declaration
         // initialized from that literal; the Assign stmt is dropped
         // (see the Assign arm). Only literal RHSs are lifted — a
@@ -1563,8 +1598,16 @@ impl Render {
             // the fixed-buffer transform: the var_lengths analysis
             // proves len(v) <= b, so the buffer is b+1 bytes
             self.emit(&format!("char {name}[{}] = \"\";", b + 1));
-        } else {
+        } else if self.capture_vars.contains(v) {
+            // capture targets stay raw char*: the capture helper fills
+            // a static buffer and the assign strdups from it
             self.emit(&format!("char* {name} = NULL;"));
+        } else {
+            // managed string: owns its storage, grows on demand,
+            // no leak on reassign (the raw char* default leaked on
+            // every reassignment because strdup replaced the pointer)
+            self.emit(&format!("_sh_mstr {name} = {{0}};"));
+            self.managed_strings.insert(name.clone());
         }
     }
 
@@ -1752,7 +1795,14 @@ impl Render {
     /// expansions).
     fn store_ref(&self, name: &str) -> String {
         let id = self.c_ident(name);
-        format!("({id} ? {id} : \"\")")
+        // managed-string vars read via .p; raw char* vars via null-guard
+        if self.managed_strings.contains(name) {
+            format!("_sh_mstr_get(&{id})")
+        } else if self.capture_vars.contains(name) {
+            format!("({id} ? {id} : \"\")")
+        } else {
+            format!("({id} ? {id} : \"\")")
+        }
     }
 
     /// store read with the env fallback: an ASSIGNED var reads the C
@@ -8393,7 +8443,7 @@ impl Render {
                     // a later statement rewrites (a sibling snprintf
                     // self-aliases `snprintf(_sN, "%s * %s", _sN, x)`),
                     // so the var must own its storage
-                    self.emit(&format!("{name} = strdup({rhs});"));
+                    self.emit(&format!("_sh_mstr_set(&{name}, {rhs});"));
                 } else {
                     self.emit(&format!("{name} = {rhs};"));
                 }

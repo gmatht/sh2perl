@@ -144,6 +144,8 @@ pub struct Render {
     fh_counter: usize,
     /// WalkDir used → __sh2_walk preamble helper needed.
     need_walk: bool,
+    /// rm -r used → File::Path remove_tree import needed.
+    need_rm_r: bool,
     /// ReadLine used → __sh2_read_line preamble helper needed.
     need_readline: bool,
 }
@@ -255,6 +257,10 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
             r.emit(line);
         }
         r.emit("");
+    }
+    if r.need_rm_r {
+        r.emit("");
+        r.emit("use File::Path ();");
     }
     let scalars: Vec<String> = r
         .scalars
@@ -726,11 +732,80 @@ impl Render {
         }
     }
 
+    /// Does this capture body render ENTIRELY natively (no child process
+    /// whose fd-1 output would escape select()-based capture)?
+    fn capture_body_is_native(stmts: &[IrStmt]) -> bool {
+        stmts.iter().all(|s| match s {
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if func == "exec" || func == "builtin" =>
+            {
+                match args.first() {
+                    Some(IrExpr::Str(c, _)) => matches!(
+                        c.as_str(),
+                        "echo" | "printf" | "cd" | "exit" | "mkdir" | "touch" | "rm"
+                            | "read" | "shift" | "let" | "true" | "false" | "local"
+                            | "declare" | "set" | "test"
+                    ),
+                    _ => true,
+                }
+            }
+            IrStmt::Assign { expr, .. } => capture_body_expr_native(expr),
+            IrStmt::Output { value, .. } => capture_body_expr_native(value),
+            IrStmt::While { cond, body, .. } | IrStmt::DoWhile { body, cond, .. } => {
+                capture_body_expr_native(cond) && Self::capture_body_is_native(body)
+            }
+            IrStmt::Block(b) => Self::capture_body_is_native(b),
+            IrStmt::Expr(IrExpr::Call { func, .. }) if func == "test" => true,
+            _ => false,
+        })
+    }
+
     fn capture_from_expr(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Arrow(stmts) => {
-                let cmd = self.shell_cmd(stmts, "; ");
-                self.qx(&cmd)
+                // Native capture requires every body command to be one the
+                // renderer lowers NATIVELY (echo/printf/…) — child processes
+                // write to fd 1, which select()-based capture cannot see.
+                // Anything external → the qx fallback (fork/exec is then
+                // unavoidable; bash semantics beat purity).
+                if !Self::capture_body_is_native(stmts) {
+                    // qx fallback (fork/exec unavoidable): still apply the
+                    // command-substitution trailing-newline strip
+                    let cmd = self.shell_cmd(stmts, "; ");
+                    let k = self.fh_counter;
+                    self.fh_counter += 1;
+                    return format!(
+                        "do {{ my $__qx{k} = {}; $__qx{k} =~ s/\\n+$//; $__qx{k} }}",
+                        self.qx(&cmd)
+                    );
+                }
+                // NATIVE capture (no fork/exec): redirect STDOUT into an
+                // IN-MEMORY scalar, run the body's OWN statements, restore,
+                // strip trailing newlines ($() semantics). The body renders
+                // into a TEMP BUFFER so the whole capture becomes one
+                // do{…} BLOCK EXPRESSION usable in value position.
+                let k = self.fh_counter;
+                self.fh_counter += 1;
+                let mut saved = std::mem::take(&mut self.out);
+                for s in stmts {
+                    self.stmt(s);
+                }
+                let body_lines = std::mem::take(&mut self.out);
+                self.out = saved;
+                let mut blk = String::from("do {\n");
+                blk.push_str(&format!("my $__cap{k} = '';\n"));
+                blk.push_str(&format!("open(my $__mem{k}, '>', \\$__cap{k}) or die;\n"));
+                blk.push_str(&format!("my $__sel{k} = select($__mem{k});\n"));
+                for l in &body_lines {
+                    blk.push_str(l);
+                    blk.push('\n');
+                }
+                blk.push_str(&format!("close($__mem{k});\n"));
+                blk.push_str(&format!("select($__sel{k});\n"));
+                blk.push_str(&format!("$__cap{k} =~ s/\\n+$//;\n"));
+                blk.push_str(&format!("$__cap{k}\n"));
+                blk.push('}');
+                blk
             }
             other => {
                 self.mark_todo("capture expr");
@@ -1355,7 +1430,11 @@ impl Render {
                     matches!(w, IrExpr::Str(s, _) if s == "-r" || s == "-R" || s == "-rf" || s == "-fr")
                 });
                 if recursive {
-                    self.mark_todo("rm -r");
+                    self.need_rm_r = true;
+                    for f in &files {
+                        self.emit(&format!("File::Path::remove_tree({}, undef);", f));
+                    }
+                    return;
                 }
                 self.emit(&format!("unlink {};", files.join(", ")));
             }
@@ -1490,6 +1569,21 @@ impl Render {
         // two-char \n): perl printf would print them literally. Decode the
         // standard escape set once, then let %s/%d pass through to perl's
         // sprintf (same conv set java renders).
+        if let IrExpr::Interpolate(parts) = fmt {
+            // single-Lit / all-Lit formats: decode escapes per part
+            if parts.iter().all(|p| matches!(p, InterpPart::Lit(_))) {
+                let mut decoded = String::new();
+                for p in parts {
+                    if let InterpPart::Lit(s) = p {
+                        decoded.push_str(&unescape_perl(s));
+                    }
+                }
+                let args: Vec<String> = words[1..].iter().map(|w| self.expr(w)).collect();
+                let lit = Self::perl_str(&decoded);
+                self.emit(&format!("printf({}, {});", lit, args.join(", ")));
+                return;
+            }
+        }
         if let IrExpr::Str(s, _) = fmt {
             let un = s
                 .replace("\\n", "\n")
@@ -1584,6 +1678,39 @@ impl Render {
         if toks.is_empty() {
             return "0".to_string();
         }
+        // merge $(( … )) fragments that whitespace-splitting broke apart
+        // (`$((n % 2))` arrives as ["$((n", "%", "2))"])
+        let mut merged: Vec<String> = Vec::new();
+        let mut ti = 0usize;
+        while ti < toks.len() {
+            let t = &toks[ti];
+            if t.starts_with("$((") && !t.ends_with("))") {
+                let mut acc = t.clone();
+                let mut j = ti + 1;
+                while j < toks.len() {
+                    acc.push(' ');
+                    acc.push_str(&toks[j]);
+                    let done = toks[j].ends_with("))");
+                    j += 1;
+                    if done { break; }
+                }
+                merged.push(acc);
+                ti = j;
+            } else {
+                merged.push(t.clone());
+                ti += 1;
+            }
+        }
+        let toks: &[String] = &merged;
+        // -a / -o chain operators (word-level AND/OR)
+        for (i, t) in toks.iter().enumerate().skip(1) {
+            if t == "-a" || t == "-o" {
+                let l = self.test_tokens_parse(&toks[..i]);
+                let r = self.test_tokens_parse(&toks[i + 1..]);
+                let jop = if t == "-a" { "&&" } else { "||" };
+                return format!("({l} {jop} {r})");
+            }
+        }
         // `!` negation
         if toks[0] == "!" {
             let inner = self.test_tokens_parse(&toks[1..]);
@@ -1599,7 +1726,39 @@ impl Render {
         }
         match toks.len() {
             1 => {
-                let v = self.test_value(&toks[0]);
+                // glued comparison inside one token (`$var!="c"`): split on
+                // the FIRST ==/!= that sits outside quotes
+                let one = &toks[0];
+                let bytes: Vec<char> = one.chars().collect();
+                let mut si: Option<(usize, usize)> = None; // (idx, oplen)
+                let mut q: Option<char> = None;
+                let mut ci = 0usize;
+                while ci < bytes.len() {
+                    match q {
+                        Some(qc) => {
+                            if bytes[ci] == '\\' { ci += 1; }
+                            else if bytes[ci] == qc { q = None; }
+                        }
+                        None => {
+                            if bytes[ci] == '"' || bytes[ci] == '\'' { q = Some(bytes[ci]); }
+                            else if bytes[ci] == '=' && ci + 1 < bytes.len() && bytes[ci + 1] == '=' {
+                                si = Some((ci, 2));
+                                break;
+                            }
+                            else if bytes[ci] == '!' && ci + 1 < bytes.len() && bytes[ci + 1] == '=' {
+                                si = Some((ci, 2));
+                                break;
+                            }
+                        }
+                    }
+                    ci += 1;
+                }
+                if let Some((idx, oplen)) = si {
+                    let l = self.test_tokens_parse(&[one[..idx].to_string()]);
+                    let r = self.test_tokens_parse(&[one[idx + oplen..].to_string()]);
+                    return format!("({l} {} {r})", if oplen == 2 && one.as_bytes()[idx] == b'!' { "!=" } else { "==" });
+                }
+                let v = self.test_value(one);
                 format!("({v})")
             }
             2 => {
@@ -1684,6 +1843,13 @@ impl Render {
             .and_then(|s| s.strip_suffix('"'))
             .or_else(|| t.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
             .unwrap_or(t);
+        // $(( ARITH )) — arithmetic expansion as a test operand (numeric)
+        if t.starts_with("$((") && t.ends_with("))") {
+            let inner_arith = &t[3..t.len() - 2];
+            if let Some(ast) = crate::shir::parse_arith(inner_arith) {
+                return self.arith(&ast);
+            }
+        }
         if let Some(name) = inner.strip_prefix('$') {
             if !name.is_empty() {
                 return self.var_ref(name);
@@ -2591,6 +2757,43 @@ impl Render {
 // ── free helpers ─────────────────────────────────────────────────────
 
 /// Sanitize a shell variable name into a Perl identifier.
+/// Value expressions are native when they contain no external-command
+/// exec (child processes escape select()-based capture).
+/// Decode the standard backslash escapes an A1 Str carries raw.
+fn unescape_perl(s: &str) -> String {
+    s.replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\r", "\r")
+        .replace("\\\\", "\\")
+}
+
+fn capture_body_expr_native(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+            match args.first() {
+                Some(IrExpr::Str(c, _)) => matches!(
+                    c.as_str(),
+                    "echo" | "printf" | "cd" | "exit" | "mkdir" | "touch" | "rm"
+                        | "read" | "shift" | "let" | "true" | "false"
+                ),
+                _ => true,
+            }
+        }
+        IrExpr::Call { args, .. } => args.iter().all(capture_body_expr_native),
+        IrExpr::Array(items) => items.iter().all(capture_body_expr_native),
+        IrExpr::BinOp { lhs, rhs, .. } => {
+            capture_body_expr_native(lhs) && capture_body_expr_native(rhs)
+        }
+        IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
+            InterpPart::Lit(_) => true,
+            InterpPart::Expr(x) => capture_body_expr_native(x),
+        }),
+        IrExpr::Ext(n) => n.children().iter().all(|c| capture_body_expr_native(c)),
+        IrExpr::Capture { .. } => false,
+        _ => true,
+    }
+}
+
 fn ident(name: &str) -> String {
     let mut out = String::new();
     for c in name.chars() {
