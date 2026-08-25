@@ -237,7 +237,7 @@ impl JavaRender {
             o.push('\n');
         }
         // assemble: header fields discovered during rendering
-        let mut header = String::from("    static long __SH_RC = 0;\n    static String __SH_T = \"\";\n    static boolean __SH_NOCASE = false;
+        let mut header = String::from("    static long __SH_RC = 0;\n    static String __SH_T = \"\";\n    static String __v___mf = \"\";\n    static boolean __SH_NOCASE = false;
     static String __SH_CWD = System.getProperty(\"user.dir\");\n    static LinkedHashMap<String, String> __SH_EXPORTS = new LinkedHashMap<>();\n    static List<String> __SH_ARGV = new ArrayList<>();\n    static Scanner __SH_IN = new Scanner(System.in);\n");
         for f in &self.fields {
             header.push_str(&format!("    static String __v_{f} = \"\";\n"));
@@ -775,6 +775,76 @@ impl JavaRender {
                 self.emit(&format!("__SH_RC = shRun({});", parts2.join(" + \" | \" + ")));
                 Ok(())
             }
+            IrExpr::Call { func, args, .. } if func == "grepMatches" => {
+                // grep [flags] PATTERN <<< input — real child so stdout
+                // reaches the terminal (bash-faithful)
+                let hay = self.expr_str(args.first().ok_or("grepMatches: no input")?)?;
+                let pat = self.expr_str(args.get(1).unwrap_or(&IrExpr::Str(String::new(), StrStyle::DoubleQuoted)))?;
+                // grepMatches IS the grep -o lift (transforms/grep_o.rs):
+                // one match per line, rc 0 iff any match
+                let fl = "-o ".to_string();
+                self.helper("quote");
+                self.helper("run");
+                self.emit(&format!("__SH_RC = shRun(\"grep {}\" + \" \" + shQuote({pat}) + \" <<< \" + shQuote({hay}));", fl));
+                Ok(())
+            }
+            IrExpr::Call { func, args, .. } if func == "and" || func == "or" => {
+                // Left-to-right short-circuit evaluation:
+                // - Arrow bodies whose stmts are fully native execute on the
+                //   Java side (state changes survive: mapfile arrays, cd)
+                // - anything else becomes one bash -c text run
+                // bash rules: && runs next on success, || on failure
+                    let is_or = func == "or";
+                    // pre-run renderer-temp captures natively so referenced
+                    // paths are real
+                    for a in args.iter() {
+                        if let IrExpr::Arrow(body) = a {
+                            for bs in body.iter() {
+                                if let IrStmt::Assign { targets, .. } = bs {
+                                    if targets.first().map(|t| t.var.starts_with("__ps_")).unwrap_or(false) {
+                                        self.stmt(bs)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.emit("__chain: {");
+                    self.depth += 1;
+                    let mut i = 0usize;
+                    while i < args.len() {
+                        if i > 0 {
+                            let gate = if is_or { "__SH_RC == 0" } else { "__SH_RC != 0" };
+                            self.emit(&format!("if ({gate}) break __chain;"));
+                        }
+                        let arg = &args[i];
+                        if let IrExpr::Arrow(body) = arg {
+                            if body.iter().all(chain_stmt_native) {
+                                for bs in body.iter() { self.stmt(bs)?; }
+                                i += 1;
+                                continue;
+                            }
+                        }
+                        // non-native remainder: ONE bash -c text for this
+                        // and everything after
+                        let mut parts: Vec<String> = Vec::new();
+                        for a in args.iter().skip(i) {
+                            if let IrExpr::Arrow(body) = a {
+                                parts.push(self.arrow_expr(body)?);
+                            } else {
+                                parts.push(self.expr_str(a)?);
+                            }
+                        }
+                        self.helper("quote");
+                        self.helper("run");
+                        self.emit(&format!("__SH_RC = shRun({});", parts.join(&format!(" + \"{}\" + ", sep_of(func)))));
+                        i = args.len();
+                        continue;
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                    Ok(())
+            }
+
             IrExpr::Call { func, .. } if func == "continue" => { self.emit("continue;"); Ok(()) }
             IrExpr::Call { func, .. } if func == "break" => { self.emit("break;"); Ok(()) }
             IrExpr::BinOp { ref op, lhs, rhs, .. }
@@ -920,6 +990,28 @@ impl JavaRender {
                     Some(c) => { let n = self.expr_num(c)?; self.emit(&format!("System.exit((int) {n});")); }
                     None => self.emit("System.exit((int) __SH_RC);"),
                 }
+                Ok(())
+            }
+            "mapfile" => {
+                // mapfile [-t] VAR — read stdin lines into an array field
+                let target = rest.iter()
+                    .flat_map(|w| flatten_words(std::slice::from_ref(w)))
+                    .find_map(|e| match e {
+                        IrExpr::Str(t, _) if !t.starts_with('-') => Some(t.clone()),
+                        _ => None,
+                    })
+                    .ok_or("mapfile: no target var")?;
+                self.arrays.insert(sanitize(&target));
+                self.helper("readln");
+                self.emit(&format!("__a_{} = new ArrayList<>();", sanitize(&target)));
+                self.block_open("{");
+                self.emit("__v___mf = shReadln();");
+                self.block_open("while (__v___mf != null) {");
+                self.emit(&format!("__a_{}.add(__v___mf);", sanitize(&target)));
+                self.emit("__v___mf = shReadln();");
+                self.block_close();
+                self.emit("}");
+                self.emit("__SH_RC = 0;");
                 Ok(())
             }
             ":" | "true" => { self.emit("__SH_RC = 0;"); Ok(()) }
@@ -1670,7 +1762,7 @@ impl JavaRender {
                 return Ok(format!("shCapture({})", parts.join(" + \" | \" + ")));
             }
             IrExpr::Call { func, args, .. } if func == "and" || func == "or" => {
-                let sep = if func == "and" { " \" && \"" } else { " \" || \"" };
+                let sep = if func == "and" { " && " } else { " || " };
                 let mut parts = Vec::new();
                 for a in args.iter() {
                     if let IrExpr::Arrow(body) = a {
@@ -1681,17 +1773,17 @@ impl JavaRender {
                 }
                 self.helper("quote");
                 self.helper("capture");
-                return Ok(format!("shCapture({})", parts.join(sep)));
+                return Ok(format!("shCapture({})", parts.join(&format!(" + \"{sep}\" + "))));
             }
             IrExpr::BinOp { op: BinOpKind::And | BinOpKind::Or, .. } => {
                 // command chains in value position: run both sides
-                let sep = if matches!(e, IrExpr::BinOp { op: BinOpKind::And, .. }) { " \" && \"" } else { " \" || \"" };
+                let sep = if matches!(e, IrExpr::BinOp { op: BinOpKind::And, .. }) { " && " } else { " || " };
                 if let IrExpr::BinOp { lhs, rhs, .. } = e {
                     let l = self.side_text(lhs)?;
                     let r = self.side_text(rhs)?;
                     self.helper("quote");
                     self.helper("capture");
-                    return Ok(format!("shCapture({l}{sep}{r})"));
+                    return Ok(format!("shCapture({l} + \"{sep}\" + {r})"));
                 }
                 unreachable!()
             }
@@ -2166,6 +2258,7 @@ impl JavaRender {
                             sub.push(self.expr_str(a)?);
                         }
                     }
+                    eprintln!("DBG and-join sub={:?} sep={sep}", sub);
                     parts.push(sub.join(&format!(" + \"{sep}\" + ")));
                 }
                 IrStmt::Expr(IrExpr::BinOp { op, lhs, rhs, .. }) => {
@@ -2291,6 +2384,30 @@ impl JavaRender {
                     }
                 }
                 Ok(parts2.join(" + \" | \" + "))
+            }
+            IrExpr::Call { func, args, .. } if func == "and" || func == "or" => {
+                // pre-run renderer-temp captures so interpolated paths are real
+                for a in args.iter() {
+                    if let IrExpr::Arrow(body) = a {
+                        for bs in body.iter() {
+                            if let IrStmt::Assign { targets, .. } = bs {
+                                if targets.first().map(|t| t.var.starts_with("__ps_")).unwrap_or(false) {
+                                    self.stmt(bs)?;
+                                }
+                            }
+                        }
+                    }
+                }
+                let sep = if func == "and" { " && " } else { " || " };
+                let mut parts = Vec::new();
+                for a in args.iter() {
+                    if let IrExpr::Arrow(body) = a {
+                        parts.push(self.arrow_expr(body)?);
+                    } else {
+                        parts.push(self.expr_str(a)?);
+                    }
+                }
+                Ok(format!("({})", parts.join(&format!("){sep}("))))
             }
             other => Err(format!("command-chain side not representable: {other:?}")),
         }
@@ -3183,6 +3300,22 @@ fn expand_group(items: &serde_json::Value) -> Result<Vec<String>, String> {
 }
 
 /// Flatten Array-of-words wrappers inside command args.
+/// True when every statement of the chain body renders natively (no
+/// child-text fallback): native builtins, redirects thereof, temp assigns.
+fn chain_stmt_native(st: &IrStmt) -> bool {
+    match st {
+        IrStmt::Expr(IrExpr::Call { func, args, .. }) if func == "builtin" || func == "exec" => {
+            matches!(str_arg(args, 0),
+                Some("echo") | Some("printf") | Some("mapfile") | Some("read")
+                | Some("cd") | Some("export") | Some("true") | Some("false")
+                | Some(":") | Some(":="))
+        }
+        IrStmt::Redirect { inner, .. } => inner.iter().all(chain_stmt_native),
+        IrStmt::Assign { .. } => true,
+        _ => false,
+    }
+}
+
 fn flatten_words(args: &[IrExpr]) -> Vec<&IrExpr> {
     let mut out = Vec::new();
     for a in args {
@@ -3268,3 +3401,5 @@ fn unbalanced_cmdsub(s: &str) -> bool {
     }
     false
 }
+
+fn sep_of(func: &str) -> &'static str { if func == "and" { " && " } else { " || " } }
