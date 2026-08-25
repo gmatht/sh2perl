@@ -94,6 +94,18 @@ fn build_cat_replacement(args: &[IrExpr]) -> Option<IrStmt> {
     let num_var = format!("__cn{seq}");
     let mut blocks: Vec<IrStmt> = Vec::new();
     for file in &files {
+        if numbered {
+            // counter zero-init BEFORE the loop
+            blocks.push(IrStmt::Assign {
+                targets: vec![crate::ir::AssignTarget {
+                    var: num_var.clone(),
+                    sigil: None,
+                    indices: Vec::new(),
+                }],
+                expr: IrExpr::Int(0),
+                asm: None,
+            });
+        }
         let body = if numbered {
             vec![
                 counter_incr(&num_var),
@@ -123,11 +135,11 @@ fn counter_incr(name: &str) -> IrStmt {
             sigil: None,
             indices: Vec::new(),
         }],
-        expr: IrExpr::Arith(Box::new(ArithAst::Bin {
-            op: "+".to_string(),
-            lhs: Box::new(ArithAst::Var(name.to_string())),
-            rhs: Box::new(ArithAst::Num(1)),
-        })),
+        expr: IrExpr::BinOp {
+            op: crate::ir::BinOpKind::Add,
+            lhs: Box::new(IrExpr::Var(name.to_string(), None)),
+            rhs: Box::new(IrExpr::Int(1)),
+        },
         asm: None,
     }
 }

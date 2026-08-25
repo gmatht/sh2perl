@@ -88,6 +88,10 @@ pub fn expr_to_json(e: &IrExpr) -> Value {
             "kind": "Call", "func": func,
             "args": args.iter().map(expr_to_json).collect::<Vec<_>>(),
         }),
+        IrExpr::Array(items) => json!({
+            "kind": "Array",
+            "items": items.iter().map(expr_to_json).collect::<Vec<_>>(),
+        }),
         IrExpr::Ext(n) => json!({"kind": "Ext", "tag": n.tag(), "node": n.to_json()}),
         other => json!({"kind": "Other", "repr": format!("{other:?}")}),
     }
@@ -105,6 +109,10 @@ pub fn json_to_expr(v: &Value) -> Result<IrExpr, String> {
             func: v["func"].as_str().ok_or("Call.func")?.to_string(),
             args: json_to_exprs(&v["args"])?
         }),
+        Some("Array") => Ok(IrExpr::Array(
+            v["items"].as_array().ok_or("Array.items")?
+                .iter().map(json_to_expr).collect::<Result<Vec<_>, _>>()?
+        )),
         Some("BinOp") => {
             let op = match v["op"].as_str() {
                 Some("Add") => crate::ir::BinOpKind::Add,
