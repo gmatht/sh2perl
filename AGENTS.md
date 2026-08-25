@@ -7,7 +7,10 @@ self-contained).
 
 ## Build & test
 
-- Build: `cargo build --bin debashc`
+- Build: `cargo build -p debashcl --bin otranspiler` (the DEFAULT
+  user-facing binary — `cargo run` runs it too; parse shell → A1 → any
+  backend, `otranspiler <input> [output] [--target L]`). `debashc`
+  remains the flag-level CLI the gates and scripts invoke.
 - Unit tests: `cargo test`
 - Corpus gate: the full 517-example suite runs from the workspace harness
   (a `fail` script outside this repo); this repo only guarantees `cargo
