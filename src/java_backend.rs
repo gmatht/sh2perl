@@ -368,7 +368,9 @@ impl JavaRender {
                 let items = self.for_items(iter)?;
                 self.fields.insert(sanitize(var));
                 self.emit(&format!("__v_{} = \"\";", sanitize(var)));
-                if items.contains('\u{1}') || items.contains("shSplit(") && !items.starts_with('"') {
+                let runtime_list = items.contains('\u{1}') || items.contains("shSplit(")
+                   || items.contains("__SH_ARGV");
+                if runtime_list {
                     // mixed literal + runtime-list iterable
                     self.emit("List<String> __items = new ArrayList<>();");
                     for piece in items.split('\u{1}') {
@@ -1197,6 +1199,7 @@ impl JavaRender {
                     })
                     .ok_or("read cond: no target")?;
                 self.helper("readln");
+                self.ensure_field(&target);
                 Ok(format!("((__v_{t} = shReadln()) != null)", t = sanitize(&target)))
             }
             "true" => Ok("true".into()),
