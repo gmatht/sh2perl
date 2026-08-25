@@ -352,6 +352,7 @@ mod tests {
     #[test]
     fn pipeline_runs_on_empty_program() {
         let prog = IrProgram {
+            var_storage: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
             imports: vec![],
@@ -388,6 +389,7 @@ mod tests {
     #[test]
     fn pipeline_is_deterministic() {
         let prog = IrProgram {
+            var_storage: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
             imports: vec![],
@@ -420,6 +422,7 @@ mod tests {
     fn pipeline_tallies_sh2_calls() {
         use crate::ir::IrExpr;
         let prog = IrProgram {
+            var_storage: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
             imports: vec![],
@@ -449,6 +452,7 @@ mod tests {
     #[test]
     fn pipeline_attaches_const_markup() {
         let prog = IrProgram {
+            var_storage: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
             imports: vec![],

@@ -472,6 +472,7 @@ mod tests {
 
     fn empty_prog() -> IrProgram {
         IrProgram {
+            var_storage: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
             imports: vec![],
@@ -535,6 +536,7 @@ mod tests {
         ctx.const_vars
             .insert("x".to_string(), crate::ir::VarKind::Const);
         let mut prog = IrProgram {
+            var_storage: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
             imports: vec![],

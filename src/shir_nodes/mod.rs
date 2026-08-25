@@ -185,6 +185,7 @@ mod tests {
             body: vec![IrStmt::Expr(crate::ir::IrExpr::Int(1))],
         }));
         let prog = IrProgram {
+            var_storage: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![ext],
@@ -236,6 +237,7 @@ mod tests {
             ],
         }));
         let prog = IrProgram {
+            var_storage: vec![],
             imports: vec![],
             requires: vec![],
             stmts: vec![ext],

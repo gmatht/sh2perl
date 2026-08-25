@@ -71,6 +71,7 @@ mod tests {
     #[test]
     fn walker_handles_empty_program() {
         let prog = IrProgram {
+            var_storage: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
             imports: vec![],
@@ -93,6 +94,7 @@ mod tests {
     #[test]
     fn walker_handles_non_liftable_program() {
         let prog = IrProgram {
+            var_storage: vec![],
             var_nospace: vec![],
             var_bash_env: vec![],
             imports: vec![],

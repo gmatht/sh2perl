@@ -667,6 +667,7 @@ mod tests {
 
     fn program(stmts: Vec<IrStmt>) -> IrProgram {
         IrProgram {
+            var_storage: vec![],
             imports: vec![],
             requires: vec![],
             stmts,
