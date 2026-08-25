@@ -569,6 +569,15 @@ impl Render {
             self.emit("static char _sh_opts[] = \"hB\"; /* $- — option flags */");
             self.emit("/* background jobs (fork-based) reaped by bare wait */");
             self.emit("static pid_t _sh_bg_pids[512]; static size_t _sh_bg_n = 0;");
+            // ── managed string: the C equivalent of sh2.vars.x ──
+            self.emit("typedef struct { char *p; } sh2_str;");
+            self.emit("static void sh2_str_set(sh2_str *v, const char *val) {");
+            self.emit("  free(v->p);");
+            self.emit("  v->p = val ? strdup(val) : NULL;");
+            self.emit("}");
+            self.emit("static const char *sh2_str_get(const sh2_str *v) {");
+            self.emit("  return (v->p) ? v->p : \"\"");
+            self.emit("}");
             self.emit("static char *_sh_cmd = 0; static size_t _sh_cap = 0;");
             self.emit("static char *_sh_wb = 0; static size_t _sh_wcap = 0;");
             self.emit("static char *_sh_wrap = 0; static size_t _sh_wrapcap = 0;");
