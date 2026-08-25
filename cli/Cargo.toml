@@ -2,6 +2,8 @@
 name = "debashcl"
 version = "0.1.0"
 edition = "2021"
+# bare `cargo run` runs the unified command
+default-run = "otranspiler"
 
 # CLI layer: debashcl (library of CLI logic) wraps debashl (transpiler core);
 # the debashc binary is a 3-line main over debashcl::main_with_args.
@@ -10,6 +12,13 @@ edition = "2021"
 # (cli/src/wasi_api.rs): `debashc_cli_run(argc, argv)` runs the full
 # command-line processing from any embedder, so debashc can be implemented
 # in three lines of JS (see cli/example-wasi.mjs and build-wasi.sh).
+
+# otranspiler — the DEFAULT user-facing binary: unified transpile command
+# (parse shell → A1 shIR, render through any backend). debashc stays for
+# the gates/scripts that invoke individual CLI flags directly.
+[[bin]]
+name = "otranspiler"
+path = "src/bin/otranspiler.rs"
 
 [[bin]]
 name = "debashc"
