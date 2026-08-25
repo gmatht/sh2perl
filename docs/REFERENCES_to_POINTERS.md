@@ -286,3 +286,96 @@ consults, replacing the current ad-hoc checks.
 | Tagged value | ★★★☆☆ | ★★★★☆ | Large diff | Phase 3 |
 | RC pointer | ★★★☆☆ | ★★★★★ | Deferred | Phase 4 |
 | Heap strdup | ★★☆☆☆ | ★★★☆☆ | Current default | Baseline |
+
+## The sh2_str integration path (C backend)
+
+Switching from raw `char *x = NULL` to `sh2_str` touches every site that
+reads or writes an unbounded variable. There are six categories:
+
+| Access-site category | Count | Current C form | sh2_str form |
+|---|---|---|---|
+| `store_ref(name)` read | 19 | `(x ? x : "")` | `sh2_str_get(&x)` |
+| Format-string cast | 15 | `(char*)(x)` | `sh2_str_get(&x)` |
+| strdup assignment | 14 | `x = strdup(v);` | `sh2_str_set(&x, v);` |
+| `_sh_export` to child | 17 | `_sh_export(n, x);` | `_sh_export(n, sh2_str_get(&x));` |
+| Guarded copy (bounded) | 8 | unchanged (inline stays) | unchanged |
+| `getVar` dispatch arms | 4 | mixed reads/writes | per-arm update |
+
+Total: ~66 sites across c_backend.rs. All mechanical replacements; no
+logic changes required. The diff is large but each hunk is independent.
+
+### What does NOT change
+- Numeric vars (`long long`) stay as-is
+- Bounded inline buffers (`char x[1024]`) stay as-is
+- Capture helpers (`_cap_N()`) still return `char *`
+- Site command text (`_sh_badd`) stays as-is (child bash reads via env)
+
+## How much is cross-backend?
+
+The division is strict:
+
+**CROSS-BACKEND (shared analyses + IR vocabulary):**
+
+| Component | Where it lives | Every backend uses? |
+|---|---|---|
+| getVar / setVar node family | core IR | ✅ all |
+| escape_classes verdicts | transforms/escape_classes.rs | ✅ all (when wired) |
+| var_lengths bounds analysis | shir.rs analyze_string_lengths | ✅ all |
+| analyze_var_const Const/Var verdicts | shir.rs | ✅ all |
+| capture_vars set | c_backend.rs collect_capture_vars | ⚠️ C only (should be shared) |
+| WordCount/Split/StrLen/etc nodes | shir_nodes/*.node | ✅ all (via Ext dispatch) |
+| Storage-class decision matrix | REFERENCES_to_POINTERS.md (design) | concept shared, impl per-backend |
+
+**PER-BACKEND (representation + runtime helpers):**
+
+| Concept | C implementation | JS/Estree equivalent | Perl equivalent | Go equivalent |
+|---|---|---|---|---|
+| Managed string | `sh2_str { ptr }` | `sh2.vars.x` (plain property) | `$x` (scalar SV) | `var y string` |
+| Bounds checking | compile-time only | V8 runtime (free) | runtime (free) | compiler + runtime |
+| Use-after-free detect | ❌ none | GC handles it | refcounting | compiler |
+| Type coercion | `atoll(x)` explicit | implicit (dynamic) | implicit (scalar context) | explicit |
+| Arena allocation | custom bump allocator | GC young gen | arena allocator | GC |
+| In-place mutation | `char buf[]` writable | ❌ immutable strings | ✅ mutable | ✅ mutable []byte |
+| RC pointer | custom refcnt | GC refcount (V8 internal) | SV refcount | GC |
+
+**Key insight**: the ANALYSES that decide which representation a variable
+gets are always cross-backend. The REPRESENTATIONS themselves are
+per-backend because each language has different native capabilities.
+The shIR doesn't need new node types for any of this — it needs the
+ANALYSES to publish their verdicts so every backend can consult them.
+
+What IS missing at the shIR level: a way for a transform to DECLARE "this
+variable should be stored as X" without knowing what X means in each
+backend. The `.node` format could carry an `output_type` hint:
+
+```
+node ReadLine
+tag "ReadLine"
+kind expr
+field text: expr
+output_type str_unbounded   ← informs every backend's storage selector
+```
+
+Each backend maps `str_unbounded` to its own representation:
+- C → `sh2_str` (or raw `char*` if escaping)
+- JS → plain string (already correct)
+- Perl → scalar (already correct)
+- Go → `string` (already correct)
+
+This is the missing piece that makes storage-class selection truly
+cross-backend without coupling backends.
+
+## Integration effort estimate
+
+| Phase | Sites touched | Risk | Value |
+|---|---|---|---|
+| sh2_str runtime preamble | 1 (emit_runtime) | zero | infrastructure |
+| store_ref → sh2_str_get | ~19 call sites | low | correctness (no NULL deref) |
+| strdup → sh2_str_set | ~14 assignment arms | low | no leaks on reassign |
+| export → sh2_str_get | ~17 child-bash exports | low | consistency |
+| format casts → sh2_str_get | ~15 printf args | low | no crash on garbage |
+| guarded copies → skip for sh2_str | ~8 sites | medium | avoids double-buffer |
+| **Total** | **~66 mechanical replacements** | | |
+
+All are one-line substitutions with no control-flow changes. The diff
+is large but each hunk is trivially reviewable.
