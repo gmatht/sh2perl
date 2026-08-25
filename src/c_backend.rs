@@ -1511,8 +1511,11 @@ impl Render {
                     // already handled by is_num check below
                 }
                 crate::ir::StorageClass::ManagedString => {
-                    // For-loop iteration vars alias into the split buffer —
-                    // they must stay char*, never managed strings
+                    // TODO(sh2_str-migration): managed strings require
+                    // updating ~66 access sites (store_ref reads, strdup
+                    // assignments, format casts, exports). Deferred until
+                    // the tree is stable from concurrent normalisation work.
+                    // For now: raw char* with null-guard reads (safe).
                     self.emit(&format!("char* {name} = NULL;"));
                     return;
                 }
