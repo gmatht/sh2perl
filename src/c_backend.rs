@@ -953,11 +953,11 @@ impl Render {
             self.emit("  }");
             self.emit("}");
             self.emit("/* assign into a read-loop var (char* slot; mstr vars use their own setter) */");
-            self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
-            self.emit("/* read-split target assignment (frees old, strdups new) */");
-            self.emit("static void _sh_read_assign(char **slot, const char *val) {");
-            self.emit("  free(*slot); *slot = strdup(val ? val : \"\");");
+            self.emit("static void _sh_mstr_set_from(char **slot, const char *val) {");
+            self.emit("  /* no free: the slot may be a fixed buffer, not heap */");
+            self.emit("  *slot = val ? strdup(val) : \"\";");
             self.emit("}");
+            self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
             self.emit("static char *_sh_strippre(char *d, size_t cap, const char *s, const char *pat, int greedy) {");
             self.emit("  static char sc[65536];");
             self.emit("  strncpy(sc, s, sizeof sc - 1); sc[sizeof sc - 1] = 0;");
@@ -7731,7 +7731,7 @@ impl Render {
                                 for (vi, v) in vars_c.iter().enumerate() {
                                     let vid = self.c_ident(v);
                                     self.emit(&format!(
-                                        "_sh_read_assign(&{vid}, __fv[{vi}]);"
+                                        "_sh_mstr_set_from(&{vid}, __fv[{vi}]);"
                                     ));
                                 }
                                 self.emit("}");
@@ -7755,7 +7755,7 @@ impl Render {
                                 for (vi, v) in vars_c.iter().enumerate() {
                                     let vid = self.c_ident(v);
                                     self.emit(&format!(
-                                        "_sh_read_assign(&{vid}, __fv[{vi}]);"
+                                        "_sh_mstr_set_from(&{vid}, __fv[{vi}]);"
                                     ));
                                 }
                                 self.emit("}");
@@ -7899,7 +7899,7 @@ impl Render {
                                 for (vi, v) in vars_c.iter().enumerate() {
                                     let vid = self.c_ident(v);
                                     self.emit(&format!(
-                                        "_sh_read_assign(&{vid}, __fv[{vi}]);"
+                                        "_sh_mstr_set_from(&{vid}, __fv[{vi}]);"
                                     ));
                                 }
                                 self.emit("}");
