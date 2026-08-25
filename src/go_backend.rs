@@ -6611,6 +6611,7 @@ const RUNTIME_HELPERS: &[&str] = &[
     "            j++",
     "            for j < len(f) && f[j] >= '0' && f[j] <= '9' { j++ }",
     "        }",
+    "        for j < len(f) && strings.ContainsRune(\"lhLzjt\", rune(f[j])) { j++ }",
     "        if j >= len(f) { out.WriteByte('%'); break }",
     "        v := f[j]",
     "        spec := f[i : j+1]",
