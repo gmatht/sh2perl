@@ -927,6 +927,23 @@ impl Render {
             self.emit("  while (j[n] && j[n] != ',' && n < 30) { buf[n] = j[n]; n++; }");
             self.emit("  buf[n] = 0; return buf;");
             self.emit("}");
+            self.emit("/* read -r a b c ...: split one line across N variables */");
+            self.emit("static void _sh_read_split(char *line, const char *ifs, size_t nv, char **out) {");
+            self.emit("  for (size_t k = 0; k < nv; k++) out[k] = \"\";");
+            self.emit("  if (nv == 0) return;");
+            self.emit("  if (!*ifs) { out[0] = line; return; }");
+            self.emit("  int ws = (strcmp(ifs, \" \\t\") == 0);");
+            self.emit("  char *p = line;");
+            self.emit("  if (ws) { while (*p == ' ' || *p == 9) p++; }");
+            self.emit("  for (size_t k = 0;; k++) {");
+            self.emit("    if (k == nv - 1) { out[k] = p; return; }");
+            self.emit("    char *d;");
+            self.emit("    if (ws) { d = p; while (*d && *d != ' ' && *d != 9) d++; if (d == p) { return; } }");
+            self.emit("    else { d = strchr(p, ifs[0]); if (!d) { return; } }");
+            self.emit("    *d = 0; out[k] = p; p = d + 1;");
+            self.emit("    if (ws) { while (*p == ' ' || *p == 9) p++; }");
+            self.emit("  }");
+            self.emit("}");
             self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
             self.emit("static char *_sh_strippre(char *d, size_t cap, const char *s, const char *pat, int greedy) {");
             self.emit("  static char sc[65536];");
@@ -7334,6 +7351,336 @@ impl Render {
     }
 
     fn stmt(&mut self, s: &IrStmt) {
+        // `while IFS= read -r line && [ -n "$line" ] && (( … )); do … done
+        //   < F | < <(producer)` — NATIVE streaming read loop. The child-
+        // text form loses every variable the body assigns (shell state
+        // cannot cross exec) and was the top remaining red class.
+        if let IrStmt::Redirect { inner, redirects } = s {
+            if redirects.len() == 1
+                && redirects[0].fd == Some(0)
+                && matches!(redirects[0].mode.as_str(), "r" | "process-in")
+            {
+                if let Some(IrStmt::While { cond, .. }) = inner.first() {
+                    if let Some((vars, ifs_spec, rest)) =
+                        self.try_read_loop_cond(cond)
+                    {
+                        let is_pipe = redirects[0].mode == "process-in";
+                        let src_text =
+                            Self::str_arg(&[redirects[0].target.clone()], 0);
+                        let mut body_cl: Vec<IrStmt> = Vec::new();
+                        if let Some(IrStmt::While { body, .. }) = inner.first() {
+                            body_cl = body.clone();
+                        }
+                        let rest_c = rest.clone();
+                        let vars_c = vars.clone();
+                        // a body containing $(…) captures renders those via
+                        // cap_sites whose system() interaction with the
+                        // enclosing fgets loop misorders output — keep such
+                        // heads on the proven text path
+                        fn has_capture(stmts: &[IrStmt]) -> bool {
+                            for st in stmts {
+                                match st {
+                                    IrStmt::Expr(IrExpr::Call { func, .. })
+                                        if func == "capture" || func == "captureWords" =>
+                                    {
+                                        return true
+                                    }
+                                    IrStmt::If { then, elsifs, else_, .. } => {
+                                        if has_capture(then)
+                                            || elsifs.iter().any(|(_, b)| has_capture(b))
+                                            || has_capture(else_)
+                                        {
+                                            return true
+                                        }
+                                    }
+                                    IrStmt::Block(b) | IrStmt::Background(b) => {
+                                        if has_capture(b) {
+                                            return true
+                                        }
+                                    }
+                                    IrStmt::Pipeline { stages, .. } => {
+                                        if stages.iter().any(|s2| has_capture(s2)) {
+                                            return true
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            false
+                        }
+                        if has_capture(&body_cl) {
+                            // fall through to the generic (text) path
+                        } else {
+                        self.need_sh = true;
+                        let id = self.site_seq;
+                        self.site_seq += 1;
+                        let saved = std::mem::take(&mut self.out);
+                        let saved_depth = self.depth;
+                        self.depth = 1;
+
+                        for v in &vars_c {
+                            self.store.insert(v.clone());
+                            self.var_types.insert(v.clone(), IrType::Str);
+                        }
+
+                        if is_pipe {
+                            // arbitrary producer pipeline: unavoidable popen.
+                            // Export every variable the producer references
+                            let ptxt = src_text.clone().unwrap_or_default();
+                            self.sh_export_vars(&ptxt);
+                            self.emit(&format!(
+                                "_sh_wrap_cmd({});",
+                                Self::cstr(&ptxt)
+                            ));
+                            self.emit(&format!(
+                                "FILE *_pf{id} = popen(_sh_wrap, \"r\");"
+                            ));
+                        } else {
+                            let src_e = self.value_c(&redirects[0].target);
+                            self.emit(&format!(
+                                "FILE *_pf{id} = fopen({src_e}, \"r\");"
+                            ));
+                        }
+                        // the loop drives execution natively — a leftover
+                        // _sh_cmd would be re-run by the tail system()
+                        self.emit(&format!("if (_pf{id}) {{"));
+                        self.depth += 1;
+                        self.emit(&format!("static char _rl{id}[65536];"));
+                        self.emit(&format!(
+                            "while (fgets(_rl{id}, sizeof _rl{id}, _pf{id})) {{"
+                        ));
+                        self.depth += 1;
+                        self.emit(&format!(
+                            "size_t _rn{id} = strlen(_rl{id}); while (_rn{id} && (_rl{id}[_rn{id}-1]=='\\n' || _rl{id}[_rn{id}-1]=='\\r')) _rl{id}[--_rn{id}] = 0;"
+                        ));
+                        let nv = vars_c.len();
+                        match &ifs_spec {
+                            None => {
+                                // default IFS: leading-blank trim + split
+                                self.emit(&format!(
+                                    "{{ size_t _sk{id} = 0; while (_rl{id}[_sk{id}] == ' ' || _rl{id}[_sk{id}] == '\\t') _sk{id}++; if (_sk{id}) memmove(_rl{id}, _rl{id} + _sk{id}, strlen(_rl{id} + _sk{id}) + 1); }}"
+                                ));
+                                self.emit(&format!(
+                                    "{{ char *__fv[{nv}]; _sh_read_split(_rl{id}, \" \\t\", {nv}, __fv);"
+                                ));
+                                for (vi, v) in vars_c.iter().enumerate() {
+                                    let vid = self.c_ident(v);
+                                    self.emit(&format!(
+                                        "{vid} = strdup(__fv[{vi}]);"
+                                    ));
+                                }
+                                self.emit("}");
+                            }
+                            Some(s) if s.is_empty() => {
+                                // IFS= : raw whole line to the FIRST var
+                                let vid = self.c_ident(&vars_c[0]);
+                                self.emit(&format!("{vid} = strdup(_rl{id});"));
+                                for (vi, v) in vars_c.iter().enumerate().skip(1) {
+                                    let vid2 = self.c_ident(v);
+                                    self.emit(&format!("{vid2} = strdup(\"\");"));
+                                }
+                            }
+                            Some(cs) => {
+                                // single-char delimiter: field split, the
+                                // LAST var keeps the remainder
+                                let dch = cs.as_bytes()[0];
+                                self.emit(&format!(
+                                    "{{ char *__fv[{nv}]; char *_rp = _rl{id}; size_t _rk; for (_rk = 0; _rk < {nv}; _rk++) {{ char *_d = (_rk + 1 < {nv}) ? strchr(_rp, {dch}) : NULL; if (_d) *_d = 0; __fv[_rk] = _rp; if (!_d) break; else _rp = _d + 1; }}"
+                                ));
+                                for (vi, v) in vars_c.iter().enumerate() {
+                                    let vid = self.c_ident(v);
+                                    self.emit(&format!(
+                                        "{vid} = strdup(__fv[{vi}] ? __fv[{vi}] : \"\");"
+                                    ));
+                                }
+                                self.emit("}");
+                            }
+                        }
+                        if !rest_c.is_empty() {
+                            let conj: Vec<String> = rest_c
+                                .iter()
+                                .map(|e| format!("({})", self.expr(e)))
+                                .collect();
+                            self.emit(&format!(
+                                "if (!({})) break;",
+                                conj.join(" && ")
+                            ));
+                        }
+                        for b in &body_cl {
+                            self.stmt(b);
+                        }
+                        self.depth -= 1;
+                        self.emit("}");
+                        self.depth -= 1;
+                        if is_pipe {
+                            self.emit(&format!("pclose(_pf{id});"));
+                        } else {
+                            self.emit(&format!("fclose(_pf{id});"));
+                        }
+                        self.emit("}");
+
+                        let body_lines =
+                            std::mem::replace(&mut self.out, saved);
+                        self.depth = saved_depth;
+                        let mut s3 =
+                            format!("static int _sh_site_{id}(void) {{\n");
+                        for line in &body_lines {
+                            s3.push_str(line);
+                            s3.push('\n');
+                        }
+                        s3.push_str("return 0; /* loop rc: last body status tracked via _sh_rc */\n}");
+                        self.site_bodies.push(s3);
+                        self.site_ids.push(id);
+                        self.emit(&format!("_sh_site_{id}();"));
+                        return;
+                        }
+                    }
+                }
+            }
+        }
+        // `while IFS= read -r line && [ -n "$line" ] && (( … )); do … done
+        //   < F | < <(producer)` — NATIVE streaming read loop. The child-
+        // text form loses every variable the body assigns (shell state
+        // cannot cross exec) and was the top remaining red class.
+        if let IrStmt::Redirect { inner, redirects } = s {
+            if redirects.len() == 1
+                && redirects[0].fd == Some(0)
+                && matches!(redirects[0].mode.as_str(), "r" | "process-in")
+            {
+                if let Some(IrStmt::While { cond, .. }) = inner.first() {
+                    if let Some((vars, ifs_spec, rest)) =
+                        self.try_read_loop_cond(cond)
+                    {
+                        let is_pipe = redirects[0].mode == "process-in";
+                        let src_text =
+                            Self::str_arg(&[redirects[0].target.clone()], 0);
+                        let mut body_cl: Vec<IrStmt> = Vec::new();
+                        if let Some(IrStmt::While { body, .. }) = inner.first() {
+                            body_cl = body.clone();
+                        }
+                        let rest_c = rest.clone();
+                        let vars_c = vars.clone();
+
+                        self.need_sh = true;
+                        let id = self.site_seq;
+                        self.site_seq += 1;
+                        let saved = std::mem::take(&mut self.out);
+                        let saved_depth = self.depth;
+                        self.depth = 1;
+
+                        for v in &vars_c {
+                            self.store.insert(v.clone());
+                            self.var_types.insert(v.clone(), IrType::Str);
+                        }
+
+                        if is_pipe {
+                            // arbitrary producer pipeline: unavoidable popen.
+                            // Export every variable the producer references
+                            let ptxt = src_text.clone().unwrap_or_default();
+                            self.sh_export_vars(&ptxt);
+                            self.emit(&format!(
+                                "_sh_wrap_cmd({});",
+                                Self::cstr(&ptxt)
+                            ));
+                            self.emit(&format!(
+                                "FILE *_pf{id} = popen(_sh_wrap, \"r\");"
+                            ));
+                        } else {
+                            let src_e = self.value_c(&redirects[0].target);
+                            self.emit(&format!(
+                                "FILE *_pf{id} = fopen({src_e}, \"r\");"
+                            ));
+                        }
+                        self.emit(&format!("if (_pf{id}) {{"));
+                        self.depth += 1;
+                        self.emit(&format!("static char _rl{id}[65536];"));
+                        self.emit(&format!(
+                            "while (fgets(_rl{id}, sizeof _rl{id}, _pf{id})) {{"
+                        ));
+                        self.depth += 1;
+                        self.emit(&format!(
+                            "size_t _rn{id} = strlen(_rl{id}); while (_rn{id} && (_rl{id}[_rn{id}-1]=='\\n' || _rl{id}[_rn{id}-1]=='\\r')) _rl{id}[--_rn{id}] = 0;"
+                        ));
+                        // IFS: None = default whitespace split with
+                        // leading trim; Some("") = raw whole line to the
+                        // first var; Some(cs) = delimiter cs
+                        let nv = vars_c.len();
+                        match &ifs_spec {
+                            None => {
+                                self.emit(&format!(
+                                    "{{ size_t _sk{id} = 0; while (_rl{id}[_sk{id}] == ' ' || _rl{id}[_sk{id}] == '\\t') _sk{id}++; if (_sk{id}) memmove(_rl{id}, _rl{id} + _sk{id}, strlen(_rl{id} + _sk{id}) + 1); }}"
+                                ));
+                                let vid = self.c_ident(&vars_c[0]);
+                                self.emit(&format!("{vid} = strdup(_rl{id});"));
+                            }
+                            Some(s) if s.is_empty() => {
+                                let vid = self.c_ident(&vars_c[0]);
+                                self.emit(&format!("{vid} = strdup(_rl{id});"));
+                            }
+                            Some(cs) if nv == 1 => {
+                                let vid = self.c_ident(&vars_c[0]);
+                                self.emit(&format!(
+                                    "{{ char *_d = strchr(_rl{id}, {cs_byte}); if (_d) *_d = 0; {vid} = strdup(_rl{id}); }}",
+                                    cs_byte = cs.as_bytes()[0]
+                                ));
+                            }
+                            Some(cs) => {
+                                let ifs_s = cs.clone();
+                                self.emit(&format!(
+                                    "{{ char *__fv[{nv}]; _sh_read_split(_rl{id}, {}, {nv}, __fv);",
+                                    Self::cstr(&ifs_s),
+                                    nv = nv
+                                ));
+                                for (vi, v) in vars_c.iter().enumerate() {
+                                    let vid = self.c_ident(v);
+                                    self.emit(&format!(
+                                        "{vid} = strdup(__fv[{vi}]);"
+                                    ));
+                                }
+                                self.emit("}");
+                            }
+                        }
+                        if !rest_c.is_empty() {
+                            let conj: Vec<String> = rest_c
+                                .iter()
+                                .map(|e| format!("({})", self.expr(e)))
+                                .collect();
+                            self.emit(&format!(
+                                "if (!({})) break;",
+                                conj.join(" && ")
+                            ));
+                        }
+                        for b in &body_cl {
+                            self.stmt(b);
+                        }
+                        self.depth -= 1;
+                        self.emit("}");
+                        self.depth -= 1;
+                        if is_pipe {
+                            self.emit(&format!("pclose(_pf{id});"));
+                        } else {
+                            self.emit(&format!("fclose(_pf{id});"));
+                        }
+                        self.emit("}");
+
+                        let body_lines =
+                            std::mem::replace(&mut self.out, saved);
+                        self.depth = saved_depth;
+                        let mut s3 =
+                            format!("static int _sh_site_{id}(void) {{\n");
+                        for line in &body_lines {
+                            s3.push_str(line);
+                            s3.push('\n');
+                        }
+                        s3.push_str("return !_sh_system_rc();\n}");
+                        self.site_bodies.push(s3);
+                        self.site_ids.push(id);
+                        self.emit(&format!("_sh_site_{id}();"));
+                        return;
+                    }
+                }
+            }
+        }
         // `mapfile -t NAME < FILE` / `readarray …`: run NATIVELY — reading
         // the lines in a child loses the array (bash arrays cannot cross
         // exec), which broke every `< <(producer)` mapfile use
@@ -10769,6 +11116,237 @@ fn collect_ext_foreach_line_vars(st: &IrStmt, out: &mut BTreeSet<String>) {
                 out.extend(fv);
             }
         }
+    }
+}
+
+fn expr_is_and_tree(e: &IrExpr) -> bool {
+    matches!(
+        e,
+        IrExpr::Call { func, .. } if func == "and" || func == "block"
+    ) || matches!(e, IrExpr::BinOp { op: crate::ir::BinOpKind::And, .. })
+}
+
+/// One flattened condition leaf of a `while` head.
+#[derive(Debug)]
+enum CondLeaf {
+    /// builtin/exec call statement (`read`, `test`, `true`, `let`, ...)
+    Stmt(IrStmt),
+    /// bare expression leaf (`(( counter < max ))`, `[ -n "$line" ]`)
+    Expr(IrExpr),
+}
+
+/// Flatten a while-head condition into ordered AND-leaves. Returns false
+/// when the head mixes semantics we cannot reorder (Or, unmodeled shapes).
+fn flatten_and_cond(cond: &IrExpr, out: &mut Vec<CondLeaf>) -> bool {
+    match cond {
+        IrExpr::Call { func, args } if func == "and" || func == "block" => {
+            for a in args {
+                match a {
+                    IrExpr::Arrow(sts) => {
+                        if !flatten_and_stmts(sts, out) {
+                            return false;
+                        }
+                    }
+                    other => {
+                        if expr_is_and_tree(other) {
+                            if !flatten_and_cond(other, out) {
+                                return false;
+                            }
+                        } else {
+                            out.push(CondLeaf::Expr(other.clone()));
+                        }
+                    }
+                }
+            }
+            true
+        }
+        IrExpr::BinOp { op: crate::ir::BinOpKind::And, lhs, rhs } => {
+            if !flatten_and_cond(lhs, out) {
+                return false;
+            }
+            if expr_is_and_tree(rhs) {
+                flatten_and_cond(rhs, out)
+            } else {
+                out.push(CondLeaf::Expr(rhs.as_ref().clone()));
+                true
+            }
+        }
+        other => {
+            if expr_is_and_tree(other) && !matches!(other, IrExpr::BinOp { .. }) {
+                flatten_and_cond(other, out)
+            } else {
+                out.push(CondLeaf::Expr(other.clone()));
+                true
+            }
+        }
+    }
+}
+
+/// builtin/exec `read [-r] var…` call?
+fn is_read_call(e: &IrExpr) -> bool {
+    matches!(e, IrExpr::Call { func, args }
+        if (func == "exec" || func == "builtin")
+            && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "read"))
+}
+
+fn flatten_and_stmts(sts: &[IrStmt], out: &mut Vec<CondLeaf>) -> bool {
+    for st in sts {
+        match st {
+            IrStmt::Expr(e) => {
+                let is_and = matches!(
+                    e,
+                    IrExpr::BinOp { op: crate::ir::BinOpKind::And, .. }
+                ) || matches!(e, IrExpr::Call { func, .. } if func == "and");
+                if is_and {
+                    if !flatten_and_cond(e, out) {
+                        return false;
+                    }
+                } else {
+                    out.push(CondLeaf::Stmt(st.clone()));
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+impl Render {
+    fn expr_is_and_tree_unused(e: &IrExpr) -> bool {
+        matches!(
+            e,
+            IrExpr::Call { func, .. } if func == "and" || func == "block"
+        ) || matches!(e, IrExpr::BinOp { op: crate::ir::BinOpKind::And, .. })
+    }
+
+    /// Decompose a while-head into (read vars, raw-mode flag, remaining
+    /// condition leaves). None when the head is not a canonical
+    /// single-`read` AND-chain.
+    fn try_read_loop_cond(&self, cond: &IrExpr) -> Option<(Vec<String>, Option<String>, Vec<IrExpr>)> {
+        let mut leaves: Vec<CondLeaf> = Vec::new();
+        if !flatten_and_cond(cond, &mut leaves) {
+            return None;
+        }
+        let mut vars: Vec<String> = Vec::new();
+        let mut ifs_spec: Option<String> = None;
+        let mut rest: Vec<IrExpr> = Vec::new();
+        for leaf in leaves {
+            match leaf {
+                CondLeaf::Stmt(IrStmt::Expr(call @ IrExpr::Call { .. })) => {
+                    let IrExpr::Call { func, args } = &call else {
+                        unreachable!()
+                    };
+                    let cmd = Self::str_arg(args, 0)
+                        .unwrap_or_default();
+                    let is_decl_call = func == "exec" || func == "builtin";
+                    if is_decl_call && cmd == "read" {
+                        if !vars.is_empty() {
+                            return None; // multi-read heads stay textual
+                        }
+                        for a in args {
+                            if let IrExpr::Object(fields) = a {
+                                for (k, v) in fields {
+                                    if k == "IFS" {
+                                        if let IrExpr::Str(val, _) = v {
+                                            ifs_spec = Some(val.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let words: Vec<String> = match args.get(1) {
+                            Some(IrExpr::Array(items)) => items
+                                .iter()
+                                .filter_map(|w| Self::str_arg(&[w.clone()], 0))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        for w in &words {
+                            if w.starts_with('-') {
+                                if w != "-r" && w != "-n" {
+                                    return None;
+                                }
+                            } else if is_ident(w) {
+                                vars.push(w.clone());
+                            } else {
+                                return None;
+                            }
+                        }
+                        if vars.is_empty() {
+                            return None;
+                        }
+                    } else if cmd == "true" || func == "true" {
+                        for a in args {
+                            if let IrExpr::Object(fields) = a {
+                                for (k, v) in fields {
+                                    if k == "IFS" {
+                                        if let IrExpr::Str(val, _) = v {
+                                            ifs_spec = Some(val.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        rest.push(IrExpr::Call {
+                            func: func.clone(),
+                            args: args.clone(),
+                        });
+                    }
+                }
+                CondLeaf::Stmt(_) => return None,
+                CondLeaf::Expr(e) => {
+                    if is_read_call(&e) {
+                        if !vars.is_empty() {
+                            return None;
+                        }
+                        if let IrExpr::Call { args, .. } = &e {
+                            for a in args {
+                                if let IrExpr::Object(fields) = a {
+                                    for (k, v) in fields {
+                                        if k == "IFS" {
+                                            if let IrExpr::Str(val, _) = v {
+                                                ifs_spec = Some(val.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let words: Vec<String> = match e {
+                            IrExpr::Call { args, .. } => match args.get(1) {
+                                Some(IrExpr::Array(items)) => items
+                                    .iter()
+                                    .filter_map(|w| Self::str_arg(&[w.clone()], 0))
+                                    .collect(),
+                                _ => Vec::new(),
+                            },
+                            _ => Vec::new(),
+                        };
+                        for w in &words {
+                            if w.starts_with('-') {
+                                if w != "-r" && w != "-n" {
+                                    return None;
+                                }
+                            } else if is_ident(w) {
+                                vars.push(w.clone());
+                            } else {
+                                return None;
+                            }
+                        }
+                        if vars.is_empty() {
+                            return None;
+                        }
+                    } else {
+                        rest.push(e.clone());
+                    }
+                }
+            }
+        }
+        if vars.is_empty() {
+            return None;
+        }
+        Some((vars, ifs_spec, rest))
     }
 }
 
