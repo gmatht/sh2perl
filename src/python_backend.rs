@@ -32,6 +32,11 @@ pub struct Render {
     /// plain name folds to "" — the SH2_ASSUME_NO_ENV read fold, mirroring
     /// the estree emitter's collect_never_written)
     written: HashSet<String>,
+    /// user-defined shell FUNCTION names (IrStmt::Function): command
+    /// calls matching these lower to NATIVE python calls
+    user_funcs: HashSet<String>,
+    /// user-defined shell FUNCTION names (IrStmt::Function): command
+    /// calls matching these lower to NATIVE python calls
     /// names written ONLY through the runtime store (`setVar` calls — the
     /// imperative frontends' handle temps `___hp_*` etc.): a getVar of one
     /// of these must round-trip through the store, NOT the python binding
@@ -562,6 +567,89 @@ impl Render {
         ))
     }
 
+    /// Translate shell text with baked positional/expansion refs
+    /// ("msg=$1") into a python VALUE expression. None when an
+    /// untranslatable form appears.
+    fn baked_refs_to_py(&mut self, s: &str) -> Option<String> {
+        // whole-string single ref fast paths
+        if let Some(rest) = s.strip_prefix('$') {
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                let i: usize = rest.parse().ok()?;
+                let q: &str = "''";
+                if self.in_function > 0 {
+                    return Some(format!(
+                        "(__a[{i} - 1] if len(__a) >= {i} else {q})"
+                    ));
+                }
+                return Some(format!(
+                    "(sys.argv[{i}] if len(sys.argv) > {i} else {q})"
+                ));
+            }
+            if let Some(first) = rest.chars().next() {
+                if first.is_alphabetic() || first == '_' {
+                    if rest.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        return Some(self.py_ident(rest));
+                    }
+                }
+            }
+        }
+        // mixed literal+refs: build a python f-string body; refs render
+        // via getVar, literals pass through
+        let mut body = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '$' => {
+                    let nxt = (*chars.peek()?).to_string();
+                    if nxt == "{" {
+                        chars.next();
+                        let mut name = String::new();
+                        for c2 in chars.by_ref() {
+                            if c2 == '}' {
+                                break;
+                            }
+                            name.push(c2);
+                        }
+                        let r = self.call(
+                            "getVar",
+                            &[IrExpr::Str(
+                                name.clone(),
+                                crate::ir::StrStyle::DoubleQuoted,
+                            )],
+                        );
+                        body.push_str(&format!("{{{r}}}"));
+                    } else {
+                        let mut name = String::new();
+                        name.push_str(&nxt);
+                        while let Some(c2) = chars.peek() {
+                            if c2.is_alphanumeric() || *c2 == '_' {
+                                name.push(*c2);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        if name.is_empty() {
+                            body.push('$');
+                        } else {
+                            let r = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.clone(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            body.push_str(&format!("{{{r}}}"));
+                        }
+                    }
+                }
+                '"' => {}
+                other => body.push(other),
+            }
+        }
+        Some(format!("f\"{body}\""))
+    }
+
     /// An IR expression as a python STR-typed runtime value expression
     /// (string literals stay literals; vars/numbers coerce via str()).
     fn py_value(&mut self, e: &IrExpr) -> String {
@@ -701,7 +789,10 @@ impl Render {
                     self.collect_writes(finally_body);
                 }
                 IrStmt::Block(b) => self.collect_writes(b),
-                IrStmt::Function { body, .. } => self.collect_writes(body),
+                IrStmt::Function { name, body, .. } => {
+                    self.user_funcs.insert(name.clone());
+                    self.collect_writes(body);
+                }
                 IrStmt::Exec { cmd, args, capture, .. } => {
                     if let Some(v) = capture {
                         self.written.insert(v.clone());
@@ -1273,6 +1364,67 @@ impl Render {
                 // While(true) cond (a backward-goto loop) — lower to the
                 // python constants
                 if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    // USER FUNCTION CALL — native python call. bash status
+                    // semantics: the callee's `return "0"` is success; the
+                    // estree runtime maps the same way (r=="0" ->
+                    // lastExit=0). Statement context discards the bool;
+                    // condition contexts test it.
+                    if self.user_funcs.contains(cmd) {
+                        let fargs: Vec<String> = match args.get(1) {
+                            Some(IrExpr::Array(items)) => items
+                                .iter()
+                                .map(|i| self.py_value(i))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        return format!(
+                            "(str({}({})) == \"0\")",
+                            self.py_ident(cmd),
+                            fargs.join(", ")
+                        );
+                    }
+                    // `local n=$1` / `local x` — function-local vars are
+                    // plain python locals inside the def. Values carry
+                    // baked positional refs ("msg=$1") translated to __a.
+                    if cmd == "local" {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            let mut out_lines: Vec<String> = Vec::new();
+                            let mut ok = true;
+                            for it in items.iter() {
+                                match it {
+                                    IrExpr::Str(tok, _) if tok.starts_with('-') => {
+                                        continue;
+                                    }
+                                    IrExpr::Str(tok, _) => match tok.split_once('=') {
+                                        Some((v, val)) => {
+                                            let r = self.baked_refs_to_py(val);
+                                            match r {
+                                                Some(pyv) => out_lines.push(format!(
+                                                    "{} = {pyv}",
+                                                    self.py_ident(v)
+                                                )),
+                                                None => {
+                                                    ok = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        None => out_lines.push(format!(
+                                            "{} = \"\"",
+                                            self.py_ident(tok)
+                                        )),
+                                    },
+                                    _ => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if ok && !out_lines.is_empty() {
+                                return out_lines.join("\n");
+                            }
+                        }
+                    }
                     if cmd == "true" {
                         return "True".into();
                     }
@@ -1365,6 +1517,22 @@ impl Render {
                         "?" => {
                             self.need_rc = true;
                             return "str(__sh_rc)".into();
+                        }
+                        "#" if self.in_function > 0 => {
+                            return "str(len(__a))".into();
+                        }
+                        "@" | "*" if self.in_function > 0 => {
+                            return "\" \".join(__a)".into();
+                        }
+                        n if self.in_function > 0
+                            && !n.is_empty()
+                            && n.chars().all(|c| c.is_ascii_digit()) =>
+                        {
+                            let i: usize = n.parse().unwrap_or(1);
+                            let q: &str = "''";
+                            return format!(
+                                "(__a[{i} - 1] if len(__a) >= {i} else {q})"
+                            );
                         }
                         "#" => return "str(len(sys.argv) - 1)".into(),
                         "@" | "*" => return "\" \".join(sys.argv[1:])".into(),
@@ -2021,11 +2189,12 @@ impl Render {
             return self.printf_fallback(args);
         }
         let arg_exprs: Vec<String> = fmt_args.iter().map(|a| self.expr(a)).collect();
-        // a spec with flags/width/prec must keep the runtime builtin
+        // flags/width/prec lower NATIVELY onto python's format()
+        // mini-language (%-10s -> format(x, "<10"), %05d -> "05d", %.0s
+        // -> ".0s" truncation); i/u collapse to d. '#' keeps the runtime
+        // builtin (alternate form has no clean mapping).
         let complex = els.iter().any(|(_, s)| match s {
-            Some((flags, width, prec, _)) => {
-                !flags.is_empty() || *width > 0 || prec.is_some()
-            }
+            Some((flags, _, _, _)) => flags.contains('#'),
             None => false,
         });
         if complex {
@@ -2055,10 +2224,65 @@ impl Render {
                         let arg = arg_exprs.get(ai).cloned().unwrap_or_else(|| "\"\"".into());
                         ai += 1;
                         match conv {
-                            's' => pieces.push(format!("str({arg})")),
-                            'd' | 'i' | 'u' => {
-                                self.need_atoi = true;
-                                pieces.push(format!("str(__sh_atoi({arg}))"));
+                            's' | 'd' | 'i' | 'u' => {
+                                // flags/width/prec map onto python's format()
+                                // mini-language: %-10s -> "<10", %05d -> "05d",
+                                // % i -> " d" (sign space); i/u collapse to d
+                                let mut py_spec = String::new();
+                                if let Some((flags, width, prec, cv)) = spec {
+                                    if flags.contains('-') {
+                                        py_spec.push('<');
+                                    } else if flags.contains('+') {
+                                        py_spec.push('+');
+                                    } else if flags.contains(' ') {
+                                        py_spec.push(' ');
+                                    }
+                                    if flags.contains('0')
+                                        && !flags.contains('-')
+                                        && *width > 0
+                                        && *cv != 's'
+                                    {
+                                        py_spec.push('0');
+                                    }
+                                    if *width > 0 {
+                                        py_spec.push_str(&width.to_string());
+                                    }
+                                    if let Some(p) = prec {
+                                        if *cv == 's' {
+                                            py_spec.push('.');
+                                            py_spec.push_str(&p.to_string());
+                                        } else {
+                                            return self.printf_fallback(args);
+                                        }
+                                    }
+                                    py_spec.push(if *cv == 's' { 's' } else { 'd' });
+                                }
+                                let plain = matches!(py_spec.as_str(), "s" | "d");
+                                match conv {
+                                    's' => {
+                                        if plain {
+                                            pieces.push(format!("str({arg})"));
+                                        } else {
+                                            pieces.push(format!(
+                                                "format({arg}, {})",
+                                                Self::py_str(&py_spec)
+                                            ));
+                                        }
+                                    }
+                                    _ => {
+                                        self.need_atoi = true;
+                                        if plain {
+                                            pieces.push(format!(
+                                                "str(__sh_atoi({arg}))"
+                                            ));
+                                        } else {
+                                            pieces.push(format!(
+                                                "format(__sh_atoi({arg}), {})",
+                                                Self::py_str(&py_spec)
+                                            ));
+                                        }
+                                    }
+                                }
                             }
                             _ => unreachable!("printf_parse gates the conversions"),
                         }
@@ -2872,7 +3096,7 @@ impl Render {
             }
             IrStmt::Function { name, body, .. } => {
                 let n = self.py_ident(name);
-                self.emit(&format!("def {n}():"));
+                self.emit(&format!("def {n}(*__a):"));
                 self.in_function += 1;
                 self.block(body);
                 self.in_function -= 1;
