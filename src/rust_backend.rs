@@ -858,8 +858,46 @@ impl Render {
     }
 
     /// Render as a bool-typed expression (conditions).
+    /// Normalize an arith STRING for parse_arith ($x/${x} → bare idents).
+    fn norm_arith_text(s: &str) -> String {
+        let norm: String = s
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if c == '$'
+                    && i + 1 < s.len()
+                    && (s[i + 1..].starts_with('{')
+                        || s[i + 1..]
+                            .chars()
+                            .next()
+                            .map_or(false, |n| n.is_ascii_alphabetic() || n == '_'))
+                {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        norm.replace('{', " ").replace('}', " ")
+    }
+
     fn expr_bool(&mut self, e: &IrExpr) -> String {
         match e {
+            // test/testArith/arith condition calls — the C frontend's
+            // arithmetic-truth conditions (a missing arm rendered every
+            // such cond as an empty-string -n test, i.e. always false)
+            IrExpr::Call { func, args, .. }
+                if func == "test" || func == "testArith" || func == "arith" =>
+            {
+                if let Some(IrExpr::Str(sv, _)) = args.first() {
+                    let norm = Self::norm_arith_text(sv);
+                    if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
+                        let r = self.arith(&ast);
+                        return format!("(({}) != 0)", r);
+                    }
+                }
+                self.test_call_bool(args)
+            }
             IrExpr::Bool(b) => {
                 if *b { "true".into() } else { "false".into() }
             }
