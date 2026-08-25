@@ -1511,11 +1511,10 @@ impl Render {
                     // already handled by is_num check below
                 }
                 crate::ir::StorageClass::ManagedString => {
-                    // TODO(sh2_str-migration): managed strings require
-                    // updating ~66 access sites (store_ref reads, strdup
-                    // assignments, format casts, exports). Deferred until
-                    // the tree is stable from concurrent normalisation work.
-                    // For now: raw char* with null-guard reads (safe).
+                    // char* IS the idiomatic default: shell scripts are
+                    // short-lived processes, leaks don't matter, strdup
+                    // per assign gives exclusive ownership. _sh_mstr is
+                    // an opt-in for hot-loop accumulators only.
                     self.emit(&format!("char* {name} = NULL;"));
                     return;
                 }
