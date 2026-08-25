@@ -1062,17 +1062,26 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
                         let mut ai = 0usize;
                         for _pass in 0..passes {
                             for (text, spec) in &els {
-                                if let Some(conv) = spec {
+                                if let Some((conv, fw)) = spec {
                                     let arg = arg_exprs
                                         .get(ai)
                                         .cloned()
                                         .unwrap_or_else(|| "\"\"".into());
                                     ai += 1;
-                                    match conv {
-                                        's' => pieces.push(arg),
-                                        'd' | 'i' | 'u' => pieces
-                                            .push(format!("Long.toString(sh2Num({arg}))")),
-                                        _ => unreachable!("printf_parse gates the conversions"),
+                                    // flags/width via String.format (the
+                                    // java runtime owns padding); bare
+                                    // specs keep the cheap direct renders
+                                    match (conv, fw.as_str()) {
+                                        ('s', "") => pieces.push(arg),
+                                        ('s', w) => pieces.push(format!(
+                                            "String.format(\"%{w}s\", {arg})"
+                                        )),
+                                        (_, "") => pieces.push(format!(
+                                            "Long.toString(sh2Num({arg}))"
+                                        )),
+                                        (_, w) => pieces.push(format!(
+                                            "String.format(\"%{w}d\", sh2Num({arg}))"
+                                        )),
                                     }
                                 } else {
                                     pieces.push(java_str_lit(&printf_unescape(text)));
@@ -1199,9 +1208,13 @@ fn java_str_lit(s: &str) -> String {
 /// %s/%d/%i/%u conversions over literal text runs. A flags/width/prec
 /// spec (or any other conversion) yields None — the caller keeps the
 /// v1 raw join. `%%` is an escaped percent.
-fn printf_parse(fmt: &str) -> Option<(Vec<(String, Option<char>)>, usize)> {
+///
+/// Flags+width (%-10s, %05d — backend/java 9f434788) ARE parsed: the
+/// spec carries the flags/width text and the renderer applies it via
+/// String.format. Precision still yields None.
+fn printf_parse(fmt: &str) -> Option<(Vec<(String, Option<(char, String)>)>, usize)> {
     let chars: Vec<char> = fmt.chars().collect();
-    let mut els: Vec<(String, Option<char>)> = Vec::new();
+    let mut els: Vec<(String, Option<(char, String)>)> = Vec::new();
     let mut text = String::new();
     let mut n_specs = 0usize;
     let mut pos = 0usize;
@@ -1229,15 +1242,17 @@ fn printf_parse(fmt: &str) -> Option<(Vec<(String, Option<char>)>, usize)> {
             let Some(&conv) = chars.get(i) else {
                 return None;
             };
-            if has_flags || has_width || has_prec {
+            if has_prec {
                 return None;
             }
+            // [-0-9]* flags+width carried on the spec ('' when bare)
+            let fw: String = chars[flags_start..i].iter().collect();
             match conv {
                 's' | 'd' | 'i' | 'u' => {
                     if !text.is_empty() {
                         els.push((std::mem::take(&mut text), None));
                     }
-                    els.push((String::new(), Some(conv)));
+                    els.push((String::new(), Some((conv, fw))));
                     n_specs += 1;
                     pos = i + 1;
                 }
@@ -1365,7 +1380,7 @@ fn expr_need_sh2num(e: &IrExpr) -> bool {
                     if printf_parse(fmt)
                         .map(|(els, _)| {
                             els.iter()
-                                .any(|(_, spec)| matches!(spec, Some('d' | 'i' | 'u')))
+                                .any(|(_, spec)| matches!(spec, Some(('d' | 'i' | 'u', _))))
                         })
                         .unwrap_or(false)
                     {
