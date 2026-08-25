@@ -262,6 +262,10 @@ enum CmdBuf {
 
 /// Bounded Str vars get a fixed buffer of bound+1 bytes; unbounded or
 /// over-cap vars stay `char*`. Aligned with the analysis' own CAP.
+/// Maximum bytes for a stack-allocated string buffer. Vars whose
+/// proven length bound exceeds this go on the heap even when all other
+/// stack-eligibility criteria pass (local, non-capturing callees).
+/// Tune down for embedded targets, up for scripts with long paths.
 const FIXED_BUF_CAP: u64 = 1024;
 
 /// Per-capture-site result buffer size (command substitution output).
