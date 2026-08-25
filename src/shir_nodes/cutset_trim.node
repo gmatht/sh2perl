@@ -6,6 +6,8 @@
 #
 # GENERIC. text is any expression evaluating to a string; cutset is the
 # set of characters (stringified like the host) stripped from BOTH ends.
+# side (optional): "left" strips leading only, "right" trailing only
+# (Go strings.TrimLeft / strings.TrimRight); absent = both ends.
 #
 # Backends: Perl s/^[..]+// + s/[..]+$// with \Q..\E, JS scan/slice IIFE,
 #           C strspn loop, Rust trim_matches(|c| cutset.contains(c))
@@ -15,3 +17,4 @@ tag "CutsetTrim"
 kind expr
 field text: expr
 field cutset: expr
+field side: optional_string
