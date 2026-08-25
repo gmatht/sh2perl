@@ -69,3 +69,7 @@ file_00[0-9]
 ?*${*
 test.py
 x.py
+
+# ── repo-size hygiene (see ../GIT_SIZE_CLEANUP.md) ──────────────────
+# Cargo build dir used by the core gate (target-core/debug was committed wholesale)
+target-core/

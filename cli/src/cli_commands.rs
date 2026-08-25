@@ -756,10 +756,17 @@ pub fn parse_shir_json_to_estree(filename: &str) {
         Ok(c) => c,
         Err(e) => { eprintln!("read {}: {}", filename, e); return; }
     };
-    let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+    let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
         Ok(p) => p,
         Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
     };
+    // Frontend-emitted A1 carries constructs as opaque exec calls (let
+    // conditions, read, …) — normalise them through the SAME gated
+    // transform channel the direct path uses, so every backend sees the
+    // reduced vocabulary regardless of who produced the A1. text_ops is
+    // opt-in (DEBASHC_TRANSFORMS must list it), keeping default ingests
+    // byte-stable.
+    debashl::transforms::apply(&mut prog.stmts);
     match debashl::shir::shir_to_estree_json(&prog) {
         Ok(s) => println!("{}", s),
         Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
