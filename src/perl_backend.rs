@@ -1678,6 +1678,39 @@ impl Render {
         if toks.is_empty() {
             return "0".to_string();
         }
+        // merge $(( … )) fragments that whitespace-splitting broke apart
+        // (`$((n % 2))` arrives as ["$((n", "%", "2))"])
+        let mut merged: Vec<String> = Vec::new();
+        let mut ti = 0usize;
+        while ti < toks.len() {
+            let t = &toks[ti];
+            if t.starts_with("$((") && !t.ends_with("))") {
+                let mut acc = t.clone();
+                let mut j = ti + 1;
+                while j < toks.len() {
+                    acc.push(' ');
+                    acc.push_str(&toks[j]);
+                    let done = toks[j].ends_with("))");
+                    j += 1;
+                    if done { break; }
+                }
+                merged.push(acc);
+                ti = j;
+            } else {
+                merged.push(t.clone());
+                ti += 1;
+            }
+        }
+        let toks: &[String] = &merged;
+        // -a / -o chain operators (word-level AND/OR)
+        for (i, t) in toks.iter().enumerate().skip(1) {
+            if t == "-a" || t == "-o" {
+                let l = self.test_tokens_parse(&toks[..i]);
+                let r = self.test_tokens_parse(&toks[i + 1..]);
+                let jop = if t == "-a" { "&&" } else { "||" };
+                return format!("({l} {jop} {r})");
+            }
+        }
         // `!` negation
         if toks[0] == "!" {
             let inner = self.test_tokens_parse(&toks[1..]);
@@ -1693,7 +1726,39 @@ impl Render {
         }
         match toks.len() {
             1 => {
-                let v = self.test_value(&toks[0]);
+                // glued comparison inside one token (`$var!="c"`): split on
+                // the FIRST ==/!= that sits outside quotes
+                let one = &toks[0];
+                let bytes: Vec<char> = one.chars().collect();
+                let mut si: Option<(usize, usize)> = None; // (idx, oplen)
+                let mut q: Option<char> = None;
+                let mut ci = 0usize;
+                while ci < bytes.len() {
+                    match q {
+                        Some(qc) => {
+                            if bytes[ci] == '\\' { ci += 1; }
+                            else if bytes[ci] == qc { q = None; }
+                        }
+                        None => {
+                            if bytes[ci] == '"' || bytes[ci] == '\'' { q = Some(bytes[ci]); }
+                            else if bytes[ci] == '=' && ci + 1 < bytes.len() && bytes[ci + 1] == '=' {
+                                si = Some((ci, 2));
+                                break;
+                            }
+                            else if bytes[ci] == '!' && ci + 1 < bytes.len() && bytes[ci + 1] == '=' {
+                                si = Some((ci, 2));
+                                break;
+                            }
+                        }
+                    }
+                    ci += 1;
+                }
+                if let Some((idx, oplen)) = si {
+                    let l = self.test_tokens_parse(&[one[..idx].to_string()]);
+                    let r = self.test_tokens_parse(&[one[idx + oplen..].to_string()]);
+                    return format!("({l} {} {r})", if oplen == 2 && one.as_bytes()[idx] == b'!' { "!=" } else { "==" });
+                }
+                let v = self.test_value(one);
                 format!("({v})")
             }
             2 => {
@@ -1778,6 +1843,13 @@ impl Render {
             .and_then(|s| s.strip_suffix('"'))
             .or_else(|| t.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
             .unwrap_or(t);
+        // $(( ARITH )) — arithmetic expansion as a test operand (numeric)
+        if t.starts_with("$((") && t.ends_with("))") {
+            let inner_arith = &t[3..t.len() - 2];
+            if let Some(ast) = crate::shir::parse_arith(inner_arith) {
+                return self.arith(&ast);
+            }
+        }
         if let Some(name) = inner.strip_prefix('$') {
             if !name.is_empty() {
                 return self.var_ref(name);
