@@ -2004,6 +2004,18 @@ impl Render {
                             return format!("(int)atoll({v})");
                         }
                     }
+                    // a BARE identifier (`${flags:j:1}` slice offsets
+                    // carry the loop var without `$`) — live read
+                    if is_ident(s) {
+                        let v = self.call(
+                            "getVar",
+                            &[IrExpr::Str(
+                                s.to_string(),
+                                crate::ir::StrStyle::DoubleQuoted,
+                            )],
+                        );
+                        return format!("(int)atoll({v})");
+                    }
                     format!("(int)atoll({})", Self::cstr(s))
                 }
             },
@@ -5779,6 +5791,42 @@ impl Render {
             // positional $N — the function-call argv (empty at top level)
             self.need_sh = true;
             format!("(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")")
+        } else if let Some(obrace) = name.find('[') {
+            // `arr[idx]` element base read (idx literal or $var text) —
+            // supports strip-op param leaves whose name carries a
+            // subscript (`${args[i]#--}` → param("#", "args[i]", "--"))
+            if name.ends_with(']') {
+                let base = &name[..obrace];
+                let idxs = &name[obrace + 1..name.len() - 1];
+                if (self.arrays.contains(base) || self.assoc_arrays.contains(base))
+                    && !idxs.is_empty()
+                {
+                    let bid = self.c_ident(base);
+                    let idxv = if let Ok(n) = idxs.parse::<i64>() {
+                        format!("{n}")
+                    } else if let Some(stripped) = idxs.strip_prefix('$') {
+                        format!("(long long)atoll({})", self.store_read(stripped))
+                    } else if is_ident(idxs) && self.var_types.get(idxs) == Some(&IrType::Int) {
+                        self.c_ident(idxs)
+                    } else {
+                        format!("(long long)atoll({})", self.store_read(idxs))
+                    };
+                    if self.assoc_arrays.contains(base) {
+                        self.need_sh = true;
+                        format!(
+                            "(char*)_sh_assoc_get({bid}_k, {bid}_v, {bid}_n, {idxv})"
+                        )
+                    } else {
+                        format!(
+                            "(char*)_sh_arr_get({bid}, {bid}_len, {idxv})"
+                        )
+                    }
+                } else {
+                    "\"\"".to_string()
+                }
+            } else {
+                "\"\"".to_string()
+            }
         } else if self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
             // `${LIST:-}` / `${MAP[k]}` — an ARRAY read: element 0 for
             // scalars (the array_join path handles the @/* forms above)
@@ -6602,6 +6650,18 @@ impl Render {
         self.arrays.insert(var.to_string());
         let id = self.c_ident(var);
         let v = self.value_c(val);
+        if let IrExpr::Interpolate(parts) = key {
+            // an Interpolate KEY (e.g. `m["${flags:j:1}"]=v` arrives as
+            // Lit('"') + expr + Lit('"'))): concatenate the part VALUES
+            // into a temp and use it as the assoc key
+            self.assoc_arrays.insert(var.to_string());
+            let kv = self.value_c(key);
+            let id2 = self.c_ident(var);
+            self.emit(&format!(
+                "_sh_assoc_set({id2}_k, {id2}_v, &{id2}_n, {ARR_CAP}, {kv}, {v});"
+            ));
+            return;
+        }
         if let IrExpr::Str(kraw, _) = key {
             // bash strips subscript quotes at parse time
             let kq = kraw.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
@@ -11261,6 +11321,46 @@ fn expr_is_and_tree(e: &IrExpr) -> bool {
     ) || matches!(e, IrExpr::BinOp { op: crate::ir::BinOpKind::And, .. })
 }
 
+
+/// Map an operator string (`:-d`, `##p`, `` ``, `/r`, ...) applied to the
+/// bare var `x` into param/getVar call args. Shared by `${x<op>}` and
+/// `${arr[i]<op>}` forms.
+fn dollar_brace_name_op(opstr: &str) -> Option<Vec<IrExpr>> {
+    let s = |t: &str| IrExpr::Str(t.to_string(), crate::ir::StrStyle::DoubleQuoted);
+    if opstr.is_empty() {
+        return Some(vec![s("x")]);
+    }
+    let (op, arg): (String, String) = if let Some(r) = opstr.strip_prefix(":-") {
+        (":-".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix(":=") {
+        (":=".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix(":?") {
+        (":?".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix(":+") {
+        (":+".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix("##") {
+        ("##".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix("%%") {
+        ("%%".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix("//") {
+        ("//".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix('#') {
+        ("#".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix('%') {
+        ("%".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix('/') {
+        ("/".into(), r.to_string())
+    } else if let Some(r) = opstr.strip_prefix('-') {
+        ("-".into(), r.to_string())
+    } else {
+        return None;
+    };
+    if arg.contains('$') || arg.contains('`') || arg.contains('{') {
+        return None;
+    }
+    Some(vec![s(&op), s("x"), s(&arg)])
+}
+
 /// One flattened condition leaf of a `while` head.
 #[derive(Debug)]
 enum CondLeaf {
@@ -12415,6 +12515,20 @@ fn dollar_brace_args(body: &str) -> Option<Vec<IrExpr>> {
     if body.starts_with('!') {
         return None; // ${!x} indirect — not modeled
     }
+    // `arr[i]#op` — a SUBSCRIPTED name followed by an operator: parse the
+    // subscript as part of the name (param_call's element-read arm
+    // resolves it), then apply the operator chain to the element value.
+    if body.starts_with('[') {
+        if let Some(clo) = body.find(']') {
+            let name_full = &body[..=clo];
+            let opstr = &body[clo + 1..];
+            let base_args = dollar_brace_name_op(opstr)?;
+            let mut outv = vec![base_args[0].clone(), s(name_full)];
+            outv.extend(base_args[1..].iter().cloned());
+            return Some(outv);
+        }
+        return None;
+    }
     // leading name
     let ch: Vec<char> = body.chars().collect();
     let mut i = 0;
@@ -12447,25 +12561,23 @@ fn dollar_brace_args(body: &str) -> Option<Vec<IrExpr>> {
     } else if let Some(r) = rest.strip_prefix(":+") {
         (":+".into(), r.to_string())
     } else if let Some(r) = rest.strip_prefix(":") {
-        // ${x:off} / ${x:off:len} — slice; args must be plain integers
+        // ${x:off} / ${x:off:len} — slice; offsets may be expressions
+        // (${flags:j:1}) — passed through as raw args, param_call's
+        // value_num path resolves vars natively
         let mut it = r.splitn(2, ':');
         let off = it.next().unwrap_or("").trim();
         let len = it.next();
-        if !off.chars().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        let mut a = vec![s("slice"), s(&name), s(off)];
-        if let Some(l) = len {
-            let l = l.trim();
+        if len.is_some() {
+            let l = len.unwrap().trim();
             let neg = l.starts_with('-');
             let dt = l.trim_start_matches('-');
-            if !dt.chars().all(|c| c.is_ascii_digit()) || dt.is_empty() {
+            if dt.is_empty() {
                 return None;
             }
             let lenv = if neg { format!("-{dt}") } else { l.to_string() };
-            a.push(s(&lenv));
+            return Some(vec![s("slice"), s(&name), s(off), s(&lenv)]);
         }
-        return Some(a);
+        return Some(vec![s("slice"), s(&name), s(off)]);
     } else if let Some(r) = rest.strip_prefix("##") {
         ("##".into(), r.to_string())
     } else if let Some(r) = rest.strip_prefix("%%") {
