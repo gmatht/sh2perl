@@ -952,6 +952,10 @@ impl Render {
             self.emit("    if (ws) { while (*p == ' ' || *p == 9) p++; }");
             self.emit("  }");
             self.emit("}");
+            self.emit("/* assign into a read-loop var (char* slot; mstr vars use their own setter) */");
+            self.emit("static void _sh_mstr_set_from(char **slot, const char *val) {");
+            self.emit("  free(*slot); *slot = strdup(val ? val : \"\");");
+            self.emit("}");
             self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
             self.emit("static char *_sh_strippre(char *d, size_t cap, const char *s, const char *pat, int greedy) {");
             self.emit("  static char sc[65536];");
@@ -5074,7 +5078,11 @@ impl Render {
                 if l.is_empty() || r.is_empty() {
                     continue;
                 }
-                let lc = if let Ok(n) = l.parse::<i64>() {
+                // __SHCNT_ tokens are pre-substituted array counts —
+                // already numeric-native, never atoll-wrapped
+                let lc = if l.starts_with("__SHCNT_") {
+                    self.apply_array_counts(&format!("(long long){l}"))
+                } else if let Ok(n) = l.parse::<i64>() {
                     n.to_string()
                 } else if self.is_num(l) {
                     self.c_ident(l)
@@ -5083,7 +5091,9 @@ impl Render {
                 } else {
                     continue;
                 };
-                let rc = if let Ok(n) = r.parse::<i64>() {
+                let rc = if r.starts_with("__SHCNT_") {
+                    self.apply_array_counts(&format!("(long long){r}"))
+                } else if let Ok(n) = r.parse::<i64>() {
                     n.to_string()
                 } else if self.is_num(r) {
                     self.c_ident(r)
@@ -5710,6 +5720,9 @@ impl Render {
         let Some(op) = Self::str_arg(args, 0) else {
             return "0".into();
         };
+        if std::env::var("SH2_DBG_PARAMS").is_ok() {
+            eprintln!("DBG param_call op={op:?} name={:?} nargs={}", Self::str_arg(args, 1), args.len());
+        }
         let Some(name) = Self::str_arg(args, 1) else {
             return "0".into();
         };
@@ -5906,6 +5919,9 @@ impl Render {
             .get(3)
             .map(|x| self.default_word(x))
             .unwrap_or_else(|| "\"\"".into());
+        if std::env::var("SH2_DBG_PARAMS").is_ok() {
+            eprintln!("DBG pre-match op={op:?} vexpr_arrget={}", var_expr.contains("_sh_arr_get"));
+        }
         match op.as_str() {
             "" => var_expr,
             "-" => format!("(({var_expr}) ? ({var_expr}) : ({val}))"),
@@ -5925,6 +5941,9 @@ impl Render {
                 }
             }
             "#" | "#:" | "##" | "##:" => {
+                if std::env::var("SH2_DBG_PARAMS").is_ok() {
+                    eprintln!("DBG # arm fired name={name:?} pat={:?}", Self::str_arg(args, 2));
+                }
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
                 self.need_sh = true;
                 self.need_fnmatch = true;
@@ -7711,7 +7730,7 @@ impl Render {
                                 for (vi, v) in vars_c.iter().enumerate() {
                                     let vid = self.c_ident(v);
                                     self.emit(&format!(
-                                        "{vid} = strdup(__fv[{vi}]);"
+                                        "_sh_mstr_set_from(&{vid}, __fv[{vi}]);"
                                     ));
                                 }
                                 self.emit("}");
@@ -7735,7 +7754,7 @@ impl Render {
                                 for (vi, v) in vars_c.iter().enumerate() {
                                     let vid = self.c_ident(v);
                                     self.emit(&format!(
-                                        "{vid} = strdup(__fv[{vi}] ? __fv[{vi}] : \"\");"
+                                        "_sh_mstr_set_from(&{vid}, __fv[{vi}]);"
                                     ));
                                 }
                                 self.emit("}");
@@ -7879,7 +7898,7 @@ impl Render {
                                 for (vi, v) in vars_c.iter().enumerate() {
                                     let vid = self.c_ident(v);
                                     self.emit(&format!(
-                                        "{vid} = strdup(__fv[{vi}]);"
+                                        "_sh_mstr_set_from(&{vid}, __fv[{vi}]);"
                                     ));
                                 }
                                 self.emit("}");
