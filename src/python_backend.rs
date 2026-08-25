@@ -1455,12 +1455,87 @@ impl Render {
             }
             "param" => {
                 if let Some(IrExpr::Str(op, _)) = args.first() {
+                    // param("", name) — a plain ${name} read (incl.
+                    // indexed/assoc targets like "arr[1]" / "map[$k]")
+                    if op.is_empty() {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            return self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.clone(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                        }
+                    }
                     if op == "len" {
                         if let Some(IrExpr::Str(name, _)) = args.get(1) {
                             return format!("str(len({}))", self.py_ident(name));
                         }
                     }
-                    // `${x:-default}` — the value if non-empty else the default
+                    // ${x#pat} / ${x##pat} / ${x%pat} / ${x%%pat} via the
+                    // native __sh_strip helper (regex-based approximation)
+                    if matches!(op.as_str(), "#" | "##" | "%" | "%%") {
+                        if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Str(pat, _))) =
+                            (args.get(1), args.get(2))
+                        {
+                            self.need_strip = true;
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.clone(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            return format!(
+                                "__sh_strip({}, {}, {})",
+                                Self::py_str(pat),
+                                Self::py_str(op),
+                                v
+                            );
+                        }
+                    }
+                    // ${x:?msg} — error+exit when unset/empty; else the value
+                    if op == ":?" {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            self.need_sys = true;
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.clone(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            let msg = match args.get(2) {
+                                Some(IrExpr::Str(s, _)) => Self::py_str(s),
+                                _ => "parameter null or not set".to_string(),
+                            };
+                            return format!(
+                                "({v} if {v} != \"\" else sys.exit({msg}))"
+                            );
+                        }
+                    }
+                    // ${x//old/new} / ${x/old/new} — substitution
+                    if op == "//" || op == "/" {
+                        if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Str(pat, _)), Some(IrExpr::Str(repl, _))) =
+                            (args.get(1), args.get(2), args.get(3))
+                        {
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.clone(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            let cnt = if op == "//" { "-1" } else { "1" };
+                            return format!(
+                                "str({v}).replace({}, {}, {cnt})",
+                                Self::py_str(pat),
+                                Self::py_str(repl)
+                            );
+                        }
+                    }
+                    // ${x:-default} — the value if non-empty else the default
                     // case conversion: ${x^^} / ${x,,} / ${x^} / ${x,}
                     if op == "^^" || op == ",," || op == "^" || op == "," {
                         if let Some(IrExpr::Str(name, _)) = args.get(1) {
@@ -1472,8 +1547,8 @@ impl Render {
                                 )],
                             );
                             match op.as_str() {
-                                "^^" => return format!("{v}.upper()"),
-                                ",," => return format!("{v}.lower()"),
+                                "^^" => return format!("str({v}).upper()"),
+                                ",," => return format!("str({v}).lower()"),
                                 "^" => return format!(
                                     "({v}[:1].upper() + {v}[1:] if {v} else \"\")"
                                 ),
