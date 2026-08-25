@@ -570,12 +570,12 @@ impl Render {
             self.emit("/* background jobs (fork-based) reaped by bare wait */");
             self.emit("static pid_t _sh_bg_pids[512]; static size_t _sh_bg_n = 0;");
             // ── managed string: the C equivalent of sh2.vars.x ──
-            self.emit("typedef struct { char *p; } sh2_str;");
-            self.emit("static void sh2_str_set(sh2_str *v, const char *val) {");
+            self.emit("typedef struct { char *p; } _sh_mstr;");
+            self.emit("static void _sh_mstr_set(_sh_mstr *v, const char *val) {");
             self.emit("  free(v->p);");
             self.emit("  v->p = val ? strdup(val) : NULL;");
             self.emit("}");
-            self.emit("static const char *sh2_str_get(const sh2_str *v) {");
+            self.emit("static const char *_sh_mstr_get(const _sh_mstr *v) {");
             self.emit("  return (v->p) ? v->p : \"\";");
             self.emit("}");
             self.emit("static char *_sh_cmd = 0; static size_t _sh_cap = 0;");
