@@ -62,6 +62,40 @@ pub fn shir_to_java(prog: &IrProgram) -> Result<String, String> {
     }
     // every assignment target / store / arith read becomes a static
     // String field (empty default — bash reads an unset var as "")
+    // child-process execution layer (ported from backend/java 9f434788):
+    // exported env + $? + argv/text runners. Unconditional — javac keeps
+    // unused package-private statics; removes the missing-symbol class.
+    out.push_str("    static java.util.LinkedHashMap<String, String> __SH_EXPORTS = new java.util.LinkedHashMap<>();\n");
+    out.push_str("    static long __SH_RC = 0;\n");
+    out.push_str("    static long __shRunArgv(String[] argv) {\n");
+    out.push_str("        try {\n");
+    out.push_str("            ProcessBuilder pb = new ProcessBuilder(argv);\n");
+    out.push_str("            pb.environment().putAll(__SH_EXPORTS);\n");
+    out.push_str("            pb.inheritIO();\n");
+    out.push_str("            return pb.start().waitFor();\n");
+    out.push_str("        } catch (Exception e) { return 127; }\n");
+    out.push_str("    }\n");
+    out.push_str("    static long __shRun(String cmdline) {\n");
+    out.push_str("        return __shRunArgv(new String[]{\"bash\", \"-c\", cmdline});\n");
+    out.push_str("    }\n");
+    out.push_str("    static void __shExport(String w) {\n");
+    out.push_str("        int eq = w.indexOf('=');\n");
+    out.push_str("        if (eq > 0) __SH_EXPORTS.put(w.substring(0, eq), w.substring(eq + 1));\n");
+    out.push_str("    }\n");
+    out.push_str("    static String __shQ(String w) {\n");
+    out.push_str("        return \"'\" + w.replace(\"'\", \"'\\\\''\") + \"'\";\n");
+    out.push_str("    }\n");
+    out.push_str("    static String __shCap(String[] argv) {\n");
+    out.push_str("        try {\n");
+    out.push_str("            ProcessBuilder pb = new ProcessBuilder(argv);\n");
+    out.push_str("            pb.environment().putAll(__SH_EXPORTS);\n");
+    out.push_str("            Process p = pb.start();\n");
+    out.push_str("            byte[] b = p.getInputStream().readAllBytes();\n");
+    out.push_str("            p.waitFor();\n");
+    out.push_str("            __SH_RC = p.exitValue();\n");
+    out.push_str("            return new String(b).trim();\n");
+    out.push_str("        } catch (Exception e) { __SH_RC = 127; return \"\"; }\n");
+    out.push_str("    }\n");
     let mut fields: Vec<String> = Vec::new();
     collect_vars(&prog.stmts, &mut fields);
     let has_fns = prog.stmts.iter().any(|st| {
@@ -187,6 +221,24 @@ fn collect_vars_expr(e: &IrExpr, out: &mut Vec<String>) {
             if matches!(func.as_str(), "setVar" | "getVar") {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     push_var(name, out);
+                }
+            }
+            // bare `export NAME` reads NAME's field at runtime
+            // (backend/java 9f434788)
+            if func == "exec" {
+                if let (Some(IrExpr::Str(c, _)), Some(IrExpr::Array(items))) =
+                    (args.first(), args.get(1))
+                {
+                    if c == "export" {
+                        for it in items {
+                            if let IrExpr::Str(w, _) = it {
+                                let n = w.split('=').next().unwrap_or(w);
+                                if !n.is_empty() {
+                                    push_var(n, out);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             for a in args {
@@ -1094,9 +1146,55 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
                     out.push_str(&pieces.join(" + "));
                     out.push_str(");\n");
                 }
+                "export" => {
+                    // export VAR=value / bare export NAME — record in
+                    // __SH_EXPORTS so every child process sees it
+                    // (backend/java 9f434788)
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        for it in items {
+                            match it {
+                                IrExpr::Str(w, _) if !w.contains('$') && w.contains('=') => {
+                                    let (n, v) = w.split_once('=').unwrap();
+                                    indent(out, d);
+                                    out.push_str(&format!(
+                                        "__SH_EXPORTS.put({}, {});\n",
+                                        java_str_lit(n),
+                                        java_str_lit(v)
+                                    ));
+                                }
+                                IrExpr::Str(n, _) => {
+                                    // bare NAME: mark the CURRENT field value
+                                    indent(out, d);
+                                    out.push_str(&format!(
+                                        "__SH_EXPORTS.put({}, {});\n",
+                                        java_str_lit(n),
+                                        java_home(n)
+                                    ));
+                                }
+                                _ => {
+                                    let wj = word_to_java(it)?;
+                                    indent(out, d);
+                                    out.push_str(&format!("__shExport({wj});\n"));
+                                }
+                            }
+                        }
+                    }
+                }
                 other => {
+                    // any other command: a REAL child process — argv exec,
+                    // stdout/stderr inherited, exit status lands in $?
+                    // (__SH_RC). Replaces the v1 comment stub.
+                    let mut parts = vec![java_str_lit(other)];
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        for it in items {
+                            parts.push(word_to_java(it)?);
+                        }
+                    }
                     indent(out, d);
-                    out.push_str(&format!("// sh2.{} (external — v1 stub)\n", other));
+                    out.push_str(&format!(
+                        "__SH_RC = __shRunArgv(new String[]{{{}}});\n",
+                        parts.join(", ")
+                    ));
                 }
             }
             Ok(())
@@ -1134,6 +1232,57 @@ fn expr_stmt_to_java(e: &IrExpr, d: usize, out: &mut String) -> Result<(), Strin
             indent(out, d);
             out.push_str(&mem_call_java(func, args)?);
             out.push_str(";\n");
+            Ok(())
+        }
+        IrExpr::BinOp { lhs, rhs, op } => {
+            // statement-position command chain (`a && b`, `a || b`) —
+            // passthrough as ONE bash -c text (bash owns precedence and
+            // short-circuit), stdout inherited, rc lands in $?
+            // (backend/java 9f434788)
+            if !matches!(*op, crate::ir::BinOpKind::And | crate::ir::BinOpKind::Or) {
+                return Err(format!("statement chain op not in the v1 Java subset: {op:?}"));
+            }
+            // side_text returns a JAVA EXPRESSION evaluating to the
+            // shell-quoted command text (__shQ single-quotes at RUNTIME,
+            // so interpolated args are safe)
+            fn side_text(e: &IrExpr) -> Result<String, String> {
+                match e {
+                    IrExpr::BinOp { lhs, rhs, op } => {
+                        let sep = match *op {
+                            crate::ir::BinOpKind::And => " && ",
+                            crate::ir::BinOpKind::Or => " || ",
+                            _ => return Err("chain op".into()),
+                        };
+                        Ok(format!(
+                            "({}) + \"{}\" + ({})",
+                            side_text(lhs)?,
+                            sep,
+                            side_text(rhs)?
+                        ))
+                    }
+                    IrExpr::Call { func, args, .. }
+                        if matches!(func.as_str(), "exec" | "builtin") =>
+                    {
+                        let mut words: Vec<String> = Vec::new();
+                        for a in args {
+                            match a {
+                                IrExpr::Str(w, _) => words.push(format!("__shQ({})", java_str_lit(w))),
+                                IrExpr::Array(items) => {
+                                    for it in items {
+                                        words.push(format!("__shQ({})", word_to_java(it)?));
+                                    }
+                                }
+                                other => return Err(format!("chain word {other:?} not in the v1 subset")),
+                            }
+                        }
+                        Ok(words.join(" + \" \" + "))
+                    }
+                    other => Err(format!("chain operand {other:?} not in the v1 subset")),
+                }
+            }
+            let t = side_text(e)?;
+            indent(out, d);
+            out.push_str(&format!("__SH_RC = __shRun({});\n", t));
             Ok(())
         }
         IrExpr::Arith(a) => {
@@ -1554,7 +1703,7 @@ fn word_to_java(e: &IrExpr) -> Result<String, String> {
                                 }
                             }
                             return Ok(format!(
-                                "new String(new ProcessBuilder({}).start().getInputStream().readAllBytes()).trim()",
+                                "__shCap(new String[]{{{}}})",
                                 argv.join(", ")
                             ));
                         }
@@ -1771,7 +1920,7 @@ fn expr_to_java(e: &IrExpr, out: &mut String) -> Result<(), String> {
                                 }
                             }
                             out.push_str(&format!(
-                                "new String(new ProcessBuilder({}).start().getInputStream().readAllBytes()).trim()",
+                                "__shCap(new String[]{{{}}})",
                                 argv.join(", ")
                             ));
                             return Ok(());
