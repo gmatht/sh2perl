@@ -516,6 +516,14 @@ impl Render {
 
     fn expr(&mut self, e: &IrExpr) -> String {
         match e {
+            // unquoted-$var word splitting (default IFS): drop leading/
+            // trailing whitespace and empty fields — split(' ') is the awk
+            // idiom for exactly that. In string context the words rejoin
+            // with single spaces (echo's own joining).
+            IrExpr::Call { func, args } if func == "split" => {
+                let inner = args.first().map(|a| self.expr(a)).unwrap_or_else(|| "''".into());
+                return format!("join(' ', split(' ', {}))", inner);
+            }
             IrExpr::Int(n) => n.to_string(),
             IrExpr::Str(s, _) => Self::perl_str(s),
             IrExpr::Var(name, sigil) => match sigil {
