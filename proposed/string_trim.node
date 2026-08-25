@@ -1,0 +1,12 @@
+# shir_nodes/string_trim.node — expression-level semantic IR node.
+# Trim leading/trailing whitespace (lowered from `sed`, `xargs`).
+#
+# Backends: Perl s/^\s+//, JS trim(), C isspace loop, Rust .trim()
+# Fallback: sh2.stringTrim(text, leading, trailing)
+
+node StringTrim
+tag "StringTrim"
+kind expr
+field text: expr
+field leading: bool
+field trailing: bool

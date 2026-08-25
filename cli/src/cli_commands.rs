@@ -756,14 +756,38 @@ pub fn parse_shir_json_to_estree(filename: &str) {
         Ok(c) => c,
         Err(e) => { eprintln!("read {}: {}", filename, e); return; }
     };
-    let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+    let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
         Ok(p) => p,
         Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
     };
+    // Frontend-emitted A1 carries constructs as opaque exec calls (let
+    // conditions, read, …) — normalise them through the SAME gated
+    // transform channel the direct path uses, so every backend sees the
+    // reduced vocabulary regardless of who produced the A1. text_ops is
+    // opt-in (DEBASHC_TRANSFORMS must list it), keeping default ingests
+    // byte-stable.
+    debashl::transforms::apply(&mut prog.stmts);
     match debashl::shir::shir_to_estree_json(&prog) {
         Ok(s) => println!("{}", s),
         Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
     }
+}
+
+/// Ingest a ShIR JSON file and emit idiomatic JS source via the
+/// worktree-local js backend renderer (src/js_backend.rs). Closes the
+/// frontend → shIR → JS path; the js backend is a scaffold renderer
+/// (sh2.* stubs for anything outside the lowable subset).
+pub fn parse_shir_json_to_js(filename: &str) {
+    let content = match std::fs::read_to_string(filename) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("read {}: {}", filename, e); return; }
+    };
+    let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+    };
+    let js = debashl::js_backend::shir_to_js(&prog);
+    print!("{}", js);
 }
 
 pub fn interactive_mode() {

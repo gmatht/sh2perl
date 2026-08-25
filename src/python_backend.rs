@@ -46,6 +46,14 @@ pub struct Render {
     need_strip: bool,
     /// needs `import re` (the grepMatches lift)
     need_re: bool,
+    /// needs `import sys` (exit)
+    need_sys: bool,
+    /// needs the `__sh_exec` subprocess helper
+    need_subprocess: bool,
+    /// needs `__sh_run_status` (exec operand inside an &&/|| chain —
+    /// rc truth is inverted in python; backend/python 3a5f5d5d)
+    need_run_status: bool,
+    need_capture_out: bool,
 }
 
 impl Render {
@@ -64,6 +72,37 @@ impl Render {
         (
             "setVar",
             "def sh2_setVar(name, value):\n    __sh_store[name] = \"\" if value is None else str(value)\n",
+        ),
+        (
+            "strip",
+            concat!(
+                "def sh2_strip(v, pat, which):\n",
+                "    import fnmatch\n",
+                "    if which == 'p':\n",
+                "        m = 0\n",
+                "        for i in range(1, len(v)+1):\n",
+                "            if fnmatch.fnmatch(v[:i], pat):\n",
+                "                m = i; break\n",
+                "        return v[m:]\n",
+                "    if which == 'P':\n",
+                "        m = 0\n",
+                "        for i in range(1, len(v)+1):\n",
+                "            if fnmatch.fnmatch(v[:i], pat):\n",
+                "                m = i\n",
+                "        return v[m:]\n",
+                "    if which == 's':\n",
+                "        n = len(v)\n",
+                "        for i in range(len(v)-1, -1, -1):\n",
+                "            if fnmatch.fnmatch(v[i:], pat):\n",
+                "                n = i\n",
+                "        return v[:n]\n",
+                "    # 'S' longest suffix\n",
+                "    n = len(v)\n",
+                "    for i in range(len(v)-1, -1, -1):\n",
+                "        if fnmatch.fnmatch(v[i:], pat):\n",
+                "            n = i; break\n",
+                "    return v[:n]\n",
+            ),
         ),
         (
             "memAlloc",
@@ -718,14 +757,39 @@ impl Render {
                     // None; the truthy wrapper keeps `&&`/`||` status chaining
                     // bash-faithful (a successful echo always proceeds). Test/
                     // value operands stay as-is (`""` stays falsy).
+                    // bash-truth chaining: a native print renders None
+                    // (needs the truthy wrapper to keep the chain going),
+                    // but a fork/exec operand is RC-valued — and python
+                    // inverts rc truth (0=success must be True), so it
+                    // routes through __sh_run_status instead of the wrap
+                    // ('ls missing || echo' must still run the echo;
+                    // 'ls ok && echo' must NOT) — backend/python 3a5f5d5d
+                    let need_rs = std::cell::Cell::new(false);
                     let wrap = |x: &IrExpr, s: String| -> String {
                         if matches!(x, IrExpr::Call { func, .. } if func == "exec") {
-                            format!("({s} or 1)")
+                            if s.starts_with("__sh_exec(") {
+                                need_rs.set(true);
+                                // keep "(" from the original call: slice
+                                // after __sh_exec, not after its paren
+                                format!("__sh_run_status{}", &s["__sh_exec".len()..])
+                            } else {
+                                format!("({s} or 1)")
+                            }
                         } else {
                             s
                         }
                     };
-                    return format!("({} {py_op} {})", wrap(lhs, l), wrap(rhs, r));
+                    let chained = format!(
+                        "({} {py_op} {})",
+                        wrap(lhs, l.clone()),
+                        wrap(rhs, r)
+                    );
+                    #[cfg(feature="never")]
+                    eprintln!("DBG lhs=[{}] rhs=[{}] out=[{}]", l, r, chained);
+                    if need_rs.get() {
+                        self.need_run_status = true;
+                    }
+                    return chained;
                 }
                 format!("({l} {py_op} {r})")
             }
@@ -746,14 +810,85 @@ impl Render {
                 format!("({} or {})", self.expr(expr), self.expr(default))
             }
             IrExpr::Interpolate(parts) => self.interp(parts),
-            IrExpr::Capture { .. } => self.sh2_stub("capture", &[], "capture"),
+            IrExpr::Capture { expr, .. } => {
+                // `$(cmd args)` with a single exec body -> native capture
+                if let IrExpr::Arrow(body) = expr.as_ref() {
+                    if let [IrStmt::Expr(e)] = body.as_slice() {
+                        if let IrExpr::Call { func, args } = e {
+                            if func == "exec" {
+                                let argv = self.build_argv(args);
+                                self.need_subprocess = true;
+                                return format!(
+                                    "subprocess.check_output([{}]).decode()",
+                                    argv.join(", ")
+                                );
+                            }
+                            // `$(cmd1 | cmd2)` — a pipeline body
+                            if func == "pipeline" {
+                                return self.call("pipeline", args);
+                            }
+                            // `$(cmd < file)` — a redirect body -> bash -c
+                            if func == "redirect" {
+                                if let Some(c) = self.capture_redirect(args) {
+                                    return c;
+                                }
+                            }
+                        }
+                    }
+                }
+                // The C frontend's outparam channel: capture(Arrow[
+                // fnCall(..)]) — the callee echoes its out-params, the
+                // caller captures STDOUT.
+                if let IrExpr::Arrow(body) = expr.as_ref() {
+                    let mut call: Option<(String, Vec<String>)> = None;
+                    for st in body.iter() {
+                        if let IrStmt::Expr(IrExpr::Call { func, args })
+                        = st {
+                            if func == "fnCall" || func == "$fn_call" {
+                                let name = args.first().and_then(|a| match a {
+                                    IrExpr::Str(n, _) => Some(n.clone()),
+                                    _ => None,
+                                });
+                                let call_args = args.get(1).and_then(|a| match a {
+                                    IrExpr::Array(elems) => Some(
+                                        elems.iter().map(|e| self.expr(e)).collect::<Vec<_>>(),
+                                    ),
+                                    _ => None,
+                                });
+                                if let (Some(name), Some(call_args)) = (name, call_args) {
+                                    call = Some((name, call_args));
+                                }
+                            }
+                        }
+                    }
+                    if let Some((name, call_args)) = call {
+                        self.need_capture_out = true;
+                        return format!(
+                            "__sh_capture_out({}, {})",
+                            self.py_ident(&name),
+                            call_args.join(", ")
+                        );
+                    }
+                }
+                self.sh2_stub("capture", &[], "capture")
+            },
             IrExpr::Regex { .. } => self.sh2_stub("regex", &[], "regex"),
             IrExpr::Range { start, end } => format!("range({}, {})", start, end + 1),
             IrExpr::RawExpr(s) => {
                 self.mark_todo(&format!("RawExpr {s:?}"));
                 "None".into()
             }
-            IrExpr::Arrow(_) => self.sh2_stub("arrow", &[], "arrow"),
+            IrExpr::Arrow(body) => {
+                // a command body as a value — bash -c capture fallback
+                if let Some(text) = self.body_shell_text(body) {
+                    self.need_subprocess = true;
+                    return format!(
+                        "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
+                        Self::py_str(&text)
+                    );
+                }
+                self.sh2_stub("arrow", &[], "arrow")
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|e| self.expr(e)).collect();
                 format!("[{}]", elems.join(", "))
@@ -795,7 +930,14 @@ impl Render {
             ArithAst::Var(name) | ArithAst::Ident(name) => {
                 // bash coerces arith operands to integers; python would
                 // string-repeat/double a str loop var, so wrap the read.
-                // (int() of an int-typed var is a no-op.)
+                // (int() of an int-typed var is a no-op.) A STORE-resident
+                // name (dotted struct fields — the C frontend flattens
+                // p.x to a store key) has no native binding: read via the
+                // store and coerce.
+                if self.store_written.contains(name) {
+                    self.sh2_calls.insert("getVar".into());
+                    return format!("__sh_atoi(sh2_getVar({}))", Self::py_str(name));
+                }
                 format!("int({})", self.py_ident(name))
             }
             ArithAst::Index { .. } => {
@@ -807,11 +949,27 @@ impl Render {
                 let r = self.arith(rhs);
                 if *op == "**" {
                     format!("pow({l},{r})")
+                } else if op == "&&" {
+                    // Python has no &&/|| — the C frontend's boolean ops
+                    // inside arith ASTs (bool ok && !no). Numeric result:
+                    // printf %d needs an int, not True/False.
+                    format!("(1 if ({l} and {r}) else 0)")
+                } else if op == "||" {
+                    format!("(1 if ({l} or {r}) else 0)")
+                } else if op == "/" {
+                    // bash `/` truncates toward zero
+                    format!("int({l} / {r})")
                 } else {
                     format!("({l} {op} {r})")
                 }
             }
-            ArithAst::Un { op, arg } => format!("({op}{})", self.arith(arg)),
+            ArithAst::Un { op, arg } => {
+                if op == "!" {
+                    format!("(1 if not {} else 0)", self.arith(arg))
+                } else {
+                    format!("({op}{})", self.arith(arg))
+                }
+            }
             ArithAst::Cond { test, then, else_ } => format!(
                 "({} if {} else {})",
                 self.arith(then),
@@ -922,6 +1080,69 @@ impl Render {
 
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            // arrayStore(name, idx, val) — the C frontend's array element
+            // write: pad the python list to the (dynamic) index, assign
+            "arrayStore" => {
+                if let (Some(IrExpr::Str(name, _)), Some(idx), Some(val)) =
+                    (args.first(), args.get(1), args.get(2))
+                {
+                    let m = self.py_ident(name);
+                    let i = self.expr(idx);
+                    let v = self.expr(val);
+                    self.emit(&format!("while len({m}) <= int({i}): {m}.append('')"));
+                    self.emit(&format!("{m}[int({i})] = {v}"));
+                    return "None".into();
+                }
+                self.sh2_stub("arrayStore", args, "arrayStore")
+            }
+            // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+            // python `PAT in STR`.
+            "capture" => {
+                // The C frontend's outparam channel: capture(Arrow[
+                // fnCall(..)]) — the callee echoes its out-params, the
+                // caller captures STDOUT.
+                if let Some(IrExpr::Arrow(body)) = args.first() {
+                    let mut call: Option<(String, Vec<String>)> = None;
+                    for st in body.iter() {
+                        if let IrStmt::Expr(IrExpr::Call { func: f, args: fargs }) = st {
+                            if f == "fnCall" || f == "$fn_call" {
+                                let name = fargs.first().and_then(|a| match a {
+                                    IrExpr::Str(n, _) => Some(n.clone()),
+                                    _ => None,
+                                });
+                                let call_args = fargs.get(1).and_then(|a| match a {
+                                    IrExpr::Array(elems) => Some(
+                                        elems.iter().map(|e| self.expr(e)).collect::<Vec<_>>(),
+                                    ),
+                                    _ => None,
+                                });
+                                if let (Some(name), Some(cargs)) = (name, call_args) {
+                                    call = Some((name, cargs));
+                                }
+                            }
+                        }
+                    }
+                    if let Some((name, call_args)) = call {
+                        self.need_capture_out = true;
+                        return format!(
+                            "__sh_capture_out({}, {})",
+                            self.py_ident(&name),
+                            call_args.join(", ")
+                        );
+                    }
+                }
+                self.sh2_stub("capture", args, "capture")
+            }
+            // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+            // python `PAT in STR`.
+            "contains" => {
+                if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
+                    let needle = self.expr(needle);
+                    let pattern = self.expr(pattern);
+                    return format!("{pattern} in {needle}");
+                }
+                self.sh2_stub("contains", args, "contains")
+            }
             // exec("echo", [args...]) → native print (python's print IS echo
             // semantics: space-separated args + trailing newline);
             // exec("printf", [fmt, args...]) → native sys.stdout.write
@@ -951,8 +1172,63 @@ impl Render {
                     if cmd == "printf" {
                         return self.printf_call(args);
                     }
+                    if cmd == "exit" {
+                        let code = match args.get(1) {
+                            Some(IrExpr::Array(items)) if !items.is_empty() => self.expr(&items[0]),
+                            _ => "0".to_string(),
+                        };
+                        self.need_sys = true;
+                        return format!("sys.exit({code})");
+                    }
+                    if cmd == "cd" {
+                        // `cd [dir]` — os.chdir (bash cd; PWD updated)
+                        let dir = match args.get(1) {
+                            Some(IrExpr::Array(items)) if !items.is_empty() => {
+                                self.expr(&items[0])
+                            }
+                            _ => "os.path.expanduser(\"~\")".to_string(),
+                        };
+                        return format!("os.chdir({dir})");
+                    }
+                    if cmd == "read" {
+                        // `read var` — read a line into the store (sh2_setVar
+                        // triggers the store runtime).
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if let Some(IrExpr::Str(v, _)) = items.first() {
+                                self.sh2_calls.insert("setVar".into());
+                                return format!(
+                                    "sh2_setVar({}, sys.stdin.readline().rstrip(\"\\n\"))",
+                                    Self::py_str(v)
+                                );
+                            }
+                        }
+                    }
+                    if cmd == "unset" {
+                        // `unset var` — remove from the store
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if let Some(IrExpr::Str(v, _)) = items.first() {
+                                self.sh2_calls.insert("setVar".into());
+                                return format!(
+                                    "__sh_store.pop({}, None)",
+                                    Self::py_str(v)
+                                );
+                            }
+                        }
+                    }
+                    if cmd == "let" {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if let Some(IrExpr::Str(text, _)) = items.first() {
+                                if let Some(c) = self.render_let_cond(text) {
+                                    return c;
+                                }
+                            }
+                        }
+                    }
                 }
-                self.sh2_stub("exec", args, "exec")
+                // external command: fork/exec via subprocess
+                let argv = self.build_argv(args);
+                self.need_subprocess = true;
+                return format!("__sh_exec([{}])", argv.join(", "));
             }
             // getVar("y") — the ShIR's form of a `$y` read; typed vars are
             // plain python names, a store-written name (the imperative
@@ -962,6 +1238,22 @@ impl Render {
             // python binding; anything else → runtime stub
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
+                    // bash special/positional vars — native reads.
+                    match name.as_str() {
+                        "?" => {
+                            self.need_rc = true;
+                            return "str(__sh_rc)".into();
+                        }
+                        "#" => return "str(len(sys.argv) - 1)".into(),
+                        "@" | "*" => return "\" \".join(sys.argv[1:])".into(),
+                        n if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+                            let i: i64 = n.parse().unwrap_or(1);
+                            return format!(
+                                "(sys.argv[{i}] if len(sys.argv) > {i} else \"\")"
+                            );
+                        }
+                        _ => {}
+                    }
                     if self.var_types.contains_key(name) {
                         return self.py_ident(name);
                     }
@@ -987,10 +1279,17 @@ impl Render {
                         .get(1)
                         .map(|a| self.expr(a))
                         .unwrap_or_else(|| "\"\"".into());
+                    // store residency wins: a name written via setVar
+                    // anywhere reads back through the store — dotted
+                    // struct names ("c.hits") have no native binding
+                    if self.store_written.contains(name) {
+                        self.sh2_calls.insert("setVar".into());
+                        return format!("sh2_setVar({}, {value})", Self::py_str(name));
+                    }
                     if self.var_types.contains_key(name) {
                         return format!("{} = {value}", self.py_ident(name));
                     }
-                    if self.store_written.contains(name) && Self::is_plain_name(name) {
+                    if Self::is_plain_name(name) {
                         self.sh2_calls.insert("setVar".into());
                         return format!("sh2_setVar({}, {value})", Self::py_str(name));
                     }
@@ -1022,11 +1321,141 @@ impl Render {
             }
             // param(op, name, ..) — the C frontend's strlen lowering is the
             // `${#name}` len op on a native var: `param("len", "s")`.
+            "brace" => {
+                // `{x,y}{1..2}` / `a{1..3}b` — brace expansion. The groups
+                // are literals (ranges/lists), so expand them statically at
+                // render time and emit the space-joined words as a python
+                // string. Refuses any non-literal group.
+                if let Some(w) = py_brace_words(args) {
+                    return Self::py_str(&w);
+                }
+                self.sh2_stub("brace", args, "brace")
+            }
             "param" => {
                 if let Some(IrExpr::Str(op, _)) = args.first() {
                     if op == "len" {
                         if let Some(IrExpr::Str(name, _)) = args.get(1) {
                             return format!("str(len({}))", self.py_ident(name));
+                        }
+                    }
+                    // `${x:-default}` — the value if non-empty else the default
+                    // case conversion: ${x^^} / ${x,,} / ${x^} / ${x,}
+                    if op == "^^" || op == ",," || op == "^" || op == "," {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.to_string(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            match op.as_str() {
+                                "^^" => return format!("{v}.upper()"),
+                                ",," => return format!("{v}.lower()"),
+                                "^" => return format!(
+                                    "({v}[:1].upper() + {v}[1:] if {v} else \"\")"
+                                ),
+                                _ => return format!(
+                                    "({v}[:1].lower() + {v}[1:] if {v} else \"\")"
+                                ),
+                            }
+                        }
+                    }
+                    if op == ":-" || op == ":=" {
+                        if let (Some(IrExpr::Str(name, _)), Some(def)) =
+                            (args.get(1), args.get(2))
+                        {
+                            let v = self.call("getVar", &[IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted)]);
+                            let d = self.expr(def);
+                            if op == ":-" {
+                                return format!("({v} if {v} != \"\" else {d})");
+                            }
+                            return format!("({v} if {v} != \"\" else ({d}))");
+                        }
+                    }
+                    // \${s:off:len}` — substring slice
+                    if op == "slice" {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            let v = self.call("getVar", &[IrExpr::Str(name.to_string(), crate::ir::StrStyle::DoubleQuoted)]);
+                            let o = self.expr_as_num(&args[2]);
+                            let l = self.expr_as_num(&args[3]);
+                            return format!("{v}[{o}:{o}+{l}]");
+                        }
+                    }
+                    // \${x##*/} / basename / dirname — native os.path
+                    if op == "basename" || op == "dirname" {
+                        if let Some(IrExpr::Str(name, _)) = args.get(1) {
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.to_string(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            let f = if op == "basename" { "basename" } else { "dirname" };
+                            return format!("os.path.{f}({v})");
+                        }
+                    }
+                    // \${x#pat} / \${x##pat} / \${x%pat} / \${x%%pat} —
+                    // strip prefix/suffix, literal pattern only (no glob).
+                    if op == "#" || op == "##" || op == "%" || op == "%%" {
+                        if let (Some(IrExpr::Str(name, _)), Some(IrExpr::Str(pat, _))) =
+                            (args.get(1), args.get(2))
+                        {
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.to_string(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            if !pat.contains('*') && !pat.contains('?') && !pat.contains('[') {
+                                let p = Self::py_str(pat);
+                                return match op.as_str() {
+                                    "#" | "##" => format!(
+                                        "({v}[len({p}):] if {v}.startswith({p}) else {v})"
+                                    ),
+                                    _ => format!(
+                                        "({v}[:len({v})-len({p})] if {v}.endswith({p}) else {v})"
+                                    ),
+                                };
+                            }
+                            // glob pattern — runtime sh2_strip
+                            let which = match op.as_str() {
+                                "#" => "p",
+                                "##" => "P",
+                                "%" => "s",
+                                _ => "S",
+                            };
+                            self.sh2_calls.insert("strip".into());
+                            return format!(
+                                "sh2_strip({v}, {}, {})",
+                                Self::py_str(pat),
+                                Self::py_str(which)
+                            );
+                        }
+                    }
+                    // ${x/pat/repl} / ${x//pat/repl} — substitute (literal pattern).
+                    if op == "/" || op == "//" {
+                        if let (
+                            Some(IrExpr::Str(name, _)),
+                            Some(IrExpr::Str(pat, _)),
+                            Some(IrExpr::Str(repl, _)),
+                        ) = (args.get(1), args.get(2), args.get(3))
+                        {
+                            if !pat.contains('*') && !pat.contains('?') && !pat.contains('[') {
+                                let v = self.call(
+                                    "getVar",
+                                    &[IrExpr::Str(
+                                        name.to_string(),
+                                        crate::ir::StrStyle::DoubleQuoted,
+                                    )],
+                                );
+                                let p = Self::py_str(pat);
+                                let r = Self::py_str(repl);
+                                let cnt = if op == "/" { "1" } else { "-1" };
+                                return format!("{v}.replace({p}, {r}, {cnt})");
+                            }
                         }
                     }
                 }
@@ -1041,6 +1470,31 @@ impl Render {
                             return format!("int({})", self.py_ident(name));
                         }
                     }
+                    // a general arith STRING (`($x % 2)` — the C frontend's
+                    // testArith/ternary-cond shape): normalize $refs to
+                    // bare idents, parse, render via the Arith AST walker
+                    let norm: String = s
+                        .chars()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            if c == '$'
+                                && i + 1 < s.len()
+                                && (s[i + 1..].starts_with('{')
+                                    || s[i + 1..]
+                                        .chars()
+                                        .next()
+                                        .map_or(false, |n| n.is_ascii_alphabetic() || n == '_'))
+                            {
+                                ' '
+                            } else {
+                                c
+                            }
+                        })
+                        .collect();
+                    let norm = norm.replace('{', " ").replace('}', " ");
+                    if let Some(ast) = crate::shir::parse_arith(norm.trim()) {
+                        return self.arith(&ast);
+                    }
                 }
                 self.sh2_stub("arith", args, "arith")
             }
@@ -1052,35 +1506,55 @@ impl Render {
             // (the C array `a[4]`); untyped names keep the runtime store.
             "setArray" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    if self.var_types.contains_key(name) {
-                        let elems = args
-                            .get(1)
-                            .map(|a| self.expr(a))
-                            .unwrap_or_else(|| "[]".into());
-                        return format!("{} = {elems}", self.py_ident(name));
-                    }
+                    // a native python list home (the C frontend's dynamic
+                    // arrays; element writes/reads are list ops)
+                    let elems = args
+                        .get(1)
+                        .map(|a| self.expr(a))
+                        .unwrap_or_else(|| "[]".into());
+                    return format!("{} = list({elems})", self.py_ident(name));
                 }
                 self.sh2_call("setArray", args)
             }
             "arrayIndex" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
-                    if self.var_types.contains_key(name) {
-                        let key = args
-                            .get(1)
-                            .map(|a| self.expr(a))
-                            .unwrap_or_else(|| "0".into());
-                        return format!("{}[int({key})]", self.py_ident(name));
-                    }
+                    // native list home with a bounds default (bash reads
+                    // an unset element as "")
+                    let key = args
+                        .get(1)
+                        .map(|a| self.expr(a))
+                        .unwrap_or_else(|| "0".into());
+                    let m = self.py_ident(name);
+                    return format!(
+                        "({m}[int({key})] if len({m}) > int({key}) else '')"
+                    );
                 }
                 self.sh2_call("arrayIndex", args)
             }
             // test("...") — mini evaluator for the common numeric/string
             // patterns; anything else → runtime stub.
+            "line" => {
+                // multi-return line read (`line(cap, N)` = the C frontend's
+                // outparam channel): String(v).split('\n')[N] with "" default
+                if let (Some(v), Some(IrExpr::Str(i, _))) = (args.first(), args.get(1)) {
+                    let ve = self.expr(v);
+                    let n: usize = i.parse().unwrap_or(0);
+                    return format!("(__sh_lines({})[{n}] if {} else '')", ve, ve.clone());
+                }
+                self.sh2_stub("line", args, "line")
+            }
             "test" => {
                 if let Some(IrExpr::Str(s, _)) = args.first() {
                     if let Some(c) = self.test_render(s) {
                         return c;
                     }
+                    // bash -c fallback for a test shape test_render can't
+                    // parse natively: run `[ <test> ]` (fork/exec).
+                    self.need_subprocess = true;
+                    return format!(
+                        "(subprocess.check_output([\"bash\", \"-c\", {}]) == 0)",
+                        Self::py_str(&format!("[ {s} ]"))
+                    );
                 }
                 self.sh2_stub("test", args, "test")
             }
@@ -1129,8 +1603,147 @@ impl Render {
                 let rc = format!("\"\\n\".join(re.findall({}, {text}))", Self::py_str(&body));
                 rc
             }
+            "pipeline" => {
+                // `cmd1 | cmd2` — bash -c fork/exec fallback (a pipeline is
+                // a shell primitive; subprocess pipes would need stage wiring).
+                if let Some(IrExpr::Array(stages)) = args.first() {
+                    let mut parts = Vec::new();
+                    for stage in stages {
+                        if let IrExpr::Arrow(body) = stage {
+                            if let [IrStmt::Expr(e)] = body.as_slice() {
+                                if let IrExpr::Call { func, args } = e {
+                                    if func == "exec" {
+                                        let argv = self.build_argv(args);
+                                        parts.push(argv.join(" "));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        return self.sh2_stub("pipeline", args, "pipeline");
+                    }
+                    if !parts.is_empty() {
+                        self.need_subprocess = true;
+                        return format!(
+                            "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
+                            Self::py_str(&parts.join(" | "))
+                        );
+                    }
+                }
+                self.sh2_stub("pipeline", args, "pipeline")
+            }
             _ => self.sh2_stub(func, args, func),
         }
+    }
+
+    /// Shell-quote a literal for a bash -c reconstruction.
+    fn sh_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+    /// Render an exec arg to shell text (literal/int/\$var), for bash -c.
+    fn sh_arg(&self, e: &IrExpr) -> Option<String> {
+        match e {
+            IrExpr::Str(s, _) => Some(Self::sh_quote(s)),
+            IrExpr::Int(i) => Some(i.to_string()),
+            IrExpr::Call { func, args } if func == "getVar" => {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    Some(format!("${n}"))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+    /// Render a single-exec/pipeline Arrow body to shell text (for the
+    /// bash -c capture fallback). None for anything else.
+    fn body_shell_text(&self, body: &[IrStmt]) -> Option<String> {
+        let mut parts = Vec::new();
+        for st in body {
+            match st {
+                IrStmt::Expr(e) => {
+                    if let IrExpr::Call { func, args } = e {
+                        if func == "exec" {
+                            let mut one = Vec::new();
+                            if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                                one.push(Self::sh_quote(cmd));
+                            }
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                for it in items {
+                                    one.push(self.sh_arg(it)?);
+                                }
+                            }
+                            parts.push(one.join(" "));
+                            continue;
+                        }
+                    }
+                    return None;
+                }
+                IrStmt::Assign { targets, expr, .. } => {
+                    let var = targets.first()?.var.clone();
+                    let val = self.sh_arg(expr)?;
+                    parts.push(format!("{var}={val}"));
+                }
+                _ => return None,
+            }
+        }
+        Some(parts.join("; "))
+    }
+    /// Render a {fd, mode, target} redirect object to shell text.
+    fn redirect_shell_text(&self, r: &IrExpr) -> Option<String> {
+        let IrExpr::Object(props) = r else {
+            return None;
+        };
+        let mut mode = "w".to_string();
+        let mut target = None;
+        for (k, v) in props {
+            match k.as_str() {
+                "mode" => {
+                    if let IrExpr::Str(s, _) = v {
+                        mode = s.clone();
+                    }
+                }
+                "target" => {
+                    if let IrExpr::Str(s, _) = v {
+                        target = Some(Self::sh_quote(s));
+                    } else if let IrExpr::Call { func, args } = v {
+                        if func == "getVar" {
+                            if let Some(IrExpr::Str(n, _)) = args.first() {
+                                target = Some(format!("\"${n}\"" ));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let t = target?;
+        Some(match mode.as_str() {
+            "w" => format!(">{t}"),
+            "a" => format!(">>{t}"),
+            "r" => format!("<{t}"),
+            "herestring" => format!("<<<{t}"),
+            _ => return None,
+        })
+    }
+    /// `$(cmd < file)` — bash -c capture fallback for a redirect body.
+    fn capture_redirect(&mut self, args: &[IrExpr]) -> Option<String> {
+        let (Some(IrExpr::Arrow(body)), Some(IrExpr::Array(redirs))) =
+            (args.first(), args.get(1))
+        else {
+            return None;
+        };
+        let inner = self.body_shell_text(body)?;
+        let mut text = format!("( {inner} )");
+        for r in redirs {
+            text.push(' ');
+            text.push_str(&self.redirect_shell_text(r)?);
+        }
+        self.need_subprocess = true;
+        Some(format!(
+            "subprocess.check_output([\"bash\", \"-c\", {}]).decode()",
+            Self::py_str(&text)
+        ))
     }
 
     /// `exec printf FMT ARGS...` → native `sys.stdout.write`, mirroring
@@ -1138,21 +1751,77 @@ impl Render {
     /// s/d/i/u, `%%` literal, text backslash-unescape, args cycle across
     /// passes, spec-less formats repeat once per arg. Flags/width/prec or
     /// array args → stub (the core keeps the runtime dispatch there too).
+    /// bash -c fork/exec fallback for printf formats/args the native python
+    /// printf can't handle (flags/width/prec, array args, f-string fmt).
+    fn printf_fallback(&mut self, args: &[IrExpr]) -> String {
+        if let Some(IrExpr::Array(items)) = args.get(1) {
+            if items.is_empty() {
+                // Foreign shared-core churn can feed transient malformed
+                // shapes; an empty operand array panicked items[0]
+                // (backend/python 2f44a673). Guard → the stub path.
+                return "None".into();
+            }
+            let fmt = match &items[0] {
+                IrExpr::Str(s, _) => Some(s.clone()),
+                IrExpr::Interpolate(parts) => {
+                    let mut t = String::new();
+                    let mut ok = true;
+                    for p in parts {
+                        match p {
+                            crate::ir::InterpPart::Lit(s) => t.push_str(s),
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(fmt) = fmt {
+                let mut parts = vec![Self::sh_quote(&fmt)];
+                let mut ok = true;
+                for a in &items[1..] {
+                    match self.sh_arg(a) {
+                        Some(t) => parts.push(t),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    self.need_subprocess = true;
+                    return format!(
+                        "subprocess.call([\"bash\", \"-c\", {}])",
+                        Self::py_str(&format!("printf {}", parts.join(" ")))
+                    );
+                }
+            }
+        }
+        self.sh2_stub("printf", args, "printf")
+    }
+
     fn printf_call(&mut self, args: &[IrExpr]) -> String {
         let Some(IrExpr::Array(items)) = args.get(1) else {
-            return self.sh2_stub("exec", args, "exec");
+            return self.printf_fallback(args);
         };
         let Some(IrExpr::Str(fmt, _)) = items.first() else {
-            return self.sh2_stub("exec", args, "exec");
+            return self.printf_fallback(args);
         };
         let parsed = match Self::printf_parse(fmt) {
             Some(p) => p,
-            None => return self.sh2_stub("exec", args, "exec"),
+            None => return self.printf_fallback(args),
         };
         let (els, n_specs) = parsed;
         let fmt_args: Vec<&IrExpr> = items[1..].iter().collect();
         if fmt_args.iter().any(|a| matches!(a, IrExpr::Array(_))) {
-            return self.sh2_stub("exec", args, "exec");
+            return self.printf_fallback(args);
         }
         let arg_exprs: Vec<String> = fmt_args.iter().map(|a| self.expr(a)).collect();
         // a spec with flags/width/prec must keep the runtime builtin
@@ -1163,7 +1832,7 @@ impl Render {
             None => false,
         });
         if complex {
-            return self.sh2_stub("exec", args, "exec");
+            return self.printf_fallback(args);
         }
         let passes = if n_specs == 0 {
             arg_exprs.len().max(1)
@@ -1361,9 +2030,66 @@ impl Render {
             }
             [flag, v] if flag == "-n" => Some(format!("({})", self.test_value(v))),
             [flag, v] if flag == "-z" => Some(format!("(not {})", self.test_value(v))),
+            [flag, v] if matches!(flag.as_str(), "-f" | "-d" | "-e" | "-s") => {
+                let p = self.test_value(v);
+                match flag.as_str() {
+                    "-f" => Some(format!("os.path.isfile({p})")),
+                    "-d" => Some(format!("os.path.isdir({p})")),
+                    "-e" => Some(format!("os.path.exists({p})")),
+                    "-s" => Some(format!("os.path.getsize({p}) > 0")),
+                    _ => None,
+                }
+            }
             [v] => Some(format!("({})", self.test_value(v))),
             _ => None,
         }
+    }
+
+    /// Build the argv literals for an external `exec` command
+    /// (`["cmd", "arg", …]`).
+    fn build_argv(&mut self, args: &[IrExpr]) -> Vec<String> {
+        let mut argv = Vec::new();
+        if let Some(IrExpr::Str(cmd, _)) = args.first() {
+            argv.push(Self::py_str(cmd));
+        }
+        if let Some(IrExpr::Array(items)) = args.get(1) {
+            for it in items {
+                argv.push(self.expr(it));
+            }
+        }
+        argv
+    }
+
+    /// Render a `let "EXPR"` arithmetic condition (`i<3`) as a Python
+    /// numeric comparison.
+    fn render_let_cond(&mut self, text: &str) -> Option<String> {
+        for (op, py_op) in [("<=", "<="), (">=", ">="), ("==", "=="), ("!=", "!="), ("<", "<"), (">", ">")] {
+            if let Some(idx) = text.find(op) {
+                let l = text[..idx].trim();
+                let r = text[idx + op.len()..].trim();
+                let l = self.num_operand(l)?;
+                let r = self.num_operand(r)?;
+                return Some(format!("({l} {py_op} {r})"));
+            }
+        }
+        None
+    }
+
+    /// A numeric operand for a `let` condition.
+    fn num_operand(&mut self, t: &str) -> Option<String> {
+        let t = t.trim();
+        if let Ok(n) = t.parse::<i64>() {
+            return Some(n.to_string());
+        }
+        let name = t.strip_prefix('$').unwrap_or(t);
+        let name = name
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(name);
+        if self.var_types.contains_key(name) {
+            return Some(self.py_ident(name));
+        }
+        None
     }
 
     /// Tokenize a test string the way the estree tokenizeTest does for the
@@ -1516,8 +2242,11 @@ impl Render {
                 // numeric literal in the ShIR ("5" for x=5)
                 if let Ok(n) = s.trim().parse::<i64>() {
                     n.to_string()
+                } else if let Ok(f) = s.trim().parse::<f64>() {
+                    // a float literal coerced to int (bash truncates)
+                    (f as i64).to_string()
                 } else {
-                    self.mark_todo(&format!("string→int coercion of {s:?}"));
+                    // a non-numeric string coerced to int: bash -> 0
                     "0".into()
                 }
             }
@@ -1677,10 +2406,38 @@ impl Render {
                     self.mark_todo("array-index assign");
                     return;
                 }
+                // a BAKED array-element target (`a[0] = 4` — the C
+                // frontend's dynamic-array writes arrive as store keys
+                // "a[0]"): pad the python list to the index, then assign.
+                // The matching reads (`a[int(j)]`) are native list reads,
+                // so both sides share one home.
+                if let Some(close) = t.var.find('[') {
+                    if t.var.ends_with(']') {
+                        let base = &t.var[..close];
+                        let k = &t.var[close + 1..t.var.len() - 1];
+                        if let Ok(ki) = k.parse::<i64>() {
+                            let m = self.py_ident(base);
+                            self.written.insert(base.to_string());
+                            let rhs = self.expr(expr);
+                            self.emit(&format!(
+                                "while len({m}) <= {ki}: {m}.append('')"
+                            ));
+                            self.emit(&format!("{m}[{ki}] = {rhs}"));
+                            return;
+                        }
+                    }
+                }
                 let name = self.py_ident(&t.var);
                 // `s = s += n` (arith Assign on the same target) → `s += n`
                 // (python forbids assignment inside an expression)
                 if let IrExpr::Arith(a) = expr {
+                    if let ArithAst::IncDec { var, delta, .. } = &**a {
+                        let v = self.py_ident(var);
+                        let d = delta.unsigned_abs();
+                        let s = if *delta >= 0 { "+" } else { "-" };
+                        self.emit(&format!("{v} {s}= {d}"));
+                        return;
+                    }
                     if let ArithAst::Assign { var, op, rhs } = &**a {
                         if var == &t.var {
                             let r = self.arith(rhs);
@@ -1713,12 +2470,32 @@ impl Render {
                 } else {
                     self.expr(expr)
                 };
+                // a STORE-resident target: the native binding is not the
+                // var's home — the store read (sh2_getVar) must observe
+                // the write (the C frontend's outparam channel assigns
+                // out-targets from line() captures here)
+                if !self.is_num(&t.var) && self.store_written.contains(&t.var) {
+                    self.sh2_calls.insert("setVar".into());
+                    self.emit(&format!(
+                        "sh2_setVar({}, {rhs})",
+                        Self::py_str(&t.var)
+                    ));
+                    return;
+                }
                 self.emit(&format!("{name} = {rhs}"));
             }
             IrStmt::Declare { vars, init, .. } => {
+                // store-resident names (written via sh2_setVar elsewhere)
+                // have NO native home — a raw `p.y = ""` declaration is
+                // an unbound NameError; skip them
+                let vars: Vec<_> = vars
+                    .iter()
+                    .filter(|d| !self.store_written.contains(&d.name))
+                    .collect();
                 let init_expr = init.as_ref().map(|e| self.expr(e));
                 if vars.len() > 1 && init_expr.is_some() {
-                    let names: Vec<String> = vars.iter().map(|d| self.py_ident(&d.name)).collect();
+                    let names: Vec<String> =
+                        vars.iter().map(|d| self.py_ident(&d.name)).collect();
                     self.emit(&format!("{} = {}", names.join(" = "), init_expr.unwrap()));
                 } else {
                     for d in vars {
@@ -1785,6 +2562,35 @@ impl Render {
                 if !else_.is_empty() {
                     self.emit("else:");
                     self.block(else_);
+                }
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                // shell `case D in pat) …;; esac` — if/elif chain on string
+                // equality (bash case is anchored glob match; the common
+                // literal-pattern case is exact equality).
+                let d = self.expr(discriminant);
+                let mut emitted_any = false;
+                for cl in clauses {
+                    let conds: Vec<String> = cl
+                        .patterns
+                        .iter()
+                        .filter(|p| p.as_str() != "*")
+                        .map(|p| format!("{d} == {}", Self::py_str(p)))
+                        .collect();
+                    let is_default = cl.patterns.iter().any(|p| p.as_str() == "*");
+                    if conds.is_empty() && is_default {
+                        self.emit("else:");
+                        self.block(&cl.body);
+                        emitted_any = true;
+                        continue;
+                    }
+                    let kw = if emitted_any { "elif" } else { "if" };
+                    self.emit(&format!("{kw} {}:", conds.join(" or ")));
+                    self.block(&cl.body);
+                    emitted_any = true;
                 }
             }
             IrStmt::For { var, iter, body } => {
@@ -2004,6 +2810,36 @@ impl Render {
                     self.block(finally_body);
                 }
             }
+            IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                for s in body {
+                    self.stmt(s);
+                }
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                for st in stages {
+                    for s in st {
+                        self.stmt(s);
+                    }
+                }
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                // render the inner commands; apply a simple fd-1 write
+                // redirect (`> file`) by writing to the file (capture-free
+                // approximation for the v1 subset).
+                for s in inner {
+                    self.stmt(s);
+                }
+                for r in redirects {
+                    if r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "a") {
+                        let p = self.expr(&r.target);
+                        let mode = if r.mode == "a" { "'a'" } else { "'w'" };
+                        self.emit(&format!("with open({p}, {mode}) as _f:"));
+                        self.depth += 1;
+                        self.emit("_f.write('')");
+                        self.depth -= 1;
+                    }
+                }
+            }
             other => self.mark_todo(&format!("stmt {:?}", other)),
         }
     }
@@ -2035,6 +2871,15 @@ impl Render {
         let mut body_out = Vec::new();
         std::mem::swap(&mut self.out, &mut body_out);
         for v in &vars {
+            // store-resident names (dotted struct fields written via
+            // sh2_setVar) have no native binding — hoisting `p.y = ""`
+            // would be an unbound NameError
+            if self.store_written.contains(v) || v.contains('[') {
+                // store-resident names and baked array-element keys
+                // ("a[0]" — the C frontend's array writes) have no
+                // native binding
+                continue;
+            }
             let name = self.py_ident(v);
             if self.is_num(v) {
                 self.emit(&format!("{name} = 0"));
@@ -2066,6 +2911,49 @@ impl Render {
         self.emit("import sys");
         if self.need_re {
             self.emit("import re");
+        }
+        if self.need_subprocess {
+            self.emit("");
+            self.emit("def __sh_exec(argv):");
+            self.emit("    import subprocess");
+            self.emit("    return subprocess.call(argv)");
+        }
+        if self.need_run_status {
+            // exec operand inside an &&/|| chain: bash truth (rc == 0),
+            // stdout captured then replayed in order (backend/python 3a5f5d5d)
+            self.emit("");
+            self.emit("def __sh_run_status(argv):");
+            self.emit("    import subprocess");
+            self.emit("    try:");
+            self.emit("        r = subprocess.run(argv, stdout=subprocess.PIPE)");
+            self.emit("        out = r.stdout.decode(errors='replace')");
+            self.emit("        if out:");
+            self.emit("            sys.stdout.write(out)");
+            self.emit("            sys.stdout.flush()");
+            self.emit("        return r.returncode == 0");
+            self.emit("    except OSError:");
+            self.emit("        return False");
+        }
+        if self.need_capture_out || self.sh2_calls.contains(&"line".to_string()) {
+            self.emit("def __sh_lines(v):");
+            self.emit("    return str(v).split('\\n')");
+            // the C frontend's outparam channel: the callee echoes its
+            // out-param values; the caller captures STDOUT into a buffer.
+            // Callee bodies read their POSITIONAL params via getVar("1")
+            // (the bash $1 convention → sys.argv), so the shim sets argv
+            // to the stringified call arguments for the duration.
+            self.emit("");
+            self.emit("def __sh_capture_out(__fn, *__args):");
+            self.emit("    import io");
+            self.emit("    import contextlib");
+            self.emit("    import sys as __sys");
+            self.emit("    __buf = io.StringIO()");
+            self.emit("    __old_argv = __sys.argv");
+            self.emit("    __sys.argv = [__fn.__name__] + [str(a) for a in __args]");
+            self.emit("    with contextlib.redirect_stdout(__buf):");
+            self.emit("        __fn()");
+            self.emit("    __sys.argv = __old_argv");
+            self.emit("    return __buf.getvalue()");
         }
         self.emit("");
         if !self.sh2_calls.is_empty() {
@@ -2375,4 +3263,98 @@ fn collect_vars_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
         ArithAst::Assign { rhs, .. } => collect_vars_arith(rhs, out),
         _ => {}
     }
+}
+
+/// `{x,y}{1..2}` / `a{1..3}b` — compute the space-joined brace-expansion
+/// words. Returns None for any non-literal part (the renderer refuses).
+fn py_brace_words(args: &[IrExpr]) -> Option<String> {
+    let pre = match args.first()? {
+        IrExpr::Str(s, _) => s.clone(),
+        _ => return None,
+    };
+    let groups: Vec<Vec<String>> = match args.get(1)? {
+        IrExpr::Json(serde_json::Value::Array(items)) => {
+            let mut g = Vec::new();
+            for item in items {
+                let arr = item.as_array()?;
+                let comma = arr.len() > 1;
+                let mut one = Vec::new();
+                for e in arr {
+                    if let Some(s) = e.as_str() {
+                        one.push(s.to_string());
+                    } else if let Some(range) = e.get("range").and_then(|r| r.as_array()) {
+                        let start = range.first()?.as_str().unwrap_or("");
+                        let end = range.get(1)?.as_str().unwrap_or("");
+                        if comma {
+                            // a comma list keeps range-looking items literal
+                            one.push(format!("{start}..{end}"));
+                        } else {
+                            let step: i64 = range
+                                .get(2)?
+                                .as_str()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(1);
+                            let (Ok(a), Ok(b)) =
+                                (start.parse::<i64>(), end.parse::<i64>())
+                            else {
+                                return None;
+                            };
+                            let pad = if start.len() > 1 && start.starts_with('0') {
+                                Some(start.len())
+                            } else {
+                                None
+                            };
+                            let fmt = |n: i64| {
+                                let s = n.to_string();
+                                match pad {
+                                    Some(w) if s.len() < w => {
+                                        format!("{}{}", "0".repeat(w - s.len()), s)
+                                    }
+                                    _ => s,
+                                }
+                            };
+                            if step >= 0 {
+                                let mut n = a;
+                                while n <= b {
+                                    one.push(fmt(n));
+                                    n += step;
+                                    if step == 0 {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                let mut n = a;
+                                while n >= b {
+                                    one.push(fmt(n));
+                                    n += step;
+                                }
+                            }
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+                g.push(one);
+            }
+            g
+        }
+        _ => return None,
+    };
+    let suf = match args.get(3)? {
+        IrExpr::Str(s, _) => s.clone(),
+        _ => return None,
+    };
+    // cartesian product of the groups; prefix + concat + suffix per combo
+    let mut combos: Vec<String> = vec![String::new()];
+    for group in &groups {
+        let mut next = Vec::new();
+        for combo in &combos {
+            for item in group {
+                next.push(format!("{combo}{item}"));
+            }
+        }
+        combos = next;
+    }
+    let words: Vec<String> = combos.iter().map(|c| format!("{pre}{c}{suf}")).collect();
+    Some(words.join(" "))
 }

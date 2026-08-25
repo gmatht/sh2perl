@@ -28,7 +28,7 @@
 //! inference" gap PLAN.md v2 flagged (the numeric width side is now
 //! covered by the range analysis; the string side stays open).
 
-use crate::ir::{ArithAst, InterpPart, IrExpr, IrProgram, IrStmt, IrType, VarKind};
+use crate::ir::{ArithAst, IrExpr, IrProgram, IrStmt, IrType, InterpPart, VarKind};
 use std::collections::{BTreeSet, HashMap};
 
 enum Part {
@@ -133,12 +133,13 @@ pub struct Render {
     /// `const` declarations initialized from that literal, and the
     /// assignment statement is dropped.
     const_vars: HashMap<String, VarKind>,
+    /// vars whose top-level Assign RHS is a command capture — the
+    /// length analysis under-bounds command output, so they must not
+    /// get a fixed buffer (stay `char*`).
+    capture_vars: BTreeSet<String>,
     /// name -> the single top-level `Assign` RHS of a `Const` var (the
     /// hoisted `const` declaration's initializer).
     const_rhs: HashMap<String, IrExpr>,
-    /// var name → the source line of its Assign (for the const-lift
-    /// `/* line N */` comment).
-    var_line: HashMap<String, usize>,
     /// names already emitted as `const` (the matching Assign stmt is
     /// skipped at emission time).
     const_lifted: BTreeSet<String>,
@@ -154,9 +155,15 @@ pub struct Render {
     /// scope instead of the fn's local block (shadowing would stale the
     /// helper's read).
     site_file_vars: BTreeSet<String>,
+    /// body-buffer line index of each Declare definition (for the
+    /// site-file promotion rewrite)
+    decl_line_idx: std::collections::BTreeMap<String, usize>,
     /// the definitions themselves (name, body) — emitted in the
     /// preamble (BEFORE main: C has no nested function definitions).
     fn_defs: Vec<(String, Vec<IrStmt>)>,
+    /// forward declarations for the hoisted functions (emitted before
+    /// their definitions so call order never matters)
+    fn_fwd_decls: Vec<String>,
     /// distinct sh2.* callee names that need stubs
     sh2_calls: BTreeSet<String>,
     need_upper: bool,
@@ -166,6 +173,16 @@ pub struct Render {
     /// (`char _sN[cap]; snprintf(_sN, ...)` before the enclosing stmt)
     temp_seq: usize,
     todo: usize,
+    /// a heredoc terminator was just emitted — the next raw token must
+    /// start on a fresh line (the terminator must be alone on its line)
+    heredoc_nl: bool,
+    /// emit the _sh_import_env runtime helper (source/eval state pull)
+    need_state_import: bool,
+    /// vars assigned as SHELL TEXT in the current command buffer — the
+    /// child bash owns their value for this site; re-exporting the stale
+    /// C var inside the same buffer would clobber it (091_while_pipe_var:
+    /// count=$((count+1)) then echo "$count" exported 0 every iteration)
+    shell_assigned: BTreeSet<String>,
     /// untyped var names (A2 verdict missing) — the native `char*` store.
     /// getVar/param reads of these render `(name ? name : "")`; Assign
     /// targets render `name = value;` (pointer semantics).
@@ -182,14 +199,40 @@ pub struct Render {
     need_stat: bool,
     /// fnmatch.h (test glob `==`/`!=` with * or ?)
     need_fnmatch: bool,
+    /// string-var ++/-- helpers (sequence-point-safe inc/dec)
+    need_incdec: bool,
     /// regex.h (test `=~`)
     need_regex: bool,
+    /// grepMatches (`grep -o` lift) native match-all helper
+    need_grep: bool,
     /// time.h nanosleep (the sleep builtin)
     need_time: bool,
     /// integer pow helper (cc has no -lm on the gate)
     need_pow: bool,
     /// counter for _sh_site_N() / _cap_N() helper ids
     site_seq: usize,
+    /// vars ASSIGNED anywhere in the shell-text stage currently being
+    /// rendered (Assign targets, read targets) — the child bash owns
+    /// these during the stage, so getVar refs must NOT re-export the C
+    /// value (that would clobber the child's own mutation: a
+    /// `count=$((count+1))` loop would echo a stale count)
+    stage_assigned: BTreeSet<String>,
+    /// vars already exported in the CURRENT site — the first textual
+    /// reference exports the entry value (all export C-code runs before
+    /// the single system() call), later references must leave the
+    /// child-owned variable alone
+    site_exported: BTreeSet<String>,
+    /// set before a sh_word call that must GLUE to text already in the
+    /// buffer (`NAME=` + value = one word) — consumed by the next
+    /// word-append
+    glue_next_word: bool,
+    /// the script READS \\$PIPESTATUS — pipeline sites must export the
+    /// stage statuses (env-import) so the reads see them
+    need_pipestatus: bool,
+    /// NATIVE statements deferred to AFTER the enclosing site's
+    /// system() call — a native mapfile reading a FIFO must run once the
+    /// child (which spawns the FIFO writer) has started, not before it
+    pending_native_stmts: Vec<IrStmt>,
     /// emitted shell-out site helper bodies (`static int _sh_site_N(void) {...}`)
     site_bodies: Vec<String>,
     /// emitted capture helper bodies (`static char *_cap_N(void) {...}`)
@@ -219,6 +262,10 @@ enum CmdBuf {
 
 /// Bounded Str vars get a fixed buffer of bound+1 bytes; unbounded or
 /// over-cap vars stay `char*`. Aligned with the analysis' own CAP.
+/// Maximum bytes for a stack-allocated string buffer. Vars whose
+/// proven length bound exceeds this go on the heap even when all other
+/// stack-eligibility criteria pass (local, non-capturing callees).
+/// Tune down for embedded targets, up for scripts with long paths.
 const FIXED_BUF_CAP: u64 = 1024;
 
 /// Per-capture-site result buffer size (command substitution output).
@@ -230,9 +277,10 @@ const ARR_CAP: usize = 1024;
 /// Render an `IrProgram` to C source (main() body).
 pub fn shir_to_c(prog: &IrProgram) -> String {
     let mut prog = prog.clone();
-    // builtin-op fallback arm (shir-builtin-op-20260816): the c backend
-    // has NOT accepted the `builtin` op — render as exec.
-    crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
+    if std::env::var("SH2_DBG_VARS").is_ok() {
+        eprintln!("DBG shir_to_c entry stmts={} t0={}", prog.stmts.len(),
+            match prog.stmts.first() { Some(IrStmt::Assign{..}) => "Assign", Some(IrStmt::Expr(_)) => "Expr", _ => "?" });
+    }
     // A2 + var_lengths: the analyses run at serialization time in the
     // JSON path; the library path must run the same ones.
     prog.var_types = crate::shir::analyze_var_types(&prog);
@@ -252,17 +300,9 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
     r.var_lengths = prog.var_lengths.iter().cloned().collect();
     r.const_vars = prog.var_const.iter().cloned().collect();
     r.const_rhs = const_assign_rhs(&prog.stmts, &r.const_vars);
-    // var → source line (the const lift hoists the Assign into the decl
-    // block, so the `/* line N */` comment must ride the decl)
-    for (i, st) in prog.stmts.iter().enumerate() {
-        if let IrStmt::Assign { targets, .. } = st {
-            if let Some((_, l)) = prog.stmt_lines.iter().find(|(si, _)| *si == i) {
-                for t in targets {
-                    r.var_line.insert(t.var.clone(), *l);
-                }
-            }
-        }
-    }
+    let mut capture_vars = BTreeSet::new();
+    collect_capture_vars(&prog.stmts, &mut capture_vars);
+    r.capture_vars = capture_vars;
     r.var_ranges = ranges;
     r.var_widths = widths;
     r.program(&prog);
@@ -293,6 +333,11 @@ pub fn shir_to_c(prog: &IrProgram) -> String {
 
 impl Render {
     fn emit(&mut self, s: &str) {
+        if s == "_sh_reset();" {
+            // a new command buffer starts — shell-text assignments from
+            // the previous one no longer own their vars
+            self.shell_assigned.clear();
+        }
         if s.is_empty() {
             self.out.push(String::new());
         } else {
@@ -309,104 +354,45 @@ impl Render {
     /// which only covers loop vars — renderers mangle the rest).
     fn c_ident(&self, name: &str) -> String {
         const C_KEYWORDS: &[&str] = &[
-            "auto",
-            "break",
-            "case",
-            "char",
-            "const",
-            "continue",
-            "default",
-            "do",
-            "double",
-            "else",
-            "enum",
-            "extern",
-            "float",
-            "for",
-            "goto",
-            "if",
-            "inline",
-            "int",
-            "long",
-            "register",
-            "restrict",
-            "return",
-            "short",
-            "signed",
-            "sizeof",
-            "static",
-            "struct",
-            "switch",
-            "typedef",
-            "union",
-            "unsigned",
-            "void",
-            "volatile",
-            "while",
-            "_Bool",
-            "_Complex",
-            "true",
-            "false",
+            "auto", "break", "case", "char", "const", "continue", "default", "do", "double",
+            "else", "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long",
+            "register", "restrict", "return", "short", "signed", "sizeof", "static", "struct",
+            "switch", "typedef", "union", "unsigned", "void", "volatile", "while", "_Bool",
+            "_Complex", "true", "false",
             // libc functions declared by the included headers — a shell
             // var with one of these names would clash at file scope
-            "index",
-            "system",
-            "stat",
-            "lstat",
-            "read",
-            "write",
-            "sleep",
-            "time",
-            "stdin",
-            "stdout",
-            "stderr",
-            "getenv",
-            "getpid",
-            "getgid",
-            "getuid",
-            "access",
-            "chdir",
-            "getcwd",
-            "isatty",
-            "tolower",
-            "toupper",
-            "pow",
-            "nanosleep",
-            "waitpid",
-            "fork",
-            "strlen",
-            "strcpy",
-            "strncpy",
-            "strcmp",
-            "strstr",
-            "strchr",
-            "strrchr",
-            "snprintf",
-            "printf",
-            "fprintf",
-            "fputs",
-            "puts",
-            "fopen",
-            "fclose",
-            "malloc",
-            "realloc",
-            "free",
-            "atoi",
-            "atol",
-            "atoll",
-            "atof",
-            "abort",
-            "exit",
-            "assert",
-            "regexec",
-            "regcomp",
-            "fnmatch",
-            "getline",
-            "signal",
+            "index", "system", "stat", "lstat", "read", "write", "sleep", "time",
+            "stdin", "stdout", "stderr",
+            "getenv", "getpid", "getgid", "getuid", "access", "chdir", "getcwd",
+            "isatty", "tolower", "toupper", "pow", "nanosleep", "waitpid", "fork",
+            "strlen", "strcpy", "strncpy", "strcmp", "strstr", "strchr", "strrchr",
+            "snprintf", "printf", "fprintf", "fputs", "puts", "fopen", "fclose",
+            "malloc", "realloc", "free", "atoi", "atol", "atoll", "atof", "abort",
+            "exit", "assert", "regexec", "regcomp", "fnmatch", "getline", "signal",
+            // _GNU_SOURCE additionally exposes these from string.h/libgen.h
+            "basename", "dirname", "strcasecmp", "strncasecmp", "strdup", "strndup",
+            "strtok", "strtok_r", "strsep", "memmove", "memcmp", "memset", "strchr",
+            "strrchr", "strstr", "strcat", "strncat", "strtod", "strtol", "strtoll",
+            "strtoul", "strtoull", "qsort", "bsearch", "abs", "labs", "llabs", "getline",
+            "rewind", "fflush", "feof", "ferror", "clearerr", "remove", "rename",
+            "tmpfile", "tmpnam", "setvbuf", "perror", "sprintf", "vsnprintf",
+            "vprintf", "vfprintf", "fdopen", "fileno", "popen", "pclose", "system",
+            "chmod", "chown", "link", "unlink", "symlink", "readlink", "realpath",
+            "mkstemp", "mkdtemp", "umask", "dup", "dup2", "pipe", "close", "open",
+            "creat", "lseek", "pread", "pwrite", "gethostname", "uname", "getcwd",
+            "putenv", "clearenv", "setenv", "unsetenv", "getopt", "optarg", "optind",
+            "isalpha", "isdigit", "isalnum", "isspace", "isupper", "islower", "isprint",
+            "iscntrl", "ispunct", "isxdigit", "isgraph", "getchar", "putchar", "gets",
+            "fgets", "fread", "fwrite", "fscanf", "sscanf", "strftime", "localtime",
+            "gmtime", "ctime", "asctime", "difftime", "mktime", "clock", "time",
+            "nanosleep", "usleep", "alarm", "pause", "kill", "raise", "sigaction",
         ];
         if C_KEYWORDS.contains(&name) {
             format!("{name}_")
-        } else if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        } else if name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             name.to_string()
         } else {
             // not a C identifier at all (`-n` from `typeset -n`, ...):
@@ -422,12 +408,7 @@ impl Render {
                     }
                 })
                 .collect();
-            if s.is_empty()
-                || s.chars()
-                    .next()
-                    .map(|c| c.is_ascii_digit())
-                    .unwrap_or(false)
-            {
+            if s.is_empty() || s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
                 s.insert(0, 'v');
             }
             s
@@ -461,7 +442,10 @@ impl Render {
     /// analysis also bounds numeric RHS (`i=$((i+1))` -> 20), and
     /// `strlen`/`strncpy` on a `long long` is itself UB.
     fn buf_bound(&self, name: &str) -> Option<u64> {
-        if self.is_num(name) {
+        if self.is_num(name) || self.capture_vars.contains(name) {
+            // a capture-receiving var: the length analysis under-bounds
+            // command output (`sha256sum` emits hash + filename) — a
+            // fixed buffer would truncate real data; stay char*
             return None;
         }
         self.var_lengths
@@ -485,7 +469,15 @@ impl Render {
             || rhs.starts_with("_cap_")
             || is_ident(rhs);
         if stringy {
-            self.emit(&format!("assert(strlen({rhs_c}) <= {b});"));
+            // The DEBUG assert is a tripwire for bounded SOURCES (string
+            // literals, other fixed buffers). A capture site's output is
+            // NOT reliably bounded by the length analysis (sha256sum
+            // emits hash + filename — the analysis only counted the
+            // hash), so the assert would false-positive; the strncpy
+            // below still truncates safely.
+            if !rhs.starts_with("_cap_") && !rhs.starts_with("sh2_") {
+                self.emit(&format!("assert(strlen({rhs_c}) <= {b});"));
+            }
             self.emit(&format!("strncpy({name}, {rhs_c}, {b} + 1);"));
             self.emit(&format!("{name}[{b}] = '\\0';"));
         } else {
@@ -515,20 +507,35 @@ impl Render {
 
     /// Emit the runtime preamble pieces the renderer has flagged.
     fn emit_runtime(&mut self) {
+        if self.need_fnmatch || self.need_regex {
+            // FNM_EXTMATCH (extglobs) and REG_ICASE live behind
+            // _GNU_SOURCE — must precede EVERY system include
+            self.emit("#define _GNU_SOURCE");
+        }
         self.emit("#include <stdio.h>");
         self.emit("#include <stdlib.h>");
         self.emit("#include <string.h>");
-        // sys/wait.h is only needed by the shell-out wait macros
-        // (WIFEXITED/WEXITSTATUS in _sh_system_rc/_sh_capture) and is
-        // NOT in tcc's bundled header set — gate it so pure printf/loop
-        // output (no shell-out) compiles in the browser's tcc.
-        if self.need_sh {
-            self.emit("#include <sys/wait.h>");
-        }
-        self.emit("#include <unistd.h>"); // chdir/access/getcwd
+        self.emit("#include <sys/wait.h>");
+        self.emit("#include <unistd.h>"); // chdir/access/getcwd/gethostname
         self.emit("#include <ctype.h>"); // tolower/... in text transforms
         if self.need_stat {
             self.emit("#include <sys/stat.h>");
+        }
+        if self.need_state_import {
+            // source/eval state pull: import the child's KEY=VALUE dump
+            // into the environment (env-fallback reads pick it up)
+            self.emit("static void _sh_import_env(void) {");
+            self.emit("  FILE *_pf = fopen(\"/tmp/.shellstate_pull\", \"r\");");
+            self.emit("  if (!_pf) return;");
+            self.emit("  static char _pl[65536];");
+            self.emit("  while (fgets(_pl, sizeof _pl, _pf)) {");
+            self.emit("    size_t _pn = strlen(_pl); while (_pn && (_pl[_pn-1]=='\\n'||_pl[_pn-1]=='\\r')) _pl[--_pn] = 0;");
+            self.emit("    char *_eq = strchr(_pl, '=');");
+            self.emit("    if (!_eq || _eq == _pl) continue;");
+            self.emit("    *_eq = 0; setenv(_pl, _eq + 1, 1);");
+            self.emit("  }");
+            self.emit("  fclose(_pf); remove(\"/tmp/.shellstate_pull\");");
+            self.emit("}"); 
         }
         if self.need_fnmatch || self.need_sh {
             // the shell-out runtime's ${s#pat} strip helpers use fnmatch
@@ -559,6 +566,18 @@ impl Render {
             self.emit("/* shell-out runtime: build a command line, run it via bash -c */");
             self.emit("static int _sh_rc = 0;");
             self.emit("static int _sh_argc = 0; static char **_sh_argv = 0;");
+            self.emit("static char _sh_opts[] = \"hB\"; /* $- — option flags */");
+            self.emit("/* background jobs (fork-based) reaped by bare wait */");
+            self.emit("static pid_t _sh_bg_pids[512]; static size_t _sh_bg_n = 0;");
+            // ── managed string: the C equivalent of sh2.vars.x ──
+            self.emit("typedef struct { char *p; } sh2_str;");
+            self.emit("static void sh2_str_set(sh2_str *v, const char *val) {");
+            self.emit("  free(v->p);");
+            self.emit("  v->p = val ? strdup(val) : NULL;");
+            self.emit("}");
+            self.emit("static const char *sh2_str_get(const sh2_str *v) {");
+            self.emit("  return (v->p) ? v->p : \"\"");
+            self.emit("}");
             self.emit("static char *_sh_cmd = 0; static size_t _sh_cap = 0;");
             self.emit("static char *_sh_wb = 0; static size_t _sh_wcap = 0;");
             self.emit("static char *_sh_wrap = 0; static size_t _sh_wrapcap = 0;");
@@ -576,9 +595,7 @@ impl Render {
             self.emit("  _sh_grow(&_sh_cmd, &_sh_cap, l + 2);");
             self.emit("  _sh_cmd[l] = c; _sh_cmd[l + 1] = 0;");
             self.emit("}");
-            self.emit(
-                "static void _sh_reset(void) { _sh_grow(&_sh_cmd, &_sh_cap, 1); _sh_cmd[0] = 0; }",
-            );
+            self.emit("static void _sh_reset(void) { _sh_grow(&_sh_cmd, &_sh_cap, 1); _sh_cmd[0] = 0; }");
             self.emit("static void _sh_wb_add(const char *s) {");
             self.emit("  size_t l = _sh_wb ? strlen(_sh_wb) : 0, n = strlen(s);");
             self.emit("  _sh_grow(&_sh_wb, &_sh_wcap, l + n + 1);");
@@ -606,9 +623,7 @@ impl Render {
             self.emit("  _sh_grow(b, cap, l + 2);");
             self.emit("  (*b)[l] = c; (*b)[l + 1] = 0;");
             self.emit("}");
-            self.emit(
-                "static void _sh_bres(char **b, size_t *cap) { _sh_grow(b, cap, 1); (*b)[0] = 0; }",
-            );
+            self.emit("static void _sh_bres(char **b, size_t *cap) { _sh_grow(b, cap, 1); (*b)[0] = 0; }");
             self.emit("static void _sh_bword(char **b, size_t *cap, const char *s) {");
             self.emit("  _sh_badd(b, cap, \" '\");");
             self.emit("  for (const char *p = s; *p; p++) {");
@@ -617,9 +632,7 @@ impl Render {
             self.emit("  _sh_baddc(b, cap, '\\'');");
             self.emit("}");
             self.emit("static void _sh_idx_init(char **b, size_t *cap, const char *name, char **a, size_t n) {");
-            self.emit(
-                "  _sh_badd(b, cap, \" \"); _sh_badd(b, cap, name); _sh_badd(b, cap, \"=(\");",
-            );
+            self.emit("  _sh_badd(b, cap, \" \"); _sh_badd(b, cap, name); _sh_badd(b, cap, \"=(\");");
             self.emit("  for (size_t i = 0; i < n; i++) if (a[i]) _sh_bword(b, cap, a[i]);");
             self.emit("  _sh_badd(b, cap, \")\");");
             self.emit("}");
@@ -632,22 +645,20 @@ impl Render {
             self.emit("  _sh_baddc(b, cap, '\\'');");
             self.emit("}");
             self.emit("static void _sh_assoc_init(char **b, size_t *cap, const char *name, char **k, char **v, size_t n) {");
-            self.emit(
-                "  _sh_badd(b, cap, \" \"); _sh_badd(b, cap, name); _sh_badd(b, cap, \"=(\");",
-            );
+            self.emit("  _sh_badd(b, cap, \" \"); _sh_badd(b, cap, name); _sh_badd(b, cap, \"=(\");");
             self.emit("  for (size_t i = 0; i < n; i++) {");
             self.emit("    if (!k[i]) continue;");
             self.emit("    if (i > 0) _sh_badd(b, cap, \" \");");
-            self.emit(
-                "    _sh_badd(b, cap, \"[\"); _sh_baddq(b, cap, k[i]); _sh_badd(b, cap, \"]=\");",
-            );
+            self.emit("    _sh_badd(b, cap, \"[\"); _sh_baddq(b, cap, k[i]); _sh_badd(b, cap, \"]=\");");
             self.emit("    _sh_baddq(b, cap, v[i] ? v[i] : \"\");");
             self.emit("  }");
             self.emit("  _sh_badd(b, cap, \")\");");
             self.emit("}");
             self.emit("static void _sh_arr_set(char **a, size_t *len, size_t cap, long long i, const char *v) {");
             self.emit("  if (i < 0 || i >= (long long)cap || !v) return;");
-            self.emit("  a[i] = (char*)v;");
+            // strdup: the source may be a stack temp that dies when its
+            // block closes (a capture/arith string in a loop body)
+            self.emit("  a[i] = (char*)strdup(v);");
             self.emit("  if ((size_t)(i + 1) > *len) *len = (size_t)(i + 1);");
             self.emit("}");
             self.emit("static const char *_sh_arr_get(char **a, size_t len, long long i) {");
@@ -657,12 +668,10 @@ impl Render {
             self.emit("static void _sh_assoc_set(char **k, char **v, size_t *n, size_t cap, const char *key, const char *val) {");
             self.emit("  if (!key) return;");
             self.emit("  for (size_t i = 0; i < *n; i++)");
-            self.emit("    if (k[i] && strcmp(k[i], key) == 0) { v[i] = (char*)val; return; }");
-            self.emit("  if (*n < cap) { k[*n] = (char*)key; v[*n] = (char*)val; (*n)++; }");
+            self.emit("    if (k[i] && strcmp(k[i], key) == 0) { v[i] = (char*)strdup(val ? val : \"\"); return; }");
+            self.emit("  if (*n < cap) { k[*n] = (char*)strdup(key); v[*n] = (char*)strdup(val ? val : \"\"); (*n)++; }");
             self.emit("}");
-            self.emit(
-                "static const char *_sh_assoc_get(char **k, char **v, size_t n, const char *key) {",
-            );
+            self.emit("static const char *_sh_assoc_get(char **k, char **v, size_t n, const char *key) {");
             self.emit("  if (!key) return \"\";");
             self.emit("  for (size_t i = 0; i < n; i++)");
             self.emit("    if (k[i] && strcmp(k[i], key) == 0) return v[i] ? v[i] : \"\";");
@@ -695,6 +704,22 @@ impl Render {
             self.emit("  }");
             self.emit("  d[n] = 0; return d;");
             self.emit("}");
+            self.emit("/* ${@:off:len} — positional-param slice (off is 1-based; off 0 includes $0) */");
+            self.emit("static char *_sh_argv_slice(char *d, size_t cap, long long off, long long len) {");
+            self.emit("  long long total = (long long)_sh_argc;");
+            self.emit("  long long b = (off <= 0) ? 0 : off;");
+            self.emit("  if (b > total) b = total;");
+            self.emit("  long long nav = total - b;");
+            self.emit("  long long e = b + ((len < 0) ? nav + len : len);");
+            self.emit("  if (e > total) e = total; if (e < b) e = b;");
+            self.emit("  size_t dn = 0; long long i;");
+            self.emit("  for (i = b; i < e; i++) {");
+            self.emit("    if (i > b && dn + 1 < cap) d[dn++] = ' ';");
+            self.emit("    const char *s = _sh_argv[i] ? _sh_argv[i] : \"\";");
+            self.emit("    while (*s && dn + 1 < cap) d[dn++] = *s++;");
+            self.emit("  }");
+            self.emit("  d[dn] = 0; return d;");
+            self.emit("}");
             self.emit("/* wrap the built command as `bash -c '<cmd>'` (single-quote escaped) */");
             self.emit("static void _sh_wrap_cmd(const char *cmd) {");
             self.emit("  size_t n = strlen(cmd), need = n * 2 + 16;");
@@ -722,9 +747,68 @@ impl Render {
             self.emit("  size_t n = fread(buf, 1, cap - 1, p); buf[n] = 0;");
             self.emit("  int rc = pclose(p);");
             self.emit("  _sh_rc = (rc == -1) ? 127 : (WIFEXITED(rc) ? WEXITSTATUS(rc) : 1);");
-            self.emit(
-                "  while (n > 0 && (buf[n - 1] == '\\n' || buf[n - 1] == '\\r')) buf[--n] = 0;",
-            );
+            self.emit("  while (n > 0 && (buf[n - 1] == '\\n' || buf[n - 1] == '\\r')) buf[--n] = 0;");
+            self.emit("}");
+            self.emit("/* string-var ++/-- — function-call boundaries are sequence");
+            self.emit("   points, so two mutations in one expression stay ordered */");
+            self.emit("static long long _sh_postinc(char **v, int d) {");
+            self.emit("  long long r = atoll(*v ? *v : \"\");");
+            self.emit("  char b[32]; snprintf(b, sizeof b, \"%lld\", (long long)(r + d));");
+            self.emit("  free(*v); *v = strdup(b); return r;");
+            self.emit("}");
+            self.emit("static long long _sh_preinc(char **v, int d) {");
+            self.emit("  long long r = atoll(*v ? *v : \"\") + d;");
+            self.emit("  char b[32]; snprintf(b, sizeof b, \"%lld\", r);");
+            self.emit("  free(*v); *v = strdup(b); return r;");
+            self.emit("}");
+            self.emit("/* fixed-buffer forms: write in place (bound asserted elsewhere) */");
+            self.emit("static long long _sh_postinc_buf(char *v, int d) {");
+            self.emit("  long long r = atoll(v);");
+            self.emit("  snprintf(v, 32, \"%lld\", (long long)(r + d)); return r;");
+            self.emit("}");
+            self.emit("static long long _sh_preinc_buf(char *v, int d) {");
+            self.emit("  long long r = atoll(v) + d;");
+            self.emit("  snprintf(v, 32, \"%lld\", r); return r;");
+            self.emit("}");
+            self.emit("/* eval / . : import a NUL-separated env dump back into this process */");
+            self.emit("static void _sh_import_env(const char *path) {");
+            self.emit("  FILE *p = fopen(path, \"rb\");");
+            self.emit("  if (!p) return;");
+            self.emit("  fseek(p, 0, SEEK_END); long sz = ftell(p); fseek(p, 0, SEEK_SET);");
+            self.emit("  if (sz <= 0) { fclose(p); return; }");
+            self.emit("  char *data = (char*)malloc((size_t)sz + 1);");
+            self.emit("  size_t rd = fread(data, 1, (size_t)sz, p); data[rd] = 0; fclose(p);");
+            self.emit("  char *q = data; char *end = data + rd;");
+            self.emit("  while (q < end) {");
+            self.emit("    size_t len = strnlen(q, (size_t)(end - q));");
+            self.emit("    char *eq = (char*)memchr(q, '=', len);");
+            self.emit("    if (eq && eq > q) {");
+            self.emit("      size_t nl = (size_t)(eq - q);");
+            self.emit("      int ok = isalpha((unsigned char)q[0]) || q[0] == '_';");
+            self.emit("      for (size_t k = 1; ok && k < nl; k++) ok = isalnum((unsigned char)q[k]) || q[k] == '_';");
+            self.emit("      if (ok) { char c = *eq; *eq = 0; setenv(q, eq + 1, 1); *eq = c; }");
+            self.emit("    }");
+            self.emit("    q += len + 1;");
+            self.emit("  }");
+            self.emit("  free(data);");
+            self.emit("}");
+            self.emit("/* eval / . : run the built command, then snapshot the child's");
+            self.emit("   post-command environment and import it so assignments persist */");
+            self.emit("static int _sh_state_run(void) {");
+            self.emit("  const char *suffix = \" ; __shst_rc=$? ; env -0 > \\\"${_SH2ENVF}\\\" ; exit $__shst_rc\";");
+            self.emit("  const char *pre = \"set -a ; \";");
+            self.emit("  size_t l = _sh_cmd ? strlen(_sh_cmd) : 0, n = strlen(suffix), p0 = strlen(pre);");
+            self.emit("  _sh_grow(&_sh_cmd, &_sh_cap, l + n + p0 + 1);");
+            self.emit("  if (!_sh_cmd) return 127;");
+            self.emit("  memmove(_sh_cmd + p0, _sh_cmd, l + 1);");
+            self.emit("  memcpy(_sh_cmd, pre, p0);");
+            self.emit("  strcat(_sh_cmd, suffix);");
+            self.emit("  _sh_wrap_cmd(_sh_cmd);");
+            self.emit("  int rc = system(_sh_wrap);");
+            self.emit("  rc = (rc == -1) ? 127 : (WIFEXITED(rc) ? WEXITSTATUS(rc) : 1);");
+            self.emit("  const char *f = getenv(\"_SH2ENVF\");");
+            self.emit("  if (f && *f) _sh_import_env(f);");
+            self.emit("  return rc;");
             self.emit("}");
             self.emit("/* split a captured string on IFS whitespace into words */");
             self.emit("static size_t _sh_split(char *buf, char **words, size_t max) {");
@@ -753,11 +837,35 @@ impl Render {
             self.emit("  return _sh_rd;");
             self.emit("}");
             self.emit("/* ${x:off:len} substring (bash: off<0 counts from the end) */");
+            self.emit("/* ${arr[@]:off:len} — an ELEMENT slice of the space-joined string */");
+            self.emit("static void _sh_arr_slice(char *d, size_t cap, const char *s, long long off, long long len) {");
+            self.emit("  const char *p = s; size_t n = 0;");
+            self.emit("  while (*p) { while (*p == ' ') p++; if (!*p) break; n++; while (*p && *p != ' ') p++; }");
+            self.emit("  long long b = off < 0 ? (long long)n + off : off;");
+            self.emit("  if (b < 0) b = 0; if (b > (long long)n) b = (long long)n;");
+            self.emit("  long long e = b + ((len < 0) ? (long long)n + len : len);");
+            self.emit("  if (e > (long long)n) e = (long long)n; if (e < b) e = b;");
+            self.emit("  size_t dn = 0, i = 0; p = s;");
+            self.emit("  while (*p && i < (size_t)e) {");
+            self.emit("    while (*p == ' ') p++;");
+            self.emit("    if (!*p) break;");
+            self.emit("    const char *w = p;");
+            self.emit("    while (*p && *p != ' ') p++;");
+            self.emit("    if (i >= (size_t)b) {");
+            self.emit("      if (dn && dn + 1 < cap) d[dn++] = ' ';");
+            self.emit("      size_t wl = (size_t)(p - w);");
+            self.emit("      if (dn + wl >= cap) wl = cap - dn - 1;");
+            self.emit("      memcpy(d + dn, w, wl); dn += wl;");
+            self.emit("    }");
+            self.emit("    i++;");
+            self.emit("  }");
+            self.emit("  d[dn] = 0;");
+            self.emit("}");
             self.emit("static char *_sh_substr(char *d, size_t cap, const char *s, long long off, long long len) {");
             self.emit("  size_t n = strlen(s);");
             self.emit("  long long b = off < 0 ? (long long)n + off : off;");
             self.emit("  if (b < 0) b = 0; if (b > (long long)n) b = (long long)n;");
-            self.emit("  long long e = (len < 0) ? (long long)n : b + len;");
+            self.emit("  long long e = b + ((len < 0) ? (long long)n + len : len);");
             self.emit("  if (e > (long long)n) e = (long long)n; if (e < b) e = b;");
             self.emit("  size_t out = (size_t)(e - b);");
             self.emit("  if (out >= cap) out = cap - 1;");
@@ -780,6 +888,34 @@ impl Render {
             self.emit("  while (*p && dn + 1 < cap) d[dn++] = *p++;");
             self.emit("  d[dn] = 0;");
             self.emit("  return d;");
+            self.emit("}");
+            self.emit("/* FIRST match only — bash ${var/pat/repl} */");
+            self.emit("static char *_sh_replace_first(char *d, size_t cap, const char *s, const char *pat, const char *repl) {");
+            self.emit("  size_t pn = strlen(pat), rn = strlen(repl), dn = 0;");
+            self.emit("  const char *p = s;");
+            self.emit("  if (!pn) { strncpy(d, s, cap - 1); d[cap - 1] = 0; return d; }");
+            self.emit("  const char *hit = strstr(p, pat);");
+            self.emit("  if (!hit) { strncpy(d, s, cap - 1); d[cap - 1] = 0; return d; }");
+            self.emit("  size_t pre = (size_t)(hit - p);");
+            self.emit("  while (pre-- && dn + 1 < cap) d[dn++] = *p++;");
+            self.emit("  for (size_t i = 0; i < rn && dn + 1 < cap; i++) d[dn++] = repl[i];");
+            self.emit("  p = hit + pn;");
+            self.emit("  while (*p && dn + 1 < cap) d[dn++] = *p++;");
+            self.emit("  d[dn] = 0;");
+            self.emit("  return d;");
+            self.emit("}");
+            self.emit("/* $PIPESTATUS[i] — comma-joined stage statuses imported from the pipeline child */");
+            self.emit("static char *_sh_ps(size_t i) {");
+            self.emit("  /* ring of buffers: two reads in ONE printf must not alias */");
+            self.emit("  static char bufs[4][32]; static int rk = 0;");
+            self.emit("  char *buf = bufs[rk]; rk = (rk + 1) % 4;");
+            self.emit("  const char *j = getenv(\"__shps_j\");");
+            self.emit("  if (!j) { buf[0] = 0; return buf; }");
+            self.emit("  size_t k = 0;");
+            self.emit("  while (*j && k < i) { if (*j == ',') k++; j++; }");
+            self.emit("  size_t n = 0;");
+            self.emit("  while (j[n] && j[n] != ',' && n < 30) { buf[n] = j[n]; n++; }");
+            self.emit("  buf[n] = 0; return buf;");
             self.emit("}");
             self.emit("/* ${s#pat}/${s##pat} prefix strip (glob-aware, greedy = longest) */");
             self.emit("static char *_sh_strippre(char *d, size_t cap, const char *s, const char *pat, int greedy) {");
@@ -817,14 +953,64 @@ impl Render {
             self.runtime_end = self.out.len();
             self.runtime_known = true;
         }
+        if self.need_grep {
+            self.emit("/* grepMatches(text, pat, flags) — the `grep -o` lift: print");
+            self.emit("   each match on its own line (grep -o's output), set _sh_rc");
+            self.emit("   (0 iff any match), return the newline-joined matches */");
+            self.emit("static char *_sh_grep_matches(const char *text, const char *pat, const char *flags) {");
+            self.emit("  static char _sh_gm_buf[65536];");
+            self.emit("  static char _sh_gm_re[65536];");
+            self.emit("  char *d = _sh_gm_re; const char *p = pat;");
+            self.emit("  if (strchr(flags, 'F')) {");
+            self.emit("    for (; *p && d - _sh_gm_re < 65530; p++) {");
+            self.emit("      if (strchr(\"\\\\^$.|?*+()[]{}${}\", *p)) *d++ = '\\\\';");
+            self.emit("      *d++ = *p;");
+            self.emit("    }");
+            self.emit("    *d = 0;");
+            self.emit("  } else if (!strchr(flags, 'E')) {");
+            self.emit("    for (; *p && d - _sh_gm_re < 65530; p++) {");
+            self.emit("      if (*p == '\\\\' && p[1] && strchr(\"(){}?+|\", p[1])) { *d++ = p[1]; p++; }");
+            self.emit("      else *d++ = *p;");
+            self.emit("    }");
+            self.emit("    *d = 0;");
+            self.emit("  } else {");
+            self.emit("    strncpy(_sh_gm_re, pat, 65535); _sh_gm_re[65535] = 0;");
+            self.emit("  }");
+            self.emit("  regex_t rx;");
+            self.emit("  if (regcomp(&rx, _sh_gm_re, REG_EXTENDED | REG_NEWLINE | (strchr(flags, 'i') ? REG_ICASE : 0)) != 0) {");
+            self.emit("    _sh_rc = 2; return _sh_gm_buf; /* bad pattern: grep exits 2 */");
+            self.emit("  }");
+            self.emit("  _sh_gm_buf[0] = 0;");
+            self.emit("  size_t out = 0, n = strlen(text), pos = 0, any = 0;");
+            self.emit("  regmatch_t m;");
+            self.emit("  while (pos <= n && out < 65535) {");
+            self.emit("    int rc = regexec(&rx, text + pos, 1, &m, 0);");
+            self.emit("    if (rc != 0) break;");
+            self.emit("    size_t ms = (size_t)m.rm_so, me = (size_t)m.rm_eo;");
+            self.emit("    if (me == ms) { pos++; continue; } /* grep -o skips empty matches */");
+            self.emit("    any = 1;");
+            self.emit("    printf(\"%.*s\\n\", (int)(me - ms), text + pos + ms);");
+            self.emit("    size_t len = me - ms;");
+            self.emit("    if (out + len + 1 < sizeof _sh_gm_buf) {");
+            self.emit("      memcpy(_sh_gm_buf + out, text + pos + ms, len);");
+            self.emit("      out += len;");
+            self.emit("      if (out + 1 < sizeof _sh_gm_buf) _sh_gm_buf[out++] = '\\n';");
+            self.emit("    }");
+            self.emit("    pos += me;");
+            self.emit("  }");
+            self.emit("  _sh_gm_buf[out] = 0;");
+            self.emit("  regfree(&rx);");
+            self.emit("  _sh_rc = any ? 0 : 1;");
+            self.emit("  return _sh_gm_buf;");
+            self.emit("}");
+            self.emit("");
+        }
         if self.need_stat {
             self.emit("/* [ -f/-d/-e/-s/... ] file tests */");
             self.emit("static long long _sh_mtime(const char *p) { struct stat st; return stat(p, &st) == 0 ? (long long)st.st_mtime : -1; }");
             self.emit("static int _sh_is_f(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISREG(st.st_mode); }");
             self.emit("static int _sh_is_d(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }");
-            self.emit(
-                "static int _sh_is_e(const char *p) { struct stat st; return stat(p, &st) == 0; }",
-            );
+            self.emit("static int _sh_is_e(const char *p) { struct stat st; return stat(p, &st) == 0; }");
             self.emit("static int _sh_is_s(const char *p) { struct stat st; return stat(p, &st) == 0 && st.st_size > 0; }");
             self.emit("static int _sh_is_l(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISLNK(st.st_mode); }");
             self.emit("static int _sh_is_h(const char *p) { struct stat st; return lstat(p, &st) == 0 && S_ISLNK(st.st_mode); }");
@@ -863,6 +1049,8 @@ impl Render {
             self.emit("");
         }
     }
+
+    // ── expressions ──────────────────────────────────────────────────
 
     /// Drop the `_sh_*` shell-out helpers the generated body never uses
     /// (directly or transitively). Everything in the need_sh block is
@@ -919,7 +1107,9 @@ impl Render {
             for (names, lines) in &segs {
                 if names.iter().any(|n| needed.contains(n)) {
                     for t in sh_tokens(&lines.join("\n")) {
-                        if needed.insert(t) { changed = true; }
+                        if needed.insert(t) {
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -1048,8 +1238,6 @@ impl Render {
         });
     }
 
-    // ── expressions ──────────────────────────────────────────────────
-
     fn expr(&mut self, e: &IrExpr) -> String {
         match e {
             IrExpr::Int(i) => i.to_string(),
@@ -1057,11 +1245,7 @@ impl Render {
             IrExpr::Var(name, _) => self.c_ident(name),
             IrExpr::Ident(name) => self.c_ident(name),
             IrExpr::Bool(b) => {
-                if *b {
-                    "1".into()
-                } else {
-                    "0".into()
-                }
+                if *b { "1".into() } else { "0".into() }
             }
             IrExpr::BinOp { lhs, op, rhs } => {
                 let l = self.expr(lhs);
@@ -1083,7 +1267,14 @@ impl Render {
                     // `!` is UNARY — the ShIR duplicates the operand
                     // (until loops: BinOp{Not, test, test}), so render
                     // the negation of the lhs and ignore the rhs copy.
-                    crate::ir::BinOpKind::Not => return format!("(!({l}))"),
+                    // The negated STATUS writes back to _sh_rc — bash
+                    // `! cmd` sets $? to the flipped status (`exit: $?`
+                    // after `! grep …` saw the RAW status otherwise).
+                    crate::ir::BinOpKind::Not => {
+                        // the operand is bash TRUTHINESS (1 = succeeded);
+                        // the flipped STATUS is 1/0 accordingly
+                        return format!("(!(_sh_rc = ({l}) ? 1 : 0))")
+                    }
                     crate::ir::BinOpKind::Pow => {
                         return format!("pow({l},{r})");
                     }
@@ -1101,15 +1292,16 @@ impl Render {
                 format!("[{}]", elems.join(", "))
             }
             IrExpr::Call { func, args } => self.call(func, args),
+            // `$(...)` — the raw Capture node (the ShIR JSON round-trip
+            // keeps the node; the in-process lowering folds it into a
+            // `capture` call). Render the Arrow body as command text and
+            // capture its stdout.
+            IrExpr::Capture { expr, .. } => self.capture_expr(expr),
             IrExpr::Json(v) => match v {
                 serde_json::Value::String(s) => Self::cstr(s),
                 serde_json::Value::Number(n) => n.to_string(),
                 serde_json::Value::Bool(b) => {
-                    if *b {
-                        "1".into()
-                    } else {
-                        "0".into()
-                    }
+                    if *b { "1".into() } else { "0".into() }
                 }
                 _ => {
                     self.mark_todo("Json expr");
@@ -1184,11 +1376,18 @@ impl Render {
                     let o = if op.ends_with('=') { op.as_str() } else { "=" };
                     format!("{} {o} {}", self.c_ident(var), self.arith(rhs))
                 } else if op == "=" {
-                    // a Str var: store the numeric result as a string
+                    // a Str var: store the numeric result as a string —
+                    // POINTER assignment for unbounded char* vars (a
+                    // strcpy into the NULL-initialized store would
+                    // segfault); fixed buffers must keep strcpy
                     let r = self.arith(rhs);
                     let t = self.num_temp(&r);
                     let id = self.c_ident(var);
-                    format!("(strcpy({id}, {t}), atoll({t}))")
+                    if self.buf_bound(var).is_some() {
+                        format!("(strcpy({id}, {t}), atoll({t}))")
+                    } else {
+                        format!("({id} = {t}, atoll({t}))")
+                    }
                 } else {
                     // a Str var: read the value, compute, write back —
                     // `atoll(y) += 2` would be an lvalue error
@@ -1197,25 +1396,54 @@ impl Render {
                     let base = op.trim_end_matches('=');
                     let t = self.num_temp(&format!("({l} {base} {r})"));
                     let id = self.c_ident(var);
-                    format!("(strcpy({id}, {t}), atoll({t}))")
+                    if self.buf_bound(var).is_some() {
+                        format!("(strcpy({id}, {t}), atoll({t}))")
+                    } else {
+                        format!("({id} = {t}, atoll({t}))")
+                    }
                 }
             }
             ArithAst::IncDec { var, delta, prefix } => {
                 // `++x` / `x++` / `--x` / `x--` (delta ±1)
                 let name = self.c_ident(var);
-                if *prefix {
-                    format!("{}{}", if *delta >= 0 { "++" } else { "--" }, name)
+                if self.is_num(var) {
+                    if *prefix {
+                        format!("{}{}", if *delta >= 0 { "++" } else { "--" }, name)
+                    } else {
+                        format!("{}{}", name, if *delta >= 0 { "++" } else { "--" })
+                    }
                 } else {
-                    format!("{}{}", name, if *delta >= 0 { "++" } else { "--" })
+                    // a Str var: helper calls — SEQUENCE POINTS are
+                    // well-defined across functions, unlike the hoisted-
+                    // temp strcpy form (two mutations in one expression,
+                    // `j = i++ + ++i`, read stale temps and lost the
+                    // second write). postinc returns the OLD value,
+                    // preinc the NEW one.
+                    self.need_incdec = true;
+                    let d = if *delta >= 0 { "1" } else { "-1" };
+                    if self.buf_bound(var).is_some() {
+                        // fixed buffer: write IN PLACE (&name has the
+                        // wrong pointer type for a char** helper)
+                        if *prefix {
+                            format!("_sh_preinc_buf({name}, {d})")
+                        } else {
+                            format!("_sh_postinc_buf({name}, {d})")
+                        }
+                    } else if *prefix {
+                        format!("_sh_preinc(&{name}, {d})")
+                    } else {
+                        format!("_sh_postinc(&{name}, {d})")
+                    }
                 }
             }
-            // C-frontend nodes (never emitted by the shell path): sizeof
-            // is a compile-time constant; casts render as C casts (the C
-            // target's native widening/narrowing).
+            // C-frontend nodes: sizeof is a compile-time constant; casts
+            // are value-preserving (C arith is already 64-bit here)
             ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
             ArithAst::Cast { arg, .. } => self.arith(arg),
         }
     }
+
+
 
     fn sh2_stub(&mut self, name: &str, _args: &[IrExpr], note: &str) -> String {
         self.sh2_calls.insert(name.to_string());
@@ -1256,6 +1484,7 @@ impl Render {
     /// per-function hoists.
     fn emit_var_decl(&mut self, v: &str) {
         let name = self.c_ident(v);
+        if v == "SHELL_VAR" { eprintln!("DBG emit_var_decl SHELL_VAR out_len={}", self.out.len()); }
         // const-markup lift: a Const var whose single top-level
         // assignment is a literal renders as a const declaration
         // initialized from that literal; the Assign stmt is dropped
@@ -1275,19 +1504,30 @@ impl Render {
                 self.literal_init(&rhs)
             };
             if let Some(init) = init {
-                self.const_lifted.insert(v.to_string());
-                let lc = self.var_line.get(v).map(|l| format!(" /* line {l} */")).unwrap_or_default();
-                if self.is_num(v) {
-                    self.emit(&format!(
-                        "const {} {name} = {init};{lc}",
-                        self.width_of_var(v).c_type()
-                    ));
-                } else if let Some(b) = self.buf_bound(v) {
-                    self.emit(&format!("const char {name}[{}] = {init};{lc}", b + 1));
+                // type guard: a numeric literal cannot initialize a char
+                // buffer/pointer (invalid C — 078_arithmetic_double_paren
+                // `const char i[21] = 2;`); only lift when the declared
+                // form matches the initializer kind
+                let numeric_init = matches!(rhs, IrExpr::Int(_))
+                    || matches!(&rhs, IrExpr::Str(s, _) if s.trim().parse::<i128>().is_ok());
+                let ok = if self.is_num(v) {
+                    numeric_init || matches!(&rhs, IrExpr::Str(s, _) if s.trim().parse::<i128>().is_ok())
+                } else if self.buf_bound(v).is_some() {
+                    !numeric_init && matches!(rhs, IrExpr::Str(_, _) | IrExpr::Interpolate(_))
                 } else {
-                    self.emit(&format!("const char* {name} = {init};{lc}"));
+                    matches!(rhs, IrExpr::Str(_, _) | IrExpr::Interpolate(_))
+                };
+                if ok {
+                    self.const_lifted.insert(v.to_string());
+                    if self.is_num(v) {
+                        self.emit(&format!("const {} {name} = {init};", self.width_of_var(v).c_type()));
+                    } else if let Some(b) = self.buf_bound(v) {
+                        self.emit(&format!("const char {name}[{}] = {init};", b + 1));
+                    } else {
+                        self.emit(&format!("const char* {name} = {init};"));
+                    }
+                    return;
                 }
-                return;
             }
         }
         if self.is_num(v) {
@@ -1349,6 +1589,14 @@ impl Render {
         collect_assigned_vars(body, &mut fvars);
         let mut declared = BTreeSet::new();
         collect_declare_names(body, &mut declared);
+        // nested-block declares hoist to the FN TOP (bash `local` is
+        // function-scoped; the in-block Declare renders as an assignment)
+        let mut nested_declared = BTreeSet::new();
+        collect_nested_declares(body, &mut nested_declared);
+        for v in &nested_declared {
+            declared.remove(v);
+            fvars.insert(v.clone());
+        }
         let fvars: BTreeSet<String> = fvars
             .iter()
             .filter(|v| {
@@ -1384,10 +1632,13 @@ impl Render {
         self.depth = 1;
         let prev_fn = self.in_function;
         self.in_function = true;
+        let site_mark = self.site_bodies.len();
+        let cap_mark = self.cap_bodies.len();
+        self.decl_line_idx.clear();
         for st in body {
             self.stmt(st);
         }
-        let body_out = std::mem::replace(&mut self.out, saved);
+        let mut body_out = std::mem::replace(&mut self.out, saved);
         self.depth = saved_depth;
         self.in_function = prev_fn;
         for n in &fvars {
@@ -1396,6 +1647,46 @@ impl Render {
                 self.site_file_vars.insert(n.clone());
             }
         }
+        // `local`-declared vars referenced by the site/capture helpers
+        // registered in THIS body: the helpers are file-scope functions,
+        // so the var must hoist too (the Declare's definition line is
+        // rewritten to a plain assignment below — a local shadow would
+        // hide the file-scope copy the helper reads).
+        for n in &declared {
+            if self.const_lifted.contains(n) {
+                continue;
+            }
+            let id = self.c_ident(n);
+            let refd = self.site_bodies[site_mark..]
+                .iter()
+                .any(|b| text_contains_ident(b, &id))
+                || self.cap_bodies[cap_mark..]
+                    .iter()
+                    .any(|b| text_contains_ident(b, &id));
+            if refd {
+                self.site_file_vars.insert(n.clone());
+                if let Some(&idx) = self.decl_line_idx.get(n) {
+                    if let Some(line) = body_out.get_mut(idx) {
+                        let name = self.c_ident(n);
+                        let trimmed = line.trim_start();
+                        if trimmed.starts_with(&format!("char {name}[")) {
+                            // bounded buffer: the file-scope decl owns
+                            // the storage; the guarded copy below still
+                            // assigns it
+                            *line =
+                                format!("/* {name}: file-scope decl (site-referenced) */");
+                        } else if let Some(pos) = trimmed.find(&format!("{name} = ")) {
+                            // `long long i = v;` / `char* i = v;` -> `i = v;`
+                            let keep = trimmed[pos..].to_string();
+                            *line = keep;
+                        }
+                    }
+                }
+            }
+        }
+        // forward declaration: a function may CALL another defined later
+        // (nested defs are hoisted in collection order — 081 inner/outer)
+        self.fn_fwd_decls.push(format!("static void {fname}(void);"));
         self.emit(&format!("static void {fname}(void) {{"));
         self.depth += 1;
         let mut local_lines: Vec<&String> = Vec::new();
@@ -1458,18 +1749,21 @@ impl Render {
     fn num_temp(&mut self, v: &str) -> String {
         let t = format!("_s{}", self.temp_seq);
         self.temp_seq += 1;
-        self.emit(&format!("char {t}[32];"));
-        self.emit(&format!(
-            "snprintf({t}, sizeof {t}, \"%lld\", (long long)({v}));"
-        ));
+        // STATIC: a file-scope var may hold the temp's address (`n =
+        // _s17`); a plain local's stack slot is reused by sibling
+        // scopes (gcc -O0 coalesces non-overlapping blocks) and the var
+        // would read a clobbered value on the next iteration.
+        self.emit(&format!("static char {t}[32];"));
+        self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", (long long)({v}));"));
         t
     }
 
     /// Emit `char _sN[cap];` and return `_sN` — a per-use string temp.
+    /// STATIC (see num_temp — the address may escape into a var).
     fn str_temp(&mut self, cap: usize) -> String {
         let t = format!("_s{}", self.temp_seq);
         self.temp_seq += 1;
-        self.emit(&format!("char {t}[{cap}];"));
+        self.emit(&format!("static char {t}[{cap}];"));
         t
     }
 
@@ -1541,6 +1835,17 @@ impl Render {
                     let Some(name) = Self::str_arg(args, 0) else {
                         return "0".into();
                     };
+                    // `${#s}` arrives as getVar("#s") — string length
+                    if let Some(base) = name.strip_prefix('#') {
+                        if !base.is_empty() && is_ident(base) {
+                            let v = if self.is_num(base) {
+                                self.num_temp(&self.c_ident(base))
+                            } else {
+                                self.store_read(base)
+                            };
+                            return self.num_temp(&format!("(long long)strlen({v})"));
+                        }
+                    }
                     if name == "?" {
                         return self.num_temp("_sh_rc");
                     }
@@ -1549,7 +1854,8 @@ impl Render {
                         return self.num_temp("getpid()");
                     }
                     if name == "#" {
-                        return "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into();
+                        // string form: `echo $#` prints the count
+                        return self.num_temp("((_sh_argc > 0) ? (_sh_argc - 1) : 0)");
                     }
                     if name == "@" || name == "*" {
                         let t = self.str_temp(4096);
@@ -1577,10 +1883,10 @@ impl Render {
                     }
                 }
                 "param" => {
-                    if self.param_is_len(args) {
-                        let v = self.param_call(args);
-                        return self.num_temp(&v);
-                    }
+                    // param_call already returns the right VALUE form
+                    // (a string temp for len/slice) — wrapping it in
+                    // num_temp again would re-stringify the POINTER
+                    // (`%lld` of a char*) into garbage
                     self.param_call(args)
                 }
                 "capture" | "captureWords" => self.capture_call(args),
@@ -1607,6 +1913,37 @@ impl Render {
                     None => "0".into(),
                 },
                 "join" => self.join_value(args),
+                "arith" => {
+                    // VALUE context `x=$(( dyn ))`: NATIVE evaluation
+                    // first (parse_arith → the typed arith renderer —
+                    // no fork/exec emulation); the child-bash capture
+                    // (`echo "$(( ))"`) is the fallback for texts the
+                    // parser cannot handle.
+                    if let Some(s) = Self::str_arg(args, 0) {
+                        let pre = Self::arith_subst_specials(&s);
+                        if let Some(ast) = crate::shir::parse_arith(&pre) {
+                            let v = if Self::arith_has_side_effects(&ast) {
+                                self.arith_sequenced(&ast)
+                            } else {
+                                self.arith(&ast)
+                            };
+                            return self.num_temp(&v);
+                        }
+                        let s = s.clone();
+                        self.cap_site(|r, id| {
+                            r.sh_export_vars(&s);
+                            r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
+                            r.emit(&format!(
+                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                Self::cstr(&format!("echo \"$(({s}))\""))
+                            ));
+                            r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
+                            r.emit("return buf;");
+                        })
+                    } else {
+                        "0".into()
+                    }
+                }
                 _ => self.expr(e),
             },
             _ => self.expr(e),
@@ -1620,7 +1957,28 @@ impl Render {
             IrExpr::Int(i) => i.to_string(),
             IrExpr::Str(s, _) => match s.trim().parse::<i64>() {
                 Ok(n) => n.to_string(),
-                Err(_) => format!("(int)atoll({})", Self::cstr(s)),
+                Err(_) => {
+                    // `$i` / `${i}` slice-index text: resolve the live
+                    // value (a literal atoll("$i") is always 0)
+                    let t = s.trim();
+                    let name = t.strip_prefix('$').map(|r| r.trim_matches('{').trim_matches('}'));
+                    if let Some(name) = name {
+                        if is_ident(name)
+                            || name.chars().all(|c| c.is_ascii_digit())
+                            || name == "?"
+                        {
+                            let v = self.call(
+                                "getVar",
+                                &[IrExpr::Str(
+                                    name.to_string(),
+                                    crate::ir::StrStyle::DoubleQuoted,
+                                )],
+                            );
+                            return format!("(int)atoll({v})");
+                        }
+                    }
+                    format!("(int)atoll({})", Self::cstr(s))
+                }
             },
             IrExpr::Var(name, _) | IrExpr::Ident(name) if self.is_num(name) => self.c_ident(name),
             IrExpr::Call { func, args } if func == "getVar" => {
@@ -1650,8 +2008,61 @@ impl Render {
     /// Register a command-run site; `body` renders the helper body (the
     /// command-text build). Returns the call expression `_sh_site_N()`.
     /// `invert` makes the helper return `!rc` (the `(( ))` truth value).
+    /// `.`/`source FILE` / `eval TEXT` — statement position. The text is
+    /// arbitrary dynamic shell code with no native lowering (the one
+    /// documented fork/exec case), but bash semantics require its
+    /// ASSIGNMENTS to persist in this process: run it via `_sh_state_run`,
+    /// which appends an `env -0` snapshot to the child command and imports
+    /// every identifier assignment back via setenv — later reads go
+    /// through getenv, children inherit through _sh_export/getenv.
+    fn source_eval_site(&mut self, kind: &str, args: &[IrExpr]) -> String {
+        self.need_sh = true;
+        let words = match args.get(1) {
+            Some(IrExpr::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        };
+        let kind_str = IrExpr::Str(kind.to_string(), crate::ir::StrStyle::DoubleQuoted);
+        let id = self.site_seq;
+        self.site_seq += 1;
+        let saved = std::mem::take(&mut self.out);
+        let saved_depth = self.depth;
+        self.depth = 0;
+        // unique-per-process snapshot path for the child's env dump
+        self.emit(&format!(
+            "{{ static char _envf{id}[64]; snprintf(_envf{id}, sizeof _envf{id}, \"/tmp/.shstate.%ld\", (long)getpid()); _sh_export(\"_SH2ENVF\", _envf{id}); }}"
+        ));
+        self.emit("_sh_reset();");
+        self.sh_word(CmdBuf::Shared, &kind_str);
+        for w in &words {
+            self.sh_word(CmdBuf::Shared, w);
+        }
+        let body_out = std::mem::replace(&mut self.out, saved);
+        self.depth = saved_depth;
+        let mut s = format!("static int _sh_site_{id}(void) {{\n");
+        for line in body_out {
+            s.push_str(&line);
+            s.push('\n');
+        }
+        s.push_str("  return !_sh_state_run();\n}");
+        self.site_bodies.push(s);
+        self.site_ids.push(id);
+        format!("_sh_site_{id}()")
+    }
+
+    /// The exec/builtin args of a state-mutating builtin (`[cmd, words]`
+    /// where cmd is `.` / `source` / `eval`).
+    fn state_builtin_args(args: &[IrExpr]) -> Option<(&str, &[IrExpr])> {
+        match args.first() {
+            Some(IrExpr::Str(c, _)) if matches!(c.as_str(), "." | "source" | "eval") => {
+                Some((c.as_str(), args))
+            }
+            _ => None,
+        }
+    }
+
     fn shell_site(&mut self, body: impl FnOnce(&mut Render), invert: bool) -> String {
         self.need_sh = true;
+        self.site_exported.clear();
         let id = self.site_seq;
         self.site_seq += 1;
         let saved = std::mem::take(&mut self.out);
@@ -1664,13 +2075,36 @@ impl Render {
         // the C-truthiness (chains/ifs/whiles all use this convention)
         let _ = invert;
         let ret = "  return !_sh_system_rc();";
+        // deferred NATIVE statements (mapfile-from-FIFO etc.) run AFTER
+        // system(): the child may be what unblocks them (a FIFO writer)
+        let mut native_lines: Vec<String> = Vec::new();
+        let natives: Vec<IrStmt> = std::mem::take(&mut self.pending_native_stmts);
+        if !natives.is_empty() {
+            let saved = std::mem::take(&mut self.out);
+            let saved_depth = self.depth;
+            self.depth = 1;
+            for st in &natives {
+                self.stmt(st);
+            }
+            self.depth = saved_depth;
+            native_lines = std::mem::replace(&mut self.out, saved);
+        }
         let mut s = format!("static int _sh_site_{id}(void) {{\n");
         for line in body_out {
             s.push_str(&line);
             s.push('\n');
         }
-        s.push_str(ret);
-        s.push_str("\n}");
+        if !native_lines.is_empty() {
+            s.push_str("  int _site_rc = _sh_system_rc();\n");
+            for line in native_lines {
+                s.push_str(&line);
+                s.push('\n');
+            }
+            s.push_str("  return !_site_rc;\n}");
+        } else {
+            s.push_str(ret);
+            s.push_str("\n}");
+        }
         self.site_bodies.push(s);
         self.site_ids.push(id);
         format!("_sh_site_{id}()")
@@ -1694,6 +2128,7 @@ impl Render {
     /// Returns the call expression `_cap_N()` (a char*).
     fn cap_site(&mut self, body: impl FnOnce(&mut Render, usize)) -> String {
         self.need_sh = true;
+        self.site_exported.clear();
         let id = self.site_seq;
         self.site_seq += 1;
         let saved = std::mem::take(&mut self.out);
@@ -1725,10 +2160,44 @@ impl Render {
     /// word evaluate into a temp (their sites have private buffers, so
     /// the build never interleaves).
     fn sh_word(&mut self, buf: CmdBuf, e: &IrExpr) {
-        let word = |r: &mut Render, v: String| match buf {
-            CmdBuf::Shared => r.emit(&format!("_sh_word({v});")),
-            CmdBuf::Private(id) => r.emit(&format!("_sh_bword(&_c{id}_cmd, &_c{id}_cap, {v});")),
+        let word = |r: &mut Render, v: String| {
+            // glue mode: append WITHOUT the word-separating space
+            // (`NAME=` + value = ONE shell word)
+            let glue = std::mem::take(&mut r.glue_next_word);
+            match buf {
+                CmdBuf::Shared => {
+                    if glue {
+                        r.emit(&format!("_sh_add({v});"))
+                    } else {
+                        r.emit(&format!("_sh_word({v});"))
+                    }
+                }
+                CmdBuf::Private(id) => {
+                    if glue {
+                        r.emit(&format!("_sh_badd(&_c{id}_cmd, &_c{id}_cap, {v});"))
+                    } else {
+                        r.emit(&format!("_sh_bword(&_c{id}_cmd, &_c{id}_cap, {v});"))
+                    }
+                }
+            }
         };
+        // a glob-marked literal (`\x01SH2GLOB\x01*.txt`) is an UNQUOTED
+        // glob pattern: emit it RAW (stripped) so the child bash
+        // expands it against the filesystem — quoting it would keep it
+        // literal (bash `ls \"$x\"` semantics are for quoted refs)
+        if let IrExpr::Str(s, _) = e {
+            if s.starts_with("\u{1}SH2GLOB\u{1}") {
+                let raw = strip_glob(s).to_string();
+                match buf {
+                    CmdBuf::Shared => self.emit(&format!("_sh_addraw({});", Self::cstr(&raw))),
+                    CmdBuf::Private(id) => self.emit(&format!(
+                        "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                        Self::cstr(&format!(" {raw}"))
+                    )),
+                }
+                return;
+            }
+        }
         match e {
             IrExpr::Str(s, _) => word(self, Self::cstr(s)),
             IrExpr::Int(i) => word(self, format!("\"{i}\"")),
@@ -1745,11 +2214,49 @@ impl Render {
                 "getVar" => {
                     let name = Self::str_arg(args, 0);
                     match name.as_deref() {
+                        Some(n) if n.starts_with('#') && is_ident(&n[1..]) => {
+                            // `${#s}` → getVar("#s")
+                            let v = if self.is_num(&n[1..]) {
+                                self.num_temp(&self.c_ident(&n[1..]))
+                            } else {
+                                self.store_read(&n[1..])
+                            };
+                            let t = self.num_temp(&format!("(long long)strlen({v})"));
+                            word(self, t);
+                        }
                         Some("?") => {
                             let t = self.num_temp("_sh_rc");
                             word(self, t);
                         }
-                        Some("@") | Some("*") => {
+                        Some("@") => {
+                            // `"$@"` expands to SEPARATELY QUOTED words —
+                            // joining into one word made the child run
+                            // 'id -u' (with the space) as a command name.
+                            // Emit a C loop appending 'arg' per argv slot.
+                            let quoted = "'\\\"'\\\"'"; // '"'"' escaping
+                            let body = format!(
+                                "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; {a1} for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) {a2} else {a3} }} {a4} }} }}",
+                                a1 = Self::cstr(" '"),
+                                a2 = Self::cstr(quoted),
+                                a3 = "{ _sh_addc(*_qp); }",
+                                a4 = Self::cstr("'"),
+                            );
+                            match buf {
+                                CmdBuf::Shared => self.emit(&body),
+                                CmdBuf::Private(id) => {
+                                    let b = body.replace("_sh_add(", &format!("_sh_badd(&_c{id}_cmd, &_c{id}_cap, "));
+                                    // _sh_badd takes (b, cap, s) — rebuild instead
+                                    let _ = b;
+                                    self.emit(&format!(
+                                        "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; _sh_badd(&_c{id}_cmd, &_c{id}_cap, {q1}); for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) _sh_badd(&_c{id}_cmd, &_c{id}_cap, {q2}); else _sh_baddc(&_c{id}_cmd, &_c{id}_cap, *_qp); }} _sh_badd(&_c{id}_cmd, &_c{id}_cap, {q3}); }} }}",
+                                        q1 = Self::cstr(" '"),
+                                        q2 = Self::cstr(quoted),
+                                        q3 = Self::cstr("'"),
+                                    ));
+                                }
+                            }
+                        }
+                        Some("*") => {
                             let t = self.str_temp(4096);
                             self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
                             word(self, t);
@@ -1759,9 +2266,36 @@ impl Render {
                                 "_sh_export(\"_SHARGV\", (({n} < _sh_argc && _sh_argv[{n}]) ? _sh_argv[{n}] : \"\"));"
                             ));
                             match buf {
-                                CmdBuf::Shared => self.emit("_sh_add(\"$_SHARGV\");"),
+                                CmdBuf::Shared => self.emit("_sh_addraw(\"$_SHARGV\");"),
                                 CmdBuf::Private(id) => self.emit(&format!(
-                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"$_SHARGV\");"
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" $_SHARGV\");"
+                                )),
+                            }
+                        }
+                        Some(n) if n == "@" || n == "*" => {
+                            // "$@" / "$*" — the JOINED positional value,
+                            // evaluated at site-build time while _sh_argv
+                            // is live (an env export of "@" is always
+                            // empty: generator-system-echo-checkqx)
+                            let t = self.str_temp(65536);
+                            self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+                            word(self, t);
+                        }
+                        Some("IFS") => {
+                            // bash RESETS an inherited IFS to " \t\n" at
+                            // startup — a child can never see it. Expand
+                            // the parent's VALUE inline (quoted).
+                            let v = if self.is_num("IFS") {
+                                self.num_temp(&self.c_ident("IFS"))
+                            } else {
+                                self.store_read("IFS")
+                            };
+                            match buf {
+                                CmdBuf::Shared => self.emit(&format!(
+                                    "_sh_word((char*)({v}));"
+                                )),
+                                CmdBuf::Private(id) => self.emit(&format!(
+                                    "_sh_bword(&_c{id}_cmd, &_c{id}_cap, (char*)({v}));"
                                 )),
                             }
                         }
@@ -1772,11 +2306,27 @@ impl Render {
                             } else {
                                 self.store_read(n)
                             };
-                            self.emit(&format!("_sh_export({}, {v});", Self::cstr(n)));
+                            // the first textual reference in a site exports
+                            // the ENTRY value; later references must not
+                            // clobber a variable the CHILD assigns (a
+                            // `count=$((count+1))` loop would echo a stale
+                            // count). Vars assigned by THIS stage are
+                            // child-owned from the start.
+                            let owned = self.stage_assigned.contains(n);
+                            if !owned || self.site_exported.insert(n.to_string()) {
+                                self.emit(&format!("_sh_export({}, {v});", Self::cstr(n)));
+                            }
+
+                            // a BARE getVar word is the QUOTED form (the
+                            // core spells unquoted refs `split(getVar)` —
+                            // the split arm above emits them raw); quote it
+                            // or the child bash re-splits `"$x"`.
                             match buf {
-                                CmdBuf::Shared => self.emit(&format!("_sh_addraw(\"${n}\");")),
+                                CmdBuf::Shared => self.emit(&format!(
+                                    "_sh_addraw(\"\\\"${n}\\\"\");"
+                                )),
                                 CmdBuf::Private(id) => self.emit(&format!(
-                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" ${n}\");"
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" \\\"${n}\\\"\");"
                                 )),
                             }
                         }
@@ -1803,6 +2353,29 @@ impl Render {
                         }
                     }
                 }
+                "listVar" if matches!(Self::str_arg(args, 0).as_deref(), Some("@")) => {
+                    // `"$@"` as the COMMAND word: expand to SEPARATELY
+                    // quoted words (a joined single word made the child run
+                    // 'id -u' as one command name). The value_c listVar
+                    // fallback joins into one space-separated string.
+                    let addq = Self::cstr(" '");
+                    let escq = Self::cstr("'\"'\"'");
+                    let endq = Self::cstr("'");
+                    match buf {
+                        CmdBuf::Shared => self.emit(&format!(
+                            "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; _sh_add({addq}); for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) _sh_add({escq}); else _sh_addc(*_qp); }} _sh_add({endq}); }} }}",
+                            addq = addq,
+                            escq = escq,
+                            endq = endq,
+                        )),
+                        CmdBuf::Private(id) => self.emit(&format!(
+                            "{{ for (int _qi = 1; _qi < _sh_argc; _qi++) {{ const char *_qa = _sh_argv[_qi] ? _sh_argv[_qi] : \"\"; _sh_badd(&_c{id}_cmd, &_c{id}_cap, {addq}); for (const char *_qp = _qa; *_qp; _qp++) {{ if (*_qp == 39) _sh_badd(&_c{id}_cmd, &_c{id}_cap, {escq}); else _sh_baddc(&_c{id}_cmd, &_c{id}_cap, *_qp); }} _sh_badd(&_c{id}_cmd, &_c{id}_cap, {endq}); }} }}",
+                            addq = addq,
+                            escq = escq,
+                            endq = endq,
+                        )),
+                    }
+                }
                 "brace" => {
                     // compile-time expansion → one word per item
                     for item in brace_expand(args) {
@@ -1814,7 +2387,29 @@ impl Render {
                     self.temp_seq += 1;
                     let cap = self.capture_call(args);
                     self.emit(&format!("char *{t} = {cap};"));
-                    word(self, t);
+                    if func == "captureWords" {
+                        // UNQUOTED command substitution: the captured
+                        // output is field-split by the child shell (echo
+                        // `ls | grep …` → newline-separated list joined
+                        // by IFS spaces), mirroring the `split` arm below.
+                        // Export the raw capture and append the BARE ref so
+                        // the child re-splits it — a quoted `_sh_word` would
+                        // keep the embedded newlines (bash single-token).
+                        match buf {
+                            CmdBuf::Shared => {
+                                self.emit(&format!("_sh_export(\"_SHSPLIT\", {t});"));
+                                self.emit("_sh_addraw(\"$_SHSPLIT\");");
+                            }
+                            CmdBuf::Private(id) => {
+                                self.emit(&format!("_sh_export(\"_SHSPLIT\", {t});"));
+                                self.emit(&format!(
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \" $_SHSPLIT\");"
+                                ));
+                            }
+                        }
+                    } else {
+                        word(self, t);
+                    }
                 }
                 _ => {
                     let v = self.value_c(e);
@@ -1930,6 +2525,37 @@ impl Render {
                             }
                             IrExpr::Call { func, args } if func == "getVar" => {
                                 let n = Self::str_arg(args, 0).unwrap_or_default();
+                                if n == "@" || n == "*" {
+                                    // "$@" — the JOINED positional value at
+                                    // site-build time (an env export of "@"
+                                    // is always empty)
+                                    let t = self.str_temp(65536);
+                                    self.emit(&format!("_sh_argv_join({t}, sizeof {t});"));
+                                    // mid-word: GLUE the runtime value in
+                                    // as a double-quoted piece (`"hello $@"`
+                                    // is ONE word — a word separator would
+                                    // double the space)
+                                    match buf {
+                                        CmdBuf::Shared => {
+                                            self.emit("_sh_add(\"\\\"\");");
+                                            self.emit(&format!("_sh_add({t});"));
+                                            self.emit("_sh_add(\"\\\"\");");
+                                        }
+                                        CmdBuf::Private(id) => {
+                                            self.emit(&format!(
+                                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"\\\"\");"
+                                            ));
+                                            self.emit(&format!(
+                                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {t});"
+                                            ));
+                                            self.emit(&format!(
+                                                "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"\\\"\");"
+                                            ));
+                                        }
+                                    }
+                                    first_seg = false;
+                                    return;
+                                }
                                 let v = if n == "?" {
                                     self.num_temp("_sh_rc")
                                 } else if self.is_num(&n) {
@@ -1938,28 +2564,40 @@ impl Render {
                                 } else {
                                     self.store_read(&n)
                                 };
-                                self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
+                                if !self.shell_assigned.contains(&n) {
+                                    self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
+                                }
                                 let ref_text = if n == "?" { v.clone() } else { format!("${n}") };
                                 if first_seg {
+                                    // NEW word: keep the separating space
+                                    // (`-- "$d/f1"` is TWO args — gluing
+                                    // the ref to the literal before it
+                                    // concatenates them into ONE)
                                     match buf {
                                         CmdBuf::Shared => self.emit(&format!(
                                             "_sh_addraw({});",
-                                            Self::cstr(&format!("\"{ref_text}\""))
-                                        )),
-                                        CmdBuf::Private(id) => self.emit(&format!(
-                                            "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
-                                            Self::cstr(&format!("\"{ref_text}\""))
-                                        )),
-                                    }
-                                } else {
-                                    match buf {
-                                        CmdBuf::Shared => self.emit(&format!(
-                                            "_sh_addraw({});",
-                                            Self::cstr(&format!("\"{ref_text}\""))
+                                            Self::cstr(&format!(" \"{ref_text}\""))
                                         )),
                                         CmdBuf::Private(id) => self.emit(&format!(
                                             "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
                                             Self::cstr(&format!(" \"{ref_text}\""))
+                                        )),
+                                    }
+                                } else {
+                                    // mid-word getVar parts GLUE to the
+                                    // literal before them (`'hello ' "$name"`
+                                    // = ONE word — a space would split it
+                                    // and echo would join with a double
+                                    // space); the first segment is a NEW
+                                    // word, so it keeps the space.
+                                    match buf {
+                                        CmdBuf::Shared => self.emit(&format!(
+                                            "_sh_add({});",
+                                            Self::cstr(&format!("\"{ref_text}\""))
+                                        )),
+                                        CmdBuf::Private(id) => self.emit(&format!(
+                                            "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                            Self::cstr(&format!("\"{ref_text}\""))
                                         )),
                                     }
                                 }
@@ -2004,6 +2642,17 @@ impl Render {
 
     /// Append raw separator text to a command buffer (buf-parameterized).
     fn sh_raw(&mut self, buf: CmdBuf, s: &str) {
+        // a heredoc terminator must be alone on its line — any raw token
+        // that follows (`)`, `|`, `;`) starts on a fresh line
+        if self.heredoc_nl {
+            match buf {
+                CmdBuf::Shared => self.emit("_sh_add(\"\\n\");"),
+                CmdBuf::Private(id) => self.emit(&format!(
+                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, \"\\n\");"
+                )),
+            }
+            self.heredoc_nl = false;
+        }
         match buf {
             CmdBuf::Shared => self.emit(&format!("_sh_addraw({});", Self::cstr(s))),
             CmdBuf::Private(id) => self.emit(&format!(
@@ -2026,10 +2675,12 @@ impl Render {
 
     /// Append a `[ ... ]` test to a command buffer.
     fn sh_test_text(&mut self, buf: CmdBuf, t: &str) {
+        let t = respace_test_text(t);
         match buf {
-            CmdBuf::Shared => {
-                self.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[ {t} ]"))))
-            }
+            CmdBuf::Shared => self.emit(&format!(
+                "_sh_addraw({});",
+                Self::cstr(&format!("[ {t} ]"))
+            )),
             CmdBuf::Private(id) => self.emit(&format!(
                 "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
                 Self::cstr(&format!(" [ {t} ]"))
@@ -2039,7 +2690,67 @@ impl Render {
 
     /// Reconstruct the command text of one Arrow body (an exec call, a
     /// test, a redirect, a nested pipeline). Emits word appends.
+    /// Collect the variable names ASSIGNED in a stage's statements
+    /// (Assign targets, `read` targets, nested bodies). See the
+    /// `stage_assigned` field doc for why this matters.
+    fn collect_assigned(stmts: &[IrStmt], set: &mut BTreeSet<String>) {
+        for s in stmts {
+            match s {
+                IrStmt::Assign { targets, .. } => {
+                    for t in targets {
+                        set.insert(t.var.clone());
+                    }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args })
+                    if func == "exec" || func == "builtin" =>
+                {
+                    // `read [-r] name...` — the words after the flags are
+                    // assignment targets (the child writes them)
+                    let is_read = matches!(Self::str_arg(args, 0).as_deref(), Some("read"));
+                    if is_read {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            for w in items {
+                                if let IrExpr::Str(n, _) = w {
+                                    if !n.starts_with('-') && is_ident(n) {
+                                        set.insert(n.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "whileLoop" => {
+                    for a in args {
+                        if let IrExpr::Arrow(sts) = a {
+                            Self::collect_assigned(sts, set);
+                        }
+                    }
+                }
+                IrStmt::Redirect { inner, .. } => Self::collect_assigned(inner, set),
+                IrStmt::Block(b) | IrStmt::Background(b) => Self::collect_assigned(b, set),
+                IrStmt::Pipeline { stages, .. } => {
+                    for st in stages {
+                        Self::collect_assigned(st, set);
+                    }
+                }
+                IrStmt::If { then, elsifs, else_, .. } => {
+                    Self::collect_assigned(then, set);
+                    for (_, b) in elsifs {
+                        Self::collect_assigned(b, set);
+                    }
+                    Self::collect_assigned(else_, set);
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn sh_stage(&mut self, buf: CmdBuf, stmts: &[IrStmt]) {
+        // track what THIS stage assigns (child-owned vars — see the
+        // field docs); nested sh_stage calls scope their own set
+        let saved_assigned = std::mem::take(&mut self.stage_assigned);
+        Self::collect_assigned(stmts, &mut self.stage_assigned);
+        self.stage_assigned.extend(saved_assigned.iter().cloned());
         let mut first_stmt = true;
         for s in stmts {
             if !first_stmt {
@@ -2048,24 +2759,133 @@ impl Render {
             first_stmt = false;
             match s {
                 IrStmt::Expr(IrExpr::Call { func, args }) if func == "exec" || func == "builtin" => {
-                    // env prefix: `IFS=: cmd ...` (the Object arg)
-                    for a in args {
-                        if let IrExpr::Object(fields) = a {
-                            for (k, v) in fields {
-                                let key = k.clone();
-                                let val = v.clone();
-                                self.sh_raw(buf, &key);
-                                self.sh_raw(buf, "=");
-                                self.sh_word(buf, &val);
+                    // a command reading a C-side array (`${LIST:-}`) needs
+                    // it MATERIALIZED into the child command
+                    {
+                        let mut texts: Vec<String> = Vec::new();
+                        fn gather(e: &IrExpr, out: &mut Vec<String>) {
+                            match e {
+                                IrExpr::Str(s, _) => out.push(s.clone()),
+                                IrExpr::Array(items) => items.iter().for_each(|x| gather(x, out)),
+                                IrExpr::Interpolate(parts) => parts.iter().for_each(|p| {
+                                    if let InterpPart::Expr(x) = p { gather(x, out) }
+                                }),
+                                IrExpr::Call { args, .. } => args.iter().for_each(|x| gather(x, out)),
+                                _ => {}
+                            }
+                        }
+                        for a in args {
+                            gather(a, &mut texts);
+                        }
+                        let joined = texts.join(" ");
+                        let names: Vec<String> = self.arrays.iter().cloned().collect();
+                        for n in names {
+                            // assoc arrays materialize via _sh_assoc_init
+                            if self.assoc_arrays.contains(&n) {
+                                continue;
+                            }
+                            let id = self.c_ident(&n);
+                            if !joined.is_empty() && joined.contains(&id) {
+                                self.emit(&format!(
+                                    "_sh_idx_init(&_sh_cmd, &_sh_cap, {}, {}, {}_len);",
+                                    Self::cstr(&n),
+                                    id,
+                                    id
+                                ));
+                                self.sh_add(buf, ";");
                             }
                         }
                     }
-                    if let Some(cmd) = Self::str_arg(args, 0) {
-                        self.sh_word(buf, &IrExpr::Str(cmd, crate::ir::StrStyle::DoubleQuoted));
+                    // `while IFS= read -r line` — the core splits the
+                    // env-prefix assignment into words (cmd=NAME,
+                    // args[0]="=", args[1]=value?): glue NAME=value and
+                    // treat the REST as the command (a space-separated
+                    // `IFS = read` is not an assignment in bash:
+                    // 071_while_ifs_read)
+                    // env prefix: `IFS=: cmd ...` (the Object arg).
+                    // NAME=VALUE must be GLUED — a spaced `IFS = read`
+                    // is not an assignment in bash (071_while_ifs_read)
+                    for a in args {
+                        if let IrExpr::Object(fields) = a {
+                            for (k, v) in fields {
+                                match v {
+                                    IrExpr::Str(s, _) => {
+                                        self.sh_add(buf, &format!(" {k}={s}"));
+                                    }
+                                    other => {
+                                        // dynamic value: export it under a
+                                        // temp name, the child expands it
+                                        let vt = self.value_c(other);
+                                        let en = format!("__SH2_EP{}", self.temp_seq);
+                                        self.temp_seq += 1;
+                                        self.emit(&format!(
+                                            "_sh_export({}, {vt});",
+                                            Self::cstr(&en)
+                                        ));
+                                        self.sh_add(buf, &format!(" {k}=${en}"));
+                                    }
+                                }
+                            }
+                        }
                     }
-                    if let Some(IrExpr::Array(items)) = args.get(1) {
-                        for w in items {
-                            self.sh_word(buf, w);
+                    // the cmd is an EXPR (a param/getVar call for
+                    // `"${VAR}"` commands, an Interpolate, ...) —
+                    // str_arg only sees static strings
+                    if let Some(cmd) = args.first() {
+                        self.sh_word(buf, cmd);
+                    }
+                    // `echo -e …` inside a TEXT stage: the words are
+                    // single-quoted so the CHILD prints raw backslashes —
+                    // interpret the escapes at RENDER time instead
+                    let mut skip_echo_e = false;
+                    if Self::str_arg(args, 0).as_deref() == Some("echo") {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            if matches!(items.first(), Some(IrExpr::Str(f, _)) if f == "-e") {
+                                skip_echo_e = true;
+                                let lit_of = |w: &IrExpr| -> Option<String> {
+                                    match w {
+                                        IrExpr::Str(s, _) => Some(s.clone()),
+                                        IrExpr::Interpolate(parts) => {
+                                            let mut out = String::new();
+                                            for p in flatten_parts(parts) {
+                                                match p {
+                                                    InterpPart::Lit(l) => {
+                                                        out.push_str(&l)
+                                                    }
+                                                    _ => return None,
+                                                }
+                                            }
+                                            Some(out)
+                                        }
+                                        _ => None,
+                                    }
+                                };
+                                for w in items.iter().skip(1) {
+                                    if let Some(txt) = lit_of(w) {
+                                        let u = unescape_echo_e(&txt)
+                                            .unwrap_or_else(|| txt.clone());
+                                        match buf {
+                                            CmdBuf::Shared => self.emit(&format!(
+                                                "_sh_word({});",
+                                                Self::cstr(&u)
+                                            )),
+                                            CmdBuf::Private(id) => self.emit(&format!(
+                                                "_sh_bword(&_c{id}_cmd, &_c{id}_cap, {});",
+                                                Self::cstr(&u)
+                                            )),
+                                        }
+                                    } else {
+                                        self.sh_word(buf, w);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !skip_echo_e {
+                        if let Some(IrExpr::Array(items)) = args.get(1) {
+                            for w in items {
+                                self.sh_word(buf, w);
+                            }
                         }
                     }
                 }
@@ -2081,45 +2901,65 @@ impl Render {
                         self.emit("_sh_addraw(\"; done\");");
                     }
                 }
-                IrStmt::Assign { targets, expr, asm, .. } => {
-                    // Declarator-position asm label (core request
-                    // c-sh-go-toplevelasmargument-20260814-042952) — no C
-                    // rendering in this tree (the backend worktree owns
-                    // the asm-aware renderer); refuse loudly.
-                    if let Some(spec) = asm {
-                        self.emit(&format!(
-                            "// TODO(unsupported): asm label '{}' on an assign",
-                            spec.template
-                        ));
-                        return;
-                    }
+                IrStmt::Assign { targets, expr, .. } => {
                     // shell text form: NAME=$(( ... )) / NAME='value'
                     if let Some(t) = targets.first() {
                         if t.indices.is_empty() {
-                            self.emit(&format!(
-                                "_sh_addraw({});",
-                                Self::cstr(&format!("{}=", t.var))
-                            ));
+                            // a capture RHS: run it ONCE and store into
+                            // the C var — later site text reads the C
+                            // var (`_sh_word((__ps_tmp0 ...))`), so the
+                            // child-bash-only assign would leave it NULL
+                            // and the downstream commands would see ""
+                            if let IrExpr::Call { func, args } = expr {
+                                if func == "capture" || func == "captureWords" {
+                                    let cap = self.capture_call(args);
+                                    let id = self.c_ident(&t.var);
+                                    self.store.insert(t.var.clone());
+                                    self.emit(&format!("{id} = {cap};"));
+                                    self.emit(&format!(
+                                        "_sh_addraw({});",
+                                        Self::cstr(&format!("{}=", t.var))
+                                    ));
+                                    // GLUE: NAME= + value is ONE word
+                                    // (`__ps_tmp0= '/tmp/…'` made bash run
+                                    // the path as a COMMAND)
+                                    let v = format!("({id} ? {id} : \"\")");
+                                    match buf {
+                                        CmdBuf::Shared => {
+                                            self.emit(&format!("_sh_add({v});"))
+                                        }
+                                        CmdBuf::Private(bid) => self.emit(&format!(
+                                            "_sh_badd(&_c{bid}_cmd, &_c{bid}_cap, {v});"
+                                        )),
+                                    }
+                                    continue;
+                                }
+                            }
+                            self.shell_assigned.insert(t.var.clone());
+                            // NAME=VALUE must be ONE word — `count= $(…)`
+                            // makes bash treat the assignment as an env
+                            // PREFIX for the next command (empty count)
+                            self.sh_raw(buf, &format!("{}=", t.var));
                             match expr {
                                 IrExpr::Arith(a) => {
                                     self.emit(&format!(
-                                        "_sh_addraw({});",
+                                        "_sh_add({});",
                                         Self::cstr(&format!("$(({}))", arith_shell(a)))
                                     ));
                                 }
+                                IrExpr::Str(s, _) => {
+                                    self.sh_add(buf, &Self::cstr(s));
+                                }
                                 _ => {
+                                    // glue the value to NAME= (no space)
+                                    self.glue_next_word = true;
                                     self.sh_word(buf, expr);
                                 }
                             }
                         }
                     }
                 }
-                IrStmt::If {
-                    cond,
-                    then,
-                    elsifs,
-                    else_,
-                } => {
+                IrStmt::If { cond, then, elsifs, else_ } => {
                     self.emit("_sh_addraw(\"if\");");
                     self.sh_stage_expr(buf, cond);
                     self.emit("_sh_addraw(\"; then\");");
@@ -2146,8 +2986,43 @@ impl Render {
                     self.sh_pipeline_text(buf, args);
                 }
                 IrStmt::Redirect { inner, redirects } => {
-                    self.sh_stage(buf, inner);
-                    self.sh_redirect_text(buf, redirects);
+                    // process-substitution temp: the producer's redirect
+                    // target is a `__ps_` var (the process_subst
+                    // transform's namespace) — a REGULAR file would make
+                    // an infinite producer never EOF (no SIGPIPE). Mirror
+                    // the perl backend: replace the file with a FIFO and
+                    // run the producer in the BACKGROUND — the consumer's
+                    // close gives the writer SIGPIPE and it dies.
+                    let ps_target = redirects.iter().find_map(|rd| {
+                        match (&rd.mode, &rd.target) {
+                            (m, IrExpr::Var(n, _))
+                                if (m == "w" || m == "a") && n.starts_with("__ps_") =>
+                            {
+                                Some(n.clone())
+                            }
+                            _ => None,
+                        }
+                    });
+                    if let Some(target) = ps_target {
+                        let tv = IrExpr::Var(target.clone(), None);
+                        self.sh_raw(buf, "rm -f");
+                        self.sh_word(buf, &tv);
+                        self.sh_raw(buf, ";");
+                        self.sh_raw(buf, "mkfifo");
+                        self.sh_word(buf, &tv);
+                        self.sh_raw(buf, ";");
+                        self.sh_raw(buf, "{");
+                        self.sh_raw(buf, "(");
+                        self.sh_stage(buf, inner);
+                        self.sh_raw(buf, ")");
+                        self.sh_raw(buf, ">");
+                        self.sh_word(buf, &tv);
+                        self.sh_raw(buf, "&");
+                        self.sh_raw(buf, "}");
+                    } else {
+                        self.sh_stage(buf, inner);
+                        self.sh_redirect_text(buf, redirects);
+                    }
                 }
                 IrStmt::Expr(IrExpr::Call { func, args }) if func == "redirect" => {
                     // a redirect CALL inside a stage: `cmd > f`
@@ -2220,9 +3095,11 @@ impl Render {
                 }
                 IrStmt::Expr(IrExpr::Call { func, args }) if func == "assign" => {
                     // `n=$(( ... ))` — the arith-assign call
-                    if let (Some(n), Some(op), Some(v)) =
-                        (Self::str_arg(args, 0), Self::str_arg(args, 1), args.get(2))
-                    {
+                    if let (Some(n), Some(op), Some(v)) = (
+                        Self::str_arg(args, 0),
+                        Self::str_arg(args, 1),
+                        args.get(2),
+                    ) {
                         self.sh_add(buf, &format!("{n}="));
                         if let IrExpr::Call { func: f2, args: a2 } = v {
                             if f2 == "arith" {
@@ -2256,27 +3133,187 @@ impl Render {
                     }
                     self.sh_add(buf, "; }");
                 }
-                IrStmt::Case {
-                    discriminant,
-                    clauses,
-                } => {
+                IrStmt::Case { discriminant, clauses } => {
                     // `case D in pat) body;; ... esac`
                     self.sh_raw(buf, "case");
                     self.sh_stage_expr(buf, discriminant);
                     self.sh_raw(buf, "in");
                     for cl in clauses {
-                        let pats = cl.patterns.join("|");
+                        let pats: Vec<String> =
+                            cl.patterns.iter().map(|p| strip_glob(p).to_string()).collect();
+                        let pats = pats.join("|");
                         self.sh_raw(buf, &format!("{pats})"));
                         self.sh_stage(buf, &cl.body);
                         self.sh_raw(buf, ";;");
                     }
                     self.sh_raw(buf, "esac");
                 }
+                IrStmt::Exec { cmd, args, capture, redirects, env } => {
+                    // the REAL Exec stmt node (the Call form is above):
+                    // env prefix, cmd word, args, then the redirects
+                    for (k, v) in env {
+                        let key = k.clone();
+                        let val = v.clone();
+                        self.sh_raw(buf, &key);
+                        self.sh_raw(buf, "=");
+                        self.sh_word(buf, &val);
+                    }
+                    self.sh_word(buf, cmd);
+                    for w in args {
+                        self.sh_word(buf, w);
+                    }
+                    if !redirects.is_empty() {
+                        self.sh_redirect_specs(buf, redirects);
+                    }
+                    let _ = capture;
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "and" || func == "or" => {
+                    // Call-form `A && B` — each Arrow is one side
+                    let joiner = if func == "and" { "&&" } else { "||" };
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.sh_raw(buf, joiner);
+                        }
+                        if let IrExpr::Arrow(stmts) = a {
+                            self.sh_stage(buf, stmts);
+                        }
+                    }
+                }
+                IrStmt::Block(body) => {
+                    // bash requires the `;` (or newline) before `}` —
+                    // `{ echo data }` is a syntax error; the `block`
+                    // CALL arm above already emits `; }`.
+                    self.sh_raw(buf, "{");
+                    self.sh_stage(buf, body);
+                    self.sh_raw(buf, "; }");
+                }
+                IrStmt::Continue => self.sh_add(buf, "continue"),
+                IrStmt::Break => self.sh_add(buf, "break"),
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "continue" => {
+                    self.sh_add(buf, "continue");
+                    let _ = args;
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "break" => {
+                    self.sh_add(buf, "break");
+                    let _ = args;
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "exit" => {
+                    let code = args
+                        .first()
+                        .map(|x| self.value_num(x))
+                        .unwrap_or_else(|| "0".into());
+                    self.sh_add(buf, &format!("exit {code}"));
+                }
+                IrStmt::Exit(e) => {
+                    let code = e
+                        .as_ref()
+                        .map(|x| self.value_num(x))
+                        .unwrap_or_else(|| "0".into());
+                    self.sh_add(buf, &format!("exit {code}"));
+                }
+                IrStmt::Expr(IrExpr::Call { func, args }) if func == "grepMatches" => {
+                    // grep -o PAT <<< text — the bash -c child gets the
+                    // ORIGINAL grep text (its own grep does the -o)
+                    if let (Some(text), Some(pat)) = (args.first(), args.get(1)) {
+                        let flags_s = match args.get(2) {
+                            Some(x) => Self::str_arg(&[x.clone()], 0).unwrap_or_default(),
+                            None => String::new(),
+                        };
+                        self.sh_raw(buf, "grep");
+                        let mut oflags = String::from("-o");
+                        for c in flags_s.chars() {
+                            if c == 'E' || c == 'i' || c == 'F' {
+                                oflags.push(c);
+                            }
+                        }
+                        self.sh_raw(buf, &oflags);
+                        self.sh_word(buf, pat);
+                        self.sh_raw(buf, "<<<");
+                        self.sh_word(buf, text);
+                    }
+                }
+                IrStmt::ForInit {
+                    init,
+                    cond,
+                    step,
+                    body,
+                } => {
+                    // c-style for as a real node: `for (( i=0; i<n; i++ ))`
+                    let mut init_parts: Vec<String> = Vec::new();
+                    for s in init {
+                        if let IrStmt::Assign {
+                            expr: IrExpr::Arith(a),
+                            ..
+                        } = s
+                        {
+                            init_parts.push(arith_shell(a));
+                        }
+                    }
+                    let mut step_parts: Vec<String> = Vec::new();
+                    for s in step {
+                        if let IrStmt::Assign {
+                            expr: IrExpr::Arith(a),
+                            ..
+                        } = s
+                        {
+                            step_parts.push(arith_shell(a));
+                        }
+                    }
+                    let cond_s = match cond {
+                        IrExpr::Call { args, .. } => match args.get(1) {
+                            Some(IrExpr::Array(items)) => match items.first() {
+                                Some(IrExpr::Str(t, _)) => t.clone(),
+                                _ => String::new(),
+                            },
+                            _ => String::new(),
+                        },
+                        _ => String::new(),
+                    };
+                    self.sh_add(
+                        buf,
+                        &format!(
+                            "for (( {}; {cond_s}; {} )); do",
+                            init_parts.join(", "),
+                            step_parts.join(", ")
+                        ),
+                    );
+                    self.sh_stage(buf, body);
+                    self.sh_add(buf, "; done");
+                }
+                IrStmt::Declare { vars, init, .. } => {
+                    // `local x=...` / `declare x=...` inside staged text:
+                    // `local` outside a function is a bash ERROR, so emit
+                    // the plain assignment (`x=value`); a bare `local x`
+                    // (no init) is a no-op — emit `:` so the stage stays
+                    // a valid command
+                    if let Some(t) = vars.first() {
+                        self.sh_raw(buf, &format!("{} =", t.name));
+                        match init {
+                            Some(e) => self.sh_word(buf, e),
+                            None => self.sh_raw(buf, ":"),
+                        }
+                    }
+                }
+                IrStmt::Pipeline { stages, capture, .. } => {
+                    // `cmd1 | cmd2 | …` as a capture body: emit each stage
+                    // (a list of stmts) joined by `|`. A captured pipeline
+                    // is `$(…)`-substituted by the caller; the stages
+                    // themselves reconstruct to shell text like the other
+                    // stmt arms.
+                    let _ = capture;
+                    for (i, stage) in stages.iter().enumerate() {
+                        if i > 0 {
+                            self.sh_raw(buf, "|");
+                        }
+                        self.sh_stage(buf, stage);
+                    }
+                }
                 _ => {
                     self.mark_todo(&format!("capture body stmt {:?}", s));
                 }
             }
         }
+        self.stage_assigned = saved_assigned;
     }
 
     /// Reconstruct the shell text of a for-iterable (`in <iter>`).
@@ -2317,15 +3354,9 @@ impl Render {
                 let idx = Self::str_arg(args, 2).unwrap_or_default();
                 if idx == "@" || idx == "*" {
                     if let Some(keys) = name.strip_prefix('!') {
-                        self.emit(&format!(
-                            "_sh_addraw({});",
-                            Self::cstr(&format!("${{!{keys}[@]}}"))
-                        ));
+                        self.emit(&format!("_sh_addraw({});", Self::cstr(&format!("${{!{keys}[@]}}"))));
                     } else {
-                        self.emit(&format!(
-                            "_sh_addraw({});",
-                            Self::cstr(&format!("${{{name}[@]}}"))
-                        ));
+                        self.emit(&format!("_sh_addraw({});", Self::cstr(&format!("${{{name}[@]}}"))));
                     }
                 }
             }
@@ -2343,10 +3374,7 @@ impl Render {
                 self.emit("_sh_addraw(\")\");");
             }
             IrExpr::Range { start, end } => {
-                self.emit(&format!(
-                    "_sh_addraw({});",
-                    Self::cstr(&format!("$(seq {} {})", start, end))
-                ));
+                self.emit(&format!("_sh_addraw({});", Self::cstr(&format!("$(seq {} {})", start, end))));
             }
             other => {
                 self.mark_todo(&format!("stage iter {:?}", other));
@@ -2399,13 +3427,10 @@ impl Render {
                 }
             }
             IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
-                self.sh_stage(
-                    buf,
-                    &[IrStmt::Expr(IrExpr::Call {
-                        func: func.clone(),
-                        args: args.clone(),
-                    })],
-                );
+                self.sh_stage(buf, &[IrStmt::Expr(IrExpr::Call {
+                    func: func.clone(),
+                    args: args.clone(),
+                })]);
             }
             IrExpr::Call { func, args } if func == "redirect" => {
                 if let Some(IrExpr::Arrow(stmts)) = args.first() {
@@ -2423,7 +3448,13 @@ impl Render {
                     } else {
                         self.store_read(&n)
                     };
-                    self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
+                    // child-owned vars: export only the FIRST reference's
+                    // entry value (see stage_assigned / site_exported)
+                    if !self.stage_assigned.contains(&n)
+                        || self.site_exported.insert(n.clone())
+                    {
+                        self.emit(&format!("_sh_export({}, {v});", Self::cstr(&n)));
+                    }
                     self.sh_add(buf, &format!("${n}"));
                 }
             }
@@ -2439,6 +3470,36 @@ impl Render {
                 self.sh_stage_expr(buf, lhs);
                 self.sh_raw(buf, opstr);
                 self.sh_stage_expr(buf, rhs);
+            }
+            IrExpr::Call { func, args } if func == "pipeline" => {
+                self.sh_pipeline_text(buf, args);
+            }
+            IrExpr::Call { func, args } if func == "block" => {
+                if let Some(IrExpr::Arrow(stmts)) = args.first() {
+                    self.sh_stage(buf, stmts);
+                }
+            }
+            IrExpr::Call { func, args } if func == "and" || func == "or" => {
+                let joiner = if func == "and" { "&&" } else { "||" };
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        self.sh_raw(buf, joiner);
+                    }
+                    if let IrExpr::Arrow(stmts) = a {
+                        self.sh_stage(buf, stmts);
+                    }
+                }
+            }
+            IrExpr::Call { func, args } if func == "whileLoop" => {
+                if let (Some(IrExpr::Arrow(cond)), Some(IrExpr::Arrow(body))) =
+                    (args.first(), args.get(1))
+                {
+                    self.emit("_sh_addraw(\"while\");");
+                    self.sh_stage(buf, cond);
+                    self.emit("_sh_addraw(\"; do\");");
+                    self.sh_stage(buf, body);
+                    self.emit("_sh_addraw(\"; done\");");
+                }
             }
             _ => {
                 self.mark_todo(&format!("stage cond {:?}", e));
@@ -2458,21 +3519,49 @@ impl Render {
                     j += 1;
                 }
                 let name: String = chars[i + 1..j].iter().collect();
-                if self.var_types.contains_key(&name) || self.store.contains(&name) {
-                    if self.is_num(&name) {
-                        let t = self.num_temp(&self.c_ident(&name));
-                        self.emit(&format!("_sh_export({}, {t});", Self::cstr(&name)));
-                    } else {
-                        self.emit(&format!(
-                            "_sh_export({}, {});",
-                            Self::cstr(&name),
-                            self.store_ref(&name)
-                        ));
-                    }
-                }
+                self.export_one(&name);
                 i = j;
             } else {
                 i += 1;
+            }
+        }
+        // BARE identifier refs (`(( count + 1 ))` — the arith texts the
+        // core emits without `$`) — export the known vars
+        let mut k = 0;
+        while k < chars.len() {
+            let c = chars[k];
+            if c.is_ascii_alphabetic() || c == '_' {
+                let mut j = k;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let name: String = chars[k..j].iter().collect();
+                self.export_one(&name);
+                k = j;
+            } else {
+                k += 1;
+            }
+        }
+    }
+
+    /// `_sh_export("name", value)` for a program var (numeric vars via
+    /// their string form).
+    fn export_one(&mut self, name: &str) {
+        if self.shell_assigned.contains(name) {
+            // the current command text already assigns this var — the
+            // child's own value is authoritative
+            return;
+        }
+        if self.var_types.contains_key(name) || self.store.contains(name) {
+            if self.is_num(name) {
+                let t = self.num_temp(&self.c_ident(name));
+                self.emit(&format!("_sh_export({}, {t});", Self::cstr(name)));
+            } else {
+                self.emit(&format!(
+                    "_sh_export({}, {});",
+                    Self::cstr(name),
+                    self.store_ref(name)
+                ));
             }
         }
     }
@@ -2509,6 +3598,86 @@ impl Render {
         }
     }
 
+    /// `$( raw shell text )` inside an interpolated heredoc: run it in a
+    /// child bash (the referenced variables are exported first) and
+    /// capture stdout. This is the one genuinely unavoidable shell-out —
+    /// arbitrary command substitution text has no native C lowering.
+    fn capture_text_c(&mut self, cmd: &str) -> String {
+        let cmd = cmd.to_string();
+        self.cap_site(|r, id| {
+            r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
+            r.sh_export_vars(&cmd);
+            r.emit(&format!(
+                "_sh_capture(buf, sizeof buf, {});",
+                Self::cstr(&cmd)
+            ));
+            r.emit("return buf;");
+        })
+    }
+
+    /// An unquoted heredoc body's C value expression. The core delivers
+    /// the RAW text (`IrRedirect.target` is a plain `Str`,
+    /// `interpolate: true`) — expand it at render time via
+    /// [`split_heredoc_body`]: literals + getVar/param/native-arith
+    /// segments snprintf into a temp; `$(...)`/backtick segments run in
+    /// child bash ([`Render::capture_text_c`]). Unmodeled bodies stay
+    /// literal (the previous behavior).
+    fn heredoc_body_c(&mut self, target: &IrExpr) -> String {
+        let IrExpr::Str(s, _) = target else {
+            return self.value_c(target);
+        };
+        let Some(segs) = split_heredoc_body(s) else {
+            return Self::cstr(s);
+        };
+        if segs.len() == 1 {
+            if let HdSeg::Lit(l) = &segs[0] {
+                return Self::cstr(l);
+            }
+        }
+        let mut fmt = String::new();
+        let mut cargs: Vec<String> = Vec::new();
+        for seg in &segs {
+            match seg {
+                HdSeg::Lit(t) => fmt.push_str(&t.replace('%', "%%")),
+                HdSeg::Var(name) => {
+                    fmt.push_str("%s");
+                    cargs.push(self.value_c(&IrExpr::Call {
+                        func: "getVar".to_string(),
+                        args: vec![IrExpr::Str(
+                            name.clone(),
+                            crate::ir::StrStyle::DoubleQuoted,
+                        )],
+                    }));
+                }
+                HdSeg::Param(args) => {
+                    fmt.push_str("%s");
+                    cargs.push(self.param_call(args));
+                }
+                HdSeg::Arith(a) => {
+                    fmt.push_str("%lld");
+                    // the arith() expression may be plain-int C — the
+                    // varargs promotion needs an explicit long long
+                    cargs.push(format!("(long long)({})", self.arith(a)));
+                }
+                HdSeg::Cmd(cmd) => {
+                    fmt.push_str("%s");
+                    cargs.push(self.capture_text_c(cmd));
+                }
+            }
+        }
+        let t = self.str_temp(4096);
+        let args = if cargs.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", cargs.join(", "))
+        };
+        self.emit(&format!(
+            "snprintf({t}, sizeof {t}, {}{args});",
+            Self::cstr(&fmt)
+        ));
+        t
+    }
+
     /// Append the redirect text (`> f`, `>> f`, `< f`, heredoc, ...).
     fn sh_redirect_text(&mut self, buf: CmdBuf, redirects: &[crate::ir::IrRedirect]) {
         let raw = |r: &mut Render, s: &str| match buf {
@@ -2528,42 +3697,86 @@ impl Render {
         // append a C EXPRESSION value (already a string literal / temp)
         let addv = |r: &mut Render, v: &str| match buf {
             CmdBuf::Shared => r.emit(&format!("_sh_add({v});")),
-            CmdBuf::Private(id) => r.emit(&format!("_sh_badd(&_c{id}_cmd, &_c{id}_cap, {v});")),
+            CmdBuf::Private(id) => {
+                r.emit(&format!("_sh_badd(&_c{id}_cmd, &_c{id}_cap, {v});"))
+            }
         };
-        for rd in redirects {
+        // heredoc/herestring bodies are multi-line: their terminator line
+        // must be ALONE on its line, so file redirects (`> f`) render
+        // BEFORE them — `cat <<EOF > f` would otherwise put `> f` after
+        // the terminator and bash never sees the end of the body
+        // (heredoc-with-redirect-same-line)
+        let (heres, others): (Vec<&crate::ir::IrRedirect>, Vec<&crate::ir::IrRedirect>) =
+            redirects.iter().partition(|rd| {
+                matches!(rd.mode.as_str(), "heredoc" | "heredoc-tabs" | "herestring")
+            });
+        for rd in others.into_iter().chain(heres) {
             let mode = rd.mode.as_str();
             let fd = rd.fd.unwrap_or(1);
-            let _fd_pre = if fd == 1 {
-                String::new()
-            } else {
-                format!("{fd}")
-            };
+            let fd_pre = if fd == 1 { String::new() } else { format!("{fd}") };
             match mode {
                 "w" => {
-                    raw(self, ">");
+                    // `2>&1` — the target is a fd reference: no quoting
+                    // (a quoted `'&1'` would name a file)
+                    if let crate::ir::IrExpr::Str(t, _) = &rd.target {
+                        if t.starts_with('&') {
+                            raw(self, &format!("{fd_pre}>"));
+                            add(self, t); // NO leading space: `2>&1`
+                            continue;
+                        }
+                    }
+                    raw(self, &format!("{fd_pre}>"));
+                    self.sh_word(buf, &rd.target);
+                }
+                "wc" => {
+                    // `>|` — clobber, ignoring set -C
+                    raw(self, &format!("{fd_pre}>|"));
                     self.sh_word(buf, &rd.target);
                 }
                 "a" => {
-                    raw(self, ">>");
+                    raw(self, &format!("{fd_pre}>>"));
                     self.sh_word(buf, &rd.target);
                 }
                 "r" | "r+" => {
-                    raw(self, "<");
+                    raw(self, &format!("{fd_pre}<"));
                     self.sh_word(buf, &rd.target);
                 }
                 "heredoc" | "heredoc-tabs" => {
-                    // target = the body content (already interpolated by
-                    // the core); a quoted delimiter keeps it literal.
+                    // target = the body content. An UNQUOTED-delimiter
+                    // heredoc (interpolate = true) must expand $vars and
+                    // $(cmd) — export the vars the body mentions and let
+                    // the child bash interpolate (the quoted form keeps
+                    // everything literal: 079_heredoc_interpolation).
+                    if rd.interpolate && !matches!(&rd.target, IrExpr::Str(s, _) if !s.contains('$'))
+                    {
+                        if let IrExpr::Str(text, _) = &rd.target {
+                            self.sh_export_vars(text);
+                        }
+                        raw(self, "<<_SH2EOF_\n");
+                        let v = self.value_c(&rd.target);
+                        addv(self, &v);
+                        self.emit(&format!(
+                            "{{ size_t _hl = strlen({v}); if (_hl == 0 || {v}[_hl - 1] != '\\n') _sh_add(\"\\n\"); }}"
+                        ));
+                        add(self, "_SH2EOF_");
+                        self.heredoc_nl = true;
+                        continue;
+                    }
                     // `<<-` strips leading tabs from content + delimiter
                     // (the tab-stripped content arrives pre-stripped from
                     // the core; the delimiter line uses the same form)
                     raw(self, "<<'_SH2EOF_'\n");
-                    let v = self.value_c(&rd.target);
+                    let v = if rd.interpolate {
+                        self.heredoc_body_c(&rd.target)
+                    } else {
+                        self.value_c(&rd.target)
+                    };
                     addv(self, &v);
                     self.emit(&format!(
                         "{{ size_t _hl = strlen({v}); if (_hl == 0 || {v}[_hl - 1] != '\\n') _sh_add(\"\\n\"); }}"
                     ));
                     add(self, "_SH2EOF_");
+                    self.heredoc_nl = true;
                 }
                 "herestring" => {
                     raw(self, "<<<");
@@ -2589,6 +3802,12 @@ impl Render {
     /// Append a pipeline call's stage text (`a | b | c`).
     fn sh_pipeline_text(&mut self, buf: CmdBuf, args: &[IrExpr]) {
         let mut first = true;
+        // heredoc bodies attached to pipeline stages: bash reads the
+        // body from the lines FOLLOWING the whole pipeline line, while
+        // the `<<DELIM` marker stays attached to its own stage. Emit
+        // markers inline, defer every body to after the line.
+        let mut deferred: Vec<String> = Vec::new();
+        let mut first = true;
         if let Some(IrExpr::Array(items)) = args.first() {
             for it in items {
                 if let IrExpr::Arrow(stmts) = it {
@@ -2596,9 +3815,112 @@ impl Render {
                         self.sh_raw(buf, "|");
                     }
                     first = false;
-                    self.sh_stage(buf, stmts);
+                    let mut spec_redirect = |specs: &[IrExpr],
+                                             inner: &Vec<IrStmt>,
+                                             deferred: &mut Vec<String>,
+                                             buf: CmdBuf,
+                                             r: &mut Render|
+                     -> Vec<IrStmt> {
+                        let mut kept: Vec<IrExpr> = Vec::new();
+                        let mut all_heredoc = true;
+                        for sp in specs {
+                            if let IrExpr::Object(fields) = sp {
+                                let mut mode = String::new();
+                                let mut target =
+                                    IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted);
+                                let mut interpolate = true;
+                                for (k, v) in fields {
+                                    match k.as_str() {
+                                        "mode" => {
+                                            mode =
+                                                Self::str_arg(&[v.clone()], 0).unwrap_or_default();
+                                        }
+                                        "target" => target = v.clone(),
+                                        "interpolate" => {
+                                            if let IrExpr::Bool(b) = v {
+                                                interpolate = *b;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if matches!(mode.as_str(), "heredoc" | "heredoc-tabs") {
+                                    // inline marker, deferred body
+                                    r.sh_raw(buf, "<<'_SH2EOF_'");
+                                    let v = if interpolate {
+                                        r.heredoc_body_c(&target)
+                                    } else {
+                                        r.value_c(&target)
+                                    };
+                                    deferred.push(v);
+                                    continue;
+                                }
+                                all_heredoc = false;
+                            }
+                            kept.push(sp.clone());
+                        }
+                        if all_heredoc && !specs.is_empty() && kept.is_empty() {
+                            inner.clone()
+                        } else if kept.len() != specs.len() {
+                            vec![IrStmt::Expr(IrExpr::Call {
+                                func: "redirect".to_string(),
+                                args: vec![IrExpr::Arrow(inner.clone()), IrExpr::Array(kept)],
+                            })]
+                        } else {
+                            vec![IrStmt::Expr(IrExpr::Call {
+                                func: "redirect".to_string(),
+                                args: vec![
+                                    IrExpr::Arrow(inner.clone()),
+                                    IrExpr::Array(specs.to_vec()),
+                                ],
+                            })]
+                        }
+                    };
+                    let cleaned: Vec<IrStmt> = stmts
+                        .iter()
+                        .flat_map(|s| match s {
+                            IrStmt::Redirect { inner, redirects } => {
+                                let specs: Vec<IrExpr> = redirects
+                                    .iter()
+                                    .map(|rd| {
+                                        IrExpr::Object(vec![
+                                            (
+                                                "fd".to_string(),
+                                                IrExpr::Int(rd.fd.unwrap_or(0) as i64),
+                                            ),
+                                            ("mode".to_string(), IrExpr::Str(rd.mode.clone(), crate::ir::StrStyle::DoubleQuoted)),
+                                            ("target".to_string(), rd.target.clone()),
+                                            ("interpolate".to_string(), IrExpr::Bool(rd.interpolate)),
+                                        ])
+                                    })
+                                    .collect();
+                                spec_redirect(&specs, inner, &mut deferred, buf, self)
+                            }
+                            IrStmt::Expr(IrExpr::Call { func, args })
+                                if func == "redirect" =>
+                            {
+                                match (args.first(), args.get(1)) {
+                                    (Some(IrExpr::Arrow(inner)), Some(IrExpr::Array(specs))) => {
+                                        spec_redirect(specs, inner, &mut deferred, buf, self)
+                                    }
+                                    _ => vec![s.clone()],
+                                }
+                            }
+                            other => vec![other.clone()],
+                        })
+                        .collect();
+                    self.sh_stage(buf, &cleaned);
                 }
             }
+        }
+        // bodies follow the whole pipeline line, one block per marker
+        for v in &deferred {
+            self.emit("_sh_add(\"\\n\");");
+            self.emit(&format!("_sh_add({v});"));
+            self.emit(&format!(
+                "{{ size_t _hl = strlen({v}); if (_hl == 0 || {v}[_hl - 1] != '\\n') _sh_add(\"\\n\"); }}"
+            ));
+            self.emit(&format!("_sh_add({});", Self::cstr("_SH2EOF_\n")));
         }
     }
 
@@ -2617,7 +3939,24 @@ impl Render {
                 // (a split word would collapse whitespace in bash)
                 if words.iter().all(|w| self.echo_native_ok(w)) {
                     let mut parts = Vec::new();
+                    let mut skip_nl = false;
+                    let mut saw_e = false;
                     if let Some(IrExpr::Array(items)) = args.get(1) {
+                        // consume the -n/-e/-E flags (bash echo builtin)
+                        let mut items: Vec<&IrExpr> = items.iter().collect();
+                        while let Some(IrExpr::Str(fl, _)) = items.first().copied() {
+                            if fl == "-n" {
+                                skip_nl = true;
+                                items.remove(0);
+                            } else if fl == "-e" {
+                                saw_e = true;
+                                items.remove(0);
+                            } else if fl == "-E" {
+                                items.remove(0);
+                            } else {
+                                break;
+                            }
+                        }
                         for (i, item) in items.iter().enumerate() {
                             if i > 0 {
                                 parts.push(Part::Lit(" ".to_string()));
@@ -2625,7 +3964,32 @@ impl Render {
                             parts.extend(self.parts_of(item));
                         }
                     }
-                    parts.push(Part::Lit("\n".to_string()));
+                    if !skip_nl {
+                        parts.push(Part::Lit("\n".to_string()));
+                    }
+                    // -e interprets backslash escapes in LITERAL text
+                    // (`\n=== Example 2` printed the raw "\n")
+                    if saw_e {
+                        let mut np: Vec<Part> = Vec::new();
+                        let mut stopped = false;
+                        for pt in parts {
+                            match pt {
+                                Part::Lit(t) => match unescape_echo_e(&t) {
+                                    Some(u) => np.push(Part::Lit(u)),
+                                    None => {
+                                        // \c — stop output, no newline
+                                        stopped = true;
+                                        break;
+                                    }
+                                },
+                                other => np.push(other),
+                            }
+                        }
+                        parts = np;
+                        if stopped {
+                            skip_nl = true;
+                        }
+                    }
                     // `$?` inside the args must be read BEFORE the
                     // `_sh_rc = 0` below clobbers it — pre-capture
                     let has_rc = parts.iter().any(|pt| match pt {
@@ -2648,7 +4012,30 @@ impl Render {
                 }
                 self.shell_exec(args)
             }
-            "printf" => self.shell_exec(args),
+            "printf" => {
+                // native printf for the safe format subset (%s/%d/%% etc.),
+                // falling back to shell-out for bash-specific conversions
+                // (%b, %q, %(…)T, \c, recycling) — favour native C
+                if matches!(words.first(), Some(IrExpr::Str(s, _)) if s == "-v") {
+                    if let (Some(v), Some(fmtw)) = (words.get(1), words.get(2)) {
+                        if let Some(name) = Self::str_arg(&[(*v).clone()], 0) {
+                            let rest: Vec<&IrExpr> = words.iter().skip(2).copied().collect();
+                            if let Some(p) = self.try_native_printf_into(&rest, Some(&self.c_ident(&name))) {
+                                self.store.insert(name.clone());
+                                self.need_sh = true;
+                                return format!("(_sh_rc = 0, {p})");
+                            }
+                        }
+                        let _ = fmtw;
+                    }
+                }
+                if let Some(p) = self.try_native_printf(&words) {
+                    self.need_sh = true;
+                    format!("(_sh_rc = 0, {p})")
+                } else {
+                    self.shell_exec(args)
+                }
+            }
             "cd" => {
                 let dir = match words.first() {
                     Some(w) => self.value_c(w),
@@ -2696,7 +4083,9 @@ impl Render {
                                 self.arrays.insert(var.clone());
                                 let id = self.c_ident(&var);
                                 if let Ok(i) = key.parse::<i64>() {
-                                    self.emit(&format!("if ({i} < {id}_len) {id}[{i}] = 0;"));
+                                    self.emit(&format!(
+                                        "if ({i} < {id}_len) {id}[{i}] = 0;"
+                                    ));
                                 }
                                 continue;
                             }
@@ -2721,12 +4110,55 @@ impl Render {
                 }
                 "(_sh_rc = 0, 1)".into()
             }
-            "set" | "shift" => {
-                // set -euo pipefail etc. → no-op (errexit is not
-                // implemented; the corpus scripts succeed under it);
-                // `set -- args` / shift mutate positionals (not tracked)
+            "set" => {
+                // `set -- args...` — set the positional params ($1..).
+                // Other set flags (-euo pipefail...) are no-ops (errexit
+                // is not implemented; the corpus succeeds under it). The
+                // values are computed BEFORE the swap (they may read the
+                // old $N — `set -- "$1" ...`).
+                if let Some(IrExpr::Str(s, _)) = words.first() {
+                    if s.trim() == "--" {
+                        self.need_sh = true;
+                        let n = words.len() - 1;
+                        let av = format!("_sh_av{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!("char *{av}[{}];", n + 1));
+                        self.emit(&format!(
+                            "{av}[0] = (_sh_argc > 0 && _sh_argv[0]) ? _sh_argv[0] : \"\";"
+                        ));
+                        let sk = format!("_sk{}", self.temp_seq);
+                        self.temp_seq += 1;
+                        self.emit(&format!("int {sk} = 1;"));
+                        for w in words.iter().skip(1) {
+                            // a `${@:off}` slice beyond the positional
+                            // count expands to ZERO words (the bash quirk
+                            // parse-at-slice-param pins) — guard the append
+                            let guard = self.param_slice_zero_word_guard(w);
+                            let v = self.value_c(w);
+                            match guard {
+                                Some(g) => self.emit(&format!(
+                                    "if ({g}) {{ {av}[{sk}++] = strdup({v}); }}"
+                                )),
+                                None => self.emit(&format!("{av}[{sk}++] = strdup({v});")),
+                            }
+                        }
+                        self.emit(&format!("_sh_argv = {av}; _sh_argc = {sk};"));
+                        return "(_sh_rc = 0, 1)".into();
+                    }
+                }
                 self.need_sh = true;
                 "(_sh_rc = 0, 1)".into()
+            }
+            "shift" => {
+                // `shift [n]` — drop the first n positionals ($0 stays)
+                self.need_sh = true;
+                let n = match words.first() {
+                    Some(w) => self.value_num(w),
+                    None => "1".into(),
+                };
+                format!(
+                    "{{ long long _sn = {n}; if (_sn < 0) _sn = 0; if (_sn > (long long)(_sh_argc - 1)) _sn = _sh_argc - 1; for (long long _si = 1; _si + _sn < _sh_argc; _si++) _sh_argv[_si] = _sh_argv[_si + _sn]; _sh_argc -= (int)_sn; _sh_rc = 0; (_sh_rc == 0); }}"
+                )
             }
             "sleep" => {
                 let v = match words.first() {
@@ -2735,7 +4167,9 @@ impl Render {
                 };
                 self.need_sh = true;
                 self.need_time = true;
-                format!("({{ int _r = _sh_sleep({v}); _sh_rc = (_r == 0 ? 0 : 1); _r == 0; }})")
+                format!(
+                    "({{ int _r = _sh_sleep({v}); _sh_rc = (_r == 0 ? 0 : 1); _r == 0; }})"
+                )
             }
             "read" => {
                 // `read [-r] var...` — read a line into the first var
@@ -2757,7 +4191,9 @@ impl Render {
                 let id = self.c_ident(&target);
                 self.store.insert(target.clone());
                 self.emit(&format!("{id} = _sh_readline();"));
-                format!("({{ int _r = ({id}[0] ? 0 : 1); _sh_rc = _r; _r == 0; }})")
+                format!(
+                    "({{ int _r = ({id}[0] ? 0 : 1); _sh_rc = _r; _r == 0; }})"
+                )
             }
             "let" => {
                 if let Some(IrExpr::Array(items)) = args.get(1) {
@@ -2769,6 +4205,10 @@ impl Render {
                                 "({{ long long _r = ({c}); _sh_rc = (_r != 0 ? 0 : 1); _r != 0; }})"
                             );
                         }
+                        // a dynamic text (parameter expansions, arrays):
+                        // run `(( text ))` as a shell site — a
+                        // constant-true fallback would spin the loop
+                        return self.arith_string_site(expr);
                     }
                 }
                 self.need_sh = true;
@@ -2791,14 +4231,11 @@ impl Render {
                     let v = self.value_c(w);
                     self.emit(&format!("{av}[{}] = {v};", i + 1));
                 }
-                self.emit(&format!(
-                    "char **{sv} = _sh_argv; int _sh_sc{} = _sh_argc;",
-                    self.temp_seq
-                ));
+                self.emit(&format!("char **{sv} = _sh_argv; int _sh_sc{} = _sh_argc;", self.temp_seq));
                 self.temp_seq += 1;
                 self.emit(&format!("_sh_argv = {av}; _sh_argc = {};", n));
                 format!(
-                    "({}(), _sh_argv = {sv}, _sh_argc = _sh_sc{}, _sh_rc)",
+                    "({}(), _sh_argv = {sv}, _sh_argc = _sh_sc{}, _sh_rc == 0)",
                     self.c_ident(&cmd),
                     self.temp_seq - 1
                 )
@@ -2811,7 +4248,55 @@ impl Render {
     fn declare_words(&mut self, words: &[&IrExpr]) {
         let mut i = 0;
         while i < words.len() {
+            // `declare -a arr=(1 2)` — the core passes the literal as a
+            // nested setArray call word (`declare -a` + setArray("arr",
+            // [1, 2], false)); apply it like a plain assignment.
+            if let IrExpr::Call { func, args } = words[i] {
+                if matches!(func.as_str(), "setArray" | "setArrayAppend") {
+                    if let Some(name) = Self::str_arg(args, 0) {
+                        let name_c = name.clone();
+                        // emit_set_array takes the FULL args (name at 0,
+                        // items at 1, assoc Bool at 2) — no shift
+                        if func == "setArray" {
+                            self.emit_set_array(&name_c, args);
+                        } else {
+                            self.emit_set_array_append(&name_c, args);
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
             if let Some(ws) = Self::str_arg(&[(*words[i]).clone()], 0) {
+                // bare `export NAME` / `export arr` (no '='): sync the
+                // CURRENT value into the environment — children ($ENV in
+                // perl, _sh_export'd refs) must see it
+                if !ws.contains('=') && is_ident(&ws) {
+                    let id = self.c_ident(&ws);
+                    if self.is_num(&ws) {
+                        self.emit(&format!(
+                            "{{ char _b[32]; snprintf(_b, sizeof _b, \"%lld\", (long long)({id})); setenv(\"{ws}\", _b, 1); }}"
+                        ));
+                    } else if self.arrays.contains(&ws) || self.assoc_arrays.contains(&ws) {
+                        // arrays cannot cross exec — skip
+                    } else {
+                        // a const-lifted var: reference the C ident —
+                        // reading getenv here would (a) miss the value and
+                        // (b) let unused-decl cleanup drop the lifted
+                        // declaration entirely
+                        let v = if self.const_lifted.contains(&ws) {
+                            self.c_ident(&ws)
+                        } else {
+                            self.store_read(&ws)
+                        };
+                        self.emit(&format!(
+                            "setenv({}, {v} ? {v} : \"\", 1);",
+                            Self::cstr(&ws)
+                        ));
+                    }
+                    i += 1;
+                    continue;
+                }
                 if let Some((name, val)) = ws.split_once('=') {
                     if !name.is_empty()
                         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -2846,7 +4331,8 @@ impl Render {
                             }
                         } else if val.contains('$') {
                             // `local n=$1` — the core keeps the source text
-                            let v = self.dollar_text_value(val).unwrap_or_else(|| "\"\"".into());
+                            let v =
+                                self.dollar_text_value(val).unwrap_or_else(|| "\"\"".into());
                             if let Some(b) = self.buf_bound(name) {
                                 self.emit_guarded_copy(&id, b, &v);
                             } else {
@@ -2869,17 +4355,11 @@ impl Render {
     /// brace-multiword, no capture in shell-out-requiring position)?
     fn echo_native_ok(&self, w: &IrExpr) -> bool {
         match w {
-            IrExpr::Str(_, _)
-            | IrExpr::Int(_)
-            | IrExpr::Var(_, _)
-            | IrExpr::Ident(_)
-            | IrExpr::Arith(_)
-            | IrExpr::BinOp { .. }
-            | IrExpr::Bool(_) => true,
-            IrExpr::Call { func, .. } => !matches!(
-                func.as_str(),
-                "split" | "capture" | "captureWords" | "pipeline"
-            ),
+            IrExpr::Str(_, _) | IrExpr::Int(_) | IrExpr::Var(_, _) | IrExpr::Ident(_)
+            | IrExpr::Arith(_) | IrExpr::BinOp { .. } | IrExpr::Bool(_) => true,
+            IrExpr::Call { func, .. } => {
+                !matches!(func.as_str(), "split" | "capture" | "captureWords" | "pipeline")
+            }
             IrExpr::Interpolate(parts) => parts.iter().all(|p| match p {
                 InterpPart::Lit(_) => true,
                 InterpPart::Expr(x) => match x.as_ref() {
@@ -2916,12 +4396,76 @@ impl Render {
         })
     }
 
+    /// `$(...)` — a raw Capture node (ShIR JSON round-trip): render the
+    /// wrapped Arrow body as a command and capture its stdout (the
+    /// runtime `_sh_capture` strips trailing newlines, bash semantics).
+    fn capture_expr(&mut self, expr: &IrExpr) -> String {
+        let expr = expr.clone();
+        self.cap_site(|r, id| {
+            r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
+            if let IrExpr::Arrow(stmts) = &expr {
+                r.sh_stage(CmdBuf::Private(id), stmts);
+            } else {
+                r.mark_todo(&format!("capture expr {:?}", expr));
+            }
+            r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
+            r.emit("return buf;");
+        })
+    }
+
+    /// The core keeps `${x:-\"word\"}` defaults/replacements as RAW
+    /// TEXT (quote chars included); bash strips the quotes during word
+    /// expansion — emit the unquoted literal. A non-Str arg (a $var
+    /// default) renders as its value.
+    fn default_word(&mut self, x: &IrExpr) -> String {
+        if let IrExpr::Str(s, _) = x {
+            // a default carrying `$var`/`${...}` EXPANDS at runtime
+            // (${MOUNTPOINT:-${NAME}} → the NAME value) — render it like
+            // an unquoted heredoc body instead of the literal text
+            if s.contains('$') {
+                return self.heredoc_body_c(x);
+            }
+            let t = s.trim();
+            let chars: Vec<char> = t.chars().collect();
+            if chars.len() >= 2
+                && ((chars[0] == '"' && chars[chars.len() - 1] == '"')
+                    || (chars[0] == '\'' && chars[chars.len() - 1] == '\''))
+            {
+                let inner: String = chars[1..chars.len() - 1].iter().collect();
+                return Self::cstr(&inner);
+            }
+            Self::cstr(t)
+        } else {
+            self.value_c(x)
+        }
+    }
+
+
+    /// A numeric operand that may be RAW TEXT carrying `$var` refs
+    /// (`${s:$i:1}` arrives with the offset as Str("$i")) — expand the
+    /// text like an unquoted heredoc body, then atoll() it.
+    fn value_num_dollar(&mut self, x: &IrExpr) -> String {
+        if let IrExpr::Str(s, _) = x {
+            if s.contains('$') {
+                let v = self.heredoc_body_c(x);
+                // RAW numeric expr — num_temp would stringify it back
+                // into a char* buffer
+                return format!("(long long)atoll({v})");
+            }
+        }
+        self.value_num(x)
+    }
+
     /// A shell-out exec site (statement or expr position).
     fn shell_exec(&mut self, args: &[IrExpr]) -> String {
+        let arr_inits = self.array_inits_for_args(&args);
         let args = args.to_vec();
         self.shell_site(
-            |r| {
+            move |r| {
                 r.emit("_sh_reset();");
+                for l in &arr_inits {
+                    r.emit(l);
+                }
                 if let Some(cmd) = Self::str_arg(&args, 0) {
                     r.sh_word(
                         CmdBuf::Shared,
@@ -2940,6 +4484,294 @@ impl Render {
 
     /// `(( expr ))` as a site: export the vars, run `(( expr ))` via
     /// bash -c; return the INVERTED rc (bash rc==0 ⟺ value nonzero).
+    /// A raw `(( ... ))` text — try NATIVE evaluation first (parse_arith
+    /// → the typed C arith renderer: no fork/exec emulation); fall back
+    /// to the child-bash site only for texts the parser cannot handle.
+    /// Positional/special params are substituted textually first (bash
+    /// expands them before the arithmetic parses).
+    fn arith_text(&mut self, s: &str) -> String {
+        let pre = Self::arith_subst_specials(s);
+        if let Some(ast) = crate::shir::parse_arith(&pre) {
+            if Self::arith_has_side_effects(&ast) {
+                return self.arith_sequenced(&ast);
+            }
+            return self.arith(&ast);
+        }
+        self.arith_string_site(s)
+    }
+
+    /// Shell-text initializers for every KNOWN array whose ident appears
+    /// in the given shell text — the child bash needs them materialized.
+    fn array_inits_for_text(&self, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for n in &self.arrays {
+            // assoc arrays are emitted by the assoc loop below (their C
+            // storage is map_k/map_v/map_n — no plain `map` ident)
+            if self.assoc_arrays.contains(n) {
+                continue;
+            }
+            let id = self.c_ident(n);
+            if text.contains(&id) {
+                out.push(format!(
+                    "_sh_idx_init(&_sh_cmd, &_sh_cap, {}, {id}, {id}_len);",
+                    Self::cstr(n)
+                ));
+                out.push("_sh_add(\";\");".to_string());
+            }
+        }
+        // ASSOC arrays live as map_k/map_v/map_n — their initializer is
+        // `_sh_assoc_init` (a plain ident mention must not emit the
+        // indexed form: 009_arrays/029_arrays_associative)
+        for n in &self.assoc_arrays {
+            let id = self.c_ident(n);
+            if text.contains(&id) {
+                out.push(format!(
+                    "_sh_assoc_init(&_sh_cmd, &_sh_cap, {}, {id}_k, {id}_v, {id}_n);",
+                    Self::cstr(n)
+                ));
+                out.push("_sh_add(\";\");".to_string());
+            }
+        }
+        out
+    }
+
+    /// Same over a command's ARG EXPRS (shell_exec sites): any Str text
+    /// mentioning an array ident triggers the initializer.
+    fn array_inits_for_args(&self, args: &[IrExpr]) -> Vec<String> {
+        let mut texts: Vec<String> = Vec::new();
+        fn gather(e: &IrExpr, out: &mut Vec<String>) {
+            match e {
+                IrExpr::Str(s, _) => out.push(s.clone()),
+                IrExpr::Array(items) => items.iter().for_each(|x| gather(x, out)),
+                IrExpr::Interpolate(parts) => parts.iter().for_each(|p| {
+                    if let InterpPart::Expr(x) = p {
+                        gather(x, out)
+                    }
+                }),
+                IrExpr::Call { args, .. } => args.iter().for_each(|x| gather(x, out)),
+                _ => {}
+            }
+        }
+        for a in args {
+            gather(a, &mut texts);
+        }
+        let joined = texts.join(" ");
+        self.array_inits_for_text(&joined)
+    }
+
+    /// `$N` / `${N}` (positionals), `$#`, `$?` → their numeric C reads.
+    /// bash expands these BEFORE the arith parser sees the text.
+    fn arith_subst_specials(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '$' && i + 1 < chars.len() {
+                let rest: String = chars[i + 1..].iter().collect();
+                if let Some(inner) = rest.strip_prefix('{') {
+                    if let Some(end) = inner.find('}') {
+                        let name = &inner[..end];
+                        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                            out.push_str(&Self::positional_read(name));
+                            i += 3 + end;
+                            continue;
+                        }
+                    }
+                } else if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                    let mut j = i + 1;
+                    while j < chars.len() && chars[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    let n: String = chars[i + 1..j].iter().collect();
+                    out.push_str(&Self::positional_read(&n));
+                    i = j;
+                    continue;
+                } else if rest.starts_with('#') {
+                    out.push_str("((_sh_argc > 0) ? (_sh_argc - 1) : 0)");
+                    i += 2;
+                    continue;
+                } else if rest.starts_with('?') {
+                    out.push_str("((long long)_sh_rc)");
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
+    }
+
+    fn positional_read(n: &str) -> String {
+        format!(
+            "(atoll((( {n} < _sh_argc && _sh_argv[{n}]) ? _sh_argv[{n}] : \"\")))"
+        )
+    }
+
+    /// Conservative native-renderability test for the Redirect fast path:
+    /// scalar assigns / arith / tests (and And/Or chains over them) —
+    /// anything else may need a shell site.
+    fn stmt_natively_renderable(s: &IrStmt) -> bool {
+        match s {
+            IrStmt::Expr(e) => Self::expr_natively_renderable(e),
+            IrStmt::Assign { targets, expr, .. } => {
+                targets.iter().all(|t| t.indices.is_empty())
+                    && Self::expr_natively_renderable(expr)
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                redirects.iter().all(|rd| matches!(rd.fd, Some(f) if f >= 2))
+                    && inner.iter().all(Self::stmt_natively_renderable)
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_natively_renderable(e: &IrExpr) -> bool {
+        match e {
+            IrExpr::Int(_) | IrExpr::Str(_, _) => true,
+            IrExpr::Call { func, args } => {
+                matches!(func.as_str(), "test" | "arith" | "getVar" | "setVar" | "assign")
+                    && args.iter().all(|a| match a {
+                        IrExpr::Str(s, _) => !s.contains("$(") && !s.contains("`"),
+                        other => Self::expr_natively_renderable(other),
+                    })
+            }
+            IrExpr::BinOp { lhs, op, rhs } => {
+                matches!(
+                    op,
+                    crate::ir::BinOpKind::And
+                        | crate::ir::BinOpKind::Or
+                        | crate::ir::BinOpKind::Not
+                ) && Self::expr_natively_renderable(lhs)
+                    && Self::expr_natively_renderable(rhs)
+            }
+            IrExpr::Arith(a) => !Self::arith_has_side_effects(a),
+            _ => false,
+        }
+    }
+
+    fn arith_has_side_effects(a: &ArithAst) -> bool {
+        match a {
+            ArithAst::Assign { .. } | ArithAst::IncDec { .. } => true,
+            ArithAst::Bin { lhs, rhs, .. } => {
+                Self::arith_has_side_effects(lhs) || Self::arith_has_side_effects(rhs)
+            }
+            ArithAst::Un { arg, .. } => Self::arith_has_side_effects(arg),
+            ArithAst::Cond { test, then, else_ } => {
+                Self::arith_has_side_effects(test)
+                    || Self::arith_has_side_effects(then)
+                    || Self::arith_has_side_effects(else_)
+            }
+            ArithAst::Index { key, .. } => Self::arith_has_side_effects(key),
+            _ => false,
+        }
+    }
+
+    /// Side-effecting arith (`j = i++ + ++i`) rendered SEQUENCED: every
+    /// mutation becomes an ordered statement writing a numbered temp; the
+    /// final expression reads only temps. A flat nested expression would
+    /// let hoisted temps reorder bash's left-to-right mutations.
+    fn arith_sequenced(&mut self, a: &ArithAst) -> String {
+        let mut out: Vec<String> = Vec::new();
+        let e = self.arith_seq_walk(a, &mut out);
+        for l in out {
+            self.emit(&l);
+        }
+        e
+    }
+
+    fn fresh_ll(&mut self) -> String {
+        let t = format!("_sq{}", self.temp_seq);
+        self.temp_seq += 1;
+        t
+    }
+
+    /// A var write of a numeric VALUE as its shell string form — pushed
+    /// into the ordered statement list (NOT emitted directly: helpers
+    /// like num_temp would break the sequence order).
+    fn seq_write_str_var(&mut self, var: &str, val: &str, out: &mut Vec<String>) {
+        let id = self.c_ident(var);
+        let t = self.temp_seq;
+        self.temp_seq += 1;
+        if let Some(b) = self.buf_bound(var) {
+            out.push(format!(
+                "{{ char _wb{t}[32]; snprintf(_wb{t}, sizeof _wb{t}, \"%lld\", (long long)({val})); strncpy({id}, _wb{t}, {b} + 1); {id}[{b}] = '\\0'; }}"
+            ));
+        } else {
+            out.push(format!(
+                "{{ static char _wb{t}[32]; snprintf(_wb{t}, sizeof _wb{t}, \"%lld\", (long long)({val})); {id} = _wb{t}; }}"
+            ));
+        }
+    }
+
+    fn arith_seq_walk(&mut self, a: &ArithAst, out: &mut Vec<String>) -> String {
+        match a {
+            ArithAst::IncDec { var, delta, prefix } => {
+                let id = self.c_ident(var);
+                let d = if *delta >= 0 { "1" } else { "-1" };
+                let t = self.fresh_ll();
+                if self.is_num(var) {
+                    if *prefix {
+                        out.push(format!("long long {t} = ({id} += {d});"));
+                    } else {
+                        out.push(format!("long long {t} = {id};"));
+                        out.push(format!("{id} += {d};"));
+                    }
+                } else {
+                    let store = self.store_read(var);
+                    if *prefix {
+                        out.push(format!("long long {t} = atoll({store}) + {d};"));
+                        let tv = t.clone();
+                        self.seq_write_str_var(var, &tv, out);
+                    } else {
+                        out.push(format!("long long {t} = atoll({store});"));
+                        let w = format!("({t} + {d})");
+                        self.seq_write_str_var(var, &w, out);
+                    }
+                }
+                t
+            }
+            ArithAst::Assign { var, op, rhs } => {
+                let r = self.arith_seq_walk(rhs, out);
+                let id = self.c_ident(var);
+                let t = self.fresh_ll();
+                if op == "=" {
+                    if self.is_num(var) {
+                        out.push(format!("long long {t} = ({id} = ({r}));"));
+                    } else {
+                        out.push(format!("long long {t} = ({r});"));
+                        let tv = t.clone();
+                        self.seq_write_str_var(var, &tv, out);
+                    }
+                } else if self.is_num(var) {
+                    out.push(format!("long long {t} = ({id} {op} ({r}));"));
+                } else {
+                    let base = op.trim_end_matches('=');
+                    let store = self.store_read(var);
+                    out.push(format!(
+                        "long long {t} = (atoll({store}) {base} ({r}));"
+                    ));
+                    let tv = t.clone();
+                    self.seq_write_str_var(var, &tv, out);
+                }
+                t
+            }
+            ArithAst::Bin { op, lhs, rhs } => {
+                let l = self.arith_seq_walk(lhs, out);
+                let r = self.arith_seq_walk(rhs, out);
+                if op == "**" {
+                    self.need_pow = true;
+                    format!("_sh_pow({l},{r})")
+                } else if op == "/" || op == "%" {
+                    format!("({r} == 0 ? 0 : ({l} {op} {r}))")
+                } else {
+                    format!("({l} {op} {r})")
+                }
+            }
+            other => self.arith(other),
+        }
+    }
+
     fn arith_string_site(&mut self, s: &str) -> String {
         let s = s.to_string();
         self.shell_site(
@@ -2959,17 +4791,49 @@ impl Render {
     /// (flattened forms) or `[ <text> ]` (spaced forms) — the child bash
     /// runs the command substitutions itself.
     fn test_shell_site(&mut self, s: &str) -> String {
-        let s = s.to_string();
+        let s = respace_test_text(s).to_string();
         let flat = !s.contains(' ');
+        let ext = ["@(", "+(", "!(",
+                   "?("].iter().any(|e| s.contains(e));
+        let mut sp = s.clone();
+        if ext {
+            for o in ["!(", "+(", "?(", "@("] {
+                sp = sp.replace(o, &format!(" {o}"));
+            }
+            let mut padded = None;
+            for o in ["!=", "=="] {
+                if sp.contains(o) && !sp.contains(&format!(" {o} ")) {
+                    padded = Some(sp.replace(o, &format!(" {o} ")));
+                    break;
+                }
+            }
+            if let Some(p) = padded {
+                sp = p;
+            } else if !sp.contains("==") && !sp.contains("!=") {
+                sp = sp.replacen('=', " = ", 1);
+            }
+        }
+        // arrays the text indexes must be MATERIALIZED into the child
+        // command (`[ "$n" -lt $(( a[1] + a[2] )) ]` — a lives C-side)
+        let arr_inits = self.array_inits_for_text(&sp);
         self.shell_site(
-            |r| {
+            move |r| {
                 r.sh_export_vars(&s);
                 r.emit("_sh_reset();");
-                if flat {
+                for l in &arr_inits {
+                    r.emit(l);
+                }
+                if ext {
                     r.emit(&format!(
                         "_sh_addraw({});",
-                        Self::cstr(&format!("[[ {s} ]]"))
+                        Self::cstr("shopt -s extglob >/dev/null 2>&1;")
                     ));
+                    r.emit(&format!(
+                        "_sh_addraw({});",
+                        Self::cstr(&format!("[[ {sp} ]]"))
+                    ));
+                } else if flat {
+                    r.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[[ {s} ]]"))));
                 } else {
                     r.emit(&format!("_sh_addraw({});", Self::cstr(&format!("[ {s} ]"))));
                 }
@@ -2985,6 +4849,10 @@ impl Render {
     /// target of `+=`).
     fn let_render(&mut self, s: &str) -> Option<String> {
         let s = s.trim();
+        // plain comparisons (`i <= n`, `x == 3`) — the ForInit conds
+        if let Some(c) = self.let_compare(s) {
+            return Some(c);
+        }
         // `name op number` / `name op $var` — the op-assign shapes
         for op in ["+=", "-=", "*=", "/=", "%="] {
             if let Some((l, r)) = s.split_once(op) {
@@ -3013,8 +4881,13 @@ impl Render {
                 }
                 let base = &op[..op.len() - 1];
                 let store = self.store_read(l);
-                let t = self.num_temp(&format!("((long long)atoll({store}) {base} {rhs})"));
-                return Some(format!("(strcpy({id}, {t}), atoll({t}))"));
+                let t = self.num_temp(&format!(
+                    "((long long)atoll({store}) {base} {rhs})"
+                ));
+                if self.buf_bound(l).is_some() {
+                    return Some(format!("(strcpy({id}, {t}), atoll({t}))"));
+                }
+                return Some(format!("({id} = {t}, atoll({t}))"));
             }
         }
         // `i++` / `i--` / `++i` / `--i`
@@ -3044,13 +4917,53 @@ impl Render {
             "((long long)atoll({store}) {})",
             if delta >= 0 { "+ 1" } else { "- 1" }
         ));
+        let write = if self.buf_bound(var).is_some() {
+            format!("(strcpy({id}, {t}), atoll({t}))")
+        } else {
+            format!("({id} = {t}, atoll({t}))")
+        };
         if prefix {
-            Some(format!("(strcpy({id}, {t}), atoll({t}))"))
+            Some(write.clone())
         } else {
             // postfix: the cond reads the NEW value (bash `((i++))`
             // status is the post-increment value)
-            Some(format!("(strcpy({id}, {t}), atoll({t}))"))
+            Some(write)
         }
+    }
+
+    /// A plain comparison (`i <= n`, `x == 3`) — the ForInit conds and
+    /// simple `let` tests. Operands are idents / numbers / `$var`.
+    fn let_compare(&mut self, s: &str) -> Option<String> {
+        let s = s.trim();
+        for op in ["<=", ">=", "==", "!=", "<", ">"] {
+            if let Some((l, r)) = s.split_once(op) {
+                let l = l.trim().trim_start_matches('$');
+                let r = r.trim().trim_start_matches('$');
+                if l.is_empty() || r.is_empty() {
+                    continue;
+                }
+                let lc = if let Ok(n) = l.parse::<i64>() {
+                    n.to_string()
+                } else if self.is_num(l) {
+                    self.c_ident(l)
+                } else if self.var_types.contains_key(l) || self.store.contains(l) {
+                    format!("(long long)atoll({})", self.store_ref(l))
+                } else {
+                    continue;
+                };
+                let rc = if let Ok(n) = r.parse::<i64>() {
+                    n.to_string()
+                } else if self.is_num(r) {
+                    self.c_ident(r)
+                } else if self.var_types.contains_key(r) || self.store.contains(r) {
+                    format!("(long long)atoll({})", self.store_ref(r))
+                } else {
+                    continue;
+                };
+                return Some(format!("({lc} {op} {rc})"));
+            }
+        }
+        None
     }
     // ── test lowering ────────────────────────────────────────────────
 
@@ -3190,7 +5103,8 @@ impl Render {
         // rebuild: the loop above pushes on split; a non-split token must
         // be pushed too — redo cleanly
         t2.clear();
-        for tok in &t {
+        let t_len = t.len();
+        for (idx, tok) in t.iter().enumerate() {
             let mut split = false;
             for op in ["==", "!=", "=~", "\\>", "\\<"] {
                 if let Some(pos) = tok.find(op) {
@@ -3200,6 +5114,15 @@ impl Render {
                             t2.push(l);
                             t2.push(op.to_string());
                             t2.push(r);
+                            split = true;
+                            break;
+                        }
+                        // op as a SUFFIX (`$x!=` — the pre-merge glued
+                        // a spaced `$x != y`): split to `$x` + `!=` when
+                        // a RHS token follows
+                        if idx + 1 < t_len && pos + op.len() == tok.len() {
+                            t2.push(l);
+                            t2.push(op.to_string());
                             split = true;
                             break;
                         }
@@ -3227,9 +5150,24 @@ impl Render {
             }
         }
         let toks: Vec<String> = t3;
-        // `\( ... \)` parens
-        if toks[0] == "\\(" {
-            if toks.last() == Some(&"\\)".to_string()) {
+        // `\( ... \)` parens — only a FULL wrap: the first `\(` must
+        // close at the LAST token (a `\(` group followed by `-o` etc.
+        // is not a wrap — stripping it would corrupt the rest).
+        if toks[0] == "\\(" && toks.last() == Some(&"\\)".to_string()) {
+            let mut depth = 0i32;
+            let mut full_wrap = true;
+            for (i, t) in toks.iter().enumerate() {
+                if t == "\\(" {
+                    depth += 1;
+                } else if t == "\\)" {
+                    depth -= 1;
+                    if depth == 0 && i != toks.len() - 1 {
+                        full_wrap = false;
+                        break;
+                    }
+                }
+            }
+            if full_wrap && depth == 0 {
                 return self.test_tokens_parse(&toks[1..toks.len() - 1]);
             }
         }
@@ -3263,8 +5201,8 @@ impl Render {
                 match flag.as_str() {
                     "-n" => format!("(({v}) && ({v})[0])"),
                     "-z" => format!("(!({v}) || !({v})[0])"),
-                    "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L" | "-S" | "-p" | "-b"
-                    | "-c" | "-g" | "-k" | "-u" | "-G" | "-O" | "-N" | "-h" => {
+                    "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L" | "-S" | "-p"
+                    | "-b" | "-c" | "-g" | "-k" | "-u" | "-G" | "-O" | "-N" | "-h" => {
                         self.need_stat = true;
                         format!("_sh_is_{}({v})", &flag[1..])
                     }
@@ -3278,24 +5216,9 @@ impl Render {
                             let flag = rest.to_string();
                             if matches!(
                                 flag.as_str(),
-                                "-f" | "-d"
-                                    | "-e"
-                                    | "-s"
-                                    | "-r"
-                                    | "-w"
-                                    | "-x"
-                                    | "-L"
-                                    | "-S"
-                                    | "-p"
-                                    | "-b"
-                                    | "-c"
-                                    | "-g"
-                                    | "-k"
-                                    | "-u"
-                                    | "-G"
-                                    | "-O"
-                                    | "-N"
-                                    | "-h"
+                                "-f" | "-d" | "-e" | "-s" | "-r" | "-w" | "-x" | "-L"
+                                    | "-S" | "-p" | "-b" | "-c" | "-g" | "-k" | "-u"
+                                    | "-G" | "-O" | "-N" | "-h"
                             ) {
                                 self.need_stat = true;
                                 return format!("(!_sh_is_{}({v}))", &flag[1..]);
@@ -3331,46 +5254,96 @@ impl Render {
             "\\>" => format!("(strcmp({l}, {r}) > 0)"),
             "\\<" => format!("(strcmp({l}, {r}) < 0)"),
             "=" | "==" | "!=" => {
-                let has_glob = raw_l.contains('*')
-                    || raw_l.contains('?')
-                    || raw_r.contains('*')
-                    || raw_r.contains('?');
-                if has_glob {
-                    // `[[ x == pattern ]]` — glob match (fnmatch);
-                    // `!(...)` extglob approximated (negated fnmatch)
-                    self.need_fnmatch = true;
-                    let neg = op == "!=";
-                    let pat = if neg { raw_r.clone() } else { raw_r.clone() };
-                    if let Some(inner) = pat.strip_prefix("!(") {
-                        if let Some(rest) = inner.split_once(')') {
-                            let inner_pat = format!("{}{}", rest.0, rest.1);
-                            let flags = if self.nocasematch {
-                                ", FNM_CASEFOLD"
+                // glob metachars in the PATTERN text — but `$?`/`${…}`/
+                // `$var` expansions must not count (their `?`/`*` are
+                // parameter syntax), and a QUOTED pattern is literal
+                let mask_params = |s: &str| -> String {
+                    let d = s.trim_matches(|c| c == '"' || c == '\'');
+                    let chars: Vec<char> = d.chars().collect();
+                    let mut out = String::new();
+                    let mut i = 0;
+                    while i < chars.len() {
+                        if chars[i] == '$' {
+                            i += 1;
+                            if i < chars.len() && chars[i] == '{' {
+                                let mut depth = 1;
+                                i += 1;
+                                while i < chars.len() && depth > 0 {
+                                    if chars[i] == '{' {
+                                        depth += 1;
+                                    } else if chars[i] == '}' {
+                                        depth -= 1;
+                                    }
+                                    i += 1;
+                                }
                             } else {
-                                ""
-                            };
-                            let m =
-                                format!("fnmatch({}, {l}, 0{flags}) == 0", Self::cstr(&inner_pat));
-                            return if neg {
-                                format!("(!{m})")
-                            } else {
-                                format!("({m})")
-                            };
+                                i += 1;
+                            }
+                        } else {
+                            out.push(chars[i]);
+                            i += 1;
                         }
                     }
+                    out
+                };
+                let r_quoted = raw_r.starts_with('"') || raw_r.starts_with('\'');
+                let masked_r = mask_params(raw_r);
+                let has_glob = !r_quoted && (masked_r.contains('*') || masked_r.contains('?'))
+                    || mask_params(raw_l).contains('*')
+                    || mask_params(raw_l).contains('?');
+                if has_glob {
+                    // `[[ x == pattern ]]` — glob match (fnmatch);
+                    // extglobs (`!(a)`, `@(a|b)`, `+(a)`, ...) use
+                    // glibc's FNM_EXTMATCH (native semantics — the
+                    // old negated-fnmatch approximation was wrong)
+                    self.need_fnmatch = true;
+                    let neg = op == "!=";
+                    let pat = raw_r.trim_matches(|c| c == '"' || c == '\'').to_string();
+                    let ext = pat.contains("!(")
+                        || pat.contains("@(")
+                        || pat.contains("+(")
+                        || pat.contains("*(")
+                        || pat.contains("?(");
+                    let flags = if ext { " | FNM_EXTMATCH" } else { "" };
                     let flags = if self.nocasematch {
-                        ", FNM_CASEFOLD"
+                        format!("{flags} | FNM_CASEFOLD")
                     } else {
-                        ""
+                        flags.to_string()
                     };
-                    let m = format!("fnmatch({}, {l}, 0{flags}) == 0", Self::cstr(&pat));
+                    let pat_dq = {
+                        let t = pat.trim();
+                        let fch = t.chars().next().unwrap_or(' ');
+                        let lch = t.chars().last().unwrap_or(' ');
+                        if t.len() >= 2 && ((fch == '"' && lch == '"') || (fch == '\'' && lch == '\'')) {
+                            t[1..t.len() - 1].to_string()
+                        } else {
+                            t.to_string()
+                        }
+                    };
+                    let m = format!(
+                        "fnmatch({}, {l}, 0{flags}) == 0",
+                        Self::cstr(strip_glob(&pat_dq))
+                    );
                     if neg {
                         format!("(!{m})")
                     } else {
                         m
                     }
                 } else if op == "!=" {
-                    format!("(strcmp({l}, {r}) != 0)")
+                    if self.nocasematch {
+                        // shopt -s nocasematch: == compares are
+                        // case-insensitive; patterns arrive QUOTED
+                        let dq = raw_r
+                            .trim_matches(|c| c == '"' || c == '\'');
+                        self.need_fnmatch = true;
+                        format!("(fnmatch({}, {l}, FNM_CASEFOLD) != 0)", Self::cstr(dq))
+                    } else {
+                        format!("(strcmp({l}, {r}) != 0)")
+                    }
+                } else if self.nocasematch {
+                    let dq = raw_r.trim_matches(|c| c == '"' || c == '\'');
+                    self.need_fnmatch = true;
+                    format!("(fnmatch({}, {l}, FNM_CASEFOLD) == 0)", Self::cstr(dq))
                 } else {
                     format!("(strcmp({l}, {r}) == 0)")
                 }
@@ -3388,11 +5361,10 @@ impl Render {
             }
             "=~" => {
                 self.need_regex = true;
-                let t = format!("_s{}", self.temp_seq);
-                self.temp_seq += 1;
-                self.emit(&format!("char {t}[1024];"));
-                self.emit(&format!("snprintf({t}, sizeof {t}, \"^(?:%s)$\", {r});"));
-                format!("_sh_regex_match({l}, {t})")
+                // bash `=~` is UNANCHORED (a match anywhere in the
+                // string); the pattern carries its own `^`/`$` when the
+                // script anchored it — no wrapping
+                format!("_sh_regex_match({l}, {r})")
             }
             _ => {
                 self.mark_todo(&format!("test op {op}"));
@@ -3423,16 +5395,20 @@ impl Render {
         }
         // `${name op arg}` — a parameter expansion inside the test.
         // (The core may DROP the closing `}` when the pattern contains a
-        // `#` — parse the unclosed form too.)
-        if raw.starts_with("${") {
-            let inner = if raw.ends_with('}') {
-                &raw[2..raw.len() - 1]
+        // `#` — parse the unclosed form too.) Checked on the DEQUOTED
+        // form — `"${x}"` (quoted) is the same expansion.
+        let dequoted = raw
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .unwrap_or(raw);
+        if dequoted.starts_with("${") {
+            let inner = if dequoted.ends_with('}') {
+                &dequoted[2..dequoted.len() - 1]
             } else {
-                raw.trim_end_matches(' ').trim_start_matches("${")
+                dequoted.trim_end_matches(' ').trim_start_matches("${")
             };
-            for op in [
-                "##", "%%", "#", "%", ":-", "-", ":=", "=", "//", "/", "^^", ",,",
-            ] {
+            for op in ["##", "%%", "#", "%", ":-", "-", ":=", "=", "//", "/", "^^", ",,"] {
                 if let Some(pos) = inner.find(op) {
                     if pos > 0 {
                         let name = inner[..pos].to_string();
@@ -3449,19 +5425,14 @@ impl Render {
             // plain ${name}
             return self.value_c(&IrExpr::Call {
                 func: "getVar".to_string(),
-                args: vec![IrExpr::Str(
-                    inner.to_string(),
-                    crate::ir::StrStyle::DoubleQuoted,
-                )],
+                args: vec![IrExpr::Str(inner.to_string(), crate::ir::StrStyle::DoubleQuoted)],
             });
         }
-        let dequoted = raw
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .or_else(|| raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-            .unwrap_or(raw);
         let stripped = dequoted.strip_prefix('$').unwrap_or(dequoted);
-        if self.var_types.contains_key(stripped) {
+        // Var lookup ONLY for `$`-prefixed operands — a bare/quoted word
+        // (`"c"`, `abc`) is a LITERAL string in `[[ ]]`, never a var
+        // (a quoted "c" must not read a loop var named c).
+        if dequoted.starts_with('$') && self.var_types.contains_key(stripped) {
             if self.is_num(stripped) {
                 self.num_temp(&self.c_ident(stripped))
             } else {
@@ -3515,14 +5486,90 @@ impl Render {
                 ));
                 return t;
             }
+            // special params ($?, $#, $$, $!, $-, $0, $1.., $@) — the
+            // getVar mapping (a `?` here previously rendered as "")
+            let is_special = stripped == "?"
+                || stripped == "$"
+                || stripped == "#"
+                || stripped == "!"
+                || stripped == "-"
+                || stripped == "@"
+                || stripped == "*"
+                || (!stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit()));
+            if is_special {
+                let v = self.call(
+                    "getVar",
+                    &[IrExpr::Str(stripped.to_string(), crate::ir::StrStyle::DoubleQuoted)],
+                );
+                // numeric-valued specials (?, #, $, !) render as ints —
+                // a test operand needs a char*
+                if matches!(&stripped[..], "?" | "#" | "$" | "!") {
+                    let t = self.str_temp(32);
+                    self.emit(&format!("snprintf({t}, sizeof {t}, \"%lld\", (long long)({v}));"));
+                    return t;
+                }
+                return v;
+            }
             "\"\"".into()
         } else if raw.starts_with('$') && raw.len() > 1 {
-            // positional / special ($1, $#, $@) — empty argv in the gate
+            // positional / special vars — $? is the LAST STATUS (a
+            // constant "" broke `[ "$?" = "0" ]` chains)
             self.need_sh = true;
-            "\"\"".into()
+            match &raw[1..] {
+                "?" => self.num_temp("_sh_rc"),
+                "$" => self.num_temp("getpid()"),
+                "#" => {
+                    self.num_temp("((_sh_argc > 0) ? (_sh_argc - 1) : 0)")
+                }
+                d if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) => {
+                    format!(
+                        "(({} < _sh_argc && _sh_argv[{}]) ? _sh_argv[{}] : \"\")",
+                        d, d, d
+                    )
+                }
+                _ => "\"\"".into(),
+            }
+        } else if stripped.len() >= 2 {
+            // dequote quoted literals (`"0"` matched as a fnmatch pattern
+            // WITH quote chars and never matched)
+            let f = stripped.chars().next().unwrap();
+            let l = stripped.chars().last().unwrap();
+            if (f == '"' && l == '"') || (f == '\'' && l == '\'') {
+                Self::cstr(&stripped[1..stripped.len() - 1])
+            } else {
+                Self::cstr(stripped)
+            }
         } else {
             Self::cstr(stripped)
         }
+    }
+
+    /// bash `${@:off}` — a slice beyond the positional count expands to
+    /// ZERO words (the word vanishes from `set -- ... "${@:3}"`). Returns
+    /// a runtime guard that is true iff the slice contributes a word.
+    fn param_slice_zero_word_guard(&mut self, w: &IrExpr) -> Option<String> {
+        if let IrExpr::Call { func, args } = w {
+            if func == "param" {
+                if let (Some(IrExpr::Str(op, _)), Some(IrExpr::Str(nm, _))) =
+                    (args.first(), args.get(1))
+                {
+                    if op == "slice" && (nm == "@" || nm == "*") {
+                        let off = match args.get(2) {
+                            Some(IrExpr::Str(s, _)) if s == "@" || s == "*" => args
+                                .get(3)
+                                .map(|x| self.value_num(x))
+                                .unwrap_or_else(|| "0".into()),
+                            Some(x) => self.value_num(x),
+                            None => "0".into(),
+                        };
+                        // the first selected index is off<=0 ? 0 : off —
+                        // the slice has words iff it is < _sh_argc
+                        return Some(format!("(({off} <= 0) ? 0 : ({off})) < _sh_argc"));
+                    }
+                }
+            }
+        }
+        None
     }
 
     // ── parameter expansion ──────────────────────────────────────────
@@ -3534,37 +5581,98 @@ impl Render {
         let Some(name) = Self::str_arg(args, 1) else {
             return "0".into();
         };
+        // ${PIPESTATUS[N]} — per-stage statuses of the last pipeline
+        // (exported by the pipeline site's state-import suffix)
+        if let Some(rest) = name
+            .strip_prefix("PIPESTATUS[")
+            .and_then(|r| r.strip_suffix(']'))
+        {
+            if let Ok(i) = rest.parse::<usize>() {
+                self.need_sh = true;
+                return format!("(char*)_sh_ps({i})");
+            }
+        }
         // `${#arr[@]}` — the core spells it param("slice", "#arr", "@", "")
         if name.starts_with('#')
             && (name.ends_with("[@]")
                 || name.ends_with("[*]")
                 || matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*"))
         {
-            let rest = name[1..].trim_end_matches("[@]").trim_end_matches("[*]");
+            let rest = name[1..]
+                .trim_end_matches("[@]")
+                .trim_end_matches("[*]");
             if !rest.is_empty() {
                 let l = self.array_len(rest);
                 return self.num_temp(&l);
             }
         }
-        // `${arr[@]:off:len}` — param("slice", "arr", "@", off, len)
-        if op == "slice" && matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*") {
-            let joined = if let Some(keys) = name.strip_prefix('!') {
-                self.array_keys_join(keys)
-            } else {
-                self.array_join_all(&name)
-            };
-            let off = self.args_value_num(3);
-            let len = match args.get(4) {
-                None => "-1".to_string(),
-                Some(IrExpr::Str(s, _)) if s.is_empty() => "-1".to_string(),
-                Some(_) => self.args_value_num(4),
-            };
-            self.need_sh = true;
-            let t = self.str_temp(65536);
-            self.emit(&format!(
-                "_sh_substr({t}, sizeof {t}, {joined}, {off}, {len});"
-            ));
-            return t;
+        // `${arr[@]:off:len}` — the shir shapes: the idx arg carries
+        // `@`/`*`, the name carries `[@]`, or the plain name with the
+        // idx being the offset
+        if op == "slice" {
+            let idx_is_at = matches!(args.get(2), Some(IrExpr::Str(s, _)) if s == "@" || s == "*");
+            let name_has_at = name.ends_with("[@]") || name.ends_with("[*]");
+            if idx_is_at || name_has_at || args.len() >= 4 {
+                self.cur_param_args = args.to_vec();
+                let mut is_array = true;
+                let mut is_positional = name == "@" || name == "*";
+                let joined = if let Some(keys) = name.strip_prefix('!') {
+                    self.array_keys_join(keys)
+                } else if name == "@" || name == "*" {
+                    // `${@:off:len}` — the positional params (the
+                    // helper slices _sh_argv directly)
+                    is_positional = true;
+                    "\"\"".to_string()
+                } else if name_has_at {
+                    self.array_join_all(&name[..name.len() - 3])
+                } else if self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
+                    self.array_join_all(&name)
+                } else {
+                    // a scalar string slice `${x:off:len}` — CHAR-based
+                    is_array = false;
+                    is_positional = false;
+                    let v = if self.is_num(&name) {
+                        self.num_temp(&self.c_ident(&name))
+                    } else {
+                        self.store_read(&name)
+                    };
+                    let t = self.str_temp(65536);
+                    self.emit(&format!("strncpy({t}, {v}, 65535); {t}[65535] = 0;"));
+                    t
+                };
+                let off_idx = if idx_is_at { 3 } else { 2 };
+                let len_idx = off_idx + 1;
+                let off = self.args_value_num(off_idx);
+                // `_sh_substr`/`_sh_arr_slice` count negative lengths
+                // from the END (bash `${x::-2}` = n-2 chars), so the
+                // no-length sentinel must be a huge POSITIVE value that
+                // clamps to n (a -1 sentinel would chop the last char
+                // under the end-counting rule)
+                let len = match args.get(len_idx) {
+                    None => "(long long)1LL<<60".to_string(),
+                    Some(IrExpr::Str(s, _)) if s.is_empty() => "(long long)1LL<<60".to_string(),
+                    Some(_) => self.args_value_num(len_idx),
+                };
+                self.need_sh = true;
+                let t = self.str_temp(65536);
+                if is_positional {
+                    // `${@:off:len}` — bash's offset is 1-based (0
+                    // includes $0); the helper slices _sh_argv directly
+                    // (the space-joined form would lose empty elements)
+                    self.emit(&format!(
+                        "_sh_argv_slice({t}, sizeof {t}, {off}, {len});"
+                    ));
+                } else if is_array {
+                    self.emit(&format!(
+                        "_sh_arr_slice({t}, sizeof {t}, {joined}, {off}, {len});"
+                    ));
+                } else {
+                    self.emit(&format!(
+                        "_sh_substr({t}, sizeof {t}, {joined}, {off}, {len});"
+                    ));
+                }
+                return t;
+            }
         }
         // `${arr[1]}` / `${#arr[@]}` — the array machinery (bare
         // `@`/`*` are the positional params — the var_expr chain below
@@ -3601,6 +5709,15 @@ impl Render {
             // positional $N — the function-call argv (empty at top level)
             self.need_sh = true;
             format!("(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")")
+        } else if self.arrays.contains(&name) || self.assoc_arrays.contains(&name) {
+            // `${LIST:-}` / `${MAP[k]}` — an ARRAY read: element 0 for
+            // scalars (the array_join path handles the @/* forms above)
+            let id = self.c_ident(&name);
+            if self.assoc_arrays.contains(&name) {
+                format!("(char*)_sh_assoc_get({id}_k, {id}_v, {id}_n, \"\")")
+            } else {
+                format!("(({id}_len > 0 && {id}[0]) ? {id}[0] : \"\")")
+            }
         } else if self.store.contains(&name) {
             self.store_ref(&name)
         } else {
@@ -3615,11 +5732,11 @@ impl Render {
         };
         let val = args
             .get(2)
-            .map(|x| self.value_c(x))
+            .map(|x| self.default_word(x))
             .unwrap_or_else(|| "\"\"".into());
         let repl = args
             .get(3)
-            .map(|x| self.value_c(x))
+            .map(|x| self.default_word(x))
             .unwrap_or_else(|| "\"\"".into());
         match op.as_str() {
             "" => var_expr,
@@ -3628,9 +5745,17 @@ impl Render {
             ":?" => format!(
                 "((({var_expr}) && ({var_expr})[0]) ? ({var_expr}) : (fprintf(stderr, \"%s\\n\", {val}), exit(1), (char*)0))"
             ),
-            "=" | ":=" => format!(
-                "((({var_expr}) && ({var_expr})[0]) ? ({var_expr}) : ({val}))"
-            ),
+            "=" | ":=" => {
+                let v = format!("((({var_expr}) && ({var_expr})[0]) ? ({var_expr}) : ({val}))");
+                if self.is_num(&name) || name.is_empty() {
+                    v
+                } else if let Some(b) = self.buf_bound(&name) {
+                    // `:=` ASSIGNS the default back (fixed buffer: copy)
+                    format!("(strcpy({}, {v}), {v})", self.c_ident(&name))
+                } else {
+                    format!("({} = {v}, {v})", self.c_ident(&name))
+                }
+            }
             "#" | "#:" | "##" | "##:" => {
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
                 self.need_sh = true;
@@ -3639,7 +5764,7 @@ impl Render {
                 let greedy = if op.starts_with("##") { "1" } else { "0" };
                 self.emit(&format!(
                     "_sh_strippre({t}, sizeof {t}, {var_expr}, {}, {greedy});",
-                    Self::cstr(&pat)
+                    Self::cstr(strip_glob(&pat))
                 ));
                 t
             }
@@ -3651,7 +5776,7 @@ impl Render {
                 let greedy = if op.starts_with("%%") { "1" } else { "0" };
                 self.emit(&format!(
                     "_sh_stripsuf({t}, sizeof {t}, {var_expr}, {}, {greedy});",
-                    Self::cstr(&pat)
+                    Self::cstr(strip_glob(&pat))
                 ));
                 t
             }
@@ -3659,15 +5784,31 @@ impl Render {
                 let pat = Self::str_arg(args, 2).unwrap_or_default();
                 self.need_sh = true;
                 let t = self.str_temp(4096);
+                // `/` replaces the FIRST match only; `//` replaces all —
+                // one helper served both and \${y/one/1} clobbered every
+                let helper = if op == "//" {
+                    "_sh_replace"
+                } else {
+                    "_sh_replace_first"
+                };
                 self.emit(&format!(
-                    "_sh_replace({t}, sizeof {t}, {var_expr}, {}, {repl});",
-                    Self::cstr(&pat)
+                    "{helper}({t}, sizeof {t}, {var_expr}, {}, {repl});",
+                    Self::cstr(strip_glob(&pat))
                 ));
                 t
             }
             "slice" => {
-                let off = args.get(2).map(|x| self.value_num(x)).unwrap_or_else(|| "0".into());
-                let len = args.get(3).map(|x| self.value_num(x)).unwrap_or_else(|| "-1".into());
+                let off = args
+                    .get(2)
+                    .map(|x| self.value_num_dollar(x))
+                    .unwrap_or_else(|| "0".into());
+                // no length arg = to the end — a huge positive sentinel
+                // (see the 4-arg slice arm: negative lens are real
+                // end-counts in the runtime)
+                let len = args
+                    .get(3)
+                    .map(|x| self.value_num_dollar(x))
+                    .unwrap_or_else(|| "(long long)1LL<<60".into());
                 self.need_sh = true;
                 let t = self.str_temp(4096);
                 self.emit(&format!(
@@ -3761,7 +5902,11 @@ impl Render {
                 "slice" => {
                     // `${arr[@]:off:len}` — slice of the joined elements
                     let off = self.args_value_num(2);
-                    let len = self.args_value_num(3);
+                    let len = match self.cur_param_args.get(3) {
+                        None => "(long long)1LL<<60".to_string(),
+                        Some(IrExpr::Str(s, _)) if s.is_empty() => "(long long)1LL<<60".to_string(),
+                        Some(_) => self.args_value_num(3),
+                    };
                     let joined = self.array_join_all(var);
                     let t = self.str_temp(65536);
                     self.emit(&format!(
@@ -3802,9 +5947,35 @@ impl Render {
                     // `$$` — the shell PID
                     return "getpid()".into();
                 }
+                // `${#s}` arrives as getVar("#s") — string length as a
+                // STRING temp (shell values are strings; strdup'ing a raw
+                // long long would segfault)
+                if let Some(base) = name.strip_prefix('#') {
+                    if !base.is_empty() && is_ident(base) {
+                        let v = if self.is_num(base) {
+                            self.num_temp(&self.c_ident(base))
+                        } else {
+                            self.store_read(base)
+                        };
+                        return self.num_temp(&format!("(long long)strlen({v})"));
+                    }
+                }
                 if name == "#" {
                     self.need_sh = true;
                     return "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into();
+                }
+                if name == "0" {
+                    // $0 — the program name (argv[0]; bash carries the
+                    // script path there, the transpiled binary its own)
+                    self.need_sh = true;
+                    return "((_sh_argc > 0 && _sh_argv[0]) ? _sh_argv[0] : \"\")".into();
+                }
+                if name == "-" {
+                    // $- — current option flags. The native runtime keeps
+                    // them in a mutable string seeded with the interactive-
+                    // off defaults; `set ±x/v/e` update it when rendered.
+                    self.need_sh = true;
+                    return "_sh_opts".into();
                 }
                 if name == "@" || name == "*" {
                     self.need_sh = true;
@@ -3819,6 +5990,30 @@ impl Render {
                         "(({name} < _sh_argc && _sh_argv[{name}]) ? _sh_argv[{name}] : \"\")"
                     );
                 }
+                if let Some(rest) = name.strip_prefix('#') {
+                    // ${#var} — the core spells the LENGTH expansion
+                    // getVar("#var") (010_substring_loop len=${#s})
+                    if rest.is_empty() || rest == "@" || rest == "*" {
+                        return self.num_temp("((_sh_argc > 0) ? (_sh_argc - 1) : 0)");
+                    }
+                    let v = if self.is_num(rest) {
+                        self.num_temp(&self.c_ident(rest))
+                    } else if self.store.contains(rest) || self.var_types.contains_key(rest) {
+                        self.store_read(rest)
+                    } else {
+                        self.need_sh = true;
+                        format!(
+                            "(getenv({}) ? getenv({}) : \"\")",
+                            Self::cstr(rest),
+                            Self::cstr(rest)
+                        )
+                    };
+                    let t = self.str_temp(32);
+                    self.emit(&format!(
+                        "snprintf({t}, sizeof {t}, \"%lld\", (long long)strlen({v}));"
+                    ));
+                    return t;
+                }
                 if self.arrays.contains(&name) {
                     let id = self.c_ident(&name);
                     format!("(({id}_len > 0 && {id}[0]) ? {id}[0] : \"\")")
@@ -3830,11 +6025,7 @@ impl Render {
                     // an environment variable (HOME, PATH, ...): read the
                     // real environment (the gate runs with the same env)
                     self.need_sh = true;
-                    format!(
-                        "(getenv({}) ? getenv({}) : \"\")",
-                        Self::cstr(&name),
-                        Self::cstr(&name)
-                    )
+                    format!("(getenv({}) ? getenv({}) : \"\")", Self::cstr(&name), Self::cstr(&name))
                 }
             }
             "param" => self.param_call(args),
@@ -3876,12 +6067,17 @@ impl Render {
                 }
             }
             "arith" => match Self::str_arg(args, 0) {
-                Some(s) => self.arith_string_site(&s),
+                Some(s) => self.arith_text(&s),
                 None => "0".into(),
             },
             "test" => match Self::str_arg(args, 0) {
                 Some(s) => {
-                    if s.contains("$(") {
+                    // \$( ) command substitution or EXTGLOB patterns
+                    // (@(…) +(…) !(…) ?(…)) have no native lowering —
+                    // the child bash evaluates them (extglob enabled)
+                    if s.contains("$(")
+                        || ["@(", "+(", "!(", "?("].iter().any(|e| s.contains(e))
+                    {
                         return self.test_shell_site(&s);
                     }
                     self.test_render(&s)
@@ -3890,15 +6086,29 @@ impl Render {
             },
             "capture" | "captureWords" => self.capture_call(args),
             "and" | "or" => {
-                // `A && B` / `A || B` — run each Arrow as a shell site
+                // `A && B` / `A || B` — run each Arrow as a shell site.
+                // A side containing a NATIVE statement (mapfile from file)
+                // must route it through stmt(): as child text the array
+                // assignment would be lost
                 let mut parts: Vec<String> = Vec::new();
                 for a in args {
                     if let IrExpr::Arrow(stmts) = a {
                         let stmts = stmts.clone();
+                        let natives: Vec<IrStmt> = stmts
+                            .iter()
+                            .filter(|st| is_mapfile_redirect(st))
+                            .cloned()
+                            .collect();
+                        let text: Vec<IrStmt> = stmts
+                            .iter()
+                            .filter(|st| !is_mapfile_redirect(st))
+                            .cloned()
+                            .collect();
+                        self.pending_native_stmts.extend(natives);
                         let s = self.shell_site(
-                            |r| {
+                            move |r| {
                                 r.emit("_sh_reset();");
-                                r.sh_stage(CmdBuf::Shared, &stmts);
+                                r.sh_stage(CmdBuf::Shared, &text);
                             },
                             false,
                         );
@@ -3915,6 +6125,36 @@ impl Render {
             }
             "pipeline" => {
                 let args = args.to_vec();
+                // $PIPESTATUS reads anywhere → state-import tail
+                if self.need_pipestatus {
+                    let id = self.site_seq;
+                    self.site_seq += 1;
+                    let saved = std::mem::take(&mut self.out);
+                    let saved_depth = self.depth;
+                    self.depth = 0;
+                    self.emit(&format!(
+                        "{{ static char _envf{id}[64]; snprintf(_envf{id}, sizeof _envf{id}, \"/tmp/.shstate.%ld\", (long)getpid()); _sh_export(\"_SH2ENVF\", _envf{id}); }}"
+                    ));
+                    self.emit("_sh_reset();");
+                    let a2 = args.clone();
+                    self.sh_pipeline_text(CmdBuf::Shared, &a2);
+                    self.emit(&format!(
+                        "_sh_addraw({});",
+                        Self::cstr(" ; __shps_raw=(${PIPESTATUS[@]}) ; __shps_rc=$? ; __shps_j=\"$(IFS=, ; printf '%s' \"${__shps_raw[*]}\")\" ; export __shps_j ; [ \"$__shps_rc\" -eq 0 ]")
+                    ));
+                    let body_out = std::mem::replace(&mut self.out, saved);
+                    self.depth = saved_depth;
+                    let mut s2 = format!("static int _sh_site_{id}(void) {{\n");
+                    for line in body_out {
+                        s2.push_str(&line);
+                        s2.push('\n');
+                    }
+                    s2.push_str("  return !_sh_state_run();\n}");
+                    self.site_bodies.push(s2);
+                    self.site_ids.push(id);
+                    self.need_sh = true;
+                    return format!("_sh_site_{id}()");
+                }
                 self.shell_site(
                     |r| {
                         r.emit("_sh_reset();");
@@ -3932,6 +6172,10 @@ impl Render {
                             "({{ long long _r = ({c}); _sh_rc = (_r != 0 ? 0 : 1); _r != 0; }})"
                         );
                     }
+                    // a dynamic text (parameter expansions, arrays): run
+                    // `(( text ))` as a shell site — constant-true would
+                    // spin the enclosing loop forever
+                    return self.arith_string_site(s);
                 }
                 self.need_sh = true;
                 "(_sh_rc = 0, 1)".into()
@@ -3940,6 +6184,16 @@ impl Render {
                 let s = Self::str_arg(args, 0).unwrap_or_default();
                 if s.contains("nocasematch") && s.contains("-s") {
                     self.nocasematch = true;
+                }
+                // `shopt -u nocasematch` — the flag turns OFF again
+                if s.contains("nocasematch") && (s.contains("-u") || s.contains("+s")) {
+                    self.nocasematch = false;
+                }
+                // Bool form: shopt("nocasematch", true)
+                if let Some(IrExpr::Bool(b)) = args.get(1) {
+                    if s.contains("nocasematch") {
+                        self.nocasematch = *b;
+                    }
                 }
                 self.need_sh = true;
                 self.need_fnmatch = true;
@@ -3977,7 +6231,11 @@ impl Render {
                         let NumSpec::Num(spec, cast) = self.num_spec(needle) else {
                             unreachable!("numeric needle → numeric spec")
                         };
-                        let arg = if cast { format!("(long long)({e})") } else { e };
+                        let arg = if cast {
+                            format!("(long long)({e})")
+                        } else {
+                            e
+                        };
                         self.emit(&format!("snprintf({t}, sizeof {t}, \"{spec}\", {arg});"));
                         t
                     } else {
@@ -4005,17 +6263,14 @@ impl Render {
             },
             "setArray" | "setArrayAppend" => {
                 // bare expr position (unusual — Assign normally carries
-                // these): apply to the named array
+                // these): apply to the named array. emit_set_array takes
+                // the FULL args (name at 0, items at 1, assoc at 2).
                 if let Some(name) = Self::str_arg(args, 0) {
                     let name_c = name.clone();
                     if func == "setArray" {
-                        let mut a = args.to_vec();
-                        a.remove(0);
-                        self.emit_set_array(&name_c, &a);
+                        self.emit_set_array(&name_c, args);
                     } else {
-                        let mut a = args.to_vec();
-                        a.remove(0);
-                        self.emit_set_array_append(&name_c, &a);
+                        self.emit_set_array_append(&name_c, args);
                     }
                 }
                 "(_sh_rc = 0, 1)".into()
@@ -4048,8 +6303,10 @@ impl Render {
                         r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
                         r.emit(&format!(
                             "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
-                            Self::cstr(&format!("$(({s}))"))
+                            Self::cstr(&format!("echo \"$(({s}))\""))
                         ));
+                        r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
+                        r.emit("return buf;");
                     })
                 }
                 None => "0".into(),
@@ -4070,43 +6327,38 @@ impl Render {
                     "0".into()
                 }
             }
-            // `grepMatches(text, pattern, flags)` — the `grep -o` lift:
-            // native regex.h match-all. flags: E (ERE as-is), F (fixed),
-            // i (case-insensitive); the default is BRE (translated).
-            "grepMatches" => {
-                let text = self.value_c(args.first().unwrap_or(&IrExpr::Str(String::new(), crate::ir::StrStyle::DoubleQuoted)));
-                let pat = Self::str_arg(args, 1).unwrap_or_default();
-                let flags = Self::str_arg(args, 2).unwrap_or_default();
-                let mut body = pat.to_string();
-                if flags.contains('F') {
-                    let mut lit = String::new();
-                    for c in body.chars() {
-                        if matches!(c, '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\') {
-                            lit.push('\\');
-                        }
-                        lit.push(c);
-                    }
-                    body = lit;
-                } else if !flags.contains('E') {
-                    body = body
-                        .replace("\\+", "+").replace("\\?", "?")
-                        .replace("\\\\(", "(").replace("\\\\\\)", ")")
-                        .replace("\\|", "|").replace("\\{", "{").replace("\\}", "}");
-                }
-                self.need_regex = true;
-                self.need_sh = true; // _sh_rc (grep's exit status)
-                let mout = self.str_temp(65536);
-                let flags_c = if flags.contains('i') { "REG_ICASE" } else { "0" };
-                self.emit(&format!(
-                    "{{ {mout}[0] = 0; regex_t _rx; if (regcomp(&_rx, {}, REG_EXTENDED | {flags_c}) == 0) {{ regmatch_t _m; const char *_p = {text}; size_t _mo = 0; while (regexec(&_rx, _p, 1, &_m, 0) == 0 && _m.rm_so != _m.rm_eo) {{ size_t _ml = (size_t)(_m.rm_eo - _m.rm_so); if (_mo + _ml + 1 < sizeof {mout}) {{ memcpy({mout} + _mo, _p + _m.rm_so, _ml); _mo += _ml; {mout}[_mo++] = '\\n'; }} _p += _m.rm_eo; }} {mout}[_mo] = 0; regfree(&_rx); _sh_rc = _mo > 0 ? 0 : 1; }} else {{ _sh_rc = 2; }} }}",
-                    Self::cstr(&body),
-                ));
-                format!("{mout}")
-            }
             _ if self.functions.contains(func) => {
                 let id = self.c_ident(func);
                 self.need_sh = true;
-                format!("({id}(), _sh_rc)")
+                // bash `if f; then` is TRUE iff the function's rc == 0 — the
+                // truthiness is the INVERTED rc
+                format!("({id}(), _sh_rc == 0)")
+            }
+            "grepMatches" => {
+                // `grepMatches(text, pattern, flags)` — the `grep -o`
+                // lift: the helper prints each match (grep -o's output),
+                // sets _sh_rc (0 iff any match) and returns the joined
+                // matches (the capture/value context)
+                self.need_grep = true;
+                self.need_regex = true;
+                self.need_sh = true; // the helper reads/writes _sh_rc
+                let text = args
+                    .first()
+                    .map(|x| self.expr(x))
+                    .unwrap_or_else(|| "\"\"".into());
+                let pat = match args.get(1) {
+                    Some(x) => Self::str_arg(&[x.clone()], 0).unwrap_or_default(),
+                    None => String::new(),
+                };
+                let flags = match args.get(2) {
+                    Some(x) => Self::str_arg(&[x.clone()], 0).unwrap_or_default(),
+                    None => String::new(),
+                };
+                format!(
+                    "_sh_grep_matches({text}, {}, {})",
+                    Self::cstr(strip_glob(&pat)),
+                    Self::cstr(&flags)
+                )
             }
             _ => self.sh2_stub(func, args, func),
         }
@@ -4115,6 +6367,30 @@ impl Render {
     /// A redirect call (expr position): reconstruct `cmd <redirs>` and
     /// run it.
     fn redirect_expr(&mut self, args: &[IrExpr]) -> String {
+        // NATIVE fast path: stderr-only redirects over natively
+        // renderable statements (n=$(($1+0)) 2>/dev/null) — the assign
+        // must land in the parent, a child-bash site would lose it
+        if let (Some(IrExpr::Arrow(stmts)), Some(IrExpr::Array(specs))) = (args.first(), args.get(1))
+        {
+            // stderr-only: every spec's fd >= 2 (stdout redirects change
+            // what the diff sees — never skip those)
+            let stderr_only = specs.iter().all(|sp| match sp {
+                IrExpr::Object(fields) => fields.iter().all(|(k, v)| match k.as_str() {
+                    "fd" => matches!(v, IrExpr::Int(n) if *n >= 2),
+                    "mode" | "target" => true,
+                    _ => false,
+                }),
+                _ => false,
+            });
+            if stderr_only && stmts.iter().all(Self::stmt_natively_renderable) {
+                for s in stmts {
+                    self.stmt(s);
+                }
+                // bash: the command's rc — keep the site-call convention
+                // (truthiness) so And/Or chains around this expr still work
+                return "(_sh_rc == 0)".into();
+            }
+        }
         let args = args.to_vec();
         self.shell_site(
             |r| {
@@ -4167,7 +6443,7 @@ impl Render {
             Some(e) => e.clone(),
             None => return "0".into(),
         };
-        self.value_num(&e)
+        self.value_num_dollar(&e)
     }
 
     // ── arrays ───────────────────────────────────────────────────────
@@ -4183,7 +6459,9 @@ impl Render {
         while i < chars.len() {
             if chars[i] == '$' && i + 1 < chars.len() {
                 let mut j = i + 1;
-                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                while j < chars.len()
+                    && (chars[j].is_ascii_alphanumeric() || chars[j] == '_')
+                {
                     j += 1;
                 }
                 if j > i + 1 {
@@ -4261,7 +6539,8 @@ impl Render {
                     "_sh_arr_set({id}, &{id}_len, {ARR_CAP}, {i}, {v});"
                 ));
             } else if is_ident(k.trim())
-                && (self.var_types.contains_key(k.trim()) || self.store.contains(k.trim()))
+                && (self.var_types.contains_key(k.trim())
+                    || self.store.contains(k.trim()))
             {
                 // `result[i]=x` — the bare key names a VAR: an
                 // arithmetic index, not an assoc string key
@@ -4275,9 +6554,12 @@ impl Render {
                 ));
             } else {
                 self.assoc_arrays.insert(var.to_string());
+                // bash strips subscript QUOTES at parse time — `m["os"]=v`
+                // stores key `os` (the raw shIR text keeps them)
+                let kc = k.trim().trim_matches(|c| c == '"' || c == '\'');
                 self.emit(&format!(
                     "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {}, {v});",
-                    Self::cstr(k)
+                    Self::cstr(kc)
                 ));
             }
         } else {
@@ -4319,7 +6601,14 @@ impl Render {
             // flat pairs: k1, v1, k2, v2 ...
             let mut i = 0;
             while i + 1 < items.len() {
-                let k = self.value_c(&items[i]);
+                // strip subscript quotes from literal string keys
+                // (`m["os"]=v` stores key `os`)
+                let k = match &items[i] {
+                    IrExpr::Str(ks, _) => {
+                        Self::cstr(ks.trim().trim_matches(|c| c == '"' || c == '\''))
+                    }
+                    other => self.value_c(other),
+                };
                 let v = self.value_c(&items[i + 1]);
                 self.emit(&format!(
                     "_sh_assoc_set({id}_k, {id}_v, &{id}_n, {ARR_CAP}, {k}, {v});"
@@ -4328,11 +6617,40 @@ impl Render {
             }
             return;
         }
+        let ai = format!("_ai{}", self.temp_seq);
+        self.temp_seq += 1;
+        self.emit(&format!("size_t {ai} = 0;"));
         for (i, it) in items.iter().enumerate() {
+            let _ = i;
+            // `arr=($x)` — a split element field-splits at runtime (the
+            // core's A1 split marker on an array literal element)
+            if let IrExpr::Call { func, args } = it {
+                if func == "split" {
+                    let v = self.value_c(args.first().unwrap_or(it));
+                    let t = format!("_sp{}", self.temp_seq);
+                    self.temp_seq += 1;
+                    // copy first — _sh_split NUL-terminates words IN
+                    // PLACE, and the source may be const/read-only
+                    // (string literals, static buffers)
+                    self.emit(&format!(
+                        "char {t}[65536]; strncpy({t}, {v}, 65535); {t}[65535] = 0;"
+                    ));
+                    self.emit(&format!("char *{t}_w[1024];"));
+                    self.emit(&format!(
+                        "size_t _sn{t} = _sh_split({t}, {t}_w, 1024);"
+                    ));
+                    self.emit(&format!(
+                        "for (size_t _sk{t} = 0; _sk{t} < _sn{t}; _sk{t}++) {id}[{ai} + _sk{t}] = strdup({t}_w[_sk{t}]);"
+                    ));
+                    self.emit(&format!("{id}_len = {ai} + _sn{t};"));
+                    self.emit(&format!("{ai} += _sn{t};"));
+                    continue;
+                }
+            }
             let v = self.value_c(it);
-            self.emit(&format!("{id}[{i}] = {v};"));
+            self.emit(&format!("{id}[{ai}] = strdup((char*)({v}));"));
+            self.emit(&format!("{id}_len = ++{ai};"));
         }
-        self.emit(&format!("{id}_len = {};", items.len()));
     }
 
     /// `arr+=(x y)` — append elements
@@ -4345,7 +6663,7 @@ impl Render {
         };
         for (i, it) in items.iter().enumerate() {
             let v = self.value_c(it);
-            self.emit(&format!("{id}[{id}_len + {i}] = {v};"));
+            self.emit(&format!("{id}[{id}_len + {i}] = strdup((char*)({v}));"));
         }
         self.emit(&format!("{id}_len += {};", items.len()));
     }
@@ -4366,7 +6684,9 @@ impl Render {
                 && chars[i + 1].is_ascii_alphabetic()
             {
                 let mut j = i + 1;
-                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                while j < chars.len()
+                    && (chars[j].is_ascii_alphanumeric() || chars[j] == '_')
+                {
                     j += 1;
                 }
                 if j > i + 1 {
@@ -4379,7 +6699,9 @@ impl Render {
             // a bare identifier that names a program var (`arr[i+1]`)
             if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
                 let mut j = i + 1;
-                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                while j < chars.len()
+                    && (chars[j].is_ascii_alphanumeric() || chars[j] == '_')
+                {
                     j += 1;
                 }
                 let name: String = chars[i..j].iter().collect();
@@ -4419,7 +6741,9 @@ impl Render {
         if self.assoc_arrays.contains(var) {
             let k = if let Some(rest) = key.strip_prefix('$') {
                 if rest.chars().all(|c| c.is_ascii_digit()) {
-                    format!("(({rest} < _sh_argc && _sh_argv[{rest}]) ? _sh_argv[{rest}] : \"\")")
+                    format!(
+                        "(({rest} < _sh_argc && _sh_argv[{rest}]) ? _sh_argv[{rest}] : \"\")"
+                    )
                 } else {
                     self.store_read(rest)
                 }
@@ -4442,6 +6766,18 @@ impl Render {
         } else if looks_like_arith(key) {
             // `${arr[(2*$i)-1]}` — an arithmetic index expression
             self.arith_text_expr(key)
+        } else if is_ident(key.trim())
+            && (self.store.contains(key.trim()) || self.var_types.contains_key(key.trim()))
+        {
+            // `${args[i]}` — bash arithmetic subscripts allow BARE var
+            // names: a bare identifier naming a program var reads its
+            // value (atoll("i") would be a constant 0)
+            let t = key.trim();
+            if self.is_num(t) {
+                format!("(long long)({})", self.c_ident(t))
+            } else {
+                format!("(long long)atoll({})", self.store_read(t))
+            }
         } else {
             format!("(long long)atoll({})", Self::cstr(key))
         };
@@ -4534,6 +6870,12 @@ impl Render {
             IrExpr::BinOp { .. } => vec![Part::Arg(self.expr(e), self.num_spec(e))],
             IrExpr::Call { func, args } => {
                 let args = args.clone();
+                // an arith call in a WORD position is a VALUE (`echo
+                // $((x))`) — the call() dispatch's first `arith` arm is
+                // the truthiness site, wrong for a word
+                if func == "arith" {
+                    return vec![Part::Arg(self.value_c(e), NumSpec::Str)];
+                }
                 // getVar("x") → ident if x is typed, else the store read
                 if func == "getVar" {
                     if let Some(IrExpr::Str(name, _)) = args.first() {
@@ -4541,10 +6883,7 @@ impl Render {
                             return vec![Part::Arg("_sh_rc".into(), NumSpec::Num("%lld", true))];
                         }
                         if name == "#" {
-                            return vec![Part::Arg(
-                                "((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into(),
-                                NumSpec::Num("%lld", true),
-                            )];
+                            return vec![Part::Arg("((_sh_argc > 0) ? (_sh_argc - 1) : 0)".into(), NumSpec::Num("%lld", true))];
                         }
                         if name == "@" || name == "*" {
                             self.need_sh = true;
@@ -4613,7 +6952,11 @@ impl Render {
             IrExpr::Int(_) | IrExpr::Arith(_) | IrExpr::BinOp { .. } => true,
             // `$y` reads arrive as getVar("y"); a typed-Int var is numeric
             IrExpr::Call { func, args } if func == "getVar" => {
-                matches!(args.first(), Some(IrExpr::Str(name, _)) if name == "?" || self.is_num(name))
+                matches!(
+                    args.first(),
+                    Some(IrExpr::Str(name, _))
+                        if name == "?" || name == "#" || name == "$" || self.is_num(name)
+                )
             }
             IrExpr::Call { func, .. } if func == "arrayLen" => true,
             _ => false,
@@ -4642,7 +6985,11 @@ impl Render {
                         fmt.push_str("%s");
                         // cast: the arg may be a stub call returning
                         // long long — printf("%s", long long) is UB.
-                        cargs.push(format!("(char*)({v})"));
+                        // A NULL char* prints "(null)" (glibc) where bash
+                        // prints "" — guard every %s arg
+                        cargs.push(format!(
+                            "((char*)({v}) ? (char*)({v}) : \"\")"
+                        ));
                     }
                 },
             }
@@ -4651,6 +6998,186 @@ impl Render {
             format!("fputs({}, stdout)", Self::cstr(&fmt))
         } else {
             format!("printf({}, {})", Self::cstr(&fmt), cargs.join(", "))
+        }
+    }
+
+    /// Native `printf` when the format uses only conversions the C printf
+    /// shares with bash's (`%s %d %i %u %o %x %X %%`), with the arg count
+    /// exactly matching the conversion count. Returns None (caller shells
+    /// out) for bash-specific conversions (`%b`, `%q`, `%(...)T`), the
+    /// `\c` / `\0NNN` escapes, and format-recycling (extra/insufficient
+    /// args) — the conservative path keeps those on `bash -c`.
+    fn try_native_printf(&mut self, words: &[&IrExpr]) -> Option<String> {
+        self.try_native_printf_into(words, None)
+    }
+
+    /// `printf -v VAR fmt args…` renders into VAR (a snprintf into the
+    /// store) instead of stdout; `into == None` writes stdout.
+    fn try_native_printf_into(&mut self, words: &[&IrExpr], into: Option<&str>) -> Option<String> {
+        // the format word is often a pure-literal Interpolate — collapse
+        // it so printf -v formats don't fall back to shell-out
+        let fmt_str = match words.first() {
+            Some(IrExpr::Str(s, _)) => s.clone(),
+            Some(IrExpr::Interpolate(parts)) => {
+                let mut out = String::new();
+                let mut all_lit = true;
+                for p in flatten_parts(parts) {
+                    match p {
+                        InterpPart::Lit(l) => out.push_str(&l),
+                        InterpPart::Expr(_) => {
+                            all_lit = false;
+                            break;
+                        }
+                    }
+                }
+                if all_lit {
+                    out
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        let args = &words[1..];
+        let mut fmt = String::new();
+        let mut cargs: Vec<String> = Vec::new();
+        let mut arg_i = 0usize;
+        let mut it = fmt_str.chars().peekable();
+        while let Some(ch) = it.next() {
+            match ch {
+                '\\' => match it.next() {
+                    Some('c') => return None, // bash: stop output
+                    Some('0') => return None, // octal escape differs
+                    Some('n') => fmt.push('\n'),
+                    Some('t') => fmt.push('\t'),
+                    Some('r') => fmt.push('\r'),
+                    Some('a') => fmt.push('\x07'),
+                    Some('b') => fmt.push('\x08'),
+                    Some('f') => fmt.push('\x0c'),
+                    Some('v') => fmt.push('\x0b'),
+                    Some('\\') => fmt.push('\\'),
+                    Some('\'') => fmt.push('\''),
+                    Some('"') => fmt.push('"'),
+                    // unknown escape — keep conservative, shell out
+                    Some(_) => return None,
+                    None => fmt.push('\\'),
+                },
+                '%' => {
+                    let mut pre = String::from("%");
+                    while let Some(&c) = it.peek() {
+                        if "-+ #0".contains(c) {
+                            pre.push(c);
+                            it.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    while let Some(&c) = it.peek() {
+                        if c.is_ascii_digit() {
+                            pre.push(c);
+                            it.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if it.peek() == Some(&'.') {
+                        pre.push('.');
+                        it.next();
+                        while let Some(&c) = it.peek() {
+                            if c.is_ascii_digit() {
+                                pre.push(c);
+                                it.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let conv = it.next()?;
+                    match conv {
+                        '%' => {
+                            fmt.push('%');
+                            continue;
+                        }
+                        's' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push('s');
+                            cargs.push(self.value_c(a));
+                        }
+                        'd' | 'i' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push_str("lld");
+                            cargs.push(format!("(long long)({})", self.value_num(a)));
+                        }
+                        'u' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push_str("llu");
+                            cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
+                        }
+                        'o' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push_str("llo");
+                            cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
+                        }
+                        'x' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push_str("llx");
+                            cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
+                        }
+                        'X' => {
+                            let a = *args.get(arg_i)?;
+                            arg_i += 1;
+                            fmt.push_str(&pre);
+                            fmt.push_str("llX");
+                            cargs.push(format!("(unsigned long long)({})", self.value_num(a)));
+                        }
+                        _ => return None,
+                    }
+                }
+                other => fmt.push(other),
+            }
+        }
+        // format-recycling (bash reuses fmt for leftover args) needs shell-out
+        if arg_i != args.len() {
+            return None;
+        }
+        if let Some(dest) = into {
+            // assign the formatted text to a variable (printf -v)
+            let name = dest;
+            if cargs.is_empty() {
+                if let Some(b) = self.buf_bound(name) {
+                    return Some(format!(
+                        "(strcpy({name}, {}), 1)",
+                        Self::cstr(&fmt)
+                    ));
+                }
+                return Some(format!("({name} = {}, 1)", Self::cstr(&fmt)));
+            }
+            let t = self.str_temp(65536);
+            let store = if self.buf_bound(name).is_some() {
+                format!("strcpy({}, {t})", name)
+            } else {
+                format!("{name} = strdup({t});")
+            };
+            return Some(format!(
+                "({{ snprintf({t}, sizeof {t}, {}, {args}); {store} }})",
+                Self::cstr(&fmt),
+                args = cargs.join(", "),
+            ));
+        }
+        if cargs.is_empty() {
+            Some(format!("fputs({}, stdout)", Self::cstr(&fmt)))
+        } else {
+            Some(format!("printf({}, {})", Self::cstr(&fmt), cargs.join(", ")))
         }
     }
 
@@ -4678,7 +7205,9 @@ impl Render {
         } else {
             (None, String::new())
         };
-        let prev_type = var.as_ref().and_then(|v| self.var_types.get(v).copied());
+        let prev_type = var
+            .as_ref()
+            .and_then(|v| self.var_types.get(v).copied());
         if let Some(v) = &var {
             self.var_types.insert(v.clone(), IrType::Int);
             self.store.remove(v);
@@ -4795,15 +7324,169 @@ impl Render {
     }
 
     fn stmt(&mut self, s: &IrStmt) {
+        // `mapfile -t NAME < FILE` / `readarray …`: run NATIVELY — reading
+        // the lines in a child loses the array (bash arrays cannot cross
+        // exec), which broke every `< <(producer)` mapfile use
+        if let IrStmt::Redirect { inner, redirects } = s {
+            if is_mapfile_redirect(s) && redirects.len() == 1 {
+                if let (Some(items), Some(crate::ir::IrRedirect { target, .. })) = (
+                    inner_first_words(inner),
+                    redirects.first(),
+                ) {
+                    let mut striptail = true;
+                    let mut name: Option<String> = None;
+                    for w in items.iter() {
+                        match w {
+                            IrExpr::Str(f, _) if f.starts_with('-') => {
+                                if f != "-t" {
+                                    striptail = false;
+                                }
+                            }
+                            IrExpr::Str(n, _) => {
+                                name = Some(n.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(name) = name {
+                        self.arrays.insert(name.clone());
+                        let id = self.c_ident(&name);
+                        let t = self.value_c(target);
+                        let strip = if striptail { "1" } else { "0" };
+                        self.emit(&format!(
+                            "{{ FILE *_mf = fopen({t}, \"r\"); if (_mf) {{ static char _mfl[65536]; while (fgets(_mfl, sizeof _mfl, _mf)) {{ size_t _mn = strlen(_mfl); if ({strip}) {{ while (_mn && (_mfl[_mn-1]=='\\n'||_mfl[_mn-1]=='\\r')) _mfl[--_mn]=0; }} if ({id}_len < {ARR_CAP}) {id}[{id}_len++] = strdup(_mfl); }} fclose(_mf); }} }}"
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        // `A || continue` / `A && break` (also exit): a flow statement
+        // inside an and/or chain cannot live in a shell site (the site
+        // rendered `|| 1` and NEVER continued). Peel it: evaluate the
+        // non-flow side natively and branch.
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+            if matches!(func.as_str(), "or" | "and") {
+                let sides: Vec<Vec<IrStmt>> = args
+                    .iter()
+                    .filter_map(|a| match a {
+                        IrExpr::Arrow(sts) => Some(sts.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if sides.len() == 2 {
+                    fn flow_of(sts: &[IrStmt]) -> Option<&'static str> {
+                        match sts.first() {
+                            Some(IrStmt::Expr(IrExpr::Call { func, .. }))
+                                if matches!(func.as_str(), "continue" | "break" | "exit") =>
+                            {
+                                match func.as_str() {
+                                    "continue" => Some("continue"),
+                                    "break" => Some("break"),
+                                    _ => Some("return"),
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
+                    let (flow_side, cond_side) = if flow_of(&sides[1]).is_some() {
+                        (1usize, 0usize)
+                    } else if flow_of(&sides[0]).is_some() {
+                        (0usize, 1usize)
+                    } else {
+                        (2, 1)
+                    };
+                    if flow_side <= 1 {
+                        let flow_kw = flow_of(&sides[flow_side]).unwrap();
+                        let mut v = "1".to_string();
+                        for st in &sides[cond_side] {
+                            match st {
+                                IrStmt::Expr(e) => v = self.expr(e),
+                                other => self.stmt(other),
+                            }
+                        }
+                        // or: flow runs when cond FALSE; and: when TRUE
+                        let guard = if (func == "or") == (flow_side == 1) {
+                            format!("(!({v}))")
+                        } else {
+                            format!("({v})")
+                        };
+                        self.emit(&format!(
+                            "if {guard} {{ {flow_kw}; }}"
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        // statement-position `printf -v VAR …`: assign NATIVELY instead of
+        // losing the assignment in a child bash
+        if let IrStmt::Expr(IrExpr::Call { func, args }) = s {
+            if (func == "exec" || func == "builtin")
+                && Self::str_arg(args, 0).as_deref() == Some("printf")
+            {
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    if matches!(items.first(), Some(IrExpr::Str(sv, _)) if sv == "-v") {
+                        if let Some(IrExpr::Str(name, _)) = items.get(1) {
+                            let rest: Vec<&IrExpr> =
+                                items.iter().skip(2).collect();
+                            if let Some(p) = self.try_native_printf_into(
+                                &rest,
+                                Some(&self.c_ident(name)),
+                            ) {
+                                self.store.insert(name.clone());
+                                self.emit(&format!("(_sh_rc = 0, {p});"));
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         match s {
             IrStmt::Expr(e) => {
                 match e {
+                    // eval / . / source: state-mutating dynamic shell text
+                    // (see source_eval_site) — intercept BEFORE the generic
+                    // shell-text site
+                    IrExpr::Call { func, args }
+                        if (func == "exec" || func == "builtin")
+                            && Self::state_builtin_args(args).is_some() =>
+                    {
+                        let (_, a) = Self::state_builtin_args(args).unwrap();
+                        let site = self.source_eval_site(
+                            Self::str_arg(a, 0).unwrap_or_default().as_str(),
+                            a,
+                        );
+                        self.emit(&format!("{site};"));
+                        return;
+                    }
                     // `break || X` — break ALWAYS succeeds, X never runs
                     // (`continue || X` likewise) — the C break/continue
                     // cannot be an expression, so peel the BinOp
-                    IrExpr::BinOp { lhs, op, .. }
+                    IrExpr::BinOp { lhs, op, rhs, .. }
                         if matches!(op, crate::ir::BinOpKind::Or | crate::ir::BinOpKind::And) =>
                     {
+                        // `test || continue` / `test && break`: the flow
+                        // statement cannot live in a shell site (it
+                        // rendered `|| 1` and never flowed) — branch on
+                        // the natively-rendered condition
+                        let flow_kw = match rhs.as_ref() {
+                            IrExpr::Call { func, .. } if func == "continue" => Some("continue"),
+                            IrExpr::Call { func, .. } if func == "break" => Some("break"),
+                            _ => None,
+                        };
+                        if let (Some(kw), true) = (flow_kw, true) {
+                            let is_or = matches!(op, crate::ir::BinOpKind::Or);
+                            let l = self.expr(lhs);
+                            let guard = if is_or {
+                                format!("(!({l}))")
+                            } else {
+                                format!("({l})")
+                            };
+                            self.emit(&format!("if {guard} {{ {kw}; }}"));
+                            return;
+                        }
                         if let IrExpr::Call { func, .. } = lhs.as_ref() {
                             if func == "break" {
                                 self.emit("break;");
@@ -4814,6 +7497,64 @@ impl Render {
                                 return;
                             }
                         }
+                        // statement-level `A && B` / `A || B` where A is a
+                        // command/test: bash publishes A's verdict in $?
+                        // (the chain's rc is B's rc when B runs, else A's
+                        // failure) — the flat `(l && r);` form leaked a
+                        // stale $? (eq-string-num-var status-zero2)
+                        let chain_lhs = matches!(
+                            lhs.as_ref(),
+                            IrExpr::Call { func, .. }
+                                if func == "exec"
+                                    || func == "builtin"
+                                    || func == "pipeline"
+                                    || func == "test"
+                        ) || matches!(lhs.as_ref(),
+                            IrExpr::BinOp { op: crate::ir::BinOpKind::Not, .. });
+                        if chain_lhs {
+                            let l = self.expr(lhs.as_ref());
+                            let t = self.temp_seq;
+                            self.temp_seq += 1;
+                            self.emit(&format!("{{ int _t{t} = ({l});"));
+                            self.emit(&format!("  _sh_rc = _t{t} ? 0 : 1;"));
+                            if *op == crate::ir::BinOpKind::And {
+                                self.emit(&format!("  if (_t{t}) {{"));
+                            } else {
+                                self.emit(&format!("  if (!_t{t}) {{"));
+                            }
+                            self.depth += 1;
+                            // the rhs may itself be a chain — recurse as a
+                            // statement so nested verdicts publish too
+                            let rhs_stmt = IrStmt::Expr((**rhs).clone());
+                            self.stmt(&rhs_stmt);
+                            self.depth -= 1;
+                            self.emit("  }");
+                            self.emit("}");
+                            return;
+                        }
+                    }
+                    // `! cmd` / `! pipeline` — bash stores the NEGATED rc
+                    // in $?: the statement must ASSIGN back, not discard
+                    IrExpr::Call { func, args }
+                        if (func == "exec" || func == "builtin")
+                            && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "wait") =>
+                    {
+                        // bare wait: reap the forked background jobs
+                        self.emit("{ for (size_t _wi = 0; _wi < _sh_bg_n; _wi++) waitpid(_sh_bg_pids[_wi], 0, 0); _sh_bg_n = 0; _sh_rc = 0; }");
+                        return;
+                    }
+                    IrExpr::BinOp { lhs, op: crate::ir::BinOpKind::Not, .. }
+                        if matches!(
+                            lhs.as_ref(),
+                            IrExpr::Call { func, .. }
+                                if func == "exec" || func == "builtin" || func == "pipeline"
+                        ) =>
+                    {
+                        // the site renders as bash-truthiness (true iff
+                        // rc==0); `! cmd` stores the inverted verdict
+                        let v = self.expr(lhs.as_ref());
+                        self.emit(&format!("_sh_rc = ({v}) ? 1 : 0;"));
+                        return;
                     }
                     IrExpr::Call { func, args } if func == "break" => {
                         self.emit("break;");
@@ -4867,25 +7608,74 @@ impl Render {
                                 },
                                 false,
                             );
+                            self.emit("{ int _went = 0;");
                             self.emit(&format!("while ({site}) {{"));
                             self.depth += 1;
+                            self.emit("_went = 1;");
                             for s in &body_stmts {
                                 self.stmt(s);
                             }
                             self.depth -= 1;
                             self.emit("}");
+                            // bash: a while whose condition failed BEFORE
+                            // the first body run exits 0 (the last cond
+                            // rc must not leak into $?)
+                            self.emit("if (!_went) _sh_rc = 0;");
+                            self.emit("}");
                         }
                         return;
                     }
-                    _ => {}
-                }
-                if let IrExpr::Call { func, .. } = e {
-                    if func == "grepMatches" {
-                        // statement position: the matches are the output
-                        let v = self.expr(e);
-                        self.emit(&format!("printf(\"%s\\n\", (char*)({v}));"));
+                    // `.` / `source` / `eval` — the executed text must
+                    // share state with the PARENT: the child dumps ALL
+                    // its variables after the text runs and the parent
+                    // imports them into the environment (dot-source-lib:
+                    // shared=secret). Store-var reads keep their C value;
+                    // env-fallback reads (env-style/unknown names) pick
+                    // the sourced values up.
+                    IrExpr::Call { func, args }
+                        if (func == "exec" || func == "builtin")
+                            && matches!(
+                                args.first(),
+                                Some(IrExpr::Str(c, _))
+                                    if c == "." || c == "source" || c == "eval"
+                            ) =>
+                    {
+                        self.need_state_import = true;
+                        let args_v = args.clone();
+                        // one fixed state file: sites run sequentially, so
+                        // each dump+import pair completes before the next
+                        let path = "/tmp/.shellstate_pull";
+                        let site = self.shell_site(
+                            |r| {
+                                r.emit("_sh_reset();");
+                                for a in &args_v {
+                                    match a {
+                                        IrExpr::Array(items) => {
+                                            for it in items {
+                                                r.sh_word(CmdBuf::Shared, it);
+                                            }
+                                        }
+                                        other => r.sh_word(CmdBuf::Shared, other),
+                                    }
+                                }
+                                // dump EVERY variable after the text runs,
+                                // redirected to a private temp file
+                                // (stdout parity: nothing on fd 1)
+                                r.emit(&format!(
+                                    "_sh_addraw({});",
+                                    Self::cstr(&format!(
+                                        " ; for _sk in $(compgen -v) ; do printf '%s=%s\\n' \"$_sk\" \"${{!_sk}}\" ; done > {}",
+                                        path
+                                    ))
+                                ));
+                            },
+                            false,
+                        );
+                        self.emit(&format!("{site};"));
+                        self.emit("_sh_import_env();");
                         return;
                     }
+                    _ => {}
                 }
                 let x = self.expr(e);
                 self.emit(&format!("{x};"));
@@ -4930,10 +7720,12 @@ impl Render {
                 if self.arrays.contains(&t.var) {
                     let id = self.c_ident(&t.var);
                     let v = match expr {
-                        IrExpr::Call { func, args } if func == "assign" => match args.get(2) {
-                            Some(x) => self.value_c(x),
-                            None => "\"\"".into(),
-                        },
+                        IrExpr::Call { func, args } if func == "assign" => {
+                            match args.get(2) {
+                                Some(x) => self.value_c(x),
+                                None => "\"\"".into(),
+                            }
+                        }
                         _ => self.value_c(expr),
                     };
                     self.emit(&format!(
@@ -4948,18 +7740,68 @@ impl Render {
                 if self.const_lifted.contains(&t.var) {
                     return;
                 }
+                // bash `((expr))` arith STATEMENT (the core spells the
+                // side-effect forms as Assign with an Arith expr whose
+                // ROOT Assign/IncDec writes the target): the truthiness
+                // of the arith VALUE is the status — `((i++))` with i=0
+                // exits 1, `((++i))` with the result nonzero exits 0 —
+                // and the target is the side-effect var, NOT a stored
+                // assignment (`i = i++` is a C read-modify-write no-op).
+                if let IrExpr::Arith(a) = expr {
+                    if matches!(
+                        a.as_ref(),
+                        ArithAst::Assign { .. } | ArithAst::IncDec { .. }
+                    ) {
+                        // a nested mutation (j = i++ + ++i) must not be
+                        // reordered by hoisted temps — sequence it
+                        let c = self.arith_sequenced(a);
+                        self.need_sh = true;
+                        let is_self = matches!(a.as_ref(), ArithAst::IncDec { var, .. } if var == &t.var)
+                            || matches!(a.as_ref(), ArithAst::Assign { var, .. } if var == &t.var);
+                        if is_self {
+                            // the expr carries the side effect (i++ /
+                            // x = y + 1) — emit it once, read the value
+                            // for the status
+                            self.emit(&format!("_sh_rc = !(({c}) != 0);"));
+                        } else {
+                            // `((j = i++))` — the target receives the
+                            // value AND the status reflects it
+                            let name = self.c_ident(&t.var);
+                            self.emit(&format!("_sh_rc = !(({name} = ({c})) != 0);"));
+                        }
+                        return;
+                    }
+                }
                 let name = self.c_ident(&t.var);
                 if let Some(b) = self.buf_bound(&t.var) {
                     // a bounded string var: the debug-only length assert
                     // fires BEFORE the write that would overflow the
-                    // fixed buffer (see emit_guarded_copy).
+                    // fixed buffer (see emit_guarded_copy). A NUMERIC
+                    // RHS (arith `i = 2` in a cstyle-for) renders as a
+                    // C int expression — stringify it first or the
+                    // copy is a no-op.
                     let rhs = self.expr(expr);
+                    let rhs = if self.expr_is_num(expr) {
+                        self.num_temp(&rhs)
+                    } else {
+                        rhs
+                    };
                     self.emit_guarded_copy(&name, b, &rhs);
                     return;
                 }
                 let is_num = self.is_num(&t.var);
                 let rhs = if is_num {
-                    self.expr_as_num(expr)
+                    if let IrExpr::Call { func, .. } = expr {
+                        if func == "arith" {
+                            // `n=$(( dyn ))` — the arith VALUE (the
+                            // site arm returns only the truthiness)
+                            format!("(long long)atoll({})", self.value_c(expr))
+                        } else {
+                            self.expr_as_num(expr)
+                        }
+                    } else {
+                        self.expr_as_num(expr)
+                    }
                 } else if let IrExpr::Call { func, args } = expr {
                     if func == "arith" {
                         // `x=$(( ... ))` — the arith RESULT (a capture),
@@ -4994,6 +7836,12 @@ impl Render {
                 // before returning, so the value never matters).
                 if !is_num && rhs.starts_with("sh2_") {
                     self.emit(&format!("{name} = (char*)({rhs});"));
+                } else if !is_num {
+                    // COPY: the RHS may be (or alias) a temp buffer that
+                    // a later statement rewrites (a sibling snprintf
+                    // self-aliases `snprintf(_sN, "%s * %s", _sN, x)`),
+                    // so the var must own its storage
+                    self.emit(&format!("{name} = strdup({rhs});"));
                 } else {
                     self.emit(&format!("{name} = {rhs};"));
                 }
@@ -5010,8 +7858,42 @@ impl Render {
                 } else {
                     init.as_ref().map(|e| self.expr(e))
                 };
+                // a `local` Declare inside a NESTED BLOCK: bash `local`
+                // scopes to the FUNCTION — a C block declaration would
+                // vanish at the closing brace (stderr_/rc used after the
+                // block were 'undeclared'). The fn-top hoist owns the
+                // storage; render an ASSIGNMENT.
+                let nested_fn_scope = self.in_function && self.depth > 1;
                 for d in vars {
                     let name = self.c_ident(&d.name);
+                    if nested_fn_scope {
+                        match &init_expr {
+                            Some(v) if self.is_num(&d.name) => {
+                                self.emit(&format!("{name} = (long long)atoll((char*)({v}));"));
+                            }
+                            Some(v) => {
+                                // a FIXED BUFFER cannot be reassigned —
+                                // copy into it (j = strdup("0") on
+                                // char j[21] was an assignment-to-array)
+                                if let Some(b) = self.buf_bound(&d.name) {
+                                    self.emit_guarded_copy(
+                                        &name,
+                                        b,
+                                        &format!("(char*)({v})"),
+                                    );
+                                } else {
+                                    self.emit(&format!(
+                                        "{name} = strdup((char*)({v}));"
+                                    ));
+                                }
+                            }
+                            None => {
+                                self.emit(&format!("{name} = NULL;"));
+                            }
+                        }
+                        self.decl_line_idx.insert(d.name.clone(), self.out.len() - 1);
+                        continue;
+                    }
                     if self.is_num(&d.name) {
                         let v = match &init_expr {
                             Some(v) if v.starts_with('"') || v.starts_with('(') => {
@@ -5020,18 +7902,18 @@ impl Render {
                             Some(v) => v.clone(),
                             None => "0".into(),
                         };
-                        self.emit(&format!(
-                            "{} {name} = {v};",
-                            self.width_of_var(&d.name).c_type()
-                        ));
+                        self.emit(&format!("{} {name} = {v};", self.width_of_var(&d.name).c_type()));
+                        self.decl_line_idx.insert(d.name.clone(), self.out.len() - 1);
                     } else if let Some(b) = self.buf_bound(&d.name) {
                         self.emit(&format!("char {name}[{}] = \"\";", b + 1));
+                        self.decl_line_idx.insert(d.name.clone(), self.out.len() - 1);
                         if let Some(v) = init_expr.clone() {
                             self.emit_guarded_copy(&name, b, &v);
                         }
                     } else {
                         let v = init_expr.clone().unwrap_or_else(|| "NULL".into());
                         self.emit(&format!("char* {name} = {v};"));
+                        self.decl_line_idx.insert(d.name.clone(), self.out.len() - 1);
                     }
                 }
             }
@@ -5043,12 +7925,7 @@ impl Render {
                     self.emit(&format!("fputs((char*)({v}), stdout);"));
                 }
             }
-            IrStmt::If {
-                cond,
-                then,
-                elsifs,
-                else_,
-            } => {
+            IrStmt::If { cond, then, elsifs, else_ } => {
                 let c = self.expr(cond);
                 self.emit(&format!("if ({c}) {{"));
                 self.depth += 1;
@@ -5076,10 +7953,7 @@ impl Render {
                 self.emit("}");
             }
             IrStmt::Exit(e) => {
-                let code = e
-                    .as_ref()
-                    .map(|x| self.expr(x))
-                    .unwrap_or_else(|| "0".into());
+                let code = e.as_ref().map(|x| self.expr(x)).unwrap_or_else(|| "0".into());
                 self.emit(&format!("return {code};"));
             }
             IrStmt::For { var, iter, body } => {
@@ -5147,6 +8021,57 @@ impl Render {
                         }
                     }
                 }
+                // `for f in *.txt` / `for f in *.{t,l}.x` — the items
+                // are glob PATTERNS; bash expands them against the
+                // filesystem at runtime, so the loop runs a child-bash
+                // glob (`printf '%s\n' <raw patterns>` — with no match
+                // the literal pattern stays, exactly like bash's
+                // nullglob-off default).
+                let has_glob = items.iter().any(|it| {
+                    matches!(it, IrExpr::Str(s, _)
+                        if s.contains('*') || s.contains('?') || s.contains('['))
+                });
+                if has_glob {
+                    let items = items.clone();
+                    let cap = self.cap_site(|r, id| {
+                        r.emit(&format!("_sh_bres(&_c{id}_cmd, &_c{id}_cap);"));
+                        r.emit(&format!(
+                            "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                            Self::cstr("printf '%s\\n'")
+                        ));
+                        for it in &items {
+                            if let IrExpr::Str(s, _) = it {
+                                // RAW (unquoted) — the child globs it
+                                r.emit(&format!(
+                                    "_sh_badd(&_c{id}_cmd, &_c{id}_cap, {});",
+                                    Self::cstr(&format!(" {}", strip_glob(s)))
+                                ));
+                            }
+                        }
+                        r.emit(&format!("_sh_capture(buf, sizeof buf, _c{id}_cmd);"));
+                        r.emit("return buf;");
+                    });
+                    self.need_sh = true;
+                    let wn = format!("_wn_{}", self.temp_seq);
+                    self.temp_seq += 1;
+                    let ws = format!("_ws_{}", self.temp_seq);
+                    self.temp_seq += 1;
+                    self.emit(&format!(
+                        "char *{wn} = {cap}; char *{ws}[1024]; size_t _wc_{wn} = _sh_split({wn}, {ws}, 1024);"
+                    ));
+                    let var_name = self.c_ident(var);
+                    self.emit(&format!(
+                        "for (size_t _wi_{wn} = 0; _wi_{wn} < _wc_{wn}; _wi_{wn}++) {{"
+                    ));
+                    self.depth += 1;
+                    self.emit(&format!("{var_name} = {ws}[_wi_{wn}];"));
+                    for s in body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                    return;
+                }
                 // `for a in "$@"` / `$*` — the argv loop
                 if items.len() == 1 {
                     if let IrExpr::Call { func, args } = &items[0] {
@@ -5177,7 +8102,9 @@ impl Render {
                                 "for (size_t _ai_{var_name} = 1; _ai_{var_name} < (size_t)_sh_argc; _ai_{var_name}++) {{"
                             ));
                             self.depth += 1;
-                            self.emit(&format!("{var_name} = _sh_argv[_ai_{var_name}];"));
+                            self.emit(&format!(
+                                "{var_name} = _sh_argv[_ai_{var_name}];"
+                            ));
                             for s in body {
                                 self.stmt(s);
                             }
@@ -5207,7 +8134,9 @@ impl Render {
                                         "for (size_t _ai_{kid} = 0; _ai_{kid} < {kid}_n; _ai_{kid}++) {{"
                                     ));
                                     self.depth += 1;
-                                    self.emit(&format!("{var_name} = {kid}_k[_ai_{kid}];"));
+                                    self.emit(&format!(
+                                        "{var_name} = {kid}_k[_ai_{kid}];"
+                                    ));
                                     for s in body {
                                         self.stmt(s);
                                     }
@@ -5215,15 +8144,33 @@ impl Render {
                                     self.emit("}");
                                     return;
                                 }
-                                // indexed elements
+                                // indexed elements (an ASSOC array iterates
+                                // its VALUES: aa_v[0..aa_n])
                                 self.arrays.insert(name.clone());
                                 self.need_sh = true;
                                 let aid = self.c_ident(&name);
+                                if self.assoc_arrays.contains(&name) {
+                                    self.emit(&format!(
+                                        "for (size_t _ai_{aid} = 0; _ai_{aid} < {aid}_n; _ai_{aid}++) {{"
+                                    ));
+                                    self.depth += 1;
+                                    self.emit(&format!(
+                                        "{var_name} = {aid}_v[_ai_{aid}];"
+                                    ));
+                                    for s in body {
+                                        self.stmt(s);
+                                    }
+                                    self.depth -= 1;
+                                    self.emit("}");
+                                    return;
+                                }
                                 self.emit(&format!(
                                     "for (size_t _ai_{aid} = 0; _ai_{aid} < {aid}_len; _ai_{aid}++) {{"
                                 ));
                                 self.depth += 1;
-                                self.emit(&format!("{var_name} = {aid}[_ai_{aid}];"));
+                                self.emit(&format!(
+                                    "{var_name} = {aid}[_ai_{aid}];"
+                                ));
                                 for s in body {
                                     self.stmt(s);
                                 }
@@ -5238,7 +8185,10 @@ impl Render {
                 if items.len() == 1 {
                     if let IrExpr::Call { func, args } = &items[0] {
                         if func == "captureWords" || func == "capture" {
-                            let cap = self.capture_call(&[items[0].clone()]);
+                            // pass the capture's INNER Arrow args —
+                            // wrapping the whole call yielded an empty site
+                            let inner: Vec<IrExpr> = args.clone();
+                            let cap = self.capture_call(&inner);
                             self.need_sh = true;
                             let wn = format!("_wn_{}", self.temp_seq);
                             self.temp_seq += 1;
@@ -5252,7 +8202,9 @@ impl Render {
                                 "for (size_t _wi_{wn} = 0; _wi_{wn} < _wc_{wn}; _wi_{wn}++) {{"
                             ));
                             self.depth += 1;
-                            self.emit(&format!("{var_name} = {ws}[_wi_{wn}];"));
+                            self.emit(&format!(
+                                "{var_name} = {ws}[_wi_{wn}];"
+                            ));
                             for s in body {
                                 self.stmt(s);
                             }
@@ -5316,9 +8268,7 @@ impl Render {
                             }
                         }
                     }
-                    if !ok {
-                        return;
-                    }
+                    if !ok { return; }
                     self.emit(&format!(
                         "static const long long {arr_id}[] = {{{}}};",
                         values.join(", ")
@@ -5346,9 +8296,7 @@ impl Render {
                             }
                         }
                     }
-                    if !ok {
-                        return;
-                    }
+                    if !ok { return; }
                     self.emit(&format!(
                         "static const char* {arr_id}[] = {{{}}};",
                         values.join(", ")
@@ -5372,12 +8320,18 @@ impl Render {
                 // emits must refresh EVERY iteration, not hoist before
                 // the loop.
                 let c = self.cond_site(cond);
+                self.emit("{ int _went = 0;");
                 self.emit(&format!("while ({c}) {{"));
                 self.depth += 1;
+                self.emit("_went = 1;");
                 for s in body {
                     self.stmt(s);
                 }
                 self.depth -= 1;
+                self.emit("}");
+                // bash: a while whose condition failed BEFORE the first
+                // body run exits 0 (the cond rc must not leak into $?)
+                self.emit("if (!_went) { _sh_rc = 0; }");
                 self.emit("}");
             }
             IrStmt::DoWhile { body, cond, until } => {
@@ -5399,6 +8353,22 @@ impl Render {
                 // calls arrive as exec("<name>") and render `name();`.
             }
             IrStmt::Redirect { inner, redirects } => {
+                // NATIVE fast path: a redirect that only touches fd≥2
+                // (`cmd 2>/dev/null`) silences stderr — stdout parity is
+                // unaffected, so when the inner statement is natively
+                // renderable (a scalar assign / test / arith chain), skip
+                // the child-bash site entirely (the assign's variable
+                // write must land in the PARENT process — a site would
+                // lose it: dollar-positional-arithmetic n=$(($1+0)) 2>/dev/null)
+                let stderr_only = redirects.iter().all(|rd| {
+                    matches!(rd.fd, Some(f) if f >= 2)
+                });
+                if stderr_only && inner.iter().all(Self::stmt_natively_renderable) {
+                    for s in inner {
+                        self.stmt(s);
+                    }
+                    return;
+                }
                 // `cmd > file 2>&1` — reconstruct the full shell text and
                 // run it (bash applies the redirections exactly)
                 let inner = inner.clone();
@@ -5413,9 +8383,7 @@ impl Render {
                 );
                 self.emit(&format!("{site};"));
             }
-            IrStmt::Pipeline {
-                stages, capture, ..
-            } => {
+            IrStmt::Pipeline { stages, capture, .. } => {
                 let stages = stages.clone();
                 let capture = capture.clone();
                 if let Some(var) = capture {
@@ -5423,14 +8391,54 @@ impl Render {
                     self.store.insert(var.clone());
                     let id = self.c_ident(&var);
                     let args = vec![IrExpr::Array(
-                        stages.iter().map(|st| IrExpr::Arrow(st.clone())).collect(),
+                        stages
+                            .iter()
+                            .map(|st| IrExpr::Arrow(st.clone()))
+                            .collect(),
                     )];
                     let cap = self.capture_call(&args);
                     self.emit(&format!("{id} = {cap};"));
                 } else {
                     let args = vec![IrExpr::Array(
-                        stages.iter().map(|st| IrExpr::Arrow(st.clone())).collect(),
+                        stages
+                            .iter()
+                            .map(|st| IrExpr::Arrow(st.clone()))
+                            .collect(),
                     )];
+                    // the script reads $PIPESTATUS: run the pipeline via
+                    // _sh_state_run (env import) with a suffix exporting
+                    // the per-stage statuses into __shps_j
+                    if self.need_pipestatus {
+                        let id = self.site_seq;
+                        self.site_seq += 1;
+                        let saved = std::mem::take(&mut self.out);
+                        let saved_depth = self.depth;
+                        self.depth = 0;
+                        self.emit(&format!(
+                            "{{ static char _envf{id}[64]; snprintf(_envf{id}, sizeof _envf{id}, \"/tmp/.shstate.%ld\", (long)getpid()); _sh_export(\"_SH2ENVF\", _envf{id}); }}"
+                        ));
+                        self.emit("_sh_reset();");
+                        let args_c = args.clone();
+                        self.sh_pipeline_text(CmdBuf::Shared, &args_c);
+                        self.emit(&format!(
+                            "_sh_addraw({});",
+                            Self::cstr(" ; __shps_raw=(${PIPESTATUS[@]}) ; __shps_rc=$? ; __shps_j=\"$(IFS=, ; printf '%s' \"${__shps_raw[*]}\")\" ; export __shps_j ; [ \"$__shps_rc\" -eq 0 ]")
+                        ));
+                        let body_out = std::mem::replace(&mut self.out, saved);
+                        self.depth = saved_depth;
+                        let mut s2 =
+                            format!("static int _sh_site_{id}(void) {{\n");
+                        for line in body_out {
+                            s2.push_str(&line);
+                            s2.push('\n');
+                        }
+                        s2.push_str("  return !_sh_state_run();\n}");
+                        self.site_bodies.push(s2);
+                        self.site_ids.push(id);
+                        self.need_sh = true;
+                        self.emit(&format!("_sh_site_{id}();"));
+                        return;
+                    }
                     let site = self.shell_site(
                         |r| {
                             r.emit("_sh_reset();");
@@ -5441,13 +8449,35 @@ impl Render {
                     self.emit(&format!("{site};"));
                 }
             }
-            IrStmt::Block(body) | IrStmt::Background(body) => {
+            IrStmt::Block(body) => {
                 self.emit("{");
                 self.depth += 1;
                 for s in body {
                     self.stmt(s);
                 }
                 self.depth -= 1;
+                self.emit("}");
+            }
+            IrStmt::Background(body) => {
+                // bash forks the job onto a COPY of the shell state —
+                // fork() is the native mapping: async ordering AND the
+                // copy semantics come free ({ x=2; } & cannot leak x=2
+                // into the parent: 105_background_copy_semantics), no
+                // synchronous child-bash site needed
+                let bg = self.temp_seq;
+                self.temp_seq += 1;
+                self.emit(&format!("{{ pid_t _bg{bg} = fork();"));
+                self.emit(&format!("  if (_bg{bg} == 0) {{"));
+                self.depth += 1;
+                for s in body {
+                    self.stmt(s);
+                }
+                self.emit("fflush(stdout); _exit(0);");
+                self.depth -= 1;
+                self.emit("  }");
+                self.emit(&format!(
+                    "  if (_bg{bg} > 0 && _sh_bg_n < sizeof _sh_bg_pids / sizeof *_sh_bg_pids) _sh_bg_pids[_sh_bg_n++] = _bg{bg};"
+                ));
                 self.emit("}");
             }
             IrStmt::Subshell(body) => {
@@ -5497,24 +8527,30 @@ impl Render {
                 self.depth -= 1;
                 self.emit("}");
             }
-            IrStmt::Case {
-                discriminant,
-                clauses,
-            } => {
+            IrStmt::Case { discriminant, clauses } => {
                 let d = self.value_c(discriminant);
                 self.need_fnmatch = true;
                 let mut first = true;
                 for cl in clauses {
-                    for pat in &cl.patterns {
+                    for pat_raw in &cl.patterns {
+                        // patterns arrive as RAW TEXT including any
+                        // quoting (`"add"`) — bash strips the QUOTES before
+                        // matching, so fnmatch never saw a match
+                        let stripped = strip_glob(pat_raw);
+                        let pat = unquote_case_pattern(stripped);
                         let kw = if first { "if" } else { "else if" };
                         first = false;
-                        let flags = if self.nocasematch {
-                            ", FNM_CASEFOLD"
-                        } else {
-                            ""
-                        };
-                        let pat_c = Self::cstr(pat);
-                        self.emit(&format!("{kw} (fnmatch({pat_c}, {d}, 0{flags}) == 0) {{"));
+                        let flags = if self.nocasematch { " | FNM_CASEFOLD" } else { "" };
+                        // a QUOTED pattern keeps its quote chars in the
+                        // shIR text (`''` arrived as two-quote string):
+                        // strip them — bash matches the DEQUOTED word,
+                        // and an empty pattern must match the empty value
+                        let pat_text = strip_glob(pat)
+                            .trim_matches(|c| c == '"' || c == '\'');
+                        let pat_c = Self::cstr(pat_text);
+                        self.emit(&format!(
+                            "{kw} (fnmatch({pat_c}, {d}, 0{flags}) == 0) {{"
+                        ));
                         self.depth += 1;
                         for s in &cl.body {
                             self.stmt(s);
@@ -5529,11 +8565,7 @@ impl Render {
                 self.depth -= 1;
                 self.emit("}");
             }
-            IrStmt::WriteFile {
-                path,
-                content,
-                append,
-            } => {
+            IrStmt::WriteFile { path, content, append } => {
                 let p = self.value_c(path);
                 let c = self.value_c(content);
                 let mode = if *append { "a" } else { "w" };
@@ -5573,19 +8605,23 @@ impl Render {
                 let id = self.c_ident(var);
                 for (i, e) in elements.iter().enumerate() {
                     let v = self.value_c(e);
-                    self.emit(&format!("{id}[{i}] = {v};"));
+                    self.emit(&format!("{id}[{i}] = strdup((char*)({v}));"));
                 }
                 self.emit(&format!("{id}_len = {};", elements.len()));
             }
-            IrStmt::Exec {
-                cmd,
-                args,
-                capture,
-                redirects,
-                ..
-            } => {
+            IrStmt::Exec { cmd, args, capture, redirects, .. } => {
                 let mut call_args = vec![cmd.clone()];
                 call_args.push(IrExpr::Array(args.clone()));
+                // eval / . / source (no capture/redirects): state site
+                if capture.is_none()
+                    && redirects.is_empty()
+                    && Self::state_builtin_args(&call_args).is_some()
+                {
+                    let (k, a) = Self::state_builtin_args(&call_args).unwrap();
+                    let site = self.source_eval_site(k, a);
+                    self.emit(&format!("{site};"));
+                    return;
+                }
                 if let Some(var) = capture {
                     self.store.insert(var.clone());
                     let id = self.c_ident(var);
@@ -5661,6 +8697,110 @@ impl Render {
                     self.emit(&format!("{site};"));
                 }
             }
+            IrStmt::Continue => {
+                self.emit("continue;");
+            }
+            IrStmt::Break => {
+                self.emit("break;");
+            }
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                // c-style for as a real node: `init; while (cond) {
+                // body; step; }`. The init/step render as STATEMENTS (not
+                // for-header exprs) so their arith temps land inside the
+                // loop (a hoisted step temp would freeze the loop).
+                for s in init {
+                    self.stmt(s);
+                }
+                let cond_c = self.expr(cond);
+                self.emit(&format!("while ({cond_c}) {{"));
+                self.depth += 1;
+                for s in body {
+                    self.stmt(s);
+                }
+                for s in step {
+                    self.stmt(s);
+                }
+                self.depth -= 1;
+                self.emit("}");
+            }
+            // NEW-CORE NODE: ForEachLine — STREAMING line iteration over
+            // a file (O(1) memory; the node doc pins "C getline"). The
+            // loop var is STRING-typed by construction.
+            IrStmt::Ext(ref node) if node.tag() == "ForEachLine" => {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static FL_N: AtomicUsize = AtomicUsize::new(0);
+                let k = FL_N.fetch_add(1, Ordering::Relaxed);
+                let fl = node.as_any()
+                    .downcast_ref::<crate::shir_nodes::ForEachLine>()
+                    .expect("tag/type agree");
+                self.store.insert(fl.var.clone());
+                self.var_types.insert(fl.var.clone(), IrType::Str);
+                // body self-increment assigns ('cat -n F' counter) are
+                // NUMERIC — typed here before the body renders or the
+                // counter hoists as char* and prints pointer garbage
+                for b in &fl.body {
+                    if let IrStmt::Assign { targets, expr, .. } = b {
+                        if let IrExpr::BinOp {
+                            lhs,
+                            op: crate::ir::BinOpKind::Add,
+                            rhs,
+                        } = expr
+                        {
+                            if matches!(
+                                lhs.as_ref(),
+                                IrExpr::Var(v, _)
+                                    if targets.iter().any(|t| t.var == *v)
+                            ) && matches!(rhs.as_ref(), IrExpr::Int(_))
+                            {
+                                self.var_types
+                                    .insert(targets[0].var.clone(), IrType::Int);
+                            }
+                        }
+                    }
+                }
+                let var = self.c_ident(&fl.var);
+                let src = self.value_c(&fl.source);
+                self.emit(&format!("{{"));
+                self.emit(&format!(
+                    "  long long _lim{k} = -1;"
+                ));
+                if let Some(limit) = &fl.limit {
+                    let lv = self.value_num_dollar(limit);
+                    self.emit(&format!("  _lim{k} = {lv};"));
+                }
+                self.emit(&format!(
+                    "  FILE *_ff{k} = fopen({src}, \"r\");"
+                ));
+                self.emit(&format!("  if (_ff{k}) {{"));
+                self.emit(&format!(
+                    "    static char _fll{k}[65536]; long long _fli{k} = 0;"
+                ));
+                self.emit(&format!(
+                    "    while (fgets(_fll{k}, sizeof _fll{k}, _ff{k})) {{"
+                ));
+                self.depth += 3;
+                self.emit(&format!(
+                    "size_t _fn{k} = strlen(_fll{k}); while (_fn{k} && (_fll{k}[_fn{k}-1]=='\\n' || _fll{k}[_fn{k}-1]=='\\r')) _fll{k}[--_fn{k}] = 0;"
+                ));
+                self.emit(&format!("{var} = strdup(_fll{k});"));
+                for b in &fl.body {
+                    self.stmt(b);
+                }
+                self.depth -= 1;
+                self.emit(&format!(
+                    "if (_lim{k} >= 0 && ++_fli{k} >= _lim{k}) break;"
+                ));
+                self.depth -= 2;
+                self.emit("    }");
+                self.emit(&format!("    fclose(_ff{k});"));
+                self.emit("  }");
+                self.emit("}");
+            }
             other => self.mark_todo(&format!("stmt {:?}", other)),
         }
     }
@@ -5684,19 +8824,23 @@ impl Render {
                     .map(|(k, v)| (k.clone(), Some(*v)))
                     .collect();
                 match arith_range_local(a, &state) {
-                    Some((lo, hi)) => Width::from_range_name(crate::shir::range_width_name(lo, hi)),
+                    Some((lo, hi)) => {
+                        Width::from_range_name(crate::shir::range_width_name(lo, hi))
+                    }
                     None => Width::I64,
                 }
             }
             // `$y` read of a typed var renders as the declared ident —
             // its width is the var's declared width, not the I64 fallback
             // (without this, `echo $i` would keep the %lld cast)
-            IrExpr::Call { func, args } if func == "getVar" => match args.first() {
-                Some(IrExpr::Str(name, _)) if self.var_types.contains_key(name) => {
-                    self.width_of_var(name)
+            IrExpr::Call { func, args } if func == "getVar" => {
+                match args.first() {
+                    Some(IrExpr::Str(name, _)) if self.var_types.contains_key(name) => {
+                        self.width_of_var(name)
+                    }
+                    _ => Width::I64,
                 }
-                _ => Width::I64,
-            },
+            }
             _ => Width::I64,
         }
     }
@@ -5780,6 +8924,9 @@ impl Render {
         // and the shell function names (their calls render `name();`).
         let mut vars: BTreeSet<String> = BTreeSet::new();
         let mut for_vars: BTreeSet<String> = BTreeSet::new();
+        if std::env::var("SH2_DBG_VARS").is_ok() {
+            eprintln!("DBG program stmts={} first={:?}", prog.stmts.len(), prog.stmts.first().map(std::mem::discriminant));
+        }
         collect_vars_full(&prog.stmts, &mut vars, &mut for_vars);
         // collect function definitions at ANY depth (a function may be
         // defined inside a block/loop — the shellbench eval benches do).
@@ -5808,6 +8955,87 @@ impl Render {
         // collect the untyped store names (getVar/param reads, Assign
         // targets, Declare lists) — they hoist as `char*` entries
         collect_store_names(&prog.stmts, &mut self.store);
+        // \\$PIPESTATUS reads anywhere? pipeline sites then export the
+        // per-stage statuses through the state-import channel
+        fn scan_ps_expr(e: &IrExpr, out: &mut bool) {
+            if *out {
+                return;
+            }
+            match e {
+                IrExpr::Call { func, args } if func == "param" => {
+                    if let Some(IrExpr::Str(n, _)) = args.get(1) {
+                        if n.starts_with("PIPESTATUS[") {
+                            *out = true;
+                        }
+                    }
+                }
+                IrExpr::Interpolate(parts) => {
+                    for p in parts {
+                        if let InterpPart::Expr(x) = p {
+                            scan_ps_expr(x, out);
+                        }
+                    }
+                }
+                IrExpr::Array(items) => {
+                    for x in items {
+                        scan_ps_expr(x, out);
+                    }
+                }
+                IrExpr::Arrow(stmts) => {
+                    scan_ps_stmts(stmts, out);
+                }
+                IrExpr::Call { args, .. } => {
+                    for x in args {
+                        scan_ps_expr(x, out);
+                    }
+                }
+                IrExpr::BinOp { lhs, rhs, .. } => {
+                    scan_ps_expr(lhs, out);
+                    scan_ps_expr(rhs, out);
+                }
+                IrExpr::Object(fields) => {
+                    for (_, v) in fields {
+                        scan_ps_expr(v, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn scan_ps_stmts(stmts: &[IrStmt], out: &mut bool) {
+            for st in stmts {
+                match st {
+                    IrStmt::Expr(e) => scan_ps_expr(e, out),
+                    IrStmt::If { cond, then, elsifs, else_, .. } => {
+                        scan_ps_expr(cond, out);
+                        scan_ps_stmts(then, out);
+                        for (_, b) in elsifs {
+                            scan_ps_stmts(b, out);
+                        }
+                        scan_ps_stmts(else_, out);
+                    }
+                    IrStmt::While { cond, body, .. }
+                    | IrStmt::DoWhile { cond, body, .. } => {
+                        scan_ps_expr(cond, out);
+                        scan_ps_stmts(body, out);
+                    }
+                    IrStmt::For { iter, body, .. } => {
+                        scan_ps_expr(iter, out);
+                        scan_ps_stmts(body, out);
+                    }
+                    IrStmt::Pipeline { stages, .. } => {
+                        for s2 in stages {
+                            scan_ps_stmts(s2, out);
+                        }
+                    }
+                    IrStmt::Redirect { inner, .. } => scan_ps_stmts(inner, out),
+                    IrStmt::Block(body)
+                    | IrStmt::Subshell(body)
+                    | IrStmt::Background(body) => scan_ps_stmts(body, out),
+                    _ => {}
+                }
+            }
+        }
+        scan_ps_stmts(&prog.stmts, &mut self.need_pipestatus);
         for v in &self.store {
             vars.insert(v.clone());
         }
@@ -5848,6 +9076,9 @@ impl Render {
         if !self.arrays.is_empty() {
             self.emit("");
         }
+        if std::env::var("SH2_DBG_VARS").is_ok() {
+            eprintln!("DBG vars={:?} store={:?} lifted={:?}", vars, self.store, self.const_lifted);
+        }
         for v in &vars {
             self.emit_var_decl(v);
         }
@@ -5862,18 +9093,8 @@ impl Render {
             self.emit_bound_asserts(&vars);
             self.emit("");
         }
-        // source-mapping comments: ` /* line N */` on each top-level
-        // statement's first line (the shIR convention, like perl) — the
-        // web GUI builds its line map from these.
-        for (idx, s) in prog.stmts.iter().enumerate() {
-            let before = self.out.len();
+        for s in &prog.stmts {
             self.stmt(s);
-            let line = prog.stmt_lines.iter().find(|(i, _)| *i == idx).map(|(_, l)| *l);
-            if let Some(l) = line {
-                if let Some(first) = self.out.get_mut(before) {
-                    *first = format!("{first} /* line {l} */");
-                }
-            }
         }
         self.emit("return 0;");
         std::mem::swap(&mut self.out, &mut body_out);
@@ -5891,6 +9112,17 @@ impl Render {
         }
         fn_out = std::mem::replace(&mut self.out, saved_out);
         self.fn_defs = fn_defs;
+        // forward declarations head the function block (calls may occur
+        // in any definition order)
+        if !self.fn_fwd_decls.is_empty() {
+            let mut with_fwd: Vec<String> = Vec::new();
+            for d in std::mem::take(&mut self.fn_fwd_decls) {
+                with_fwd.push(d);
+            }
+            with_fwd.push(String::new());
+            with_fwd.extend(fn_out.iter().cloned());
+            fn_out = with_fwd;
+        }
         // fn-locals referenced by site/capture helpers hoist to FILE
         // scope (the helpers are file-scope functions; emit_function
         // already excluded them from the fn's local block)
@@ -5902,6 +9134,10 @@ impl Render {
                 .site_file_vars
                 .iter()
                 .filter(|v| !self.arrays.contains(*v))
+                // already hoisted at top level (the top-level `vars`
+                // set) — a duplicate file-scope decl would be a
+                // redefinition error
+                .filter(|v| !vars.contains(*v))
                 .cloned()
                 .collect();
             for v in &svars {
@@ -5960,7 +9196,22 @@ impl Render {
         if !fn_out.is_empty() {
             self.emit("");
         }
-        self.emit("int main(void) {");
+        self.emit("int main(int _mac, char **_mav) {");
+        if self.need_sh {
+            // real argv for $0 / positional params (function-call
+            // emulation saves/restores _sh_argv around its own sites)
+            self.emit("  _sh_argv = _mav; _sh_argc = _mac;");
+            // bash seeds HOSTNAME itself — the gate env may not carry it
+            // (064_21: ${HOSTNAME:-localhost} took the default)
+            // extern decl inline: the runtime trimmer may drop
+            // <unistd.h> when nothing else needs it
+            self.emit("  if (!getenv(\"HOSTNAME\")) { extern int gethostname(char *, size_t); static char _hn[256]; if (gethostname(_hn, sizeof _hn) == 0) setenv(\"HOSTNAME\", _hn, 0); }");
+            // bash also seeds BASH_VERSION — a script probing
+            // `${BASH_VERSION-}` asks "am I bash?" and the transpiled
+            // program preserves bash semantics, so the answer is yes.
+            // ZSH_VERSION stays UNSET (we are not zsh).
+            self.emit("  setenv(\"BASH_VERSION\", \"5.2.15(1)-release\", 0);");
+        }
         // Only REAL shell-out sites (bash -c subprocesses) need the
         // preamble: their children share fd 1 — unbuffered stdout keeps
         // the interleave order — and write to our stderr — silenced to
@@ -5976,12 +9227,39 @@ impl Render {
         self.out.extend(body_out.iter().cloned());
         self.emit("}");
         if self.todo > 0 {
-            self.emit(&format!(
-                "/* {} construct(s) lowered to TODO markers */",
-                self.todo
-            ));
+            self.emit(&format!("/* {} construct(s) lowered to TODO markers */", self.todo));
         }
     }
+}
+
+/// Collect every variable name referenced by statements (assign targets,
+/// declare lists, Var reads).
+/// Collect every variable name referenced by statements (assign targets,
+/// declare lists, Var reads).
+// All `_sh_…` identifiers in `s` (both calls `_sh_foo(` and variable
+// references `_sh_rc`). Used by trim_sh_runtime's reachability.
+fn sh_tokens(s: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i + 3 < b.len() {
+        if b[i] == b'_'
+            && b[i + 1] == b's'
+            && b[i + 2] == b'h'
+            && b[i + 3] == b'_'
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            let mut j = i + 4;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            out.insert(s[i..j].to_string());
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Does the generated text READ `_sh_rc` anywhere? A write is `_sh_rc =`
@@ -6031,6 +9309,14 @@ fn strip_rc_line(line: &str) -> Option<String> {
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
     while i < b.len() {
+        // non-ASCII bytes (em-dashes in comments etc.) — only the ASCII
+        // constructs below are processed; skip the byte (slicing at a
+        // mid-char index would panic)
+        if b[i] >= 0x80 {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
         // `(_sh_rc = N, X)` sequence wrapper → X
         if b[i] == b'(' && line[i..].starts_with("(_sh_rc = ") {
             let mut depth = 1usize;
@@ -6085,32 +9371,6 @@ fn strip_rc_line(line: &str) -> Option<String> {
     Some(out)
 }
 
-/// Collect every variable name referenced by statements (assign targets,
-/// declare lists, Var reads).
-// All `_sh_…` identifiers in `s` (both calls `_sh_foo(` and variable
-// references `_sh_rc`). Used by trim_sh_runtime's reachability.
-fn sh_tokens(s: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i + 3 < b.len() {
-        if b[i] == b'_'
-            && b[i + 1] == b's'
-            && b[i + 2] == b'h'
-            && b[i + 3] == b'_'
-            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
-        {
-            let mut j = i + 4;
-            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') { j += 1; }
-            out.insert(s[i..j].to_string());
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
 fn collect_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     collect_vars_full(stmts, out, &mut BTreeSet::new());
 }
@@ -6126,13 +9386,14 @@ fn collect_fn_defs(
             IrStmt::Function { name, body, .. } => {
                 names.insert(name.clone());
                 defs.push((name.clone(), body.clone()));
+                // NESTED definitions (`inner()` inside `outer(){}`) are
+                // also functions — bash defines them at CALL time, the C
+                // render hoists them file-scope (081_nested_functions:
+                // the `inner` call shelled out because the name was
+                // never registered)
+                collect_fn_defs(body, names, defs);
             }
-            IrStmt::If {
-                then,
-                elsifs,
-                else_,
-                ..
-            } => {
+            IrStmt::If { then, elsifs, else_, .. } => {
                 collect_fn_defs(then, names, defs);
                 for (_, b) in elsifs {
                     collect_fn_defs(b, names, defs);
@@ -6155,12 +9416,186 @@ fn collect_fn_defs(
 /// conditional single sites; the C backend lifts only the unconditional
 /// top-level ones (a hoisted initializer must always run). The verdict
 /// guarantees at most one site, so the first match is the only one.
-fn const_assign_rhs(
-    stmts: &[IrStmt],
-    const_vars: &HashMap<String, VarKind>,
-) -> HashMap<String, IrExpr> {
+/// The vars whose Assign RHS is a command capture (`x=$(...)` /
+/// `x=$(( $(...) ))`) — the length analysis under-bounds command
+/// output, so these must not get a fixed buffer (a sha256sum capture
+/// is 64+2+filename bytes, not 64).
+/// Does an expr read a positional (`$1`, `$@`...) — either as a
+/// getVar call or as literal `$N` text (the exec-local `x=$1` form)?
+fn expr_refs_positional(e: &IrExpr) -> bool {
+    match e {
+        IrExpr::Call { func, args } => {
+            if func == "getVar" {
+                if let Some(IrExpr::Str(n, _)) = args.first() {
+                    if n.chars().all(|c| c.is_ascii_digit()) || n == "@" || n == "*" {
+                        return true;
+                    }
+                }
+            }
+            args.iter().any(expr_refs_positional)
+        }
+        IrExpr::Str(s, _) => {
+            let chars: Vec<char> = s.chars().collect();
+            chars.windows(2).any(|w| w[0] == '$' && w[1].is_ascii_digit())
+        }
+        IrExpr::Interpolate(parts) => parts.iter().any(|p| match p {
+            InterpPart::Lit(s) => {
+                let chars: Vec<char> = s.chars().collect();
+                chars.windows(2).any(|w| w[0] == '$' && w[1].is_ascii_digit())
+            }
+            InterpPart::Expr(x) => expr_refs_positional(x),
+        }),
+        IrExpr::Arith(a) => arith_refs_positional(a),
+        _ => false,
+    }
+}
+
+fn arith_refs_positional(a: &ArithAst) -> bool {
+    match a {
+        ArithAst::Var(n) | ArithAst::Ident(n) => {
+            n.chars().all(|c| c.is_ascii_digit()) || n == "@" || n == "*"
+        }
+        ArithAst::Index { var: _, key } => arith_refs_positional(key),
+        ArithAst::Bin { lhs, rhs, .. } => arith_refs_positional(lhs) || arith_refs_positional(rhs),
+        ArithAst::Un { arg, .. } => arith_refs_positional(arg),
+        ArithAst::Cond { test, then, else_, .. } => {
+            arith_refs_positional(test) || arith_refs_positional(then) || arith_refs_positional(else_)
+        }
+        ArithAst::Assign { rhs, .. } => arith_refs_positional(rhs),
+        ArithAst::IncDec { .. } => false,
+        ArithAst::Cast { arg, .. } => arith_refs_positional(arg),
+        ArithAst::Sizeof(_) => false,
+        ArithAst::Num(_) => false,
+    }
+}
+
+fn collect_capture_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            IrStmt::Assign { targets, expr, .. } => {
+                // a positional-sourced value (`x=$1`) is unbounded too
+                if expr_refs_positional(expr) {
+                    for t in targets {
+                        out.insert(t.var.clone());
+                    }
+                }
+                let is_cap = match expr {
+                    // backtick/\$( ) captures deserialize as the Capture
+                    // NODE (not a Call) — equally unbounded
+                    IrExpr::Capture { .. } => true,
+                    IrExpr::Call { func, args } => {
+                        (func == "capture" || func == "captureWords")
+                            || (func == "arith" && {
+                                args.iter().any(|a| match a {
+                                    IrExpr::Str(t, _) => t.contains("$("),
+                                    _ => false,
+                                })
+                            })
+                    }
+                    _ => false,
+                };
+                if is_cap {
+                    for t in targets {
+                        out.insert(t.var.clone());
+                    }
+                }
+            }
+            IrStmt::Expr(e) => {
+                if let IrExpr::Call { func, args } = e {
+                    if func == "exec" || func == "builtin" {
+                        if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                            if cmd == "local"
+                                || cmd == "declare"
+                                || cmd == "typeset"
+                                || cmd == "export"
+                                || cmd == "readonly"
+                            {
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    for w in items {
+                                        if let IrExpr::Str(ws, _) = w {
+                                            if let Some((name, val)) = ws.split_once('=') {
+                                                if val.contains('$') {
+                                                    out.insert(name.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if cmd == "read" {
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    for w in items {
+                                        if let IrExpr::Str(n, _) = w {
+                                            if !n.starts_with('-') {
+                                                out.insert(n.clone());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_capture_vars(then, out);
+                for (_, b) in elsifs {
+                    collect_capture_vars(b, out);
+                }
+                collect_capture_vars(else_, out);
+            }
+            IrStmt::For { iter, body, .. } => {
+                collect_capture_vars(body, out);
+                let _ = iter;
+            }
+            IrStmt::ForInit { init, cond, step, body } => {
+                collect_capture_vars(init, out);
+                collect_capture_vars(step, out);
+                collect_capture_vars(body, out);
+                let _ = cond;
+            }
+            IrStmt::While { cond, body } | IrStmt::DoWhile { cond, body, .. } => {
+                collect_capture_vars(body, out);
+                let _ = cond;
+            }
+            IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
+                collect_capture_vars(b, out);
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                collect_capture_vars(inner, out);
+                let _ = redirects;
+            }
+            IrStmt::Function { body, .. } => collect_capture_vars(body, out),
+            IrStmt::Case { clauses, .. } => {
+                for c in clauses {
+                    collect_capture_vars(&c.body, out);
+                }
+            }
+            IrStmt::Pipeline { stages, capture, .. } => {
+                if let Some(var) = capture {
+                    out.insert(var.clone());
+                }
+                for st in stages {
+                    collect_capture_vars(st, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn const_assign_rhs(stmts: &[IrStmt], const_vars: &HashMap<String, VarKind>) -> HashMap<String, IrExpr> {
     let mut out = HashMap::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    // raw arith texts (`(( j = i++ + ++i ))` arrives as Call{func:"arith",
+    // args:["i++ + ++i"]}) hide writes from the typed walk — any name
+    // mentioned in one is conservatively poisoned (soundness > lift rate)
+    let mut arith_names: BTreeSet<String> = BTreeSet::new();
+    for s in stmts {
+        collect_arith_text_names(s, &mut arith_names);
+    }
+    let mut poisoned: BTreeSet<String> = arith_names;
     for s in stmts {
         if let IrStmt::Assign { targets, expr, .. } = s {
             for t in targets {
@@ -6168,8 +9603,14 @@ fn const_assign_rhs(
                     && const_vars.get(&t.var) == Some(&VarKind::Const)
                     && !out.contains_key(&t.var)
                     && !seen.contains(&t.var)
+                    && !poisoned.contains(&t.var)
                 {
                     out.insert(t.var.clone(), expr.clone());
+                } else if out.contains_key(&t.var) {
+                    // a SECOND write — the first assignment is not the
+                    // final value; the lift is unsound
+                    out.remove(&t.var);
+                    poisoned.insert(t.var.clone());
                 }
             }
         }
@@ -6181,7 +9622,90 @@ fn const_assign_rhs(
             seen.insert(r);
         }
     }
+    out.retain(|k, _| !poisoned.contains(k));
     out
+}
+
+/// Identifiers mentioned inside raw `arith` call texts — a conservative
+/// write/mutation set for the const-lift (`i++` never parses as Arith).
+fn collect_arith_text_names(s: &IrStmt, out: &mut BTreeSet<String>) {
+    fn walk(e: &IrExpr, out: &mut BTreeSet<String>) {
+        match e {
+            IrExpr::Call { func, args } if func == "arith" || func == "cstyleFor" => {
+                for a in args {
+                    if let IrExpr::Str(txt, _) = a {
+                        for tok in txt.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                            if !tok.is_empty()
+                                && tok.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                            {
+                                out.insert(tok.to_string());
+                            }
+                        }
+                    } else {
+                        walk(a, out);
+                    }
+                }
+            }
+            IrExpr::Call { func, args } if func == "test" => {
+                for a in args {
+                    if let IrExpr::Str(txt, _) = a {
+                        // `${…}`/`$var` mentions inside test text
+                        for tok in txt.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                            if !tok.is_empty()
+                                && tok.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                            {
+                                out.insert(tok.to_string());
+                            }
+                        }
+                    } else {
+                        walk(a, out);
+                    }
+                }
+            }
+            IrExpr::Capture { expr, .. } => walk(expr, out),
+            IrExpr::Arrow(body) => {
+                for st in body {
+                    collect_arith_text_names(st, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_e(e: &IrExpr, out: &mut BTreeSet<String>) {
+        walk(e, out);
+        match e {
+            IrExpr::BinOp { lhs, rhs, .. } => {
+                walk_e(lhs, out);
+                walk_e(rhs, out);
+            }
+            IrExpr::Interpolate(_) => {}
+            _ => {}
+        }
+    }
+    match s {
+        IrStmt::Expr(e) | IrStmt::Assign { expr: e, .. } => walk_e(e, out),
+        IrStmt::If { cond, then, elsifs, else_, .. } => {
+            walk_e(cond, out);
+            for st in then {
+                collect_arith_text_names(st, out);
+            }
+            for st in else_ {
+                collect_arith_text_names(st, out);
+            }
+            for (_, body) in elsifs {
+                for st in body {
+                    collect_arith_text_names(st, out);
+                }
+            }
+        }
+        IrStmt::While { cond, body, .. } | IrStmt::DoWhile { cond, body, .. } => {
+            walk_e(cond, out);
+            for st in body {
+                collect_arith_text_names(st, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Names READ by a statement (getVar/param/word mentions) — a const lift
@@ -6282,9 +9806,7 @@ fn collect_const_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
             collect_const_arith(rhs, out);
         }
         ArithAst::Un { arg, .. } => collect_const_arith(arg, out),
-        ArithAst::Cond {
-            test, then, else_, ..
-        } => {
+        ArithAst::Cond { test, then, else_, .. } => {
             collect_const_arith(test, out);
             collect_const_arith(then, out);
             collect_const_arith(else_, out);
@@ -6294,8 +9816,7 @@ fn collect_const_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
             out.insert(var.clone());
         }
         ArithAst::Num(_) => {}
-        ArithAst::Sizeof(_) => {}
-        ArithAst::Cast { arg, .. } => collect_const_arith(arg, out),
+        ArithAst::Sizeof(_) | ArithAst::Cast { .. } => {}
     }
 }
 
@@ -6316,12 +9837,7 @@ fn mark_seq_loop_vars(s: &IrStmt, var_types: &mut HashMap<String, IrType>) {
                 mark_seq_loop_vars(x, var_types);
             }
         }
-        IrStmt::If {
-            then,
-            elsifs,
-            else_,
-            ..
-        } => {
+        IrStmt::If { then, elsifs, else_, .. } => {
             for x in then {
                 mark_seq_loop_vars(x, var_types);
             }
@@ -6362,11 +9878,18 @@ fn collect_assoc_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                             }
                         }
                     }
-                    // `map[foo]=x` — the index flattened into the name
+                    // `map[foo]=x` — the index flattened into the name. A
+                    // bare-ident key is a DYNAMIC INDEX (`result[i]=x` —
+                    // bash evaluates it as an arith index), NOT an assoc
+                    // string key; only quoted / non-identifier keys
+                    // (`map["foo"]`, `map[a b]`) are assoc.
                     if let Some(open) = t.var.find('[') {
                         if t.var.ends_with(']') {
                             let key = &t.var[open + 1..t.var.len() - 1];
-                            if key.parse::<i64>().is_err() && !key.starts_with('$') {
+                            if key.parse::<i64>().is_err()
+                                && !key.starts_with('$')
+                                && !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            {
                                 out.insert(t.var[..open].to_string());
                             }
                         }
@@ -6404,13 +9927,7 @@ fn collect_assoc_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 }
                 collect_assoc_expr(e, out);
             }
-            IrStmt::If {
-                cond,
-                then,
-                elsifs,
-                else_,
-                ..
-            } => {
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
                 collect_assoc_expr(cond, out);
                 collect_assoc_names(then, out);
                 for (c, b) in elsifs {
@@ -6430,6 +9947,12 @@ fn collect_assoc_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
                 collect_assoc_names(b, out);
             }
+            IrStmt::ForInit { init, cond, step, body } => {
+                collect_assoc_names(init, out);
+                collect_assoc_expr(cond, out);
+                collect_assoc_names(step, out);
+                collect_assoc_names(body, out);
+            }
             IrStmt::Redirect { inner, redirects } => {
                 collect_assoc_names(inner, out);
                 for r in redirects {
@@ -6437,10 +9960,7 @@ fn collect_assoc_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 }
             }
             IrStmt::Function { body, .. } => collect_assoc_names(body, out),
-            IrStmt::Case {
-                discriminant,
-                clauses,
-            } => {
+            IrStmt::Case { discriminant, clauses } => {
                 collect_assoc_expr(discriminant, out);
                 for c in clauses {
                     collect_assoc_names(&c.body, out);
@@ -6459,26 +9979,7 @@ fn collect_assoc_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 /// Does an array KEY text look like an arithmetic expression (bare
 /// `arr[foo-bar]` is arith in bash; assoc keys are quoted/plain words)?
 fn looks_like_arith(k: &str) -> bool {
-    k.chars().any(|c| {
-        matches!(
-            c,
-            '+' | '-'
-                | '*'
-                | '/'
-                | '%'
-                | '('
-                | ')'
-                | '<'
-                | '>'
-                | '&'
-                | '|'
-                | '^'
-                | '~'
-                | '!'
-                | ','
-                | ' '
-        )
-    })
+    k.chars().any(|c| matches!(c, '+' | '-' | '*' | '/' | '%' | '(' | ')' | '<' | '>' | '&' | '|' | '^' | '~' | '!' | ',' | ' '))
 }
 
 /// Whole-word identifier search in rendered C text (the fn-local hoist
@@ -6530,7 +10031,10 @@ fn collect_assoc_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                         .strip_prefix("${")
                         .and_then(|s| s.strip_suffix('}'))
                         .unwrap_or(k);
-                    if k.parse::<i64>().is_err() && !k.starts_with('$') && !looks_like_arith(k) {
+                    if k.parse::<i64>().is_err()
+                        && !k.starts_with('$')
+                        && !looks_like_arith(k)
+                    {
                         if let Some(IrExpr::Str(n, _)) = args.first() {
                             out.insert(n.clone());
                         }
@@ -6592,12 +10096,7 @@ fn collect_array_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             }
             IrStmt::Expr(e) => collect_array_expr(e, out),
             IrStmt::Output { value, .. } => collect_array_expr(value, out),
-            IrStmt::If {
-                cond,
-                then,
-                elsifs,
-                else_,
-            } => {
+            IrStmt::If { cond, then, elsifs, else_ } => {
                 collect_array_expr(cond, out);
                 collect_array_names(then, out);
                 for (c, b) in elsifs {
@@ -6617,6 +10116,12 @@ fn collect_array_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
                 collect_array_names(b, out);
             }
+            IrStmt::ForInit { init, cond, step, body } => {
+                collect_array_names(init, out);
+                collect_array_expr(cond, out);
+                collect_array_names(step, out);
+                collect_array_names(body, out);
+            }
             IrStmt::Redirect { inner, redirects } => {
                 collect_array_names(inner, out);
                 for r in redirects {
@@ -6624,10 +10129,7 @@ fn collect_array_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 }
             }
             IrStmt::Function { body, .. } => collect_array_names(body, out),
-            IrStmt::Case {
-                discriminant,
-                clauses,
-            } => {
+            IrStmt::Case { discriminant, clauses } => {
                 collect_array_expr(discriminant, out);
                 for c in clauses {
                     collect_array_names(&c.body, out);
@@ -6727,13 +10229,7 @@ fn collect_array_refs(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
         match s {
             IrStmt::Expr(e) => collect_array_refs_expr(e, out),
             IrStmt::Assign { expr, .. } => collect_array_refs_expr(expr, out),
-            IrStmt::If {
-                cond,
-                then,
-                elsifs,
-                else_,
-                ..
-            } => {
+            IrStmt::If { cond, then, elsifs, else_, .. } => {
                 collect_array_refs_expr(cond, out);
                 collect_array_refs(then, out);
                 for (c, b) in elsifs {
@@ -6753,6 +10249,12 @@ fn collect_array_refs(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
                 collect_array_refs(b, out);
             }
+            IrStmt::ForInit { init, cond, step, body } => {
+                collect_array_refs(init, out);
+                collect_array_refs_expr(cond, out);
+                collect_array_refs(step, out);
+                collect_array_refs(body, out);
+            }
             IrStmt::Redirect { inner, redirects } => {
                 collect_array_refs(inner, out);
                 for r in redirects {
@@ -6760,10 +10262,7 @@ fn collect_array_refs(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 }
             }
             IrStmt::Function { body, .. } => collect_array_refs(body, out),
-            IrStmt::Case {
-                discriminant,
-                clauses,
-            } => {
+            IrStmt::Case { discriminant, clauses } => {
                 collect_array_refs_expr(discriminant, out);
                 for c in clauses {
                     collect_array_refs(&c.body, out);
@@ -6796,11 +10295,7 @@ fn collect_array_refs_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
                             }
                         }
                         if n.ends_with("[@]") || n.ends_with("[*]") {
-                            out.insert(
-                                n.trim_end_matches("[@]")
-                                    .trim_end_matches("[*]")
-                                    .to_string(),
-                            );
+                            out.insert(n.trim_end_matches("[@]").trim_end_matches("[*]").to_string());
                         }
                     }
                 }
@@ -6850,9 +10345,7 @@ fn collect_array_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
             collect_array_arith(rhs, out);
         }
         ArithAst::Un { arg, .. } => collect_array_arith(arg, out),
-        ArithAst::Cond {
-            test, then, else_, ..
-        } => {
+        ArithAst::Cond { test, then, else_, .. } => {
             collect_array_arith(test, out);
             collect_array_arith(then, out);
             collect_array_arith(else_, out);
@@ -6865,6 +10358,13 @@ fn collect_array_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
 /// Names declared by Declare stmts (the per-function hoist skips them —
 /// the Declare stmt declares them at its position).
 fn collect_declare_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    collect_declare_names_at(stmts, out, 0)
+}
+
+/// `out` = every local-declared name. Declares inside NESTED BLOCKS are
+/// bash function-scoped but C-block-scoped — emit_function hoists those
+/// (the in-block Declare renders as an assignment).
+fn collect_declare_names_at(stmts: &[IrStmt], out: &mut BTreeSet<String>, depth: usize) {
     for s in stmts {
         match s {
             IrStmt::Declare { vars, .. } => {
@@ -6872,25 +10372,56 @@ fn collect_declare_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     out.insert(d.name.clone());
                 }
             }
-            IrStmt::If {
-                then,
-                elsifs,
-                else_,
-                ..
-            } => {
-                collect_declare_names(then, out);
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_declare_names_at(then, out, depth + 1);
                 for (_, b) in elsifs {
-                    collect_declare_names(b, out);
+                    collect_declare_names_at(b, out, depth + 1);
                 }
-                collect_declare_names(else_, out);
+                collect_declare_names_at(else_, out, depth + 1);
             }
             IrStmt::While { body, .. }
             | IrStmt::DoWhile { body, .. }
             | IrStmt::For { body, .. }
             | IrStmt::Block(body)
             | IrStmt::Subshell(body)
-            | IrStmt::Background(body) => collect_declare_names(body, out),
-            IrStmt::Function { body, .. } => collect_declare_names(body, out),
+            | IrStmt::Background(body) => {
+                collect_declare_names_at(body, out, depth + 1)
+            }
+            IrStmt::Function { body, .. } => collect_declare_names_at(body, out, 0),
+            _ => {}
+        }
+    }
+}
+
+/// Names local-declared at depth > 0 (inside a nested block) — these
+/// must HOIST (see collect_declare_names_at).
+fn collect_nested_declares(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
+    collect_nested_declares_d(stmts, out, 0)
+}
+fn collect_nested_declares_d(stmts: &[IrStmt], out: &mut BTreeSet<String>, depth: usize) {
+    for s in stmts {
+        match s {
+            IrStmt::Declare { vars, .. } if depth > 0 => {
+                for d in vars {
+                    out.insert(d.name.clone());
+                }
+            }
+            IrStmt::If { then, elsifs, else_, .. } => {
+                collect_nested_declares_d(then, out, depth + 1);
+                for (_, b) in elsifs {
+                    collect_nested_declares_d(b, out, depth + 1);
+                }
+                collect_nested_declares_d(else_, out, depth + 1);
+            }
+            IrStmt::While { body, .. }
+            | IrStmt::DoWhile { body, .. }
+            | IrStmt::For { body, .. }
+            | IrStmt::Block(body)
+            | IrStmt::Subshell(body)
+            | IrStmt::Background(body) => {
+                collect_nested_declares_d(body, out, depth + 1)
+            }
+            IrStmt::Function { body, .. } => collect_nested_declares_d(body, out, 0),
             _ => {}
         }
     }
@@ -6899,9 +10430,16 @@ fn collect_declare_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
 /// Collect the untyped store names (getVar/param reads, assign targets,
 /// read/declare/unset builtin targets) so they hoist as `char*` entries.
 fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
-    for s in stmts {
-        match s {
+    if std::env::var("SH2_DBG_VARS").is_ok() && !stmts.is_empty() {
+        eprintln!("DBG csn n={} first_type={}", stmts.len(), match &stmts[0] { IrStmt::Assign{..} => "Assign", IrStmt::Expr(_) => "Expr", _ => "?" });
+    }
+        for s in stmts {
+        collect_ext_foreach_line_vars(s, out);
+    match s {
             IrStmt::Assign { targets, expr, .. } => {
+                if std::env::var("SH2_DBG_VARS").is_ok() {
+                    eprintln!("DBG csn assign -> {:?}", targets.iter().map(|t| t.var.clone()).collect::<Vec<_>>());
+                }
                 for t in targets {
                     out.insert(t.var.clone());
                 }
@@ -6920,12 +10458,7 @@ fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
             }
             IrStmt::Expr(e) => collect_store_expr(e, out),
             IrStmt::Output { value, .. } => collect_store_expr(value, out),
-            IrStmt::If {
-                cond,
-                then,
-                elsifs,
-                else_,
-            } => {
+            IrStmt::If { cond, then, elsifs, else_ } => {
                 collect_store_expr(cond, out);
                 collect_store_names(then, out);
                 for (c, b) in elsifs {
@@ -6939,9 +10472,7 @@ fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     collect_store_expr(x, out);
                 }
             }
-            IrStmt::For {
-                var, iter, body, ..
-            } => {
+            IrStmt::For { var, iter, body, .. } => {
                 // the loop var is ASSIGNED by the loop — a store entry
                 out.insert(var.clone());
                 collect_store_expr(iter, out);
@@ -6960,11 +10491,14 @@ fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     collect_store_expr(&r.target, out);
                 }
             }
+            IrStmt::ForInit { init, cond, step, body } => {
+                collect_store_names(init, out);
+                collect_store_expr(cond, out);
+                collect_store_names(step, out);
+                collect_store_names(body, out);
+            }
             IrStmt::Function { body, .. } => collect_store_names(body, out),
-            IrStmt::Case {
-                discriminant,
-                clauses,
-            } => {
+            IrStmt::Case { discriminant, clauses } => {
                 collect_store_expr(discriminant, out);
                 for c in clauses {
                     collect_store_names(&c.body, out);
@@ -6983,9 +10517,7 @@ fn collect_store_names(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 collect_store_expr(expr, out);
             }
             IrStmt::SetChildError(e) => collect_store_expr(e, out),
-            IrStmt::Exec {
-                cmd, args, capture, ..
-            } => {
+            IrStmt::Exec { cmd, args, capture, .. } => {
                 collect_store_expr(cmd, out);
                 for a in args {
                     collect_store_expr(a, out);
@@ -7116,9 +10648,7 @@ fn collect_store_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
             collect_store_arith(rhs, out);
         }
         ArithAst::Un { arg, .. } => collect_store_arith(arg, out),
-        ArithAst::Cond {
-            test, then, else_, ..
-        } => {
+        ArithAst::Cond { test, then, else_, .. } => {
             collect_store_arith(test, out);
             collect_store_arith(then, out);
             collect_store_arith(else_, out);
@@ -7131,8 +10661,7 @@ fn collect_store_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
             out.insert(var.clone());
         }
         ArithAst::Num(_) => {}
-        ArithAst::Sizeof(_) => {}
-        ArithAst::Cast { arg, .. } => collect_store_arith(arg, out),
+        ArithAst::Sizeof(_) | ArithAst::Cast { .. } => {}
     }
 }
 
@@ -7143,8 +10672,9 @@ fn collect_vars_full(
     out: &mut BTreeSet<String>,
     for_vars: &mut BTreeSet<String>,
 ) {
-    for s in stmts {
-        match s {
+        for s in stmts {
+        collect_ext_foreach_line_vars(s, out);
+    match s {
             IrStmt::Assign { targets, expr, .. } => {
                 for t in targets {
                     out.insert(t.var.clone());
@@ -7161,12 +10691,7 @@ fn collect_vars_full(
             }
             IrStmt::Expr(e) => collect_vars_expr(e, out),
             IrStmt::Output { value, .. } => collect_vars_expr(value, out),
-            IrStmt::If {
-                cond,
-                then,
-                elsifs,
-                else_,
-            } => {
+            IrStmt::If { cond, then, elsifs, else_ } => {
                 collect_vars_expr(cond, out);
                 collect_vars(then, out);
                 for (c, b) in elsifs {
@@ -7189,8 +10714,16 @@ fn collect_vars_full(
             }
             // loop bodies assign/read vars — hoist them (they are
             // ordinary top-level vars, unlike for-loop counters).
-            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => collect_vars(body, out),
+            IrStmt::While { body, .. } | IrStmt::DoWhile { body, .. } => {
+                collect_vars(body, out)
+            }
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => collect_vars(b, out),
+            IrStmt::ForInit { init, cond, step, body } => {
+                collect_vars(init, out);
+                collect_vars_expr(cond, out);
+                collect_vars(step, out);
+                collect_vars(body, out);
+            }
             _ => {}
         }
     }
@@ -7199,6 +10732,85 @@ fn collect_vars_full(
 /// Collect vars ASSIGNED in a statement list (Assign/Declare targets,
 /// arith x=/x++/x--), not mere reads — the per-function hoist declares
 /// exactly these (a read-only var is the caller's).
+/// exec/builtin args of a `printf -v VAR …` call.
+fn is_printf_v_call(args: &[IrExpr]) -> bool {
+    matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "printf")
+        && matches!(
+            args.get(1),
+            Some(IrExpr::Array(items)) if matches!(items.first(), Some(IrExpr::Str(s, _)) if s == "-v")
+        )
+}
+
+
+/// ForEachLine ext-node vars must HOIST (the streaming loop assigns them)
+fn collect_ext_foreach_line_vars(st: &IrStmt, out: &mut BTreeSet<String>) {
+    if let IrStmt::Ext(n) = st {
+        if n.tag() == "ForEachLine" {
+            if let Some(fl) = n.as_any()
+                .downcast_ref::<crate::shir_nodes::ForEachLine>()
+            {
+                out.insert(fl.var.clone());
+                // body helper vars hoist too ('cat -n F' carries the
+                // __cnN counter): every store/read inside fl.body
+                collect_store_names(&fl.body, out);
+                let mut fv = BTreeSet::new();
+                let mut ffor = BTreeSet::new();
+                collect_vars_full(&fl.body, &mut fv, &mut ffor);
+                out.extend(fv);
+            }
+        }
+    }
+}
+
+/// A Redirect whose inner command is `mapfile`/`readarray` reading stdin
+/// from a FILE — renderable natively (arrays cannot cross exec).
+fn is_mapfile_redirect(s: &IrStmt) -> bool {
+    match s {
+        IrStmt::Redirect { inner, redirects } => {
+            let is_mapfile = matches!(
+                inner.first(),
+                Some(IrStmt::Expr(IrExpr::Call { func, args }))
+                    if (func == "exec" || func == "builtin")
+                        && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "mapfile" || c == "readarray")
+            );
+            is_mapfile
+                && redirects.len() == 1
+                && redirects[0].fd == Some(0)
+                && redirects[0].mode == "r"
+        }
+        _ => false,
+    }
+}
+
+pub struct Self3;
+impl Self3 {
+    fn str_is(args: &[IrExpr], i: usize, want: &str) -> bool {
+        matches!(args.get(i), Some(IrExpr::Str(s, _)) if s == want)
+    }
+    fn str_arg(w: &IrExpr) -> Option<String> {
+        match w {
+            IrExpr::Str(s, _) => Some(s.clone()),
+            _ => None,
+        }
+    }
+}
+
+
+/// The word list of an exec/builtin Call statement's args (`[cmd, Array]`).
+fn inner_first_words(inner: &[IrStmt]) -> Option<&Vec<IrExpr>> {
+    match inner.first() {
+        Some(IrStmt::Expr(IrExpr::Call { func, args }))
+            if func == "exec" || func == "builtin" =>
+        {
+            match args.get(1) {
+                Some(IrExpr::Array(items)) => Some(items),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
     for s in stmts {
         match s {
@@ -7208,6 +10820,50 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 }
                 collect_assigned_expr(expr, out);
             }
+            // `printf -v NAME …` ASSIGNS the formatted text to NAME —
+            // the var must hoist a declaration or the native -v lowering
+            // writes an undeclared identifier
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if is_printf_v_call(args) =>
+            {
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    if let Some(IrExpr::Str(n, _)) = items.get(1) {
+                        out.insert(n.clone());
+                    }
+                }
+            }
+            // `unset NAME` MUTATES the variable (a subshell must save and
+            // restore it or the unset leaks to the parent)
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if (func == "exec" || func == "builtin")
+                    && Self3::str_is(args, 0, "unset") =>
+            {
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for w in items {
+                        if let Some(n) = Self3::str_arg(w) {
+                            let base = n.split('[').next().unwrap_or(&n);
+                            if is_ident(base) && !base.is_empty() {
+                                out.insert(base.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            // `read NAME` assigns too
+            IrStmt::Expr(IrExpr::Call { func, args })
+                if (func == "exec" || func == "builtin")
+                    && Self3::str_is(args, 0, "read") =>
+            {
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for w in items {
+                        if let Some(n) = Self3::str_arg(w) {
+                            if !n.starts_with('-') && is_ident(&n) {
+                                out.insert(n);
+                            }
+                        }
+                    }
+                }
+            }
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
                     out.insert(d.name.clone());
@@ -7216,12 +10872,7 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     collect_assigned_expr(e, out);
                 }
             }
-            IrStmt::If {
-                then,
-                elsifs,
-                else_,
-                ..
-            } => {
+            IrStmt::If { then, elsifs, else_, .. } => {
                 collect_assigned_vars(then, out);
                 for (_, b) in elsifs {
                     collect_assigned_vars(b, out);
@@ -7239,6 +10890,12 @@ fn collect_assigned_vars(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 collect_assigned_vars(body, out);
             }
             IrStmt::Expr(e) => collect_assigned_expr(e, out),
+            IrStmt::ForInit { init, cond, step, body } => {
+                collect_assigned_vars(init, out);
+                collect_assigned_expr(cond, out);
+                collect_assigned_vars(step, out);
+                collect_assigned_vars(body, out);
+            }
             _ => {}
         }
     }
@@ -7251,7 +10908,7 @@ fn collect_assigned_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
         // as exec("local", ["x=", <value>]) calls; the fn hoist must
         // see these assigns or the var renders undeclared
         IrExpr::Call { func, args }
-            if func == "exec" || func == "builtin"
+            if (func == "exec" || func == "builtin")
                 && matches!(
                     args.first(),
                     Some(IrExpr::Str(c, _))
@@ -7272,10 +10929,35 @@ fn collect_assigned_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             for w in words {
                 if let IrExpr::Str(ws, _) = w {
                     if let Some((n, _)) = ws.split_once('=') {
-                        if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        if !n.is_empty()
+                            && n.chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_')
                         {
                             out.insert(n.to_string());
                         }
+                    }
+                }
+            }
+        }
+        // `unset V` — a WRITE (it clears the var): a subshell body that
+        // unsets must save/restore like any assignment (064_20: the
+        // inner subshell's unset DEBUG leaked to the outer scope)
+        IrExpr::Call { func, args }
+            if (func == "exec" || func == "builtin")
+                && matches!(args.first(), Some(IrExpr::Str(c, _)) if c == "unset") =>
+        {
+            let mut words: Vec<&IrExpr> = Vec::new();
+            for a in args.iter().skip(1) {
+                match a {
+                    IrExpr::Array(items) => words.extend(items.iter()),
+                    other => words.push(other),
+                }
+            }
+            for w in words {
+                if let IrExpr::Str(ws, _) = w {
+                    let n = ws.trim();
+                    if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        out.insert(n.to_string());
                     }
                 }
             }
@@ -7316,6 +10998,19 @@ fn collect_vars_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             }
         }
         IrExpr::Call { func, args } if func == "exec" || func == "builtin" => {
+            // `printf -v NAME …` assigns NAME — the hoist must see it or
+            // the native -v lowering writes an undeclared identifier
+            if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                if cmd == "printf" {
+                    if let Some(IrExpr::Array(items)) = args.get(1) {
+                        if matches!(items.first(), Some(IrExpr::Str(s, _)) if s == "-v") {
+                            if let Some(IrExpr::Str(n, _)) = items.get(1) {
+                                out.insert(n.clone());
+                            }
+                        }
+                    }
+                }
+            }
             // `let "i++"` hides its var inside a STRING arg — the hoist
             // must see it or the loop var is undeclared in C.
             if let Some(IrExpr::Str(cmd, _)) = args.first() {
@@ -7375,9 +11070,7 @@ fn collect_vars_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
             collect_vars_arith(rhs, out);
         }
         ArithAst::Un { arg, .. } => collect_vars_arith(arg, out),
-        ArithAst::Cond {
-            test, then, else_, ..
-        } => {
+        ArithAst::Cond { test, then, else_, .. } => {
             collect_vars_arith(test, out);
             collect_vars_arith(then, out);
             collect_vars_arith(else_, out);
@@ -7389,6 +11082,61 @@ fn collect_vars_arith(a: &ArithAst, out: &mut BTreeSet<String>) {
 /// A plain C identifier (a mangled var name or a string-literal-less
 /// expression is NOT — used to decide whether an RHS is a string value
 /// that may be length-asserted before a guarded copy).
+/// The core wraps unquoted glob patterns in a `\x01SH2GLOB\x01` marker
+/// (shir.rs GLOB_MAGIC) to distinguish literal text from a glob; the C
+/// renderer strips it before emitting the pattern anywhere.
+/// bash `echo -e` backslash-escape interpretation. None = `\c`
+/// (stop output entirely).
+fn unescape_echo_e(s: &str) -> Option<String> {
+    let ch: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < ch.len() {
+        if ch[i] == '\\' && i + 1 < ch.len() {
+            match ch[i + 1] {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                'a' => out.push('\x07'),
+                'b' => out.push('\x08'),
+                'f' => out.push('\x0c'),
+                'v' => out.push('\x0b'),
+                '\\' => out.push('\\'),
+                '\'' => out.push('\''),
+                '"' => out.push('"'),
+                'c' => return None,
+                other => {
+                    // unknown escape: keep both characters
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+            i += 2;
+            continue;
+        }
+        out.push(ch[i]);
+        i += 1;
+    }
+    Some(out)
+}
+
+fn strip_glob(s: &str) -> &str {
+    s.strip_prefix("\u{1}SH2GLOB\u{1}").unwrap_or(s)
+}
+
+/// A case pattern arrives as RAW TEXT including any quoting (`"add"`,
+/// `'start'`) — bash strips the QUOTES before matching.
+fn unquote_case_pattern(p: &str) -> &str {
+    let t = p.trim();
+    let mut ch = t.chars();
+    if let (Some(f), Some(l)) = (ch.next(), t.chars().last()) {
+        if ch.count() >= 1 && ((f == '"' && l == '"') || (f == '\'' && l == '\'')) {
+            return &t[1..t.len() - 1];
+        }
+    }
+    p
+}
+
 fn is_ident(s: &str) -> bool {
     !s.is_empty()
         && (s.chars().next().unwrap().is_ascii_alphabetic() || s.chars().next().unwrap() == '_')
@@ -7420,7 +11168,8 @@ fn arith_leaves_at_width(a: &ArithAst, r: &Render, w: Width, has_var: &mut bool)
         }
         ArithAst::Index { .. } => false,
         ArithAst::Bin { lhs, rhs, .. } => {
-            arith_leaves_at_width(lhs, r, w, has_var) && arith_leaves_at_width(rhs, r, w, has_var)
+            arith_leaves_at_width(lhs, r, w, has_var)
+                && arith_leaves_at_width(rhs, r, w, has_var)
         }
         ArithAst::Un { arg, .. } => arith_leaves_at_width(arg, r, w, has_var),
         ArithAst::Cond {
@@ -7430,16 +11179,16 @@ fn arith_leaves_at_width(a: &ArithAst, r: &Render, w: Width, has_var: &mut bool)
                 && arith_leaves_at_width(then, r, w, has_var)
                 && arith_leaves_at_width(else_, r, w, has_var)
         }
+        ArithAst::Sizeof(_) | ArithAst::Cast { .. } => false,
         ArithAst::Assign { var, rhs, .. } => {
             *has_var = true;
-            r.is_num(var) && r.width_of_var(var) == w && arith_leaves_at_width(rhs, r, w, has_var)
+            r.is_num(var) && r.width_of_var(var) == w
+                && arith_leaves_at_width(rhs, r, w, has_var)
         }
         ArithAst::IncDec { var, .. } => {
             *has_var = true;
             r.is_num(var) && r.width_of_var(var) == w
         }
-        ArithAst::Sizeof(_) => true, // a compile-time constant fits any width
-        ArithAst::Cast { arg, .. } => arith_leaves_at_width(arg, r, w, has_var),
     }
 }
 
@@ -7490,7 +11239,7 @@ fn seq_capture_words(cap: &IrExpr) -> Option<(i128, i128, i128)> {
     let IrExpr::Call { func, args } = exec_call else {
         return None;
     };
-    if func != "exec" {
+    if !matches!(func.as_str(), "exec" | "builtin") {
         return None;
     }
     let IrExpr::Str(cmd, _) = args.first()? else {
@@ -7548,12 +11297,7 @@ fn seed_loop_var_ranges(stmts: &[IrStmt], ranges: &mut HashMap<String, (i128, i1
             IrStmt::Block(b) | IrStmt::Subshell(b) | IrStmt::Background(b) => {
                 seed_loop_var_ranges(b, ranges);
             }
-            IrStmt::If {
-                then,
-                elsifs,
-                else_,
-                ..
-            } => {
+            IrStmt::If { then, elsifs, else_, .. } => {
                 seed_loop_var_ranges(then, ranges);
                 for (_, b) in elsifs {
                     seed_loop_var_ranges(b, ranges);
@@ -7615,12 +11359,7 @@ fn walk_widths_stmts(
                 walk_widths_expr(path, state, widths);
                 walk_widths_expr(content, state, widths);
             }
-            IrStmt::If {
-                cond,
-                then,
-                elsifs,
-                else_,
-            } => {
+            IrStmt::If { cond, then, elsifs, else_ } => {
                 walk_widths_expr(cond, state, widths);
                 walk_widths_stmts(then, state, widths);
                 for (c, b) in elsifs {
@@ -7657,10 +11396,7 @@ fn walk_widths_stmts(
                 }
             }
             IrStmt::Function { body, .. } => walk_widths_stmts(body, state, widths),
-            IrStmt::Case {
-                discriminant,
-                clauses,
-            } => {
+            IrStmt::Case { discriminant, clauses } => {
                 walk_widths_expr(discriminant, state, widths);
                 for c in clauses {
                     walk_widths_stmts(&c.body, state, widths);
@@ -7761,10 +11497,7 @@ fn arith_range_local(
         ArithAst::Num(i) => Some((*i as i128, *i as i128)),
         ArithAst::Var(n) => state.get(n).copied().flatten(),
         ArithAst::Bin { op, lhs, rhs } => {
-            let (l, r) = (
-                arith_range_local(lhs, state)?,
-                arith_range_local(rhs, state)?,
-            );
+            let (l, r) = (arith_range_local(lhs, state)?, arith_range_local(rhs, state)?);
             let (l0, l1, r0, r1) = (l.0, l.1, r.0, r.1);
             match op.as_str() {
                 "+" => Some((l0.checked_add(r0)?, l1.checked_add(r1)?)),
@@ -7819,9 +11552,7 @@ fn arith_vars(a: &ArithAst, out: &mut Vec<String>) {
             arith_vars(rhs, out);
         }
         ArithAst::Un { arg, .. } => arith_vars(arg, out),
-        ArithAst::Cond {
-            test, then, else_, ..
-        } => {
+        ArithAst::Cond { test, then, else_, .. } => {
             arith_vars(test, out);
             arith_vars(then, out);
             arith_vars(else_, out);
@@ -7829,8 +11560,7 @@ fn arith_vars(a: &ArithAst, out: &mut Vec<String>) {
         ArithAst::Assign { rhs, .. } => arith_vars(rhs, out),
         ArithAst::IncDec { var, .. } => out.push(var.clone()),
         ArithAst::Num(_) => {}
-        ArithAst::Sizeof(_) => {}
-        ArithAst::Cast { arg, .. } => arith_vars(arg, out),
+        ArithAst::Sizeof(_) | ArithAst::Cast { .. } => {}
     }
 }
 
@@ -7841,9 +11571,7 @@ fn arith_shell(a: &ArithAst) -> String {
         ArithAst::Num(n) => n.to_string(),
         ArithAst::Var(name) | ArithAst::Ident(name) => format!("${{{name}}}"),
         ArithAst::Index { var, key } => format!("${{{var}[{}]}}", arith_shell(key)),
-        ArithAst::Bin { op, lhs, rhs } => {
-            format!("({} {} {})", arith_shell(lhs), op, arith_shell(rhs))
-        }
+        ArithAst::Bin { op, lhs, rhs } => format!("({} {} {})", arith_shell(lhs), op, arith_shell(rhs)),
         ArithAst::Un { op, arg } => format!("({op}{})", arith_shell(arg)),
         ArithAst::Cond { test, then, else_ } => format!(
             "({} ? {} : {})",
@@ -7861,7 +11589,7 @@ fn arith_shell(a: &ArithAst) -> String {
                 format!("{var}{u}{d}")
             }
         }
-        ArithAst::Sizeof(ty) => ty.c_sizeof().unwrap_or(4).to_string(),
+        ArithAst::Sizeof(_) => "0".to_string(),
         ArithAst::Cast { arg, .. } => arith_shell(arg),
     }
 }
@@ -7880,6 +11608,281 @@ fn flatten_parts(parts: &[InterpPart]) -> Vec<InterpPart> {
         }
     }
     out
+}
+
+// ── unquoted-heredoc body interpolation ──────────────────────────────
+
+/// One segment of an unquoted heredoc body (the core delivers the RAW
+/// text — `IrRedirect.target` is a plain `Str` with `interpolate: true`;
+/// the C backend must expand it itself, there is no Perl-style string
+/// interpolation to lean on):
+/// - `Lit` — literal text (backslash escapes already resolved)
+/// - `Var` — `$name` / `$1` / `$?` / ... → a getVar value
+/// - `Param` — `${name:-op...}` → a param call (args prebuilt)
+/// - `Arith` — `$((expr))` → native arithmetic (parsed AST)
+/// - `Cmd` — `$(text)` / `` `text` `` → child-bash capture (raw inner
+///   text; the renderer wraps it in an `_sh_capture` site)
+#[derive(Debug, Clone)]
+enum HdSeg {
+    Lit(String),
+    Var(String),
+    Param(Vec<IrExpr>),
+    Arith(ArithAst),
+    Cmd(String),
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// `${...}` body → the param/getVar call args mirroring the core's
+/// spellings (`param("len","x")`, `param(":-", name, default)`,
+/// `param("slice", name, off[, len])`, `getVar(name)`). None = a shape
+/// the mapper doesn't model — the caller falls back to literal text.
+fn dollar_brace_args(body: &str) -> Option<Vec<IrExpr>> {
+    let s = |t: &str| IrExpr::Str(t.to_string(), crate::ir::StrStyle::DoubleQuoted);
+    // `${#x}` / `${#arr[@]}` — length
+    if let Some(rest) = body.strip_prefix('#') {
+        let base = rest.trim_end_matches("[@]").trim_end_matches("[*]");
+        if is_ident(base) || base == "@" || base == "*" {
+            return Some(vec![s("len"), s(base)]);
+        }
+        return None;
+    }
+    if body.starts_with('!') {
+        return None; // ${!x} indirect — not modeled
+    }
+    // leading name
+    let ch: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < ch.len() && is_name_char(ch[i]) {
+        i += 1;
+    }
+    if i == 0 {
+        // bare special forms: ${@} ${*} ${#} ${$} ${?} ${N}
+        if matches!(ch.first(), Some('@' | '*' | '#' | '$' | '?'))
+            || ch.first().is_some_and(|c| c.is_ascii_digit())
+        {
+            if ch.len() == 1 {
+                return Some(vec![s(&ch[0].to_string())]);
+            }
+        }
+        return None;
+    }
+    let name: String = ch[..i].iter().collect();
+    let rest: String = ch[i..].iter().collect();
+    if rest.is_empty() {
+        return Some(vec![s(&name)]); // getVar shape
+    }
+    // array-element marker: `arr[@]` inside ops stays unmodeled
+    let (op, arg): (String, String) = if let Some(r) = rest.strip_prefix(":-") {
+        (":-".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix(":=") {
+        (":=".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix(":?") {
+        (":?".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix(":+") {
+        (":+".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix(":") {
+        // ${x:off} / ${x:off:len} — slice; args must be plain integers
+        let mut it = r.splitn(2, ':');
+        let off = it.next().unwrap_or("").trim();
+        let len = it.next();
+        if !off.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let mut a = vec![s("slice"), s(&name), s(off)];
+        if let Some(l) = len {
+            let l = l.trim();
+            let neg = l.starts_with('-');
+            let dt = l.trim_start_matches('-');
+            if !dt.chars().all(|c| c.is_ascii_digit()) || dt.is_empty() {
+                return None;
+            }
+            let lenv = if neg { format!("-{dt}") } else { l.to_string() };
+            a.push(s(&lenv));
+        }
+        return Some(a);
+    } else if let Some(r) = rest.strip_prefix("##") {
+        ("##".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix("%%") {
+        ("%%".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix("//") {
+        ("//".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix('#') {
+        ("#".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix('%') {
+        ("%".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix('/') {
+        ("/".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix('-') {
+        ("-".into(), r.to_string())
+    } else if let Some(r) = rest.strip_prefix('+') {
+        ("+".into(), r.to_string())
+    } else {
+        return None;
+    };
+    // a $-bearing operand is fine: param_call's default_word expands it
+    // recursively (heredoc_body_c) — ${v:-${w:-$(cmd)}} nests
+    Some(vec![s(&op), s(&name), s(&arg)])
+}
+
+/// Split an unquoted heredoc body into segments. Returns None when the
+/// body contains an expansion the splitter doesn't model — the caller
+/// keeps the raw text (today's behavior).
+fn split_heredoc_body(text: &str) -> Option<Vec<HdSeg>> {
+    let ch: Vec<char> = text.chars().collect();
+    let mut segs: Vec<HdSeg> = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0usize;
+    while i < ch.len() {
+        // backslash escapes (unquoted heredoc): \ $ ` " \ and line-join
+        if ch[i] == '\\' && i + 1 < ch.len() && matches!(ch[i + 1], '$' | '`' | '"' | '\\' | '\n') {
+            if ch[i + 1] != '\n' {
+                lit.push(ch[i + 1]);
+            }
+            i += 2;
+            continue;
+        }
+        if ch[i] == '$' && i + 1 < ch.len() {
+            let nxt = ch[i + 1];
+            // special single-char vars and positionals
+            if matches!(nxt, '?' | '#' | '@' | '*' | '$' | '!') || nxt.is_ascii_digit() {
+                if !lit.is_empty() {
+                    segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                }
+                segs.push(HdSeg::Var(nxt.to_string()));
+                i += 2;
+                continue;
+            }
+            if nxt == '{' {
+                // find the matching close brace
+                let mut depth = 1usize;
+                let mut j = i + 2;
+                while j < ch.len() {
+                    if ch[j] == '{' {
+                        depth += 1;
+                    } else if ch[j] == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    let body: String = ch[i + 2..j].iter().collect();
+                    if let Some(args) = dollar_brace_args(&body) {
+                        if !lit.is_empty() {
+                            segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                        }
+                        if args.len() == 1 {
+                            // getVar shape
+                            if let IrExpr::Str(n, _) = &args[0] {
+                                segs.push(HdSeg::Var(n.clone()));
+                                i = j + 1;
+                                continue;
+                            }
+                        }
+                        segs.push(HdSeg::Param(args));
+                        i = j + 1;
+                        continue;
+                    }
+                    return None; // unmodeled ${...} — fall back wholesale
+                }
+                return None; // unterminated
+            }
+            if nxt == '(' {
+                // `$(( arith ))`
+                if i + 2 < ch.len() && ch[i + 2] == '(' {
+                    let mut depth = 0i32;
+                    let mut j = i + 3;
+                    while j < ch.len() {
+                        if ch[j] == '(' {
+                            depth += 1;
+                        } else if ch[j] == ')' {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        j += 1;
+                    }
+                    // expect `))`
+                    if j + 1 < ch.len() && ch[j] == ')' && ch[j + 1] == ')' {
+                        let body: String = ch[i + 3..j].iter().collect();
+                        if let Some(a) = crate::shir::parse_arith(&body) {
+                            if !lit.is_empty() {
+                                segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                            }
+                            segs.push(HdSeg::Arith(a));
+                            i = j + 2;
+                            continue;
+                        }
+                        return None;
+                    }
+                    return None;
+                }
+                // `$( cmd )`
+                let mut depth = 1usize;
+                let mut j = i + 2;
+                while j < ch.len() {
+                    if ch[j] == '(' {
+                        depth += 1;
+                    } else if ch[j] == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                if depth == 0 {
+                    let body: String = ch[i + 2..j].iter().collect();
+                    if !lit.is_empty() {
+                        segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                    }
+                    segs.push(HdSeg::Cmd(body));
+                    i = j + 1;
+                    continue;
+                }
+                return None;
+            }
+            // `$name`
+            if is_name_char(nxt) {
+                let mut j = i + 1;
+                while j < ch.len() && is_name_char(ch[j]) {
+                    j += 1;
+                }
+                let name: String = ch[i + 1..j].iter().collect();
+                if !lit.is_empty() {
+                    segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                }
+                segs.push(HdSeg::Var(name));
+                i = j;
+                continue;
+            }
+        }
+        if ch[i] == '`' {
+            // `cmd` — find the closing backtick (no nesting model)
+            if let Some(rel) = ch[i + 1..].iter().position(|&c| c == '`') {
+                let body: String = ch[i + 1..i + 1 + rel].iter().collect();
+                if !lit.is_empty() {
+                    segs.push(HdSeg::Lit(std::mem::take(&mut lit)));
+                }
+                segs.push(HdSeg::Cmd(body));
+                i = i + rel + 2;
+                continue;
+            }
+            return None;
+        }
+        lit.push(ch[i]);
+        i += 1;
+    }
+    if !lit.is_empty() {
+        segs.push(HdSeg::Lit(lit));
+    }
+    Some(segs)
 }
 
 /// The Json brace-parts argument (`brace("pre", [[...]], [...], "suf")`).
@@ -7904,14 +11907,21 @@ fn brace_group_items(entry: &serde_json::Value) -> Vec<String> {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(1);
         if let (Ok(na), Ok(nb)) = (a.parse::<i64>(), b.parse::<i64>()) {
-            // numeric range with zero-padding to the wider operand
-            let width = a.len().max(b.len());
+            // zero-padding follows bash: only when the FIRST operand has
+            // a leading zero; the width is the FIRST operand's width
+            // (`{1..10..2}` stays unpadded, `{00..04..2}` pads to 2)
+            let pad: Option<usize> = if a.len() > 1 && a.starts_with('0') {
+                Some(a.len())
+            } else {
+                None
+            };
             let pad = |n: i64| -> String {
                 let s = n.to_string();
-                if s.len() < width {
-                    format!("{}{}", "0".repeat(width - s.len()), s)
-                } else {
-                    s
+                match pad {
+                    Some(width) if s.len() < width => {
+                        format!("{}{}", "0".repeat(width - s.len()), s)
+                    }
+                    _ => s,
                 }
             };
             let mut out = Vec::new();
@@ -7966,6 +11976,7 @@ fn brace_expand(args: &[IrExpr]) -> Vec<String> {
             IrExpr::Str(s, _) => Some(s.clone()),
             _ => None,
         })
+        .map(|s| strip_glob(&s).to_string())
         .unwrap_or_default();
     let suffix = args
         .get(3)
@@ -7973,6 +11984,7 @@ fn brace_expand(args: &[IrExpr]) -> Vec<String> {
             IrExpr::Str(s, _) => Some(s.clone()),
             _ => None,
         })
+        .map(|s| strip_glob(&s).to_string())
         .unwrap_or_default();
     let Some(v) = brace_json_arg(args) else {
         return vec![format!("{prefix}{suffix}")];
@@ -7982,7 +11994,20 @@ fn brace_expand(args: &[IrExpr]) -> Vec<String> {
         for g in gs {
             let mut items = Vec::new();
             if let Some(es) = g.as_array() {
+                // A MULTI-entry group is a COMMA LIST: elements that look
+                // like ranges are LITERAL text (bash expands a range only
+                // as a standalone {a..b}; `{1..3,7..9}` yields `1..3
+                // 7..9`, not `1 2 3 7 8 9`)
+                let multi = es.len() > 1;
                 for e in es {
+                    if multi {
+                        if let Some(r) = e.get("range").and_then(|r| r.as_array()) {
+                            let a = r.first().and_then(|x| x.as_str()).unwrap_or("");
+                            let b = r.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                            items.push(format!("{a}..{b}"));
+                            continue;
+                        }
+                    }
                     items.extend(brace_group_items(e));
                 }
             }
@@ -7992,15 +12017,33 @@ fn brace_expand(args: &[IrExpr]) -> Vec<String> {
     if groups.is_empty() {
         return vec![format!("{prefix}{suffix}")];
     }
-    let mut out: Vec<String> = vec![String::new()];
-    for g in &groups {
+    // the MIDDLES are the literal text BETWEEN consecutive braces
+    // (`file_{a..z}_{1..10}.{txt,log}` — "_" joins group 0→1, "." 1→2);
+    // dropping them glued the words together (064_02)
+    let middles: Vec<String> = args
+        .get(2)
+        .and_then(|a| match a {
+            IrExpr::Json(v) => v.as_array().map(|xs| {
+                xs.iter()
+                    .map(|x| x.as_str().unwrap_or_default().to_string())
+                    .collect()
+            }),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut out: Vec<String> = groups
+        .first()
+        .cloned()
+        .unwrap_or_else(|| vec![String::new()]);
+    for (gi, g) in groups.iter().enumerate().skip(1) {
         if g.is_empty() {
             continue;
         }
+        let m = middles.get(gi - 1).cloned().unwrap_or_default();
         let mut next = Vec::new();
         for o in &out {
             for item in g {
-                next.push(format!("{o}{item}"));
+                next.push(format!("{o}{m}{item}"));
             }
         }
         out = next;
@@ -8018,7 +12061,7 @@ mod tests {
     fn int_render(name: &str, lo: i64, hi: i64, w: Width) -> Render {
         let mut r = Render::default();
         r.var_types.insert(name.to_string(), IrType::Int);
-        r.var_ranges.insert(name.to_string(), (lo.into(), hi.into()));
+        r.var_ranges.insert(name.to_string(), (lo as i128, hi as i128));
         r.var_widths.insert(name.to_string(), w);
         r
     }
@@ -8041,13 +12084,7 @@ mod tests {
         for (name, lo, hi, w, fmt) in [
             ("i", 1, 10000, Width::U32, "%u"),
             ("x", -100, -100, Width::I32, "%d"),
-            (
-                "n",
-                1_000_000_000_000,
-                1_000_000_000_000,
-                Width::I64,
-                "%lld",
-            ),
+            ("n", 1_000_000_000_000, 1_000_000_000_000, Width::I64, "%lld"),
         ] {
             let r = int_render(name, lo, hi, w);
             let e = IrExpr::Var(name.to_string(), None);
@@ -8062,10 +12099,7 @@ mod tests {
         let r = int_render("i", 1, 10000, Width::U32);
         let e = IrExpr::Call {
             func: "getVar".to_string(),
-            args: vec![IrExpr::Str(
-                "i".to_string(),
-                crate::ir::StrStyle::DoubleQuoted,
-            )],
+            args: vec![IrExpr::Str("i".to_string(), crate::ir::StrStyle::DoubleQuoted)],
         };
         assert_eq!(r.num_spec(&e), NumSpec::Num("%u", false));
     }
@@ -8089,8 +12123,7 @@ mod tests {
         // not the u32 the range might suggest → %lld + cast (the safe pair)
         let mut r = int_render("i", 1, 10000, Width::U32);
         r.var_types.insert("n".to_string(), IrType::Int);
-        r.var_ranges
-            .insert("n".to_string(), (1_000_000_000_000, 1_000_000_000_000));
+        r.var_ranges.insert("n".to_string(), (1_000_000_000_000, 1_000_000_000_000));
         r.var_widths.insert("n".to_string(), Width::I64);
         let e = IrExpr::Arith(Box::new(ArithAst::Bin {
             op: "*".to_string(),
@@ -8111,6 +12144,76 @@ mod tests {
             r.num_spec(&IrExpr::Var("s".to_string(), None)),
             NumSpec::Num("%lld", true)
         );
-        assert_eq!(r.num_spec(&IrExpr::Int(42)), NumSpec::Num("%lld", true));
+        assert_eq!(
+            r.num_spec(&IrExpr::Int(42)),
+            NumSpec::Num("%lld", true)
+        );
     }
+}
+
+/// The core flattens comparisons (`$x==y` — no spaces): as ONE word bash
+/// reads a 1-arg always-true test. Re-space ==/!=/=/<=/> OUTSIDE $()/${}
+/// substitutions ([[ ]] → [ ] transport).
+fn respace_test_text(t: &str) -> String {
+        let chars: Vec<char> = t.chars().collect();
+        let mut spaced = String::new();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i] == '$'
+                && i + 1 < chars.len()
+                && matches!(chars[i + 1], '(' | '{')
+            {
+                // copy the whole substitution verbatim
+                let open = chars[i + 1];
+                let close = if open == '(' { ')' } else { '}' };
+                spaced.push(chars[i]);
+                spaced.push(open);
+                let mut d = 1;
+                i += 2;
+                while i < chars.len() && d > 0 {
+                    spaced.push(chars[i]);
+                    if chars[i] == open {
+                        d += 1;
+                    } else if chars[i] == close {
+                        d -= 1;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            let two: String = chars[i..(i + 2).min(chars.len())].iter().collect();
+            if matches!(two.as_str(), "==" | "!=" | "<=" | ">=") {
+                if !spaced.ends_with(' ') && !spaced.is_empty() {
+                    spaced.push(' ');
+                }
+                spaced.push_str(&two);
+                i += 2;
+                if i < chars.len() && chars[i] != ' ' {
+                    spaced.push(' ');
+                }
+                continue;
+            }
+            if c_eq(&chars, i) {
+                if !spaced.ends_with(' ') && !spaced.is_empty() {
+                    spaced.push(' ');
+                }
+                spaced.push('=');
+                i += 1;
+                if i < chars.len() && chars[i] != ' ' {
+                    spaced.push(' ');
+                }
+                continue;
+            }
+            spaced.push(chars[i]);
+            i += 1;
+        }
+    spaced
+}
+
+/// Is the char at `i` a single `=` comparison (not `==`)?
+fn c_eq(chars: &[char], i: usize) -> bool {
+    chars[i] == '='
+        && i + 1 < chars.len()
+        && chars[i + 1] != '='
+        && (i == 0 || chars[i - 1] != '!' && chars[i - 1] != '<' && chars[i - 1] != '>' && chars[i - 1] != '=')
 }

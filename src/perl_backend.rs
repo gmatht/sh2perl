@@ -140,6 +140,12 @@ pub struct Render {
     /// preamble emits the sh2_mem* runtime.
     need_mem: bool,
     todo: usize,
+    /// Fresh file-handle suffix for ForEachLine streaming loops.
+    fh_counter: usize,
+    /// WalkDir used → __sh2_walk preamble helper needed.
+    need_walk: bool,
+    /// ReadLine used → __sh2_read_line preamble helper needed.
+    need_readline: bool,
 }
 
 /// Render an `IrProgram` to Perl source.
@@ -187,6 +193,65 @@ pub fn shir_to_perl(prog: &IrProgram) -> String {
     if r.need_mem {
         r.emit("");
         for line in MEM_RUNTIME.lines() {
+            r.emit(line);
+        }
+        r.emit("");
+    }
+    if r.need_readline {
+        r.emit("");
+        r.emit("sub __sh2_read_line {");
+        r.emit("    my $l = <STDIN>;");
+        r.emit("    return defined $l ? do { chomp $l; $l } : '';");
+        r.emit("}");
+    }
+    if r.need_walk {
+        // STREAMING directory walk (docs/shir-primitives.md §WalkDir):
+        // GNU find subset — entries delivered one at a time to the
+        // callback, file contents never opened; the START point is
+        // evaluated against the predicates too (find . -type d lists .).
+        // maxdepth: 0 = unlimited; children of a depth-$d dir sit at
+        // $d+1 and are visited only while $d+1 <= $max.
+        for line in [
+            "sub __sh2_fnmatch {",
+            "    my ($pat, $name) = @_;",
+            "    my $re = '';",
+            "    for my $i (0 .. length($pat)-1) {",
+            "        my $c = substr($pat, $i, 1);",
+            "        if ($c eq '*') { $re .= '[^/]*'; }",
+            "        elsif ($c eq '?') { $re .= '[^/]'; }",
+            "        elsif ($c eq '[') {",
+            "            my $j = $i + 1;",
+            "            $j++ if substr($pat, $j, 1) eq '!' || substr($pat, $j, 1) eq '^';",
+            "            $j++ while $j < length($pat) && substr($pat, $j, 1) ne ']';",
+            "            if ($j >= length($pat)) { $re .= '\\['; next; }",
+            "            my $cls = substr($pat, $i, $j - $i + 1);",
+            "            $cls =~ s/^\\[!/[^/;",
+            "            $re .= $cls; $i = $j;",
+            "        }",
+            "        else { $re .= \"\\Q$c\\E\"; }",
+            "    }",
+            "    return $name =~ /^${re}$/;",
+            "}",
+            "sub __sh2_walk {",
+            "    my ($dir, $cb, $type, $max, $name, $depth) = @_;",
+            "    my $ok0 = ($type eq '' || ($type eq 'f' ? (-f $dir && !-d _) : -d $dir))",
+            "        && ($name eq '' || __sh2_fnmatch($name, $dir));",
+            "    $cb->($dir) if $ok0;",
+            "    opendir(my $dh, $dir) or return;",
+            "    while (my $e = readdir($dh)) {",
+            "        next if $e eq '.' || $e eq '..';",
+            "        my $full = \"$dir/$e\";",
+            "        my $isdir = -d $full;",
+            "        my $nm = (split('/', $full))[-1];",
+            "        my $ok = ($type eq '' ? 1 : ($type eq 'f' ? (-f $full) : $isdir))",
+            "            && ($name eq '' || __sh2_fnmatch($name, $nm));",
+            "        $cb->($full) if $ok;",
+            "        if ($isdir && ($max == 0 || $depth + 1 < $max)) {",
+            "            __sh2_walk($full, $cb, $type, $max, $name, $depth + 1);",
+            "        }",
+            "    }",
+            "}",
+        ] {
             r.emit(line);
         }
         r.emit("");
@@ -292,6 +357,10 @@ impl Render {
             _ => {
                 if is_env_style_var_name(name) {
                     format!("$ENV{{{}}}", name)
+                } else if self.loop_vars.contains(name) {
+                    // For-loop / ForEachLine vars are declared by their
+                    // loop (`while (my $v = …)`) — never scalar-hoisted.
+                    format!("${}", ident(name))
                 } else {
                     self.scalars.insert(name.to_string());
                     format!("${}", ident(name))
@@ -544,6 +613,22 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "0".to_string()
             }
+            IrExpr::Ext(n) => {
+                // `read VAR` normalisation: one stdin line, chomped
+                if n.tag() == "ReadLine" {
+                    self.need_readline = true;
+                    return "__sh2_read_line()".to_string();
+                }
+                let ctx = crate::render_ext_expr::ExprRenderCtx {
+                    backend: crate::render_ext_expr::Backend::Perl,
+                    indent: 0,
+                };
+                if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
+                    code
+                } else {
+                    format!("sh2.{}(...)", n.tag())
+                }
+            }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr(i)).collect();
                 format!("({})", elems.join(", "))
@@ -588,6 +673,18 @@ impl Render {
         match e {
             IrExpr::Call { func, args } if func == "exec" || func == "let" => {
                 format!("(({}) == 0)", self.expr(e))
+            }
+            IrExpr::Call { func, args } if func == "contains" => {
+                // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+                // perl index(STR, SUBSTR) >= 0.
+                if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
+                    let n = self.expr(needle);
+                    let p = self.expr(pattern);
+                    format!("(index({n}, {p}) >= 0)")
+                } else {
+                    self.mark_todo("call contains");
+                    "0".to_string()
+                }
             }
             _ => self.expr(e),
         }
@@ -860,6 +957,17 @@ impl Render {
 
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            "contains" => {
+                // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+                // perl index(STR, SUBSTR) >= 0.
+                if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
+                    let n = self.expr(needle);
+                    let p = self.expr(pattern);
+                    return format!("(index({n}, {p}) >= 0)");
+                }
+                self.mark_todo("call contains");
+                "0".into()
+            }
             "getVar" => match Self::str_arg(args, 0) {
                 Some(name) => self.var_ref(&name),
                 None => {
@@ -1803,7 +1911,77 @@ impl Render {
 
     fn stmt(&mut self, s: &IrStmt) {
         match s {
-            IrStmt::Ext(_) => panic!("perl backend: Ext node unsupported"),
+            IrStmt::Ext(node) if node.tag() == "WalkDir" => {
+                // STREAMING directory walk (docs/shir-primitives.md
+                // §WalkDir): recursive opendir/readdir — entries one at a
+                // time, file contents never opened.
+                let wd = node.as_any().downcast_ref::<crate::shir_nodes::WalkDir>()
+                    .expect("tag/type agree");
+                self.need_walk = true;
+                let src = self.expr(&wd.source);
+                // the callback binds the var by assignment → hoist a lexical
+                self.scalars.insert(wd.var.clone());
+                let lv = format!("${}", ident(&wd.var));
+                let tf = match &wd.type_filter {
+                    Some(x) => x.as_str(),
+                    None => "",
+                };
+                let md = match &wd.maxdepth {
+                    Some(e) => crate::ir::ir_expr_to_perl(e),
+                    None => "0".to_string(),
+                };
+                let nf = match &wd.name_filter {
+                    Some(x) => format!("\"{}\"", x.replace('\'', "\\\'")),
+                    None => "''".to_string(),
+                };
+                self.emit(&format!(
+                    "__sh2_walk({}, sub {{ {} = shift;",
+                    src, lv
+                ));
+                // NB: initial depth 0 is passed in the tail line below
+                // NB: closing paren emitted with the tail line below
+                self.depth += 1;
+                for b in &wd.body {
+                    self.stmt(b);
+                }
+                self.depth -= 1;
+                self.emit(&format!("}}, \"{}\", {}, {}, 0);", tf, md, nf));
+            }
+            IrStmt::Ext(node) => {
+                if node.tag() == "ForEachLine" {
+                    // STREAMING line iteration (docs/shir-primitives.md
+                    // §ForEachLine): open + while(<$fh>) + chomp — O(1)
+                    // memory, never a whole-file read. The body reads the
+                    // loop var as an ordinary scalar; limit → early last.
+                    let fl = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>()
+                        .expect("tag/type agree");
+                    let src = self.expr(&fl.source);
+                    let fh = format!("$__sh2_fh{}", self.fh_counter);
+                    self.fh_counter += 1;
+                    let lv = format!("${}", ident(&fl.var));
+                    // The loop var must not be `my`-hoisted as an outer
+                    // scalar (the while condition declares it).
+                    self.loop_vars.insert(fl.var.clone());
+                    self.emit(&format!("open my {fh}, '<', {src} or die \"open: $!\\n\";"));
+                    self.emit(&format!("while (my {lv} = <{fh}>) {{"));
+                    self.depth += 1;
+                    self.emit(&format!("chomp {lv};"));
+                    if let Some(lim) = &fl.limit {
+                        // head -n K: read K lines then stop (streaming
+                        // early-exit; $. is per-handle since we close it).
+                        let le = self.expr(lim);
+                        self.emit(&format!("last if $. > {le};"));
+                    }
+                    for b in &fl.body {
+                        self.stmt(b);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                    self.emit(&format!("close {fh};"));
+                    return;
+                }
+                panic!("perl backend: Ext node unsupported: {}", node.tag())
+            }
             IrStmt::Expr(e) => match e {
                 IrExpr::Call { func, args } => match func.as_str() {
                     "exec" => self.exec_stmt(args),

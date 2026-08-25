@@ -1,0 +1,17 @@
+# shir_nodes/cutset_trim.node — expression-level semantic IR node.
+# CutsetTrim: remove ALL leading/trailing characters that occur in the
+# cutset (Go strings.Trim / strings.TrimLeft / strings.TrimRight over
+# arbitrary operands; bash has no direct twin — ${s###[cutset]} strips
+# one pattern, not a char set).
+#
+# GENERIC. text is any expression evaluating to a string; cutset is the
+# set of characters (stringified like the host) stripped from BOTH ends.
+#
+# Backends: Perl s/^[..]+// + s/[..]+$// with \Q..\E, JS scan/slice IIFE,
+#           C strspn loop, Rust trim_matches(|c| cutset.contains(c))
+
+node CutsetTrim
+tag "CutsetTrim"
+kind expr
+field text: expr
+field cutset: expr

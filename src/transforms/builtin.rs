@@ -125,6 +125,7 @@ fn rewrite_expr(e: &mut IrExpr) -> bool {
         }
         IrExpr::Splice(inner) => rewrite_expr(inner),
         IrExpr::Arith(ast) => rewrite_arith(ast),
+        IrExpr::Ext(_) => false,
         IrExpr::BinOp { lhs, rhs, .. } => rewrite_expr(lhs) | rewrite_expr(rhs),
         IrExpr::Ternary { cond, then, else_ } => {
             rewrite_expr(cond) | rewrite_expr(then) | rewrite_expr(else_)
@@ -348,6 +349,7 @@ fn erase(st: &mut IrStmt) -> bool {
             }
             IrExpr::Splice(inner) => erase_expr(inner),
             IrExpr::BinOp { lhs, rhs, .. } => erase_expr(lhs) | erase_expr(rhs),
+            IrExpr::Ext(_) => false,
             IrExpr::Ternary { cond, then, else_ } => {
                 erase_expr(cond) | erase_expr(then) | erase_expr(else_)
             }
@@ -379,6 +381,16 @@ fn erase(st: &mut IrStmt) -> bool {
             let mut changed = false;
             for e in elements.iter_mut() {
                 changed |= erase_expr(e);
+            }
+            changed
+        }
+        IrStmt::Pipeline { stages, .. } => {
+            // pipeline stages are stmt lists — erase inside them too,
+            // or captures of `a | b` keep `builtin` calls the renderer
+            // cannot match (008_simple_backup backtick pipelines)
+            let mut changed = false;
+            for stage in stages.iter_mut() {
+                changed |= erase_stmts(stage);
             }
             changed
         }

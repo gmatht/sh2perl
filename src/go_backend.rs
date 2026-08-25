@@ -561,8 +561,25 @@ impl Render {
                     if let Some(c) = self.test_render(s) {
                         return c;
                     }
+                    // bash -c fallback for a test go can't parse natively
+                    let env = self.env_lit();
+                    return format!(
+                        "(redirRun({}, {env}) == 0)",
+                        Self::go_str(&format!("[ {s} ]"))
+                    );
                 }
                 self.sh2_stub("test")
+            }
+            IrExpr::Call { func, args } if func == "contains" => {
+                // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+                // strings.Contains. The strings import is auto-derived from
+                // the generated text.
+                if args.len() >= 2 {
+                    let needle = self.expr_str(&args[0]);
+                    let pattern = self.expr_str(&args[1]);
+                    return format!("strings.Contains({needle}, {pattern})");
+                }
+                self.sh2_stub("contains")
             }
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
@@ -767,6 +784,41 @@ impl Render {
             IrExpr::Splice(_) => {
                 self.mark_todo("Splice expr");
                 "nil".into()
+            }
+            IrExpr::Ext(n) => match n.tag() {
+                "StringContains" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StringContains>()
+                        .expect("tag/type agree");
+                    format!("strings.Contains({}, {})",
+                        self.expr_any(&x.text), self.expr_any(&x.pattern))
+                }
+                "FieldExtract" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()
+                        .expect("tag/type agree");
+                    // single-field fast path; ranges/multi-field fall back
+                    if x.fields.len() == 1 {
+                        if let crate::ir::FieldRange::Single(i) = x.fields[0] {
+                            return format!(
+                                "func() string {{\n_p := strings.Split({}, {})\nif {}-1 < len(_p) {{\nreturn _p[{}]\n}}\nreturn \"\"\n}}()",
+                                self.expr_any(&x.text),
+                                go_str_lit(&x.delimiter), i, i - 1);
+                        }
+                    }
+                    "nil".into()
+                }
+                "StrLen" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StrLen>()
+                        .expect("tag/type agree");
+                    format!("len({})", self.expr_any(&x.text))
+                }
+                "CaseTransform" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::CaseTransform>()
+                        .expect("tag/type agree");
+                    format!("strings.{}({})",
+                        if x.upper { "ToUpper" } else { "ToLower" },
+                        self.expr_any(&x.text))
+                }
+                _ => format!("sh2.{}(...)", n.tag()),
             }
             IrExpr::Array(items) => {
                 let elems: Vec<String> = items.iter().map(|i| self.expr_any(i)).collect();
@@ -1316,6 +1368,47 @@ impl Render {
     /// Render a Call as an expression (any-compatible).
     fn call(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            "line" => {
+                // multi-return line read (`line(cap, N)` = the C frontend's
+                // outparam channel): String(v).split('\n')[N]
+                if let (Some(v), Some(IrExpr::Str(i, _))) = (args.first(), args.get(1)) {
+                    let ve = self.expr_any(v);
+                    let n: usize = i.parse().unwrap_or(0);
+                    // s2s coerces any-typed homes (the capture writes any)
+                    return format!("__sh_line(s2s({ve}), {n})");
+                }
+                self.sh2_stub("line")
+            }
+            "fnValue" | "fnCall" => {
+                // a user-function call — values flow as strings; the
+                // positional-param convention reads fArgs inside
+                let name = args
+                    .first()
+                    .and_then(|a| match a {
+                        IrExpr::Str(nm, _) => Some(self.go_ident(nm)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "sh2TODO".to_string());
+                self.mark_read(
+                    args.first()
+                        .and_then(|a| match a {
+                            IrExpr::Str(nm, _) => Some(nm.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                );
+                self.need_fargs = true;
+                let call_args: Vec<String> = args
+                    .get(1)
+                    .and_then(|a| match a {
+                        IrExpr::Array(elems) => {
+                            Some(elems.iter().map(|e| self.expr_str(e)).collect())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                format!("{name}(&[_]string{{ {} }})", call_args.join(", "))
+            }
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
                     return self.getvar_any(name);
@@ -1327,6 +1420,11 @@ impl Render {
                     if let Some(c) = self.test_render(s) {
                         return c;
                     }
+                    let env = self.env_lit();
+                    return format!(
+                        "(redirRun({}, {env}) == 0)",
+                        Self::go_str(&format!("[ {s} ]"))
+                    );
                 }
                 self.sh2_stub("test")
             }
@@ -1395,6 +1493,39 @@ impl Render {
                 let m = self.ident_of(&name);
                 self.mark_arr(&name);
                 format!("s2s(arrLen({m}))")
+            }
+            "split" => {
+                // bash word-splitting on whitespace (the default IFS):
+                // collapse runs, drop empty fields. strings.Fields is the
+                // exact native match, joined back with single spaces.
+                if let Some(a) = args.first() {
+                    let v = self.expr_str(a);
+                    return format!("strings.Join(strings.Fields({v}), \" \")");
+                }
+                "\"\"".to_string()
+            }
+            "and" | "or" => {
+                // `A && B` / `A || B` — bash -c fork/exec fallback
+                // (short-circuit semantics are a shell primitive)
+                let mut texts = Vec::new();
+                let mut ok = true;
+                for a in args {
+                    if let Some(t) = self.cmd_text_expr(a) {
+                        texts.push(t);
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok && !texts.is_empty() {
+                    let env = self.env_lit();
+                    let sep = if func == "and" { " && " } else { " || " };
+                    return format!(
+                        "redirRun({}, {env})",
+                        Self::go_str(&texts.join(sep))
+                    );
+                }
+                self.sh2_stub(func)
             }
             "arith" => {
                 if let Some(IrExpr::Str(s, _)) = args.first() {
@@ -1596,6 +1727,19 @@ impl Render {
                 "target" => {
                     if let IrExpr::Str(s, _) = v {
                         target = Some(s.clone());
+                    } else if let IrExpr::Call { func, args } = v {
+                        // `> "$f"` — a variable redirect target: render
+                        // `$name` so the bash -c child (redirRun) resolves it
+                        // via env_lit (mirrors redirect_stmt_text).
+                        if func == "getVar" {
+                            if let Some(IrExpr::Str(n, _)) = args.first() {
+                                target = Some(format!("${{{n}}}"));
+                            } else {
+                                return None;
+                            }
+                        } else {
+                            return None;
+                        }
                     } else {
                         return None;
                     }
@@ -1618,6 +1762,39 @@ impl Render {
 
     /// `capture(Arrow)` body → capture lowering.
     fn capture_arrow(&mut self, body: &[IrStmt]) -> String {
+        // The C frontend's outparam channel: capture(Arrow[fnCall(..)]) —
+        // the callee ECHOES its out-param values; the caller captures
+        // STDOUT via a pipe (statement sides + a value expression)
+        if let [IrStmt::Expr(IrExpr::Call { func, args })] = body {
+            if func == "fnCall" || func == "fnValue" {
+                if let Some(IrExpr::Str(nm, _)) = args.first() {
+                    let m = self.go_ident(nm);
+                    self.mark_read(nm);
+                    self.need_fargs = true;
+                    let vals: Vec<String> = args
+                        .get(1)
+                        .and_then(|a| match a {
+                            IrExpr::Array(elems) => {
+                                Some(elems.iter().map(|e| self.expr_str(e)).collect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    self.sides.push(
+                        "__sh_old := os.Stdout; __r, __w, _ := os.Pipe(); os.Stdout = __w"
+                            .to_string(),
+                    );
+                    self.sides.push(format!(
+                        "fArgs = []string{{{}}}; {m}(); fArgs = nil;",
+                        vals.join(", ")
+                    ));
+                }
+                self.sides
+                    .push("__w.Close(); __b, _ := io.ReadAll(__r); os.Stdout = __sh_old"
+                        .to_string());
+                return "s2s(string(__b))".to_string();
+            }
+        }
         if let Some((cmd, argv)) = self.body_single_exec(body) {
             let mut parts = vec![cmd];
             parts.extend(argv);
@@ -2046,6 +2223,39 @@ impl Render {
         Some(t.to_string())
     }
 
+    /// Rebuild an `ArithAst` as shell arithmetic TEXT (`$((…))` operand),
+    /// so the `and`/`or`/capture bash -c fallback can reconstruct
+    /// arithmetic-containing operands. Conservative: refuses (None) the
+    /// assignment/incdec/cast shapes rather than guess.
+    fn cmd_text_arith(&self, a: &crate::ir::ArithAst) -> Option<String> {
+        match a {
+            crate::ir::ArithAst::Num(n) => Some(n.to_string()),
+            crate::ir::ArithAst::Var(name) | crate::ir::ArithAst::Ident(name) => {
+                Some(format!("${name}"))
+            }
+            crate::ir::ArithAst::Index { var, key } => Some(format!(
+                "{var}[{}]",
+                self.cmd_text_arith(key)?
+            )),
+            crate::ir::ArithAst::Bin { op, lhs, rhs } => Some(format!(
+                "({} {} {})",
+                self.cmd_text_arith(lhs)?,
+                op,
+                self.cmd_text_arith(rhs)?
+            )),
+            crate::ir::ArithAst::Un { op, arg } => {
+                Some(format!("({op}{})", self.cmd_text_arith(arg)?))
+            }
+            crate::ir::ArithAst::Cond { test, then, else_ } => Some(format!(
+                "({} ? {} : {})",
+                self.cmd_text_arith(test)?,
+                self.cmd_text_arith(then)?,
+                self.cmd_text_arith(else_)?
+            )),
+            _ => None,
+        }
+    }
+
     fn cmd_text_expr(&mut self, e: &IrExpr) -> Option<String> {
         match e {
             IrExpr::Str(s, _) => Some(s.clone()),
@@ -2069,7 +2279,9 @@ impl Render {
             }
             IrExpr::Var(name, _) => Some(format!("${name}")),
             IrExpr::Ident(name) => Some(format!("${name}")),
-            IrExpr::Arith(_) => None,
+            IrExpr::Arith(a) => self
+                .cmd_text_arith(a)
+                .map(|t| format!("$(({t}))")),
             IrExpr::BinOp { lhs, op, rhs } => {
                 let l = self.cmd_text_expr(lhs)?;
                 let r = self.cmd_text_expr(rhs)?;
@@ -2136,6 +2348,33 @@ impl Render {
                     n if n.chars().all(|c| c.is_ascii_digit()) => Some(format!("${n}")),
                     _ => Some(format!("${name}")),
                 }
+            }
+            IrExpr::Call { func, args } if func == "redirect" => {
+                // `redirect` Call: args[0] = Arrow(body), args[1] = Array of
+                // {fd, mode, target} — reconstruct as `( body ) redir`s so an
+                // `and`/`or`/capture operand containing a redirect resolves.
+                let (Some(IrExpr::Arrow(body)), Some(IrExpr::Array(redirs))) =
+                    (args.first(), args.get(1))
+                else {
+                    return None;
+                };
+                let text = self.cmd_text_stmts(body)?;
+                let mut out = format!("( {text} )");
+                for r in redirs {
+                    let rt = self.redirect_text(r)?;
+                    out.push(' ');
+                    out.push_str(&rt);
+                }
+                Some(out)
+            }
+            IrExpr::Call { func, args } if func == "subshell" || func == "block" => {
+                // `( body )` / `{ body }` groups in an `and`/`or`/capture
+                // operand — reconstruct as a subshell group.
+                let Some(IrExpr::Arrow(body)) = args.first() else {
+                    return None;
+                };
+                let text = self.cmd_text_stmts(body)?;
+                Some(format!("( {text} )"))
             }
             IrExpr::Call { func, args } if func == "assign" => {
                 let name = match args.first() {
@@ -2471,7 +2710,44 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => self.stmt_expr(e),
-            IrStmt::Ext(_) => panic!("go backend: Ext node unsupported"),
+            IrStmt::Ext(node) => {
+                // STREAMING line iteration — O(1) memory, never slurps.
+                // Body statements render through the Go backend's own
+                // emitters (recursion goes back through this match).
+                if node.tag() == "ForEachLine" {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static FL_N: AtomicUsize = AtomicUsize::new(0);
+                    let k = FL_N.fetch_add(1, Ordering::Relaxed);
+                    let fl = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>()
+                        .expect("tag/type agree");
+                    // The loop var is a STRING: register the verdict before
+                    // anything renders, so reads use native string ops and
+                    // the hoisted decl is `var __l string` not `any`.
+                    self.var_types.insert(fl.var.clone(), IrType::Str);
+                    let src = self.expr_any(&fl.source);
+                    self.emit(&format!("_ff{k}, _err{k} := os.Open({src})", src = src));
+                    self.emit(&format!("if _err{k} != nil {{ st = 1 }} else {{"));
+                    self.depth += 1;
+                    self.emit(&format!("_sc{k} := bufio.NewScanner(_ff{k})"));
+                    self.emit(&format!("for _sc{k}.Scan() {{"));
+                    self.depth += 1;
+                    self.emit(&format!("{} = _sc{k}.Text()", fl.var));
+                    self.mark_written(&fl.var);
+                    // Go errors on unused locals — silence when the body
+                    // doesn't read the line (pure counters).
+                    self.emit(&format!("_ = {}", fl.var));
+                    for b in &fl.body {
+                        self.stmt(b);
+                    }
+                    self.depth -= 1;
+                    self.emit("}");
+                    self.depth -= 1;
+                    self.emit("}");
+                    self.need_st = true;
+                } else {
+                    panic!("go backend: Ext node {} unsupported", node.tag());
+                }
+            }
             IrStmt::Assign { targets, expr, .. } => self.stmt_assign(targets, expr),
             IrStmt::Declare { vars, init, .. } => {
                 for d in vars {
@@ -2829,7 +3105,31 @@ impl Render {
                     ));
                     self.need_st = true;
                 } else {
-                    self.mark_todo("Pipeline");
+                    // bash -c fork/exec fallback (last-resort tier): a stage
+                    // that isn't a single external exec (variable cmd,
+                    // builtin, redirect) — reconstruct the whole pipeline
+                    // as shell text and run it.
+                    let mut parts = Vec::new();
+                    let mut ok2 = true;
+                    for st in stages {
+                        if let Some(t) = self.cmd_text_stmts(st) {
+                            parts.push(t);
+                        } else {
+                            ok2 = false;
+                            break;
+                        }
+                    }
+                    if ok2 {
+                        let text = parts.join(" | ");
+                        let env = self.env_lit();
+                        self.emit(&format!(
+                            "st = redirRun({}, {env});",
+                            Self::go_str(&text)
+                        ));
+                        self.need_st = true;
+                    } else {
+                        self.mark_todo("Pipeline");
+                    }
                 }
             }
             IrStmt::Background(_) => {
@@ -2886,6 +3186,28 @@ impl Render {
             self.flush_sides();
             self.emit(&format!("{m}[{key}] = {rhs};"));
             return;
+        }
+        // a BAKED array-element target ("a[0]" — the C frontend's
+        // dynamic-array writes arrive as store keys with the index baked
+        // into the name): route through the runtime arrays map so reads
+        // via arrIdx see the same home
+        if let Some(close) = t.var.find('[') {
+            if t.var.ends_with(']') {
+                let base = &t.var[..close];
+                let key_text = &t.var[close + 1..t.var.len() - 1];
+                if let Ok(ki) = key_text.parse::<i64>() {
+                    self.mark_arr(base);
+                    self.mark_written(base);
+                    self.mark_written(&t.var);
+                    let rhs = self.expr_any(expr);
+                    self.flush_sides();
+                    let sync = self.sync_inline(base);
+                    self.emit(&format!(
+                        "{base} = setArrAt({base}, {ki}, {rhs});{sync}"
+                    ));
+                    return;
+                }
+            }
         }
         let m = self.go_ident(&t.var);
         self.mark_written(&t.var);
@@ -3002,7 +3324,9 @@ impl Render {
                 _ => {}
             }
         }
-        let rhs = if self.is_num(&t.var) {
+        // an arith-written var (the goto restructure's flags) hoists as
+        // int64 — its assignments must coerce string values numerically
+        let rhs = if self.is_num(&t.var) || self.arith_ints.contains(&t.var) {
             self.expr_num(expr)
         } else if self.is_str(&t.var) {
             self.expr_str(expr)
@@ -3244,6 +3568,35 @@ impl Render {
     /// let / control-flow calls, then `_ = expr` fallback.
     fn stmt_expr(&mut self, e: &IrExpr) {
         match e {
+            // setVar(name, value) — the frontend-emitted store write: a
+            // native typed assignment (dotted struct names sanitize to
+            // go identifiers; reads route through the same ident_of)
+            IrExpr::Call { func, args } if func == "setVar" => {
+                if let (Some(IrExpr::Str(name, _)), Some(value)) =
+                    (args.first(), args.get(1))
+                {
+                    self.mark_written(name);
+                    let m = self.go_ident(name);
+                    let rhs = if self.is_num(name) {
+                        self.expr_num(value)
+                    } else if self.is_str(name) {
+                        self.expr_str(value)
+                    } else {
+                        self.expr_any(value)
+                    };
+                    self.flush_sides();
+                    let sync = self.sync_inline(name);
+                    self.emit(&format!("{m} = {rhs};{sync}"));
+                    return;
+                }
+                self.mark_todo("setVar");
+            }
+            IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
+                // user-function call in statement position
+                let v = self.expr_any(e);
+                self.flush_sides();
+                self.emit(&format!("_ = {v};"));
+            }
             IrExpr::Call { func, args } if func == "exec" => {
                 if let Some(IrExpr::Str(cmd, _)) = args.first() {
                     if self.exec_builtin_stmt(cmd, args) {
@@ -3567,9 +3920,17 @@ impl Render {
                 // eval 'code' — run the code in a bash -c child (native
                 // evaluation is impossible; the child inherits the written
                 // vars via env_lit).
-                if let Some(IrExpr::Str(code, _)) = argv.first() {
+                if let Some(code) = argv.first() {
+                    let text = if let IrExpr::Str(c, _) = code {
+                        c.clone()
+                    } else if let Some(t) = self.cmd_text_expr(code) {
+                        t
+                    } else {
+                        self.mark_todo("builtin eval");
+                        return true;
+                    };
                     let env = self.env_lit();
-                    self.emit(&format!("st = redirRun({}, {env});", Self::go_str(code)));
+                    self.emit(&format!("st = redirRun({}, {env});", Self::go_str(&text)));
                     self.need_st = true;
                     true
                 } else {
@@ -4116,6 +4477,7 @@ impl Render {
             }
             IrExpr::BinOp { .. } => vec![Part::Arg(self.expr_any(e))],
             IrExpr::Call { .. } => vec![Part::Arg(self.expr_any(e))],
+            IrExpr::Ext(n) => vec![Part::Arg(self.expr_any(e))],
             other => {
                 self.mark_todo(&format!("echo arg {:?}", other));
                 vec![Part::Arg("0".into())]
@@ -4161,6 +4523,118 @@ impl Render {
             self.written.insert(n.clone());
             if n.contains('[') {
                 self.arrays.insert(n.clone());
+            }
+        }
+        // Pre-scan: vars written by ARITH assignments / inc-decs anywhere
+        // (cstyleFor steps, the goto restructure's flags) hoist as int64 —
+        // EVERY assignment to them must coerce numerically, including
+        // ones rendered before the arith write is seen (the C frontend's
+        // `j = "0"` init vs `j++` step).
+        {
+            use IrStmt::*;
+            fn note_arith(e: &IrExpr, out: &mut BTreeSet<String>) {
+                if let IrExpr::Arith(a) = e {
+                    match &**a {
+                        ArithAst::Assign { var, .. } | ArithAst::IncDec { var, .. } => {
+                            out.insert(var.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            fn note_str_arith(sv: &str, out: &mut BTreeSet<String>) {
+                for tk in sv.split_whitespace() {
+                    if let Some(base) =
+                        tk.strip_suffix("++").or_else(|| tk.strip_suffix("--"))
+                    {
+                        let base = base.trim_matches('(').trim_matches(')');
+                        if !base.is_empty() {
+                            out.insert(base.to_string());
+                        }
+                    }
+                }
+            }
+            let mut stack: Vec<&IrStmt> = prog.stmts.iter().collect();
+            while let Some(st) = stack.pop() {
+                match st {
+                    Assign { targets, expr, .. } => {
+                        note_arith(expr, &mut self.arith_ints);
+                        if let IrExpr::Call { func: f, args } = expr {
+                            if matches!(f.as_str(), "arith" | "arithEval" | "let" | "fnCall" | "fnValue")
+                            {
+                                for a in args {
+                                    if let IrExpr::Str(sv, _) = a {
+                                        note_str_arith(sv, &mut self.arith_ints);
+                                    }
+                                    if let IrExpr::Array(items) = a {
+                                        for it in items {
+                                            if let IrExpr::Str(sv, _) = it {
+                                                note_str_arith(sv, &mut self.arith_ints);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = targets;
+                        }
+                    }
+                    Expr(IrExpr::Arith(a)) => {
+                        if let ArithAst::Assign { var, .. } | ArithAst::IncDec { var, .. } =
+                            &**a
+                        {
+                            self.arith_ints.insert(var.clone());
+                        }
+                    }
+                    Expr(IrExpr::Call { func, args })
+                        if func == "arith" || func == "arithEval" || func == "let" =>
+                    {
+                        for a in args {
+                            if let IrExpr::Str(sv, _) = a {
+                                note_str_arith(sv, &mut self.arith_ints);
+                            }
+                        }
+                    }
+                    ForInit { init, step, body, .. } => {
+                        for st in init.iter().chain(step.iter()) {
+                            match st {
+                                IrStmt::Assign { expr, .. } | IrStmt::Expr(expr) => {
+                                    note_arith(expr, &mut self.arith_ints);
+                                    if let IrExpr::Call { args, .. } = expr {
+                                        for a in args {
+                                            if let IrExpr::Str(sv, _) = a {
+                                                note_str_arith(sv, &mut self.arith_ints);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        for b in body {
+                            stack.push(b);
+                        }
+                    }
+                    If { then, elsifs, else_, .. } => {
+                        for b in then {
+                            stack.push(b);
+                        }
+                        for (_, b) in elsifs {
+                            for b in b {
+                                stack.push(b);
+                            }
+                        }
+                        for b in else_ {
+                            stack.push(b);
+                        }
+                    }
+                    While { body, .. } | DoWhile { body, .. } | Block(body)
+                    | Subshell(body) | Function { body, .. } => {
+                        for b in body {
+                            stack.push(b);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         // Pre-scan: need_vars (param-expansion reads the vars map) and
@@ -4272,6 +4746,13 @@ impl Render {
     /// The per-program declaration lines (vars, st, vars map, fArgs).
     fn decl_lines(&mut self) -> Vec<String> {
         let mut out = Vec::new();
+        // ForEachLine loop vars are STRING-typed by construction (scanner
+        // .Text() assigned in the streaming loop) — register before typing.
+        for v in &self.written {
+            if v.starts_with("__l") && !self.var_types.contains_key(v) {
+                self.var_types.insert(v.clone(), IrType::Str);
+            }
+        }
         let written: Vec<String> = self.written.iter().cloned().collect();
         for v in &written {
             let m = self.go_ident(v);
@@ -5663,6 +6144,12 @@ const RUNTIME_HELPERS: &[&str] = &[
     "",
     "func arrLen(a []any) int64 { return int64(len(a)) }",
     "",
+    "func setArrAt(a []any, i int64, v any) []any {",
+    "    for int64(len(a)) <= i { a = append(a, nil) }",
+    "    a[i] = v",
+    "    return a",
+    "}",
+    "",
     "func arrIdx(a []any, i int64) any {",
     "    if i >= 0 && int(i) < len(a) { return a[i] }",
     "    return nil",
@@ -5685,6 +6172,12 @@ const RUNTIME_HELPERS: &[&str] = &[
     "    if len(fArgs) > 0 { return fArgs }",
     "    if len(os.Args) > 1 { return os.Args[1:] }",
     "    return nil",
+    "}",
+    "",
+    "func __sh_line(s string, n int) string {",
+    "    parts := strings.Split(s, \"\\n\")",
+    "    if n >= 0 && n < len(parts) { return parts[n] }",
+    "    return \"\"",
     "}",
     "",
     "func paramAt(i int) string {",
@@ -6095,6 +6588,7 @@ const RUNTIME_HELPERS: &[&str] = &[
     "",
     "func bprintfStr(f string, a ...string) string {",
     "    f = bEsc(f)",
+    "    if len(a) == 0 { return f }",
     "    var out strings.Builder",
     "    for len(a) > 0 {",
     "        var used int",
@@ -6393,4 +6887,8 @@ mod pipe_tests {
             }
         }
     }
+}
+
+fn go_str_lit(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }

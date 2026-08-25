@@ -9,11 +9,15 @@ pub mod ir;
 pub mod pipeline_native;
 pub mod shir;
 pub mod render_ext;
+pub mod render_ext_expr;
+pub mod render_ext_estree;
 pub mod shir_nodes;
 pub mod shir_json;
+pub mod js_backend; // worktree-local: JS backend renderer (branch backend/js)
 pub mod transforms;
 
 pub mod bc;
+pub mod perl_backend; // worktree-local: Perl backend renderer (branch backend/perl)
 pub mod generator;
 pub mod shir_json_in;
 // Unified backend fleet: the renderers merged from the backend worktrees
@@ -22,9 +26,7 @@ pub mod shir_json_in;
 pub mod c_backend;
 pub mod go_backend;
 pub mod java_backend;
-pub mod js_backend;
 pub mod mir_simple;
-pub mod perl_backend;
 pub mod python_backend;
 pub mod rust_backend;
 pub mod sh_backend;

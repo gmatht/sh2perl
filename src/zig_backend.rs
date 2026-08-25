@@ -119,10 +119,23 @@ pub struct Render {
     need_truthy: bool,
     need_cat: bool,
     need_b2s: bool,
+    need_env: bool,
+    need_fexist: bool,
+    need_writefile: bool,
+    need_run: bool,
     loop_depth: usize,
     todo: usize,
+    /// inside a user-function body (A1 Function): getVar("N") reads the
+    /// positional param __args[N-1], Return returns the value, not exit
+    in_function: bool,
+    /// user functions hoisted OUT of main (rendered before it)
+    pending_fns: Vec<String>,
+    /// vars local to a hoisted user function (never declared in main)
+    fn_locals: BTreeSet<String>,
     /// counter for generated temp names (for-loop item bindings)
     tmp_counter: usize,
+    /// text-ops primitive helpers (sh2Contains/sh2Sub/…) needed
+    need_ext: bool,
 }
 
 /// Render an `IrProgram` to Zig source.
@@ -131,11 +144,25 @@ pub fn shir_to_zig(prog: &IrProgram) -> String {
     // builtin-op fallback arm (shir-builtin-op-20260816): the zig backend
     // has NOT accepted the `builtin` op — render as exec.
     crate::transforms::builtin::fallback_builtin_to_exec(&mut prog);
-    // A2: the type verdicts are computed at serialization time in the JSON
-    // path; the library path must run the same analysis.
-    prog.var_types = crate::shir::analyze_var_types(&prog);
+    // A2: the type verdicts — the FRONTEND's own var_types (the C
+    // frontend emits Int32/Int64 for typed decls) take precedence;
+    // analyze_var_types fills in names the frontend left untyped. A
+    // blind overwrite DOWNGRADED typed vars to untyped (empty map for
+    // frontend-only programs), leaving string homes with i64-typed
+    // reads/writes that did not compile.
+    let provided: std::collections::HashSet<String> =
+        prog.var_types.iter().map(|(n, _)| n.clone()).collect();
+    let analyzed = crate::shir::analyze_var_types(&prog);
+    for (n, t) in analyzed {
+        if !provided.contains(&n) {
+            prog.var_types.push((n, t));
+        }
+    }
     let mut r = Render::default();
     r.var_types = prog.var_types.iter().cloned().collect();
+    if std::env::var("ZIG_DBG").is_ok() {
+        eprintln!("DBG var_types: {:?}", r.var_types);
+    }
     r.program(&prog);
     r.out.join("\n")
 }
@@ -248,7 +275,12 @@ impl Render {
     }
 
     fn is_num(&self, name: &str) -> bool {
-        self.var_types.get(name).copied() == Some(IrType::Int)
+        // the C frontend emits the SIZED kinds (Int32/Int64/UInt32/...)
+        // — a widthless Int alone left every typed var string-homed
+        matches!(
+            self.var_types.get(name),
+            Some(IrType::Int | IrType::Int32 | IrType::Int64 | IrType::UInt32 | IrType::UInt64)
+        )
     }
 
     fn is_str(&self, name: &str) -> bool {
@@ -406,12 +438,12 @@ impl Render {
                 }
                 let m = self.zig_ident(name);
                 self.mark_read(name);
-                if self.is_str(name) {
-                    m
-                } else {
+                if self.is_num(name) {
+                    // an INT-homed var read in string context converts
                     self.need_intstr = true;
-                    format!("sh2IntStr({m})")
+                    return format!("sh2IntStr({m})");
                 }
+                m
             }
             IrExpr::Ident(name) => {
                 if !self.declared(name) {
@@ -539,6 +571,21 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "\"\"".into()
             }
+            IrExpr::Ext(n) => {
+                if let Some(code) = self.ext_value_zig(n.as_ref(), false) {
+                    code
+                } else {
+                    let ctx = crate::render_ext_expr::ExprRenderCtx {
+                        backend: crate::render_ext_expr::Backend::Zig,
+                        indent: 0,
+                    };
+                    if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
+                        code
+                    } else {
+                        format!("sh2.{}(...)", n.tag())
+                    }
+                }
+            }
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "\"\"".into()
@@ -553,6 +600,14 @@ impl Render {
     /// Render as a bool-typed expression (conditions).
     fn expr_bool(&mut self, e: &IrExpr) -> String {
         match e {
+            IrExpr::Ext(n) => {
+                // boolean-context primitive (StringContains): raw bool
+                if let Some(code) = self.ext_value_zig(n.as_ref(), true) {
+                    code
+                } else {
+                    "true".into()
+                }
+            }
             IrExpr::Bool(b) => {
                 if *b {
                     "true".into()
@@ -708,6 +763,21 @@ impl Render {
                 self.mark_todo("Splice expr");
                 "false".into()
             }
+            IrExpr::Ext(n) => {
+                if let Some(code) = self.ext_value_zig(n.as_ref(), false) {
+                    code
+                } else {
+                    let ctx = crate::render_ext_expr::ExprRenderCtx {
+                        backend: crate::render_ext_expr::Backend::Zig,
+                        indent: 0,
+                    };
+                    if let Some(code) = crate::render_ext_expr::render(&**n, &ctx) {
+                        code
+                    } else {
+                        format!("sh2.{}(...)", n.tag())
+                    }
+                }
+            }
             IrExpr::Array(_) => {
                 self.mark_todo("Array expr");
                 "false".into()
@@ -752,7 +822,16 @@ impl Render {
             IrExpr::Int(_) | IrExpr::Arith(_) => ('d', self.expr_num(e)),
             IrExpr::Str(_, _) | IrExpr::Interpolate(_) => ('s', self.expr_str(e)),
             IrExpr::Bool(_) => ('b', self.expr_bool(e)),
+            // a user-function call returns the STRING model — print it
+            // with {s} (a %d of int 42 and {s} of "42" produce the same
+            // stdout); a numeric context would coerce via sh2ToInt
+            IrExpr::Call { func, .. } if func == "fnValue" || func == "fnCall" => {
+                ('s', self.expr_str(e))
+            }
             IrExpr::Var(name, _) => {
+                // mark the read so the dead-var guard never discards a
+                // variable that is used in printf output
+                self.mark_read(name);
                 if self.is_num(name) {
                     ('d', self.expr_num(e))
                 } else {
@@ -760,6 +839,7 @@ impl Render {
                 }
             }
             IrExpr::Ident(name) => {
+                self.mark_read(name);
                 if self.is_num(name) {
                     ('d', self.expr_num(e))
                 } else {
@@ -788,14 +868,24 @@ impl Render {
             // A2 verdict so numeric vars keep the {d} specifier.
             IrExpr::Call { func, args } if func == "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
+                    self.mark_read(name);
                     if self.is_num(name) {
-                        ('d', self.expr_num(e))
-                    } else {
-                        ('s', self.expr_str(e))
+                        self.mark_read(name);
+                        return ('d', self.expr_num(e));
                     }
-                } else {
-                    ('s', self.expr_str(e))
+                    // a DECLARED non-num var homes as a string — print it
+                    // raw (sh2IntStr would wrap a []const u8 in an i64
+                    // conversion and fail to compile)
+                    if self.declared(name) {
+                        // NB: mark_read — skipping it emits a spurious
+                        // dead-var `_ = x;` guard for vars assigned inside
+                        // loops/walkers
+                        self.mark_read(name);
+                        return ('s', self.zig_ident(name));
+                    }
+                    return ('s', self.expr_str(e));
                 }
+                ('s', self.expr_str(e))
             }
             _ => ('s', self.expr_str(e)),
         }
@@ -867,6 +957,10 @@ impl Render {
                     "**" => format!("std.math.pow(i64, {l}, {r})"),
                     "&&" => format!("@intFromBool(({l} != 0) and ({r} != 0))"),
                     "||" => format!("@intFromBool(({l} != 0) or ({r} != 0))"),
+                    // zig signed ints forbid `%`/`/` truncation operators —
+                    // C semantics are truncated division/remainder (@rem)
+                    "/" => format!("@divTrunc({l}, {r})"),
+                    "%" => format!("@rem({l}, {r})"),
                     "==" | "!=" | "<" | ">" | "<=" | ">=" => {
                         format!("@intFromBool({l} {op} {r})")
                     }
@@ -919,15 +1013,76 @@ impl Render {
 
     /// String-typed context for a Call (stub callees take no args so the
     /// generated call always compiles; stubs return []const u8 by default).
+    /// An arith STRING (`($x % 2)`, `$j*3+$k == 4` — the C frontend's
+    /// testArith/ternary-cond shape): normalize $refs, parse, render via
+    /// the Arith AST walker. None when it doesn't parse.
+    fn arith_text(&mut self, s: &str) -> Option<String> {
+        let norm: String = s
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if c == '$'
+                    && i + 1 < s.len()
+                    && (s[i + 1..].starts_with('{')
+                        || s[i + 1..]
+                            .chars()
+                            .next()
+                            .map_or(false, |n| n.is_ascii_alphabetic() || n == '_'))
+                {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let norm = norm.replace('{', " ").replace('}', " ");
+        let ast = crate::shir::parse_arith(norm.trim())?;
+        Some(self.arith(&ast))
+    }
+
     fn call_str(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            "fnValue" | "fnCall" => {
+                // a user-function call: name(args...) — values flow as
+                // strings (the positional-param convention); a numeric
+                // context coerces via sh2ToInt at the read site
+                let name = args
+                    .first()
+                    .and_then(|a| match a {
+                        IrExpr::Str(n, _) => Some(self.zig_ident(n)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "sh2TODO".to_string());
+                let call_args: Vec<String> = args
+                    .get(1)
+                    .and_then(|a| match a {
+                        IrExpr::Array(elems) => {
+                            Some(elems.iter().map(|e| self.expr_str(e)).collect())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                format!("{name}(&[_][]const u8{{ {} }})", call_args.join(", "))
+            }
             "getVar" => {
                 if let Some(IrExpr::Str(name, _)) = args.first() {
+                    // inside a user function: getVar("N") is the POSITIONAL
+                    // PARAMETER read ($1 convention — the C frontend's
+                    // outparam/param channel), not an env lookup
+                    if self.in_function && name.bytes().all(|b| b.is_ascii_digit()) && !name.is_empty() {
+                        let idx: usize = name.parse().unwrap_or(1);
+                        return format!(
+                            "(if (__args.len >= {idx}) __args[{idx} - 1] else \"\")"
+                        );
+                    }
                     if self.declared(name) {
                         let m = self.zig_ident(name);
                         self.mark_read(name);
                         return m;
                     }
+                    // undeclared (env) var: read the process environment
+                    self.need_env = true;
+                    return format!("sh2Env({})", Self::zig_str(name));
                 }
                 self.sh2_stub("getVar", "getVar")
             }
@@ -936,7 +1091,32 @@ impl Render {
                 self.need_b2s = true;
                 format!("sh2B2S({})", self.call_bool(func, args))
             }
+            "split" => {
+                // word splitting: a single value with default IFS (no
+                // whitespace) is just the value; render the inner arg.
+                match args.first() {
+                    Some(arg) => self.expr_str(arg),
+                    None => self.sh2_stub("split", "split"),
+                }
+            }
+            "setArray" | "setArrayAppend" => {
+                // array assignment `arr=(a b c)` — render as a bracketed
+                // string (the common indexed-array form).
+                let mut parts = Vec::new();
+                if let Some(IrExpr::Array(items)) = args.get(1) {
+                    for it in items {
+                        parts.push(self.expr_str(it));
+                    }
+                }
+                format!("[_] []const u8{{{}}}", parts.join(", "))
+            }
             "arith" => {
+                if let Some(IrExpr::Str(sv, _)) = args.first() {
+                    if let Some(x) = self.arith_text(sv) {
+                        self.need_intstr = true;
+                        return format!("sh2IntStr({x})");
+                    }
+                }
                 self.need_intstr = true;
                 format!("sh2IntStr(sh2Arith())")
             }
@@ -947,7 +1127,14 @@ impl Render {
     /// i64-typed context for a Call.
     fn call_num(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
-            "arith" => "sh2Arith()".to_string(),
+            "arith" => {
+                if let Some(IrExpr::Str(sv, _)) = args.first() {
+                    if let Some(x) = self.arith_text(sv) {
+                        return x;
+                    }
+                }
+                "sh2Arith()".to_string()
+            }
             "test" => format!("@intFromBool({})", self.call_bool(func, args)),
             _ => {
                 self.need_toint = true;
@@ -968,8 +1155,48 @@ impl Render {
                 self.sh2_calls.insert("test".into());
                 "sh2Test()".to_string()
             }
-            "arith" => "(sh2Arith() != 0)".to_string(),
+            "contains" => {
+                // `echo X | grep LIT >/dev/null` → contains(X, LIT): native
+                // std.mem.indexOf (the backend's native substring primitive).
+                if let (Some(needle), Some(pattern)) = (args.first(), args.get(1)) {
+                    let n = self.expr_str(needle);
+                    let p = self.expr_str(pattern);
+                    return format!("std.mem.indexOf(u8, {n}, {p}) != null");
+                }
+                self.sh2_calls.insert("contains".into());
+                "sh2Contains()".to_string()
+            }
+            "arith" => {
+                if let Some(IrExpr::Str(sv, _)) = args.first() {
+                    if let Some(x) = self.arith_text(sv) {
+                        return format!("({x} != 0)");
+                    }
+                }
+                "(sh2Arith() != 0)".to_string()
+            }
             "getVar" => {
+                self.need_truthy = true;
+                format!("sh2Truthy({})", self.call_str(func, args))
+            }
+            "exec" => {
+                // builtin true/false used as a condition
+                if let Some(IrExpr::Str(cmd, _)) = args.first() {
+                    match cmd.as_str() {
+                        "true" => return "true".to_string(),
+                        "false" => return "false".to_string(),
+                        "let" => {
+                            // `let "i<3"` — an arithmetic status condition
+                            if let Some(IrExpr::Array(items)) = args.get(1) {
+                                if let Some(IrExpr::Str(text, _)) = items.first() {
+                                    if let Some(c) = self.render_let_cond(text) {
+                                        return c;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 self.need_truthy = true;
                 format!("sh2Truthy({})", self.call_str(func, args))
             }
@@ -980,8 +1207,58 @@ impl Render {
         }
     }
 
+    /// Render a `let "EXPR"` arithmetic condition (`i<3`) as a Zig
+    /// numeric comparison over declared numeric vars. Returns None for
+    /// shapes outside the simple subset.
+    fn render_let_cond(&mut self, text: &str) -> Option<String> {
+        for (op, zop) in [("<=", "<="), (">=", ">="), ("==", "=="), ("!=", "!="), ("<", "<"), (">", ">")] {
+            if let Some(idx) = text.find(op) {
+                let l = text[..idx].trim();
+                let r = text[idx + op.len()..].trim();
+                let l = self.num_operand(l)?;
+                let r = self.num_operand(r)?;
+                return Some(format!("({l} {zop} {r})"));
+            }
+        }
+        None
+    }
+
+    /// A numeric operand for a `let` condition: a declared numeric var
+    /// → its ident; a number literal → the literal.
+    fn num_operand(&mut self, t: &str) -> Option<String> {
+        let t = t.trim();
+        if let Ok(n) = t.parse::<i64>() {
+            return Some(n.to_string());
+        }
+        let name = t.strip_prefix('$').unwrap_or(t);
+        let name = name
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(name);
+        if self.declared(name) {
+            let m = self.zig_ident(name);
+            self.mark_read(name);
+            return Some(m);
+        }
+        None
+    }
+
+    /// Build the argv literals for an external `exec` command
+    /// (`["cmd", "arg", …]`). The command name is args[0]; the trailing
+    /// args array is args[1].
+    fn build_argv(&mut self, cmd: &str, args: &[IrExpr]) -> Vec<String> {
+        let mut argv = vec![Self::zig_str(cmd)];
+        if let Some(IrExpr::Array(items)) = args.get(1) {
+            for it in items {
+                argv.push(self.expr_str(it));
+            }
+        }
+        argv
+    }
+
     fn sh2_stub(&mut self, name: &str, note: &str) -> String {
         self.sh2_calls.insert(name.to_string());
+        self.mark_todo(&format!("{note} → sh2.{name}"));
         self.mark_todo(&format!("{note} → sh2.{name}"));
         format!("sh2{}()", camel(name))
     }
@@ -1006,7 +1283,7 @@ impl Render {
             fmt.push('\n');
         }
         format!(
-            "try stdout.print({}, .{{{}}});",
+            "try stdout.print({}, .{{{}}});\n    try stdout.flush();",
             Self::zig_str(&fmt),
             args.join(", ")
         )
@@ -1052,6 +1329,20 @@ impl Render {
                     }
                 }
                 out
+            }
+            // a user-function call returns the STRING model — {s} prints
+            // ints-as-strings identically to %d
+            IrExpr::Call { func, .. } if func == "fnValue" || func == "fnCall" => {
+                vec![('s', self.expr_str(e))]
+            }
+            IrExpr::Ext(n) => {
+                // text-ops primitive in echo/printf arg position
+                if let Some(code) = self.ext_value_zig(n.as_ref(), false) {
+                    vec![('s', code)]
+                } else {
+                    self.mark_todo(&format!("echo arg {:?}", n.tag()));
+                    vec![('s', "\"\"".into())]
+                }
             }
             IrExpr::Arith(a) => vec![('d', self.arith(a))],
             IrExpr::Bool(b) => {
@@ -1179,6 +1470,18 @@ impl Render {
                 };
                 Some(format!("({vv} .len != 0)"))
             }
+            [flag, v] if matches!(*flag, "-f" | "-d" | "-e" | "-s") => {
+                // file test: -f regular, -d dir, -e exists, -s non-empty
+                let (vv, nv) = self.test_operand(v);
+                let vv = if nv {
+                    self.need_intstr = true;
+                    format!("sh2IntStr({vv})")
+                } else {
+                    vv
+                };
+                self.need_fexist = true;
+                Some(format!("sh2FileTest({}, {vv})", Self::zig_str(*flag)))
+            }
             _ => None,
         }
     }
@@ -1213,10 +1516,333 @@ impl Render {
 
     // ── statements ───────────────────────────────────────────────────
 
+    /// A text-ops primitive Ext value → a ZIG expression (string context
+    /// unless `bool_ctx`). None = not in the supported subset → caller
+    /// falls back.
+    fn ext_value_zig(&mut self, node: &dyn crate::shir_nodes::ExtExpr, bool_ctx: bool) -> Option<String> {
+        let ch = node.children();
+        let child = |slf: &mut Self, i: usize| -> Option<String> { Some(slf.expr_any(ch.get(i)?)) };
+        match node.tag() {
+            // `read VAR` normalisation: one stdin line, newline stripped;
+            // EOF → "" (the helper owns the stdin reader state)
+            "ReadLine" => {
+                self.need_ext = true;
+                // rendered INSIDE main → init.io is in scope at the call
+                Some("sh2ReadLine(init.io)".to_string())
+            }
+            "StrLen" => {
+                self.need_intstr = true;
+                Some(format!("sh2IntStr(@intCast(({}).len))", child(self, 0)?))
+            }
+            "CaseTransform" => {
+                let n = node.as_any().downcast_ref::<crate::shir_nodes::CaseTransform>()?;
+                self.need_ext = true;
+                Some(format!("sh2Case({}, {})", child(self, 0)?, if n.upper { "true" } else { "false" }))
+            }
+            "SubStrExtract" => {
+                self.need_ext = true;
+                let off = child(self, 1)?;
+                let len = ch.get(2).map(|e| self.expr_num(e)).unwrap_or_else(|| "-1".into());
+                Some(format!("sh2Sub({}, {}, {})", child(self, 0)?, off, len))
+            }
+            "StringContains" => {
+                self.need_ext = true;
+                let b = format!("sh2Contains({}, {})", child(self, 0)?, child(self, 1)?);
+                if bool_ctx { Some(b) } else { self.need_b2s = true; Some(format!("sh2B2S({})", b)) }
+            }
+            "RegSub" => {
+                // pattern must be a LITERAL (no regex metachars) — zig has
+                // no std regex; real regexes fall back to the runtime.
+                let n = node.as_any().downcast_ref::<crate::shir_nodes::RegSub>()?;
+                // the command-substitution newline strip (`\n+$`, first
+                // only) is a NAMED primitive here: trim trailing newlines
+                if !n.global && n.pattern == "\n+$" {
+                    self.need_ext = true;
+                    return Some(format!("sh2TrimRightNl({})", child(self, 0)?));
+                }
+                if n.pattern.chars().any(|c| ".*+?[](){}|^$\\\\".contains(c) || c == '"') {
+                    return None;
+                }
+                self.need_ext = true;
+                Some(format!("sh2ReplaceLit({}, {}, {}, {})",
+                    child(self, 0)?,
+                    Self::zig_str(&n.pattern),
+                    Self::zig_str(&n.replacement),
+                    if n.global { "true" } else { "false" }))
+            }
+            "FieldExtract" => {
+                let n = node.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()?;
+                let mut ids: Vec<i64> = Vec::new();
+                for f in &n.fields {
+                    match f {
+                        crate::ir::FieldRange::Single(i) => ids.push(*i as i64 - 1),
+                        crate::ir::FieldRange::Range { start, end } => {
+                            let (lo, hi) = (*start as i64, *end as i64);
+                            if hi - lo > 4096 { return None; }
+                            let mut i = lo - 1;
+                            while i <= hi - 1 { ids.push(i); i += 1; }
+                        }
+                    }
+                }
+                ids.retain(|&i| i >= 0);
+                ids.sort_unstable();
+                ids.dedup();
+                if ids.is_empty() { return None; }
+                self.need_ext = true;
+                let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+                let arr = format!("&[_]usize{{ {} }}", list);
+                Some(format!("sh2Fields(std.heap.page_allocator, {}, {}, {}, {})",
+                    child(self, 0)?,
+                    Self::zig_str(&n.delimiter),
+                    arr,
+                    if n.suppress_no_delim { "true" } else { "false" }))
+            }
+            "TakeLines" => {
+                let n = node.as_any().downcast_ref::<crate::shir_nodes::TakeLines>()?;
+                let cnt = match ch.get(1) {
+                    Some(IrExpr::Int(v)) => v.to_string(),
+                    _ => return None,
+                };
+                self.need_ext = true;
+                if n.bytes {
+                    let t = child(self, 0)?;
+                    return Some(if n.from_end {
+                        format!("sh2Sub({}, if ({t}.len > {}) {t}.len - {} else 0)", t, cnt, cnt)
+                    } else {
+                        format!("sh2Sub({}, 0, {})", t, cnt)
+                    });
+                }
+                Some(format!("sh2TakeLines({}, {}, {})", child(self, 0)?, cnt, if n.from_end { "true" } else { "false" }))
+            }
+            "PathName" => {
+                let n = node.as_any().downcast_ref::<crate::shir_nodes::PathName>()?;
+                self.need_ext = true;
+                let f = if n.which == "dirname" { "sh2Dirname" } else { "sh2Basename" };
+                Some(format!("{}({})", f, child(self, 0)?))
+            }
+            "StringTrim" => {
+                let n = node.as_any().downcast_ref::<crate::shir_nodes::StringTrim>()?;
+                self.need_ext = true;
+                Some(format!("sh2TrimSides({}, {}, {})",
+                    child(self, 0)?, if n.leading { "true" } else { "false" }, if n.trailing { "true" } else { "false" }))
+            }
+            _ => None,
+        }
+    }
+
     fn stmt(&mut self, s: &IrStmt) {
         match s {
+            IrStmt::Ext(node) if node.tag() == "ForEachLine" => {
+                // STREAMING line iteration (docs/shir-primitives.md
+                // §ForEachLine): takeDelimiter('\n') reader loop — O(1)
+                // memory, never a whole-file read; an unterminated final
+                // line is still delivered (takeDelimiter treats EOF as a
+                // delimiter when bytes remain).
+                let fl = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>()
+                    .expect("tag/type agree");
+                let src = self.expr_any(&fl.source);
+                let n = self.tmp_counter;
+                self.tmp_counter += 1;
+                let fh = format!("__f{}", n);
+                let buf = format!("__b{}", n);
+                let rd = format!("__r{}", n);
+                let lv = self
+                    .mangle
+                    .get(&fl.var)
+                    .cloned()
+                    .unwrap_or_else(|| self.zig_ident(&fl.var));
+                self.mark_written(&fl.var);
+                self.mark_read(&fl.var); // bound by the loop — never a dead var
+                // a read line is ALWAYS a string — pin the A2 verdict so
+                // body reads render as strings, not sh2ToInt coerctions
+                self.var_types.insert(fl.var.clone(), IrType::Str);
+                self.emit(&format!("var {} = std.Io.Dir.cwd().openFile(init.io, {}, .{{}}) catch {{", fh, src));
+                self.emit("    std.process.exit(2);");
+                self.emit("};");
+                self.emit(&format!("defer {}.close(init.io);", fh));
+                self.emit(&format!("var {}: [8192]u8 = undefined;", buf));
+                self.emit(&format!("var {} = {}.reader(init.io, &{});", rd, fh, buf));
+                if fl.limit.is_some() {
+                    self.emit(&format!("var __n{}: usize = 0;", n));
+                }
+                // capture into a temp then bind the mangled loop var:
+                // an unread loop var would be an "unused capture" error
+                self.emit(&format!("while (try {}.interface.takeDelimiter('\\n')) |__ln{}| {{", rd, n));
+                self.depth += 1;
+                self.emit(&format!("{} = __ln{};", lv, n));
+                if let Some(lim) = &fl.limit {
+                    let le = self.expr_num(lim);
+                    self.emit(&format!("__n{} += 1;", n));
+                    self.emit(&format!("if (__n{} > {}) break;", n, le));
+                }
+                for b in &fl.body {
+                    self.stmt(b);
+                }
+                self.depth -= 1;
+                self.emit("}");
+            }
+            IrStmt::Ext(node) if node.tag() == "WalkDir" => {
+                // STREAMING directory walk (docs/shir-primitives.md
+                // §WalkDir): entries collected into a path LIST (O(tree)
+                // metadata — file CONTENTS are never opened), then iterated
+                // inline so the body captures main's locals naturally.
+                let wd = node.as_any().downcast_ref::<crate::shir_nodes::WalkDir>()
+                    .expect("tag/type agree");
+                let src = self.expr_any(&wd.source);
+                let n = self.tmp_counter;
+                self.tmp_counter += 1;
+                let lv = self
+                    .mangle
+                    .get(&wd.var)
+                    .cloned()
+                    .unwrap_or_else(|| self.zig_ident(&wd.var));
+                let tf = match &wd.type_filter {
+                    Some(x) => x.as_str(),
+                    None => "",
+                };
+                let md = match &wd.maxdepth {
+                    Some(e) => self.expr_num(e),
+                    None => "0".into(),
+                };
+                let nf = match &wd.name_filter {
+                    Some(x) => Self::zig_str(x),
+                    None => "\"\"".to_string(),
+                };
+                self.need_ext = true; // sh2GlobName fn
+                self.mark_written(&wd.var);
+                self.mark_read(&wd.var);
+                self.var_types.insert(wd.var.clone(), IrType::Str);
+                self.emit("{");
+                self.emit(&format!("    var __wl{}: std.ArrayList([]const u8) = .empty;", n));
+                self.emit(&format!("    const W{} = struct {{", n));
+                self.emit("        fn matches(t: []const u8, nm: []const u8, full: []const u8, isdir: bool) bool {");
+                self.emit("            // -name GLOB on the BASE NAME (independent of -type)");
+                self.emit("            if (nm.len != 0) {");
+                self.emit("                const bn = if (std.mem.lastIndexOfScalar(u8, full, '/')) |ix| full[ix + 1 ..] else full;");
+                self.emit("                if (!sh2GlobName(nm, bn)) return false;");
+                self.emit("            }");
+                self.emit("            if (t.len != 0) {");
+                self.emit("                if (std.mem.eql(u8, t, \"d\") != isdir) return false;");
+                self.emit("            }");
+                self.emit("            return true;");
+                self.emit("        }");
+                self.emit("        fn go(al: std.mem.Allocator, io: std.Io, dpath: []const u8, l: *std.ArrayList([]const u8), t: []const u8, nm: []const u8, max: i64, depth: i64) void {");
+                self.emit("            // GNU find evaluates the START point too");
+                self.emit("            blk0: {");
+                self.emit("                const st0 = std.Io.Dir.cwd().statFile(io, dpath, .{}) catch break :blk0;");
+                self.emit("                const bn0 = if (std.mem.lastIndexOfScalar(u8, dpath, '/')) |ix| dpath[ix + 1 ..] else dpath;");
+                self.emit("                if (matches(t, nm, bn0, st0.kind == .directory)) l.append(al, dpath) catch return;");
+                self.emit("            }");
+                self.emit("            if (max != 0 and depth >= max) return;");
+                self.emit("            var d = std.Io.Dir.cwd().openDir(io, dpath, .{ .iterate = true }) catch return;");
+                self.emit("            defer d.close(io);");
+                self.emit("            var it = d.iterate();");
+                self.emit("            while (it.next(io) catch return) |e| {");
+                self.emit("                const full = std.fmt.allocPrint(al, \"{s}/{s}\", .{ dpath, e.name }) catch continue;");
+                self.emit("                const isdir = (e.kind == .directory);");
+                self.emit("                if (matches(t, nm, e.name, isdir)) l.append(al, full) catch continue;");
+                self.emit("                if (isdir and (max == 0 or depth + 1 < max)) go(al, io, full, l, t, nm, max, depth + 1);");
+                self.emit("            }");
+                self.emit("        }");
+                self.emit("    }.go;");
+                self.emit(&format!(
+                    "    W{}(std.heap.page_allocator, init.io, {}, &__wl{}, \"{tf}\", {nf}, {md}, 0);",
+                    n, src, n, tf = tf, nf = nf, md = md
+                ));
+                self.emit(&format!(
+                    "    for (__wl{}.items) |__ln{}| {{",
+                    n, n
+                ));
+                self.depth += 1;
+                self.emit(&format!("    {} = __ln{};", lv, n));
+                for b in &wd.body {
+                    self.stmt(b);
+                }
+                self.depth -= 1;
+                self.emit("    }");
+                self.emit("}");
+            }
             IrStmt::Ext(_) => panic!("zig backend: Ext node unsupported"),
             IrStmt::Expr(e) => {
+                // setVar(name, value) — the frontend-emitted store write:
+                // a typed assignment to the var's zig home (dotted struct
+                // names sanitize consistently for reads)
+                if let IrExpr::Call { func, args } = e {
+                    if func == "setVar" {
+                        if let (Some(IrExpr::Str(name, _)), Some(value)) =
+                            (args.first(), args.get(1))
+                        {
+                            let v = self.zig_ident(name);
+                            self.mark_written(name);
+                            let rhs = if self.is_num(name) {
+                                self.expr_num(value)
+                            } else {
+                                self.expr_str(value)
+                            };
+                            self.emit(&format!("{v} = {rhs};"));
+                            return;
+                        }
+                    }
+                    if func == "fnCall" || func == "fnValue" {
+                        if let Some(IrExpr::Str(name, _)) = args.first() {
+                            let m = self.zig_ident(name);
+                            self.mark_read(name);
+                            let call_args: Vec<String> = args
+                                .get(1)
+                                .and_then(|a| match a {
+                                    IrExpr::Array(items) => Some(
+                                        items.iter().map(|w| self.expr_str(w)).collect(),
+                                    ),
+                                    _ => None,
+                                })
+                                .unwrap_or_default();
+                            self.emit(&format!(
+                                "_ = {m}(&[_][]const u8{{ {} }});",
+                                call_args.join(", ")
+                            ));
+                            return;
+                        }
+                    }
+                }
+                // statement-position arith (`runs++` — the do-while idiom):
+                // render natively (`runs += 1;`) instead of the sh2Arith
+                // stub (which was called without being emitted)
+                if let IrExpr::Arith(a) = e {
+                    if let ArithAst::IncDec { var, delta, .. } = &**a {
+                        let v = self.zig_ident(var);
+                        self.mark_read(var);
+                        let d = delta.unsigned_abs();
+                        // a STRING-homed var (the C frontend's value model
+                        // for untyped locals) coerces via sh2ToInt
+                        if self.is_num(var) {
+                            let zop = if *delta >= 0 { "+" } else { "-" };
+                            self.emit(&format!("{v} {zop}= {d};"));
+                        } else {
+                            // the value model is strings: convert back
+                            self.need_intstr = true;
+                            let op = if *delta >= 0 { "+" } else { "-" };
+                            self.emit(&format!(
+                                "{v} = sh2IntStr(sh2ToInt({v}) {op} {d});"
+                            ));
+                        }
+                        return;
+                    }
+                    if let ArithAst::Assign { var, op, rhs } = &**a {
+                        let v = self.zig_ident(var);
+                        self.mark_read(var);
+                        let r = self.arith(rhs);
+                        let zop = match op.as_str() {
+                            "+=" => "+=",
+                            "-=" => "-=",
+                            "*=" => "*=",
+                            "/=" => "/=",
+                            "%=" => "%=",
+                            _ => "=",
+                        };
+                        self.emit(&format!("{v} {zop}= {r};"));
+                        return;
+                    }
+                }
                 if let IrExpr::Call { func, args } = e {
                     if func == "exec" {
                         if let Some(IrExpr::Str(cmd, _)) = args.first() {
@@ -1229,6 +1855,15 @@ impl Render {
                                     _ => "0".to_string(),
                                 };
                                 self.emit(&format!("std.process.exit(@intCast({code}));"));
+                                return;
+                            }
+                            if cmd == "true" {
+                                // status 0 no-op
+                                return;
+                            }
+                            if cmd == "false" {
+                                // status 1: exit nonzero
+                                self.emit("std.process.exit(1);");
                                 return;
                             }
                             if cmd == "echo" {
@@ -1245,6 +1880,79 @@ impl Render {
                                     return;
                                 }
                             }
+                            if cmd == "printf" {
+                                if let Some(IrExpr::Array(items)) = args.get(1) {
+                                    if let Some(IrExpr::Str(fmt, _)) = items.first() {
+                                        let mut parts = Vec::new();
+                                        // translate the format's % conversions into
+                                        // print_from_parts specs over the arg list
+                                        let rest = &items[1..];
+                                        let mut argi = 0;
+                                        let mut chars = fmt.chars().peekable();
+                                        while let Some(c) = chars.next() {
+                                            if c == '%' {
+                                                if chars.peek() == Some(&'%') {
+                                                    chars.next();
+                                                    parts.push(('s', Self::zig_str("%")));
+                                                    continue;
+                                                }
+                                                // consume flags/width/length
+                                                // modifiers (`%lld`, `%u`,
+                                                // `%5d`): the value model is
+                                                // int-as-string or i64
+                                                while let Some(&f) = chars.peek() {
+                                                    if matches!(f, 'l' | 'h' | 'z' | 'j' | 't' | 'L')
+                                                        || f.is_ascii_digit()
+                                                        || matches!(f, '-' | '+' | ' ' | '#')
+                                                    {
+                                                        chars.next();
+                                                    } else {
+                                                        break;
+                                                    }
+                                                }
+                                                let spec = match chars.peek() {
+                                                    Some('s') => { chars.next(); 's' }
+                                                    Some('d') | Some('i') | Some('u') => { chars.next(); 'd' }
+                                                    Some('x') | Some('X') | Some('o') => { chars.next(); 'd' }
+                                                    Some('c') => { chars.next(); 's' }
+                                                    Some('\n') => { chars.next(); 's' }
+                                                    _ => { parts.push(('s', Self::zig_str("%"))); continue; }
+                                                };
+                                                if let Some(a) = rest.get(argi) {
+                                                    argi += 1;
+                                                    let mut pa = self.parts_of(a);
+                                                    if pa.len() == 1 {
+                                                        // a %d over a
+                                                        // string-model value
+                                                        // (the user-fn
+                                                        // convention) prints
+                                                        // identically with {s}
+                                                        if spec == 'd' && pa[0].0 == 's' {
+                                                            parts.push(('s', pa[0].1.clone()));
+                                                            continue;
+                                                        }
+                                                        parts.push((spec, pa[0].1.clone()));
+                                                    } else {
+                                                        parts.push(pa[0].clone());
+                                                    }
+                                                } else {
+                                                    parts.push((spec, if spec == 'd' { "0".into() } else { "\"\"".into() }));
+                                                }
+                                            } else {
+                                                parts.push(('s', Self::zig_str(&c.to_string())));
+                                            }
+                                        }
+                                        let call = self.print_from_parts(parts, false);
+                                        self.emit(&call);
+                                        return;
+                                    }
+                                }
+                            }
+                            // external command: fork/exec via sh2Run
+                            let argv = self.build_argv(cmd, args);
+                            self.need_run = true;
+                            self.emit(&format!("_ = sh2Run(&[_][]const u8{{{}}});", argv.join(", ")));
+                            return;
                         }
                     }
                     if func == "break" && self.loop_depth > 0 {
@@ -1278,6 +1986,41 @@ impl Render {
                     return;
                 }
                 let rhs = if self.is_num(&t.var) {
+                    // arith-assign / inc-dec render natively (not via
+                    // the sh2Arith stub)
+                    match expr {
+                        IrExpr::Arith(a) => match &**a {
+                            ArithAst::IncDec { var, delta, .. } => {
+                                let v = self.zig_ident(var);
+                                self.mark_read(var);
+                                let d = delta.unsigned_abs();
+                                let s = if *delta >= 0 { "+" } else { "-" };
+                                self.emit(&format!("{v} {s}= {d};"));
+                                return;
+                            }
+                            ArithAst::Assign { var, op, rhs } => {
+                                let v = self.zig_ident(var);
+                                self.mark_read(var);
+                                let r = self.arith(rhs);
+                                let zop = match op.as_str() {
+                                    "+=" => "+=",
+                                    "-=" => "-=",
+                                    "*=" => "*=",
+                                    "/=" => "/=",
+                                    "%=" => "%=",
+                                    _ => "=",
+                                };
+                                if zop == "=" {
+                                    self.emit(&format!("{v} = {r};"));
+                                } else {
+                                    self.emit(&format!("{v} {zop} {r};"));
+                                }
+                                return;
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
                     self.expr_num(expr)
                 } else {
                     self.expr_str(expr)
@@ -1363,6 +2106,46 @@ impl Render {
                     self.depth -= 1;
                 }
                 self.emit("}");
+            }
+            IrStmt::Case {
+                discriminant,
+                clauses,
+            } => {
+                // shell `case D in pat) …;; esac` — if/else-if chain on
+                // string equality (the common literal-pattern case).
+                let d = self.expr_str(discriminant);
+                let mut emitted = false;
+                for cl in clauses {
+                    let conds: Vec<String> = cl
+                        .patterns
+                        .iter()
+                        .filter(|p| p.as_str() != "*")
+                        .map(|p| format!("std.mem.eql(u8, {d}, {})", Self::zig_str(p)))
+                        .collect();
+                    let is_default = cl.patterns.iter().any(|p| p.as_str() == "*");
+                    if conds.is_empty() && is_default {
+                        self.emit("else {");
+                        self.depth += 1;
+                        for s in &cl.body {
+                            self.stmt(s);
+                        }
+                        self.depth -= 1;
+                        self.emit("}");
+                        emitted = true;
+                        continue;
+                    }
+                    let kw = if emitted { "} else if" } else { "if" };
+                    self.emit(&format!("{kw} ({}) {{", conds.join(" or ")));
+                    self.depth += 1;
+                    for s in &cl.body {
+                        self.stmt(s);
+                    }
+                    self.depth -= 1;
+                    emitted = true;
+                }
+                if emitted {
+                    self.emit("}");
+                }
             }
             IrStmt::While { cond, body } => {
                 let c = self.expr_bool(cond);
@@ -1458,36 +2241,159 @@ impl Render {
                     self.stmt(s);
                 }
             }
-            IrStmt::Exec { .. } | IrStmt::Pipeline { .. } => {
+            IrStmt::Exec { .. } => {
                 // run a compile-able stub (exits 2 at runtime) rather than
                 // silently dropping the command
-                if matches!(s, IrStmt::Exec { .. }) {
-                    let _ = self.sh2_stub("exec", "exec");
-                    self.emit("_ = sh2Exec();");
-                } else {
-                    let _ = self.sh2_stub("pipeline", "pipeline");
-                    self.emit("_ = sh2Pipeline();");
+                let _ = self.sh2_stub("exec", "exec");
+                self.emit("_ = sh2Exec();");
+            }
+            IrStmt::Pipeline { stages, .. } => {
+                // render each stage's statements in sequence (the native
+                // in-process approximation for the v1 subset).
+                for st in stages {
+                    for s in st {
+                        self.stmt(s);
+                    }
+                }
+            }
+            IrStmt::Subshell(body) | IrStmt::Background(body) | IrStmt::Block(body) => {
+                for s in body {
+                    self.stmt(s);
+                }
+            }
+            IrStmt::DeclareArray {
+                var,
+                elements,
+                sigil: _,
+            } => {
+                let elems: Vec<String> = elements.iter().map(|e| self.expr_str(e)).collect();
+                let m = self.zig_ident(var);
+                self.mark_written(var);
+                self.emit(&format!(
+                    "{m} = [_][]const u8{{{}}};",
+                    elems.join(", ")
+                ));
+            }
+            IrStmt::Redirect { inner, redirects } => {
+                // render the inner commands; apply a simple fd-1 write
+                // redirect (`> file` / `>> file`) by writing the captured
+                // output to the file (the common echo-to-file case).
+                for s in inner {
+                    self.stmt(s);
+                }
+                for r in redirects {
+                    if r.fd.unwrap_or(1) == 1 && (r.mode == "w" || r.mode == "a") {
+                        let p = self.expr_str(&r.target);
+                        self.need_writefile = true;
+                        self.emit(&format!(
+                            "sh2WriteFile({p}, \"\", {});",
+                            if r.mode == "a" { "true" } else { "false" }
+                        ));
+                    }
                 }
             }
             IrStmt::Die { .. }
             | IrStmt::Warn { .. }
-            | IrStmt::Return(_)
             | IrStmt::SetChildError(_)
             | IrStmt::Require(_)
             | IrStmt::RawText(_)
-            | IrStmt::Case { .. }
             | IrStmt::Redirect { .. }
-            | IrStmt::Function { .. }
             | IrStmt::Subshell(_)
             | IrStmt::Background(_)
             | IrStmt::Label(_)
             | IrStmt::Goto(_) => {
                 self.mark_todo(&format!("stmt {:?}", s));
             }
+            IrStmt::Return(v) => {
+                if self.in_function {
+                    // user-function value return: strings are the value
+                    // model (numeric contexts coerce at the read site)
+                    let r = v.as_ref().map(|e| self.expr_str(e)).unwrap_or_default();
+                    self.emit(&format!("return {r};"));
+                    return;
+                }
+                match v {
+                    Some(e) => {
+                        let code = self.expr_num(e);
+                        self.emit(&format!("return @intCast({code});"));
+                    }
+                    None => self.emit("return;"),
+                }
+            }
+            IrStmt::Function { name, body, .. } => {
+                // Render as a hoisted Zig fn taking POSITIONAL params:
+                // `fn name(__args: []const []const u8) []const u8` — the
+                // body's getVar("N") reads route through __args (the
+                // $1 convention), Return returns the value string.
+                // Hoisted out of main (pending_fns) — a fn nested inside
+                // another fn is legal zig but the decls/return machinery
+                // above assumes top level.
+                let id = self.zig_ident(name);
+                let prev_in_fn = self.in_function;
+                self.in_function = true;
+                let mut saved = std::mem::take(&mut self.out);
+                for s in body {
+                    self.stmt(s);
+                }
+                std::mem::swap(&mut saved, &mut self.out);
+                self.in_function = prev_in_fn;
+                let mut locals: BTreeSet<String> = BTreeSet::new();
+                for st in body {
+                    if let IrStmt::Assign { targets, .. } = st {
+                        for t in targets {
+                            locals.insert(t.var.clone());
+                        }
+                    }
+                    if let IrStmt::Declare { vars, .. } = st {
+                        for d in vars {
+                            locals.insert(d.name.clone());
+                        }
+                    }
+                }
+                self.fn_locals.extend(locals.iter().cloned());
+                let mut fntext = format!(
+                    "fn {id}(__args: []const []const u8) []const u8 {{\n"
+                );
+                for v in &locals {
+                    let m = self.zig_ident(v);
+                    if self.is_num(v) {
+                        fntext.push_str(&format!("    var {m}: i64 = 0;\n"));
+                    } else {
+                        fntext.push_str(&format!("    var {m}: []const u8 = \"\";\n"));
+                    }
+                }
+                fntext.push_str(&saved.join("\n"));
+                fntext.push('\n');
+                fntext.push_str("}\n");
+                self.pending_fns.push(fntext);
+            }
             IrStmt::Try { .. } => self.mark_todo("try"),
             IrStmt::Select { .. } => self.mark_todo("select"),
             IrStmt::Asm { .. } => self.mark_todo("asm"),
-            IrStmt::ForInit { .. } => self.mark_todo("ForInit (strip_cfor should have lowered it)"),
+            IrStmt::ForInit {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                // native while-loop: init; while (cond) { body; step }
+                for s in init {
+                    self.stmt(s);
+                }
+                let c = self.expr_bool(cond);
+                self.emit(&format!("while ({c}) {{"));
+                self.loop_depth += 1;
+                self.depth += 1;
+                for s in body {
+                    self.stmt(s);
+                }
+                for s in step {
+                    self.stmt(s);
+                }
+                self.depth -= 1;
+                self.loop_depth -= 1;
+                self.emit("}");
+            }
             IrStmt::Continue => self.emit("continue;"),
             IrStmt::Break => self.emit("break;"),
         }
@@ -1578,6 +2484,168 @@ impl Render {
             self.emit("    return if (b) \"1\" else \"0\";");
             self.emit("}");
         }
+        if self.need_env {
+            self.emit("");
+            self.emit("fn sh2Env(name: []const u8) []const u8 {");
+            self.emit("    return std.process.getEnvVar(name) catch \"\";");
+            self.emit("}");
+        }
+        if self.need_fexist {
+            self.emit("");
+            self.emit("fn sh2FileTest(flag: []const u8, p: []const u8) bool {");
+            self.emit("    const st = std.fs.cwd().statFile(p) catch return false;");
+            self.emit("    if (std.mem.eql(u8, flag, \"-f\")) return st.kind == .file;");
+            self.emit("    if (std.mem.eql(u8, flag, \"-d\")) return st.kind == .directory;");
+            self.emit("    if (std.mem.eql(u8, flag, \"-e\")) return true;");
+            self.emit("    if (std.mem.eql(u8, flag, \"-s\")) return st.size != 0;");
+            self.emit("    return false;");
+            self.emit("}");
+        }
+        if self.need_writefile {
+            self.emit("");
+            self.emit("fn sh2WriteFile(p: []const u8, data: []const u8, append: bool) void {");
+            self.emit("    const f = std.fs.cwd().createFile(p, .{ .truncate = !append }) catch return;");
+            self.emit("    defer f.close();");
+            self.emit("    f.writeAll(data) catch {};");
+            self.emit("}");
+        }
+        if self.need_ext {
+            self.emit("");
+            self.emit("fn sh2Contains(hay: []const u8, needle: []const u8) bool {");
+            self.emit("    return std.mem.indexOf(u8, hay, needle) != null;");
+            self.emit("}");
+            self.emit("fn sh2Sub(t: []const u8, off: i64, len: i64) []const u8 {");
+            self.emit("    const o: usize = @intCast(@max(0, @min(off, @as(i64, @intCast(t.len)))));");
+            self.emit("    if (len < 0) return t[o..];");
+            self.emit("    const e: usize = o + @as(usize, @intCast(len));");
+            self.emit("    return t[o..@min(e, t.len)];");
+            self.emit("}");
+            self.emit("fn sh2Case(t: []const u8, upper: bool) []const u8 {");
+            self.emit("    const b = std.heap.page_allocator.alloc(u8, t.len) catch return \"\";");
+            self.emit("    for (t, 0..) |c, i| b[i] = if (upper) std.ascii.toUpper(c) else std.ascii.toLower(c);");
+            self.emit("    return b;");
+            self.emit("}");
+            self.emit("fn sh2ReplaceLit(t: []const u8, pat: []const u8, repl: []const u8, all: bool) []const u8 {");
+            self.emit("    const i = std.mem.indexOf(u8, t, pat) orelse return t;");
+            self.emit("    if (!all) {");
+            self.emit("        return std.fmt.allocPrint(std.heap.page_allocator, \"{s}{s}{s}\", .{ t[0..i], repl, t[i + pat.len ..] }) catch \"\";");
+            self.emit("    }");
+            self.emit("    var n: usize = 0;");
+            self.emit("    var j: usize = 0;");
+            self.emit("    while (j + pat.len <= t.len) {");
+            self.emit("        if (std.mem.startsWith(u8, t[j..], pat)) { n += 1; j += pat.len; } else j += 1;");
+            self.emit("    }");
+            self.emit("    const out = std.heap.page_allocator.alloc(u8, t.len - n * pat.len + n * repl.len) catch return \"\";");
+            self.emit("    var w: usize = 0;");
+            self.emit("    j = 0;");
+            self.emit("    while (j < t.len) {");
+            self.emit("        if (j + pat.len <= t.len and std.mem.eql(u8, t[j .. j + pat.len], pat)) {");
+            self.emit("            @memcpy(out[w .. w + repl.len], repl);");
+            self.emit("            w += repl.len; j += pat.len;");
+            self.emit("        } else {");
+            self.emit("            out[w] = t[j]; w += 1; j += 1;");
+            self.emit("        }");
+            self.emit("    }");
+            self.emit("    return out[0..w];");
+            self.emit("}");
+            self.emit("fn sh2Fields(allocator: std.mem.Allocator, t: []const u8, d: []const u8, ids: []const usize, suppress: bool) []const u8 {");
+            self.emit("    if (!sh2Contains(t, d)) return if (suppress) \"\" else t;");
+            self.emit("    const p = std.heap.page_allocator.alloc([]const u8, std.mem.count(u8, t, d) + 1) catch return \"\";");
+            self.emit("    var it = std.mem.splitScalar(u8, t, d[0]);");
+            self.emit("    var np: usize = 0;");
+            self.emit("    while (it.next()) |part| { p[np] = part; np += 1; }");
+            self.emit("    var out: std.ArrayList(u8) = .empty;");
+            self.emit("    var first = true;");
+            self.emit("    for (ids) |id| {");
+            self.emit("        if (id < p.len) {");
+            self.emit("            if (!first) out.appendSlice(allocator, d) catch return \"\";");
+            self.emit("            out.appendSlice(allocator, p[id]) catch return \"\";");
+            self.emit("            first = false;");
+            self.emit("        }");
+            self.emit("    }");
+            self.emit("    return out.items;");
+            self.emit("}");
+            self.emit("fn sh2TakeLines(t: []const u8, k: usize, fromEnd: bool) []const u8 {");
+            self.emit("    var lines = std.ArrayList([]const u8).init(std.heap.page_allocator);");
+            self.emit("    var it = std.mem.splitScalar(u8, t, '\\n');");
+            self.emit("    while (it.next()) |part| lines.append(part) catch return \"\";");
+            self.emit("    const n = lines.items.len;");
+            self.emit("    const s0 = if (fromEnd) @max(0, n - k) else 0;");
+            self.emit("    const e0 = if (fromEnd) n else @min(k, n);");
+            self.emit("    return std.mem.join(std.heap.page_allocator, \"\\n\", lines.items[s0..e0]) catch \"\";");
+            self.emit("}");
+            self.emit("fn sh2Basename(t: []const u8) []const u8 {");
+            self.emit("    const i = std.mem.lastIndexOfScalar(u8, t, '/') orelse return t;");
+            self.emit("    return t[i + 1 ..];");
+            self.emit("}");
+            self.emit("fn sh2Dirname(t: []const u8) []const u8 {");
+            self.emit("    const i = std.mem.lastIndexOfScalar(u8, t, '/') orelse return \".\";");
+            self.emit("    if (i == 0) return \"/\";");
+            self.emit("    return t[0..i];");
+            self.emit("}");
+                        self.emit("var __rl_file: std.Io.File = undefined;");
+            self.emit("var __rl_buf: [4096]u8 = undefined;");
+            self.emit("var __rl_rdr: std.Io.File.Reader = undefined;");
+            self.emit("var __rl_init: bool = false;");
+            self.emit("fn sh2ReadLine(io: std.Io) []const u8 {");
+            self.emit("    if (!__rl_init) {");
+            self.emit("        __rl_file = std.Io.File.stdin();");
+            self.emit("        __rl_rdr = __rl_file.reader(io, &__rl_buf);");
+            self.emit("        __rl_init = true;");
+            self.emit("    }");
+            self.emit("    const line = __rl_rdr.interface.takeDelimiter('\\n') catch return \"\";");
+            self.emit("    return line orelse \"\";");
+            self.emit("}");
+self.emit("fn sh2TrimRightNl(t: []const u8) []const u8 {");
+            self.emit("    var s = t;");
+            self.emit("    while (s.len > 0 and s[s.len - 1] == '\\n') s = s[0 .. s.len - 1];");
+            self.emit("    return s;");
+            self.emit("}");
+            self.emit("fn sh2GlobName(pat: []const u8, name: []const u8) bool {");
+            self.emit("    // fnmatch-style: * ? [cls] — recursive matcher, no regex");
+            self.emit("    if (pat.len == 0) return name.len == 0;");
+            self.emit("    if (pat[0] == '*') {");
+            self.emit("        var k: usize = 0;");
+            self.emit("        while (k <= name.len) : (k += 1) {");
+            self.emit("            if (sh2GlobName(pat[1..], name[k..])) return true;");
+            self.emit("        }");
+            self.emit("        return false;");
+            self.emit("    }");
+            self.emit("    if (name.len == 0) return false;");
+            self.emit("    if (pat[0] == '?') return sh2GlobName(pat[1..], name[1..]);");
+            self.emit("    if (pat[0] == '[') {");
+            self.emit("        const close = std.mem.indexOfScalar(u8, pat, ']') orelse return false;");
+            self.emit("        if (close < 2) return false;");
+            self.emit("        var body = pat[1..close];");
+            self.emit("        const negate = body[0] == '!' or body[0] == '^';");
+            self.emit("        if (negate) body = body[1..];");
+            self.emit("        var hit = false;");
+            self.emit("        var bi: usize = 0;");
+            self.emit("        while (bi < body.len) : (bi += 1) {");
+            self.emit("            if (bi + 2 < body.len and body[bi + 1] == '-') {");
+            self.emit("                if (name[0] >= body[bi] and name[0] <= body[bi + 2]) hit = true;");
+            self.emit("                bi += 2;");
+            self.emit("            } else if (body[bi] == name[0]) hit = true;");
+            self.emit("        }");
+            self.emit("        if (hit != negate) return sh2GlobName(pat[close + 1 ..], name[1..]);");
+            self.emit("        return false;");
+            self.emit("    }");
+            self.emit("    return pat[0] == name[0] and sh2GlobName(pat[1..], name[1..]);");
+            self.emit("}");
+            self.emit("fn sh2TrimSides(t: []const u8, lead: bool, trail: bool) []const u8 {");
+            self.emit("    var s = t;");
+            self.emit("    if (lead) s = std.mem.trimLeft(u8, s, \" \\t\\n\\r\");");
+            self.emit("    if (trail) s = std.mem.trimRight(u8, s, \" \\t\\n\\r\");");
+            self.emit("    return s;");
+            self.emit("}");
+        }
+        if self.need_run {
+            self.emit("");
+            self.emit("fn sh2Run(argv: []const []const u8) []const u8 {");
+            self.emit("    const result = std.process.Child.run(.{ .allocator = std.heap.page_allocator, .argv = argv }) catch return \"\";");
+            self.emit("    return std.mem.trimRight(u8, result.stdout, \"\\n\");");
+            self.emit("}");
+        }
         // per-callee stubs: compile-able, exit(2) at runtime
         const RESERVED_STUB: &[&str] = &[
             "sh2TODO",
@@ -1613,15 +2681,40 @@ impl Render {
             }
         }
         self.emit("");
-        self.emit("pub fn main() !void {");
+        // hoisted user functions render BEFORE main (zig order-free, but
+        // keep the listing readable)
+        let pending = std::mem::take(&mut self.pending_fns);
+        if !pending.is_empty() {
+            self.emit("");
+            for f in &pending {
+                for line in f.lines() {
+                    self.emit(line);
+                }
+            }
+        }
+        self.emit("pub fn main(init: std.process.Init) !void {");
         // hoisted declarations (typed by the A2 verdicts)
+        // zig 0.16 errors on a `var` that is never mutated — emit `const`
+        // unless the rendered body assigns the name somewhere
         let mut decls: Vec<String> = Vec::new();
-        for v in &written {
+        // self.written (not the pass-1 local): setVar arms discovered
+        // during body rendering add their names here
+        let written_now: Vec<String> = self.written.iter().cloned().collect();
+        for v in &written_now {
+            // user-function locals hoist with their fn — never in main
+            if self.fn_locals.contains(v) {
+                continue;
+            }
             let m = self.zig_ident(v);
+            let mutated = body_stmts.iter().any(|l| {
+                let pat = [format!("{m} ="), format!("{m}="), format!("{m} +="), format!("{m} -="), format!("{m} *="), format!("{m} /="), format!("{m} %="), format!("{m}++"), format!("{m}--")];
+                pat.iter().any(|p| l.contains(p.as_str()))
+            });
+            let kw = if mutated { "var" } else { "const" };
             if self.is_num(v) {
-                decls.push(format!("    var {m}: i64 = 0;"));
+                decls.push(format!("    {kw} {m}: i64 = 0;"));
             } else {
-                decls.push(format!("    var {m}: []const u8 = \"\";"));
+                decls.push(format!("    {kw} {m}: []const u8 = \"\";"));
             }
         }
         if !decls.is_empty() {
@@ -1632,8 +2725,26 @@ impl Render {
         }
         if self.need_stdout {
             self.emit("");
+            // zig 0.16 removed std.io.getStdOut: stdout writing needs the
+            // process Init's Io. Rewrite the already-emitted main signature
+            // and set up a buffered File.Writer as `stdout` — generated
+            // statements (`try stdout.print(...)`) are unchanged, each one
+            // is followed by an explicit flush (early returns / exit() must
+            // not lose buffered output).
+            for line in self.out.iter_mut() {
+                if line == "pub fn main() !void {" {
+                    *line = "pub fn main(init: std.process.Init) !void {".to_string();
+                    break;
+                }
+            }
             self.out
-                .push("    const stdout = std.io.getStdOut().writer();".to_string());
+                .push("    var stdout_buffer: [4096]u8 = undefined;".to_string());
+            self.out.push(
+                "    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);"
+                    .to_string(),
+            );
+            self.out
+                .push("    const stdout = &stdout_file_writer.interface;".to_string());
         }
         if !body_stmts.is_empty() || !decls.is_empty() {
             self.emit("");
@@ -1697,6 +2808,14 @@ fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                 collect_written_expr(iter, out);
                 collect_written(body, out);
             }
+            IrStmt::Ext(node) if node.tag() == "ForEachLine" => {
+                // the loop var is bound by the reader loop (like For)
+                if let Some(fl) = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>() {
+                    out.insert(fl.var.clone());
+                    collect_written(&fl.body, out);
+                    collect_written_expr(&fl.source, out);
+                }
+            }
             IrStmt::Expr(e) => collect_written_expr(e, out),
             IrStmt::Output { value, .. } => collect_written_expr(value, out),
             IrStmt::WriteFile { path, content, .. } => {
@@ -1748,7 +2867,9 @@ fn collect_written(stmts: &[IrStmt], out: &mut BTreeSet<String>) {
                     collect_written(&c.body, out);
                 }
             }
-            IrStmt::Function { body, .. } => collect_written(body, out),
+            // user-function locals are hoisted with their fn — not
+            // main-level declarations
+            IrStmt::Function { .. } => {}
             IrStmt::Pipeline { stages, .. } => {
                 for st in stages {
                     collect_written(st, out);
@@ -1866,7 +2987,10 @@ mod tests {
             out.contains("try stdout.print(\"{s}{d}\\n\", .{\"x is \", x});"),
             "{out}"
         );
-        assert!(out.contains("pub fn main() !void {"), "{out}");
+        assert!(
+            out.contains("pub fn main(init: std.process.Init) !void {"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1905,6 +3029,9 @@ mod tests {
     fn for_loop_renders() {
         let out = render("for i in 1 2 3; do\necho \"$i\"\ndone\n");
         // the parser may not produce Range; just require it renders
-        assert!(out.contains("pub fn main() !void {"), "{out}");
+        assert!(
+            out.contains("pub fn main(init: std.process.Init) !void {"),
+            "{out}"
+        );
     }
 }

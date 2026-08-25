@@ -1,0 +1,25 @@
+# shir_nodes/cgo_call.node — CGO-PATH expression node.
+# A call into a CGO-bound native library (tree-sitter bindings, etc.)
+# that has NO shell/JS/Perl semantics: the faithful translation is the
+# NATIVE CALL ITSELF, executable only via the C frontend path (the
+# program becomes a C-backend build linking the native library).
+#
+# target: dotted Go callee verbatim ("sitter.NewParser",
+#         "parser.Parse", "node.Content", ...)
+# args:   evaluated argument expressions
+#
+# Backend contract:
+#   C    : renders the mapped native call (tree-sitter api.h family);
+#          UNKNOWN targets render `/* cgo-path: unimplemented <target>
+#          */ (assert(0), 0)` — loud, never silent.
+#   JS   : sh2.cgoUnsupported("target") — throws at RUNTIME (never
+#          silently wrong); browser deployments bundle the WASM/native
+#          bridge instead.
+#   Perl : die "debashc: cgo-path construct <target> requires the C
+#          frontend build\n"
+
+node CgoCall
+tag "CgoCall"
+kind expr
+field target: string
+field args: exprs

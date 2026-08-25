@@ -65,6 +65,8 @@ enum Part {
 pub struct Render {
     out: Vec<String>,
     depth: usize,
+    /// inside a hoisted user-function body: Return writes __SH_RET
+    in_function: bool,
     /// var name -> type verdict (A2); missing = Any (runtime store)
     var_types: HashMap<String, IrType>,
     /// vars written anywhere (declared at the top of main)
@@ -519,13 +521,6 @@ impl Render {
     /// A shell variable read as a String-typed expression. Handles the
     /// declared vars, positional params, special vars and env vars.
     fn getvar_str(&mut self, name: &str) -> String {
-        // `${#var}` arrives as getVar("#var") (the parser keeps the `#`
-        // in the braced-name token) — render as a character count.
-        if name.len() > 1 && name.starts_with('#') {
-            self.add_helper("len");
-            let inner = self.getvar_str(&name[1..]);
-            return format!("__sh_len(&{inner}).to_string()");
-        }
         if let Some(l) = self.captured.get(name) {
             return if self.is_num(name) {
                 format!("{l}.to_string()")
@@ -596,12 +591,6 @@ impl Render {
 
     /// A shell variable read as an i64-typed expression.
     fn getvar_num(&mut self, name: &str) -> String {
-        // `${#var}` in numeric context (see getvar_str)
-        if name.len() > 1 && name.starts_with('#') {
-            self.add_helper("len");
-            let inner = self.getvar_str(&name[1..]);
-            return format!("__sh_len(&{inner})");
-        }
         if let Some(l) = self.captured.get(name) {
             return if self.is_num(name) {
                 l.clone()
@@ -905,6 +894,16 @@ impl Render {
                 }
                 _ => format!("({} != 0)", self.expr_num(e)),
             },
+            IrExpr::Ext(n) => match n.tag() {
+                "StringContains" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StringContains>()
+                        .expect("tag/type agree");
+                    format!(
+                        "(if {}.contains({}.as_str()) {{ true }} else {{ false }})",
+                        self.expr_str(&x.text), self.expr_str(&x.pattern))
+                }
+                other => format!("({} != 0)", self.expr_num(e)),
+            },
             IrExpr::Arith(a) => format!("({} != 0)", self.arith(a)),
             IrExpr::Call { func, args } if func == "test" => self.test_call_bool(args),
             IrExpr::Call { func, args } if func == "grepMatches" => {
@@ -1122,6 +1121,41 @@ impl Render {
             IrExpr::Splice(_) => {
                 self.mark_todo("Splice expr");
                 "String::new()".to_string()
+            }
+            IrExpr::Ext(n) => match n.tag() {
+                "StringContains" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StringContains>()
+                        .expect("tag/type agree");
+                    format!(
+                        "(if {}.contains({}.as_str()) {{ 1i64 }} else {{ 0i64 }})",
+                        self.expr_str(&x.text), self.expr_str(&x.pattern))
+                }
+                "StrLen" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::StrLen>()
+                        .expect("tag/type agree");
+                    format!("({}.len() as i64)", self.expr_str(&x.text))
+                }
+                "CaseTransform" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::CaseTransform>()
+                        .expect("tag/type agree");
+                    format!("{}.{}()",
+                        self.expr_str(&x.text),
+                        if x.upper { "to_uppercase" } else { "to_lowercase" })
+                }
+                "FieldExtract" => {
+                    let x = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()
+                        .expect("tag/type agree");
+                    if x.fields.len() == 1 {
+                        if let crate::ir::FieldRange::Single(i) = x.fields[0] {
+                            return format!(
+                                "{{ let __s: String = {}; let __p: Vec<&str> = __s.split({}).collect(); if {}-1 < __p.len() {{ __p[{}].to_string() }} else {{ String::new() }} }}",
+                                self.expr_str(&x.text),
+                                Self::rust_str(&x.delimiter), i, i - 1);
+                        }
+                    }
+                    "String::new()".into()
+                }
+                _ => "String::new()".into(),
             }
         }
     }
@@ -2481,6 +2515,19 @@ impl Render {
             IrExpr::Index { var, key } => {
                 let k = self.expr_num(key);
                 format!("vec![{}]", self.array_elem(var, &k))
+            }
+            IrExpr::Ext(n) if n.tag() == "FieldExtract" => {
+                let x = n.as_any().downcast_ref::<crate::shir_nodes::FieldExtract>()
+                    .expect("tag/type agree");
+                if x.fields.len() == 1 {
+                    if let crate::ir::FieldRange::Single(i) = x.fields[0] {
+                        let t = self.expr_str(&x.text);
+                        let d = Self::rust_str_expr(&x.delimiter);
+                        return format!("vec![{{ let __s: String = {t}; let __p: Vec<&str> = __s.split({d}.as_str()).collect(); if {}-1 < __p.len() {{ __p[{}].to_string() }} else {{ String::new() }} }}]", i, i - 1);
+                    }
+                }
+                self.mark_todo("word FieldExtract (complex fields)");
+                "vec![String::new()]".to_string()
             }
             other => {
                 self.mark_todo(&format!("word {:?}", other));
@@ -4257,6 +4304,45 @@ impl Render {
     /// Non-exec Calls in String context.
     fn call_str(&mut self, func: &str, args: &[IrExpr]) -> String {
         match func {
+            // user-function call — the C frontend's value model flows as
+            // strings; functions are rendered as fns taking &mut Vec<String>
+            // out-params or returning String
+            "fnValue" | "fnCall" => {
+                // value-returning user-function call: the argv-swap call
+                // then read __SH_RET (the function's `return expr` home)
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    let m = self.fn_ident(name);
+                    let ws: Vec<String> = args
+                        .get(1)
+                        .and_then(|a| match a {
+                            IrExpr::Array(items) => {
+                                Some(items.iter().map(|w| self.expr_any(w)).collect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    return format!(
+                        "{{ let __old = __SH_ARGV.lock().unwrap().clone(); *__SH_ARGV.lock().unwrap() = vec![{}]; {}(); *__SH_ARGV.lock().unwrap() = __old; __SH_RET.lock().unwrap().clone() }}",
+                        ws.join(", "),
+                        m
+                    );
+                }
+                "String::new()".to_string()
+            }
+            "line" => {
+                // multi-return line read (`line(cap, N)` = the C frontend's
+                // outparam channel): String(v).split('\n')[N] with "" default
+                self.add_helper("lines");
+                if let (Some(v), Some(IrExpr::Str(i, _))) = (args.first(), args.get(1)) {
+                    let ve = self.expr_any(v);
+                    let n: usize = i.parse().unwrap_or(0);
+                    return format!(
+                        "(__sh_lines(&{ve}).get({n}).cloned().unwrap_or_default())"
+                    );
+                }
+                self.mark_todo("line args");
+                return "String::new()".to_string();
+            }
             "capture" => self.capture_expr(args),
             "captureWords" => {
                 let w = self.capture_words_expr(args);
@@ -4451,6 +4537,45 @@ impl Render {
     fn stmt(&mut self, s: &IrStmt) {
         match s {
             IrStmt::Expr(e) => match e {
+                // setVar(name, value) — the frontend-emitted store write:
+                // a typed assignment to the var's thread_local home (the
+                // C frontend's dotted struct names sanitize consistently
+                // for reads via the same rust_ident table)
+                IrExpr::Call { func, args } if func == "setVar" => {
+                    if let (Some(IrExpr::Str(name, _)), Some(value)) =
+                        (args.first(), args.get(1))
+                    {
+                        self.mark_written(name);
+                        let rhs = if self.is_num(name) {
+                            self.expr_num(value)
+                        } else {
+                            self.expr_str(value)
+                        };
+                        let emitted = if self.is_num(name) {
+                            self.write_num(name, &rhs)
+                        } else {
+                            self.write_str(name, &rhs)
+                        };
+                        self.emit(&emitted);
+                    }
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                }
+                IrExpr::Call { func, args } if func == "fnCall" || func == "fnValue" => {
+                    // user-function call: the argv-swap convention (the
+                    // callee reads positional params via $1/__sh_arg)
+                    if let Some(IrExpr::Str(name, _)) = args.first() {
+                        let words: Vec<&IrExpr> = args
+                            .get(1)
+                            .and_then(|a| match a {
+                                IrExpr::Array(items) => Some(items.iter().collect()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        let st = self.fn_call_stmt(name, &words);
+                        self.emit(&st);
+                    }
+                    self.emit("__SH_RC.store(0, Ordering::SeqCst);");
+                }
                 IrExpr::Call { func, args } if func == "exec" || func == "builtin" => self.exec_stmt(args),
                 IrExpr::Call { func, args } if func == "setArray" || func == "setArrayAppend" => {
                     self.array_call_stmt_by_name(func, args);
@@ -4927,6 +5052,15 @@ impl Render {
                 self.emit(&format!("std::process::exit(({code}) as i32);"));
             }
             IrStmt::Return(e) => {
+                if self.in_function {
+                    // user-function VALUE return (strings are the value
+                    // model; numeric contexts coerce via __sh_atoi)
+                    let r = e.as_ref().map(|x| self.expr_str(x)).unwrap_or_default();
+                    self.emit(&format!(
+                        "*__SH_RET.lock().unwrap() = {r}; return;"
+                    ));
+                    return;
+                }
                 if let Some(x) = e {
                     let n = self.expr_num(x);
                     self.emit(&format!("__SH_RC.store(({n}) as i32, Ordering::SeqCst); return;"));
@@ -5100,6 +5234,42 @@ impl Render {
                     "if !{ran} {{ __SH_RC.store(0, Ordering::SeqCst); }} else {{ __SH_RC.store({last}, Ordering::SeqCst); }}"
                 ));
             }
+            IrStmt::Ext(node) if node.tag() == "ForEachLine" => {
+                // STREAMING line iteration — O(1) memory (O(limit) for
+                // early-exit heads), never slurps. The loop var is bound
+                // into its thread_local String static; body statements
+                // render through the backend's own emitters.
+                let fl = node.as_any().downcast_ref::<crate::shir_nodes::ForEachLine>()
+                    .expect("tag/type agree");
+                self.var_types.insert(fl.var.clone(), IrType::Str);
+                self.mark_written(&fl.var);
+                let m = self.rust_ident(&fl.var);
+                let src = self.expr_str(&fl.source);
+                let iter = match &fl.limit {
+                    Some(lim) => {
+                        let lim_r = self.expr_num(lim);
+                        format!("std::io::BufReader::new(__sh_f).lines().take(({}) as usize)", lim_r)
+                    }
+                    None => "std::io::BufReader::new(__sh_f).lines()".to_string(),
+                };
+                self.emit(&format!("match std::fs::File::open({}) {{", src));
+                self.depth += 1;
+                self.emit("Ok(__sh_f) => {");
+                self.depth += 1;
+                self.emit(&format!("for {} in {}.flatten() {{", fl.var, iter));
+                self.depth += 1;
+                self.emit(&format!("{}.with(|v| *v.borrow_mut() = {}.clone());", m, fl.var));
+                for b in &fl.body {
+                    self.stmt(b);
+                }
+                self.depth -= 1;
+                self.emit("}");
+                self.depth -= 1;
+                self.emit("}");
+                self.emit("Err(_) => { __SH_RC.store(1, Ordering::SeqCst); }");
+                self.depth -= 1;
+                self.emit("}");
+            }
             IrStmt::Die { .. } | IrStmt::Warn { .. } | IrStmt::SetChildError(_)
             | IrStmt::Require(_) | IrStmt::RawText(_) | IrStmt::Goto(_)
             | IrStmt::Label(_) | IrStmt::Ext(_) => {
@@ -5232,7 +5402,12 @@ impl Render {
         // The thread_local var declarations are MODULE-level statics (the
         // function bodies reference them) — emitted before main. Render
         // pass may have discovered MORE arrays (eval-word param texts) —
-        // fold them in before declaring.
+        // fold them in before declaring. Same for vars discovered during
+        // rendering (ForEachLine loop vars — their writes happen inside the
+        // streaming node's hand-emitted scanner loop).
+        for v in &self.written {
+            written.insert(v.clone());
+        }
         for a in &self.arrays {
             written.insert(a.clone());
         }
@@ -5264,9 +5439,13 @@ impl Render {
             let m = self.fn_ident(name);
             self.emit(&format!("fn {m}() {{"));
             self.depth += 1;
+            // user-function bodies return VALUES via __SH_RET (the C
+            // frontend's `return expr;` — strings are the value model)
+            self.in_function = true;
             for st in body {
                 self.stmt(st);
             }
+            self.in_function = false;
             self.depth -= 1;
             self.emit("}");
             self.emit("");
@@ -5279,6 +5458,7 @@ impl Render {
         self.emit("#![allow(non_upper_case_globals)]");
         self.emit("use std::sync::atomic::Ordering;");
         self.emit("use std::io::Read;");
+        self.emit("use std::io::BufRead;");
         self.emit("use std::io::Write;");
         self.emit("");
         self.emit("static __SH_RC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
@@ -5294,6 +5474,7 @@ impl Render {
         self.emit("static __SH_BGPID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);");
         self.emit("static __SH_ARITH_ERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
         self.emit("static __SH_ARITH_WORD_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);");
+    self.emit("static __SH_RET: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());");
         self.emit("");
         self.out.extend(decl_out.iter().cloned());
         for h in HELPER_ORDER {
@@ -5397,7 +5578,7 @@ const HELPER_ORDER: &[&str] = &[
     "dirname", "env", "arg", "glob", "brace", "sleep", "rand", "grepmatches", "regex",
     "mtime", "samefile", "fmode", "fowner", "fgroup", "fnewer", "wait_all", "bg",
     "fexists", "fdir", "freg", "fsym", "fread", "fwrite", "fexec", "fsize", "aindex",
-    "div", "mod", "arith_err", "capture", "run_traps",
+    "div", "mod", "arith_err", "capture", "run_traps", "lines",
 ];
 
 /// `${var}`, `${var:-N}`, `${var:-$other}`, `${arr[i]:-N}` inside an arith
@@ -5456,6 +5637,7 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
     match h {
         "wq" => &["q"],
         "print_words" => &["echo_esc"],
+        "lines" => &[],
         "printf" => &["q", "q_printf", "echo_esc", "atoi", "atou", "atof"],
         "capture_rc" => &["cap_bytes"],
         "run" => &["spawn"],
@@ -5471,6 +5653,9 @@ fn helper_deps(h: &str) -> &'static [&'static str] {
 
 fn helper_source(h: &str) -> &'static str {
     match h {
+        "lines" => r#"fn __sh_lines(s: &str) -> Vec<String> {
+    s.split('\n').map(|x| x.to_string()).collect()
+}"#,
         "q" => r#"fn __sh_q(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 8);
     o.push('\'');
@@ -5665,6 +5850,10 @@ fn helper_source(h: &str) -> &'static str {
                     while j < ch.len() && ch[j].is_ascii_digit() { p.push(ch[j]); j += 1; }
                     prec = Some(p);
                 }
+                // C LENGTH MODIFIERS (`%lld`, `%zu`, `%hhd`) — skip them:
+                // an unconsumed 'l' leaked into the output verbatim
+                // (corpus-c 008_sized_ints printed "4000000000ld")
+                while j < ch.len() && "lhLzjt".contains(ch[j]) { j += 1; }
                 if j >= ch.len() { out.push('%'); break; }
                 let conv = ch[j];
                 i = j + 1;
@@ -8213,6 +8402,12 @@ fn collect_written_expr(e: &IrExpr, out: &mut BTreeSet<String>) {
             }
         }
         IrExpr::Call { func, args } => {
+            // setVar(name, _) — the frontend-emitted store write writes name
+            if func == "setVar" {
+                if let Some(IrExpr::Str(name, _)) = args.first() {
+                    out.insert(name.clone());
+                }
+            }
             // `assign(name, op, val)` — the arith-assignment writes name
             if func == "assign" {
                 if let Some(name) = str_arg(args, 0) {

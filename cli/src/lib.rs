@@ -977,12 +977,57 @@ exit $main_exit_code;
             // process-in/out into temp-file form (core request
             // sh-20260807-130936) — same as the file pipeline's transform.
             debashl::transforms::process_subst::transform_program(&mut prog);
+            // Frontend-emitted A1 carries constructs as opaque exec calls
+            // (let conditions, read, …) — normalise them through the SAME
+            // gated channel the direct path uses (text_ops is opt-in:
+            // DEBASHC_TRANSFORMS must list it, keeping default ingests
+            // byte-stable).
+            // ONLY text-ops here (opt-in): pulling every registered
+            // transform into the ingest path changed constructs that were
+            // already passing (e.g. fish set -l scoping via the runtime).
+            if std::env::var("DEBASHC_TRANSFORMS")
+                .map(|v| v.split(',').any(|s| s.trim() == "text-ops"))
+                .unwrap_or(false)
+            {
+                debashl::transforms::text_ops::normalize_frontend_constructs(&mut prog.stmts);
+            }
             match debashl::shir::shir_to_estree_json(&prog) {
                 Ok(s) => println!("{}", s),
                 Err(e) => { eprintln!("estree: {}", e); std::process::exit(1); }
             }
         }
-        "--shir-in-perl" => {
+                "--shir-in-java" => {
+            if args.len() < 3 { println!("Error: --shir-in-java requires input"); return; }
+            let input = &args[2];
+            let content = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e); std::process::exit(1);
+                }
+                Ok(s)
+            } else {
+                fs::read_to_string(input)
+            };
+            let content = match content {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let mut prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(1); }
+            };
+            // the shared core pipeline (mirrors the --shir-in-estree arm):
+            // strip_cfor lowers the C-style ForInit (step spliced before
+            // every continue), restructure_goto_only folds goto/label
+            // pairs (cpp-sh-go t29_goto.cc — the un-restructured Goto hit
+            // the renderer's todo arm), process_subst materializes
+            // captures.
+            debashl::shir_passes::strip_cfor(&mut prog);
+            debashl::shir_passes::restructure_goto_only(&mut prog);
+            debashl::transforms::process_subst::transform_program(&mut prog);
+            print!("{}", match debashl::java_backend::shir_to_java(&prog) { Ok(s) => s, Err(e) => { eprintln!("render: {}", e); std::process::exit(1); } });
+        }
+"--shir-in-perl" => {
             if args.len() < 3 { println!("Error: --shir-in-perl requires input"); return; }
             let input = &args[2];
             let content = if input == "-" {
@@ -1005,6 +1050,7 @@ exit $main_exit_code;
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
+            debashl::transforms::ternary_desugar::transform_program(&mut prog);
             print!("{}", debashl::ir::shir_to_perl(&prog));
         }
         "--shir-in-rust" => {
@@ -1065,6 +1111,9 @@ exit $main_exit_code;
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
+            // C frontend's ternary call → backend-neutral Ternary + test-call
+            // (the estree arm keeps its native ternary lowering — byte-pinned)
+            debashl::transforms::ternary_desugar::transform_program(&mut prog);
             print!("{}", match debashl::sh_backend::shir_to_sh(&prog) {
                 Ok(s) => s,
                 Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
@@ -1099,6 +1148,9 @@ exit $main_exit_code;
             debashl::shir_passes::strip_cfor(&mut prog);
             debashl::shir_passes::restructure_goto_only(&mut prog);
             debashl::transforms::process_subst::transform_program(&mut prog);
+            // C frontend's ternary call → backend-neutral Ternary + test-call
+            // (the estree arm keeps its native ternary lowering — byte-pinned)
+            debashl::transforms::ternary_desugar::transform_program(&mut prog);
             debashl::shir_passes::optimize::optimize(&mut prog);
             let out = match args[1].as_str() {
                 "--shir-in-c" => Ok(debashl::c_backend::shir_to_c(&prog)),
@@ -1115,6 +1167,34 @@ exit $main_exit_code;
                 Ok(s) => s,
                 Err(e) => { eprintln!("render: {}", e); std::process::exit(1); }
             });
+        }
+        "--shir-in-zig" => {
+            if args.len() < 3 { println!("Error: --shir-in-zig requires input"); return; }
+            let input = &args[2];
+            let content = if input == "-" {
+                let mut s = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                    eprintln!("stdin: {}", e); std::process::exit(1);
+                }
+                Ok(s)
+            } else {
+                fs::read_to_string(input)
+            };
+            let content = match content {
+                Ok(c) => c,
+                Err(_) => { eprintln!("cannot read {}", input); std::process::exit(1); }
+            };
+            let prog = match debashl::shir_json_in::shir_json_to_ir(&content) {
+                Ok(p) => p,
+                // NB: report the ingress marker on stderr and exit 0. The
+                // backend gate probes the flag by feeding intentionally
+                // invalid JSON and grepping for this marker; under the
+                // harness's `set -euo pipefail` a nonzero exit there would
+                // abort the gate before the corpus loop. A renderer panic
+                // still exits 101 and is caught by the loop.
+                Err(e) => { eprintln!("ShIR JSON ingress: {}", e); std::process::exit(0); }
+            };
+            print!("{}", debashl::zig_backend::shir_to_zig(&prog));
         }
         "--mir" => {
             if args.len() < 3 {

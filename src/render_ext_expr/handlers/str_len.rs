@@ -1,0 +1,9 @@
+//! Handler for StrLen — delegates to all_nodes.
+
+use crate::shir_nodes::StrLen;
+use crate::shir_nodes::ExtExpr;
+use crate::render_ext_expr::ExprRenderCtx;
+
+pub(crate) fn render(node: &StrLen, ctx: &ExprRenderCtx) -> Option<String> {
+    super::all_nodes::str_len(node, ctx)
+}
