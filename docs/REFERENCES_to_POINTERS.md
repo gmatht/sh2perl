@@ -379,3 +379,268 @@ cross-backend without coupling backends.
 
 All are one-line substitutions with no control-flow changes. The diff
 is large but each hunk is trivially reviewable.
+
+## Multi-frontend considerations
+
+### The frontend fleet
+
+The A1 contract is language-neutral: any frontend in any language emits
+the same ShIR JSON. The current fleet includes:
+
+| Frontend | Source lang | Testdata | Key constructs |
+|---|---|---|---|
+| bash (core) | shell | 551 corpus | everything |
+| c-sh-go | C subset | 105 files | AddressOf, Deref, asm, typed decls |
+| cpp-sh-go | C++ superset | shared w/ C + extras | classes, references |
+| posix-sh-go | POSIX shell | 88 files | no arrays, no [[ ]] |
+| go-sh | Go subset | 4 files | typed vars, GC'd strings |
+| zsh-sh-go | ZSH subset | typeset, assoc arrays | |
+| fish-sh-go | Fish subset | no positional params | |
+| rust-frontend | Rust subset | syn-based, ownership-aware | |
+| py-sh-go | Python subset | dynamic typing | |
+| powershell-sh-go | PowerShell subset | pipeline objects | |
+| perl-sh-go | Perl subset | scalar/array/hash sigils | |
+| bat-sh-go | Batch/CMD | labels + goto | |
+
+Each frontend's constructs map to different storage-class requirements.
+The same `getVar("x")` node can mean:
+
+- **bash**: read from the runtime store (could be anything)
+- **C frontend**: dereference a typed pointer (`int *p` or `char *s`)
+- **Rust frontend**: move or borrow a value (ownership semantics apply)
+- **Go frontend**: read an interface{} (always heap + type tag)
+- **Python frontend**: read an attribute from a dict (always tagged)
+
+### How the frontend affects storage-class selection
+
+The storage-class decision matrix in this document was designed for
+bash-to-C translation. Other frontends produce IR shapes that need
+DIFFERENT representations:
+
+#### C frontend → C backend (identity mapping)
+
+The C frontend emits `AddressOf{operand}` and `Deref{pointer}` for
+`&x` and `*p`. In the C backend these are IDENTITY operations:
+- `AddressOf{x}` → `&x` (a real C pointer)
+- `Deref{p}` → `*p` (a real C dereference)
+
+These MUST NOT be routed through managed strings or arenas. The C
+frontend's variables already have correct C storage classes chosen by
+the C compiler's own semantics.
+
+```
+Frontend: int *p = malloc(16); *p = 42;
+shIR:     Assign{p, Ext(AddressOf{...})}
+          Expr(Ext(Deref{pointer: Var("p")}))
+C render: int *p = malloc(16); *p = 42;
+```
+
+#### Rust frontend → C backend (ownership → raw pointer)
+
+Rust has ownership/borrowing. The frontend tracks lifetimes; the C
+backend doesn't need to. Every Rust variable becomes either:
+- `char *x` / `long long x` (if owned and escaping)
+- stack buffer (if owned and non-escaping and bounded)
+
+Rust's borrow checker guarantees no use-after-free, so the C backend
+doesn't need RC or arena — just plain values/pointers.
+
+#### Go frontend → C backend (GC → explicit)
+
+Go strings are immutable + GC-managed. The Go frontend emits captures
+and string operations as sh2.* calls. The C backend maps them to
+either arena strings (hot loops) or strdup (cold paths).
+
+#### Python frontend → C backend (dynamic → static)
+
+Python is dynamically typed like bash. All Python variables become
+tagged values or abstract refs — the type is never known at compile
+time. This is the worst case for the C backend.
+
+#### Batch frontend → C backend (no types at all)
+
+Batch (.bat) has no data types, no expressions, only string
+substitution. Everything is a `char[]`. No numeric vars, no arrays,
+no pointers needed.
+
+### Storage-class hints in .node declarations
+
+Ext nodes declare their output characteristics so every backend can
+select the right storage without understanding the construct's semantics:
+
+```
+node WordCount
+tag "WordCount"
+kind expr
+field text: expr
+output_type integer        ← always produces a number
+```
+
+```
+node ReadLine
+tag "ReadLine"
+kind expr
+output_type str_unbounded  ← unknown length, needs managed buffer
+```
+
+```
+node PathName
+tag "PathName"
+kind expr
+field path: expr
+output_type str_bounded    ← substring of input, bounded by input length
+```
+
+Backend mapping of output_type:
+
+| output_type | C rendering | JS rendering | Notes |
+|---|---|---|---|
+| `integer` | `long long` | number | no allocation |
+| `str_bounded(N)` | `char[N+1]` | string | stack if N ≤ MAX_STACK_ALLOC |
+| `str_unbounded` | `sh2_str` or `char*` | string | fat ptr if local, raw if escapes |
+| `ref_mutable` | `T *` | N/A | only C-like backends |
+| `ref_readonly` | `const T *` | const reference | borrowed |
+
+Without this metadata, each backend must infer the output type from
+the construct's semantics — which is fragile when new frontends emit
+shapes no backend has seen before.
+
+### Frontend-specific escape semantics
+
+Escape analysis must account for frontend-specific lifetime rules:
+
+| Frontend | String mutability | Lifetime model | Arena safe? |
+|---|---|---|---|
+| bash | mutable (in-place split OK) | scope-bounded | usually yes |
+| C | mutable (by design) | manual | yes if no escape |
+| Go | immutable | GC-tracked | unnecessary |
+| Rust | depends on type | ownership-checked | unnecessary |
+| Zsh | mutable like bash | scope-bounded | usually yes |
+| Fish | immutable lists | GC | unnecessary |
+| PowerShell | objects, mutable properties | GC | unnecessary |
+
+For backends targeting GC'd languages (JS, Go), arena allocation and
+in-place mutation are unnecessary complexity — the runtime handles it.
+Only C, C++, Rust, and Zig backends benefit from these optimisations.
+
+### The cross-backend contract
+
+The A1 schema is the ONLY interface between frontends and backends.
+Storage-class selection is entirely a BACKEND decision informed by:
+
+1. The shIR shape itself (what nodes appear)
+2. The `.node` output_type hints (what the construct produces)
+3. Backend-local analyses (var_lengths, escape_classes, var_const)
+
+No frontend needs to know how the C backend stores its variables.
+No backend needs to know why the C frontend emitted AddressOf instead
+of a Capture. The A1 contract is sufficient.
+
+This means: adding a new frontend NEVER requires changing existing
+backends. Adding a new backend requires implementing the primitives
+it will support (or refusing those it won't).
+
+## Why global buffers are NOT the default: the uniqueness requirement
+
+### The problem
+
+A global/static buffer seems attractive for unproven-escape pointers:
+no leak (reused), no dangling pointer (never freed). But using one
+requires proving **uniqueness**: at every point during execution,
+exactly ONE live variable references each static buffer.
+
+Without this proof, overwriting the buffer corrupts every other
+variable that still points into it. Concrete example from the corpus
+(alias.sh):
+
+```bash
+f() { local msg="inner"; echo "$msg"; }
+g() { local msg="outer"; f; echo "$msg"; }
+g()
+# bash: inner / outer  ✓ (local creates per-function scope)
+# C:    inner / inner  ✗ (both share the same global char *msg)
+```
+
+Both functions' `local msg` assignments target the same C global
+because the renderer hoists `msg` to file scope. Without proper
+per-function storage isolation, any global buffer strategy produces
+silent data corruption.
+
+### What uniqueness requires proving
+
+For each global buffer B, at every program point P:
+1. No OTHER variable holds a pointer into B
+2. No function save/restore has created an active alias into B
+3. No array element or struct field references into B
+4. If B is inside a recursive call chain, all outer frames'
+   references are dead
+
+Conditions 1–3 require full alias analysis across all code paths.
+Condition 4 requires interprocedural call-graph analysis. Together
+they are equivalent to Rust's borrow checker — nontrivial to implement
+correctly for a generated-code system.
+
+### Why heap allocation IS the right default
+
+| Property | Heap strdup | Global static buffer |
+|---|---|---|
+| Uniqueness | Trivially yes (fresh alloc each time) | Requires proof |
+| Aliasing | Impossible between distinct vars | Possible via pointer copy |
+| Recursion safety | Each frame gets its own copy | Shared buffer corrupts |
+| Thread safety | Safe (different allocations) | Unsafe without locks |
+| Leak on scope exit | Yes (must free or leak) | N/A (reused) |
+
+Heap strdup's only downside is potential memory growth. For shell
+scripts (bounded execution, small data), this is acceptable — the
+process exits before memory becomes a problem.
+
+### When global buffers DO work safely
+
+1. **Per-capture-site buffers** (`_cap_N()`): each site has its own
+   static buffer, no other site writes to it. The caller must consume
+   the result before calling again. Safe because:
+   - Each capture has a dedicated buffer (no cross-site aliasing)
+   - The caller immediately consumes (strdup or print)
+   - No recursion through capture paths in the corpus
+
+2. **Command-text buffers** (`_sh_cmd`): built once per site, consumed
+   by popen/system, then reset. Sequential usage guarantees no overlap.
+
+3. **Wrap buffers** (`_sh_wrap`): same pattern — built, used by system,
+   done. Single-threaded sequential access.
+
+These work because the USAGE PATTERN guarantees uniqueness: build →
+use → discard, never two live references simultaneously. The pattern
+is enforced by construction (the code generator emits them in this
+order), not by analysis.
+
+### Caller-allocates as an alternative
+
+When the CALLER can bound the result size, it can allocate the buffer
+and pass it to the callee — eliminating the ownership question entirely
+(Win32 API pattern):
+
+```c
+// caller allocates, callee fills
+char buf[256];
+gethostname(buf, sizeof(buf));       // caller owns, callee fills
+
+// vs callee-allocates (current):
+char *result = _cap_0();             // callee allocates static buf
+// or:
+char *result = strdup(_cap_0());     // callee allocates heap (leak-prone)
+```
+
+For shell-to-C, caller-allocation works when the result size is
+provably bounded (basename/dirname of a known-length input, numeric
+formatting, substring extraction). It does NOT work for command output
+(unbounded).
+
+### Summary
+
+| Strategy | Uniqueness proof needed? | Safe without proof? | Best for |
+|---|---|---|---|
+| Heap strdup per assignment | No | Yes | Default for unproven cases |
+| Per-site static buffer | Pattern-enforced (build→use→discard) | Yes within pattern | Capture results |
+| Shared global buffer | YES — full alias + liveness analysis | No | Avoid until analysis exists |
+| Caller-allocated buffer | Caller controls lifetime | Yes if bounded | Provably-bounded results |
