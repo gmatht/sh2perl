@@ -8727,6 +8727,29 @@ impl Render {
                     .expect("tag/type agree");
                 self.store.insert(fl.var.clone());
                 self.var_types.insert(fl.var.clone(), IrType::Str);
+                // body self-increment assigns ('cat -n F' counter) are
+                // NUMERIC — typed here before the body renders or the
+                // counter hoists as char* and prints pointer garbage
+                for b in &fl.body {
+                    if let IrStmt::Assign { targets, expr, .. } = b {
+                        if let IrExpr::BinOp {
+                            lhs,
+                            op: crate::ir::BinOpKind::Add,
+                            rhs,
+                        } = expr
+                        {
+                            if matches!(
+                                lhs.as_ref(),
+                                IrExpr::Var(v, _)
+                                    if targets.iter().any(|t| t.var == *v)
+                            ) && matches!(rhs.as_ref(), IrExpr::Int(_))
+                            {
+                                self.var_types
+                                    .insert(targets[0].var.clone(), IrType::Int);
+                            }
+                        }
+                    }
+                }
                 let var = self.c_ident(&fl.var);
                 let src = self.value_c(&fl.source);
                 self.emit(&format!("{{"));
@@ -10714,6 +10737,13 @@ fn collect_ext_foreach_line_vars(st: &IrStmt, out: &mut BTreeSet<String>) {
                 .downcast_ref::<crate::shir_nodes::ForEachLine>()
             {
                 out.insert(fl.var.clone());
+                // body helper vars hoist too ('cat -n F' carries the
+                // __cnN counter): every store/read inside fl.body
+                collect_store_names(&fl.body, out);
+                let mut fv = BTreeSet::new();
+                let mut ffor = BTreeSet::new();
+                collect_vars_full(&fl.body, &mut fv, &mut ffor);
+                out.extend(fv);
             }
         }
     }
