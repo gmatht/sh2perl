@@ -195,6 +195,7 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         };
         let json = crate::shir_json::shir_to_shir_json(&prog);
@@ -246,6 +247,7 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         };
         let perl = crate::ir::shir_to_perl(&prog);

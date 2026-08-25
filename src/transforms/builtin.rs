@@ -556,6 +556,7 @@ mod tests {
     fn fallback_erases_builtin() {
         let mut prog = crate::ir::IrProgram {
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
             imports: vec![],
             requires: vec![],
@@ -580,6 +581,7 @@ mod tests {
         }
         let mut prog2 = crate::ir::IrProgram {
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
             imports: vec![],
             requires: vec![],

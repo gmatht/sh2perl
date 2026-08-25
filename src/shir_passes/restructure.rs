@@ -719,6 +719,7 @@ mod tests {
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         }
     }

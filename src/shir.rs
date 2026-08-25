@@ -36557,6 +36557,7 @@ if printf "%s\n" "$x" | grep world > /dev/null; then echo yes; fi"#;
             var_const: vec![],
             var_lifetimes: vec![],
             var_nospace: vec![],
+            var_storage: vec![],
             var_bash_env: vec![],
         };
         // bare try/except: TryStatement + CatchClause + instanceof ladder
